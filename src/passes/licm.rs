@@ -27,16 +27,10 @@
 //! Address-taken allocas (used in GEP, passed to calls, etc.) are never hoisted
 //! because stores through derived pointers may not be tracked in `stored_allocas`.
 
+use super::loop_analysis::{self, NaturalLoop};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
-use crate::ir::reexports::{
-    Instruction,
-    IrFunction,
-    Operand,
-    Terminator,
-    Value,
-};
-use super::loop_analysis::{self, NaturalLoop};
+use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
@@ -46,7 +40,8 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     }
 
     // Find natural loops
-    let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+    let loops =
+        loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     if loops.is_empty() {
         return 0;
     }
@@ -128,7 +123,10 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
     }
 
     if alloca_values.is_empty() {
-        return AllocaAnalysis { alloca_values, address_taken };
+        return AllocaAnalysis {
+            alloca_values,
+            address_taken,
+        };
     }
 
     // Scan all instructions to find address-taken allocas.
@@ -144,7 +142,7 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
                 // (as the stored data) means its address escapes.
                 Instruction::Store { val, ptr, .. } => {
                     let _ = ptr; // Storing to alloca is fine.
-                    // If the stored VALUE is an alloca pointer, it's address-taken.
+                                 // If the stored VALUE is an alloca pointer, it's address-taken.
                     if let Operand::Value(v) = val {
                         if alloca_values.contains(&v.0) {
                             address_taken.insert(v.0);
@@ -172,7 +170,10 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
         });
     }
 
-    AllocaAnalysis { alloca_values, address_taken }
+    AllocaAnalysis {
+        alloca_values,
+        address_taken,
+    }
 }
 
 /// Visit each Value ID used as operands by any instruction (for address-taken analysis).
@@ -187,48 +188,104 @@ fn for_each_operand_value(inst: &Instruction, mut f: impl FnMut(u32)) {
     }
 
     match inst {
-        Instruction::BinOp { lhs, rhs, .. } => { collect(lhs, &mut f); collect(rhs, &mut f); }
+        Instruction::BinOp { lhs, rhs, .. } => {
+            collect(lhs, &mut f);
+            collect(rhs, &mut f);
+        }
         Instruction::UnaryOp { src, .. } => collect(src, &mut f),
-        Instruction::Cmp { lhs, rhs, .. } => { collect(lhs, &mut f); collect(rhs, &mut f); }
+        Instruction::Cmp { lhs, rhs, .. } => {
+            collect(lhs, &mut f);
+            collect(rhs, &mut f);
+        }
         Instruction::Cast { src, .. } => collect(src, &mut f),
         Instruction::GetElementPtr { base, offset, .. } => {
             f(base.0);
             collect(offset, &mut f);
         }
         Instruction::Copy { src, .. } => collect(src, &mut f),
-        Instruction::Call { info, .. } => { for a in &info.args { collect(a, &mut f); } }
+        Instruction::Call { info, .. } => {
+            for a in &info.args {
+                collect(a, &mut f);
+            }
+        }
         Instruction::CallIndirect { func_ptr, info } => {
             collect(func_ptr, &mut f);
-            for a in &info.args { collect(a, &mut f); }
+            for a in &info.args {
+                collect(a, &mut f);
+            }
         }
-        Instruction::Memcpy { dest, src, .. } => { f(dest.0); f(src.0); }
+        Instruction::Memcpy { dest, src, .. } => {
+            f(dest.0);
+            f(src.0);
+        }
         Instruction::VaStart { va_list_ptr, .. } => f(va_list_ptr.0),
         Instruction::VaEnd { va_list_ptr } => f(va_list_ptr.0),
-        Instruction::VaCopy { dest_ptr, src_ptr } => { f(dest_ptr.0); f(src_ptr.0); }
+        Instruction::VaCopy { dest_ptr, src_ptr } => {
+            f(dest_ptr.0);
+            f(src_ptr.0);
+        }
         Instruction::VaArg { va_list_ptr, .. } => f(va_list_ptr.0),
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => { f(dest_ptr.0); f(va_list_ptr.0); }
-        Instruction::AtomicRmw { ptr, val, .. } => { collect(ptr, &mut f); collect(val, &mut f); }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
-            collect(ptr, &mut f); collect(expected, &mut f); collect(desired, &mut f);
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            ..
+        } => {
+            f(dest_ptr.0);
+            f(va_list_ptr.0);
+        }
+        Instruction::AtomicRmw { ptr, val, .. } => {
+            collect(ptr, &mut f);
+            collect(val, &mut f);
+        }
+        Instruction::AtomicInc { ptr, .. } => collect(ptr, &mut f),
+        Instruction::AtomicCmpxchg {
+            ptr,
+            expected,
+            desired,
+            ..
+        } => {
+            collect(ptr, &mut f);
+            collect(expected, &mut f);
+            collect(desired, &mut f);
         }
         Instruction::AtomicLoad { ptr, .. } => collect(ptr, &mut f),
-        Instruction::AtomicStore { ptr, val, .. } => { collect(ptr, &mut f); collect(val, &mut f); }
-        Instruction::InlineAsm { outputs, inputs, .. } => {
+        Instruction::AtomicStore { ptr, val, .. } => {
+            collect(ptr, &mut f);
+            collect(val, &mut f);
+        }
+        Instruction::InlineAsm {
+            outputs, inputs, ..
+        } => {
             // Output pointers are alloca Values that the backend stores asm results into.
             // They must be tracked as address-taken to prevent LICM from hoisting loads
             // of those allocas out of loops containing inline asm.
-            for (_, ptr, _) in outputs { f(ptr.0); }
-            for (_, op, _) in inputs { collect(op, &mut f); }
+            for (_, ptr, _) in outputs {
+                f(ptr.0);
+            }
+            for (_, op, _) in inputs {
+                collect(op, &mut f);
+            }
         }
-        Instruction::Intrinsic { args, .. } => { for a in args { collect(a, &mut f); } }
+        Instruction::Intrinsic { args, .. } => {
+            for a in args {
+                collect(a, &mut f);
+            }
+        }
         Instruction::Phi { incoming, .. } => {
-            for (op, _) in incoming { collect(op, &mut f); }
+            for (op, _) in incoming {
+                collect(op, &mut f);
+            }
         }
         Instruction::SetReturnF64Second { src } => collect(src, &mut f),
         Instruction::SetReturnF32Second { src } => collect(src, &mut f),
         Instruction::SetReturnF128Second { src } => collect(src, &mut f),
         Instruction::DynAlloca { size, .. } => collect(size, &mut f),
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             collect(cond, &mut f);
             collect(true_val, &mut f);
             collect(false_val, &mut f);
@@ -254,9 +311,18 @@ fn for_each_operand_value(inst: &Instruction, mut f: impl FnMut(u32)) {
 fn for_each_terminator_value(term: &Terminator, mut f: impl FnMut(u32)) {
     match term {
         Terminator::Return(Some(Operand::Value(v))) => f(v.0),
-        Terminator::CondBranch { cond: Operand::Value(v), .. } => f(v.0),
-        Terminator::IndirectBranch { target: Operand::Value(v), .. } => f(v.0),
-        Terminator::Switch { val: Operand::Value(v), .. } => f(v.0),
+        Terminator::CondBranch {
+            cond: Operand::Value(v),
+            ..
+        } => f(v.0),
+        Terminator::IndirectBranch {
+            target: Operand::Value(v),
+            ..
+        } => f(v.0),
+        Terminator::Switch {
+            val: Operand::Value(v),
+            ..
+        } => f(v.0),
         _ => {}
     }
 }
@@ -302,16 +368,23 @@ fn for_each_hoistable_operand(inst: &Instruction, mut f: impl FnMut(u32)) {
             // The pointer is the operand we need to check for loop-invariance.
             f(ptr.0);
         }
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             collect_op(cond, &mut f);
             collect_op(true_val, &mut f);
             collect_op(false_val, &mut f);
         }
         Instruction::Intrinsic { args, .. } => {
-            for a in args { collect_op(a, &mut f); }
+            for a in args {
+                collect_op(a, &mut f);
+            }
         }
         // All other instructions are non-hoistable and should never reach here.
-        _ => unreachable!("for_each_hoistable_operand called on non-hoistable instruction")
+        _ => unreachable!("for_each_hoistable_operand called on non-hoistable instruction"),
     }
 }
 
@@ -341,13 +414,18 @@ struct LoopMemoryInfo {
 impl LoopMemoryInfo {
     /// Whether the loop has any store operations at all (to any target).
     fn has_any_stores(&self) -> bool {
-        !self.stored_allocas.is_empty() || self.has_unknown_derived_stores || !self.stored_global_bases.is_empty()
+        !self.stored_allocas.is_empty()
+            || self.has_unknown_derived_stores
+            || !self.stored_global_bases.is_empty()
     }
 }
 
 /// Build a mapping from GEP/Copy result values to their ultimate base alloca.
 /// Follows chains like `gep(gep(alloca, off1), off2)` → alloca.
-fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -> FxHashMap<u32, u32> {
+fn build_value_to_base_alloca(
+    func: &IrFunction,
+    alloca_info: &AllocaAnalysis,
+) -> FxHashMap<u32, u32> {
     let mut map: FxHashMap<u32, u32> = FxHashMap::default();
     // Seed: every alloca maps to itself
     for &alloca_id in &alloca_info.alloca_values {
@@ -367,7 +445,10 @@ fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -
                             }
                         }
                     }
-                    Instruction::Copy { dest, src: Operand::Value(src_val) } => {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src_val),
+                    } => {
                         if let Some(&base_alloca) = map.get(&src_val.0) {
                             if map.insert(dest.0, base_alloca) != Some(base_alloca) {
                                 changed = true;
@@ -384,7 +465,10 @@ fn build_value_to_base_alloca(func: &IrFunction, alloca_info: &AllocaAnalysis) -
 
 /// Build a mapping from GEP/Copy result values to their ultimate base GlobalAddr.
 /// Follows chains like `gep(gep(GlobalAddr, off1), off2)` → GlobalAddr.
-fn build_value_to_base_global(func: &IrFunction, global_addr_values: &FxHashSet<u32>) -> FxHashMap<u32, u32> {
+fn build_value_to_base_global(
+    func: &IrFunction,
+    global_addr_values: &FxHashSet<u32>,
+) -> FxHashMap<u32, u32> {
     // Build canonical mapping: multiple GlobalAddr instructions for the same
     // symbol should map to the same canonical ID. Without this, stores through
     // one GlobalAddr for "perm" won't block loads through another GlobalAddr
@@ -429,7 +513,10 @@ fn build_value_to_base_global(func: &IrFunction, global_addr_values: &FxHashSet<
                             }
                         }
                     }
-                    Instruction::Copy { dest, src: Operand::Value(src_val) } => {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src_val),
+                    } => {
                         if let Some(&base_global) = map.get(&src_val.0) {
                             if map.insert(dest.0, base_global) != Some(base_global) {
                                 changed = true;
@@ -539,7 +626,9 @@ fn analyze_loop_memory(
                 // stores results into. Track them as stores to prevent LICM from
                 // hoisting loads of those allocas out of loops with inline asm.
                 // InlineAsm with clobbers is also treated as a call-like barrier.
-                Instruction::InlineAsm { outputs, clobbers, .. } => {
+                Instruction::InlineAsm {
+                    outputs, clobbers, ..
+                } => {
                     for (_, ptr, _) in outputs {
                         stored_allocas.insert(ptr.0);
                     }
@@ -552,7 +641,10 @@ fn analyze_loop_memory(
                 // Vec128 intrinsics write their result through dest_ptr.
                 // Track this as a store so that reads from the same alloca
                 // (by other intrinsics or loads) are not incorrectly hoisted.
-                Instruction::Intrinsic { dest_ptr: Some(dptr), .. } => {
+                Instruction::Intrinsic {
+                    dest_ptr: Some(dptr),
+                    ..
+                } => {
                     stored_allocas.insert(dptr.0);
                 }
                 // VaStart/VaEnd/VaCopy/VaArg modify va_list state but not globals.
@@ -571,7 +663,13 @@ fn analyze_loop_memory(
         }
     }
 
-    LoopMemoryInfo { stored_allocas, modified_base_allocas, has_calls, has_unknown_derived_stores, stored_global_bases }
+    LoopMemoryInfo {
+        stored_allocas,
+        modified_base_allocas,
+        has_calls,
+        has_unknown_derived_stores,
+        stored_global_bases,
+    }
 }
 
 /// Check if a Load instruction is safe to hoist from a loop.
@@ -723,12 +821,18 @@ fn hoist_loop_invariants(
             for inst in &block.instructions {
                 match inst {
                     Instruction::GetElementPtr { dest, base, .. } => {
-                        if global_addr_values.contains(&base.0) && global_addr_values.insert(dest.0) {
+                        if global_addr_values.contains(&base.0) && global_addr_values.insert(dest.0)
+                        {
                             changed_closure = true;
                         }
                     }
-                    Instruction::Copy { dest, src: Operand::Value(src_val) } => {
-                        if global_addr_values.contains(&src_val.0) && global_addr_values.insert(dest.0) {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src_val),
+                    } => {
+                        if global_addr_values.contains(&src_val.0)
+                            && global_addr_values.insert(dest.0)
+                        {
                             changed_closure = true;
                         }
                     }
@@ -747,7 +851,13 @@ fn hoist_loop_invariants(
     let value_to_base_global = build_value_to_base_global(func, &root_global_addr_values);
 
     // Analyze loop memory for load hoisting.
-    let loop_mem = analyze_loop_memory(func, &natural_loop.body, alloca_info, &global_addr_values, &value_to_base_alloca);
+    let loop_mem = analyze_loop_memory(
+        func,
+        &natural_loop.body,
+        alloca_info,
+        &global_addr_values,
+        &value_to_base_alloca,
+    );
 
     // Iteratively identify loop-invariant instructions.
     // An instruction is loop-invariant if:
@@ -783,7 +893,10 @@ fn hoist_loop_invariants(
                     // Use callback to avoid Vec allocation in this hot loop
                     let mut all_invariant = true;
                     for_each_hoistable_operand(inst, |val_id| {
-                        if all_invariant && loop_defined.contains(&val_id) && !invariant.contains(&val_id) {
+                        if all_invariant
+                            && loop_defined.contains(&val_id)
+                            && !invariant.contains(&val_id)
+                        {
                             all_invariant = false;
                         }
                     });
@@ -846,10 +959,15 @@ fn hoist_loop_invariants(
                     }
                     all_invariant
                 } else if let Instruction::Load { ptr, .. } = inst {
-                    is_load_hoistable(ptr, alloca_info, &loop_mem,
-                                             &loop_defined, &invariant,
-                                             &global_addr_values,
-                                             &value_to_base_global)
+                    is_load_hoistable(
+                        ptr,
+                        alloca_info,
+                        &loop_mem,
+                        &loop_defined,
+                        &invariant,
+                        &global_addr_values,
+                        &value_to_base_global,
+                    )
                 } else {
                     false
                 };
@@ -880,11 +998,17 @@ fn hoist_loop_invariants(
             let mut new_insts = Vec::with_capacity(block.instructions.len());
             let old_spans = std::mem::take(&mut block.source_spans);
             let has_spans = old_spans.len() == block.instructions.len() && !old_spans.is_empty();
-            let mut new_spans = if has_spans { Vec::with_capacity(old_spans.len()) } else { Vec::new() };
+            let mut new_spans = if has_spans {
+                Vec::with_capacity(old_spans.len())
+            } else {
+                Vec::new()
+            };
             for (i, inst) in block.instructions.drain(..).enumerate() {
                 if !indices.contains(&i) {
                     new_insts.push(inst);
-                    if has_spans { new_spans.push(old_spans[i]); }
+                    if has_spans {
+                        new_spans.push(old_spans[i]);
+                    }
                 }
             }
             block.instructions = new_insts;
@@ -924,9 +1048,10 @@ fn hoist_loop_invariants(
         let num_sorted = sorted.len();
         preheader_block.instructions.extend(sorted);
         if !preheader_block.source_spans.is_empty() {
-            preheader_block.source_spans.extend(
-                std::iter::repeat_n(crate::common::source::Span::dummy(), num_sorted)
-            );
+            preheader_block.source_spans.extend(std::iter::repeat_n(
+                crate::common::source::Span::dummy(),
+                num_sorted,
+            ));
         }
     }
 
@@ -1132,7 +1257,9 @@ mod tests {
         // Check that the hoisted instruction is the multiply
         let last_preheader_inst = func.blocks[0].instructions.last().unwrap();
         match last_preheader_inst {
-            Instruction::BinOp { op: IrBinOp::Mul, .. } => {} // correct
+            Instruction::BinOp {
+                op: IrBinOp::Mul, ..
+            } => {} // correct
             other => panic!("Expected BinOp::Mul, got {:?}", other),
         }
     }
@@ -1197,9 +1324,14 @@ mod tests {
                     size: 4,
                     align: 4,
                     volatile: false,
+                    semantic_volatile: false,
                 },
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::Copy {
                     dest: Value(1),
                     src: Operand::Const(IrConst::I32(0)),
@@ -1221,8 +1353,12 @@ mod tests {
                         (Operand::Value(Value(5)), BlockId(2)),
                     ],
                 },
-                Instruction::Load { dest: Value(3), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::Cmp {
                     dest: Value(4),
                     op: IrCmpOp::Slt,
@@ -1242,15 +1378,13 @@ mod tests {
         // Block 2 (body): i++
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::BinOp {
-                    dest: Value(5),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(2)),
-                    rhs: Operand::Const(IrConst::I32(1)),
-                    ty: IrType::I32,
-                },
-            ],
+            instructions: vec![Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -1299,9 +1433,14 @@ mod tests {
                     size: 4,
                     align: 4,
                     volatile: false,
+                    semantic_volatile: false,
                 },
-                Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(0)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1311,8 +1450,12 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Slt,
@@ -1340,8 +1483,12 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { val: Operand::Value(Value(3)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    val: Operand::Value(Value(3)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1396,15 +1543,14 @@ mod tests {
         // Block 0 (entry): alloca for succeeded
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::Alloca {
-                    dest: Value(0),
-                    ty: IrType::I32,
-                    size: 4,
-                    align: 4,
-                    volatile: false,
-                },
-            ],
+            instructions: vec![Instruction::Alloca {
+                dest: Value(0),
+                ty: IrType::I32,
+                size: 4,
+                align: 4,
+                volatile: false,
+                semantic_volatile: false,
+            }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -1412,18 +1558,16 @@ mod tests {
         // Block 1 (loop body): inline asm that writes to the alloca
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::InlineAsm {
-                    template: "nop".to_string(),
-                    outputs: vec![("=r".to_string(), Value(0), None)],
-                    inputs: vec![],
-                    clobbers: vec![],
-                    operand_types: vec![IrType::I32],
-                    goto_labels: vec![],
-                    input_symbols: vec![],
-                    seg_overrides: vec![AddressSpace::Default],
-                },
-            ],
+            instructions: vec![Instruction::InlineAsm {
+                template: "nop".to_string(),
+                outputs: vec![("=r".to_string(), Value(0), None)],
+                inputs: vec![],
+                clobbers: vec![],
+                operand_types: vec![IrType::I32],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![AddressSpace::Default],
+            }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
         });
@@ -1432,8 +1576,12 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Eq,
@@ -1515,12 +1663,10 @@ mod tests {
         // Block 0 (entry): globaladdr + branch
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::GlobalAddr {
-                    dest: Value(0),
-                    name: "addr".to_string(),
-                },
-            ],
+            instructions: vec![Instruction::GlobalAddr {
+                dest: Value(0),
+                name: "addr".to_string(),
+            }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -1547,8 +1693,8 @@ mod tests {
             ],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(4)),
-                true_label: BlockId(2),   // body
-                false_label: BlockId(3),  // exit
+                true_label: BlockId(2),  // body
+                false_label: BlockId(3), // exit
             },
             source_spans: Vec::new(),
         });
@@ -1609,7 +1755,10 @@ mod tests {
         // The Copy from Value(5) must NOT be hoisted because Value(5) is
         // defined by InlineAsm inside the loop. The BinOp depends on the
         // phi (also loop-defined), so it shouldn't be hoisted either.
-        assert_eq!(hoisted, 0, "Nothing should be hoisted: Copy depends on InlineAsm output defined inside loop");
+        assert_eq!(
+            hoisted, 0,
+            "Nothing should be hoisted: Copy depends on InlineAsm output defined inside loop"
+        );
 
         // The body block should still have all 3 instructions
         assert_eq!(func.blocks[2].instructions.len(), 3);

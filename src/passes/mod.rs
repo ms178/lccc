@@ -3,11 +3,13 @@
 //! This module contains various optimization passes that transform the IR
 //! to produce better code.
 //!
-//! All optimization levels (-O0 through -O3, -Os, -Oz) run the same full set
-//! of passes. While the compiler is still maturing, having separate tiers
-//! creates hard-to-find bugs where code works at one level but breaks at
-//! another. We always run all passes to maximize test coverage of the
-//! optimizer and catch issues early.
+//! Optimization levels are distinct but intentionally conservative:
+//! - O0: no optimization pipeline (only inline-asm symbol resolution)
+//! - O1: mem2reg + constant folding + copy propagation + DCE
+//! - O2: the default full pipeline
+//! - O3: O2 plus loop unrolling
+//! - Os: O2 with code-size-increasing transforms disabled
+//! - Oz: Os with inlining disabled
 
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
@@ -22,30 +24,27 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
-pub(crate) mod univsr;
-pub(crate) mod narrow;
-mod resolve_asm;
-pub(crate) mod simplify;
 pub(crate) mod loop_unroll;
-pub(crate) mod tail_call_elim;
+pub(crate) mod narrow;
 pub(crate) mod outline_switch;
 pub(crate) mod recursion_to_iter;
+mod resolve_asm;
+pub(crate) mod simplify;
+pub(crate) mod tail_call_elim;
+pub(crate) mod univsr;
+pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{IrFunction, IrModule};
+use crate::common::fx_hash::FxHashSet;
+use crate::ir::reexports::{Instruction, IrFunction, IrModule};
 
 /// Run a per-function pass only on functions in the visit set.
 ///
 /// `visit` indicates which functions to process in this iteration.
 /// `changed` accumulates which functions were modified by any pass
 /// (so the next iteration knows what to re-visit).
-fn run_on_visited<F>(
-    module: &mut IrModule,
-    visit: &[bool],
-    changed: &mut [bool],
-    mut f: F,
-) -> usize
+fn run_on_visited<F>(module: &mut IrModule, visit: &[bool], changed: &mut [bool], mut f: F) -> usize
 where
     F: FnMut(&mut IrFunction) -> usize,
 {
@@ -89,6 +88,7 @@ fn run_gvn_licm_ivsr_shared(
     let mut gvn_total = 0usize;
     let mut licm_total = 0usize;
     let mut ivsr_total = 0usize;
+    let gvn_context = gvn::GvnContext::for_module(module);
 
     for (i, func) in module.functions.iter_mut().enumerate() {
         if func.is_declaration {
@@ -105,10 +105,12 @@ fn run_gvn_licm_ivsr_shared(
         // GVN fast path: single-block functions don't need CFG analysis.
         if num_blocks == 1 {
             if run_gvn {
-                let n = gvn::run_gvn_function(func);
+                let n = gvn::run_gvn_function_with_context(func, &gvn_context);
                 if n > 0 {
                     gvn_total += n;
-                    if i < changed.len() { changed[i] = true; }
+                    if i < changed.len() {
+                        changed[i] = true;
+                    }
                 }
             }
             // LICM and IVSR need loops (>= 2 blocks), so skip.
@@ -120,28 +122,52 @@ fn run_gvn_licm_ivsr_shared(
 
         // Run GVN with shared analysis.
         if run_gvn {
-            let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
-            let n = gvn::run_gvn_with_analysis(func, &cfg);
+            let t0 = if time_passes {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let n = gvn::run_gvn_with_analysis_and_context(func, &cfg, &gvn_context);
             if let Some(t0) = t0 {
-                eprintln!("[PASS] iter={} gvn (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
+                eprintln!(
+                    "[PASS] iter={} gvn (func {}): {:.4}s ({} changes)",
+                    iter,
+                    func.name,
+                    t0.elapsed().as_secs_f64(),
+                    n
+                );
             }
             if n > 0 {
                 gvn_total += n;
-                if i < changed.len() { changed[i] = true; }
+                if i < changed.len() {
+                    changed[i] = true;
+                }
             }
         }
 
         // Run LICM with shared analysis.
         // GVN does not modify the CFG (only replaces operands), so analysis is still valid.
         if run_licm {
-            let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
+            let t0 = if time_passes {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let n = licm::licm_with_analysis(func, &cfg);
             if let Some(t0) = t0 {
-                eprintln!("[PASS] iter={} licm (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
+                eprintln!(
+                    "[PASS] iter={} licm (func {}): {:.4}s ({} changes)",
+                    iter,
+                    func.name,
+                    t0.elapsed().as_secs_f64(),
+                    n
+                );
             }
             if n > 0 {
                 licm_total += n;
-                if i < changed.len() { changed[i] = true; }
+                if i < changed.len() {
+                    changed[i] = true;
+                }
             }
         }
 
@@ -218,68 +244,180 @@ impl DisabledPasses {
 }
 
 /// Run Phase 0: function inlining and post-inline optimization passes.
-fn run_inline_phase(module: &mut IrModule, disabled: &str) {
-    if disabled.contains("inline") {
-        return;
+fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, size_profile: bool) {
+    let dump_pre = std::env::var("CCC_DUMP_EACH_PASS").is_ok();
+    macro_rules! iphase_dump {
+        ($name:expr) => {
+            if dump_pre {
+                eprintln!("==== IR pre-loop: {} ====", $name);
+                eprintln!("{:#?}", module);
+                eprintln!("==== END IR pre-loop: {} ====", $name);
+            }
+        };
     }
-    inline::run(module);
+    // Canonicalize before cost analysis so inlining decisions use optimized
+    // IR sizes (GVN shrinks helpers like expat's sip_round 229->84, making
+    // them inlineable). GVN never rewrites param-alloca loads (see gvn.rs),
+    // so the inliner's store-into-param-alloca argument passing stays intact.
+    // Keep parameter allocas until after inlining.
+    if !std::env::var("CCC_NO_MEM2REG").is_ok() {
+        crate::ir::mem2reg::promote_allocas(module);
+    }
+    iphase_dump!("mem2reg");
+    constant_fold::run(module);
+    iphase_dump!("canonicalize-fold");
+    copy_prop::run(module);
+    iphase_dump!("canonicalize-copyprop");
+    simplify::run(module);
+    iphase_dump!("canonicalize-simplify");
+    if !disabled.contains("gvn") {
+        // Use the module context (GNU alias canonicalization, global epoch
+        // facts) exactly like the main pass loop: with the default context,
+        // loads across stores to GNU-alias'd globals are CSE'd and produce
+        // wrong code (regression gvn_global_symbol_alias).
+        let gvn_ctx = gvn::GvnContext::for_module(module);
+        module.for_each_function(|f| gvn::run_gvn_function_with_context(f, &gvn_ctx));
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+    constant_fold::run(module);
+    copy_prop::run(module);
 
-    // After inlining, convert extern inline gnu_inline functions to declarations.
-    // These function bodies were only needed for inlining; they must not be emitted
-    // as standalone definitions because their internal calls (e.g., `call btowc`)
-    // would resolve to the local definition instead of the external library symbol,
-    // causing infinite recursion. Converting to declarations ensures any remaining
-    // (non-inlined) calls resolve to the external symbol at link time.
+    if !disabled.contains("inline") {
+        if size_profile {
+            // -Os/-Oz: tiny/small callees inline (helper bodies fold away);
+            // normal/medium callees stay out to keep code size down.
+            inline::run_small_only(module);
+        } else if allow_inline {
+            inline::run(module);
+        }
+    }
+    if std::env::var("CCC_DUMP_IR").is_ok() || std::env::var("CCC_DUMP_EACH_PASS").is_ok() {
+        eprintln!("==== IR pre-loop: after inliner ====");
+        eprintln!("{:#?}", module);
+        eprintln!("==== END IR pre-loop: after inliner ====");
+    }
+
+    // After inlining, convert extern inline gnu_inline functions to declarations —
+    // but ONLY when no calls remain. The bodies were only needed for inlining;
+    // they must not be emitted as standalone definitions when fully inlined away,
+    // because their internal calls (e.g., `call btowc`) would resolve to the local
+    // definition instead of the external library symbol, causing infinite recursion.
+    // However, if any call site was NOT inlined (e.g. the caller was skipped by the
+    // inliner), the function MUST still be emitted as a local (static) definition —
+    // GNU89 `extern inline` semantics provide an inline definition usable locally.
+    // Dropping it here made glibc's rtld link fail with undefined references to
+    // `free`, `__bsearch` etc.
+    let mut still_called: FxHashSet<String> = FxHashSet::default();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Call { func: callee, .. } = inst {
+                    still_called.insert(callee.clone());
+                }
+            }
+        }
+    }
     for func in &mut module.functions {
-        if func.is_gnu_inline_def && !func.is_declaration {
+        if func.is_gnu_inline_def && !func.is_declaration && !still_called.contains(&func.name) {
             func.is_declaration = true;
             func.blocks.clear();
         }
     }
 
-    crate::ir::mem2reg::promote_allocas_with_params(module);
-    constant_fold::run(module);
-    copy_prop::run(module);
-    simplify::run(module);
-    constant_fold::run(module);
-    copy_prop::run(module);
+    if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+    }
+    iphase_dump!("cleanup-mem2reg-params");
+    if !std::env::var("CCC_NO_CLEANUP_FOLD1").is_ok() { constant_fold::run(module); }
+    iphase_dump!("cleanup-fold1");
+    if !std::env::var("CCC_NO_CLEANUP_CP1").is_ok() { copy_prop::run(module); }
+    iphase_dump!("cleanup-copyprop1");
+    if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() { simplify::run(module); }
+    iphase_dump!("cleanup-simplify");
+    if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() { constant_fold::run(module); }
+    if !std::env::var("CCC_NO_CLEANUP_CP2").is_ok() { copy_prop::run(module); }
+    iphase_dump!("cleanup-fold2-copyprop2");
     resolve_asm::resolve_inline_asm_symbols(module);
+    iphase_dump!("post-inline cleanup");
 }
 
-/// All optimization levels run the same pipeline with the same number of
-/// iterations. The `opt_level` parameter is accepted for API compatibility
-/// but currently ignored -- all levels behave identically.
+/// Run optimization passes for the requested optimization level.
 ///
-/// **Why single-level optimization matters for this project:**
-///
-/// Having multiple optimization tiers (e.g., -O0 doing minimal work, -O1 doing
-/// partial work, -O2 doing full work) is exponentially harder to test. Each tier
-/// is a separate code path through the optimizer, and bugs that only appear at
-/// one level are extremely difficult to reproduce and diagnose. For a compiler
-/// that is still maturing and being validated against hundreds of real-world
-/// projects (Linux kernel, PostgreSQL, Redis, etc.), a single optimization level
-/// ensures that:
-///
-/// 1. Every test run exercises every optimization pass. A bug in GVN or LICM
-///    will be caught even when testing with `-O0`, rather than hiding until a
-///    user happens to compile with `-O2`.
-/// 2. The number of configurations to validate stays linear (N architectures)
-///    rather than quadratic (N architectures × M optimization levels).
-/// 3. Build system interactions are predictable — the same code is always
-///    generated regardless of which `-O` flag a project's Makefile passes.
-///
-/// The `optimize` and `optimize_size` booleans on the Driver still control the
-/// `__OPTIMIZE__` and `__OPTIMIZE_SIZE__` predefined macros, which build systems
-/// like the Linux kernel depend on (e.g., `BUILD_BUG()` uses `__OPTIMIZE__` to
-/// select between a noreturn function call and a no-op). The actual pass pipeline
-/// is unaffected by these flags.
-pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::backend::Target) {
+/// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
+pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::backend::Target) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    // Debug hook: dump the module IR to stderr before optimization.
+    if std::env::var("CCC_DUMP_IR").is_ok() {
+        eprintln!("==== IR before passes (opt_level={}) ====", opt_level);
+        eprintln!("{:#?}", module);
+        eprintln!("==== END IR ====");
+    }
     if disabled.contains("all") {
         return;
     }
 
-    run_inline_phase(module, &disabled);
+    let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
+    // -fdump-tree-all equivalent: dump the module after every pass.
+    let dump_each_pass = std::env::var("CCC_DUMP_EACH_PASS").is_ok();
+
+    // -O0: preserve the alloca-based IR and skip the optimizer completely.
+    // Inline asm symbol resolution is not an optimization; it is required for
+    // correct backend emission of asm operands.
+    if opt_level == 0 {
+        resolve_asm::resolve_inline_asm_symbols(module);
+        return;
+    }
+
+    // -O1: cheap scalar cleanup only.  This tier is intentionally small and
+    // predictable for faster debug-style builds while still removing obvious
+    // dead/copy/constant IR introduced by lowering.
+    if opt_level == 1 {
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        if time_passes {
+            eprintln!("[PASS] o1 mem2reg");
+        }
+        constant_fold::run(module);
+        copy_prop::run(module);
+        module.for_each_function(dce::eliminate_dead_code);
+        resolve_asm::resolve_inline_asm_symbols(module);
+        constant_fold::resolve_remaining_is_constant(module);
+        if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+            eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
+            eprintln!("{:#?}", module);
+            eprintln!("==== END IR after all passes ====");
+        }
+        return;
+    }
+
+    let optimize_for_size = opt_level >= 4;
+    // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
+    // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
+    // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
+    // even at -Os: run the small-only inliner so helper bodies fold away while
+    // normal/medium callees stay out. -O1/-O2/-O3 keep full inlining.
+    // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
+    // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
+    // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
+    // even at -Os: run the small-only inliner so helper bodies fold away while
+    // normal/medium callees stay out. -O1/-O2/-O3 keep full inlining.
+
+macro_rules! preloop_dump {
+    ($name:expr) => {
+        if dump_each_pass {
+            eprintln!("==== IR after pre-loop {} ====", $name);
+            eprintln!("{:#?}", module);
+            eprintln!("==== END IR after pre-loop {} ====", $name);
+        }
+    };
+}
+    let allow_inline = opt_level != 4 && opt_level != 5;
+    preloop_dump!("lowering(pre-O2)");
+    run_inline_phase(module, &disabled, allow_inline, optimize_for_size);
+    preloop_dump!("inline_phase");
+    // Fold strlen("literal") after inlining so __builtin_constant_p patterns
+    // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
+    // disappears.
+    constant_fold::fold_strlen_literals(module);
     constant_fold::resolve_remaining_is_constant(module);
 
     // Switch case outlining: extract case bodies from large switch statements
@@ -290,6 +428,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if !disabled.contains("outline") {
         outline_switch::run(module);
     }
+    preloop_dump!("outline");
 
     // Tail-call-to-loop transformation.
     // Converts self-recursive tail calls into back-edge branches before the
@@ -298,12 +437,14 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if !disabled.contains("tce") {
         module.for_each_function(tail_call_elim::tail_calls_to_loops);
     }
+    preloop_dump!("tce");
 
     // Binary recursion → iterative accumulator (e.g., Fibonacci).
     // Runs after TCE so it catches patterns TCE can't handle (non-tail binary recursion).
     if !disabled.contains("rec2iter") {
         module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
+    preloop_dump!("rec2iter");
 
     let iterations = 3;
     let num_funcs = module.functions.len();
@@ -312,8 +453,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
     // `changed` accumulates which functions were modified during each iteration.
     let mut changed = vec![false; num_funcs];
-
-    let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
 
     // Per-pass change counts from the previous iteration, used for skip decisions.
     // Pass indices: 0=cfg1, 1=copyprop1, 2=narrow, 3=simplify, 4=constfold,
@@ -338,10 +477,24 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                     let t0 = std::time::Instant::now();
                     let n = $body;
                     let elapsed = t0.elapsed().as_secs_f64();
-                    eprintln!("[PASS] iter={} {}: {:.4}s ({} changes)", iter, $name, elapsed, n);
+                    eprintln!(
+                        "[PASS] iter={} {}: {:.4}s ({} changes)",
+                        iter, $name, elapsed, n
+                    );
+                    if dump_each_pass {
+                        eprintln!("==== IR after iter={} {} ====", iter, $name);
+                        eprintln!("{:#?}", module);
+                        eprintln!("==== END IR after iter={} {} ====", iter, $name);
+                    }
                     n
                 } else {
-                    $body
+                    let n = $body;
+                    if dump_each_pass {
+                        eprintln!("==== IR after iter={} {} ====", iter, $name);
+                        eprintln!("{:#?}", module);
+                        eprintln!("==== END IR after iter={} {} ====", iter, $name);
+                    }
+                    n
                 }
             }};
         }
@@ -369,7 +522,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 1: CFG simplification
         // Upstream: constfold (constant branches), dce (empty blocks)
         if !dis.cfg && should_run!(0, 4, 9) {
-            let n = timed_pass!("cfg_simplify1", run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function));
+            let n = timed_pass!(
+                "cfg_simplify1",
+                run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function)
+            );
             cur_pass_changes[0] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -378,7 +534,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 2: Copy propagation
         // Upstream: cfg_simplify (simpler CFG), gvn (eliminated exprs), licm (hoisted code), if_convert
         if !dis.copyprop && should_run!(1, 0, 5, 6, 7) {
-            let n = timed_pass!("copy_prop1", run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies));
+            let n = timed_pass!(
+                "copy_prop1",
+                run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies)
+            );
             cur_pass_changes[1] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -396,7 +555,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
         // a 32-bit-aware variant that uses single-operand imull for mulhi.
         if iter == 0 && !disabled.contains("divconst") && !target.is_32bit() {
-            let n = timed_pass!("div_by_const", run_on_visited(module, &dirty, &mut changed, div_by_const::div_by_const_function));
+            let n = timed_pass!(
+                "div_by_const",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    div_by_const::div_by_const_function
+                )
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -404,9 +571,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
         // subsequent passes can optimize the unrolled copies.
         // Pass name for CCC_DISABLE_PASSES: "unroll"
-        if iter == 0 && !dis.unroll {
-            let n = timed_pass!("loop_unroll",
-                run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops));
+        if iter == 0 && opt_level >= 3 && !optimize_for_size && !dis.unroll {
+            let n = timed_pass!(
+                "loop_unroll",
+                run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops)
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -414,9 +583,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 2b-vec: SSE2 vectorization — iter 0 only, EARLY in pipeline.
         // Run before GVN/LICM/etc to catch IR in simpler state.
         // Pass name for CCC_DISABLE_PASSES: "vectorize"
-        if iter == 0 && !disabled.contains("vectorize") {
-            let n = timed_pass!("vectorize",
-                run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function));
+        if iter == 0 && !optimize_for_size && !disabled.contains("vectorize") {
+            let n = timed_pass!(
+                "vectorize",
+                run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function)
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -424,7 +595,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 2c: Integer narrowing
         // Upstream: copy_prop (propagated values expose narrowing)
         if !dis.narrow && should_run!(2, 1) {
-            let n = timed_pass!("narrow", run_on_visited(module, &dirty, &mut changed, narrow::narrow_function));
+            let n = timed_pass!(
+                "narrow",
+                run_on_visited(module, &dirty, &mut changed, narrow::narrow_function)
+            );
             cur_pass_changes[2] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -433,7 +607,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 3: Algebraic simplification
         // Upstream: copy_prop (propagated values), narrow (smaller types)
         if !dis.simplify && should_run!(3, 1, 2) {
-            let n = timed_pass!("simplify", run_on_visited(module, &dirty, &mut changed, simplify::simplify_function));
+            let n = timed_pass!(
+                "simplify",
+                run_on_visited(module, &dirty, &mut changed, simplify::simplify_function)
+            );
             cur_pass_changes[3] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -444,7 +621,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         //           if_convert (creates Select that constfold can fold with known-constant cond),
         //           copy_prop2 (propagates constants into Select/Cmp operands after if_convert)
         if !dis.constfold && should_run!(4, 1, 2, 3, 7, 8) {
-            let n = timed_pass!("constfold", run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function));
+            let n = timed_pass!(
+                "constfold",
+                run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function)
+            );
             cur_pass_changes[4] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -457,15 +637,22 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // existing blocks), the analysis computed for GVN remains valid for LICM
         // and IVSR. We compute it once per function and share it across all three.
         {
-            let run_gvn = !dis.gvn && should_run!(5, 0, 1, 3);
+            // GVN is enabled; CCC_DISABLE_PASSES=gvn is the diagnostic kill switch.
+            let gvn_enabled = true;
+            let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
             let run_ivsr = iter == 0 && !disabled.contains("ivsr");
 
             if run_gvn || run_licm || run_ivsr {
                 let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
-                    module, &dirty, &mut changed,
-                    run_gvn, run_licm, run_ivsr,
-                    time_passes, iter,
+                    module,
+                    &dirty,
+                    &mut changed,
+                    run_gvn,
+                    run_licm,
+                    run_ivsr,
+                    time_passes,
+                    iter,
                 );
                 cur_pass_changes[5] = gvn_n;
                 total_changes += gvn_n;
@@ -481,7 +668,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 7: If-conversion
         // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
         if !dis.ifconv && should_run!(7, 0, 4) {
-            let n = timed_pass!("if_convert", run_on_visited(module, &dirty, &mut changed, if_convert::if_convert_function));
+            let n = timed_pass!(
+                "if_convert",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    if_convert::if_convert_function
+                )
+            );
             cur_pass_changes[7] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -492,8 +687,13 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         //           gvn (produced copies), licm (hoisted code), if_convert (select values)
         // Note: simplify and constfold run earlier in this iteration, so we check
         // cur_pass_changes for them (not just prev_pass_changes via should_run!).
-        if !dis.copyprop && (should_run!(8, 5, 6, 7) || cur_pass_changes[3] > 0 || cur_pass_changes[4] > 0) {
-            let n = timed_pass!("copy_prop2", run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies));
+        if !dis.copyprop
+            && (should_run!(8, 5, 6, 7) || cur_pass_changes[3] > 0 || cur_pass_changes[4] > 0)
+        {
+            let n = timed_pass!(
+                "copy_prop2",
+                run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies)
+            );
             cur_pass_changes[8] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -511,7 +711,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // (e.g., kernel's cpucap_is_possible switch folding through inlined
         // system_supports_sme -> alternative_has_cap_unlikely -> cpucap_is_possible).
         if !dis.dce && should_run!(9, 5, 6, 7, 8) {
-            let n = timed_pass!("dce", run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code));
+            let n = timed_pass!(
+                "dce",
+                run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code)
+            );
             cur_pass_changes[9] = n;
             total_changes += n;
             // Intentionally NOT added to total_changes_excl_dce
@@ -520,7 +723,10 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // Phase 10: CFG simplification again
         // Upstream: constfold (constant branches), dce (dead blocks), if_convert
         if !dis.cfg && should_run!(10, 4, 7, 9) {
-            let n = timed_pass!("cfg_simplify2", run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function));
+            let n = timed_pass!(
+                "cfg_simplify2",
+                run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function)
+            );
             cur_pass_changes[10] = n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -539,7 +745,6 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes += ipcp_changes;
             total_changes_excl_dce += ipcp_changes;
         }
-
 
         if iter == 0 {
             iter0_total_changes = total_changes_excl_dce;
@@ -576,7 +781,9 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         // least 2 iterations to complete: iter0 for initial folding, iter1 for
         // propagating results through the control flow.
         const DIMINISHING_RETURNS_FACTOR: usize = 20; // 1/20 = 5% threshold
-        if iter > 1 && ipcp_changes == 0 && iter0_total_changes > 0
+        if iter > 1
+            && ipcp_changes == 0
+            && iter0_total_changes > 0
             && total_changes_excl_dce * DIMINISHING_RETURNS_FACTOR < iter0_total_changes
         {
             break;
@@ -599,4 +806,36 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // (e.g., kernel's `___siphash_aligned` calling `__siphash_aligned` which doesn't
     // exist on x86 where CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set).
     dead_statics::eliminate_dead_static_functions(module);
+
+    // Phase 11b: Vector temp promotion. Runs on the final IR (after inlining and
+    // the optimization loop) so every vector intrinsic chain is seen whole. This
+    // removes the temp alloca + Memcpy that vector intrinsic lowering introduces
+    // for `__m256i x = _mm256_*(...)`, writing results directly into the variable
+    // slot and enabling the backend's memory-operand folding.
+    if !disabled.contains("vecpromote") {
+        vector_temp_promotion::promote_vector_temps(module);
+    }
+
+    // Phase 11b: downgrade the alignment of non-escaping vector-sized allocas
+    // (16/32 B) so every access skips the runtime lea/add/and alignment dance
+    // (3 instructions per 32-byte access in zlib-ng's compare256_avx2 inner
+    // loop). All emitter accesses are unaligned moves, and an address that
+    // never escapes makes _Alignas unobservable — so the downgrade is sound.
+    if !disabled.contains("vecpromote") {
+        vector_temp_promotion::downgrade_nonescaping_vector_align(module);
+    }
+
+    // Phase 11c: Vector load fusion. After promotion, `ymm = _mm256_loadu(p)`
+    // followed by a consumer that reads `ymm` is a pure slot round-trip; fuse
+    // the load into the consumer by passing `p` through (the backend emits
+    // `vmovdqu (%p)` / uses `(%p)` as the memory operand, matching GCC).
+    if !disabled.contains("vecpromote") {
+        vector_temp_promotion::fuse_vector_loads(module);
+    }
+
+    if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+        eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
+        eprintln!("{:#?}", module);
+        eprintln!("==== END IR after all passes ====");
+    }
 }

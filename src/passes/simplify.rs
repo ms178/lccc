@@ -1546,6 +1546,15 @@ const UNARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     ("sqrtf", IntrinsicOp::SqrtF32),
     ("fabs", IntrinsicOp::FabsF64),
     ("fabsf", IntrinsicOp::FabsF32),
+    // _Float128 / long-double bit ops: inline beats any libgcc/libm call.
+    ("__fabstf2", IntrinsicOp::F128Fabs),
+    ("fabsl", IntrinsicOp::LDFabs),
+];
+
+/// Table of binary math functions that map directly to intrinsic instructions.
+const BINARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
+    ("__copysigntf3", IntrinsicOp::F128Copysign),
+    ("copysignl", IntrinsicOp::LDCopysign),
 ];
 
 /// Create a float constant (F32 or F64) appropriate for the return type.
@@ -1576,6 +1585,19 @@ fn simplify_math_call(
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {
             if args.len() != 1 { return None; }
+            return Some(Instruction::Intrinsic {
+                dest: Some(dest),
+                op: intrinsic_op,
+                dest_ptr: None,
+                args: args.to_vec(),
+            });
+        }
+    }
+
+    // Binary intrinsic table (copysignf128/copysignl -> inline bit ops).
+    for &(name, intrinsic_op) in BINARY_INTRINSICS {
+        if func == name {
+            if args.len() != 2 { return None; }
             return Some(Instruction::Intrinsic {
                 dest: Some(dest),
                 op: intrinsic_op,
@@ -1703,6 +1725,7 @@ mod tests {
                 struct_arg_aligns: vec![],
                 struct_arg_classes: Vec::new(),
                 struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: Vec::new(),

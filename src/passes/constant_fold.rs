@@ -23,6 +23,66 @@ pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(fold_function)
 }
 
+/// Fold `strlen`/`__builtin_strlen` calls whose argument is a string-literal
+/// global into the literal's byte length. glibc's startup.h pattern
+/// `__builtin_constant_p (__builtin_strlen (message))` with a string-literal
+/// message becomes 1 after inlining; without this, the branch to
+/// `_startup_fatal_not_constant` survives into static links. Runs after
+/// inlining so parameter -> literal propagation has already happened.
+pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
+    // Narrow string literals store one C byte per Rust char, so the byte
+    // length is chars().count(); String::len() over-counts bytes >= 0x80.
+    let literals: std::collections::HashMap<String, usize> = module
+        .string_literals
+        .iter()
+        .map(|(label, value)| (label.clone(), value.chars().count()))
+        .collect();
+    if literals.is_empty() {
+        return 0;
+    }
+    let mut total = 0;
+    for func in &mut module.functions {
+        if func.is_declaration || func.blocks.is_empty() {
+            continue;
+        }
+        // Map Value -> string length from GlobalAddr instructions naming a
+        // string-literal global (per function; allocas/params excluded).
+        let mut addr_lens: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GlobalAddr { dest, name } = inst {
+                    if let Some(&len) = literals.get(name) {
+                        addr_lens.insert(dest.0, len);
+                    }
+                }
+            }
+        }
+        if addr_lens.is_empty() {
+            continue;
+        }
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Instruction::Call { func: callee, info } = inst {
+                    if callee != "strlen" && callee != "__builtin_strlen" {
+                        continue;
+                    }
+                    let Some(dest) = info.dest else { continue };
+                    if let Some(Operand::Value(v)) = info.args.first() {
+                        if let Some(&len) = addr_lens.get(&v.0) {
+                            *inst = Instruction::Copy {
+                                dest,
+                                src: Operand::Const(IrConst::I64(len as i64)),
+                            };
+                            total += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
 /// Resolve all remaining `UnaryOp::IsConstant` instructions to `Copy(0)`.
 ///
 /// After inlining and the post-inline constant folding passes, any `IsConstant`
@@ -42,11 +102,51 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
         if func.is_declaration || func.blocks.is_empty() {
             continue;
         }
+        // Build a const map first so IsConstant(Value) where the value is a
+        // Copy/Cast of a constant (e.g. strlen("lit") -> Copy(3) folded just
+        // before this pass) resolves to 1, not 0.
+        let max_id = func.max_value_id() as usize;
+        let mut const_map: Vec<Option<ConstMapEntry>> = vec![None; max_id + 1];
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Const(c) } = inst {
+                    let id = dest.0 as usize;
+                    if id <= max_id {
+                        const_map[id] = Some(ConstMapEntry { konst: Some(*c), cast_to_ty: None });
+                    }
+                }
+            }
+        }
+        // Propagate through Copy/Cast-of-Value chains (fixpoint), so
+        // IsConstant(x) with x = Cast(U64, Copy(3)) resolves to 1.
+        // (strlen -> I64 -> size_t cast is the glibc startup pattern.)
+        for _ in 0..8 {
+            let mut changed = false;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let (did, sid) = match inst {
+                        Instruction::Copy { dest, src: Operand::Value(v) } => (dest.0 as usize, v.0 as usize),
+                        Instruction::Cast { dest, src: Operand::Value(v), .. } => (dest.0 as usize, v.0 as usize),
+                        _ => continue,
+                    };
+                    if did <= max_id && sid <= max_id {
+                        if let Some(entry) = const_map[sid].clone() {
+                            if const_map[did].is_none() {
+                                const_map[did] = Some(entry);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let Instruction::UnaryOp { dest, op: IrUnaryOp::IsConstant, src, .. } = inst {
-                    // Check if the operand is a constant - if so, resolve to 1 (true).
-                    let is_const = matches!(src, Operand::Const(_));
+                    let is_const = resolve_const(src, &const_map).is_some();
                     *inst = Instruction::Copy {
                         dest: *dest,
                         src: Operand::Const(IrConst::I32(if is_const { 1 } else { 0 })),
@@ -226,6 +326,12 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 let sc = resolve_const(src, const_map)?;
                 let s = sc.to_i128()?;
                 let result = match op {
+                    // _Float128 constants are I128 bit patterns (binary128);
+                    // negation flips the SIGN BIT (bit 127), not the integer
+                    // value (-1.5 -> 0xbfff8000..., NOT 0xc0008000...).
+                    IrUnaryOp::Neg if *ty == IrType::F128 => {
+                        ((s as u128) ^ (1u128 << 127)) as i128
+                    }
                     IrUnaryOp::Neg => s.wrapping_neg(),
                     IrUnaryOp::Not => !s,
                     _ => return None,

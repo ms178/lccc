@@ -289,6 +289,7 @@ fn has_side_effects(inst: &Instruction) -> bool {
         Instruction::VaArg { .. } |
         Instruction::VaArgStruct { .. } |
         Instruction::AtomicRmw { .. } |
+        Instruction::AtomicInc { .. } |
         Instruction::AtomicCmpxchg { .. } |
         Instruction::AtomicLoad { .. } |
         Instruction::AtomicStore { .. } |
@@ -318,7 +319,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 // Dead instruction: result %1 is never used
                 Instruction::BinOp {
                     dest: Value(1),
@@ -365,6 +366,7 @@ mod tests {
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
@@ -390,7 +392,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 Instruction::BinOp {
                     dest: Value(1),
                     op: IrBinOp::Add,

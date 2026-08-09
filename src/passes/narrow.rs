@@ -152,9 +152,331 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
 
     changes += narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
+    changes += narrow_through_stores(func, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
 
     changes
+}
+
+/// Phase 6: Narrow I64/U64 BinOp chains whose results are consumed only by
+/// truncating stores or truncating casts.
+///
+/// Lowering widens C `int` arithmetic to I64 on x86-64, but the low bits of
+/// Add/Sub/Mul/And/Or/Xor/Shl are width-independent: computing them in a
+/// 32-bit type T and storing to a T-sized slot is bit-identical. Removing
+/// the widening lets the backend emit 32-bit ops (addl/xorl/andl) instead
+/// of 64-bit ones and keeps hot loops in fewer registers — a big win in
+/// hash/checksum loops (e.g. zlib-ng insert_string_roll, where
+/// `(ins_h << 5) ^ val` and `& mask` were emitted as xorq/andq on
+/// zero-extended 64-bit values).
+///
+/// A value v is narrowable-to-T when:
+///   - it is a widening Cast{X→I64} with X == T (size 4), or a Load of type T;
+///   - it is a BinOp in I64/U64 whose op is Add/Sub/Mul/And/Or/Xor (or Shl
+///     with a constant count < T.width), whose operands are narrowable-to-T
+///     (or constants representable in T);
+/// and every use of it is a Store{ty: T}, a truncating Cast, or the operand
+/// of another narrowable-to-T BinOp. Any other use (Cmp, Select, Call,
+/// address arithmetic, terminator) disqualifies the value.
+///
+/// Restricting the target type to I32/U32 matches the backend's supported
+/// operand widths (sub-int arithmetic is not codegen-able).
+fn narrow_through_stores(
+    func: &mut IrFunction,
+    widen_map: &[Option<CastInfo>],
+    narrowed_map: &mut [Option<IrType>],
+) -> usize {
+    if crate::common::types::target_is_32bit() {
+        return 0;
+    }
+    let max_id = narrowed_map.len() - 1;
+
+    // Value -> narrow type for Load instructions.
+    let mut load_type_map: Vec<Option<IrType>> = vec![None; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Load { dest, ty, .. } = inst {
+                let id = dest.0 as usize;
+                if id <= max_id && ty.is_integer() && ty.size() == 4 {
+                    load_type_map[id] = Some(*ty);
+                }
+            }
+        }
+    }
+
+    // ntype[v]: the type to which v can be narrowed (def-side fixpoint).
+    let mut ntype: Vec<Option<IrType>> = vec![None; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Cast { dest, from_ty, to_ty, .. } => {
+                    if (*to_ty == IrType::I64 || *to_ty == IrType::U64)
+                        && from_ty.is_integer()
+                        && from_ty.size() == 4
+                    {
+                        let id = dest.0 as usize;
+                        if id <= max_id {
+                            ntype[id] = Some(*from_ty);
+                        }
+                    }
+                }
+                Instruction::Load { dest, ty, .. } => {
+                    let id = dest.0 as usize;
+                    if id <= max_id {
+                        if let Some(t) = load_type_map[id] {
+                            ntype[id] = Some(t);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst {
+                    if !(*ty == IrType::I64 || *ty == IrType::U64) {
+                        continue;
+                    }
+                    let id = dest.0 as usize;
+                    if id > max_id || ntype[id].is_some() {
+                        continue;
+                    }
+                    if let Some(t) = store_narrow_target(op, lhs, rhs, &ntype, &load_type_map) {
+                        ntype[id] = Some(t);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Use-side validation: every use of a narrowable value must truncate.
+    // Disqualification is monotone; iterate until stable.
+    loop {
+        let mut disqualified = false;
+        let mut mark_bad = |v: &Operand, ok: bool, ntype: &mut Vec<Option<IrType>>, max_id: usize| {
+            if let Operand::Value(vv) = v {
+                let id = vv.0 as usize;
+                if id <= max_id && ntype[id].is_some() && !ok {
+                    ntype[id] = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Store { val, ptr, ty, .. } => {
+                        let val_ok = match val {
+                            Operand::Value(v) => {
+                                let id = v.0 as usize;
+                                if id <= max_id {
+                                    match ntype[id] {
+                                        Some(t) => t.size() == ty.size(),
+                                        None => true,
+                                    }
+                                } else { true }
+                            }
+                            _ => true,
+                        };
+                        if mark_bad(val, val_ok, &mut ntype, max_id) { disqualified = true; }
+                        if mark_bad(&Operand::Value(*ptr), false, &mut ntype, max_id) { disqualified = true; }
+                    }
+                    Instruction::Cast { src, to_ty, .. } => {
+                        let src_ok = match src {
+                            Operand::Value(v) => {
+                                let id = v.0 as usize;
+                                if id <= max_id {
+                                    match ntype[id] {
+                                        Some(t) => {
+                                            // Truncating cast (I64->T) or the widening def (T->I64).
+                                            (*to_ty == IrType::I64 || *to_ty == IrType::U64)
+                                                || to_ty.size() == t.size()
+                                        }
+                                        None => true,
+                                    }
+                                } else { true }
+                            }
+                            _ => true,
+                        };
+                        if mark_bad(src, src_ok, &mut ntype, max_id) { disqualified = true; }
+                    }
+                    Instruction::BinOp { dest, lhs, rhs, .. } => {
+                        let did = dest.0 as usize;
+                        let dest_narrow = if did <= max_id { ntype[did] } else { None };
+                        for opnd in [lhs, rhs] {
+                            let ok = match opnd {
+                                Operand::Value(v) => {
+                                    let id = v.0 as usize;
+                                    if id <= max_id {
+                                        match ntype[id] {
+                                            Some(t) => dest_narrow.is_some_and(|dt| dt.size() == t.size()),
+                                            None => true,
+                                        }
+                                    } else { true }
+                                }
+                                _ => true,
+                            };
+                            if mark_bad(opnd, ok, &mut ntype, max_id) { disqualified = true; }
+                        }
+                    }
+                    _ => {
+                        let mut uses: Vec<u32> = Vec::new();
+                        inst.for_each_used_value(|id| uses.push(id));
+                        for id in uses {
+                            let idx = id as usize;
+                            if idx <= max_id && ntype[idx].is_some() {
+                                ntype[idx] = None;
+                                disqualified = true;
+                            }
+                        }
+                    }
+                }
+            }
+            let mut uses: Vec<u32> = Vec::new();
+            block.terminator.for_each_used_value(|id| uses.push(id));
+            for id in uses {
+                let idx = id as usize;
+                if idx <= max_id && ntype[idx].is_some() {
+                    ntype[idx] = None;
+                    disqualified = true;
+                }
+            }
+        }
+        if !disqualified {
+            break;
+        }
+    }
+
+    // Rewrite narrowable BinOps to T and forward stored narrowable values
+    // through their widening casts.
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            match inst {
+                Instruction::BinOp { dest, lhs, rhs, ty, .. } => {
+                    let id = dest.0 as usize;
+                    if id <= max_id {
+                        if let Some(t) = ntype[id] {
+                            let nl = try_narrow_operand(lhs, t, Some(&load_type_map), widen_map, narrowed_map);
+                            let nr = try_narrow_operand(rhs, t, Some(&load_type_map), widen_map, narrowed_map);
+                            if let (Some(a), Some(b)) = (nl, nr) {
+                                *lhs = a;
+                                *rhs = b;
+                                *ty = t;
+                                narrowed_map[id] = Some(t);
+                                changes += 1;
+                            }
+                        }
+                    }
+                }
+                Instruction::Store { val, ty, .. } => {
+                    if let Operand::Value(v) = val {
+                        let id = v.0 as usize;
+                        if id <= max_id {
+                            if let Some(t) = ntype[id] {
+                                if t.size() == ty.size() {
+                                    if let Some(new_op) =
+                                        try_narrow_operand(val, t, Some(&load_type_map), widen_map, narrowed_map)
+                                    {
+                                        *val = new_op;
+                                        changes += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changes
+}
+
+/// Compute the narrow target type of a BinOp's operands, or None.
+fn store_narrow_target(
+    op: &IrBinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ntype: &[Option<IrType>],
+    load_type_map: &[Option<IrType>],
+) -> Option<IrType> {
+    let operand_t = |op: &Operand| -> Option<IrType> {
+        match op {
+            Operand::Value(v) => {
+                let id = v.0 as usize;
+                if id < ntype.len() {
+                    if let Some(t) = ntype[id] {
+                        return Some(t);
+                    }
+                }
+                if id < load_type_map.len() {
+                    if let Some(t) = load_type_map[id] {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            Operand::Const(_) => None,
+        }
+    };
+    match op {
+        IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
+            match (operand_t(lhs), operand_t(rhs)) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), Some(b)) if a.size() == b.size() => Some(a),
+                (Some(t), None) => {
+                    if try_narrow_const_operand(rhs, t).is_some() {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                }
+                (None, Some(t)) => {
+                    if try_narrow_const_operand(lhs, t).is_some() {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        IrBinOp::Shl => {
+            // Narrow only when the shift count is a constant < T.width bits;
+            // 64-bit vs 32-bit shifts with larger/variable counts differ.
+            let t = operand_t(lhs)?;
+            let width_bits = (t.size() * 8) as i64;
+            if let Operand::Const(c) = rhs {
+                let val = match c {
+                    IrConst::I64(v) => *v,
+                    IrConst::I32(v) => *v as i64,
+                    IrConst::I16(v) => *v as i64,
+                    IrConst::I8(v) => *v as i64,
+                    _ => return None,
+                };
+                if (0..width_bits).contains(&val) {
+                    Some(t)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Phase 4: Narrow BinOps that have an explicit narrowing Cast consumer.

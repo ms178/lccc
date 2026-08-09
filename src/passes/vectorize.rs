@@ -3938,6 +3938,30 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
         return 0;
     }
 
+    // A DynAlloca changes the live stack extent at run time. The current vector
+    // loop/remainder builder assumes fixed alloca addresses when it rewrites
+    // GEPs and carries scalar reductions, which can misaddress a VLA
+    // (reproducer: tests/regression/vla_dynamic_stack.c). This is a scoped
+    // legality check, not a global pass disable: functions without dynamic
+    // stack allocation retain full vectorization.
+    if func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+    }) {
+        return 0;
+    }
+
+    // A DynAlloca changes the live stack extent at run time. The current vector
+    // loop/remainder builder assumes fixed alloca addresses when it rewrites
+    // GEPs and carries scalar reductions, which can misaddress a VLA
+    // (reproducer: tests/regression/vla_dynamic_stack.c). This is a scoped
+    // legality check, not a global pass disable: functions without dynamic
+    // stack allocation retain full vectorization.
+    if func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+    }) {
+        return 0;
+    }
+
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis(func, &cfg)
 }

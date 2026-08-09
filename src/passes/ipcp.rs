@@ -26,7 +26,7 @@
 //! folding, DCE, and CFG simplification clean up the dead code.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{IrConst, IrModule, Instruction, Operand, Terminator};
+use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
 
 /// Run interprocedural constant propagation on the module.
 ///
@@ -50,7 +50,9 @@ pub fn run(module: &mut IrModule) -> usize {
                     let replace = match &block.instructions[i] {
                         Instruction::Call { func: callee, info } => {
                             if let Some(dest) = info.dest {
-                                const_returns.get(callee.as_str()).map(|const_val| (dest, *const_val))
+                                const_returns
+                                    .get(callee.as_str())
+                                    .map(|const_val| (dest, *const_val))
                             } else {
                                 None
                             }
@@ -85,17 +87,14 @@ pub fn run(module: &mut IrModule) -> usize {
                 let mut new_spans = Vec::new();
                 for (idx, inst) in block.instructions.drain(..).enumerate() {
                     let is_dead = match &inst {
-                        Instruction::Call { func, .. } => {
-                            dead_calls.contains(func.as_str())
-                        }
+                        Instruction::Call { func, .. } => dead_calls.contains(func.as_str()),
                         _ => false,
                     };
                     if !is_dead {
                         new_insts.push(inst);
-                        if has_spans
-                            && idx < block.source_spans.len() {
-                                new_spans.push(block.source_spans[idx]);
-                            }
+                        if has_spans && idx < block.source_spans.len() {
+                            new_spans.push(block.source_spans[idx]);
+                        }
                     } else {
                         total_changes += 1;
                     }
@@ -216,6 +215,7 @@ fn is_side_effect_free(func: &crate::ir::reexports::IrFunction) -> bool {
                 | Instruction::CallIndirect { .. }
                 | Instruction::InlineAsm { .. }
                 | Instruction::AtomicRmw { .. }
+                | Instruction::AtomicInc { .. }
                 | Instruction::AtomicCmpxchg { .. }
                 | Instruction::AtomicStore { .. }
                 | Instruction::Fence { .. }
@@ -361,7 +361,9 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
         }
         // Check if the function has any ParamRef instructions
         let has_param_ref = func.blocks.iter().any(|b| {
-            b.instructions.iter().any(|inst| matches!(inst, Instruction::ParamRef { .. }))
+            b.instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::ParamRef { .. }))
         });
         if !has_param_ref {
             continue;
@@ -390,19 +392,17 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
                                 break;
                             }
                             match arg {
-                                Operand::Const(c) => {
-                                    match &param_states[i] {
-                                        ParamState::Unknown => {
-                                            param_states[i] = ParamState::Const(*c);
-                                        }
-                                        ParamState::Const(existing) => {
-                                            if !const_equal(existing, c) {
-                                                param_states[i] = ParamState::Varying;
-                                            }
-                                        }
-                                        ParamState::Varying => {}
+                                Operand::Const(c) => match &param_states[i] {
+                                    ParamState::Unknown => {
+                                        param_states[i] = ParamState::Const(*c);
                                     }
-                                }
+                                    ParamState::Const(existing) => {
+                                        if !const_equal(existing, c) {
+                                            param_states[i] = ParamState::Varying;
+                                        }
+                                    }
+                                    ParamState::Varying => {}
+                                },
                                 Operand::Value(_) => {
                                     param_states[i] = ParamState::Varying;
                                 }
@@ -475,7 +475,10 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
         if let Some(specs) = specializations.get(&func.name) {
             for block in &mut func.blocks {
                 for inst in &mut block.instructions {
-                    if let Instruction::ParamRef { dest, param_idx, .. } = inst {
+                    if let Instruction::ParamRef {
+                        dest, param_idx, ..
+                    } = inst
+                    {
                         for (spec_idx, spec_const) in specs {
                             if *param_idx == *spec_idx {
                                 *inst = Instruction::Copy {
