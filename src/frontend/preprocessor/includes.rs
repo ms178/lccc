@@ -350,8 +350,8 @@ impl Preprocessor {
 
         // Resolve the include path to an actual file
         if let Some(resolved_path) = self.resolve_include_path(&include_path, is_system) {
-            // Check for #pragma once
-            if self.pragma_once_files.contains(&resolved_path) {
+            // Check for #pragma once (path and device/inode identity).
+            if self.is_pragma_once_file(&resolved_path) {
                 return Some(String::new());
             }
 
@@ -488,8 +488,8 @@ impl Preprocessor {
 
         // Resolve using include_next semantics
         if let Some(resolved_path) = self.resolve_include_next_path(&include_path, current_file.as_ref()) {
-            // Check for #pragma once
-            if self.pragma_once_files.contains(&resolved_path) {
+            // Check for #pragma once (path and device/inode identity).
+            if self.is_pragma_once_file(&resolved_path) {
                 return Some(String::new());
             }
 

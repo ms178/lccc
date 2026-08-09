@@ -414,7 +414,8 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__STDC_NO_ATOMICS__", "1");
     // Note: We support _Complex types, so __STDC_NO_COMPLEX__ is NOT defined.
     // __STDC_NO_THREADS__ is NOT defined because we link against glibc which provides <threads.h>
-    def(macros, "__STDC_NO_VLA__", "1");
+    // VLA declarations lower to DynAlloca and are supported. Do not define
+    // __STDC_NO_VLA__: autoconf uses its presence as a hard capability denial.
 
     // EXIT_SUCCESS and EXIT_FAILURE from <stdlib.h>
     def(macros, "EXIT_SUCCESS", "0");

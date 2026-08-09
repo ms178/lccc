@@ -71,8 +71,11 @@ pub struct Preprocessor {
     pub(super) system_include_paths: Vec<PathBuf>,
     /// Files currently being processed (for recursion detection)
     pub(super) include_stack: Vec<PathBuf>,
-    /// Files that have been included with #pragma once
+    /// Files that have been included with #pragma once (path fallback).
     pub(super) pragma_once_files: FxHashSet<PathBuf>,
+    /// Device/inode identities for #pragma once files.  This avoids double
+    /// inclusion via different paths/symlinks/hardlinks on Linux filesystems.
+    pub(super) pragma_once_identities: FxHashSet<(u64, u64)>,
     /// Whether to actually resolve includes (can be disabled for testing)
     pub(super) resolve_includes: bool,
     /// Declarations to inject into the output (from #include processing).
@@ -137,6 +140,7 @@ impl Preprocessor {
             system_include_paths: Self::default_system_include_paths(),
             include_stack: Vec::new(),
             pragma_once_files: FxHashSet::default(),
+            pragma_once_identities: FxHashSet::default(),
             resolve_includes: true,
             pending_injections: Vec::new(),
             macro_save_stack: FxHashMap::default(),
@@ -734,8 +738,8 @@ impl Preprocessor {
     pub fn preprocess_force_include(&mut self, content: &str, resolved_path: &str) {
         let resolved = PathBuf::from(resolved_path);
 
-        // Check for #pragma once
-        if self.pragma_once_files.contains(&resolved) {
+        // Check for #pragma once (path and device/inode identity).
+        if self.is_pragma_once_file(&resolved) {
             return;
         }
 
@@ -877,8 +881,18 @@ impl Preprocessor {
                 if keyword.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     let line_rest = format!("{} {}", keyword, rest);
                     self.handle_line_directive(&line_rest, line_num);
+                } else {
+                    // Unknown directives are valid preprocessing diagnostics, not
+                    // hard errors.  Warn so typos like `#defin` and `#inclde`
+                    // are visible while preserving compatibility with projects
+                    // that intentionally use vendor-specific directives.
+                    self.warnings.push(PreprocessorDiagnostic {
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message: format!("unknown preprocessing directive #{}", keyword),
+                    });
                 }
-                // Otherwise unknown directive, ignore silently
             }
         }
 

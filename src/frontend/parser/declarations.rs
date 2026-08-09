@@ -936,8 +936,23 @@ impl Parser {
                     BinOp::Add => Some(l.wrapping_add(r)),
                     BinOp::Sub => Some(l.wrapping_sub(r)),
                     BinOp::Mul => Some(l.wrapping_mul(r)),
-                    BinOp::Div if r != 0 => Some(l.wrapping_div(r)),
-                    BinOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
+                    BinOp::Div if r != 0 => {
+                        // Unsigned operands must divide as u64: e.g.
+                        // 18446744073709551615UL / 2 = 9223372036854775807,
+                        // but the i64 view (-1) / 2 would be 0.
+                        if Self::is_unsigned_int_expr(lhs) {
+                            Some(((l as u64) / (r as u64)) as i64)
+                        } else {
+                            Some(l.wrapping_div(r))
+                        }
+                    }
+                    BinOp::Mod if r != 0 => {
+                        if Self::is_unsigned_int_expr(lhs) {
+                            Some(((l as u64) % (r as u64)) as i64)
+                        } else {
+                            Some(l.wrapping_rem(r))
+                        }
+                    }
                     BinOp::Shl => Some(l.wrapping_shl(r as u32)),
                     BinOp::Shr => {
                         // Use logical (unsigned) shift when the LHS appears unsigned

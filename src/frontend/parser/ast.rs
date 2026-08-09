@@ -488,6 +488,8 @@ pub enum TypeSpecifier {
     Float,
     Double,
     LongDouble,
+    /// _Float128 / __float128 (IEEE binary128, distinct from long double).
+    Float128,
     #[allow(dead_code)] // Matched in type resolution but not currently emitted by parser
     Signed,
     #[allow(dead_code)] // Matched in type resolution but not currently emitted by parser
@@ -679,6 +681,8 @@ pub enum Expr {
     /// Long double literal (l/L suffix). Stores (f64_approx, f128_bytes, span).
     /// f128_bytes is IEEE 754 binary128 with full 112-bit mantissa precision.
     FloatLiteralLongDouble(f64, [u8; 16], Span),
+    /// _Float128 literal (Q/q/f128 suffix): value + IEEE binary128 bytes.
+    FloatLiteralF128(f64, [u8; 16], Span),
     /// Imaginary literal: value * I (double imaginary, e.g. 1.0i)
     ImaginaryLiteral(f64, Span),
     /// Float imaginary literal (e.g. 1.0fi)
@@ -818,6 +822,7 @@ impl Expr {
             | Expr::LongLiteral(_, s) | Expr::ULongLiteral(_, s)
             | Expr::LongLongLiteral(_, s) | Expr::ULongLongLiteral(_, s)
             | Expr::FloatLiteral(_, s) | Expr::FloatLiteralF32(_, s) | Expr::FloatLiteralLongDouble(_, _, s)
+            | Expr::FloatLiteralF128(_, _, s)
             | Expr::ImaginaryLiteral(_, s) | Expr::ImaginaryLiteralF32(_, s) | Expr::ImaginaryLiteralLongDouble(_, _, s)
             | Expr::StringLiteral(_, s) | Expr::WideStringLiteral(_, s)
             | Expr::Char16StringLiteral(_, s)

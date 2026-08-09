@@ -3,15 +3,48 @@
 //! Handles #pragma once, pack, push_macro/pop_macro, weak,
 //! redefine_extname, and GCC visibility directives.
 
+use std::path::Path;
+
 use super::pipeline::Preprocessor;
 
 impl Preprocessor {
+    /// Record a file as protected by `#pragma once`.
+    pub(super) fn record_pragma_once(&mut self, path: &Path) {
+        self.pragma_once_files.insert(path.to_path_buf());
+        if let Some(id) = Self::file_identity(path) {
+            self.pragma_once_identities.insert(id);
+        }
+    }
+
+    /// Return true if a resolved include path has previously used `#pragma once`.
+    pub(super) fn is_pragma_once_file(&self, path: &Path) -> bool {
+        self.pragma_once_files.contains(path)
+            || Self::file_identity(path)
+                .is_some_and(|id| self.pragma_once_identities.contains(&id))
+    }
+
+    /// Linux file identity for robust #pragma once tracking.
+    fn file_identity(path: &Path) -> Option<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
     pub(super) fn handle_pragma(&mut self, rest: &str) -> Option<String> {
         let rest = rest.trim();
         if rest == "once" {
-            // Mark the current file as "include once"
-            if let Some(current_file) = self.include_stack.last() {
-                self.pragma_once_files.insert(current_file.clone());
+            // Mark the current file as "include once".  Track both canonical
+            // path and device/inode so the same file included through a symlink
+            // or hardlink is still skipped, matching GCC/Clang behavior.
+            if let Some(current_file) = self.include_stack.last().cloned() {
+                self.record_pragma_once(&current_file);
             }
             return None;
         }

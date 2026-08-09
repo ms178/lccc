@@ -15,6 +15,10 @@ pub enum TokenKind {
     /// Long double literal (l/L suffix). Stores (f64_approx, f128_bytes).
     /// f128_bytes is IEEE 754 binary128 format with full 112-bit mantissa precision.
     FloatLiteralLongDouble(f64, [u8; 16]),
+    /// _Float128 literal (Q/q/f128 suffix): IEEE binary128 in 16 bytes.
+    FloatLiteralF128(f64, [u8; 16]),
+    /// _Float128 / __float128 type keyword.
+    Float128,
     /// Imaginary double literal (e.g. 1.0i) - GCC extension
     ImaginaryLiteral(f64),
     /// Imaginary float literal (e.g. 1.0fi or 1.0if) - GCC extension
@@ -212,7 +216,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::LongLongLiteral(_) | TokenKind::ULongLongLiteral(_) =>
                 write!(f, "integer constant"),
             TokenKind::FloatLiteral(_) | TokenKind::FloatLiteralF32(_) |
-            TokenKind::FloatLiteralLongDouble(_, _) =>
+            TokenKind::FloatLiteralLongDouble(_, _) | TokenKind::FloatLiteralF128(_, _) =>
                 write!(f, "floating constant"),
             TokenKind::ImaginaryLiteral(_) | TokenKind::ImaginaryLiteralF32(_) |
             TokenKind::ImaginaryLiteralLongDouble(_, _) =>
@@ -226,6 +230,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Identifier(name) => write!(f, "'{}'", name),
 
             // Keywords - shown as quoted keyword text
+            TokenKind::Float128 => write!(f, "'_Float128'"),
             TokenKind::Auto => write!(f, "'auto'"),
             TokenKind::Break => write!(f, "'break'"),
             TokenKind::Case => write!(f, "'case'"),
@@ -442,6 +447,7 @@ impl TokenKind {
             "__builtin_va_arg" => Some(TokenKind::BuiltinVaArg),
             "__builtin_types_compatible_p" => Some(TokenKind::BuiltinTypesCompatibleP),
             "__int128" | "__int128_t" => Some(TokenKind::Int128),
+            "_Float128" | "__float128" => Some(TokenKind::Float128),
             "__uint128_t" => Some(TokenKind::UInt128),
             "__real__" | "__real" => Some(TokenKind::RealPart),
             "__imag__" | "__imag" => Some(TokenKind::ImagPart),

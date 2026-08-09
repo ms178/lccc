@@ -5,7 +5,7 @@
 //! `__has_include()`, and `__has_include_next()` detection,
 //! and replacing undefined identifiers with 0 per the C standard.
 //!
-//! All scanning operates on byte slices for performance (no Vec<char> allocation).
+//! All scanning operates on byte slices for performance (no `Vec<char>` allocation).
 
 use super::pipeline::Preprocessor;
 use super::utils::{is_ident_start_byte, is_ident_cont_byte, bytes_to_str};
