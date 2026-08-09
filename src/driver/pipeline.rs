@@ -12,12 +12,12 @@
 use crate::backend::Target;
 use crate::common::error::{ColorMode, DiagnosticEngine, WarningConfig};
 use crate::common::source::SourceManager;
-use crate::frontend::preprocessor::Preprocessor;
 use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
+use crate::frontend::preprocessor::Preprocessor;
 use crate::frontend::sema::SemanticAnalyzer;
 use crate::ir::lowering::Lowerer;
-use crate::ir::mem2reg::{promote_allocas, eliminate_phis};
+use crate::ir::mem2reg::{eliminate_phis, promote_allocas};
 use crate::passes::run_passes;
 
 /// Compilation mode - determines where in the pipeline to stop.
@@ -115,6 +115,59 @@ pub struct Driver {
     pub(super) enable_sse4_2: bool,
     pub(super) enable_avx: bool,
     pub(super) enable_avx2: bool,
+    pub(super) enable_aes: bool,
+    pub(super) enable_pclmul: bool,
+    pub(super) enable_f16c: bool,
+    pub(super) enable_fma: bool,
+    pub(super) enable_bmi: bool,
+    pub(super) enable_bmi2: bool,
+    pub(super) enable_lzcnt: bool,
+    pub(super) enable_movbe: bool,
+    pub(super) enable_rdrnd: bool,
+    // AVX-512 family (accepted for -march/-m flag completeness; the backend
+    // lowers AVX-512 only where intrinsic coverage exists, and runtime
+    // dispatch must verify host support before use).
+    pub(super) enable_avx512f: bool,
+    pub(super) enable_avx512cd: bool,
+    pub(super) enable_avx512dq: bool,
+    pub(super) enable_avx512bw: bool,
+    pub(super) enable_avx512vl: bool,
+    pub(super) enable_avx512ifma: bool,
+    pub(super) enable_avx512vbmi: bool,
+    pub(super) enable_avx512vbmi2: bool,
+    pub(super) enable_avx512vnni: bool,
+    pub(super) enable_avx512bitalg: bool,
+    pub(super) enable_avx512vpopcntdq: bool,
+    pub(super) enable_avx512bf16: bool,
+    pub(super) enable_avx512fp16: bool,
+    pub(super) enable_avx512er: bool,
+    pub(super) enable_avx512pf: bool,
+    pub(super) enable_avx512vp2intersect: bool,
+    // AVX-VNNI / AVX10 / AVX-IFMA / AVX-NE-CONVERT / GFNI / VAES / VPCLMULQDQ
+    pub(super) enable_avxvnni: bool,
+    pub(super) enable_avxifma: bool,
+    pub(super) enable_avxneconvert: bool,
+    pub(super) enable_avx10_1: bool,
+    pub(super) enable_avx10_2: bool,
+    pub(super) enable_gfni: bool,
+    pub(super) enable_vaes: bool,
+    pub(super) enable_vpclmulqdq: bool,
+    pub(super) enable_avxvnniint8: bool,
+    pub(super) enable_avxvnniint16: bool,
+    pub(super) enable_sha512: bool,
+    pub(super) enable_sm3: bool,
+    pub(super) enable_sm4: bool,
+    pub(super) enable_movrs: bool,
+    pub(super) enable_user_msr: bool,
+    pub(super) enable_apxf: bool,
+    pub(super) enable_amx_tile: bool,
+    pub(super) enable_amx_int8: bool,
+    pub(super) enable_amx_bf16: bool,
+    pub(super) enable_cmpccxadd: bool,
+    /// Accepted x86 scheduling tune name from -mtune=. LCCC does not yet have
+    /// a machine scheduler, so this is deliberately diagnostic-only; ISA
+    /// selection belongs to -march= and is never silently conflated with tune.
+    pub(super) x86_tune: Option<String>,
     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
     /// On AArch64, this prevents FP/SIMD register usage. The Linux kernel uses
     /// this to avoid touching NEON/FP state. When set, variadic function prologues
@@ -203,6 +256,16 @@ pub struct Driver {
     /// When true, the preprocessor defines __GNUC_GNU_INLINE__ instead of __GNUC_STDC_INLINE__.
     /// This affects how projects like mpack select their inline linkage model.
     pub(super) gnu89_inline: bool,
+    /// Set when -fgnu89-inline / -fno-gnu89-inline was given EXPLICITLY on the
+    /// command line. GCC treats an explicit -fgnu89-inline/-fno-gnu89-inline as
+    /// overriding any later -std= (which only implies the default inline model).
+    /// Without this, glibc's `-std=gnu11 -fgnu89-inline` plus a trailing
+    /// `-std=gnu17` from a driver wrapper would silently revert to C99 inline
+    /// semantics, turning `extern __always_inline` into an external definition
+    /// and causing "multiple definition" errors at partial-link time.
+    pub(super) gnu89_inline_explicit: Option<bool>,
+    /// Whether -fexceptions is in effect (defines __EXCEPTIONS like GCC).
+    pub(super) exceptions: bool,
     /// Whether to dump preprocessor defines instead of preprocessed output (-dM).
     /// When true with -E, outputs `#define NAME VALUE` for all predefined and
     /// user-defined macros instead of the preprocessed source. Used by build
@@ -234,6 +297,10 @@ pub struct Driver {
     /// _REENTRANT=1 (matching GCC/Clang behavior). Build systems that detect
     /// pthread support via configure (ax_pthread.m4) add -lpthread themselves.
     pub(super) pthread: bool,
+    /// PGO: profile generation directory/file (from -fprofile-generate[=path])
+    pub(super) pgo_generate: Option<String>,
+    /// PGO: profile use path (from -fprofile-use[=path], -fprofile-use, -fbranch-probabilities, -fauto-profile)
+    pub(super) pgo_use: Option<String>,
 }
 
 impl Driver {
@@ -243,7 +310,7 @@ impl Driver {
             output_path: "a.out".to_string(),
             output_path_set: false,
             input_files: Vec::new(),
-            opt_level: 2, // All levels run the same optimizations; default to max
+            opt_level: 2,    // All levels run the same optimizations; default to max
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
             verbose: false,
@@ -273,6 +340,52 @@ impl Driver {
             enable_sse4_2: false,
             enable_avx: false,
             enable_avx2: false,
+            enable_aes: false,
+            enable_pclmul: false,
+            enable_f16c: false,
+            enable_fma: false,
+            enable_bmi: false,
+            enable_bmi2: false,
+            enable_lzcnt: false,
+            enable_movbe: false,
+            enable_rdrnd: false,
+            enable_avx512f: false,
+            enable_avx512cd: false,
+            enable_avx512dq: false,
+            enable_avx512bw: false,
+            enable_avx512vl: false,
+            enable_avx512ifma: false,
+            enable_avx512vbmi: false,
+            enable_avx512vbmi2: false,
+            enable_avx512vnni: false,
+            enable_avx512bitalg: false,
+            enable_avx512vpopcntdq: false,
+            enable_avx512bf16: false,
+            enable_avx512fp16: false,
+            enable_avx512er: false,
+            enable_avx512pf: false,
+            enable_avx512vp2intersect: false,
+            enable_avxvnni: false,
+            enable_avxifma: false,
+            enable_avxneconvert: false,
+            enable_avx10_1: false,
+            enable_avx10_2: false,
+            enable_gfni: false,
+            enable_vaes: false,
+            enable_vpclmulqdq: false,
+            enable_avxvnniint8: false,
+            enable_avxvnniint16: false,
+            enable_sha512: false,
+            enable_sm3: false,
+            enable_sm4: false,
+            enable_movrs: false,
+            enable_user_msr: false,
+            enable_apxf: false,
+            enable_amx_tile: false,
+            enable_amx_int8: false,
+            enable_amx_bf16: false,
+            enable_cmpccxadd: false,
+            x86_tune: None,
             general_regs_only: false,
             code_model_kernel: false,
             no_jump_tables: false,
@@ -294,6 +407,8 @@ impl Driver {
             function_sections: false,
             data_sections: false,
             gnu89_inline: false,
+            gnu89_inline_explicit: None,
+            exceptions: false,
             dump_defines: false,
             color_mode: ColorMode::Auto,
             fcommon: false,
@@ -302,6 +417,8 @@ impl Driver {
             no_unwind_tables: false,
             raw_args: Vec::new(),
             pthread: false,
+            pgo_generate: None,
+            pgo_use: None,
         }
     }
 
@@ -319,9 +436,10 @@ impl Driver {
         // Set the thread-local target pointer size for type system queries.
         // Must be done before any CType/IrType size computations.
         crate::common::types::set_target_ptr_size(self.target.ptr_size());
-        crate::common::types::set_target_long_double_is_f128(
-            matches!(self.target, Target::Aarch64 | Target::Riscv64)
-        );
+        crate::common::types::set_target_long_double_is_f128(matches!(
+            self.target,
+            Target::Aarch64 | Target::Riscv64
+        ));
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
@@ -356,7 +474,11 @@ impl Driver {
                     let stem = p.file_stem().unwrap_or_default().to_string_lossy();
                     format!("{}.o", stem)
                 };
-                let input_name = if input_file == "-" { "<stdin>" } else { input_file };
+                let input_name = if input_file == "-" {
+                    "<stdin>"
+                } else {
+                    input_file
+                };
                 let dep_line = format!("{}: {}\n", target, input_name);
 
                 if self.output_path_set {
@@ -372,7 +494,11 @@ impl Driver {
 
             let mut preprocessor = Preprocessor::new();
             self.configure_preprocessor(&mut preprocessor);
-            let filename = if input_file == "-" { "<stdin>" } else { input_file };
+            let filename = if input_file == "-" {
+                "<stdin>"
+            } else {
+                input_file
+            };
             preprocessor.set_filename(filename);
             self.process_force_includes(&mut preprocessor)?;
 
@@ -385,9 +511,16 @@ impl Driver {
                 let pp_errors = preprocessor.errors();
                 if !pp_errors.is_empty() {
                     for err in pp_errors {
-                        eprintln!("{}:{}:{}: error: {}", err.file, err.line, err.col, err.message);
+                        eprintln!(
+                            "{}:{}:{}: error: {}",
+                            err.file, err.line, err.col, err.message
+                        );
                     }
-                    return Err(format!("{} preprocessor error(s) in {}", pp_errors.len(), filename));
+                    return Err(format!(
+                        "{} preprocessor error(s) in {}",
+                        pp_errors.len(),
+                        filename
+                    ));
                 }
 
                 let output = preprocessor.dump_defines();
@@ -428,9 +561,16 @@ impl Driver {
                 let pp_errors = preprocessor.errors();
                 if !pp_errors.is_empty() {
                     for err in pp_errors {
-                        eprintln!("{}:{}:{}: error: {}", err.file, err.line, err.col, err.message);
+                        eprintln!(
+                            "{}:{}:{}: error: {}",
+                            err.file, err.line, err.col, err.message
+                        );
                     }
-                    return Err(format!("{} preprocessor error(s) in {}", pp_errors.len(), filename));
+                    return Err(format!(
+                        "{} preprocessor error(s) in {}",
+                        pp_errors.len(),
+                        filename
+                    ));
                 }
             }
         }
@@ -541,7 +681,8 @@ impl Driver {
         if self.output_path_set {
             cmd.arg("-o").arg(&self.output_path);
         }
-        let result = cmd.output()
+        let result = cmd
+            .output()
             .map_err(|e| format!("Failed to preprocess {}: {}", input_file, e))?;
         if !self.output_path_set {
             print!("{}", String::from_utf8_lossy(&result.stdout));
@@ -628,9 +769,7 @@ impl Driver {
                 let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                 self.assemble_source_file(input_file, tmp.to_str())?;
                 temp_guards.push(tmp);
-            } else if !Self::is_c_source(input_file)
-                && Self::looks_like_binary_object(input_file)
-            {
+            } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
                 // Unrecognized extension but file has ELF/archive magic bytes -
                 // treat as object file. These weren't caught by is_object_or_archive
                 // at parse time, so add them to the extra passthrough list.
@@ -654,7 +793,8 @@ impl Driver {
 
                 let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                 let extra = self.build_asm_extra_args();
-                self.target.assemble_with_extra(&asm, tmp.to_str(), &extra)?;
+                self.target
+                    .assemble_with_extra(&asm, tmp.to_str(), &extra)?;
                 // Write dependency file for this source file. When compiling and
                 // linking in one step, GCC's -Wp,-MMD uses the .o name as the
                 // dependency target. We use the output executable path as target,
@@ -694,7 +834,9 @@ impl Driver {
                 .collect();
             eprintln!(
                 " /usr/bin/ld -dynamic-linker {} -o {}{}",
-                self.target.dynamic_linker(), self.output_path, l_flags,
+                self.target.dynamic_linker(),
+                self.output_path,
+                l_flags,
             );
             eprintln!("LIBRARY_PATH={}", lib_paths);
         }
@@ -702,7 +844,8 @@ impl Driver {
         if linker_args.is_empty() {
             self.target.link(&all_objects, &self.output_path)?;
         } else {
-            self.target.link_with_args(&all_objects, &self.output_path, &linker_args)?;
+            self.target
+                .link_with_args(&all_objects, &self.output_path, &linker_args)?;
         }
 
         // temp_guards drop here, cleaning up all temp .o files automatically.
@@ -755,8 +898,7 @@ impl Driver {
     /// encoded as PUA code points (U+E080-U+E0FF) which the lexer decodes
     /// back to raw bytes inside string/character literals.
     fn read_c_source_file(path: &str) -> Result<String, String> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
         Ok(crate::common::encoding::bytes_to_string(bytes))
     }
 
@@ -765,7 +907,8 @@ impl Driver {
         if input_file == "-" {
             use std::io::Read;
             let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)
+            std::io::stdin()
+                .read_to_end(&mut bytes)
                 .map_err(|e| format!("Cannot read from stdin: {}", e))?;
             Ok(crate::common::encoding::bytes_to_string(bytes))
         } else {
@@ -806,6 +949,9 @@ impl Driver {
         if self.gnu89_inline {
             preprocessor.set_gnu89_inline(true);
         }
+        // __EXCEPTIONS mirrors -fexceptions (GCC: defined for C only with
+        // -fexceptions; glibc stdio-lock.h branches on it).
+        preprocessor.set_exceptions(self.exceptions);
         // Set optimization macros: __OPTIMIZE__ for -O1+, __OPTIMIZE_SIZE__ for -Os/-Oz.
         // The Linux kernel's BUILD_BUG() relies on __OPTIMIZE__ to expand to a noreturn
         // function call instead of a no-op.
@@ -829,6 +975,50 @@ impl Driver {
                 self.enable_sse4_2,
                 self.enable_avx,
                 self.enable_avx2,
+                self.enable_aes,
+                self.enable_pclmul,
+                self.enable_f16c,
+                self.enable_fma,
+                self.enable_bmi,
+                self.enable_bmi2,
+                self.enable_lzcnt,
+                self.enable_movbe,
+                self.enable_rdrnd,
+                self.enable_avx512f,
+                self.enable_avx512cd,
+                self.enable_avx512dq,
+                self.enable_avx512bw,
+                self.enable_avx512vl,
+                self.enable_avx512ifma,
+                self.enable_avx512vbmi,
+                self.enable_avx512vbmi2,
+                self.enable_avx512vnni,
+                self.enable_avx512bitalg,
+                self.enable_avx512vpopcntdq,
+                self.enable_avx512bf16,
+                self.enable_avx512fp16,
+                self.enable_avx512er,
+                self.enable_avx512pf,
+                self.enable_avx512vp2intersect,
+                self.enable_avxvnni,
+                self.enable_avxifma,
+                self.enable_avxneconvert,
+                self.enable_avx10_1,
+                self.enable_avx10_2,
+                self.enable_gfni,
+                self.enable_vaes,
+                self.enable_vpclmulqdq,
+                self.enable_avxvnniint8,
+                self.enable_avxvnniint16,
+                self.enable_sha512,
+                self.enable_sm3,
+                self.enable_sm4,
+                self.enable_movrs,
+                self.enable_amx_tile,
+                self.enable_amx_int8,
+                self.enable_amx_bf16,
+                self.enable_cmpccxadd,
+                self.enable_apxf,
             );
         }
         // Define _REENTRANT when -pthread is used.
@@ -869,7 +1059,10 @@ impl Driver {
     /// The file is searched in this order:
     /// 1. Current working directory (for relative paths)
     /// 2. Include paths (-I, -isystem, system defaults, -idirafter)
-    pub(super) fn process_force_includes(&self, preprocessor: &mut Preprocessor) -> Result<(), String> {
+    pub(super) fn process_force_includes(
+        &self,
+        preprocessor: &mut Preprocessor,
+    ) -> Result<(), String> {
         for path in &self.force_includes {
             let resolved = if std::path::Path::new(path).is_absolute() {
                 std::path::PathBuf::from(path)
@@ -882,7 +1075,8 @@ impl Driver {
                     cwd_path
                 } else {
                     // Search include paths (like #include "file")
-                    preprocessor.resolve_include_path(path, false)
+                    preprocessor
+                        .resolve_include_path(path, false)
                         .unwrap_or(cwd_path)
                 }
             };
@@ -900,6 +1094,11 @@ impl Driver {
     ///
     /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
+        if self.verbose {
+            if let Some(tune) = &self.x86_tune {
+                eprintln!("lccc: note: -mtune={} accepted as a scheduling hint; no x86 scheduler model is implemented yet", tune);
+            }
+        }
         let source = Self::read_source(input_file)?;
 
         let time_phases = std::env::var("CCC_TIME_PHASES").is_ok();
@@ -908,11 +1107,17 @@ impl Driver {
         // Preprocess
         let mut preprocessor = Preprocessor::new();
         self.configure_preprocessor(&mut preprocessor);
-        let filename = if input_file == "-" { "<stdin>" } else { input_file };
+        let filename = if input_file == "-" {
+            "<stdin>"
+        } else {
+            input_file
+        };
         preprocessor.set_filename(filename);
         self.process_force_includes(&mut preprocessor)?;
         let preprocessed = preprocessor.preprocess(&source);
-        if time_phases { eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64());
+        }
 
         // Create diagnostic engine for structured error/warning reporting
         let mut diagnostics = DiagnosticEngine::new();
@@ -926,7 +1131,8 @@ impl Driver {
             let diag = crate::common::error::Diagnostic::warning_with_kind(
                 warn.message.clone(),
                 crate::common::error::WarningKind::Cpp,
-            ).with_location(&warn.file, warn.line, warn.col);
+            )
+            .with_location(&warn.file, warn.line, warn.col);
             diagnostics.emit(&diag);
         }
 
@@ -938,7 +1144,11 @@ impl Driver {
                     .with_location(&err.file, err.line, err.col);
                 diagnostics.emit(&diag);
             }
-            return Err(format!("{} preprocessor error(s) in {}", pp_errors.len(), input_file));
+            return Err(format!(
+                "{} preprocessor error(s) in {}",
+                pp_errors.len(),
+                input_file
+            ));
         }
 
         // Lex
@@ -957,7 +1167,13 @@ impl Driver {
         let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
         lexer.set_gnu_extensions(self.gnu_extensions);
         let tokens = lexer.tokenize();
-        if time_phases { eprintln!("[TIME] lex: {:.3}s ({} tokens)", t1.elapsed().as_secs_f64(), tokens.len()); }
+        if time_phases {
+            eprintln!(
+                "[TIME] lex: {:.3}s ({} tokens)",
+                t1.elapsed().as_secs_f64(),
+                tokens.len()
+            );
+        }
 
         if self.verbose {
             eprintln!("Lexed {} tokens from {}", tokens.len(), input_file);
@@ -971,10 +1187,15 @@ impl Driver {
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
         let ast = parser.parse();
-        if time_phases { eprintln!("[TIME] parse: {:.3}s", t2.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!("[TIME] parse: {:.3}s", t2.elapsed().as_secs_f64());
+        }
 
         if parser.error_count > 0 {
-            return Err(format!("{}: {} parse error(s)", input_file, parser.error_count));
+            return Err(format!(
+                "{}: {} parse error(s)",
+                input_file, parser.error_count
+            ));
         }
 
         // Retrieve diagnostic engine (which holds the source manager) for subsequent phases
@@ -997,13 +1218,18 @@ impl Driver {
         let sema_result = sema.into_result();
         // Extract source manager for debug info emission (-g) after sema is done
         let source_manager = diagnostics.take_source_manager();
-        if time_phases { eprintln!("[TIME] sema: {:.3}s", t3.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!("[TIME] sema: {:.3}s", t3.elapsed().as_secs_f64());
+        }
 
         // Check for warnings promoted to errors by -Werror / -Werror=<name>.
         // The sema pass may have returned Ok (no hard errors), but the diagnostic
         // engine may have accumulated promoted-warning-errors that should stop compilation.
         if diagnostics.has_errors() {
-            return Err(format!("{} error(s) (warnings promoted by -Werror)", diagnostics.error_count()));
+            return Err(format!(
+                "{} error(s) (warnings promoted by -Werror)",
+                diagnostics.error_count()
+            ));
         }
 
         // Log diagnostic summary if there were any warnings
@@ -1030,7 +1256,9 @@ impl Driver {
         for (symbol, target) in &preprocessor.weak_pragmas {
             if let Some(ref alias_target) = target {
                 // #pragma weak symbol = alias -> create weak alias
-                module.aliases.push((symbol.clone(), alias_target.clone(), true));
+                module
+                    .aliases
+                    .push((symbol.clone(), alias_target.clone(), true));
             } else {
                 // #pragma weak symbol -> mark as weak
                 module.symbol_attrs.push((symbol.clone(), true, None));
@@ -1042,7 +1270,9 @@ impl Driver {
         // locally, but a proper implementation would rename symbol references
         // during lowering/codegen for the case where new_name is external.
         for (old_name, new_name) in &preprocessor.redefine_extname_pragmas {
-            module.aliases.push((old_name.clone(), new_name.clone(), false));
+            module
+                .aliases
+                .push((old_name.clone(), new_name.clone(), false));
         }
 
         // Apply -fcommon: mark tentative definitions as COMMON symbols.
@@ -1051,7 +1281,9 @@ impl Driver {
         // so the linker merges duplicates across TUs instead of reporting errors.
         if self.fcommon {
             for global in &mut module.globals {
-                if !global.is_common && !global.is_extern && !global.is_static
+                if !global.is_common
+                    && !global.is_extern
+                    && !global.is_static
                     && !global.is_thread_local
                     && matches!(global.init, crate::ir::module::GlobalInit::Zero)
                 {
@@ -1060,11 +1292,20 @@ impl Driver {
             }
         }
 
-        if time_phases { eprintln!("[TIME] lowering: {:.3}s ({} functions)", t4.elapsed().as_secs_f64(), module.functions.len()); }
+        if time_phases {
+            eprintln!(
+                "[TIME] lowering: {:.3}s ({} functions)",
+                t4.elapsed().as_secs_f64(),
+                module.functions.len()
+            );
+        }
 
         // Check for errors emitted during lowering (e.g., unresolved types, invalid constructs)
         if diagnostics.has_errors() {
-            return Err(format!("{} error(s) during IR lowering", diagnostics.error_count()));
+            return Err(format!(
+                "{} error(s) during IR lowering",
+                diagnostics.error_count()
+            ));
         }
 
         // Log diagnostic summary if there were any warnings during lowering
@@ -1079,21 +1320,31 @@ impl Driver {
         // Run optimization passes
         let t5 = std::time::Instant::now();
         promote_allocas(&mut module);
-        if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64());
+        }
 
         let t6 = std::time::Instant::now();
+        // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(&mut module, self.opt_level, self.target);
-        if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
+        }
 
         // Live range splitting: split call-spanning values, then clean up
         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
             let max_splits = std::env::var("CCC_SPLIT_MAX")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
             let mut did_split = false;
             for func in &mut module.functions {
                 if !func.is_declaration && func.blocks.len() > 10 {
-                    let n = crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
-                    if n > 0 { did_split = true; }
+                    let n =
+                        crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
+                    if n > 0 {
+                        did_split = true;
+                    }
                 }
             }
             // Run cleanup passes on split IR: copy propagation + DCE
@@ -1111,7 +1362,31 @@ impl Driver {
         // Lower SSA phi nodes to copies before codegen
         let t7 = std::time::Instant::now();
         eliminate_phis(&mut module);
-        if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64());
+        }
+
+        // ms178: phi elimination is the LAST IR transform, so the copy-backs it
+        // introduces have never been optimized: every phi copy-back becomes a
+        // store→load→store relay in codegen (gzip's longest_match had 120 copies
+        // surviving to codegen). Clean them up with the sound post-phi pass
+        // (dead-copy elimination + same-block-after propagation through
+        // single-def values), then DCE the now-dead instructions.
+        if std::env::var("CCC_NO_PHICLEANUP").is_err() {
+            let t7b = std::time::Instant::now();
+            for func in &mut module.functions {
+                if !func.is_declaration && !func.blocks.is_empty() {
+                    crate::passes::copy_prop::propagate_copies_post_phi(func);
+                    crate::passes::dce::eliminate_dead_code(func);
+                }
+            }
+            if time_phases {
+                eprintln!(
+                    "[TIME] post-phi cleanup: {:.3}s",
+                    t7b.elapsed().as_secs_f64()
+                );
+            }
+        }
 
         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
         // This fixes a bug where optimization passes can create duplicate labels
@@ -1148,7 +1423,11 @@ impl Driver {
                                 *target = new;
                             }
                         }
-                        Terminator::CondBranch { true_label, false_label, .. } => {
+                        Terminator::CondBranch {
+                            true_label,
+                            false_label,
+                            ..
+                        } => {
                             if let Some(&new) = label_map.get(true_label) {
                                 *true_label = new;
                             }
@@ -1166,7 +1445,9 @@ impl Driver {
                                 *default = new;
                             }
                         }
-                        Terminator::IndirectBranch { possible_targets, .. } => {
+                        Terminator::IndirectBranch {
+                            possible_targets, ..
+                        } => {
                             for target in possible_targets {
                                 if let Some(&new) = label_map.get(target) {
                                     *target = new;
@@ -1179,11 +1460,43 @@ impl Driver {
             }
         }
 
+        // PGO v3 is post-optimization and post-label-renumber.  Generation and
+        // use therefore fingerprint the same module, while stale profiles fail
+        // closed before optional layout.
+        let pgo_unit = crate::pgo::profile::unit_identity(input_file);
+        if let Some(ref pgo_path) = self.pgo_use {
+            crate::pgo::init_pgo_profile(Some(pgo_path));
+            crate::pgo::propagate_profile(&module, &pgo_unit);
+        } else if let Ok(p) = std::env::var("LCCC_PGO_USE") {
+            crate::pgo::init_pgo_profile(Some(&p));
+            crate::pgo::propagate_profile(&module, &pgo_unit);
+        }
+        if let Some(ref pgo_dir) = self.pgo_generate {
+            crate::pgo::instrument::instrument_module(&mut module, pgo_dir, &pgo_unit, None);
+        } else if let Ok(dir) = std::env::var("LCCC_PGO_GENERATE") {
+            crate::pgo::instrument::instrument_module(&mut module, &dir, &pgo_unit, None);
+        }
+        if let Some(profile) = crate::pgo::get_pgo_profile() {
+            crate::pgo::layout::layout_module(&mut module, profile, &pgo_unit);
+        }
+        if std::env::var_os("LCCC_NO_SCHEDULE").is_none()
+            && std::env::var_os("LCCC_SCHEDULE").is_some()
+        {
+        }
+
         // Debug: dump IR labels before codegen
+        if std::env::var("LCCC_DUMP_PRECG").is_ok() {
+            eprintln!("==== IR immediately before codegen ====");
+            eprintln!("{:#?}", module);
+            eprintln!("==== END IR before codegen ====");
+        }
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
             for func in &module.functions {
-                eprintln!("[IR] Function {}: labels = {:?}", func.name,
-                          func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>());
+                eprintln!(
+                    "[IR] Function {}: labels = {:?}",
+                    func.name,
+                    func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
+                );
             }
         }
 
@@ -1206,6 +1519,7 @@ impl Driver {
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
+            avx512: self.enable_avx512f,
             no_relax: self.riscv_no_relax,
             debug_info: self.debug_info,
             function_sections: self.function_sections,
@@ -1216,11 +1530,25 @@ impl Driver {
             emit_cfi: !self.no_unwind_tables,
         };
         let asm = self.target.generate_assembly_with_opts_and_debug(
-            &module, &opts, source_manager.as_ref(),
+            &module,
+            &opts,
+            source_manager.as_ref(),
         );
-        if time_phases { eprintln!("[TIME] codegen: {:.3}s ({} bytes asm)", t8.elapsed().as_secs_f64(), asm.len()); }
+        if time_phases {
+            eprintln!(
+                "[TIME] codegen: {:.3}s ({} bytes asm)",
+                t8.elapsed().as_secs_f64(),
+                asm.len()
+            );
+        }
 
-        if time_phases { eprintln!("[TIME] total compile {}: {:.3}s", input_file, t0.elapsed().as_secs_f64()); }
+        if time_phases {
+            eprintln!(
+                "[TIME] total compile {}: {:.3}s",
+                input_file,
+                t0.elapsed().as_secs_f64()
+            );
+        }
 
         if self.verbose {
             eprintln!("Generated {:?} assembly ({} bytes)", self.target, asm.len());
