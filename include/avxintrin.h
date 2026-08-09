@@ -17,6 +17,8 @@ typedef struct __attribute__((__aligned__(32))) {
     long long __val[4];
 } __m256i;
 
+#define __CCC_M256I_FROM_BUILTIN(expr) (*(__m256i *)(expr))
+
 /* Unaligned variants */
 typedef struct __attribute__((__aligned__(1))) {
     float __val[8];

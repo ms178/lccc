@@ -229,16 +229,7 @@ _mm_subs_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_subs_epu16(__m128i __a, __m128i __b)
 {
-    /* Unsigned saturating subtract of 8 x 16-bit elements. */
-    unsigned short *__pa = (unsigned short *)&__a;
-    unsigned short *__pb = (unsigned short *)&__b;
-    __m128i __r;
-    unsigned short *__pr = (unsigned short *)&__r;
-    for (int __i = 0; __i < 8; __i++) {
-        int __d = (int)__pa[__i] - (int)__pb[__i];
-        __pr[__i] = (unsigned short)(__d < 0 ? 0 : __d);
-    }
-    return __r;
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubusw128(__a, __b));
 }
 
 /* === Arithmetic === */
@@ -297,27 +288,13 @@ _mm_max_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_min_epu8(__m128i __a, __m128i __b)
 {
-    /* Unsigned byte minimum for each of 16 lanes. */
-    unsigned char *__pa = (unsigned char *)&__a;
-    unsigned char *__pb = (unsigned char *)&__b;
-    __m128i __r;
-    unsigned char *__pr = (unsigned char *)&__r;
-    for (int __i = 0; __i < 16; __i++)
-        __pr[__i] = __pa[__i] < __pb[__i] ? __pa[__i] : __pb[__i];
-    return __r;
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pminub128(__a, __b));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_max_epu8(__m128i __a, __m128i __b)
 {
-    /* Unsigned byte maximum for each of 16 lanes. */
-    unsigned char *__pa = (unsigned char *)&__a;
-    unsigned char *__pb = (unsigned char *)&__b;
-    __m128i __r;
-    unsigned char *__pr = (unsigned char *)&__r;
-    for (int __i = 0; __i < 16; __i++)
-        __pr[__i] = __pa[__i] > __pb[__i] ? __pa[__i] : __pb[__i];
-    return __r;
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmaxub128(__a, __b));
 }
 
 /* === Bitwise === */
@@ -355,31 +332,13 @@ _mm_xor_si128(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_add_epi8(__m128i __a, __m128i __b)
 {
-    /* Byte-level add using carry-free byte addition trick:
-     * For each byte, (a+b) mod 256.  We use a mask to isolate the low
-     * bit of each byte pair to propagate carries correctly within bytes
-     * but not across byte boundaries. */
-    unsigned long long __mask = 0x7f7f7f7f7f7f7f7fULL;
-    unsigned long long __a0 = (unsigned long long)__a.__val[0];
-    unsigned long long __b0 = (unsigned long long)__b.__val[0];
-    unsigned long long __a1 = (unsigned long long)__a.__val[1];
-    unsigned long long __b1 = (unsigned long long)__b.__val[1];
-    unsigned long long __lo = ((__a0 & __mask) + (__b0 & __mask)) ^ ((__a0 ^ __b0) & ~__mask);
-    unsigned long long __hi = ((__a1 & __mask) + (__b1 & __mask)) ^ ((__a1 ^ __b1) & ~__mask);
-    return (__m128i){ { (long long)__lo, (long long)__hi } };
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_paddb128(__a, __b));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_sub_epi8(__m128i __a, __m128i __b)
 {
-    unsigned long long __mask = 0x8080808080808080ULL;
-    unsigned long long __a0 = (unsigned long long)__a.__val[0];
-    unsigned long long __b0 = (unsigned long long)__b.__val[0];
-    unsigned long long __a1 = (unsigned long long)__a.__val[1];
-    unsigned long long __b1 = (unsigned long long)__b.__val[1];
-    unsigned long long __lo = ((__a0 | __mask) - (__b0 & ~__mask)) ^ ((__a0 ^ ~__b0) & __mask);
-    unsigned long long __hi = ((__a1 | __mask) - (__b1 & ~__mask)) ^ ((__a1 ^ ~__b1) & __mask);
-    return (__m128i){ { (long long)__lo, (long long)__hi } };
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubb128(__a, __b));
 }
 
 /* === 16-bit Arithmetic === */
@@ -399,14 +358,7 @@ _mm_sub_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_mullo_epi16(__m128i __a, __m128i __b)
 {
-    /* Multiply 8 x 16-bit signed integers, return low 16 bits of each 32-bit result. */
-    unsigned short *__pa = (unsigned short *)&__a;
-    unsigned short *__pb = (unsigned short *)&__b;
-    __m128i __r;
-    unsigned short *__pr = (unsigned short *)&__r;
-    for (int __i = 0; __i < 8; __i++)
-        __pr[__i] = (unsigned short)((unsigned int)__pa[__i] * (unsigned int)__pb[__i]);
-    return __r;
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmullw128(__a, __b));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -1648,6 +1600,15 @@ static __inline__ void __attribute__((__always_inline__))
 _mm_clflush(void const *__p)
 {
     __builtin_ia32_clflush(__p);
+}
+
+
+/* === Sum of absolute differences of unsigned bytes (8 u16 lanes) === */
+
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_sad_epu8(__m128i __a, __m128i __b)
+{
+    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psadbw128(__a, __b));
 }
 
 #endif /* _EMMINTRIN_H_INCLUDED */
