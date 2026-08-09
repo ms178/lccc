@@ -21,6 +21,11 @@ impl super::InstructionEncoder {
         }
     }
 
+    pub(super) fn encode_x87_wait_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+        self.bytes.push(0x9B);
+        self.encode_x87_mem(ops, opcode, ext)
+    }
+
     pub(super) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() == 2 {
             match &ops[0] {
@@ -127,6 +132,62 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(7, mem)
             }
             _ => Err("fnstsw requires %ax or memory operand".to_string()),
+        }
+    }
+
+    pub(super) fn encode_fstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        self.bytes.push(0x9B);
+        self.encode_fnstsw(ops)
+    }
+
+    pub(super) fn encode_x87_st_i(&mut self, ops: &[Operand], opcode: &[u8], base: u8, name: &str) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err(format!("{} requires 1 st register operand", name));
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let n = parse_st_num(&reg.name)?;
+                self.bytes.extend_from_slice(opcode);
+                self.bytes.push(base + n);
+                Ok(())
+            }
+            _ => Err(format!("{} requires st register", name)),
+        }
+    }
+
+    pub(super) fn encode_fcom(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() == 1 || ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD8, 0xD0 + n]);
+                    Ok(())
+                }
+                _ => Err("fcom requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xD8, 0xD1]);
+            Ok(())
+        } else {
+            Err("fcom requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    pub(super) fn encode_fcomp(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() == 1 || ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD8, 0xD8 + n]);
+                    Ok(())
+                }
+                _ => Err("fcomp requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xD8, 0xD9]);
+            Ok(())
+        } else {
+            Err("fcomp requires 0, 1 or 2 operands".to_string())
         }
     }
 

@@ -874,6 +874,41 @@ impl AsmOutput {
         self.buf.push('\n');
     }
 
+    /// Emit a stack-slot reference after a `pushq` scratch-save has lowered RSP.
+    ///
+    /// The inline-asm output store-back uses a `pushq`/`popq` pair to protect a
+    /// scratch register while loading the destination pointer from a stack slot.
+    /// With RSP-relative addressing (frame pointer omitted, `use_rsp_addressing`),
+    /// the push lowers RSP by 8, so the slot offset must be bumped by 8 or the
+    /// load reads the slot 8 bytes early (corrupting outputs and, for the last
+    /// store in a sequence, dereferencing a garbage pointer). RBP-relative
+    /// addressing is unaffected by the push.
+    #[inline]
+    pub fn emit_instr_rbp_reg_after_push(&mut self, mnemonic: &str, offset: i64, reg: &str) {
+        if self.use_rsp_addressing {
+            self.emit_instr_rbp_reg(mnemonic, offset + 8, reg);
+        } else {
+            self.emit_instr_rbp_reg(mnemonic, offset, reg);
+        }
+    }
+
+    /// Emit: `    cmpl $0, {offset}(%rbp)` (or rsp-relative when the frame
+    /// pointer is omitted). Tests a 4-byte stack slot against zero without
+    /// touching any register — used to test boolean conditions in place
+    /// (bools are stored as zero-extended I32, so `cmpl` reads exactly the
+    /// slot and leaves the upper bytes of the containing register untouched).
+    #[inline]
+    pub fn emit_cmp_zero_mem(&mut self, offset: i64) {
+        self.buf.push_str("    cmpl $0, ");
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp)\n");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp)\n");
+        }
+    }
+
     /// Emit: `    {mnemonic} %{reg}, {offset}(%rbp)` (or rsp-relative when frame pointer omitted)
     /// Used for stores to stack slots.
     #[inline]
@@ -1150,7 +1185,13 @@ impl PtrDirective {
 }
 
 /// Emit all data sections (rodata for string literals, .data and .bss for globals).
-pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDirective) {
+///
+/// In PIC/PIE code, const-qualified globals that contain address relocations
+/// are emitted to `.data.rel.ro` instead of `.rodata`.  The dynamic linker must
+/// write those relocations at load time; keeping them in `.rodata` makes GNU ld
+/// create DT_TEXTREL and can fail hardened builds.  `.data.rel.ro` is writable
+/// during relocation and becomes read-only under RELRO.
+pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDirective, pic_mode: bool) {
     // String literals in .rodata
     if !module.string_literals.is_empty() || !module.wide_string_literals.is_empty()
        || !module.char16_string_literals.is_empty() {
@@ -1179,7 +1220,7 @@ pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDi
     }
 
     // Global variables
-    emit_globals(out, &module.globals, ptr_dir);
+    emit_globals(out, &module.globals, ptr_dir, pic_mode);
 }
 
 /// Compute effective alignment for a global, promoting to 16 when size >= 16.
@@ -1223,6 +1264,9 @@ enum GlobalSection {
     Custom,
     /// Const-qualified, non-TLS, initialized, non-zero-size -> `.rodata`.
     Rodata,
+    /// Const-qualified initialized globals that contain address relocations in
+    /// PIC/PIE mode -> `.data.rel.ro` (relocated then read-only under RELRO).
+    DataRelRo,
     /// Thread-local, initialized, non-zero-size -> `.tdata`.
     Tdata,
     /// Non-const, non-TLS, initialized, non-zero-size -> `.data`.
@@ -1235,17 +1279,32 @@ enum GlobalSection {
     Bss,
 }
 
+/// Return true if an initializer contains an address that becomes an ELF
+/// relocation in the object file.  In PIC/PIE shared links, such relocations
+/// must not live in `.rodata` because the dynamic loader has to write them.
+fn global_init_needs_dynamic_reloc(init: &GlobalInit) -> bool {
+    match init {
+        GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => true,
+        GlobalInit::Compound(items) => items.iter().any(global_init_needs_dynamic_reloc),
+        // Label differences are assembled as link-time constants for computed
+        // goto/jump-table style data and do not require runtime dynamic writes.
+        GlobalInit::GlobalLabelDiff(_, _, _) => false,
+        _ => false,
+    }
+}
+
 /// Classify a global variable into the section it should be emitted to.
 ///
 /// The classification priority matches GCC behavior:
 /// 1. Extern symbols get no storage (just visibility directives).
 /// 2. Custom section overrides all other placement.
 /// 3. TLS globals go to .tdata (initialized) or .tbss (zero-init).
-/// 4. Const globals go to .rodata.
-/// 5. Non-zero initialized non-const globals go to .data.
-/// 6. Zero-initialized common globals go to .comm.
-/// 7. Zero-initialized non-common globals go to .bss.
-fn classify_global(g: &IrGlobal) -> GlobalSection {
+/// 4. Const globals with address relocations go to .data.rel.ro in PIC/PIE.
+/// 5. Other const globals go to .rodata.
+/// 6. Non-zero initialized non-const globals go to .data.
+/// 7. Zero-initialized common globals go to .comm.
+/// 8. Zero-initialized non-common globals go to .bss.
+fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
     if g.is_extern {
         return GlobalSection::Extern;
     }
@@ -1258,7 +1317,15 @@ fn classify_global(g: &IrGlobal) -> GlobalSection {
         return if has_nonzero_init { GlobalSection::Tdata } else { GlobalSection::Tbss };
     }
     if has_nonzero_init {
-        return if g.is_const { GlobalSection::Rodata } else { GlobalSection::Data };
+        return if g.is_const {
+            if pic_mode && global_init_needs_dynamic_reloc(&g.init) {
+                GlobalSection::DataRelRo
+            } else {
+                GlobalSection::Rodata
+            }
+        } else {
+            GlobalSection::Data
+        };
     }
     // Zero-initialized (or zero-size with init)
     if g.is_common && is_zero {
@@ -1272,9 +1339,9 @@ fn classify_global(g: &IrGlobal) -> GlobalSection {
 /// Classifies each global once via `classify_global`, then emits all globals
 /// for each section in a fixed order: extern visibility, custom sections,
 /// .rodata, .tdata, .data, .comm, .tbss, .bss.
-fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective) {
+fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective, pic_mode: bool) {
     // Phase 1: classify every global into its target section.
-    let classified: Vec<GlobalSection> = globals.iter().map(classify_global).collect();
+    let classified: Vec<GlobalSection> = globals.iter().map(|g| classify_global(g, pic_mode)).collect();
 
     // Phase 2: emit each section group in order.
 
@@ -1306,8 +1373,16 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         // variable to determine section flags, not just the section name.
         // This matters for kernel sections like .modinfo which contain const data.
         let flags = if g.is_const || section_name.contains("rodata") { "a" } else { "aw" };
-        // Sections starting with ".bss" are NOBITS (no file space, BSS semantics)
-        let section_type = if section_name.starts_with(".bss") { "@nobits" } else { "@progbits" };
+        // Sections starting with ".bss" are NOBITS (no file space, BSS semantics).
+        // A zero-initialized writable global in any custom section is also NOBITS:
+        // it costs no file space and is zero-filled at load time (used by PGO
+        // counter arrays in .lccc_pgo_cnts).
+        let is_zero = matches!(g.init, GlobalInit::Zero);
+        let section_type = if section_name.starts_with(".bss") || (flags == "aw" && is_zero) {
+            "@nobits"
+        } else {
+            "@progbits"
+        };
         out.emit_fmt(format_args!(".section {},\"{}\",{}", section_name, flags, section_type));
         if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
             emit_zero_global(out, g, "@object", ptr_dir);
@@ -1317,11 +1392,14 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         out.emit("");
     }
 
-    // .rodata: const-qualified initialized globals (matches GCC -fno-PIE behavior;
-    // the linker handles relocations in .rodata fine, and kernel linker scripts
-    // don't recognize .data.rel.ro).
+    // .rodata: const-qualified initialized globals with no runtime relocations.
     emit_section_group(out, globals, &classified, &GlobalSection::Rodata,
         ".section .rodata", false, ptr_dir);
+
+    // .data.rel.ro: const-qualified globals that need runtime relocation in
+    // PIC/PIE mode.  GNU ld places this in RELRO, eliminating DT_TEXTREL.
+    emit_section_group(out, globals, &classified, &GlobalSection::DataRelRo,
+        ".section .data.rel.ro,\"aw\",@progbits", false, ptr_dir);
 
     // .tdata: thread-local initialized globals
     emit_section_group(out, globals, &classified, &GlobalSection::Tdata,

@@ -256,7 +256,7 @@ pub(crate) fn substitute_x86_asm_operands(
                     modifier = Some('P');
                     i += 1;
                 }
-            } else if matches!(chars[i], 'k' | 'w' | 'b' | 'h' | 'q' | 'l' | 'c' | 'a' | 'n')
+            } else if matches!(chars[i], 'k' | 'w' | 'b' | 'h' | 'q' | 'l' | 'c' | 'a' | 'n' | 'd')
                 && i + 1 < chars.len() && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '[') {
                     modifier = Some(chars[i]);
                     i += 1;
@@ -345,6 +345,10 @@ pub(crate) fn emit_operand_common(
     op_imm_values: &[Option<i64>],
     op_imm_symbols: &[Option<String>],
 ) -> bool {
+    // GCC's 'd' modifier duplicates the operand (glibc math-inline-asm.h uses
+    // VARGPREFIX "%d" -> `%vdivss %1, %d0` with a "+x" operand): emit the
+    // operand in its plain register form.
+    let modifier = if modifier == Some('d') { None } else { modifier };
     let is_raw = matches!(modifier, Some('c') | Some('P'));
     let is_neg = modifier == Some('n');
     let has_symbol = op_imm_symbols.get(idx).and_then(|s| s.as_ref());

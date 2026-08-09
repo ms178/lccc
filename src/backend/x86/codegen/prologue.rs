@@ -2,15 +2,22 @@
 
 use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+use crate::backend::liveness::{for_each_operand_in_instruction, for_each_operand_in_terminator};
 use crate::backend::regalloc::PhysReg;
 use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
                      phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        // ms178 debug: dump IR per function
+        if std::env::var("CCC_DUMP_IR").is_ok() {
+            eprintln!("===== IR for {} =====", func.name);
+            eprintln!("{:#?}", func);
+            eprintln!("===== end IR =====");
+        }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
 
@@ -124,38 +131,282 @@ impl X86Codegen {
         // value is destroyed. The fix requires per-call save/restore, not
         // promotion. See binary size investigation in project memory.
 
-        // Build set of I32 values that need sign-extension (used in 64-bit contexts).
-        // Values NOT in this set can skip movslq after 32-bit register ALU ops.
-        // A value needs sext if it's: (a) a Cast source going to I64/U64/Ptr,
-        // (b) an operand of GetElementPtr, or (c) used in a 64-bit BinOp/Cmp.
+        // Compute the exact set of I32 values that are consumed in a 64-bit
+        // context and therefore need `movslq` after a 32-bit ALU op.
+        //
+        // Pass 1 (direct): mark every value that appears as an operand of a
+        // 64-bit-consuming position — 64-bit BinOp/Cmp/Store, Cast I32->I64,
+        // GEP offset, 64-bit Select, 64-bit call arg, 64-bit atomic op. This
+        // supersedes the original unsound Cast+GEP-only set.
+        //
+        // Pass 2 (transitive closure through Copy and Phi): if `w` needs sext
+        // and `w = Copy(v)` or `w = Phi(..., v, ...)`, then `v`'s 64-bit value
+        // flows into `w`'s register, so `v` needs sext too. Without this, a
+        // 32-bit ALU result `v` that is only copied to a `w` used in a 64-bit
+        // context would be wrongly skipped: the `movq %v, %w` copies the stale
+        // upper bits and the 64-bit use of `w` (when register-allocated) would
+        // read garbage. (Sound: adding values to this set only ever emits more
+        // movslq, never removes one, so it cannot miscompile.)
+        let is_64 = |t: &IrType| matches!(t,
+            IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F128);
         let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
+        // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
+        // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
+        let mut copy_phi_srcs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let mut mark = |op: &Operand, set: &mut FxHashSet<u32>| {
+            if let Operand::Value(v) = op {
+                set.insert(v.0);
+            }
+        };
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Cast { src, from_ty, to_ty, .. } => {
-                        if matches!(from_ty, IrType::I32 | IrType::U32)
-                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
-                            if let Operand::Value(v) = src {
-                                needs_sext_set.insert(v.0);
+                    Instruction::BinOp { ty, lhs, rhs, .. } if is_64(ty) => {
+                        mark(lhs, &mut needs_sext_set); mark(rhs, &mut needs_sext_set);
+                    }
+                    Instruction::Cmp { ty, lhs, rhs, .. } if is_64(ty) => {
+                        mark(lhs, &mut needs_sext_set); mark(rhs, &mut needs_sext_set);
+                    }
+                    Instruction::Store { ty, val, .. } if is_64(ty) => {
+                        mark(val, &mut needs_sext_set);
+                    }
+                    Instruction::Cast { src, from_ty, to_ty, .. }
+                        if matches!(from_ty, IrType::I32 | IrType::U32) && is_64(to_ty) => {
+                        mark(src, &mut needs_sext_set);
+                    }
+                    Instruction::GetElementPtr { offset, .. } => {
+                        mark(offset, &mut needs_sext_set);
+                    }
+                    Instruction::Select { ty, true_val, false_val, .. } if is_64(ty) => {
+                        mark(true_val, &mut needs_sext_set); mark(false_val, &mut needs_sext_set);
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        for (arg, at) in info.args.iter().zip(info.arg_types.iter()) {
+                            if is_64(at) {
+                                mark(arg, &mut needs_sext_set);
                             }
                         }
                     }
-                    Instruction::GetElementPtr { base, offset, .. } => {
-                        needs_sext_set.insert(base.0);
-                        if let Operand::Value(v) = offset {
-                            needs_sext_set.insert(v.0);
+                    Instruction::AtomicRmw { ty, val, .. } if is_64(ty) => {
+                        mark(val, &mut needs_sext_set);
+                    }
+                    Instruction::AtomicStore { ty, val, .. } if is_64(ty) => {
+                        mark(val, &mut needs_sext_set);
+                    }
+                    // Record Copy/Phi value-flow edges for the transitive closure.
+                    Instruction::Copy { dest, src } => {
+                        if let Operand::Value(v) = src {
+                            copy_phi_srcs.entry(dest.0).or_default().push(v.0);
+                        }
+                    }
+                    Instruction::Phi { dest, incoming, .. } => {
+                        let e = copy_phi_srcs.entry(dest.0).or_default();
+                        for (op, _) in incoming {
+                            if let Operand::Value(v) = op {
+                                e.push(v.0);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
         }
-        // Always sign-extend I32 values after 32-bit ALU ops. The needs_sext_set
-        // optimization was unsound: it only tracked Cast and GEP uses, missing cases
-        // where I32 values flow into 64-bit pointer arithmetic through intermediate
-        // registers (e.g., `(yysize + 1) * sizeof(yyStackEntry)` in SQLite's parser).
-        self.skip_i32_sext = false;
-        self.needs_sext_values = FxHashSet::default();
+        // Pass 1b: 64-bit consumers that live in block terminators and
+        // instructions the pass-1 match missed. All conservative (only ever
+        // ADDS values to the sext set, which only emits more movslq):
+        //   * Return operands of 64-bit-returning functions. The lowering's
+        //     emit_implicit_cast skips Ptr targets entirely (no Cast is
+        //     inserted for `return (char*)x;`), so a raw I32 value can flow
+        //     straight into a 64-bit return — it must be sign-extended.
+        //   * AtomicCmpxchg expected/desired operands of 64-bit width.
+        for block in &func.blocks {
+            if let Terminator::Return(Some(op)) = &block.terminator {
+                if is_64(&func.return_type) {
+                    mark(op, &mut needs_sext_set);
+                }
+            }
+            for inst in &block.instructions {
+                if let Instruction::AtomicCmpxchg { expected, desired, ty, .. } = inst {
+                    if is_64(ty) {
+                        mark(expected, &mut needs_sext_set);
+                        mark(desired, &mut needs_sext_set);
+                    }
+                }
+            }
+        }
+
+        // Pass 2: fixed-point transitive closure over Copy/Phi sources.
+        if !copy_phi_srcs.is_empty() {
+            let mut worklist: Vec<u32> = needs_sext_set.iter().copied().collect();
+            while let Some(vid) = worklist.pop() {
+                if let Some(srcs) = copy_phi_srcs.get(&vid) {
+                    for &s in srcs {
+                        if needs_sext_set.insert(s) {
+                            worklist.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        self.skip_i32_sext = needs_sext_set.is_empty();
+        self.needs_sext_values = needs_sext_set;
+
+        // ── Value type map, use counts and Cmp→consumer flag fusion ──────
+        //
+        // The codegen emits IR instructions strictly in order. When a Cmp's
+        // result is consumed ONLY by the immediately-following Select or
+        // CondBranch (same block, no instruction in between), the boolean
+        // materialization (setcc/movzbl/store) is redundant: the flags set by
+        // the cmp/test are still live. We record such Cmp destinations in
+        // `fused_cmp_dests`; the Cmp emitter then skips setcc and the
+        // consumer emits `jcc`/`cmovcc` directly. This is the single biggest
+        // instruction-count win in branch-heavy code (gzip's longest_match).
+        //
+        // Soundness: the Cmp handler only skips the setcc when the map says
+        // the consumer is the next instruction, and the dispatch loop runs
+        // instructions in order with nothing inserted in between (the
+        // machinst lowering path is opt-in via CCC_USE_MACHINST and bypasses
+        // both handlers, so the map is ignored there — the Cmp then takes the
+        // normal path and the bool is materialized).
+        {
+            let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
+            let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    // Map every producing instruction to its result type.
+                    if let Some(ty) = inst.result_type() {
+                        if let Some(dest) = inst.dest() {
+                            value_types.entry(dest.0).or_insert(ty);
+                        }
+                    }
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            *use_counts.entry(v.0).or_insert(0) += 1;
+                        }
+                    });
+                    // Copy/Phi: propagate the source type to the dest.
+                    match inst {
+                        Instruction::Copy { dest, src } => {
+                            if let Operand::Value(v) = src {
+                                if let Some(&t) = value_types.get(&v.0) {
+                                    value_types.insert(dest.0, t);
+                                }
+                            }
+                        }
+                        Instruction::Phi { dest, incoming, .. } => {
+                            for (op, _) in incoming {
+                                if let Operand::Value(v) = op {
+                                    if let Some(&t) = value_types.get(&v.0) {
+                                        value_types.insert(dest.0, t);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for_each_operand_in_terminator(&block.terminator, |op| {
+                    if let Operand::Value(v) = op {
+                        *use_counts.entry(v.0).or_insert(0) += 1;
+                    }
+                });
+            }
+            // ParamRef/Alloca/Load/… dest types come from result_type(); also
+            // map function parameters (their ParamRef carries the type).
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::ParamRef { dest, ty, .. } = inst {
+                        value_types.entry(dest.0).or_insert(*ty);
+                    }
+                }
+            }
+
+            // Find fused Cmp → Select/CondBranch pairs: the consumer must be
+            // the immediately-following instruction (or the block terminator)
+            // and the Cmp dest must have exactly one use.
+            //
+            // CHAIN EXTENSION: a run of `Copy` instructions between the Cmp
+            // and the consumer is also fuseable — a Copy emits a plain
+            // flag-neutral `movq` (and is often coalesced away entirely), so
+            // the flags set by the Cmp survive to the consumer. Only Copy is
+            // allowed in the chain (anything else could clobber flags or be a
+            // different consumer).
+            // Maps a fused Cmp's dest value to the FINAL value of the copy
+            // chain that feeds the consumer (== the cmp dest when the
+            // consumer is adjacent). The Cmp emitter records pending flags
+            // under the chain-end value so the consumer matches.
+            let mut fused: FxHashMap<u32, u32> = FxHashMap::default();
+            for block in &func.blocks {
+                let insts = &block.instructions;
+                for (ii, inst) in insts.iter().enumerate() {
+                    if let Instruction::Cmp { dest, .. } = inst {
+                        if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
+                            continue;
+                        }
+                        // Walk forward over Copies that forward the cmp value.
+                        let mut cur = dest.0;
+                        let mut k = ii + 1;
+                        let mut is_consumer = false;
+                        let mut chain_single_use = true;
+                        while k < insts.len() {
+                            match &insts[k] {
+                                Instruction::Copy { dest: cd, src: Operand::Value(sv) }
+                                    if sv.0 == cur => {
+                                    // Flag-neutral forwarding copy.
+                                    //
+                                    // SOUNDNESS (v13): with flag fusion, the Cmp
+                                    // SKIPS materializing the boolean, so `dest`
+                                    // and every intermediate copy destination are
+                                    // NEVER WRITTEN (the copies just forward a
+                                    // stale register). It is therefore only safe
+                                    // to fuse if EVERY value in the chain is used
+                                    // EXACTLY ONCE (only by the forwarding copy /
+                                    // the final select-or-branch). If any
+                                    // intermediate value is read by any other
+                                    // instruction (a store, a call argument, a
+                                    // return, an ALU...), that read sees the
+                                    // never-materialized stale bool — a
+                                    // miscompile. (The old code only checked the
+                                    // FINAL value's use count, missing reads of
+                                    // intermediate copies → expat runtests
+                                    // segfault in the accounting tests.)
+                                    if use_counts.get(&cd.0).copied().unwrap_or(0) != 1 {
+                                        chain_single_use = false;
+                                        break;
+                                    }
+                                    cur = cd.0;
+                                    k += 1;
+                                }
+                                Instruction::Select { cond: Operand::Value(v), .. } if v.0 == cur => {
+                                    // The copy chain must terminate here (the
+                                    // final value has exactly one use: this
+                                    // select).
+                                    if use_counts.get(&cur).copied().unwrap_or(0) == 1 {
+                                        is_consumer = true;
+                                    }
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if is_consumer && chain_single_use {
+                            fused.insert(dest.0, cur);
+                        } else if !is_consumer && chain_single_use && k == insts.len() && insts.len() >= 1 {
+                            // Check the block terminator as the consumer.
+                            if let Terminator::CondBranch { cond: Operand::Value(v), .. } = &block.terminator {
+                                if v.0 == cur && use_counts.get(&cur).copied().unwrap_or(0) == 1 {
+                                    fused.insert(dest.0, cur);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            self.fused_cmp_dests = fused;
+            self.value_use_counts = use_counts;
+            self.value_types = value_types;
+        }
 
         let (reg_assigned, cached_liveness, caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
@@ -184,12 +435,6 @@ impl X86Codegen {
             let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
             (-new_space, new_space)
         }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, true);
-
-        // Initialize emergency spill offset below the allocated frame space.
-        // Without this, emergency spills start at offset 0 from the frame base
-        // and grow upward into the callee-saved register push area, corrupting
-        // saved registers (e.g., writing to -8(%rbp) where %rbx was pushed).
-        self.state.emergency_spill_offset = -space;
 
         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
         self.caller_save_spill_slots.clear();
@@ -234,6 +479,7 @@ impl X86Codegen {
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         self.current_return_type = func.return_type;
         self.func_ret_classes = func.ret_eightbyte_classes.clone();
+        self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         if self.state.cf_protection_branch {
             self.state.emit("    endbr64");
         }
@@ -315,6 +561,24 @@ impl X86Codegen {
                     self.state.emit("    orl $0, (%rsp)");
                 } else {
                     self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                }
+            }
+        }
+
+        // Preserve source-level volatile semantics through the late text
+        // peephole.  The marker is a GNU-as comment and is consumed only by
+        // LCCC's peephole pre-scan; it names the final direct slot address.
+        // This avoids treating a volatile local as an ordinary dead stack
+        // temporary after register/FP shuttle rewrites.
+        let mut volatile_ids: Vec<u32> = self.state.volatile_alloca_values.iter().copied().collect();
+        volatile_ids.sort_unstable();
+        for id in volatile_ids {
+            if let Some(slot) = self.state.get_slot(id) {
+                if self.state.out.use_rsp_addressing {
+                    let off = self.state.out.rsp_frame_size + slot.0;
+                    self.state.emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rsp)", off));
+                } else {
+                    self.state.emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rbp)", slot.0));
                 }
             }
         }
@@ -609,6 +873,10 @@ impl X86Codegen {
                     if let Some(hi) = hi_fp_idx {
                         self.state.out.emit_instr_reg_rbp("    movq", xmm_regs[hi], slot.0 + 8);
                     }
+                }
+                ParamClass::F128SseReg { reg_idx } => {
+                    // _Float128: the full 16 bytes arrive in ONE XMM register.
+                    self.state.out.emit_instr_reg_rbp("    movdqu", xmm_regs[reg_idx], slot.0);
                 }
                 ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. } => {
                     self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[int_reg_idx], slot.0);

@@ -76,6 +76,9 @@ pub(crate) struct CodegenOptions {
     /// with retpoline (-mindirect-branch=thunk-extern) to avoid indirect jumps that
     /// objtool would reject.
     pub(crate) no_jump_tables: bool,
+    /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
+    /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
+    pub(crate) avx512: bool,
     /// Whether to suppress linker relaxation (-mno-relax, RISC-V only).
     /// When true, the codegen emits `.option norelax` at the top of the
     /// assembly output, which prevents the GNU assembler from generating

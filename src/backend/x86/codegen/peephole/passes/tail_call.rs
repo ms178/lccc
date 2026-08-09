@@ -3,12 +3,12 @@
 //! This pass detects the pattern where a function call's return value is directly
 //! returned by the enclosing function. The sequence:
 //!     call TARGET      (or call *%r10)
-//!     <callee-save restores from rbp>
+//!     `<callee-save restores from rbp>`
 //!     movq %rbp, %rsp
 //!     popq %rbp
 //!     ret
 //! is transformed to:
-//!     <callee-save restores from rbp>
+//!     `<callee-save restores from rbp>`
 //!     movq %rbp, %rsp
 //!     popq %rbp
 //!     jmp TARGET       (or jmp *%r10)

@@ -5,6 +5,23 @@
 
 use super::*;
 
+fn infer_movext_dst_size(ops: &[Operand]) -> Result<u8, String> {
+    if ops.len() != 2 {
+        return Err("mov extension requires 2 operands".to_string());
+    }
+    match &ops[1] {
+        Operand::Register(dst) => {
+            let size = reg_size(&dst.name);
+            if size == 2 || size == 4 {
+                Ok(size)
+            } else {
+                Err(format!("mov extension destination must be 16/32-bit GP register: {}", dst.name))
+            }
+        }
+        _ => Err("mov extension destination must be a register".to_string()),
+    }
+}
+
 impl super::InstructionEncoder {
     // ---- Instruction-specific encoders ----
 
@@ -291,6 +308,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
@@ -321,12 +339,23 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
             _ => return Err("unsupported movzx operands".to_string()),
         }
         Ok(())
+    }
+
+    pub(super) fn encode_movsx_infer_dst(&mut self, ops: &[Operand], src_size: u8) -> Result<(), String> {
+        let dst_size = infer_movext_dst_size(ops)?;
+        self.encode_movsx(ops, src_size, dst_size)
+    }
+
+    pub(super) fn encode_movzx_infer_dst(&mut self, ops: &[Operand], src_size: u8) -> Result<(), String> {
+        let dst_size = infer_movext_dst_size(ops)?;
+        self.encode_movzx(ops, src_size, dst_size)
     }
 
     pub(super) fn encode_lea(&mut self, ops: &[Operand], _size: u8) -> Result<(), String> {

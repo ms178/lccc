@@ -103,6 +103,12 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
             AsmItem::Byte(vals) => {
                 result.push(AsmItem::Byte(resolve_numeric_data_values(vals, i, &defs)));
             }
+            AsmItem::Uleb128(vals) => {
+                result.push(AsmItem::Uleb128(resolve_numeric_data_values(vals, i, &defs)));
+            }
+            AsmItem::Sleb128(vals) => {
+                result.push(AsmItem::Sleb128(resolve_numeric_data_values(vals, i, &defs)));
+            }
             AsmItem::SkipExpr(expr, fill) => {
                 let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
                 result.push(AsmItem::SkipExpr(new_expr, *fill));

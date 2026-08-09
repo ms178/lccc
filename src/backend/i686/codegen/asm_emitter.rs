@@ -340,7 +340,7 @@ impl InlineAsmEmitter for I686Codegen {
                     IrType::F128 => "fldt",
                     _ => "fldl",
                 };
-                if self.state.is_alloca(ptr.0) {
+                if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
                     self.state.emit_fmt(format_args!("    {} {}", fld_instr, sr));
                 } else {
@@ -362,7 +362,7 @@ impl InlineAsmEmitter for I686Codegen {
         let is_xmm = reg.starts_with("xmm");
         if let Some(slot) = self.state.get_slot(ptr.0) {
             let sr = self.slot_ref(slot);
-            if self.state.is_alloca(ptr.0) {
+            if self.state.is_direct_slot(ptr.0) {
                 if is_xmm {
                     let load_instr = match ty {
                         IrType::F32 => "movss",
@@ -384,30 +384,32 @@ impl InlineAsmEmitter for I686Codegen {
                     self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, dest));
                 }
             } else {
-                // Non-alloca: slot holds a pointer — do indirect load
+                // Indirect slot: the slot contains a pointer to the live storage.
                 if is_pair {
                     self.state.emit_fmt(format_args!("    movl {}, %{}", sr, reg));
                     self.state.emit_fmt(format_args!("    movl 4(%{}), %{}", reg, reg_hi));
                     self.state.emit_fmt(format_args!("    movl (%{}), %{}", reg, reg));
+                } else if is_xmm {
+                    let load_instr = match ty {
+                        IrType::F32 => "movss",
+                        IrType::F64 => "movsd",
+                        _ => "movdqu",
+                    };
+                    self.state.emit("    pushl %ecx");
+                    self.esp_adjust += 4;
+                    self.state.emit_fmt(format_args!("    movl {}, %ecx", sr));
+                    self.state.emit_fmt(format_args!("    {} (%ecx), %{}", load_instr, reg));
+                    self.state.emit("    popl %ecx");
+                    self.esp_adjust -= 4;
                 } else {
                     self.state.emit_fmt(format_args!("    movl {}, %{}", sr, reg));
-                    if is_xmm {
-                        let load_instr = match ty {
-                            IrType::F32 => "movss",
-                            IrType::F64 => "movsd",
-                            _ => "movdqu",
-                        };
-                        self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg, reg));
+                    let load_instr = Self::i686_mov_load_for_type(ty);
+                    let dest = if Self::is_extending_load(load_instr) {
+                        Self::reg_to_32(reg)
                     } else {
-                        let load_instr = Self::i686_mov_load_for_type(ty);
-                        // For zero/sign-extending loads, destination must be 32-bit
-                        let dest = if Self::is_extending_load(load_instr) {
-                            Self::reg_to_32(reg)
-                        } else {
-                            Self::dest_reg_for_type(reg, ty)
-                        };
-                        self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg, dest));
-                    }
+                        Self::dest_reg_for_type(reg, ty)
+                    };
+                    self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg, dest));
                 }
             }
         }

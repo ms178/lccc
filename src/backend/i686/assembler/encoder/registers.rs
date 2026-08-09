@@ -84,7 +84,22 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         | "sgdtl" | "sidtl" | "lgdtl" | "lidtl"
         | "lmsw" | "smsw"
         | "wbinvd" | "invlpg" | "rdpmc"
-        | "ljmpl" | "ljmpw" | "ljmp" | "lret" | "lretl" | "lretq" => return None,
+        | "ljmpl" | "ljmpw" | "ljmp" | "lret" | "lretl" | "lretq"
+        // x87 instructions without AT&T integer-size suffixes.  Several of
+        // these end in b/w/l/q/d but are not GP integer instructions; keeping
+        // them here prevents generic helpers from misclassifying them by the
+        // final character.
+        | "fninit" | "finit" | "fwait" | "wait"
+        | "fnstcw" | "fstcw" | "fldcw"
+        | "fld1" | "fldl2e" | "fldlg2" | "fldln2" | "fldz" | "fldpi" | "fldl2t"
+        | "fabs" | "fsqrt" | "frndint" | "f2xm1" | "fscale" | "fpatan"
+        | "fprem" | "fprem1" | "fyl2x" | "fyl2xp1" | "fptan" | "fsin"
+        | "fcos" | "fsincos" | "fxtract" | "ftst" | "fxam" | "fnclex"
+        | "fclex" | "fxch" | "fnop" | "fincstp" | "fdecstp" | "ffree"
+        | "fadd" | "fmul" | "fsub" | "fdiv" | "fcom" | "fcomp" | "fcompp"
+        | "fcomip" | "fucom" | "fucomp" | "fucomi" | "fucomip" | "fucompp"
+        | "fnstenv" | "fstenv" | "fldenv" | "fnsave" | "fsave" | "frstor"
+        | "fnstsw" | "fstsw" => return None,
         _ => {}
     }
     let last = mnemonic.as_bytes().last()?;
@@ -104,7 +119,8 @@ pub(crate) fn parse_st_num(name: &str) -> Result<u8, String> {
         return Ok(0);
     }
     if name.starts_with("st(") && name.ends_with(')') {
-        let n: u8 = name[3..name.len()-1].parse()
+        let n: u8 = name[3..name.len() - 1]
+            .parse()
             .map_err(|_| format!("bad st register: {}", name))?;
         if n > 7 {
             return Err(format!("st register out of range: {}", name));

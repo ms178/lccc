@@ -11,6 +11,37 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        // A cast OF an x87 bit-pattern value (LDFabs/LDCopysign result,
+        // tracked in f128_direct_slots) is a no-op regardless of the source
+        // type in the IR (the value is already the 16-byte x87 format).
+        // Without this, the I64->F128 cast path ran fildq on the bit pattern
+        // — 0xC000000000000000 (-3.0 x87) became -2^62.
+        if to_ty == IrType::F128 && from_ty != IrType::F128 {
+            if let Operand::Value(v) = src {
+                if self.state.f128_direct_slots.contains(&v.0) {
+                    // Pure type relabel: the 16 bytes are already the x87
+                    // format. Propagate the marker to dest and copy the
+                    // payload; the cast must NOT run the integer (fildq)
+                    // conversion below. F128 SSA temps hold the value
+                    // directly in their slot (resolve_slot_addr calls
+                    // non-allocas "Indirect", but that only applies to
+                    // pointer-holding slots), so copy straight to
+                    // get_slot(dest) — a Direct-only copy silently dropped
+                    // the payload for every non-alloca dest (the return then
+                    // fldt'ed the uninitialized slot).
+                    self.state.f128_direct_slots.insert(dest.0);
+                    if let (Some(src_slot), Some(dest_slot)) =
+                        (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                    {
+                        if src_slot.0 != dest_slot.0 {
+                            self.state.out.emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
+                            self.state.out.emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         // Intercept casts TO F128: produce full 80-bit x87 value in dest slot.
         if to_ty == IrType::F128 && from_ty != IrType::F128 && !is_i128_type(from_ty) {
             if let Some(dest_slot) = self.state.get_slot(dest.0) {

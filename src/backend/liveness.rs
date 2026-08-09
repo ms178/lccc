@@ -19,15 +19,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrConst,
-    IrFunction,
-    Operand,
-    Terminator,
-    Value,
-};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value};
 
 /// A live interval for an IR value: [start, end] in program point numbering.
 /// start = the point where the value is defined
@@ -64,7 +56,9 @@ impl BitSet {
     /// Create a new empty bitset that can hold indices [0..num_bits).
     fn new(num_bits: usize) -> Self {
         let num_words = num_bits.div_ceil(64);
-        Self { words: vec![0u64; num_words] }
+        Self {
+            words: vec![0u64; num_words],
+        }
     }
 
     #[inline(always)]
@@ -93,7 +87,12 @@ impl BitSet {
     }
 
     /// Computes: self = gen ∪ (out - kill) in one pass. Returns true if self changed.
-    fn assign_gen_union_out_minus_kill(&mut self, gen: &BitSet, out: &BitSet, kill: &BitSet) -> bool {
+    fn assign_gen_union_out_minus_kill(
+        &mut self,
+        gen: &BitSet,
+        out: &BitSet,
+        kill: &BitSet,
+    ) -> bool {
         let mut changed = false;
         for i in 0..self.words.len() {
             let new_val = gen.words[i] | (out.words[i] & !kill.words[i]);
@@ -108,7 +107,9 @@ impl BitSet {
     /// Iterate over all set bits, calling f(bit_index) for each.
     fn for_each_set_bit(&self, mut f: impl FnMut(usize)) {
         for (word_idx, &word) in self.words.iter().enumerate() {
-            if word == 0 { continue; }
+            if word == 0 {
+                continue;
+            }
             let base = word_idx * 64;
             let mut w = word;
             while w != 0 {
@@ -153,7 +154,11 @@ struct ProgramPointState {
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult {
+            intervals: Vec::new(),
+            call_points: Vec::new(),
+            block_loop_depth: Vec::new(),
+        };
     }
 
     // Debug: trace phi references for GetToken return value
@@ -163,19 +168,33 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     let num_values = value_ids.len();
     if num_values == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult {
+            intervals: Vec::new(),
+            call_points: Vec::new(),
+            block_loop_depth: Vec::new(),
+        };
     }
 
     // Phase 1: Assign program points and build gen/kill sets.
     let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
 
     // Phase 1b: Extend liveness of GEP base values for GEP folding.
-    extend_gep_base_liveness(func, &alloca_set, &id_to_dense,
-        &mut ps.last_use_points, &mut ps.block_gen);
+    extend_gep_base_liveness(
+        func,
+        &alloca_set,
+        &id_to_dense,
+        &mut ps.last_use_points,
+        &mut ps.block_gen,
+    );
 
     // Phase 1c: Extend liveness for F128 source pointers.
-    extend_f128_source_liveness(func, &alloca_set, &id_to_dense,
-        &mut ps.last_use_points, &mut ps.block_gen);
+    extend_f128_source_liveness(
+        func,
+        &alloca_set,
+        &id_to_dense,
+        &mut ps.last_use_points,
+        &mut ps.block_gen,
+    );
 
     // Phase 2: Build successor lists for the CFG.
     let successors = build_successor_lists(func, num_blocks, &ps.block_id_to_idx);
@@ -185,19 +204,30 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     // Phase 3: Backward dataflow to compute live-in/live-out per block.
     let (live_in, live_out) = run_backward_dataflow(
-        num_blocks, num_values, &successors, &ps.block_gen, &ps.block_kill,
+        num_blocks,
+        num_values,
+        &successors,
+        &ps.block_gen,
+        &ps.block_kill,
     );
 
     // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
     extend_intervals_from_liveness(
-        num_blocks, &live_in, &live_out,
-        &ps.block_start_points, &ps.block_end_points,
-        &mut ps.def_points, &mut ps.last_use_points,
+        num_blocks,
+        &live_in,
+        &live_out,
+        &ps.block_start_points,
+        &ps.block_end_points,
+        &mut ps.def_points,
+        &mut ps.last_use_points,
     );
 
     // Phase 4b: Handle setjmp/longjmp.
     extend_intervals_for_setjmp(
-        &ps.setjmp_block_indices, ps.num_points, &live_in, &live_out,
+        &ps.setjmp_block_indices,
+        ps.num_points,
+        &live_in,
+        &live_out,
         &mut ps.last_use_points,
     );
 
@@ -226,11 +256,17 @@ fn collect_alloca_set(func: &IrFunction) -> FxHashSet<u32> {
 
 /// Collect all non-alloca value IDs and build a dense remapping:
 /// sparse value_id -> dense index in [0..num_values).
-fn build_dense_value_map(func: &IrFunction, alloca_set: &FxHashSet<u32>) -> (Vec<u32>, FxHashMap<u32, usize>) {
+fn build_dense_value_map(
+    func: &IrFunction,
+    alloca_set: &FxHashSet<u32>,
+) -> (Vec<u32>, FxHashMap<u32, usize>) {
     let mut value_ids: Vec<u32> = Vec::new();
     let mut seen: FxHashSet<u32> = FxHashSet::default();
 
-    let maybe_add = |id: u32, alloca_set: &FxHashSet<u32>, seen: &mut FxHashSet<u32>, value_ids: &mut Vec<u32>| {
+    let maybe_add = |id: u32,
+                     alloca_set: &FxHashSet<u32>,
+                     seen: &mut FxHashSet<u32>,
+                     value_ids: &mut Vec<u32>| {
         if !alloca_set.contains(&id) && seen.insert(id) {
             value_ids.push(id);
         }
@@ -315,7 +351,9 @@ fn assign_program_points(
                 Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
                     call_points.push(point);
                 }
-                Instruction::InlineAsm { outputs, inputs, .. } => {
+                Instruction::InlineAsm {
+                    outputs, inputs, ..
+                } => {
                     // Only treat as call point if the asm has register operands
                     // (outputs or inputs that bind to GP registers).
                     if !outputs.is_empty() || !inputs.is_empty() {
@@ -339,7 +377,10 @@ fn assign_program_points(
                 // assembly level, clobbering all caller-saved registers.
                 Instruction::BinOp { op, ty, .. }
                     if matches!(ty, IrType::I128 | IrType::U128)
-                        && matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) =>
+                        && matches!(
+                            op,
+                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+                        ) =>
                 {
                     call_points.push(point);
                 }
@@ -353,7 +394,13 @@ fn assign_program_points(
                 _ => {}
             }
 
-            record_instruction_uses_dense(inst, point, alloca_set, id_to_dense, &mut last_use_points);
+            record_instruction_uses_dense(
+                inst,
+                point,
+                alloca_set,
+                id_to_dense,
+                &mut last_use_points,
+            );
 
             // Record InlineAsm output definitions BEFORE gen collection so
             // that promoted (non-alloca) outputs are in the kill set and won't
@@ -396,7 +443,13 @@ fn assign_program_points(
             point += 1;
         }
 
-        record_terminator_uses_dense(&block.terminator, point, alloca_set, id_to_dense, &mut last_use_points);
+        record_terminator_uses_dense(
+            &block.terminator,
+            point,
+            alloca_set,
+            id_to_dense,
+            &mut last_use_points,
+        );
         collect_terminator_gen_dense(&block.terminator, alloca_set, id_to_dense, &kill, &mut gen);
         let block_end = point;
         block_end_points.push(block_end);
@@ -418,7 +471,9 @@ fn assign_program_points(
             if let Instruction::Phi { incoming, .. } = inst {
                 for (op, pred_label) in incoming {
                     if let Operand::Value(v) = op {
-                        if alloca_set.contains(&v.0) { continue; }
+                        if alloca_set.contains(&v.0) {
+                            continue;
+                        }
                         if let Some(&dense) = id_to_dense.get(&v.0) {
                             if let Some(&pred_idx) = block_id_to_idx.get(&pred_label.0) {
                                 let pred_end = block_end_points[pred_idx];
@@ -516,7 +571,9 @@ fn run_backward_dataflow(
             }
 
             let in_changed = live_in[idx].assign_gen_union_out_minus_kill(
-                &block_gen[idx], &live_out[idx], &block_kill[idx]
+                &block_gen[idx],
+                &live_out[idx],
+                &block_kill[idx],
             );
             changed |= in_changed;
         }
@@ -600,14 +657,28 @@ fn extend_intervals_for_setjmp(
 }
 
 /// Phase 5: Build sorted live intervals from def/use point arrays.
-fn build_intervals(value_ids: &[u32], def_points: &[u32], last_use_points: &[u32]) -> Vec<LiveInterval> {
+fn build_intervals(
+    value_ids: &[u32],
+    def_points: &[u32],
+    last_use_points: &[u32],
+) -> Vec<LiveInterval> {
     let mut intervals: Vec<LiveInterval> = Vec::new();
     for (dense_idx, &vid) in value_ids.iter().enumerate() {
         let start = def_points[dense_idx];
-        if start == u32::MAX { continue; }
+        if start == u32::MAX {
+            continue;
+        }
         let end = last_use_points[dense_idx];
-        let end = if end == u32::MAX { start } else { end.max(start) };
-        intervals.push(LiveInterval { start, end, value_id: vid });
+        let end = if end == u32::MAX {
+            start
+        } else {
+            end.max(start)
+        };
+        intervals.push(LiveInterval {
+            start,
+            end,
+            value_id: vid,
+        });
     }
     intervals.sort_unstable_by_key(|iv| iv.start);
     intervals
@@ -639,7 +710,12 @@ fn extend_gep_base_liveness(
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } => {
                     // Constant-offset GEP: foldable into Load/Store addressing mode
                     if alloca_set.contains(&base.0) {
                         continue;
@@ -655,7 +731,12 @@ fn extend_gep_base_liveness(
                         gep_info.insert(dest.0, (base.0, offset_val));
                     }
                 }
-                Instruction::GetElementPtr { dest, base, offset: Operand::Value(_), .. } => {
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Value(_),
+                    ..
+                } => {
                     // Variable-offset GEP: may be used for SIB indexed addressing.
                     // The base pointer must stay live until the Load/Store that uses
                     // this GEP result, otherwise the register allocator may reuse the
@@ -683,10 +764,9 @@ fn extend_gep_base_liveness(
             match inst {
                 Instruction::Load { ptr, ty, .. } => {
                     // Load.ptr is foldable unless i128
-                    if matches!(ty, IrType::I128 | IrType::U128)
-                        && gep_info.contains_key(&ptr.0) {
-                            non_foldable.insert(ptr.0);
-                        }
+                    if matches!(ty, IrType::I128 | IrType::U128) && gep_info.contains_key(&ptr.0) {
+                        non_foldable.insert(ptr.0);
+                    }
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
                     // Store.val is NOT foldable; Store.ptr is (unless i128)
@@ -695,10 +775,9 @@ fn extend_gep_base_liveness(
                             non_foldable.insert(v.0);
                         }
                     }
-                    if matches!(ty, IrType::I128 | IrType::U128)
-                        && gep_info.contains_key(&ptr.0) {
-                            non_foldable.insert(ptr.0);
-                        }
+                    if matches!(ty, IrType::I128 | IrType::U128) && gep_info.contains_key(&ptr.0) {
+                        non_foldable.insert(ptr.0);
+                    }
                 }
                 _ => {
                     // Any other use invalidates folding
@@ -752,8 +831,11 @@ fn extend_gep_base_liveness(
                         // too. This prevents the register allocator from reusing
                         // the source's register before the fold-based load.
                         let mut extend_id = base_id;
-                        for _ in 0..10 { // max Copy chain depth
-                            if alloca_set.contains(&extend_id) { break; }
+                        for _ in 0..10 {
+                            // max Copy chain depth
+                            if alloca_set.contains(&extend_id) {
+                                break;
+                            }
                             let debug_liveness = std::env::var("CCC_DEBUG_LIVENESS").is_ok();
                             if let Some(&dense) = id_to_dense.get(&extend_id) {
                                 let entry = &mut last_use_points[dense];
@@ -771,7 +853,11 @@ fn extend_gep_base_liveness(
                             let mut found_copy_src = None;
                             for b in &func.blocks {
                                 for i in &b.instructions {
-                                    if let Instruction::Copy { dest, src: Operand::Value(s) } = i {
+                                    if let Instruction::Copy {
+                                        dest,
+                                        src: Operand::Value(s),
+                                    } = i
+                                    {
                                         if dest.0 == extend_id {
                                             found_copy_src = Some(s.0);
                                         }
@@ -993,12 +1079,16 @@ fn collect_terminator_gen_dense(
 fn terminator_targets(term: &Terminator) -> Vec<u32> {
     match term {
         Terminator::Branch(target) => vec![target.0],
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             vec![true_label.0, false_label.0]
         }
-        Terminator::IndirectBranch { possible_targets, .. } => {
-            possible_targets.iter().map(|t| t.0).collect()
-        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => possible_targets.iter().map(|t| t.0).collect(),
         Terminator::Switch { cases, default, .. } => {
             let mut targets = vec![default.0];
             for (_, label) in cases {
@@ -1015,7 +1105,10 @@ fn terminator_targets(term: &Terminator) -> Vec<u32> {
 /// Values live at the call point must have their intervals extended to prevent stack slot reuse.
 fn is_returns_twice_call(inst: &Instruction) -> bool {
     if let Instruction::Call { func, .. } = inst {
-        matches!(func.as_str(), "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp")
+        matches!(
+            func.as_str(),
+            "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp"
+        )
     } else {
         false
     }
@@ -1025,17 +1118,32 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
 /// This is the single canonical source of truth for instruction operand traversal.
 /// All code that needs to enumerate operands (liveness, use-counting, GEP fold
 /// verification) should call this rather than hand-rolling its own match.
-pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl FnMut(&Operand)) {
+pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl FnMut(&Operand)) {
     match inst {
         Instruction::Alloca { .. } => {}
         Instruction::DynAlloca { size, .. } => f(size),
         Instruction::Store { val, .. } => f(val),
         Instruction::Load { .. } => {}
-        Instruction::BinOp { lhs, rhs, .. } => { f(lhs); f(rhs); }
+        Instruction::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
         Instruction::UnaryOp { src, .. } => f(src),
-        Instruction::Cmp { lhs, rhs, .. } => { f(lhs); f(rhs); }
-        Instruction::Call { info, .. } => { for a in &info.args { f(a); } }
-        Instruction::CallIndirect { func_ptr, info } => { f(func_ptr); for a in &info.args { f(a); } }
+        Instruction::Cmp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        Instruction::Call { info, .. } => {
+            for a in &info.args {
+                f(a);
+            }
+        }
+        Instruction::CallIndirect { func_ptr, info } => {
+            f(func_ptr);
+            for a in &info.args {
+                f(a);
+            }
+        }
         Instruction::GetElementPtr { offset, .. } => f(offset),
         Instruction::Cast { src, .. } => f(src),
         Instruction::Copy { src, .. } => f(src),
@@ -1046,24 +1154,59 @@ pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
         Instruction::VaEnd { .. } => {}
         Instruction::VaCopy { .. } => {}
         Instruction::VaArgStruct { .. } => {}
-        Instruction::AtomicRmw { ptr, val, .. } => { f(ptr); f(val); }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => { f(ptr); f(expected); f(desired); }
+        Instruction::AtomicRmw { ptr, val, .. } => {
+            f(ptr);
+            f(val);
+        }
+        Instruction::AtomicInc { ptr, .. } => f(ptr),
+        Instruction::AtomicCmpxchg {
+            ptr,
+            expected,
+            desired,
+            ..
+        } => {
+            f(ptr);
+            f(expected);
+            f(desired);
+        }
         Instruction::AtomicLoad { ptr, .. } => f(ptr),
-        Instruction::AtomicStore { ptr, val, .. } => { f(ptr); f(val); }
+        Instruction::AtomicStore { ptr, val, .. } => {
+            f(ptr);
+            f(val);
+        }
         Instruction::Fence { .. } => {}
-        Instruction::Phi { incoming, .. } => { for (op, _) in incoming { f(op); } }
+        Instruction::Phi { incoming, .. } => {
+            for (op, _) in incoming {
+                f(op);
+            }
+        }
         Instruction::LabelAddr { .. } => {}
         Instruction::GetReturnF64Second { .. } => {}
         Instruction::SetReturnF64Second { src } => f(src),
         Instruction::GetReturnF32Second { .. } => {}
         Instruction::SetReturnF32Second { src } => f(src),
-        Instruction::GetReturnF128Second { .. } => {},
+        Instruction::GetReturnF128Second { .. } => {}
         Instruction::SetReturnF128Second { src } => f(src),
         Instruction::InlineAsm { inputs, .. } => {
-            for (_, op, _) in inputs { f(op); }
+            for (_, op, _) in inputs {
+                f(op);
+            }
         }
-        Instruction::Intrinsic { args, .. } => { for a in args { f(a); } }
-        Instruction::Select { cond, true_val, false_val, .. } => { f(cond); f(true_val); f(false_val); }
+        Instruction::Intrinsic { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
+            f(cond);
+            f(true_val);
+            f(false_val);
+        }
         Instruction::StackSave { .. } => {}
         Instruction::StackRestore { .. } => {}
         Instruction::ParamRef { .. } => {}
@@ -1074,21 +1217,38 @@ pub(super) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
 /// These are pointer/base values used directly (not wrapped in Operand),
 /// e.g., the `ptr` in Store/Load, `base` in GEP, `dest`/`src` in Memcpy.
 /// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
-pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl FnMut(&Value)) {
+pub(crate) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl FnMut(&Value)) {
     match inst {
         Instruction::Store { ptr, .. } => f(ptr),
         Instruction::Load { ptr, .. } => f(ptr),
         Instruction::GetElementPtr { base, .. } => f(base),
-        Instruction::Memcpy { dest, src, .. } => { f(dest); f(src); }
+        Instruction::Memcpy { dest, src, .. } => {
+            f(dest);
+            f(src);
+        }
         Instruction::VaArg { va_list_ptr, .. } => f(va_list_ptr),
         Instruction::VaStart { va_list_ptr } => f(va_list_ptr),
         Instruction::VaEnd { va_list_ptr } => f(va_list_ptr),
-        Instruction::VaCopy { dest_ptr, src_ptr } => { f(dest_ptr); f(src_ptr); }
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => { f(dest_ptr); f(va_list_ptr); }
-        Instruction::InlineAsm { outputs, .. } => {
-            for (_, v, _) in outputs { f(v); }
+        Instruction::VaCopy { dest_ptr, src_ptr } => {
+            f(dest_ptr);
+            f(src_ptr);
         }
-        Instruction::Intrinsic { dest_ptr: Some(dp), .. } => {
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            ..
+        } => {
+            f(dest_ptr);
+            f(va_list_ptr);
+        }
+        Instruction::InlineAsm { outputs, .. } => {
+            for (_, v, _) in outputs {
+                f(v);
+            }
+        }
+        Instruction::Intrinsic {
+            dest_ptr: Some(dp), ..
+        } => {
             f(dp);
         }
         Instruction::StackRestore { ptr } => f(ptr),
@@ -1098,7 +1258,7 @@ pub(super) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl 
 
 /// Iterate over all Operand references in a terminator.
 /// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
-pub(super) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMut(&Operand)) {
+pub(crate) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMut(&Operand)) {
     match term {
         Terminator::Return(Some(op)) => f(op),
         Terminator::CondBranch { cond, .. } => f(cond),
@@ -1219,7 +1379,8 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 Instruction::BinOp {
-                    dest: Value(0), op: IrBinOp::Add,
+                    dest: Value(0),
+                    op: IrBinOp::Add,
                     lhs: Operand::Const(IrConst::I32(1)),
                     rhs: Operand::Const(IrConst::I32(2)),
                     ty: IrType::I32,
@@ -1243,8 +1404,10 @@ mod tests {
 
         let result = compute_live_intervals(&func);
         // The InlineAsm instruction should appear as a call point
-        assert!(!result.call_points.is_empty(),
-            "InlineAsm with register operands should be a call point");
+        assert!(
+            !result.call_points.is_empty(),
+            "InlineAsm with register operands should be a call point"
+        );
     }
 
     /// Verify that empty inline asm barriers (no inputs/outputs) are NOT call points.
@@ -1257,7 +1420,8 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 Instruction::BinOp {
-                    dest: Value(0), op: IrBinOp::Add,
+                    dest: Value(0),
+                    op: IrBinOp::Add,
                     lhs: Operand::Const(IrConst::I32(1)),
                     rhs: Operand::Const(IrConst::I32(2)),
                     ty: IrType::I32,
@@ -1281,7 +1445,9 @@ mod tests {
 
         let result = compute_live_intervals(&func);
         // Call points should only contain the calls, not the empty barrier
-        assert!(result.call_points.is_empty(),
-            "Empty inline asm barriers should NOT be call points");
+        assert!(
+            result.call_points.is_empty(),
+            "Empty inline asm barriers should NOT be call points"
+        );
     }
 }

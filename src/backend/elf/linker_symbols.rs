@@ -118,6 +118,8 @@ pub fn get_standard_linker_symbols(addrs: &LinkerSymbolAddresses) -> Vec<LinkerD
 pub fn section_index(section_name: &str, content_sections: &[String], shndx_offset: u16) -> u16 {
     if section_name == "*COM*" {
         SHN_COMMON
+    } else if section_name == "*ABS*" {
+        SHN_ABS
     } else if section_name == "*UND*" || section_name.is_empty() {
         SHN_UNDEF
     } else {

@@ -10,12 +10,153 @@ use super::types::{GlobalSymbol, PAGE_SIZE};
 use super::emit_exec::resolve_sym;
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
+
+/// Strip the .symver version suffix from a linker symbol name:
+/// "foo@@GLIBC_2.34" / "foo@GLIBC_2.2.5" -> "foo".
+fn sym_base(name: &str) -> String {
+    if let Some(pos) = name.find('@') {
+        name[..pos].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VersionScript {
+    version_name: String,
+    global_patterns: Vec<String>,
+    local_star: bool,
+}
+
+impl VersionScript {
+    fn parse(path: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let text = strip_version_script_comments(&text);
+        let open = text.find('{')?;
+        let version_name = text[..open].split_whitespace().next()?.trim().to_string();
+        if version_name.is_empty() { return None; }
+
+        let close = text[open + 1..].find('}')? + open + 1;
+        let body = &text[open + 1..close];
+        let mut global_patterns = Vec::new();
+        let mut local_star = false;
+        let mut mode: Option<&str> = None;
+
+        for segment in body.split(';') {
+            let mut t = segment.trim();
+            if t.is_empty() { continue; }
+
+            if let Some(pos) = t.find("global:") {
+                mode = Some("global");
+                t = t[pos + "global:".len()..].trim();
+            }
+            if let Some(pos) = t.find("local:") {
+                mode = Some("local");
+                t = t[pos + "local:".len()..].trim();
+            }
+            if t.is_empty() { continue; }
+
+            // Version scripts normally list one pattern per semicolon, but allow
+            // whitespace-separated patterns as a robustness improvement.
+            for pat in t.split_whitespace() {
+                let pat = pat.trim().trim_matches(';').trim();
+                if pat.is_empty() { continue; }
+                match mode {
+                    Some("global") => global_patterns.push(pat.to_string()),
+                    Some("local") if pat == "*" => local_star = true,
+                    _ => {}
+                }
+            }
+        }
+
+        Some(Self { version_name, global_patterns, local_star })
+    }
+
+    fn matches_global(&self, name: &str) -> bool {
+        self.global_patterns.iter().any(|pat| wildcard_match(pat, name))
+    }
+}
+
+fn strip_version_script_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else if bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    if pattern == "*" { return true; }
+    if !pattern.contains('*') { return pattern == text; }
+    let mut rest = text;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() { continue; }
+        if first && !pattern.starts_with('*') {
+            if !rest.starts_with(part) { return false; }
+            rest = &rest[part.len()..];
+        } else if let Some(pos) = rest.find(part) {
+            rest = &rest[pos + part.len()..];
+        } else {
+            return false;
+        }
+        first = false;
+    }
+    pattern.ends_with('*') || rest.is_empty()
+}
+
+fn push_verdef_entry(buf: &mut Vec<u8>, index: u16, name: &str, name_off: usize, next: u32) {
+    let start = buf.len();
+    buf.resize(start + 20, 0);
+    let name_off32 = name_off as u32;
+    debug_assert_eq!(name_off32 as usize, name_off);
+    // Elf64_Verdef: vd_version, vd_flags, vd_ndx, vd_cnt, vd_hash, vd_aux, vd_next
+    w16(buf, start, 1);
+    w16(buf, start + 2, if index == 1 { 1 } else { 0 }); // VER_FLG_BASE for base
+    w16(buf, start + 4, index);
+    w16(buf, start + 6, 1);
+    w32(buf, start + 8, elf_hash_name(name));
+    w32(buf, start + 12, 20);
+    w32(buf, start + 16, next);
+    let aux = buf.len();
+    buf.resize(aux + 8, 0);
+    // Elf64_Verdaux: vda_name, vda_next
+    w32(buf, aux, name_off32);
+    w32(buf, aux + 4, 0);
+}
+
+fn elf_hash_name(name: &str) -> u32 {
+    let mut h: u32 = 0;
+    for b in name.bytes() {
+        h = (h << 4).wrapping_add(b as u32);
+        let g = h & 0xf0000000;
+        if g != 0 { h ^= g >> 24; }
+        h &= !g;
+    }
+    h
+}
+
+
 pub(super) fn emit_shared_library(
     objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
     section_map: &HashMap<(usize, usize), (usize, u64)>,
     needed_sonames: &[String], output_path: &str,
     soname: Option<String>, rpath_entries: &[String], use_runpath: bool,
+    version_script_path: Option<&str>,
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
 
@@ -27,6 +168,7 @@ pub(super) fn emit_shared_library(
         dynstr.add(&s);
         Some(s)
     };
+    let version_script = version_script_path.and_then(VersionScript::parse);
 
     // Identify symbols that need PLT entries: any symbol referenced via
     // R_X86_64_PLT32 or R_X86_64_PC32 that is not defined locally.
@@ -150,10 +292,22 @@ pub(super) fn emit_shared_library(
     // Collect all defined global symbols for export
     let mut dyn_sym_names: Vec<String> = Vec::new();
     let mut exported: Vec<String> = globals.iter()
-        .filter(|(_, g)| {
-            g.defined_in.is_some() && !g.is_dynamic
+        .filter(|(name, g)| {
+            if !(g.defined_in.is_some() && !g.is_dynamic
                 && (g.info >> 4) != 0 // not STB_LOCAL
-                && g.section_idx != SHN_UNDEF
+                && g.section_idx != SHN_UNDEF) {
+                return false;
+            }
+            // GNU version scripts commonly use `local: *;` to hide all symbols
+            // except listed API patterns.  Honor that for shared libraries so
+            // FFmpeg-style DSOs expose the intended ABI and produce versioned
+            // dynamic symbols for consumers like mpv.
+            if let Some(ref vs) = version_script {
+                if vs.local_star && !vs.matches_global(name) {
+                    return false;
+                }
+            }
+            true
         })
         .map(|(n, _)| n.clone())
         .collect();
@@ -173,14 +327,51 @@ pub(super) fn emit_shared_library(
         }
     }
 
-    // Ensure all symbols referenced by R_X86_64_64 data relocations are in dynsym
+    // Ensure externally-versioned symbols referenced by R_X86_64_64 data
+    // relocations are in dynsym.  Version-script-local definitions are resolved
+    // with RELATIVE relocations below and must not be re-exported here.
     for name in &abs64_sym_names {
-        if !dyn_sym_names.contains(name) {
+        let is_version_local = version_script.as_ref().is_some_and(|vs|
+            vs.local_star && !vs.matches_global(name));
+        if !is_version_local && !dyn_sym_names.contains(name) {
             dyn_sym_names.push(name.clone());
         }
     }
 
-    for name in &dyn_sym_names { dynstr.add(name); }
+    // Split .symver-derived names ("foo@@GLIBC_2.34", "foo@GLIBC_2.2.5")
+    // into (base name, version, is_default). The .dynstr holds base names;
+    // versions become verdef nodes. Without this, ld cannot bind unversioned
+    // references (e.g. __libc_start_main) against the DSO.
+    let mut sym_versions: Vec<(String, Option<String>, bool)> = Vec::new();
+    let mut version_set: Vec<String> = Vec::new();
+    for name in &dyn_sym_names {
+        if let Some(pos) = name.find("@@") {
+            let base = name[..pos].to_string();
+            let ver = name[pos + 2..].to_string();
+            if !version_set.contains(&ver) { version_set.push(ver.clone()); }
+            dynstr.add(&base);
+            sym_versions.push((base, Some(ver), true));
+        } else if let Some(pos) = name.find('@') {
+            let base = name[..pos].to_string();
+            let ver = name[pos + 1..].to_string();
+            if !version_set.contains(&ver) { version_set.push(ver.clone()); }
+            dynstr.add(&base);
+            sym_versions.push((base, Some(ver), false));
+        } else {
+            dynstr.add(name);
+            sym_versions.push((name.clone(), None, false));
+        }
+    }
+    // Version node names must be in .dynstr BEFORE dynstr_size is computed.
+    for v in &version_set {
+        dynstr.add(v);
+    }
+    let versioned_name = version_script.as_ref().map(|vs| vs.version_name.clone());
+    let base_version_name = soname.clone().unwrap_or_else(|| output_path.rsplit('/').next().unwrap_or(output_path).to_string());
+    if let Some(ref vn) = versioned_name {
+        dynstr.add(&base_version_name);
+        dynstr.add(vn);
+    }
 
     let dynsym_count = 1 + dyn_sym_names.len();
     let dynsym_size = dynsym_count as u64 * 24;
@@ -219,7 +410,7 @@ pub(super) fn emit_shared_library(
     let gnu_hash_bloom_shift: u32 = 6;
 
     let hashed_sym_hashes: Vec<u32> = defined_syms.iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
+        .map(|name| linker_common::gnu_hash(sym_base(name).as_bytes()))
         .collect();
 
     let mut bloom_words: Vec<u64> = vec![0u64; gnu_hash_bloom_size as usize];
@@ -243,7 +434,7 @@ pub(super) fn emit_shared_library(
     }
 
     let hashed_sym_hashes: Vec<u32> = dyn_sym_names[undef_syms.len()..].iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
+        .map(|name| linker_common::gnu_hash(sym_base(name).as_bytes()))
         .collect();
 
     let mut gnu_hash_buckets = vec![0u32; gnu_hash_nbuckets as usize];
@@ -266,6 +457,53 @@ pub(super) fn emit_shared_library(
         gnu_hash_chains[last_in_bucket] |= 1;
     }
 
+
+    let (versym_data, verdef_data, verdef_count): (Vec<u8>, Vec<u8>, u64) = if !version_set.is_empty() {
+        // Proper GNU versioning from the objects' .symver names: one verdef
+        // node per version; each dynsym entry's versym index selects its node.
+        // The base node (1) carries the SONAME.
+        let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
+        versym.extend_from_slice(&0u16.to_le_bytes()); // dynsym[0]
+        for (_, ver, _) in &sym_versions {
+            let idx: u16 = match ver {
+                Some(v) => 2 + version_set.iter().position(|x| x == v).unwrap_or(0) as u16,
+                None => 1,
+            };
+            versym.extend_from_slice(&idx.to_le_bytes());
+        }
+        let mut verdef = Vec::new();
+        let base_off = dynstr.get_offset(&base_version_name);
+        push_verdef_entry(&mut verdef, 1, &base_version_name, base_off, 28);
+        for (i, v) in version_set.iter().enumerate() {
+            let voff = dynstr.get_offset(v);
+            push_verdef_entry(&mut verdef, (2 + i) as u16, v, voff, 0);
+        }
+        (versym, verdef, 1 + version_set.len() as u64)
+    } else if let Some(ref vn) = versioned_name {
+        let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
+        versym.extend_from_slice(&0u16.to_le_bytes());
+        for name in &dyn_sym_names {
+            let idx: u16 = if let Some(g) = globals.get(name) {
+                if g.defined_in.is_some() && g.section_idx != SHN_UNDEF {
+                    2
+                } else {
+                    1
+                }
+            } else { 1 };
+            versym.extend_from_slice(&idx.to_le_bytes());
+        }
+        let mut verdef = Vec::new();
+        let base_off = dynstr.get_offset(&base_version_name);
+        let ver_off = dynstr.get_offset(vn);
+        push_verdef_entry(&mut verdef, 1, &base_version_name, base_off, 28);
+        push_verdef_entry(&mut verdef, 2, vn, ver_off, 0);
+        (versym, verdef, 2)
+    } else {
+        (Vec::new(), Vec::new(), 0)
+    };
+    let versym_size = versym_data.len() as u64;
+    let verdef_size = verdef_data.len() as u64;
+
     let gnu_hash_size: u64 = 16 + (gnu_hash_bloom_size as u64 * 8)
         + (gnu_hash_nbuckets as u64 * 4) + (num_hashed as u64 * 4);
 
@@ -284,6 +522,7 @@ pub(super) fn emit_shared_library(
     if has_fini_array { dyn_count += 2; }
     if !plt_names.is_empty() { dyn_count += 4; } // DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL, DT_JMPREL
     if rpath_string.is_some() { dyn_count += 1; } // DT_RUNPATH or DT_RPATH
+    if verdef_count > 0 { dyn_count += 3; } // DT_VERSYM, DT_VERDEF, DT_VERDEFNUM
     let dynamic_size = dyn_count * 16;
 
     let has_tls_sections = output_sections.iter().any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
@@ -342,6 +581,10 @@ pub(super) fn emit_shared_library(
     offset = (offset + 7) & !7;
     let dynsym_offset = offset; let dynsym_addr = base_addr + offset; offset += dynsym_size;
     let dynstr_offset = offset; let dynstr_addr = base_addr + offset; offset += dynstr_size;
+    offset = (offset + 1) & !1;
+    let versym_offset = offset; let versym_addr = base_addr + offset; offset += versym_size;
+    offset = (offset + 7) & !7;
+    let verdef_offset = offset; let verdef_addr = base_addr + offset; offset += verdef_size;
 
     // Text segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -621,7 +864,16 @@ pub(super) fn emit_shared_library(
     // Program headers
     let mut ph = 64usize;
     wphdr(&mut out, ph, PT_PHDR, PF_R, 64, base_addr + 64, phdr_total_size, phdr_total_size, 8); ph += 56;
-    let ro_seg_end = dynstr_offset + dynstr_size;
+    // Initial read-only metadata segment: ELF/PHDR + dynamic lookup tables.
+    // Keep provider-side version sections inside this LOAD segment; linkers and
+    // dynamic loaders expect DT_VERSYM/DT_VERDEF virtual addresses to be mapped.
+    let ro_seg_end = if verdef_size > 0 {
+        verdef_offset + verdef_size
+    } else if versym_size > 0 {
+        versym_offset + versym_size
+    } else {
+        dynstr_offset + dynstr_size
+    };
     wphdr(&mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, PAGE_SIZE); ph += 56;
     if text_total_size > 0 {
         wphdr(&mut out, ph, PT_LOAD, PF_R|PF_X, text_page_offset, text_page_addr, text_total_size, text_total_size, PAGE_SIZE); ph += 56;
@@ -664,7 +916,7 @@ pub(super) fn emit_shared_library(
     // .dynsym
     let mut ds = dynsym_offset as usize + 24; // skip null entry
     for name in &dyn_sym_names {
-        let no = dynstr.get_offset(name) as u32;
+        let no = dynstr.get_offset(&sym_base(name)) as u32;
         w32(&mut out, ds, no);
         if let Some(gsym) = globals.get(name) {
             if gsym.defined_in.is_some() && !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF {
@@ -699,8 +951,14 @@ pub(super) fn emit_shared_library(
         ds += 24;
     }
 
-    // .dynstr
+    // .dynstr and provider-side GNU symbol versioning tables.
     write_bytes(&mut out, dynstr_offset as usize, dynstr.as_bytes());
+    if !versym_data.is_empty() {
+        write_bytes(&mut out, versym_offset as usize, &versym_data);
+    }
+    if !verdef_data.is_empty() {
+        write_bytes(&mut out, verdef_offset as usize, &verdef_data);
+    }
 
     // Section data
     for sec in output_sections.iter() {
@@ -839,9 +1097,12 @@ pub(super) fn emit_shared_library(
                         // Named global/weak symbols need R_X86_64_64 dynamic relocs
                         // (with symbol index) to support symbol interposition.
                         // Section symbols and local symbols use R_X86_64_RELATIVE.
+                        let is_version_local = version_script.as_ref().is_some_and(|vs|
+                            vs.local_star && !vs.matches_global(&sym.name));
                         let is_named_global = !sym.name.is_empty()
                             && !sym.is_local()
-                            && sym.sym_type() != STT_SECTION;
+                            && sym.sym_type() != STT_SECTION
+                            && !is_version_local;
                         if is_named_global {
                             abs64_entries.push((p, sym.name.clone(), a));
                         } else if s != 0 {
@@ -996,6 +1257,11 @@ pub(super) fn emit_shared_library(
     ] {
         w64(&mut out, dd, tag as u64); w64(&mut out, dd+8, val); dd += 16;
     }
+    if verdef_count > 0 {
+        w64(&mut out, dd, DT_VERSYM as u64); w64(&mut out, dd+8, versym_addr); dd += 16;
+        w64(&mut out, dd, DT_VERDEF as u64); w64(&mut out, dd+8, verdef_addr); dd += 16;
+        w64(&mut out, dd, DT_VERDEFNUM as u64); w64(&mut out, dd+8, verdef_count); dd += 16;
+    }
     if has_init_array {
         w64(&mut out, dd, DT_INIT_ARRAY as u64); w64(&mut out, dd+8, init_array_addr); dd += 16;
         w64(&mut out, dd, DT_INIT_ARRAYSZ as u64); w64(&mut out, dd+8, init_array_size); dd += 16;
@@ -1022,10 +1288,10 @@ pub(super) fn emit_shared_library(
     let mut shstrtab = vec![0u8]; // null byte at offset 0
     let mut shstr_offsets: HashMap<String, u32> = HashMap::new();
     let known_names = [
-        ".gnu.hash", ".dynsym", ".dynstr",
+        ".gnu.hash", ".dynsym", ".dynstr", ".gnu.version", ".gnu.version_d",
         ".rela.dyn", ".rela.plt", ".plt", ".dynamic",
         ".got", ".got.plt", ".init_array", ".fini_array",
-        ".tdata", ".tbss", ".bss", ".shstrtab",
+        ".tdata", ".tbss", ".bss", ".symtab", ".strtab", ".shstrtab",
     ];
     for name in &known_names {
         let off = shstrtab.len() as u32;
@@ -1053,8 +1319,123 @@ pub(super) fn emit_shared_library(
     let dynsym_shidx: u32 = 2; // NULL=0, .gnu.hash=1, .dynsym=2
     let dynstr_shidx: u32 = 3; // .dynstr=3
 
+    // Map merged output sections to their final section-header indices.
+    let mut out_sec_to_hdr: HashMap<usize, u16> = HashMap::new();
+    let mut next_hdr = 4usize;
+    if versym_size > 0 { next_hdr += 1; }
+    if verdef_size > 0 { next_hdr += 1; }
+    if rela_dyn_size > 0 { next_hdr += 1; }
+    if rela_plt_size > 0 { next_hdr += 1; }
+    if plt_size > 0 { next_hdr += 1; }
+    for (i, sec) in output_sections.iter().enumerate() {
+        if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
+            && sec.name != ".init_array" && sec.name != ".fini_array"
+        {
+            out_sec_to_hdr.insert(i, next_hdr as u16);
+            next_hdr += 1;
+        }
+    }
+    for (i, sec) in output_sections.iter().enumerate() {
+        if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
+            out_sec_to_hdr.insert(i, next_hdr as u16);
+            next_hdr += 1;
+        }
+    }
+    for (i, sec) in output_sections.iter().enumerate() {
+        if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
+            out_sec_to_hdr.insert(i, next_hdr as u16);
+            next_hdr += 1;
+        }
+    }
+    if has_init_array { next_hdr += 1; }
+    if has_fini_array { next_hdr += 1; }
+    next_hdr += 1; // .dynamic
+    if got_plt_size > 0 { next_hdr += 1; }
+    if got_size > 0 { next_hdr += 1; }
+    for (i, sec) in output_sections.iter().enumerate() {
+        if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
+            out_sec_to_hdr.insert(i, next_hdr as u16);
+            next_hdr += 1;
+        }
+    }
+    let symtab_shidx = next_hdr as u16;
+    let strtab_shidx = symtab_shidx + 1;
+
+    // Full static symbol table for GDB, perf, and Callgrind. ELF requires local
+    // entries before globals and sh_info to name the first global index.
+    let mut symtab_entries: Vec<[u8; 24]> = vec![[0u8; 24]];
+    let mut symtab_names: Vec<u8> = vec![0];
+    let mut locals: Vec<(usize, &Symbol)> = objects
+        .iter()
+        .enumerate()
+        .flat_map(|(obj_idx, obj)| {
+            obj.symbols.iter().filter_map(move |sym| {
+                if sym.is_local() && !sym.name.is_empty() && sym.shndx != SHN_UNDEF
+                    && sym.shndx != SHN_ABS
+                    && section_map.contains_key(&(obj_idx, sym.shndx as usize))
+                {
+                    Some((obj_idx, sym))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    locals.sort_by(|(oa, a), (ob, b)| {
+        oa.cmp(ob).then_with(|| a.value.cmp(&b.value)).then_with(|| a.name.cmp(&b.name))
+    });
+    for (obj_idx, sym) in locals {
+        let (oi, sec_off) = section_map[&(obj_idx, sym.shndx as usize)];
+        let Some(&shndx) = out_sec_to_hdr.get(&oi) else { continue };
+        let name_off = symtab_names.len() as u32;
+        symtab_names.extend_from_slice(sym.name.as_bytes());
+        symtab_names.push(0);
+        let mut entry = [0u8; 24];
+        entry[0..4].copy_from_slice(&name_off.to_le_bytes());
+        entry[4] = sym.info;
+        entry[5] = sym.other;
+        entry[6..8].copy_from_slice(&shndx.to_le_bytes());
+        let value = output_sections[oi].addr + sec_off + sym.value;
+        entry[8..16].copy_from_slice(&value.to_le_bytes());
+        entry[16..24].copy_from_slice(&sym.size.to_le_bytes());
+        symtab_entries.push(entry);
+    }
+    let first_global = symtab_entries.len() as u32;
+    let mut global_names: Vec<(&String, &GlobalSymbol)> = globals
+        .iter()
+        .filter(|(_, sym)| sym.defined_in.is_some() && !sym.is_dynamic)
+        .collect();
+    global_names.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, sym) in global_names {
+        let name_off = symtab_names.len() as u32;
+        symtab_names.extend_from_slice(name.as_bytes());
+        symtab_names.push(0);
+        let shndx = if sym.section_idx == SHN_ABS {
+            SHN_ABS
+        } else if sym.section_idx == SHN_COMMON {
+            SHN_COMMON
+        } else if let Some(obj_idx) = sym.defined_in {
+            section_map
+                .get(&(obj_idx, sym.section_idx as usize))
+                .and_then(|(oi, _)| out_sec_to_hdr.get(oi))
+                .copied()
+                .unwrap_or(SHN_ABS)
+        } else {
+            SHN_ABS
+        };
+        let mut entry = [0u8; 24];
+        entry[0..4].copy_from_slice(&name_off.to_le_bytes());
+        entry[4] = sym.info;
+        entry[6..8].copy_from_slice(&shndx.to_le_bytes());
+        entry[8..16].copy_from_slice(&sym.value.to_le_bytes());
+        entry[16..24].copy_from_slice(&sym.size.to_le_bytes());
+        symtab_entries.push(entry);
+    }
+
     // Count total sections to determine .shstrtab index
     let mut sh_count: u16 = 4; // NULL + .gnu.hash + .dynsym + .dynstr
+    if versym_size > 0 { sh_count += 1; }
+    if verdef_size > 0 { sh_count += 1; }
     if rela_dyn_size > 0 { sh_count += 1; }
     if rela_plt_size > 0 { sh_count += 1; }
     if plt_size > 0 { sh_count += 1; }
@@ -1081,16 +1462,27 @@ pub(super) fn emit_shared_library(
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 { sh_count += 1; }
     }
+    sh_count += 2; // .symtab + .strtab
+    debug_assert_eq!(symtab_shidx, sh_count - 2);
+    debug_assert_eq!(strtab_shidx, sh_count - 1);
     let shstrtab_shidx = sh_count; // .shstrtab is the last section
     sh_count += 1;
 
-    // Align and append .shstrtab data
-    while !out.len().is_multiple_of(8) { out.push(0); }
+    while out.len() % 8 != 0 { out.push(0); }
+    let symtab_data_offset = out.len() as u64;
+    for entry in &symtab_entries {
+        out.extend_from_slice(entry);
+    }
+    let symtab_data_size = (symtab_entries.len() * 24) as u64;
+    let strtab_data_offset = out.len() as u64;
+    out.extend_from_slice(&symtab_names);
+
+    while out.len() % 8 != 0 { out.push(0); }
     let shstrtab_data_offset = out.len() as u64;
     out.extend_from_slice(&shstrtab);
 
     // Align section header table to 8 bytes
-    while !out.len().is_multiple_of(8) { out.push(0); }
+    while out.len() % 8 != 0 { out.push(0); }
     let shdr_offset = out.len() as u64;
 
     // Write section headers
@@ -1105,6 +1497,14 @@ pub(super) fn emit_shared_library(
     // .dynstr
     write_shdr_so(&mut out, get_shname(".dynstr"), SHT_STRTAB, SHF_ALLOC,
                dynstr_addr, dynstr_offset, dynstr_size, 0, 0, 1, 0);
+    if versym_size > 0 {
+        write_shdr_so(&mut out, get_shname(".gnu.version"), SHT_GNU_VERSYM, SHF_ALLOC,
+                   versym_addr, versym_offset, versym_size, dynsym_shidx, 0, 2, 2);
+    }
+    if verdef_size > 0 {
+        write_shdr_so(&mut out, get_shname(".gnu.version_d"), SHT_GNU_VERDEF, SHF_ALLOC,
+                   verdef_addr, verdef_offset, verdef_size, dynstr_shidx, verdef_count as u32, 8, 0);
+    }
     // .rela.dyn
     if rela_dyn_size > 0 {
         write_shdr_so(&mut out, get_shname(".rela.dyn"), SHT_RELA, SHF_ALLOC,
@@ -1176,6 +1576,12 @@ pub(super) fn emit_shared_library(
                        sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
         }
     }
+    // Non-allocated static symbols used by profilers and debuggers.
+    write_shdr_so(&mut out, get_shname(".symtab"), SHT_SYMTAB, 0,
+               0, symtab_data_offset, symtab_data_size,
+               strtab_shidx as u32, first_global, 8, 24);
+    write_shdr_so(&mut out, get_shname(".strtab"), SHT_STRTAB, 0,
+               0, strtab_data_offset, symtab_names.len() as u64, 0, 0, 1, 0);
     // .shstrtab (last section)
     write_shdr_so(&mut out, get_shname(".shstrtab"), SHT_STRTAB, 0,
                0, shstrtab_data_offset, shstrtab.len() as u64, 0, 0, 1, 0);

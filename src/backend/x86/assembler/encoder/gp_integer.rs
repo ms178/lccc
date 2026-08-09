@@ -1,5 +1,25 @@
 use super::*;
 
+fn infer_movext_dst_size(ops: &[Operand]) -> Result<u8, String> {
+    if ops.len() != 2 {
+        return Err("mov extension requires 2 operands".to_string());
+    }
+    match &ops[1] {
+        Operand::Register(dst) => {
+            if is_reg64(&dst.name) {
+                Ok(8)
+            } else if is_reg32(&dst.name) {
+                Ok(4)
+            } else if is_reg16(&dst.name) {
+                Ok(2)
+            } else {
+                Err(format!("mov extension destination must be 16/32/64-bit GP register: {}", dst.name))
+            }
+        }
+        _ => Err("mov extension destination must be a register".to_string()),
+    }
+}
+
 impl super::InstructionEncoder {
     // ---- Instruction-specific encoders ----
 
@@ -271,6 +291,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_segment_prefix(mem)?;
                 if dst_size == 2 { self.bytes.push(0x66); }
                 self.emit_rex_rm(dst_size, &dst.name, mem);
                 self.bytes.extend_from_slice(&opcode);
@@ -308,6 +329,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_segment_prefix(mem)?;
                 if dst_size == 2 { self.bytes.push(0x66); }
                 self.emit_rex_rm(rex_size, &dst.name, mem);
                 self.bytes.extend_from_slice(&opcode);
@@ -318,6 +340,21 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    /// Encode GAS source-size-only sign-extension aliases such as
+    /// `movsb mem, %r10` and `movsw mem, %r10`. GAS infers the destination
+    /// width from the destination register.
+    pub(crate) fn encode_movsx_infer_dst(&mut self, ops: &[Operand], src_size: u8) -> Result<(), String> {
+        let dst_size = infer_movext_dst_size(ops)?;
+        self.encode_movsx(ops, src_size, dst_size)
+    }
+
+    /// Encode GAS source-size-only zero-extension aliases such as
+    /// `movzb mem, %r10` and `movzw mem, %r10`.
+    pub(crate) fn encode_movzx_infer_dst(&mut self, ops: &[Operand], src_size: u8) -> Result<(), String> {
+        let dst_size = infer_movext_dst_size(ops)?;
+        self.encode_movzx(ops, src_size, dst_size)
+    }
+
     pub(crate) fn encode_lea(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("lea requires 2 operands".to_string());
@@ -325,6 +362,10 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                // Segment override (TLS initial-exec: `g_tls@TPOFF(%fs:0)`).
+                // lea was missing emit_segment_prefix, silently dropping %fs/
+                // %gs and miscompiling every TLS read through lea.
+                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(size, &dst.name, mem);
                 self.bytes.push(0x8D);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1093,7 +1134,9 @@ impl super::InstructionEncoder {
         let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
 
         match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Memory(mem)) => {
+            (Operand::Register(src), Operand::Memory(mem))
+            | (Operand::Memory(mem), Operand::Register(src)) => {
+                // xchg is symmetric: `xchgl (%rdx), %ecx` == `xchgl %ecx, (%rdx)`.
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 if size == 2 { self.bytes.push(0x66); }
                 self.emit_rex_rm(size, &src.name, mem);
@@ -1146,6 +1189,65 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(src_num, mem)
             }
             _ => Err("unsupported xadd operands".to_string()),
+        }
+    }
+    // ---- CET shadow-stack family (Intel CET / SHSTK) ----
+    // Encodings verified against GNU binutils 2.44 (AT&T syntax):
+    //   rstorssp m64      F3 0F 01 /5
+    //   saveprevssp       F3 0F 01 EA        (fixed, no ModRM)
+    //   setssbsy          F3 0F 01 E8        (fixed, no ModRM)
+    //   clrssbsy m64      F3 0F AE /6        (memory operand, mod != 11)
+    //   wrssd r32, m32    0F 38 F6 /r
+    //   wrssq r64, m64    REX.W 0F 38 F6 /r
+    //   wrussd r32, m32   66 0F 38 F5 /r
+    //   wrussq r64, m64   66 REX.W 0F 38 F5 /r
+
+    pub(crate) fn encode_rstorssp(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("rstorssp requires 1 memory operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem)?;
+                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01]);
+                self.encode_modrm_mem(5, mem) // /5
+            }
+            _ => Err("rstorssp requires a memory operand".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_clrssbsy(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("clrssbsy requires 1 memory operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem)?;
+                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0xAE]);
+                self.encode_modrm_mem(6, mem) // /6
+            }
+            _ => Err("clrssbsy requires a memory operand".to_string()),
+        }
+    }
+
+    /// WRSSD/WRSSQ/WRUSSD/WRUSSQ: store to shadow stack (reg -> memory).
+    /// `is_user` selects the WRUSS variant (66-prefixed, opcode F5 vs F6).
+    pub(crate) fn encode_wrss(&mut self, ops: &[Operand], size: u8, is_user: bool) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("wrss/wruss requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_segment_prefix(mem)?;
+                if is_user {
+                    self.bytes.push(0x66); // 66 operand-size prefix (WRUSS only)
+                }
+                self.emit_rex_rm(size, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, if is_user { 0xF5 } else { 0xF6 }]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("wrss/wruss requires register, memory operands".to_string()),
         }
     }
 }

@@ -303,7 +303,8 @@ impl ArmCodegen {
                 // ARM would use NEON intrinsics differently
                 unimplemented!("Register-based vector intrinsics not implemented for ARM");
             }
-        }
+                    _ => { /* x86-only SIMD op on arm: no-op */ }
+}
     }
 
     // ---- F128 (long double / IEEE quad precision) soft-float helpers ----

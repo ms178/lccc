@@ -138,6 +138,10 @@ impl InstructionEncoder {
             "movzbl" => self.encode_movzx(ops, 1, 4),
             "movzwl" => self.encode_movzx(ops, 2, 4),
             "movzbw" => self.encode_movzx(ops, 1, 2),
+            "movzb" => self.encode_movzx_infer_dst(ops, 1),
+            "movzw" => self.encode_movzx_infer_dst(ops, 2),
+            "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
+            "movsw" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 2),
 
             // LEA
             "leal" | "lea" => self.encode_lea(ops, 4),
@@ -230,6 +234,16 @@ impl InstructionEncoder {
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
             | "jc" | "jnc" => {
+                self.encode_jcc(ops, mnemonic)
+            }
+            // GAS accepts every canonical and negated condition-code alias:
+            // jna/jnbe, jng/jnle, jnge/jnl, jpe/jpo, etc.  Keep this guarded
+            // fallback next to the explicit hot set so future aliases are handled
+            // without routing non-Jcc mnemonics such as jmp/jecxz/loop here.
+            _ if mnemonic.starts_with('j')
+                && mnemonic.len() > 1
+                && cc_from_mnemonic(&mnemonic[1..]).is_ok() =>
+            {
                 self.encode_jcc(ops, mnemonic)
             }
             // jecxz/jcxz - short jump only (no long form)
@@ -332,7 +346,7 @@ impl InstructionEncoder {
             "repnz" | "repne" if ops.is_empty() => { self.bytes.push(0xF2); Ok(()) }
 
             // String ops
-            "movsb" => { self.bytes.push(0xA4); Ok(()) }
+            "movsb" if ops.is_empty() => { self.bytes.push(0xA4); Ok(()) }
             "movsl" if ops.is_empty() => { self.bytes.push(0xA5); Ok(()) }
             "stosb" => { self.bytes.push(0xAA); Ok(()) }
             "stosl" => { self.bytes.push(0xAB); Ok(()) }
@@ -379,6 +393,7 @@ impl InstructionEncoder {
 
             // Non-temporal stores
             "movnti" | "movntil" => self.encode_movnti(ops),
+            "movntq" => self.encode_sse_store_only(ops, &[0x0F, 0xE7]),
             "movntdq" => self.encode_sse_store_only(ops, &[0x66, 0x0F, 0xE7]),
 
             "addsd" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x58]),
@@ -449,6 +464,7 @@ impl InstructionEncoder {
             "cvtpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
 
             // SSE packed integer
+            "pshufw" => self.encode_sse_op_imm8(ops, &[0x0F, 0x70]),
             "pshufd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x70]),
             "pshuflw" => self.encode_sse_op_imm8(ops, &[0xF2, 0x0F, 0x70]),
             "pshufhw" => self.encode_sse_op_imm8(ops, &[0xF3, 0x0F, 0x70]),
@@ -496,6 +512,9 @@ impl InstructionEncoder {
             "pavgw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE3]),
             "psadbw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF6]),
             "pmaddwd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF5]),
+            "psignb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x08]),
+            "psignw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x09]),
+            "psignd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0A]),
             "pabsb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x1C]),
             "pabsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x1D]),
             "pabsd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x1E]),
@@ -578,13 +597,20 @@ impl InstructionEncoder {
             "fldpi" => { self.bytes.extend_from_slice(&[0xD9, 0xEB]); Ok(()) }
             "fldz" => { self.bytes.extend_from_slice(&[0xD9, 0xEE]); Ok(()) }
             "fnstsw" => self.encode_fnstsw(ops),
+            "fstsw" => self.encode_fstsw(ops),
             "fnstcw" => self.encode_x87_mem(ops, &[0xD9], 7),
+            "fstcw" => self.encode_x87_wait_mem(ops, &[0xD9], 7),
             "fldcw" => self.encode_x87_mem(ops, &[0xD9], 5),
             "fwait" | "wait" => { self.bytes.push(0x9B); Ok(()) }
             "fnclex" => { self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
+            "fclex" => { self.bytes.push(0x9B); self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
             "fninit" => { self.bytes.extend_from_slice(&[0xDB, 0xE3]); Ok(()) }
+            "finit" => { self.bytes.push(0x9B); self.bytes.extend_from_slice(&[0xDB, 0xE3]); Ok(()) }
             "ftst" => { self.bytes.extend_from_slice(&[0xD9, 0xE4]); Ok(()) }
             "fxam" => { self.bytes.extend_from_slice(&[0xD9, 0xE5]); Ok(()) }
+            "fnop" => { self.bytes.extend_from_slice(&[0xD9, 0xD0]); Ok(()) }
+            "fincstp" => { self.bytes.extend_from_slice(&[0xD9, 0xF7]); Ok(()) }
+            "fdecstp" => { self.bytes.extend_from_slice(&[0xD9, 0xF6]); Ok(()) }
             "fcomip" => self.encode_fcomip(ops),
             "fucomip" => self.encode_fucomip(ops),
             "fucomi" => self.encode_fucomi(ops),
@@ -615,17 +641,22 @@ impl InstructionEncoder {
             // x87 additional
             "fxtract" => { self.bytes.extend_from_slice(&[0xD9, 0xF4]); Ok(()) }
             "fnstenv" => self.encode_x87_mem(ops, &[0xD9], 6),
+            "fstenv" => self.encode_x87_wait_mem(ops, &[0xD9], 6),
             "fldenv" => self.encode_x87_mem(ops, &[0xD9], 4),
+            "fnsave" => self.encode_x87_mem(ops, &[0xDD], 6),
+            "fsave" => self.encode_x87_wait_mem(ops, &[0xDD], 6),
+            "frstor" => self.encode_x87_mem(ops, &[0xDD], 4),
+            "ffree" => self.encode_x87_st_i(ops, &[0xDD], 0xC0, "ffree"),
+            "fcom" => self.encode_fcom(ops),
+            "fcomp" => self.encode_fcomp(ops),
+            "fcompp" => { self.bytes.extend_from_slice(&[0xDE, 0xD9]); Ok(()) }
+            "fucompp" => { self.bytes.extend_from_slice(&[0xDA, 0xE9]); Ok(()) }
+            "fsincos" => { self.bytes.extend_from_slice(&[0xD9, 0xFB]); Ok(()) }
             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
             "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
             "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
             "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fistpll" => self.encode_x87_mem(ops, &[0xDF], 7),
-            "fstcw" => {
-                // fstcw = fwait + fnstcw
-                self.bytes.push(0x9B); // FWAIT
-                self.encode_x87_mem(ops, &[0xD9], 7)
-            }
 
             // Flag manipulation
             "cld" => { self.bytes.push(0xFC); Ok(()) }
@@ -747,7 +778,7 @@ impl InstructionEncoder {
             "rcrb" | "rcrw" | "rcrl" | "rcr" => self.encode_shift(ops, mnemonic, 3),
 
             // 16-bit string operations
-            "movsw" => { self.bytes.extend_from_slice(&[0x66, 0xA5]); Ok(()) }
+            "movsw" if ops.is_empty() => { self.bytes.extend_from_slice(&[0x66, 0xA5]); Ok(()) }
             "stosw" => { self.bytes.extend_from_slice(&[0x66, 0xAB]); Ok(()) }
             "lodsw" => { self.bytes.extend_from_slice(&[0x66, 0xAD]); Ok(()) }
             "scasw" => { self.bytes.extend_from_slice(&[0x66, 0xAF]); Ok(()) }

@@ -1,13 +1,87 @@
 //! X86Codegen: i128 arithmetic and comparison operations.
 
-use crate::ir::reexports::{IrCmpOp, Operand, Value};
+use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::StackSlot;
 use super::emit::X86Codegen;
 
 impl X86Codegen {
     pub(super) fn emit_i128_prep_binop_impl(&mut self, lhs: &Operand, rhs: &Operand) {
-        self.prep_i128_binop(lhs, rhs);
+        // Load RHS into %rcx (low) / %rsi (high) FIRST — this only touches
+        // rcx/rsi, which no i128 operand can depend on (i128 values live in
+        // stack slots or constants). Then load LHS into rax:rdx.
+        //
+        // CORRECTNESS: the previous implementation saved the LHS with
+        // `pushq %rdx; pushq %rax` and restored it with pops. Each push/pop
+        // shifts RSP by 8, so every %rsp-relative stack slot emitted inside
+        // the window carries a +16 offset. The text-based peephole optimizer
+        // does not model this shift: its dead-store and store-forwarding
+        // passes compare slot offsets verbatim, so a store before the push
+        // window and a load inside it appear to reference different slots.
+        // That made the dead-store pass delete LIVE stores in i128
+        // pack/unpack sequences (struct-return via i128 packing), producing
+        // garbage (e.g. gzip's mtime struct assignment). Avoiding the
+        // push/pop removes the shift at the root — and is faster (no
+        // stack round-trip).
+        self.load_i128_to_rcx_rsi(rhs);
+        self.operand_to_rax_rdx(lhs);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Load an i128 operand into %rcx (low) / %rsi (high) without touching
+    /// rax/rdx. The operand is a constant or a stack slot (i128 values are
+    /// never register-allocated); constants materialize directly, values are
+    /// loaded from their 16-byte slot.
+    fn load_i128_to_rcx_rsi(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                match c {
+                    IrConst::I128(v) => {
+                        let low = *v as u64 as i64;
+                        let high = (*v >> 64) as u64 as i64;
+                        if low == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
+                        }
+                        if high == 0 {
+                            self.state.emit("    xorl %esi, %esi");
+                        } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", high, "rsi");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", high, "rsi");
+                        }
+                    }
+                    IrConst::Zero => {
+                        self.state.emit("    xorl %ecx, %ecx");
+                        self.state.emit("    xorl %esi, %esi");
+                    }
+                    _ => {
+                        // Smaller constant: load into rax (clobbering rax is
+                        // fine here — the LHS has not been loaded yet), then
+                        // zero-extend the pair into rcx:rsi.
+                        self.operand_to_rax(op);
+                        self.state.emit("    xorl %edx, %edx");
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                        self.state.out.emit_instr_reg_reg("    movq", "rdx", "rsi");
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0 + 8, "rsi");
+                } else {
+                    // No slot (should not happen for i128 values): fall back
+                    // to the accumulator pair, then copy into rcx:rsi.
+                    self.operand_to_rax_rdx(op);
+                    self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                    self.state.out.emit_instr_reg_reg("    movq", "rdx", "rsi");
+                }
+            }
+        }
     }
 
     pub(super) fn emit_i128_add_impl(&mut self) {
@@ -159,12 +233,18 @@ impl X86Codegen {
         let func_name = match (from_signed, to_ty) {
             (true, IrType::F64)  => "__floattidf",
             (true, IrType::F32)  => "__floattisf",
+            (true, IrType::F128) => "__floattitf",
             (false, IrType::F64) => "__floatuntidf",
             (false, IrType::F32) => "__floatuntisf",
+            (false, IrType::F128) => "__floatuntitf",
             _ => panic!("unsupported i128-to-float conversion: {:?}", to_ty),
         };
         self.state.emit_fmt(format_args!("    call {}@PLT", func_name));
         self.state.reg_cache.invalidate_all();
+        if to_ty == IrType::F128 {
+            // _Float128 result stays in %xmm0 (single-XMM SysV ABI).
+            return;
+        }
         if to_ty == IrType::F32 {
             self.state.emit("    movd %xmm0, %eax");
         } else {
@@ -173,6 +253,34 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_float_to_i128_call_impl(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) {
+        if from_ty == IrType::F128 {
+            // _Float128 (binary128): ONE XMM register per SysV psABI. Load the
+            // 16-byte value into %xmm0, then call libgcc's __fixtfti /
+            // __fixunstfti (i128 result in %rdx:%rax).
+            match src {
+                Operand::Value(v) => {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
+                    } else if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+                        if held != "xmm0" {
+                            self.state
+                                .emit_fmt(format_args!("    movdqa %{}, %xmm0", held));
+                        }
+                    } else {
+                        self.operand_to_reg(src, "rax");
+                        self.state.emit("    movdqu (%rax), %xmm0");
+                    }
+                }
+                _ => {
+                    self.operand_to_reg(src, "rax");
+                    self.state.emit("    movdqu (%rax), %xmm0");
+                }
+            }
+            let func_name = if to_signed { "__fixtfti" } else { "__fixunstfti" };
+            self.state.emit_fmt(format_args!("    call {}@PLT", func_name));
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
         self.operand_to_rax(src);
         if from_ty == IrType::F32 {
             self.state.emit("    movd %eax, %xmm0");

@@ -204,7 +204,10 @@ pub(super) fn classify_instructions(
 
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Alloca { dest, size, ty, align, .. } = inst {
+            if let Instruction::Alloca { dest, size, ty, align, semantic_volatile, .. } = inst {
+                if *semantic_volatile {
+                    state.volatile_alloca_values.insert(dest.0);
+                }
                 classify_alloca(
                     state, dest, *size, *ty, *align, ctx,
                     assign_slot, non_local_space, deferred_slots,
@@ -494,8 +497,7 @@ fn classify_value(
     // resolve_copy_aliases phase may later share the slot with the alias root
     // when safe (no interference), but values must have their own fallback slot
     // in case resolve_copy_aliases blocks the sharing due to liveness conflicts.
-    // Skipping classification here left values without any slot when sharing was
-    // blocked, causing them to get emergency slots that overlap with other values.
+    // Skipping classification here can leave a live value without a location.
     if !is_i128 && !is_f128 && !is_protected && !is_multi_def && !has_cross_block_use && is_copy_aliased {
         if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
             // When slot coalescing is fully disabled, classify normally (fall through).
@@ -929,6 +931,10 @@ pub(super) fn resolve_copy_aliases(
     phi_web_aliases: &FxHashSet<u32>,
     func: &crate::ir::reexports::IrFunction,
 ) {
+    let debug_slot_coalesce = std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok();
+    let mut resolved_count = 0usize;
+    let mut blocked_overlap_count = 0usize;
+    let mut blocked_missing_root_count = 0usize;
     // Build liveness intervals for interference checking.
     // We use a lightweight approach: compute def-point and last-use-point for
     // each value by scanning all instructions. Two values interfere if their
@@ -977,15 +983,25 @@ pub(super) fn resolve_copy_aliases(
             continue;
         }
 
-        // Liveness-based interference check for copy alias coalescing.
+        // The CFG-aware coalescer has already proven that every member of this
+        // alias class is non-interfering on real CFG edges. Its members must
+        // therefore override their fallback slots. The legacy heuristic retains
+        // its old linear interval guard when explicitly selected for bisection.
+        let cfg_proven = std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
+            && phi_web_aliases.contains(&dest_id);
         if let Some(&slot) = state.value_locations.get(&root_id) {
-            let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
-            let root_last = last_use.get(&root_id).copied().unwrap_or(0);
-            if dest_def <= root_last {
-                continue; // Root still live when dest is defined
+            if !cfg_proven {
+                let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
+                let root_last = last_use.get(&root_id).copied().unwrap_or(0);
+                if dest_def <= root_last {
+                    blocked_overlap_count += 1;
+                    continue; // Root still live when dest is defined
+                }
             }
             state.value_locations.insert(dest_id, slot);
+            resolved_count += 1;
         } else {
+            blocked_missing_root_count += 1;
             continue;
         }
         // Propagate small-slot property
@@ -999,6 +1015,17 @@ pub(super) fn resolve_copy_aliases(
         if let Some(&align) = state.alloca_alignments.get(&root_id) {
             state.alloca_alignments.insert(dest_id, align);
         }
+    }
+
+    if debug_slot_coalesce && !copy_alias.is_empty() {
+        eprintln!(
+            "[SLOT-COALESCE] resolve fn={} requested={} resolved={} blocked_overlap={} blocked_missing_root={}",
+            func.name,
+            copy_alias.len(),
+            resolved_count,
+            blocked_overlap_count,
+            blocked_missing_root_count,
+        );
     }
 }
 

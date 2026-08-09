@@ -444,7 +444,8 @@ impl I686Codegen {
                 // These are x86-64-specific register-based vector operations
                 unimplemented!("Register-based vector intrinsics not implemented for i686");
             }
-        }
+                    _ => { /* x86-only SIMD op on i686: no-op */ }
+}
         self.state.reg_cache.invalidate_acc();
     }
 

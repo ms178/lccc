@@ -332,6 +332,37 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode XSAVE-family: opcode /ext with optional forced REX.W (64-bit forms).
+    /// GNU as encodings (verified against binutils 2.44):
+    ///   xsave m       0F AE /4      xsave64 m     REX.W 0F AE /4
+    ///   xrstor m      0F AE /5      xrstor64 m    REX.W 0F AE /5
+    ///   xsaveopt m    0F AE /6      xsaveopt64 m  REX.W 0F AE /6
+    ///   xsavec m      0F C7 /4      xsavec64 m    REX.W 0F C7 /4
+    ///   xsaves m      0F C7 /5      xsaves64 m    REX.W 0F C7 /5
+    ///   xrstors m     0F C7 /3      xrstors64 m   REX.W 0F C7 /3
+    ///   fxrstor m     0F AE /1
+    pub(crate) fn encode_xsave_family(
+        &mut self, ops: &[Operand], opcode: &[u8], ext: u8, force_rex_w: bool,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("instruction requires 1 memory operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                if force_rex_w {
+                    let rex_b = mem.base.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
+                    let rex_x = mem.index.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
+                    self.bytes.push(self.rex(true, false, rex_x, rex_b));
+                } else {
+                    self.emit_rex_rm(0, "", mem);
+                }
+                self.bytes.extend_from_slice(opcode);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("instruction requires memory operand".to_string()),
+        }
+    }
+
     /// Encode FXSAVEQ: REX.W + 0F AE /0 (64-bit fxsave)
     pub(crate) fn encode_fxsaveq(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 1 {

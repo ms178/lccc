@@ -28,7 +28,7 @@ impl X86Codegen {
 
     pub(super) fn emit_call_stack_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
                             _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize) -> i64 {
-        let need_align_pad = !stack_arg_space.is_multiple_of(16);
+        let need_align_pad = stack_arg_space % 16 != 0;
         let mut sp_adjust: i64 = 0;
         if need_align_pad {
             self.state.emit("    subq $8, %rsp");
@@ -60,53 +60,87 @@ impl X86Codegen {
                                     crate::ir::reexports::f64_to_x87_bytes(f64_val)
                                 }
                             };
+                            // SysV x86-64 passes long double in a 16-byte stack
+                            // slot (the low 10 bytes are x87 extended precision).
+                            // Account for the reservation before emitting any
+                            // RSP-relative operand, otherwise `slot_ref`/`fldt`
+                            // address the pre-subtraction stack location.
+                            self.state.emit("    subq $16, %rsp");
+                            sp_adjust += 16;
+                            if self.state.out.use_rsp_addressing {
+                                self.state.out.rsp_frame_size += 16;
+                            }
                             let lo = u64::from_le_bytes(x87_bytes[0..8].try_into().unwrap());
                             let hi_2bytes = u16::from_le_bytes(x87_bytes[8..10].try_into().unwrap());
-                            self.state.out.emit_instr_imm("    pushq", hi_2bytes as i64);
                             self.state.out.emit_instr_imm_reg("    movabsq", lo as i64, "rax");
-                            self.state.emit("    pushq %rax");
+                            self.state.emit("    movq %rax, (%rsp)");
+                            self.state.emit_fmt(format_args!("    movw ${}, 8(%rsp)", hi_2bytes));
                             self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
                         }
                         Operand::Value(ref v) => {
                             if self.state.f128_direct_slots.contains(&v.0) {
+                                self.state.emit("    subq $16, %rsp");
+                                sp_adjust += 16;
+                                if self.state.out.use_rsp_addressing {
+                                    self.state.out.rsp_frame_size += 16;
+                                }
                                 if let Some(slot) = self.state.get_slot(v.0) {
-                                    self.state.emit("    subq $16, %rsp");
                                     self.state.out.emit_instr_rbp("    fldt", slot.0);
                                     self.state.emit("    fstpt (%rsp)");
-                                } else {
-                                    self.state.emit("    subq $16, %rsp");
                                 }
                             } else if let Some(slot) = self.state.get_slot(v.0) {
                                 if self.state.is_alloca(v.0) {
                                     self.state.emit("    subq $16, %rsp");
+                                    sp_adjust += 16;
+                                    if self.state.out.use_rsp_addressing {
+                                        self.state.out.rsp_frame_size += 16;
+                                    }
                                     self.state.out.emit_instr_rbp("    fldt", slot.0);
                                     self.state.emit("    fstpt (%rsp)");
                                 } else {
+                                    // The value is represented as a scalar f64
+                                    // bit-pattern. Read it before reserving the
+                                    // outgoing slot, then widen in that slot;
+                                    // this avoids an untracked push/pop window.
                                     self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
-                                    self.state.reg_cache.invalidate_all();
                                     self.state.emit("    subq $16, %rsp");
-                                    self.state.emit("    pushq %rax");
+                                    sp_adjust += 16;
+                                    if self.state.out.use_rsp_addressing {
+                                        self.state.out.rsp_frame_size += 16;
+                                    }
+                                    self.state.emit("    movq %rax, (%rsp)");
                                     self.state.emit("    fldl (%rsp)");
-                                    self.state.emit("    addq $8, %rsp");
                                     self.state.emit("    fstpt (%rsp)");
                                 }
                             } else {
                                 self.state.emit("    subq $16, %rsp");
+                                sp_adjust += 16;
+                                if self.state.out.use_rsp_addressing {
+                                    self.state.out.rsp_frame_size += 16;
+                                }
                             }
                             self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
                         }
                     }
                 }
                 CallArgClass::I128Stack => {
-                    // Push 128-bit value to stack. Load directly from slot
-                    // to avoid operand_to_rax_rdx clobbering rdx.
+                    // Read both halves before changing RSP.  The old code
+                    // advanced rsp_frame_size before these slot_ref calls, so
+                    // a source i128 was read from the outgoing argument area
+                    // and its halves were swapped/corrupted.
                     match &args[si] {
                         Operand::Value(v) => {
                             if let Some(slot) = self.state.get_slot(v.0) {
                                 let sr1 = self.slot_ref(slot.0 + 8);
                                 let sr0 = self.slot_ref(slot.0);
-                                self.state.emit_fmt(format_args!("    pushq {}", sr1));
-                                self.state.emit_fmt(format_args!("    pushq {}", sr0));
+                                self.state.emit_fmt(format_args!("    movq {}, %r11", sr1));
+                                self.state.emit_fmt(format_args!("    movq {}, %rax", sr0));
+                                self.state.emit("    pushq %r11");
+                                self.state.emit("    pushq %rax");
                             } else {
                                 self.state.emit("    pushq $0");
                                 self.state.emit("    pushq $0");
@@ -126,6 +160,12 @@ impl X86Codegen {
                                 self.state.emit("    pushq %rax");
                             }
                         }
+                    }
+                    // Subsequent stack arguments and register arguments see
+                    // the two pushed qwords at their new RSP-relative offsets.
+                    sp_adjust += 16;
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 16;
                     }
                 }
                 CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
@@ -173,6 +213,22 @@ impl X86Codegen {
         // Return the total RSP adjustment so emit_call_reg_args can
         // compensate stack slot offsets when loading register arguments.
         sp_adjust
+    }
+
+    /// Spill an indirect function pointer before stack argument setup.
+    ///
+    /// The shared call pipeline pushes stack arguments before emitting the call.
+    /// If we reload the function pointer from an RSP-addressed stack slot after
+    /// those pushes, the slot offset is wrong and the indirect call may jump to
+    /// NULL.  Keep the target in r10 instead: r10 is not an ABI argument register
+    /// on SysV x86-64, and caller-saved live values have already been spilled by
+    /// `emit_pre_call_save_caller_regs` before this hook runs.
+    pub(super) fn emit_call_spill_fptr_impl(&mut self, func_ptr: &Operand) {
+        self.operand_to_rax(func_ptr);
+        self.state.emit("    movq %rax, %r10");
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_call_reg_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
@@ -246,6 +302,58 @@ impl X86Codegen {
                         float_count += 1;
                     }
                 }
+                CallArgClass::F128SseReg { reg_idx } => {
+                    // _Float128: the full 16 bytes go in ONE XMM register (SysV psABI).
+                    // The IR value is the 16-byte DATA (in a slot), not a pointer:
+                    // load the slot directly. Constants are materialized bit-exact.
+                    match arg {
+                        Operand::Value(v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm_regs[reg_idx]);
+                            } else {
+                                self.state.emit_fmt(format_args!("    pxor %{}, %{}", xmm_regs[reg_idx], xmm_regs[reg_idx]));
+                            }
+                        }
+                        Operand::Const(IrConst::I128(c)) => {
+                            let bytes = (*c as u128).to_le_bytes();
+                            let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                            let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                            // Register-agnostic materialization via a 16-byte
+                            // stack scratch: the old xmm0/xmm1 construction
+                            // clobbered earlier arguments when reg_idx != 0
+                            // (the second _Float128 constant argument
+                            // overwrote the first).
+                            self.state.emit("    subq $16, %rsp");
+                            self.state.out.emit_instr_imm_reg("    movabsq", lo as i64, "rax");
+                            self.state.emit("    movq %rax, (%rsp)");
+                            self.state.out.emit_instr_imm_reg("    movabsq", hi as i64, "rax");
+                            self.state.emit("    movq %rax, 8(%rsp)");
+                            self.state.emit_fmt(format_args!("    movdqu (%rsp), %{}", xmm_regs[reg_idx]));
+                            self.state.emit("    addq $16, %rsp");
+                        }
+                        Operand::Const(IrConst::LongDouble(_, f128_bytes)) => {
+                            // long double (x87 80-bit): the constant's payload
+                            // is binary128; narrow to x87 bytes first, then
+                            // materialize the 16-byte slot (10 significant
+                            // bytes) into the XMM argument register.
+                            let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+                            let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+                            let hi = u64::from_le_bytes([x87[8], x87[9], 0, 0, 0, 0, 0, 0]);
+                            self.state.emit("    subq $16, %rsp");
+                            self.state.out.emit_instr_imm_reg("    movabsq", lo as i64, "rax");
+                            self.state.emit("    movq %rax, (%rsp)");
+                            self.state.out.emit_instr_imm_reg("    movabsq", hi as i64, "rax");
+                            self.state.emit("    movq %rax, 8(%rsp)");
+                            self.state.emit_fmt(format_args!("    movdqu (%rsp), %{}", xmm_regs[reg_idx]));
+                            self.state.emit("    addq $16, %rsp");
+                        }
+                        _ => {
+                            self.operand_to_rax(arg);
+                            self.state.emit_fmt(format_args!("    movdqu 0(%rax), %{}", xmm_regs[reg_idx]));
+                        }
+                    }
+                    float_count += 1;
+                }
                 CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. } => {
                     self.operand_to_rax(arg);
                     self.state.out.emit_instr_mem_reg("    movq", 8, "rax", xmm_regs[fp_reg_idx]);
@@ -315,6 +423,8 @@ impl X86Codegen {
             self.state.emit("    xorl %eax, %eax");
         }
         self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
         // Restore the original RSP frame size.
         if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
             self.state.out.rsp_frame_size -= total_sp_adjust;
@@ -322,29 +432,33 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_call_instruction_impl(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, _indirect: bool, _stack_arg_space: usize) {
+        // v5 lazy flush: the call clobbers all XMM registers — a pending
+        // deferred vector-result store must hit its slot first.
+        self.flush_pending_vec_store_impl();
         if let Some(name) = direct_name {
             if self.state.needs_plt(name) {
                 self.state.emit_fmt(format_args!("    call {}@PLT", name));
             } else {
                 self.state.out.emit_call(name);
             }
-        } else if let Some(ptr) = func_ptr {
-            // Load function pointer into rax and call through it.
-            // Using rax avoids clobbering r10 which may hold a
-            // register-allocated value.
-            self.operand_to_rax(ptr);
+        } else if func_ptr.is_some() {
+            // Indirect function pointers are preloaded into r10 by
+            // emit_call_spill_fptr_impl before stack arguments are pushed.  Do
+            // not reload the Operand here: stack argument setup changes %rsp,
+            // so RSP-relative slots would be addressed incorrectly.
             if self.state.indirect_branch_thunk {
-                self.state.emit("    movq %rax, %r10");
                 self.state.emit("    call __x86_indirect_thunk_r10");
             } else {
-                self.state.emit("    call *%rax");
+                self.state.emit("    call *%r10");
             }
         }
         self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_call_cleanup_impl(&mut self, stack_arg_space: usize, _f128_temp_space: usize, _indirect: bool) {
-        let need_align_pad = !stack_arg_space.is_multiple_of(16);
+        let need_align_pad = stack_arg_space % 16 != 0;
         let total_cleanup = stack_arg_space + if need_align_pad { 8 } else { 0 };
         if total_cleanup > 0 {
             self.state.out.emit_instr_imm_reg("    addq", total_cleanup as i64, "rsp");
@@ -355,11 +469,30 @@ impl X86Codegen {
         self.call_ret_classes = classes.to_vec();
     }
 
+    pub(super) fn set_call_ret_is_f128_sse_impl(&mut self, is_f128: bool) {
+        self.call_ret_is_f128_sse = is_f128;
+    }
+
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
         // Void functions have no meaningful return value — skip the store.
         // Without this, store_rax_to writes garbage %rax to a stack slot that
         // may overlap with callee-saved register save area, corrupting them.
         if return_type == IrType::Void {
+            return;
+        }
+        if self.call_ret_is_f128_sse {
+            // _Float128 returns come back in ONE XMM register (xmm0, 16 bytes).
+            // Mark the dest as a 16-byte payload value: its slot holds the
+            // DATA directly (resolve_slot_addr must answer Direct, and
+            // copies/loads/stores must treat it as full 128-bit).
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.state.out.emit_instr_reg_rbp("    movdqu", "xmm0", slot.0);
+                self.state.i128_values.insert(dest.0);
+                self.state.f128_direct_slots.insert(dest.0);
+            }
+            self.state.reg_cache.invalidate_all();
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
             return;
         }
         if is_i128_type(return_type) {
@@ -374,6 +507,8 @@ impl X86Codegen {
                             self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
                     }
                     (EightbyteClass::Sse, EightbyteClass::Integer) => {
                         if let Some(slot) = self.state.get_slot(dest.0) {
@@ -382,6 +517,8 @@ impl X86Codegen {
                             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
                     }
                     (EightbyteClass::Sse, EightbyteClass::Sse) => {
                         if let Some(slot) = self.state.get_slot(dest.0) {
@@ -391,6 +528,8 @@ impl X86Codegen {
                             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
                     }
                     _ => {
                         self.store_rax_rdx_to(dest);

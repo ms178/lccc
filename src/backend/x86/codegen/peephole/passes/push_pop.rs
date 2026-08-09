@@ -76,6 +76,15 @@ fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
     if (s.starts_with("subq ") || s.starts_with("addq ")) && s.ends_with("%rsp") {
         return true;
     }
+    // ANY memory operand addressed via %rsp (e.g. "(%rsp)", "8(%rsp)",
+    // "(%rsp,%rax,4)") depends on the pushed value sitting at the stack top:
+    // eliminating the surrounding push/pop pair would leave the access
+    // pointing at a different (wrong) location. This matters for inline-asm
+    // output stores, which materialize the destination pointer, push it, and
+    // store through "(%rsp)".
+    if s.contains("%rsp)") || s.contains("%rsp,") {
+        return true;
+    }
     false
 }
 

@@ -38,7 +38,17 @@ pub fn run_regalloc_and_merge_clobbers(
         Vec::new()
     };
     let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, allow_inline_asm_regalloc, xmm_regs };
-    let alloc_result = super::super::regalloc::allocate_registers(func, &config);
+    // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).
+    let alloc_result = if std::env::var("CCC_NO_REGALLOC").is_ok() {
+        super::super::regalloc::RegAllocResult {
+            assignments: Default::default(),
+            used_regs: Vec::new(),
+            caller_save_spans: Default::default(),
+            liveness: None,
+        }
+    } else {
+        super::super::regalloc::allocate_registers(func, &config)
+    };
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;
     let caller_save_spans = alloc_result.caller_save_spans;
