@@ -252,6 +252,10 @@ pub(super) struct FuncSig {
     /// Used to determine which eightbytes go in GP vs SSE registers on return.
     /// Empty if not applicable (non-struct return, sret, or non-x86-64).
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True if the return value is _Float128 (ONE 16-byte XMM return).
+    pub ret_is_f128_sse: bool,
+    /// Per-param: true if the param is _Float128 (ONE 16-byte XMM param).
+    pub param_is_f128_sse: Vec<bool>,
     /// Per-parameter struct sizes for by-value struct passing ABI.
     /// Each entry is Some(size) if that parameter is a struct/union, None otherwise.
     pub param_struct_sizes: Vec<Option<usize>>,
@@ -277,6 +281,8 @@ impl FuncSig {
             sret_size: None,
             two_reg_ret_size: None,
             ret_eightbyte_classes: Vec::new(),
+            ret_is_f128_sse: false,
+            param_is_f128_sse: Vec::new(),
             param_struct_sizes: Vec::new(),
             param_struct_classes: Vec::new(),
             param_riscv_float_classes: Vec::new(),

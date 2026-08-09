@@ -80,9 +80,7 @@ impl Lowerer {
                         // Address of a global variable or function
                         if self.globals.contains_key(name) || self.known_functions.contains(name) {
                             // Apply __asm__("label") redirect (e.g. stat -> stat64)
-                            let resolved = self.asm_label_map.get(name.as_str())
-                                .cloned()
-                                .unwrap_or_else(|| name.clone());
+                            let resolved = self.resolve_ref_name(name.as_str());
                             return Some(GlobalInit::GlobalAddr(resolved));
                         }
                         None
@@ -117,9 +115,7 @@ impl Lowerer {
                     // Without this, glibc's __REDIRECT mechanism (used for LFS stat/fstat
                     // when _FILE_OFFSET_BITS=64) would store the non-redirected symbol
                     // in global initializers like sqlite's aSyscall[] table.
-                    let resolved = self.asm_label_map.get(name.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| name.clone());
+                    let resolved = self.resolve_ref_name(name.as_str());
                     return Some(GlobalInit::GlobalAddr(resolved));
                 }
                 // Check static local array names first (they shadow globals)

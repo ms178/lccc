@@ -372,8 +372,15 @@ impl Lowerer {
                     return loaded;
                 }
                 if self.globals.contains_key(name) {
+                    // Apply __asm__("label") redirect (glibc hidden_proto data:
+                    // `extern struct opaque_auth _null_auth __asm__("__GI__null_auth")
+                    // __attribute__((visibility("hidden")))` — member accesses
+                    // like `_null_auth.oa_flavor` must reference __GI__null_auth,
+                    // otherwise the object has an unversioned plain reference
+                    // that no member defines).
+                    let resolved_name = self.resolve_ref_name(name);
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
                     return addr;
                 }
                 // Unknown - try to evaluate as expression
@@ -485,7 +492,7 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
-                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                     alloca
                 }
@@ -501,7 +508,7 @@ impl Lowerer {
                         let alloca = self.fresh_value();
                         let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                         let store_ty = Self::packed_store_type(alloc_size);
-                        self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
+                        self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
                         self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
                         alloca
                     } else {
@@ -509,7 +516,7 @@ impl Lowerer {
                         let src_val = self.lower_expr(expr);
                         let src_addr = self.operand_to_value(src_val);
                         let tmp_alloca = self.fresh_value();
-                        self.emit(Instruction::Alloca { dest: tmp_alloca, size: struct_size, ty: IrType::Ptr, align: 0, volatile: false });
+                        self.emit(Instruction::Alloca { dest: tmp_alloca, size: struct_size, ty: IrType::Ptr, align: 0, volatile: false, semantic_volatile: false });
                         self.emit(Instruction::Memcpy { dest: tmp_alloca, src: src_addr, size: struct_size });
                         tmp_alloca
                     }
@@ -535,7 +542,7 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
-                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                     alloca
                 } else {

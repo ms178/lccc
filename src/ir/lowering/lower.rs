@@ -75,6 +75,10 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((fastcall)).
     /// On i386, these use ecx/edx for the first two integer/pointer args.
     pub(super) fastcall_functions: FxHashSet<String>,
+    /// Set while lowering a top-level expression whose result is discarded
+    /// (expression statement, for-increment), so a discarded post-inc/dec can
+    /// skip its volatile old-value spill.
+    pub(super) discard_expr_result: bool,
     /// Set of function names that have at least one file-scope declaration
     /// without the `inline` specifier OR with `extern`. Per C99 6.7.4p7,
     /// an inline definition is only an "inline definition" (no external def)
@@ -118,6 +122,12 @@ pub struct Lowerer {
     /// E.g., `extern int strerror_r(...) __asm__("__xpg_strerror_r")` maps
     /// "strerror_r" -> "__xpg_strerror_r". Used to redirect calls/references at IR emission.
     pub(super) asm_label_map: FxHashMap<String, String>,
+    /// Versioned symbol references from top-level `.symver real, name@VER`
+    /// where `real` is NOT defined in this TU. GCC semantics: all references
+    /// to `real` become references to `name@VER` (glibc
+    /// `compat_symbol_reference`; GNU ld 2.47 refuses to bind unversioned
+    /// refs to `foo@VER` definitions under --whole-archive).
+    pub(super) symver_ref_map: FxHashMap<String, String>,
     /// Memoization cache for get_expr_ctype().
     /// Maps `ExprId` keys to their resolved CType plus the Expr discriminant at
     /// insertion time. The discriminant is checked on cache hit to detect address
@@ -205,6 +215,7 @@ impl Lowerer {
             error_functions: FxHashSet::default(),
             noreturn_functions: FxHashSet::default(),
             fastcall_functions: FxHashSet::default(),
+            discard_expr_result: false,
             has_non_inline_decl: FxHashSet::default(),
             types: type_context,
             func_meta: FunctionMeta::default(),
@@ -216,6 +227,7 @@ impl Lowerer {
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
+            symver_ref_map: FxHashMap::default(),
             expr_ctype_cache: RefCell::new(FxHashMap::default()),
             diagnostics: RefCell::new(diagnostics),
             materialized_compound_literals: FxHashMap::default(),
@@ -396,9 +408,11 @@ impl Lowerer {
                     struct_arg_aligns: vec![],
                     struct_arg_classes: Vec::new(),
                     struct_arg_riscv_float_classes: Vec::new(),
+                    struct_arg_is_f128_sse: Vec::new(),
                     is_sret: false,
                     is_fastcall: false,
                     ret_eightbyte_classes: Vec::new(),
+                    ret_is_f128_sse: false,
                 },
             });
         }
@@ -553,11 +567,41 @@ impl Lowerer {
                         let is_function_decl = declarator.derived.iter().any(|d|
                             matches!(d, DerivedDeclarator::Function(_, _))
                         );
-                        if is_function_decl {
+                        if is_function_decl || !is_x86_register_name(asm_label) {
                             self.asm_label_map.insert(
                                 declarator.name.clone(),
                                 asm_label.clone(),
                             );
+                            self.module
+                                .asm_labels
+                                .insert(declarator.name.clone(), asm_label.clone());
+                        }
+                    }
+
+                    // Collect __asm__("label") linker symbol redirects on FILE-SCOPE
+                    // variable declarations too (`extern int dfoo __asm("abccb");`).
+                    // GCC emits the definition/aliases under the asm name; glibc's
+                    // configure probes this exact pattern (`working alias attribute
+                    // support`). Global register variables are unaffected: their
+                    // references take the read_global_register path before the
+                    // asm_label_map lookup, and they never carry a definition.
+                    if let Some(ref asm_label) = declarator.attrs.asm_register {
+                        let is_function_decl = declarator.derived.iter().any(|d|
+                            matches!(d, DerivedDeclarator::Function(_, _))
+                        );
+                        if !is_function_decl
+                            && !is_x86_register_name(asm_label)
+                            && !decl.is_typedef()
+                            && !declarator.name.is_empty()
+                            && !self.asm_label_map.contains_key(&declarator.name)
+                        {
+                            self.asm_label_map.insert(
+                                declarator.name.clone(),
+                                asm_label.clone(),
+                            );
+                            self.module
+                                .asm_labels
+                                .insert(declarator.name.clone(), asm_label.clone());
                         }
                     }
 
@@ -607,6 +651,55 @@ impl Lowerer {
             }
         }
 
+        // Pre-pass: versioned .symver references (GCC semantics). glibc's
+        // compat_symbol_reference emits `.symver real, name@VER` as top-level
+        // asm; when `real` is NOT defined in this TU, every reference to it
+        // must become a versioned reference `name@VER` (GNU ld 2.47 refuses
+        // to bind unversioned refs to `foo@VER` under --whole-archive).
+        // Must run BEFORE body lowering so references lower correctly.
+        {
+            let mut defined: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // Function DEFINITIONS (a mere declaration does not count: glibc's
+            // compat_symbol_reference versionizes references to declared-only
+            // functions like matherr).
+            for decl in &tu.decls {
+                if let ExternalDecl::FunctionDef(func) = decl {
+                    defined.insert(func.name.clone());
+                }
+            }
+            for decl in &tu.decls {
+                if let ExternalDecl::Declaration(decl) = decl {
+                    for declarator in &decl.declarators {
+                        if !declarator.name.is_empty()
+                            && (declarator.init.is_some() || !decl.is_extern())
+                        {
+                            defined.insert(declarator.name.clone());
+                        }
+                    }
+                }
+            }
+            for decl in &tu.decls {
+                if let ExternalDecl::TopLevelAsm(asm_str) = decl {
+                    for line in asm_str.lines() {
+                        let t = line.trim();
+                        if let Some(rest) = t.strip_prefix(".symver") {
+                            let rest = rest.trim();
+                            if let Some(comma) = rest.find(',') {
+                                let real = rest[..comma].trim().to_string();
+                                let alias_ver = rest[comma + 1..].trim().to_string();
+                                if !real.is_empty() && alias_ver.contains('@')
+                                    && !defined.contains(&real)
+                                {
+                                    self.symver_ref_map.insert(real, alias_ver);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Collect constructor/destructor/alias attributes from function definitions and declarations
         for decl in &tu.decls {
             match decl {
@@ -633,11 +726,19 @@ impl Lowerer {
                         {
                             self.module.destructors.push(declarator.name.clone());
                         }
-                        // Collect __attribute__((alias("target"))) declarations
+                        // Collect __attribute__((alias("target"))) declarations.
+                        // The alias name must honour the declaration's asm label
+                        // (`extern int foo __asm("xyzzy") __attribute__((alias("bar")))`
+                        // emits `.set xyzzy,bar`, matching GCC; glibc's configure
+                        // depends on this exact behaviour).
                         if let Some(ref target) = declarator.attrs.alias_target {
                             if !declarator.name.is_empty() {
+                                let asm_name = self.asm_label_map
+                                    .get(&declarator.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| declarator.name.clone());
                                 self.module.aliases.push((
-                                    declarator.name.clone(),
+                                    asm_name,
                                     target.clone(),
                                     declarator.attrs.is_weak(),
                                 ));
@@ -752,6 +853,19 @@ impl Lowerer {
             }
         }
         (self.module, self.diagnostics.into_inner())
+    }
+
+    /// Resolve a symbol reference: versioned .symver references first (glibc
+    /// compat_symbol_reference), then __asm__("label") redirects, else the
+    /// plain name.
+    pub(super) fn resolve_ref_name(&self, name: &str) -> String {
+        if let Some(v) = self.symver_ref_map.get(name) {
+            return v.clone();
+        }
+        self.asm_label_map
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Register function metadata (return type, param types, variadic, sret) for
@@ -900,8 +1014,17 @@ impl Lowerer {
             }
         }
 
-        // Compute SysV eightbyte classification for two-register struct returns
-        let ret_eightbyte_classes = if two_reg_ret_size.is_some() && ptr_count == 0 {
+        // Compute SysV eightbyte classification for two-register struct returns.
+        // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
+        // register (xmm0).
+        let mut ret_is_f128_sse = false;
+        let ret_eightbyte_classes = if matches!(full_ret_ctype, CType::Float128) {
+            ret_is_f128_sse = true;
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::Sse,
+            ]
+        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
             if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
                 if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
                     layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
@@ -979,6 +1102,9 @@ impl Lowerer {
                 Some(CType::ComplexDouble.size())
             } else if !decomposes_cf && matches!(ctype, CType::ComplexFloat) {
                 Some(CType::ComplexFloat.size())
+            } else if matches!(ctype, CType::Float128) {
+                // _Float128 is passed as a 16-byte SSE-class value (SysV psABI).
+                Some(16)
             } else {
                 None
             }
@@ -987,7 +1113,12 @@ impl Lowerer {
         // Compute per-eightbyte SysV ABI classification for struct params
         let param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = params.iter().enumerate().map(|(i, p)| {
             if param_struct_sizes.get(i).copied().flatten().is_some() {
-                if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                if matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128) {
+                    vec![
+                        crate::common::types::EightbyteClass::Sse,
+                        crate::common::types::EightbyteClass::Sse,
+                    ]
+                } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                     layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                 } else {
                     Vec::new()
@@ -995,6 +1126,11 @@ impl Lowerer {
             } else {
                 Vec::new()
             }
+        }).collect();
+
+        // _Float128 params: ONE 16-byte XMM register per arg (SysV psABI).
+        let param_is_f128_sse: Vec<bool> = params.iter().map(|p| {
+            matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
         }).collect();
 
         // Compute RISC-V LP64D float field classification for struct params
@@ -1021,9 +1157,11 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
+                ret_is_f128_sse,
                 param_struct_sizes,
                 param_struct_classes,
                 param_riscv_float_classes,
+                param_is_f128_sse: param_is_f128_sse.clone(),
             }
         } else {
             FuncSig {
@@ -1036,9 +1174,11 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes,
+                ret_is_f128_sse: false,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
                 param_riscv_float_classes: Vec::new(),
+                param_is_f128_sse,
             }
         };
         self.func_meta.sigs.insert(name.to_string(), sig);
@@ -1108,9 +1248,24 @@ impl Lowerer {
     /// Used for local variable declarations so that variables whose
     /// declarations are skipped by `goto` still have valid stack slots.
     pub(super) fn emit_entry_alloca(&mut self, ty: IrType, size: usize, align: usize, volatile: bool) -> Value {
+        self.emit_entry_alloca_with_flags(ty, size, align, volatile, volatile)
+    }
+
+    /// Emit an entry alloca with independent SSA-promotion and C-volatile
+    /// semantics.  Compiler-created spill homes may need to remain in memory
+    /// without turning their ordinary loads/stores into observable volatile
+    /// accesses.
+    pub(super) fn emit_entry_alloca_with_flags(
+        &mut self,
+        ty: IrType,
+        size: usize,
+        align: usize,
+        volatile: bool,
+        semantic_volatile: bool,
+    ) -> Value {
         let dest = self.fresh_value();
         self.func_mut().entry_allocas.push(Instruction::Alloca {
-            dest, ty, size, align, volatile,
+            dest, ty, size, align, volatile, semantic_volatile,
         });
         dest
     }
@@ -1134,6 +1289,220 @@ impl Lowerer {
         let dest = self.fresh_value();
         self.emit(Instruction::Cast { dest, src, from_ty, to_ty });
         dest
+    }
+
+    // === _Float128 (binary128) soft-float call helpers ===
+    //
+    // _Float128 arithmetic/comparison/conversion is lowered to calls of the
+    // libgcc/compiler-rt TF helpers (__addtf3, __extendsftf2, ...), exactly
+    // like GCC. _Float128 values follow the SysV psABI: each _Float128 arg is
+    // passed in ONE 16-byte XMM register; returns come back in xmm0.
+
+    /// Emit a call to a libgcc soft-float helper. `struct_info[i]` is
+    /// Some((size, align, classes)) for SSE-class 16-byte args, None for
+    /// scalar args. `ret_classes` is the return eightbyte classification.
+    /// `ret_is_f128` marks a single-XMM _Float128 return.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_softfloat_call(
+        &mut self,
+        name: &str,
+        args: Vec<Operand>,
+        arg_types: Vec<IrType>,
+        struct_info: Vec<Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)>>,
+        ret: IrType,
+        ret_classes: Vec<crate::common::types::EightbyteClass>,
+        ret_is_f128: bool,
+    ) -> Value {
+        // _Float128 (16-byte carrier) arguments are passed like SSE-class
+        // values: the backend emits 16-byte XMM loads. Spill each carrier arg
+        // into a fresh 16-byte temp and pass its address.
+        let mut args = args;
+        let mut arg_types = arg_types;
+        let mut arg_is_f128 = vec![false; args.len()];
+        for (i, info) in struct_info.iter().enumerate() {
+            if info.is_some() {
+                let tmp = self.fresh_value();
+                self.emit(Instruction::Alloca {
+                    dest: tmp,
+                    ty: IrType::U128,
+                    size: 16,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                });
+                let store_ty = arg_types.get(i).copied().unwrap_or(IrType::U128);
+                self.emit(Instruction::Store {
+                    val: args[i].clone(),
+                    ptr: tmp,
+                    ty: store_ty,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                });
+                args[i] = Operand::Value(tmp);
+                arg_types[i] = IrType::U128;
+                arg_is_f128[i] = true;
+            }
+        }
+        let dest = self.fresh_value();
+        let n = args.len();
+        let mut struct_arg_sizes = Vec::with_capacity(n);
+        let mut struct_arg_aligns = Vec::with_capacity(n);
+        let mut struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>> = Vec::with_capacity(n);
+        for info in &struct_info {
+            match info {
+                Some((size, align, classes)) => {
+                    struct_arg_sizes.push(Some(*size));
+                    struct_arg_aligns.push(Some(*align));
+                    struct_arg_classes.push(classes.clone());
+                }
+                None => {
+                    struct_arg_sizes.push(None);
+                    struct_arg_aligns.push(None);
+                    struct_arg_classes.push(Vec::new());
+                }
+            }
+        }
+        self.emit(Instruction::Call {
+            func: name.to_string(),
+            info: CallInfo {
+                dest: Some(dest),
+                args,
+                arg_types,
+                return_type: ret,
+                is_variadic: false,
+                num_fixed_args: n,
+                struct_arg_sizes,
+                struct_arg_aligns,
+                struct_arg_classes,
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: arg_is_f128,
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: ret_classes,
+                ret_is_f128_sse: ret_is_f128,
+            },
+        });
+        dest
+    }
+
+    /// _Float128 call argument marker: 16-byte all-SSE (single XMM in psABI).
+    pub(super) fn f128_arg_info() -> Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)> {
+        Some((
+            16,
+            16,
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::Sse,
+            ],
+        ))
+    }
+
+    pub(crate) fn f128_ret_classes() -> Vec<crate::common::types::EightbyteClass> {
+        vec![
+            crate::common::types::EightbyteClass::Sse,
+            crate::common::types::EightbyteClass::Sse,
+        ]
+    }
+
+    /// Emit a binary128 arithmetic call: __addtf3 etc. (single-XMM ABI).
+    pub(super) fn emit_f128_binop_call(&mut self, helper: &str, lhs: Operand, rhs: Operand) -> Value {
+        self.emit_softfloat_call(
+            helper,
+            vec![lhs, rhs],
+            vec![IrType::U128, IrType::U128],
+            vec![Self::f128_arg_info(), Self::f128_arg_info()],
+            IrType::U128,
+            Self::f128_ret_classes(),
+            true,
+        )
+    }
+
+    /// Emit a binary128 comparison call: __lttf2/__eqtf2/... These return an
+    /// ordinary `int` (not _Float128), so the call is a plain I32 return with
+    /// NO SSE eightbyte classification and NO f128 return marker.
+    pub(super) fn emit_f128_cmp_call(&mut self, helper: &str, lhs: Operand, rhs: Operand) -> Value {
+        self.emit_softfloat_call(
+            helper,
+            vec![lhs, rhs],
+            vec![IrType::U128, IrType::U128],
+            vec![Self::f128_arg_info(), Self::f128_arg_info()],
+            IrType::I32,
+            Vec::new(),
+            false,
+        )
+    }
+
+    /// Convert `val` (of C type `from_ct`) to _Float128 via the libgcc
+    /// widening helpers, matching GCC's codegen.
+    pub(super) fn convert_to_f128(&mut self, val: Operand, from_ct: &crate::common::types::CType) -> Operand {
+        use crate::common::types::CType;
+        let (helper, arg_ty, struct_info): (&str, IrType, Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)>) = match from_ct {
+            CType::Float => ("__extendsftf2", IrType::F32, None),
+            CType::Double => ("__extenddftf2", IrType::F64, None),
+            // x87 long double: passed per SysV (16-byte stack slot, x87 class).
+            CType::LongDouble => ("__extendxftf2", IrType::F128, None),
+            CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort
+            | CType::Int | CType::UInt => {
+                let signed = matches!(from_ct, CType::Bool | CType::Char | CType::Short | CType::Int);
+                (if signed { "__floatsitf" } else { "__floatunsitf" }, IrType::I32, None)
+            }
+            CType::Long | CType::ULong | CType::LongLong | CType::ULongLong => {
+                let signed = matches!(from_ct, CType::Long | CType::LongLong);
+                (if signed { "__floatditf" } else { "__floatunditf" }, IrType::I64, None)
+            }
+            CType::Int128 | CType::UInt128 => {
+                let signed = matches!(from_ct, CType::Int128);
+                (if signed { "__floattitf" } else { "__floatuntitf" }, IrType::I128, None)
+            }
+            CType::Float128 => return val,
+            _ => return val,
+        };
+        let dest = self.emit_softfloat_call(
+            helper,
+            vec![val],
+            vec![arg_ty],
+            vec![struct_info],
+            IrType::U128,
+            Self::f128_ret_classes(),
+            true,
+        );
+        Operand::Value(dest)
+    }
+
+    /// Convert `val` (_Float128) to C type `to_ct` via the libgcc narrowing
+    /// helpers, matching GCC's codegen.
+    pub(super) fn convert_from_f128(&mut self, val: Operand, to_ct: &crate::common::types::CType) -> Operand {
+        use crate::common::types::CType;
+        let (helper, ret_ty, ret_classes): (&str, IrType, Vec<crate::common::types::EightbyteClass>) = match to_ct {
+            CType::Float => ("__trunctfsf2", IrType::F32, Vec::new()),
+            CType::Double => ("__trunctfdf2", IrType::F64, Vec::new()),
+            // x87 long double: returned in st(0) (the backend's F128 return path).
+            CType::LongDouble => ("__trunctfxf2", IrType::F128, Vec::new()),
+            CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort
+            | CType::Int | CType::UInt => {
+                let signed = matches!(to_ct, CType::Bool | CType::Char | CType::Short | CType::Int);
+                (if signed { "__fixtfsi" } else { "__fixunstfsi" }, IrType::I32, Vec::new())
+            }
+            CType::Long | CType::ULong | CType::LongLong | CType::ULongLong => {
+                let signed = matches!(to_ct, CType::Long | CType::LongLong);
+                (if signed { "__fixtfdi" } else { "__fixunstfdi" }, IrType::I64, Vec::new())
+            }
+            CType::Int128 | CType::UInt128 => {
+                let signed = matches!(to_ct, CType::Int128);
+                (if signed { "__fixtfti" } else { "__fixunstfti" }, IrType::I128, Vec::new())
+            }
+            CType::Float128 => return val,
+            _ => return val,
+        };
+        let dest = self.emit_softfloat_call(
+            helper,
+            vec![val],
+            vec![IrType::U128],
+            vec![Self::f128_arg_info()],
+            ret_ty,
+            ret_classes,
+            false,
+        );
+        Operand::Value(dest)
     }
 
     /// Emit a GEP + Store: store `val` at `base + byte_offset` with the given type.
@@ -1435,4 +1804,28 @@ impl Lowerer {
         self.zero_init_region(alloca, 0, total_size);
     }
 
+}
+
+/// True if `name` is an x86-64 register name. Distinguishes
+/// `register int x __asm__("rbx")` (register pinning) from
+/// `extern int x __asm__("symbol")` (linker symbol rename) on variable
+/// declarations — both are stored in the same attribute field by the parser.
+/// A symbol-rename label that is also a register spelling must never be
+/// interpreted as a register variable (previously emitted `movzbl %sym, %sym`
+/// self-moves, e.g. `__GI__libc_intl_domainname`).
+pub(super) fn is_x86_register_name(name: &str) -> bool {
+    const REGS: &[&str] = &[
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+        "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+        "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
+        "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+        "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+        "ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7",
+        "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15",
+    ];
+    REGS.contains(&name)
 }

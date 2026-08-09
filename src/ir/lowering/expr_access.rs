@@ -77,7 +77,7 @@ impl Lowerer {
 
             // Allocate stack space for the union and zero-initialize it
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, size: union_size, ty: IrType::Ptr, align: 0, volatile: false });
+            self.emit(Instruction::Alloca { dest: alloca, size: union_size, ty: IrType::Ptr, align: 0, volatile: false, semantic_volatile: false });
             self.zero_init_alloca(alloca, union_size);
 
             // If the source is an aggregate (struct/union), lower_expr returns a pointer
@@ -130,7 +130,7 @@ impl Lowerer {
             let from_ty = self.get_expr_type(inner);
 
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, size: vec_size, ty: IrType::Ptr, align: vec_size, volatile: false });
+            self.emit(Instruction::Alloca { dest: alloca, size: vec_size, ty: IrType::Ptr, align: vec_size, volatile: false, semantic_volatile: false });
             // Zero-initialize in case source is smaller than vector
             self.zero_init_alloca(alloca, vec_size);
             // Store scalar at offset 0 (bitwise reinterpretation)
@@ -150,11 +150,23 @@ impl Lowerer {
             // Different sizes: allocate new vector, memcpy what fits
             let src_val = self.operand_to_value(src);
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, size: dst_size, ty: IrType::Ptr, align: dst_size, volatile: false });
+            self.emit(Instruction::Alloca { dest: alloca, size: dst_size, ty: IrType::Ptr, align: dst_size, volatile: false, semantic_volatile: false });
             self.zero_init_alloca(alloca, dst_size);
             let copy_size = src_size.min(dst_size);
             self.emit(Instruction::Memcpy { dest: alloca, src: src_val, size: copy_size });
             return Operand::Value(alloca);
+        }
+
+        // _Float128 (binary128) casts route through the libgcc soft-float
+        // conversion helpers (__extendsftf2, __trunctfdf2, __fixtfdi, ...),
+        // exactly like GCC. Both directions are covered.
+        if matches!(inner_ctype, CType::Float128) && target_ctype != CType::Float128 {
+            let src = self.lower_expr(inner);
+            return self.convert_from_f128(src, &target_ctype);
+        }
+        if target_ctype == CType::Float128 && inner_ctype != CType::Float128 {
+            let src = self.lower_expr(inner);
+            return self.convert_to_f128(src, &inner_ctype);
         }
 
         let src = self.lower_expr(inner);
@@ -628,7 +640,7 @@ impl Lowerer {
         &mut self, type_spec: &TypeSpecifier, init: &Initializer, ty: IrType, size: usize,
     ) -> Value {
         let alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: alloca, size, ty, align: 0, volatile: false });
+        self.emit(Instruction::Alloca { dest: alloca, size, ty, align: 0, volatile: false, semantic_volatile: false });
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         match init {
             Initializer::Expr(expr) => {
@@ -703,9 +715,7 @@ impl Lowerer {
         if let Expr::Identifier(name, _) = inner {
             let dest = self.fresh_value();
             // Apply __asm__("label") redirect (e.g. stat -> stat64)
-            let resolved = self.asm_label_map.get(name.as_str())
-                .cloned()
-                .unwrap_or_else(|| name.clone());
+            let resolved = self.resolve_ref_name(name.as_str());
             self.emit(Instruction::GlobalAddr { dest, name: resolved });
             return Operand::Value(dest);
         }
@@ -1182,7 +1192,7 @@ impl Lowerer {
                 size: alloc_size,
                 ty: IrType::I64,
                 align: struct_align,
-                volatile: false,
+                volatile: false, semantic_volatile: false,
             });
             self.emit(Instruction::VaArgStruct {
                 dest_ptr: alloca,
@@ -1209,7 +1219,7 @@ impl Lowerer {
             size: alloc_size,
             ty: default_slot_ty,
             align: struct_align,
-            volatile: false,
+            volatile: false, semantic_volatile: false,
         });
 
         // Get the va_list pointer (same logic as scalar va_arg)
@@ -1335,7 +1345,7 @@ impl Lowerer {
                 ty: IrType::Ptr,
                 size: 8,
                 align: 0,
-                volatile: false,
+                volatile: false, semantic_volatile: false,
             });
             self.emit(Instruction::Store { val: Operand::Value(packed), ptr: tmp_alloca, ty: read_ty,
              seg_override: AddressSpace::Default });

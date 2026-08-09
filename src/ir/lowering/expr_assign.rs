@@ -65,11 +65,11 @@ impl Lowerer {
             // For _Bool targets, normalize at the source type before any truncation.
             // Truncating first (e.g. 0x100 -> U8 = 0) then normalizing gives wrong results.
             let rhs_val = self.lower_expr(rhs);
-            let rhs_ty = self.get_expr_type(rhs);
+            let rhs_ty = self.value_ir_type(rhs);
             self.emit_bool_normalize_typed(rhs_val, rhs_ty)
         } else {
             let rhs_val = self.lower_expr(rhs);
-            let rhs_ty = self.get_expr_type(rhs);
+            let rhs_ty = self.value_ir_type(rhs);
             self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
         };
 
@@ -173,7 +173,7 @@ impl Lowerer {
         // (any nonzero becomes 1) BEFORE bitfield truncation. Without this,
         // e.g. `s.bool_bf = 2` would mask 2 (0b10) to 1 bit = 0, not 1.
         let store_val = if is_bool {
-            let rhs_ty = self.get_expr_type(rhs);
+            let rhs_ty = self.value_ir_type(rhs);
             self.emit_bool_normalize_typed(rhs_val, rhs_ty)
         } else {
             rhs_val
@@ -709,7 +709,7 @@ impl Lowerer {
             // Spill it to an alloca so we can memcpy from it.
             let alloca = self.fresh_value();
             let store_ty = Self::packed_store_type(total_size);
-            self.emit(Instruction::Alloca { dest: alloca, size: total_size, ty: store_ty, align: 0, volatile: false });
+            self.emit(Instruction::Alloca { dest: alloca, size: total_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
             self.emit(Instruction::Store { val: rhs_val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
             alloca
         } else {

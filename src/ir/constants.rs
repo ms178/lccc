@@ -231,9 +231,15 @@ impl IrConst {
         }
     }
 
-    /// Returns true if this constant is one (integer only).
+    /// Returns true if this constant is the integer value one.
+    ///
+    /// Do not fold floating `x * 1.0` or `x / 1.0` through this predicate:
+    /// without an explicit fast-math contract those rewrites can alter IEEE
+    /// exception/rounding observability. Floating identities need their own
+    /// opt-in legality gate instead of silently sharing integer algebra.
     pub fn is_one(&self) -> bool {
-        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) | IrConst::I128(1))
+        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1)
+            | IrConst::I64(1) | IrConst::I128(1))
     }
 
     /// Returns true if this constant is nonzero (for truthiness checks in const eval).

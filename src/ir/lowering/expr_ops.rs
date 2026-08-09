@@ -61,7 +61,12 @@ impl Lowerer {
             | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) {
             let lhs_ty = self.get_expr_type(lhs);
             let rhs_ty = self.get_expr_type(rhs);
-            if !lhs_ty.is_float() && !rhs_ty.is_float() {
+            // _Float128 (carrier U128) is NOT an integer: folding its bit
+            // pattern as an i128 would compute garbage (e.g. 1.5F128 * 3.125F128
+            // multiplied as integers). F128 ops go through libgcc soft-float.
+            let lhs_f128 = matches!(self.expr_ctype(lhs), CType::Float128);
+            let rhs_f128 = matches!(self.expr_ctype(rhs), CType::Float128);
+            if !lhs_ty.is_float() && !rhs_ty.is_float() && !lhs_f128 && !rhs_f128 {
                 if let Some(val) = self.eval_const_expr_from_parts(op, lhs, rhs) {
                     return Operand::Const(val);
                 }
@@ -104,7 +109,72 @@ impl Lowerer {
                 return Operand::Value(dest);
             }
 
+        // _Float128 (binary128): arithmetic and comparisons lower to libgcc
+        // soft-float helper calls (__addtf3/__eqtf2/...), matching GCC.
+        let lhs_ct = self.expr_ctype(lhs);
+        let rhs_ct = self.expr_ctype(rhs);
+        if matches!(lhs_ct, CType::Float128) || matches!(rhs_ct, CType::Float128) {
+            return self.lower_f128_binop(op, lhs, lhs_ct, rhs, rhs_ct);
+        }
+
         self.lower_arithmetic_binop(op, lhs, rhs)
+    }
+
+    /// Lower arithmetic/comparison on _Float128 via libgcc soft-float calls.
+    fn lower_f128_binop(&mut self, op: &BinOp, lhs: &Expr, lhs_ct: CType, rhs: &Expr, rhs_ct: CType) -> Operand {
+        let lhs_val = self.lower_expr(lhs);
+        let rhs_val = self.lower_expr(rhs);
+        let lhs128 = self.convert_to_f128(lhs_val, &lhs_ct);
+        let rhs128 = self.convert_to_f128(rhs_val, &rhs_ct);
+        match op {
+            BinOp::Add => {
+                let d = self.emit_f128_binop_call("__addtf3", lhs128, rhs128);
+                Operand::Value(d)
+            }
+            BinOp::Sub => {
+                let d = self.emit_f128_binop_call("__subtf3", lhs128, rhs128);
+                Operand::Value(d)
+            }
+            BinOp::Mul => {
+                let d = self.emit_f128_binop_call("__multf3", lhs128, rhs128);
+                Operand::Value(d)
+            }
+            BinOp::Div => {
+                let d = self.emit_f128_binop_call("__divtf3", lhs128, rhs128);
+                Operand::Value(d)
+            }
+            BinOp::Eq => {
+                let d = self.emit_f128_cmp_call("__eqtf2", lhs128, rhs128);
+                let z = self.emit_cmp_val(IrCmpOp::Eq, Operand::Value(d), Operand::Const(IrConst::I64(0)), IrType::I32);
+                Operand::Value(z)
+            }
+            BinOp::Ne => {
+                let d = self.emit_f128_cmp_call("__netf2", lhs128, rhs128);
+                let z = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(d), Operand::Const(IrConst::I64(0)), IrType::I32);
+                Operand::Value(z)
+            }
+            BinOp::Lt => {
+                let d = self.emit_f128_cmp_call("__lttf2", lhs128, rhs128);
+                let z = self.emit_cmp_val(IrCmpOp::Slt, Operand::Value(d), Operand::Const(IrConst::I64(0)), IrType::I32);
+                Operand::Value(z)
+            }
+            BinOp::Le => {
+                let d = self.emit_f128_cmp_call("__letf2", lhs128, rhs128);
+                let z = self.emit_cmp_val(IrCmpOp::Sle, Operand::Value(d), Operand::Const(IrConst::I64(0)), IrType::I32);
+                Operand::Value(z)
+            }
+            BinOp::Gt => {
+                let d = self.emit_f128_cmp_call("__gttf2", lhs128, rhs128);
+                let z = self.emit_cmp_val(IrCmpOp::Sgt, Operand::Value(d), Operand::Const(IrConst::I64(0)), IrType::I32);
+                Operand::Value(z)
+            }
+            BinOp::Ge => {
+                let d = self.emit_f128_cmp_call("__getf2", lhs128, rhs128);
+                let z = self.emit_cmp_val(IrCmpOp::Sge, Operand::Value(d), Operand::Const(IrConst::I64(0)), IrType::I32);
+                Operand::Value(z)
+            }
+            _ => self.lower_arithmetic_binop(op, lhs, rhs),
+        }
     }
 
     fn lower_complex_binary_op(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr, lhs_ct: &CType, rhs_ct: &CType) -> Operand {
@@ -347,6 +417,32 @@ impl Lowerer {
                     let ptr = self.operand_to_value(val);
                     return self.lower_complex_neg(ptr, &inner_ct);
                 }
+                // _Float128 constants are I128 bit patterns (binary128).
+                // Float negation flips the SIGN BIT (bit 127), not the
+                // integer value: -0x3fff8000... (1.5) must become
+                // 0xbfff8000... (-1.5), NOT 0xc0008000... (-3.0). Fold here
+                // so no UnaryOp(Neg) with a U128-typed bit pattern ever
+                // reaches the generic i128 negator.
+                if inner_ct == CType::Float128 {
+                    // _Float128 negation = toggle sign bit 127. Constants fold
+                    // directly; variables go through the F128Neg intrinsic
+                    // (a generic UnaryOp Neg on the U128 bit pattern would
+                    // wrap the integer instead — -1.5 -> -3.0).
+                    if let Expr::FloatLiteralF128(_, bytes, _) = inner {
+                        let bits = u128::from_le_bytes(*bytes);
+                        let toggled = (bits ^ (1u128 << 127)) as i128;
+                        return Operand::Const(IrConst::I128(toggled));
+                    }
+                    let val = self.lower_expr(inner);
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::Intrinsic {
+                        dest: Some(dest),
+                        op: crate::ir::intrinsics::IntrinsicOp::F128Neg,
+                        dest_ptr: None,
+                        args: vec![val],
+                    });
+                    return Operand::Value(dest);
+                }
                 let ty = self.get_expr_type(inner);
                 let inner_ty = self.infer_expr_type(inner);
                 let neg_ty = if ty.is_float() || ty.is_128bit() { ty } else { widened_op_type(ty) };
@@ -478,15 +574,13 @@ impl Lowerer {
             }
         }
 
-        let cond_val = self.lower_condition_expr(cond);
-
         // For complex types, both branches produce Ptr values; use Ptr as the
         // alloca/store/load type so we don't emit bogus int-to-float casts.
         // When the branch types differ, convert each to the common complex type.
         if result_is_complex {
             let common_ct = self.common_complex_type(&then_ct, &else_ct);
-            return self.emit_ternary_branch(
-                cond_val,
+            return self.emit_ternary_branch_cond(
+                cond,
                 IrType::Ptr,
                 |s| {
                     let v = s.lower_expr(then_expr);
@@ -527,8 +621,8 @@ impl Lowerer {
         // Use target int type for loading packed small-struct data (≤8 bytes)
         let effective_ty = if needs_struct_load { crate::common::types::target_int_ir_type() } else { common_ty };
 
-        self.emit_ternary_branch(
-            cond_val,
+        self.emit_ternary_branch_cond(
+            cond,
             effective_ty,
             |s| {
                 let then_val = s.lower_expr(then_expr);
@@ -620,6 +714,45 @@ impl Lowerer {
     /// Shared helper for ternary branch patterns (conditional and GNU conditional).
     /// Evaluates `then_fn` in the true branch and `else_fn` in the false branch,
     /// stores both results to an alloca, and returns the loaded result.
+    /// ms178: Ternary whose condition is an arbitrary C expression lowered via
+    /// `lower_condition_branch` (cmp; jcc branch tree for && / || chains).
+    fn emit_ternary_branch_cond(
+        &mut self,
+        cond_expr: &Expr,
+        result_ty: IrType,
+        then_fn: impl FnOnce(&mut Self) -> Operand,
+        else_fn: impl FnOnce(&mut Self) -> Operand,
+    ) -> Operand {
+        // Use emit_entry_alloca so the alloca is in the entry block, ensuring
+        // mem2reg can promote it to SSA/Phi form.
+        let int_ty = crate::common::types::target_int_ir_type();
+        let min_alloca_size = int_ty.size();
+        let alloca_size = result_ty.size().max(min_alloca_size);
+        let alloca_ty = if result_ty.size() > min_alloca_size { result_ty } else { int_ty };
+        let result_alloca = self.emit_entry_alloca(alloca_ty, alloca_size, 0, false);
+
+        let then_label = self.fresh_label();
+        let else_label = self.fresh_label();
+        let end_label = self.fresh_label();
+
+        self.lower_condition_branch(cond_expr, then_label, else_label);
+
+        self.start_block(then_label);
+        let then_val = then_fn(self);
+        self.emit(Instruction::Store { val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.terminate(Terminator::Branch(end_label));
+
+        self.start_block(else_label);
+        let else_val = else_fn(self);
+        self.emit(Instruction::Store { val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.terminate(Terminator::Branch(end_label));
+
+        self.start_block(end_label);
+        let result = self.fresh_value();
+        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        Operand::Value(result)
+    }
+
     fn emit_ternary_branch(
         &mut self,
         cond: Operand,
@@ -679,6 +812,27 @@ impl Lowerer {
             if int_ty == IrType::I32 { IrConst::I32(v as i32) } else { IrConst::I64(v) }
         };
 
+        // ms178: A comparison / logical-operator / logical-NOT RHS already
+        // lowers to a normalized 0/1 boolean, so re-normalizing it with an
+        // extra `!= 0` comparison (`emit_cmp_val(Ne, rhs_val, 0)`) is an
+        // identity that only emits a redundant cmp+setcc+movzbl per condition
+        // in short-circuit chains (gzip's longest_match: `a != b || c != d`
+        // materialized BOTH sides plus a re-compare of the RHS bool). Only
+        // normalize when the RHS lowering can produce an arbitrary nonzero
+        // value (pointers, integers, floats, compound exprs).
+        let rhs_is_normalized_bool = matches!(rhs, Expr::BinaryOp(op, _, _, _) if op.is_comparison())
+            || matches!(rhs, Expr::UnaryOp(UnaryOp::LogicalNot, _, _));
+        // Lower rhs and produce a 0/1 boolean, skipping the identity `!= 0`
+        // when the RHS expression already yields a normalized boolean.
+        let lower_rhs_bool = |slf: &mut Self| -> Operand {
+            let rhs_val = slf.lower_condition_expr(rhs);
+            if rhs_is_normalized_bool {
+                rhs_val
+            } else {
+                Operand::Value(slf.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty))
+            }
+        };
+
         // Constant-fold the LHS to eliminate dead code at lowering time.
         // This is critical for constructs like IS_ENABLED(CONFIG_X) && func()
         // where CONFIG_X is not set: without this, the compiler would emit a
@@ -691,18 +845,14 @@ impl Lowerer {
                     return Operand::Const(make_int_const(0));
                 }
                 // nonzero && rhs => result is bool(rhs)
-                let rhs_val = self.lower_condition_expr(rhs);
-                let rhs_bool = self.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty);
-                return Operand::Value(rhs_bool);
+                return lower_rhs_bool(self);
             } else {
                 if lhs_is_true {
                     // nonzero || rhs => always 1, skip RHS entirely
                     return Operand::Const(make_int_const(1));
                 }
                 // 0 || rhs => result is bool(rhs)
-                let rhs_val = self.lower_condition_expr(rhs);
-                let rhs_bool = self.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty);
-                return Operand::Value(rhs_bool);
+                return lower_rhs_bool(self);
             }
         }
 
@@ -749,9 +899,8 @@ impl Lowerer {
         self.terminate(Terminator::CondBranch { cond: lhs_val, true_label, false_label });
 
         self.start_block(rhs_label);
-        let rhs_val = self.lower_condition_expr(rhs);
-        let rhs_bool = self.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty);
-        self.emit(Instruction::Store { val: Operand::Value(rhs_bool), ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+        let rhs_bool = lower_rhs_bool(self);
+        self.emit(Instruction::Store { val: rhs_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
@@ -784,17 +933,17 @@ impl Lowerer {
             let loaded = self.load_lvalue_typed(&lv, ty);
             let loaded_val = self.operand_to_value(loaded);
 
-            // For post-increment/decrement (return_new == false), save the old
-            // value to a volatile alloca BEFORE computing the new value. This
-            // prevents register coalescing from clobbering the old value: after
-            // mem2reg, the old value gets coalesced with the phi dest (same
-            // register), but the inc/dec computation writes the new value to
-            // that register before the old value is consumed (e.g., the
-            // CondBranch in `while(n--)`).
+            // Post-inc/dec saves the old value to a volatile alloca before
+            // computing the new one (register coalescing would otherwise
+            // clobber it, e.g. `while (n--)`). When the result is DISCARDED
+            // (expression statement, for-increment) the old value is never
+            // observed, so the per-iteration spill is pure overhead — skip it.
             let mut postdec_alloca = None;
-            if !return_new {
+            if !return_new && !self.discard_expr_result {
                 let alloca_ty = if ty == IrType::Ptr { IrType::I64 } else { ty };
-                let tmp = self.emit_entry_alloca(alloca_ty, alloca_ty.size(), 0, true);
+                let tmp = self.emit_entry_alloca_with_flags(
+                    alloca_ty, alloca_ty.size(), 0, true, false,
+                );
                 self.emit(Instruction::Store {
                     val: Operand::Value(loaded_val), ptr: tmp,
                     ty: alloca_ty, seg_override: AddressSpace::Default,
@@ -814,6 +963,11 @@ impl Lowerer {
             };
             self.store_lvalue_typed(&lv, store_op, ty);
             if return_new {
+                return store_op;
+            }
+            // Result is discarded: no volatile spill was emitted and the old
+            // value is never observed — nothing left to do.
+            if self.discard_expr_result {
                 return store_op;
             }
             // Reload the old value from the alloca we saved earlier

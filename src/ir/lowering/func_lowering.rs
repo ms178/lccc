@@ -153,7 +153,7 @@ impl Lowerer {
         // Check if function returns a large struct via sret
         if let Some(sig) = self.func_meta.sigs.get(&func.name) {
             if let Some(sret_size) = sig.sret_size {
-                params.push(IrParam { ty: IrType::Ptr, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+                params.push(IrParam { ty: IrType::Ptr, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
                 uses_sret = true;
                 let _ = sret_size; // used for alloca sizing in allocate_function_params
             }
@@ -178,7 +178,7 @@ impl Lowerer {
                 } else if matches!(param_ctype, CType::ComplexFloat) && self.uses_packed_complex_float() {
                     // x86-64: _Complex float packed into single F64
                     let ir_idx = params.len();
-                    params.push(IrParam { ty: IrType::F64, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+                    params.push(IrParam { ty: IrType::F64, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
                     param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
                     continue;
                 } else {
@@ -186,9 +186,9 @@ impl Lowerer {
                     // ComplexLongDouble on ARM64 only)
                     let comp_ty = Self::complex_component_ir_type(&param_ctype);
                     let real_idx = params.len();
-                    params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+                    params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
                     let imag_idx = params.len();
-                    params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+                    params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
                     param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
                     continue;
                 }
@@ -228,8 +228,28 @@ impl Lowerer {
                 } else {
                     (None, Vec::new(), None)
                 };
-                params.push(IrParam { ty: IrType::Ptr, struct_size, struct_align, struct_eightbyte_classes, riscv_float_class });
+                params.push(IrParam { ty: IrType::Ptr, struct_size, struct_align, struct_eightbyte_classes, riscv_float_class, is_f128_sse: false });
                 param_kinds.push(ParamKind::Struct(ir_idx));
+                continue;
+            }
+
+            // _Float128 parameters: ONE 16-byte XMM register (SysV psABI).
+            // Carried in a U128-typed param (bit-exact storage); classified as
+            // a 16-byte SSE struct so the backend routes it through XMM regs.
+            if matches!(param_ctype, CType::Float128) {
+                let ir_idx = params.len();
+                params.push(IrParam {
+                    ty: IrType::U128,
+                    struct_size: Some(16),
+                    struct_align: Some(16),
+                    struct_eightbyte_classes: vec![
+                        crate::common::types::EightbyteClass::Sse,
+                        crate::common::types::EightbyteClass::Sse,
+                    ],
+                    riscv_float_class: None,
+                    is_f128_sse: true,
+                });
+                param_kinds.push(ParamKind::Normal(ir_idx));
                 continue;
             }
 
@@ -244,7 +264,7 @@ impl Lowerer {
                     other => other,
                 };
             }
-            params.push(IrParam { ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+            params.push(IrParam { ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
             param_kinds.push(ParamKind::Normal(ir_idx));
         }
 
@@ -259,13 +279,13 @@ impl Lowerer {
             let alloca = self.fresh_value();
             if info.uses_sret && ir_allocas.is_empty() {
                 let ptr_size = crate::common::types::target_ptr_size();
-                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: ptr_size, align: 0, volatile: false });
+                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: ptr_size, align: 0, volatile: false, semantic_volatile: false });
                 self.func_mut().sret_ptr = Some(alloca);
                 ir_allocas.push(alloca);
                 continue;
             }
             let size = param.ty.size().max(param.struct_size.unwrap_or(param.ty.size()));
-            self.emit(Instruction::Alloca { dest: alloca, ty: param.ty, size, align: 0, volatile: false });
+            self.emit(Instruction::Alloca { dest: alloca, ty: param.ty, size, align: 0, volatile: false, semantic_volatile: false });
             ir_allocas.push(alloca);
         }
 
@@ -415,7 +435,7 @@ impl Lowerer {
         let complex_size = ct.size();
 
         let complex_alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: complex_alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false });
+        self.emit(Instruction::Alloca { dest: complex_alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false, semantic_volatile: false });
 
         let real_val = self.fresh_value();
         self.emit(Instruction::Load { dest: real_val, ptr: real_alloca, ty: comp_ty , seg_override: AddressSpace::Default });
@@ -451,7 +471,7 @@ impl Lowerer {
                     self.emit(Instruction::Load { dest: f64_val, ptr: local_info.alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
                     let f32_val = self.emit_cast_val(Operand::Value(f64_val), IrType::F64, IrType::F32);
                     let f32_alloca = self.fresh_value();
-                    self.emit(Instruction::Alloca { dest: f32_alloca, ty: IrType::F32, size: 4, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: f32_alloca, ty: IrType::F32, size: 4, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val: Operand::Value(f32_val), ptr: f32_alloca, ty: IrType::F32 , seg_override: AddressSpace::Default });
                     if let Some(local) = self.func_mut().locals.get_mut(&name) {
                         local.alloca = f32_alloca; local.ty = IrType::F32; local.alloc_size = 4;
@@ -464,7 +484,7 @@ impl Lowerer {
                     let narrow_val = self.emit_cast_val(Operand::Value(i32_val), IrType::I32, declared_ty);
                     let narrow_alloca = self.fresh_value();
                     let size = declared_ty.size().max(1);
-                    self.emit(Instruction::Alloca { dest: narrow_alloca, ty: declared_ty, size, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: narrow_alloca, ty: declared_ty, size, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val: Operand::Value(narrow_val), ptr: narrow_alloca, ty: declared_ty , seg_override: AddressSpace::Default });
                     if let Some(local) = self.func_mut().locals.get_mut(&name) {
                         local.alloca = narrow_alloca; local.ty = declared_ty; local.alloc_size = size;
@@ -548,11 +568,22 @@ impl Lowerer {
         let ret_eightbyte_classes = self.func_meta.sigs.get(&func.name)
             .map(|s| s.ret_eightbyte_classes.clone())
             .unwrap_or_default();
+        // _Float128 returns come back in ONE XMM register (SysV psABI).
+        let ret_is_f128_sse = self.func_meta.sigs.get(&func.name)
+            .map(|s| s.ret_is_f128_sse)
+            .unwrap_or(false);
         // Use the lowerer's global next_label counter to ensure labels are globally unique
         let next_label = self.next_label;
 
         let ir_func = IrFunction {
-            name: func.name.clone(), return_type, params,
+            // GCC __asm__("symbol") asm labels: a function DEFINITION must be
+            // emitted under the asm label, not its C name. The declaration
+            // (e.g. `extern int __printf__(...) __asm__("rpl_printf")` from
+            // gnulib's stdio.h) has already been collected into asm_label_map
+            // by the signature pass, and call sites resolve through it, so we
+            // only need to rename the emitted definition symbol here.
+            name: self.asm_label_map.get(&func.name).cloned().unwrap_or_else(|| func.name.clone()),
+            return_type, params,
             blocks: std::mem::take(&mut self.func_mut().blocks),
             is_variadic: func.variadic, is_declaration: false, is_static,
             is_inline: func.attrs.is_inline(),
@@ -571,6 +602,7 @@ impl Lowerer {
             is_naked: func.attrs.is_naked(),
             global_init_label_blocks: global_init_labels,
             ret_eightbyte_classes,
+            ret_is_f128_sse,
             is_gnu_inline_def: is_gnu_inline_no_extern_def,
         };
         // Collect __attribute__((symver("..."))) directives

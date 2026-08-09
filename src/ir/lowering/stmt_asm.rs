@@ -82,7 +82,7 @@ impl Lowerer {
                     let tmp = self.fresh_value();
                     self.emit(Instruction::Alloca {
                         dest: tmp, ty: out_ty, size: out_ty.size(),
-                        align: out_ty.align(), volatile: false,
+                        align: out_ty.align(), volatile: false, semantic_volatile: false,
                     });
                     tmp
                 } else {
@@ -97,7 +97,7 @@ impl Lowerer {
                 let tmp = self.fresh_value();
                 self.emit(Instruction::Alloca {
                     dest: tmp, ty: out_ty, size: out_ty.size(),
-                    align: out_ty.align(), volatile: false,
+                    align: out_ty.align(), volatile: false, semantic_volatile: false,
                 });
                 tmp
             };

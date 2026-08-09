@@ -46,7 +46,8 @@ impl Lowerer {
                 return s.chars().count() + 1; // +1 for null terminator (count in wchar_t elements)
             }
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &items[0].init {
-                return s.len() + 1; // narrow string to wchar_t array (each byte is an element)
+                // Narrow literal stores one C byte per char; each byte is an element.
+                return s.chars().count() + 1;
             }
         }
         // Special case: char16_t c[] = {u"hello"} - single brace-wrapped char16_t string literal

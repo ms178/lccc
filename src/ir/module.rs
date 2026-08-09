@@ -28,6 +28,10 @@ pub struct IrModule {
     /// Symbol attribute directives for extern declarations:
     /// (name, is_weak, visibility) - emitted as .weak/.hidden/.protected directives
     pub symbol_attrs: Vec<(String, bool, Option<String>)>,
+    /// __asm__("label") linker-symbol redirects on declarations
+    /// (C name -> asm label). Filled during lowering; consumed by the
+    /// backend when emitting symbol names.
+    pub asm_labels: std::collections::HashMap<String, String>,
     /// Symbol version directives: (function_name, symver_string)
     /// From __attribute__((symver("name@@VERSION"))) - emitted as .symver directives
     pub symver_directives: Vec<(String, String)>,
@@ -220,6 +224,8 @@ pub struct IrFunction {
     /// returned in a GP register (rax/rdx) or SSE register (xmm0/xmm1).
     /// Empty for non-struct returns, sret, or non-x86-64 targets.
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True if the return value is _Float128 (ONE 16-byte XMM return).
+    pub ret_is_f128_sse: bool,
     /// True for `extern inline __attribute__((gnu_inline))` functions (or `extern inline`
     /// in GNU89 mode). These function bodies are lowered for inlining, but must NOT be
     /// emitted as standalone definitions. After the inlining pass, they are converted to
@@ -242,6 +248,8 @@ pub struct IrParam {
     /// Empty for non-struct params or when classification is not applicable.
     /// Each entry indicates whether that eightbyte should use SSE or GP registers.
     pub struct_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True for _Float128 params: ONE 16-byte XMM register.
+    pub is_f128_sse: bool,
     /// RISC-V LP64D float field classification for struct params.
     /// When Some, indicates this struct should use FP registers per the psABI
     /// hardware floating-point calling convention. None for non-struct params
@@ -262,6 +270,7 @@ impl IrModule {
             aliases: Vec::new(),
             toplevel_asm: Vec::new(),
             symbol_attrs: Vec::new(),
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: Vec::new(),
         }
     }
@@ -315,6 +324,7 @@ impl IrFunction {
             is_naked: false,
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
+            ret_is_f128_sse: false,
             is_gnu_inline_def: false,
         }
     }

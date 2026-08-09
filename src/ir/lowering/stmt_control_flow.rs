@@ -11,17 +11,15 @@ use super::lower::Lowerer;
 
 impl Lowerer {
     pub(super) fn lower_if_stmt(&mut self, cond: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
-        let cond_val = self.lower_condition_expr(cond);
         let then_label = self.fresh_label();
         let else_label = self.fresh_label();
         let end_label = self.fresh_label();
 
         let false_target = if else_stmt.is_some() { else_label } else { end_label };
-        self.terminate(Terminator::CondBranch {
-            cond: cond_val,
-            true_label: then_label,
-            false_label: false_target,
-        });
+        // ms178: lower the condition as a direct branch (cmp; jcc via flag
+        // fusion) instead of materializing a boolean value. For && / ||
+        // chains this emits a branch tree with no setcc/movzbl/test round-trips.
+        self.lower_condition_branch(cond, then_label, false_target);
 
         self.start_block(then_label);
         self.lower_stmt(then_stmt);
@@ -48,12 +46,8 @@ impl Lowerer {
         self.terminate(Terminator::Branch(cond_label));
 
         self.start_block(cond_label);
-        let cond_val = self.lower_condition_expr(cond);
-        self.terminate(Terminator::CondBranch {
-            cond: cond_val,
-            true_label: body_label,
-            false_label: end_label,
-        });
+        // ms178: direct branch lowering for the while condition.
+        self.lower_condition_branch(cond, body_label, end_label);
 
         self.start_block(body_label);
         self.lower_stmt(body);
@@ -104,12 +98,8 @@ impl Lowerer {
         // Condition
         self.start_block(cond_label);
         if let Some(cond) = cond {
-            let cond_val = self.lower_condition_expr(cond);
-            self.terminate(Terminator::CondBranch {
-                cond: cond_val,
-                true_label: body_label,
-                false_label: end_label,
-            });
+            // ms178: direct branch lowering for the for-loop condition.
+            self.lower_condition_branch(cond, body_label, end_label);
         } else {
             self.terminate(Terminator::Branch(body_label));
         }
@@ -122,7 +112,9 @@ impl Lowerer {
         // Increment
         self.start_block(inc_label);
         if let Some(inc) = inc {
-            self.lower_expr(inc);
+            // The increment expression's result is discarded: post-inc/dec
+            // can skip their volatile old-value spill.
+            self.lower_expr_discard(inc);
         }
         self.terminate(Terminator::Branch(cond_label));
 
@@ -151,12 +143,8 @@ impl Lowerer {
         self.terminate(Terminator::Branch(cond_label));
 
         self.start_block(cond_label);
-        let cond_val = self.lower_condition_expr(cond);
-        self.terminate(Terminator::CondBranch {
-            cond: cond_val,
-            true_label: body_label,
-            false_label: end_label,
-        });
+        // ms178: direct branch lowering for the do-while condition.
+        self.lower_condition_branch(cond, body_label, end_label);
 
         self.func_mut().break_labels.pop();
         self.func_mut().continue_labels.pop();

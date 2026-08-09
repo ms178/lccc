@@ -1,3 +1,6 @@
+use super::constants::IrConst;
+use super::intrinsics::IntrinsicOp;
+use super::ops::{AtomicOrdering, AtomicRmwOp, IrBinOp, IrCmpOp, IrUnaryOp};
 /// IR instruction definitions: the core SSA instruction set.
 ///
 /// This module defines the SSA IR instruction enum with 38 variants covering
@@ -14,9 +17,6 @@
 /// - `BasicBlock`: a labeled sequence of instructions ending in a terminator
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, EightbyteClass, IrType};
-use super::constants::IrConst;
-use super::intrinsics::IntrinsicOp;
-use super::ops::{AtomicOrdering, AtomicRmwOp, IrBinOp, IrCmpOp, IrUnaryOp};
 
 /// A basic block identifier. Uses a u32 index for zero-cost copies
 /// instead of heap-allocated String labels. The block's assembly label
@@ -93,6 +93,10 @@ pub struct CallInfo {
     pub struct_arg_classes: Vec<Vec<EightbyteClass>>,
     /// RISC-V LP64D float field classification for struct args.
     pub struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
+    /// True for args that are _Float128: ONE 16-byte XMM register (SysV psABI).
+    pub struct_arg_is_f128_sse: Vec<bool>,
+    /// True if the return value is _Float128 (ONE 16-byte XMM register).
+    pub ret_is_f128_sse: bool,
     /// True if the call uses a hidden pointer argument for struct returns (i386 SysV ABI).
     pub is_sret: bool,
     /// True if the callee uses the fastcall calling convention.
@@ -108,29 +112,73 @@ pub enum Instruction {
     /// Allocate stack space: %dest = alloca ty
     /// `align` is the alignment override (0 means use default platform alignment).
     /// `volatile` prevents mem2reg from promoting this alloca to an SSA register.
-    /// This is needed for volatile-qualified locals that must survive setjmp/longjmp.
-    Alloca { dest: Value, ty: IrType, size: usize, align: usize, volatile: bool },
+    /// It is also used for compiler-internal stack homes whose memory identity must
+    /// survive SSA promotion (for example, the saved old value of `i++`).
+    ///
+    /// `semantic_volatile` is true only for storage originating from a C
+    /// volatile-qualified object.  Backend memory optimizers must preserve every
+    /// access to such storage; an internal non-promotable stack home does not have
+    /// those externally observable volatile-access semantics.
+    Alloca {
+        dest: Value,
+        ty: IrType,
+        size: usize,
+        align: usize,
+        volatile: bool,
+        semantic_volatile: bool,
+    },
 
     /// Dynamic stack allocation: %dest = dynalloca size_operand, align
     /// Used for __builtin_alloca - adjusts stack pointer at runtime.
-    DynAlloca { dest: Value, size: Operand, align: usize },
+    DynAlloca {
+        dest: Value,
+        size: Operand,
+        align: usize,
+    },
 
     /// Store to memory: store val, ptr (type indicates size of store)
     /// seg_override: segment register override for x86 (%gs:/%fs:) from named address spaces.
-    Store { val: Operand, ptr: Value, ty: IrType, seg_override: AddressSpace },
+    Store {
+        val: Operand,
+        ptr: Value,
+        ty: IrType,
+        seg_override: AddressSpace,
+    },
 
     /// Load from memory: %dest = load ptr
     /// seg_override: segment register override for x86 (%gs:/%fs:) from named address spaces.
-    Load { dest: Value, ptr: Value, ty: IrType, seg_override: AddressSpace },
+    Load {
+        dest: Value,
+        ptr: Value,
+        ty: IrType,
+        seg_override: AddressSpace,
+    },
 
     /// Binary operation: %dest = op lhs, rhs
-    BinOp { dest: Value, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType },
+    BinOp {
+        dest: Value,
+        op: IrBinOp,
+        lhs: Operand,
+        rhs: Operand,
+        ty: IrType,
+    },
 
     /// Unary operation: %dest = op src
-    UnaryOp { dest: Value, op: IrUnaryOp, src: Operand, ty: IrType },
+    UnaryOp {
+        dest: Value,
+        op: IrUnaryOp,
+        src: Operand,
+        ty: IrType,
+    },
 
     /// Comparison: %dest = cmp op lhs, rhs
-    Cmp { dest: Value, op: IrCmpOp, lhs: Operand, rhs: Operand, ty: IrType },
+    Cmp {
+        dest: Value,
+        op: IrCmpOp,
+        lhs: Operand,
+        rhs: Operand,
+        ty: IrType,
+    },
 
     /// Direct function call: %dest = call func(args...)
     Call { func: String, info: CallInfo },
@@ -139,10 +187,20 @@ pub enum Instruction {
     CallIndirect { func_ptr: Operand, info: CallInfo },
 
     /// Get element pointer (for arrays/structs)
-    GetElementPtr { dest: Value, base: Value, offset: Operand, ty: IrType },
+    GetElementPtr {
+        dest: Value,
+        base: Value,
+        offset: Operand,
+        ty: IrType,
+    },
 
     /// Type cast/conversion
-    Cast { dest: Value, src: Operand, from_ty: IrType, to_ty: IrType },
+    Cast {
+        dest: Value,
+        src: Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    },
 
     /// Copy a value
     Copy { dest: Value, src: Operand },
@@ -151,12 +209,20 @@ pub enum Instruction {
     GlobalAddr { dest: Value, name: String },
 
     /// Memory copy: memcpy(dest, src, size)
-    Memcpy { dest: Value, src: Value, size: usize },
+    Memcpy {
+        dest: Value,
+        src: Value,
+        size: usize,
+    },
 
     /// va_arg: extract the next variadic argument from a va_list.
     /// va_list_ptr is a pointer to the va_list struct/pointer.
     /// result_ty is the type of the argument being extracted.
-    VaArg { dest: Value, va_list_ptr: Value, result_ty: IrType },
+    VaArg {
+        dest: Value,
+        va_list_ptr: Value,
+        result_ty: IrType,
+    },
 
     /// va_arg for struct/union types: read a struct from the va_list into a
     /// pre-allocated buffer. `dest_ptr` is a pointer to the buffer (an alloca),
@@ -182,7 +248,7 @@ pub enum Instruction {
     },
 
     /// va_start: initialize a va_list. last_named_param is the pointer to the last named parameter.
-    VaStart { va_list_ptr: Value, },
+    VaStart { va_list_ptr: Value },
 
     /// va_end: cleanup a va_list (typically a no-op).
     VaEnd { va_list_ptr: Value },
@@ -197,6 +263,17 @@ pub enum Instruction {
         op: AtomicRmwOp,
         ptr: Operand,
         val: Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    },
+
+    /// Atomic increment with no SSA result.  This is intentionally separate
+    /// from AtomicRmw: PGO counters do not need the old value, and inventing a
+    /// dead destination stresses register allocation and spill-slot liveness.
+    AtomicInc {
+        ptr: Operand,
+        /// Constant byte offset from the base pointer; zero for a scalar.
+        offset: i64,
         ty: IrType,
         ordering: AtomicOrdering,
     },
@@ -233,9 +310,7 @@ pub enum Instruction {
     },
 
     /// Memory fence
-    Fence {
-        ordering: AtomicOrdering,
-    },
+    Fence { ordering: AtomicOrdering },
 
     /// SSA Phi node: merges values from different predecessor blocks.
     /// Each entry in `incoming` is (value, block_id) indicating which value
@@ -340,7 +415,11 @@ pub enum Instruction {
     /// to SSA and enabling constant propagation through reassigned parameters.
     /// The backend translates this to a load from the appropriate argument register
     /// or stack slot according to the calling convention.
-    ParamRef { dest: Value, param_idx: usize, ty: IrType },
+    ParamRef {
+        dest: Value,
+        param_idx: usize,
+        ty: IrType,
+    },
 }
 
 /// Block terminator.
@@ -353,11 +432,18 @@ pub enum Terminator {
     Branch(BlockId),
 
     /// Conditional branch
-    CondBranch { cond: Operand, true_label: BlockId, false_label: BlockId },
+    CondBranch {
+        cond: Operand,
+        true_label: BlockId,
+        false_label: BlockId,
+    },
 
     /// Indirect branch (computed goto): goto *addr
     /// possible_targets lists all labels that could be jumped to (for optimization/validation)
-    IndirectBranch { target: Operand, possible_targets: Vec<BlockId> },
+    IndirectBranch {
+        target: Operand,
+        possible_targets: Vec<BlockId>,
+    },
 
     /// Switch dispatch via jump table.
     /// Implements dense switch statements efficiently: the backend emits a jump table
@@ -406,8 +492,7 @@ impl Instruction {
             | Instruction::Select { dest, .. }
             | Instruction::StackSave { dest }
             | Instruction::ParamRef { dest, .. } => Some(*dest),
-            Instruction::Call { info, .. }
-            | Instruction::CallIndirect { info, .. } => info.dest,
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.dest,
             Instruction::Intrinsic { dest, .. } => *dest,
             Instruction::Store { .. }
             | Instruction::Memcpy { .. }
@@ -416,6 +501,7 @@ impl Instruction {
             | Instruction::VaCopy { .. }
             | Instruction::VaArgStruct { .. }
             | Instruction::AtomicStore { .. }
+            | Instruction::AtomicInc { .. }
             | Instruction::Fence { .. }
             | Instruction::SetReturnF64Second { .. }
             | Instruction::SetReturnF32Second { .. }
@@ -434,17 +520,26 @@ impl Instruction {
             Instruction::UnaryOp { ty, .. } => Some(*ty),
             Instruction::Cmp { .. } => Some(IrType::I8), // comparisons produce i8
             Instruction::Cast { to_ty, .. } => Some(*to_ty),
-            Instruction::Call { info, .. }
-            | Instruction::CallIndirect { info, .. } => Some(info.return_type),
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                Some(info.return_type)
+            }
             Instruction::VaArg { result_ty, .. } => Some(*result_ty),
             Instruction::AtomicRmw { ty, .. } => Some(*ty),
-            Instruction::AtomicCmpxchg { ty, returns_bool, .. } => {
-                if *returns_bool { Some(IrType::I8) } else { Some(*ty) }
+            Instruction::AtomicCmpxchg {
+                ty, returns_bool, ..
+            } => {
+                if *returns_bool {
+                    Some(IrType::I8)
+                } else {
+                    Some(*ty)
+                }
             }
             Instruction::AtomicLoad { ty, .. } => Some(*ty),
             // Alloca, GEP, GlobalAddr, Copy, DynAlloca, LabelAddr, StackSave produce pointers or copy types
-            Instruction::Alloca { .. } | Instruction::DynAlloca { .. }
-            | Instruction::GetElementPtr { .. } | Instruction::GlobalAddr { .. }
+            Instruction::Alloca { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::GlobalAddr { .. }
             | Instruction::LabelAddr { .. }
             | Instruction::StackSave { .. } => Some(IrType::Ptr),
             Instruction::Copy { .. } => None, // unknown without tracking
@@ -470,60 +565,123 @@ impl Instruction {
     pub fn for_each_used_value(&self, mut f: impl FnMut(u32)) {
         #[inline(always)]
         fn visit_op(op: &Operand, f: &mut impl FnMut(u32)) {
-            if let Operand::Value(v) = op { f(v.0); }
+            if let Operand::Value(v) = op {
+                f(v.0);
+            }
         }
         match self {
-            Instruction::Alloca { .. } | Instruction::GlobalAddr { .. }
-            | Instruction::LabelAddr { .. } | Instruction::StackSave { .. }
-            | Instruction::Fence { .. } | Instruction::GetReturnF64Second { .. }
+            Instruction::Alloca { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::Fence { .. }
+            | Instruction::GetReturnF64Second { .. }
             | Instruction::GetReturnF32Second { .. }
             | Instruction::GetReturnF128Second { .. }
             | Instruction::ParamRef { .. } => {}
 
             Instruction::Load { ptr, .. } => f(ptr.0),
-            Instruction::Store { val, ptr, .. } => { visit_op(val, &mut f); f(ptr.0); }
+            Instruction::Store { val, ptr, .. } => {
+                visit_op(val, &mut f);
+                f(ptr.0);
+            }
             Instruction::DynAlloca { size, .. } => visit_op(size, &mut f),
-            Instruction::BinOp { lhs, rhs, .. }
-            | Instruction::Cmp { lhs, rhs, .. } => { visit_op(lhs, &mut f); visit_op(rhs, &mut f); }
+            Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+                visit_op(lhs, &mut f);
+                visit_op(rhs, &mut f);
+            }
             Instruction::UnaryOp { src, .. }
             | Instruction::Cast { src, .. }
             | Instruction::Copy { src, .. } => visit_op(src, &mut f),
             Instruction::Call { info, .. } => {
-                for arg in &info.args { visit_op(arg, &mut f); }
+                for arg in &info.args {
+                    visit_op(arg, &mut f);
+                }
             }
             Instruction::CallIndirect { func_ptr, info } => {
                 visit_op(func_ptr, &mut f);
-                for arg in &info.args { visit_op(arg, &mut f); }
+                for arg in &info.args {
+                    visit_op(arg, &mut f);
+                }
             }
-            Instruction::GetElementPtr { base, offset, .. } => { f(base.0); visit_op(offset, &mut f); }
-            Instruction::Memcpy { dest, src, .. } => { f(dest.0); f(src.0); }
+            Instruction::GetElementPtr { base, offset, .. } => {
+                f(base.0);
+                visit_op(offset, &mut f);
+            }
+            Instruction::Memcpy { dest, src, .. } => {
+                f(dest.0);
+                f(src.0);
+            }
             Instruction::VaArg { va_list_ptr, .. }
             | Instruction::VaStart { va_list_ptr }
             | Instruction::VaEnd { va_list_ptr } => f(va_list_ptr.0),
-            Instruction::VaCopy { dest_ptr, src_ptr } => { f(dest_ptr.0); f(src_ptr.0); }
-            Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => { f(dest_ptr.0); f(va_list_ptr.0); }
-            Instruction::AtomicRmw { ptr, val, .. } => { visit_op(ptr, &mut f); visit_op(val, &mut f); }
-            Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
-                visit_op(ptr, &mut f); visit_op(expected, &mut f); visit_op(desired, &mut f);
+            Instruction::VaCopy { dest_ptr, src_ptr } => {
+                f(dest_ptr.0);
+                f(src_ptr.0);
+            }
+            Instruction::VaArgStruct {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            } => {
+                f(dest_ptr.0);
+                f(va_list_ptr.0);
+            }
+            Instruction::AtomicRmw { ptr, val, .. } => {
+                visit_op(ptr, &mut f);
+                visit_op(val, &mut f);
+            }
+            Instruction::AtomicCmpxchg {
+                ptr,
+                expected,
+                desired,
+                ..
+            } => {
+                visit_op(ptr, &mut f);
+                visit_op(expected, &mut f);
+                visit_op(desired, &mut f);
             }
             Instruction::AtomicLoad { ptr, .. } => visit_op(ptr, &mut f),
-            Instruction::AtomicStore { ptr, val, .. } => { visit_op(ptr, &mut f); visit_op(val, &mut f); }
+            Instruction::AtomicStore { ptr, val, .. } => {
+                visit_op(ptr, &mut f);
+                visit_op(val, &mut f);
+            }
+            Instruction::AtomicInc { ptr, .. } => visit_op(ptr, &mut f),
             Instruction::Phi { incoming, .. } => {
-                for (op, _) in incoming { visit_op(op, &mut f); }
+                for (op, _) in incoming {
+                    visit_op(op, &mut f);
+                }
             }
             Instruction::SetReturnF64Second { src }
             | Instruction::SetReturnF32Second { src }
             | Instruction::SetReturnF128Second { src } => visit_op(src, &mut f),
-            Instruction::InlineAsm { outputs, inputs, .. } => {
-                for (_, ptr, _) in outputs { f(ptr.0); }
-                for (_, op, _) in inputs { visit_op(op, &mut f); }
+            Instruction::InlineAsm {
+                outputs, inputs, ..
+            } => {
+                for (_, ptr, _) in outputs {
+                    f(ptr.0);
+                }
+                for (_, op, _) in inputs {
+                    visit_op(op, &mut f);
+                }
             }
             Instruction::Intrinsic { dest_ptr, args, .. } => {
-                if let Some(ptr) = dest_ptr { f(ptr.0); }
-                for arg in args { visit_op(arg, &mut f); }
+                if let Some(ptr) = dest_ptr {
+                    f(ptr.0);
+                }
+                for arg in args {
+                    visit_op(arg, &mut f);
+                }
             }
-            Instruction::Select { cond, true_val, false_val, .. } => {
-                visit_op(cond, &mut f); visit_op(true_val, &mut f); visit_op(false_val, &mut f);
+            Instruction::Select {
+                cond,
+                true_val,
+                false_val,
+                ..
+            } => {
+                visit_op(cond, &mut f);
+                visit_op(true_val, &mut f);
+                visit_op(false_val, &mut f);
             }
             Instruction::StackRestore { ptr } => f(ptr.0),
         }
@@ -543,9 +701,18 @@ impl Terminator {
     pub fn for_each_used_value(&self, mut f: impl FnMut(u32)) {
         match self {
             Terminator::Return(Some(Operand::Value(v))) => f(v.0),
-            Terminator::CondBranch { cond: Operand::Value(v), .. } => f(v.0),
-            Terminator::IndirectBranch { target: Operand::Value(v), .. } => f(v.0),
-            Terminator::Switch { val: Operand::Value(v), .. } => f(v.0),
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } => f(v.0),
+            Terminator::IndirectBranch {
+                target: Operand::Value(v),
+                ..
+            } => f(v.0),
+            Terminator::Switch {
+                val: Operand::Value(v),
+                ..
+            } => f(v.0),
             _ => {}
         }
     }

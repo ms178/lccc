@@ -17,7 +17,7 @@ use crate::frontend::parser::ast::{
     UnaryOp,
 };
 use crate::ir::reexports::IrConst;
-use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type};
+use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type, widened_op_type};
 use super::lower::Lowerer;
 
 /// Promote small integer types to I32, matching C integer promotion rules.
@@ -301,6 +301,7 @@ impl Lowerer {
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
             "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
             "__builtin_infl" | "__builtin_huge_vall" => Some(IrType::F128),
+            "__builtin_inff128" | "__builtin_huge_valf128" | "__builtin_nanf128" => Some(IrType::F128),
             "__builtin_nan" => Some(IrType::F64),
             "__builtin_nanf" => Some(IrType::F32),
             "__builtin_nanl" => Some(IrType::F128),
@@ -314,7 +315,37 @@ impl Lowerer {
             | "__builtin_floorf" | "__builtin_ceilf" | "__builtin_roundf"
             | "__builtin_copysignf"
             | "__builtin_nextafterf" => Some(IrType::F32),
-            "__builtin_fabsl" | "__builtin_nextafterl" => Some(IrType::F128),
+            "__builtin_fabsl" | "__builtin_sqrtl" | "__builtin_nextafterl" => Some(IrType::F128),
+            // __builtin_* variants: the LibcAlias lowering asks for the
+            // BUILTIN name (e.g. "__builtin_copysignl"), not the libc name.
+            // Without these, the call was typed I64 -> the caller cast the
+            // x87 result via fildq (bit-pattern corruption) or lost it.
+            "__builtin_copysignl" | "__builtin_truncl" | "__builtin_floorl"
+            | "__builtin_ceill" | "__builtin_rintl" | "__builtin_nearbyintl"
+            | "__builtin_roundl" | "__builtin_fmodl" | "__builtin_remainderl"
+            | "__builtin_powl" | "__builtin_sinl" | "__builtin_cosl"
+            | "__builtin_tanl" | "__builtin_asinl" | "__builtin_acosl"
+            | "__builtin_atanl" | "__builtin_atan2l" | "__builtin_sinhl"
+            | "__builtin_coshl" | "__builtin_tanhl" | "__builtin_asinhl"
+            | "__builtin_acoshl" | "__builtin_atanhl" | "__builtin_exp2l"
+            | "__builtin_expm1l" | "__builtin_log1pl" | "__builtin_log10l"
+            | "__builtin_log2l" | "__builtin_fmaxl" | "__builtin_fminl"
+            | "__builtin_fdiml" | "__builtin_fmal" | "__builtin_hypotl"
+            | "__builtin_cbrtl" | "__builtin_frexpl" | "__builtin_ldexpl"
+            | "__builtin_scalbnl" | "__builtin_scalblnl" | "__builtin_modfl"
+            | "__builtin_erfl" | "__builtin_erfcl" | "__builtin_tgammal"
+            | "__builtin_lgammal" | "__builtin_j0l" | "__builtin_j1l"
+            | "__builtin_jnl" | "__builtin_y0l" | "__builtin_y1l"
+            | "__builtin_ynl" => Some(IrType::F128),
+            // plain libm names used by simplify's binary/unary intrinsic folds
+            // (copysignl/fabsl -> LDCopysign/LDFabs); wrong default typing
+            // (I64) made the return cast the x87 result via fildq.
+            "copysignl" | "fabsl" | "truncl" | "floorl" | "ceill" | "rintl"
+            | "nearbyintl" | "sqrtl" => Some(IrType::F128),
+            // _Float128-specific builtins: results are 16-byte binary128 BIT
+            // PATTERNS (U128). Returning F128 here makes the caller cast
+            // F128->U128 via __fixunstfti, corrupting the value.
+            "__builtin_copysignf128" | "__builtin_fabsf128" => Some(IrType::U128),
             // Integer-returning classification builtins
             "__builtin_fpclassify" | "__builtin_isnan" | "__builtin_isinf"
             | "__builtin_isfinite" | "__builtin_isnormal" | "__builtin_signbit"
@@ -448,6 +479,38 @@ impl Lowerer {
                 result
             }
         }
+    }
+
+    /// IR type of the VALUE the lowered expression actually produces (its
+    /// defining instruction's result type). Arithmetic BinOps compute in the
+    /// C-semantic common type (see lower_arithmetic_binop), while
+    /// get_expr_type reports the widened storage type (I64 for int-op-literal
+    /// on LP64). Casts, assignments and returns must describe the ACTUAL bits
+    /// in the register: using the widened type as from_ty skips the sign
+    /// extension that int->u64 conversions require ((unsigned long long)(i-3)
+    /// zero-extended instead of sign-extending). Mirrors the exact type
+    /// computation of lower_arithmetic_binop.
+    pub(super) fn value_ir_type(&self, expr: &Expr) -> IrType {
+        if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
+            if !op.is_comparison()
+                && !matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr)
+            {
+                let lhs_ty = self.infer_expr_type(lhs);
+                let rhs_ty = self.infer_expr_type(rhs);
+                let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+                let ot = if is_shift {
+                    let promoted_lhs = Self::integer_promote(lhs_ty);
+                    widened_op_type(promoted_lhs)
+                } else {
+                    let ct = Self::common_type(lhs_ty, rhs_ty);
+                    widened_op_type(ct)
+                };
+                if ot.is_integer() && ot.size() <= 8 {
+                    return ot;
+                }
+            }
+        }
+        self.get_expr_type(expr)
     }
 
     /// Return the wider/common type between two types, preferring float > int.
@@ -678,13 +741,17 @@ impl Lowerer {
         let is_32bit = target_is_32bit();
         match expr {
             Expr::IntLiteral(val, _) => {
+                // Storage-level type query: LP64 reports I64 (ILP32: I32 when
+                // the value fits). Conversion boundaries (casts, assignments,
+                // inits, returns) must use value_ir_type(), which reports the
+                // ACTUAL producer type so int->u64 conversions sign-extend.
                 if is_32bit {
-                    // On ILP32, int is 32-bit. Values outside i32 range promote to long long (64-bit).
                     if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { IrType::I32 } else { IrType::I64 }
                 } else {
                     IrType::I64
                 }
             }
+            // C character constants have type int (not the char type).
             Expr::CharLiteral(_, _) => if is_32bit { IrType::I32 } else { IrType::I64 },
             Expr::UIntLiteral(val, _) => {
                 // C `unsigned int` is 32-bit on both ILP32 and LP64.
@@ -712,6 +779,7 @@ impl Lowerer {
             Expr::FloatLiteral(_, _) => IrType::F64,
             Expr::FloatLiteralF32(_, _) => IrType::F32,
             Expr::FloatLiteralLongDouble(_, _, _) => IrType::F128,
+            Expr::FloatLiteralF128(_, _, _) => IrType::U128,
             Expr::ImaginaryLiteral(_, _) | Expr::ImaginaryLiteralF32(_, _)
             | Expr::ImaginaryLiteralLongDouble(_, _, _) => IrType::Ptr,
             Expr::StringLiteral(_, _) | Expr::WideStringLiteral(_, _)
@@ -1252,6 +1320,7 @@ impl Lowerer {
             Expr::FloatLiteral(_, _) => Some(CType::Double),
             Expr::FloatLiteralF32(_, _) => Some(CType::Float),
             Expr::FloatLiteralLongDouble(_, _, _) => Some(CType::LongDouble),
+            Expr::FloatLiteralF128(_, _, _) => Some(CType::Float128),
             // Wide string literal L"..." has type wchar_t* (which is int* on all targets)
             Expr::WideStringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default)),
             // char16_t string literal u"..." has type char16_t* (which is unsigned short*)

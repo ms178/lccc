@@ -12,10 +12,13 @@
 use crate::frontend::parser::ast::{
     BinOp,
     Expr,
+    PostfixOp,
     UnaryOp,
 };
 use crate::ir::reexports::{
+    Terminator,
     Instruction,
+    BlockId,
     IrBinOp,
     IrCmpOp,
     IrConst,
@@ -66,6 +69,74 @@ impl Lowerer {
         }
     }
 
+    /// Lower a condition expression into a direct conditional branch on
+    /// `(true_label, false_label)` WITHOUT materializing a boolean value.
+    ///
+    /// `a && b` / `a || b` chains become branch trees: each operand is lowered
+    /// as its own `Cmp` followed by `CondBranch`, which the backend fuses into
+    /// a bare `cmp; jcc`. This eliminates the setcc/movzbl/(store/load)/test
+    /// round-trips that condition-VALUE lowering produces per comparison in
+    /// branch-heavy hot code (gzip's `longest_match`, deflate hot loops).
+    ///
+    /// Semantics are identical to `lower_condition_expr` + `CondBranch`:
+    ///  - `a || b`: branch to `true_label` if `a` is true, else test `b`.
+    ///  - `a && b`: branch to `false_label` if `a` is false, else test `b`.
+    ///  - Evaluation order and short-circuit side effects are preserved.
+    ///  - When either side of a logical operator is a compile-time constant,
+    ///    control falls back to the value-based path so dead-branch functions
+    ///    are never referenced (IS_ENABLED-style patterns keep working).
+    pub(super) fn lower_condition_branch(
+        &mut self,
+        expr: &Expr,
+        true_label: BlockId,
+        false_label: BlockId,
+    ) {
+        let const_side = |e: &Expr| self.eval_const_expr(e).is_some();
+        match expr {
+            Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
+                self.lower_condition_branch(inner, false_label, true_label);
+            }
+            Expr::BinaryOp(BinOp::LogicalAnd, lhs, rhs, _) => {
+                if const_side(lhs) || const_side(rhs) {
+                    let cond_val = self.lower_condition_expr(expr);
+                    self.terminate(Terminator::CondBranch {
+                        cond: cond_val,
+                        true_label,
+                        false_label,
+                    });
+                    return;
+                }
+                let rhs_label = self.fresh_label();
+                self.lower_condition_branch(lhs, rhs_label, false_label);
+                self.start_block(rhs_label);
+                self.lower_condition_branch(rhs, true_label, false_label);
+            }
+            Expr::BinaryOp(BinOp::LogicalOr, lhs, rhs, _) => {
+                if const_side(lhs) || const_side(rhs) {
+                    let cond_val = self.lower_condition_expr(expr);
+                    self.terminate(Terminator::CondBranch {
+                        cond: cond_val,
+                        true_label,
+                        false_label,
+                    });
+                    return;
+                }
+                let rhs_label = self.fresh_label();
+                self.lower_condition_branch(lhs, true_label, rhs_label);
+                self.start_block(rhs_label);
+                self.lower_condition_branch(rhs, true_label, false_label);
+            }
+            _ => {
+                let cond_val = self.lower_condition_expr(expr);
+                self.terminate(Terminator::CondBranch {
+                    cond: cond_val,
+                    true_label,
+                    false_label,
+                });
+            }
+        }
+    }
+
     /// Lower a condition expression, ensuring floating-point values are properly
     /// tested for truthiness (masking sign bit so -0.0 is falsy).
     /// For complex types, tests (real != 0) || (imag != 0) per C11 6.3.1.2.
@@ -108,7 +179,30 @@ impl Lowerer {
         val
     }
 
+    /// Lower an expression whose result is discarded (expression statement,
+    /// for-increment); lets a top-level post-inc/dec skip its old-value spill.
+    pub(super) fn lower_expr_discard(&mut self, expr: &Expr) -> Operand {
+        self.discard_expr_result = true;
+        let r = self.lower_expr(expr);
+        self.discard_expr_result = false;
+        r
+    }
+
     pub(super) fn lower_expr(&mut self, expr: &Expr) -> Operand {
+        // The discard flag applies only when the expression being lowered IS
+        // the top-level post-increment/decrement. Nested occurrences always
+        // need their result (e.g. `foo(i++)` reads the old value), so clear
+        // the flag for the duration of any other subexpression.
+        let saved_discard = self.discard_expr_result;
+        if !matches!(expr, Expr::PostfixOp(PostfixOp::PostInc | PostfixOp::PostDec, _, _)) {
+            self.discard_expr_result = false;
+        }
+        let result = self.lower_expr_inner(expr);
+        self.discard_expr_result = saved_discard;
+        result
+    }
+
+    fn lower_expr_inner(&mut self, expr: &Expr) -> Operand {
         match expr {
             // Literals
             Expr::IntLiteral(val, _) => Operand::Const(IrConst::I64(*val)),
@@ -120,6 +214,14 @@ impl Lowerer {
             Expr::FloatLiteral(val, _) => Operand::Const(IrConst::F64(*val)),
             Expr::FloatLiteralF32(val, _) => Operand::Const(IrConst::F32(*val as f32)),
             Expr::FloatLiteralLongDouble(val, bytes, _) => Operand::Const(IrConst::long_double_with_bytes(*val, *bytes)),
+            Expr::FloatLiteralF128(_, bytes, _) => {
+                // _Float128 literal: the 16 bytes ARE the IEEE binary128 value;
+                // carried in an I128 constant (bit-exact 16-byte moves). Use the
+                // RAW little-endian bytes (NOT f128_bytes_to_u128, which converts
+                // the floating value to an integer).
+                let v = u128::from_le_bytes(*bytes);
+                Operand::Const(IrConst::I128(v as i128))
+            }
             Expr::CharLiteral(ch, _) => {
                 // Sign-extend from signed char to int, matching GCC behavior.
                 // '\xEF' should be -17, not 239, when char is signed.
@@ -228,7 +330,7 @@ impl Lowerer {
     pub(super) fn read_global_register(&mut self, reg_name: &str, ty: IrType) -> Operand {
         // Create a temporary alloca for the inline asm output
         let tmp_alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: tmp_alloca, ty, size: ty.size(), align: ty.align(), volatile: false });
+        self.emit(Instruction::Alloca { dest: tmp_alloca, ty, size: ty.size(), align: ty.align(), volatile: false, semantic_volatile: false });
         let output_constraint = format!("={{{}}}", reg_name);
         self.emit(Instruction::InlineAsm {
             template: String::new(),
@@ -338,18 +440,23 @@ impl Lowerer {
         }
 
         if let Some(ginfo) = self.globals.get(name).cloned() {
-            // Global register variable: read the register directly via inline asm
+            // Global register variable: read the register directly via inline
+            // asm — ONLY for real register names. A symbol-rename asm label
+            // (e.g. `extern int dfoo __asm__("abccb")`) goes through the
+            // normal load path with the renamed symbol.
             if let Some(ref reg_name) = ginfo.asm_register {
-                return self.read_global_register(reg_name, ginfo.ty);
+                if crate::ir::lowering::lower::is_x86_register_name(reg_name) {
+                    return self.read_global_register(reg_name, ginfo.ty);
+                }
             }
-            return self.load_global_var(name.to_string(), &ginfo);
+            // Resolve any __asm__("symbol") redirect before emitting the load.
+            let resolved = self.resolve_ref_name(name);
+            return self.load_global_var(resolved, &ginfo);
         }
 
         // Note: implicit declaration warnings are emitted during sema, not here.
         // Apply __asm__("label") linker symbol redirect if present.
-        let resolved_name = self.asm_label_map.get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_string());
+        let resolved_name = self.resolve_ref_name(name);
         let dest = self.fresh_value();
         self.emit(Instruction::GlobalAddr { dest, name: resolved_name });
         Operand::Value(dest)
@@ -515,7 +622,7 @@ impl Lowerer {
     /// Lower expression and cast to target type if needed.
     pub(super) fn lower_expr_with_type(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
         let src = self.lower_expr(expr);
-        let src_ty = self.get_expr_type(expr);
+        let src_ty = self.value_ir_type(expr);
         self.emit_implicit_cast(src, src_ty, target_ty)
     }
 

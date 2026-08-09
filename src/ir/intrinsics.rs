@@ -44,6 +44,22 @@ pub enum IntrinsicOp {
     Por128,
     Pand128,
     Pxor128,
+    /// Packed single-precision float ops (addps/subps/mulps).
+    /// xorps/andps/orps reuse the integer Pxor/Pand/Por ops (bitwise identical).
+    AddPs128,
+    SubPs128,
+    MulPs128,
+    /// Packed double-precision float ops (addpd/subpd/mulpd).
+    AddPd128,
+    SubPd128,
+    MulPd128,
+    /// Packed 32x32->64 multiplies: pmuludq (SSE2, unsigned),
+    /// pmuldq (SSE4.1, signed), pmulld (SSE4.1, low 32).
+    Pmuludq128,
+    Pmuldq128,
+    Pmulld128,
+    /// Free 128-bit reinterpret cast: the value is passed through unchanged.
+    CastReinterpret128,
     /// Move byte mask (pmovmskb) - returns i32
     Pmovmskb128,
     /// Set all bytes to value (splat)
@@ -55,6 +71,10 @@ pub enum IntrinsicOp {
     Crc32_16,
     Crc32_32,
     Crc32_64,
+    /// __builtin_ia32_rdtsc() - 64-bit timestamp counter (EDX:EAX)
+    Rdtsc,
+    /// __builtin_ia32_rdtscp(&aux) - rdtscp, stores IA32_TSC_AUX (ecx) to aux
+    Rdtscp,
     /// __builtin_frame_address(0) - returns current frame pointer
     FrameAddress,
     /// __builtin_return_address(0) - returns current return address
@@ -69,6 +89,16 @@ pub enum IntrinsicOp {
     /// args[0] = input float value; dest = |x|
     FabsF32,
     FabsF64,
+    /// _Float128 fabs: clear sign bit 127 (inline bit ops, no libgcc call).
+    F128Fabs,
+    /// _Float128 negate: toggle sign bit 127 (NOT an integer negation).
+    F128Neg,
+    /// _Float128 copysign: x magnitude combined with y sign bit 127.
+    F128Copysign,
+    /// long double (80-bit x87) fabs: clear bit 79 in the 10-byte slot.
+    LDFabs,
+    /// long double (80-bit x87) copysign: x magnitude with y sign bit 79.
+    LDCopysign,
     /// Packed double FMA for vectorized matmul inner loop.
     /// Computes: *dest_ptr[0..2] += broadcast(*args[0]) * *args[1][0..2]
     /// dest_ptr: pointer to 2×F64 accumulator (read+write, 16 bytes)
@@ -258,6 +288,46 @@ pub enum IntrinsicOp {
     Paddw128,
     /// Packed 16-bit subtract (PSUBW)
     Psubw128,
+    /// Packed 8-bit add (PADDB)
+    Paddb128,
+    /// Packed 8-bit subtract (PSUBB)
+    Psubb128,
+    /// Packed unsigned 16-bit saturating subtract (PSUBUSW)
+    Psubusw128,
+    /// Sum of absolute differences of unsigned bytes (PSADBW)
+    Psadbw128,
+    /// Packed low 16-bit multiply (PMULLW)
+    Pmullw128,
+    /// Packed multiply unsigned/signed bytes, horizontal add pairs (PMADDUBSW, SSSE3)
+    Pmaddubsw128,
+    /// Packed 16-bit horizontal add (PHADDW, SSSE3)
+    Phaddw128,
+    /// Packed 32-bit horizontal add (PHADDD, SSSE3)
+    Phaddd128,
+    /// Packed byte shuffle (PSHUFB, SSSE3)
+    Pshufb128,
+    /// Packed absolute value bytes (PABSB, SSSE3)
+    Pabsb128,
+    /// Packed absolute value words (PABSW, SSSE3)
+    Pabsw128,
+    /// Packed absolute value dwords (PABSD, SSSE3)
+    Pabsd128,
+    /// Concatenate shift-in bytes (PALIGNR, SSSE3)
+    Palignr128,
+    /// Packed max unsigned bytes (PMAXUB)
+    Pmaxub128,
+    /// Packed min unsigned bytes (PMINUB)
+    Pminub128,
+    /// Packed variable blend bytes (PBLENDVB, SSE4.1)
+    Pblendvb128,
+    /// Packed zero-extend 8-bit to 16-bit (PMOVZXBW, SSE4.1)
+    Pmovzxbw128,
+    /// Packed zero-extend 16-bit to 32-bit (PMOVZXWD, SSE4.1)
+    Pmovzxwd128,
+    /// Packed 16-bit variable shift left (PSLLW)
+    Psllw128,
+    /// Packed 16-bit variable shift right (PSRLW)
+    Psrlw128,
     /// Packed 16-bit multiply high (PMULHW)
     Pmulhw128,
     /// Packed 16-bit multiply-add to 32-bit (PMADDWD)
@@ -334,6 +404,58 @@ pub enum IntrinsicOp {
     Pinsrq128,
     /// Extract 64-bit value at lane (PEXTRQ) - returns scalar i64
     Pextrq128,
+
+    // --- AVX2 256-bit integer operations (lowered to v* ymm instructions) ---
+    Loadu256,
+    Storeu256,
+    Load256,
+    Store256,
+    Paddb256,
+    Paddw256,
+    Paddd256,
+    Psubb256,
+    Psubw256,
+    Psubusw256,
+    Psadbw256,
+    Pmaddubsw256,
+    Pmaddwd256,
+    Pcmpeqb256,
+    Pcmpgtb256,
+    Pmovmskb256,
+    Pshufb256,
+    Pabsb256,
+    Pabsw256,
+    Pmaxub256,
+    Pminub256,
+    Pxor256,
+    Por256,
+    Pand256,
+    Psllidi256,
+    Psrlidi256,
+    Psllwi256,
+    Psrlwi256,
+    Broadcast128to256,
+    Zext128to256,
+    Cast256to128,
+    Insert128to256,
+    SetEpi16_256,
+    SetEpi32_256,
+    SetEpi64x256,
+
+    // --- AVX-VNNI (VEX, Raptor Lake+) ---
+    Dpbusd128, Dpbusds128, Dpwusd128, Dpwusds128,
+    Dpbusd256, Dpbusds256, Dpwusd256, Dpwusds256,
+    // --- AVX-VNNI-INT8 ---
+    Dpbssd128, Dpbssds128, Dpbsud128, Dpbsuds128, Dpbuud128, Dpbuuds128,
+    Dpbssd256, Dpbssds256, Dpbsud256, Dpbsuds256, Dpbuud256, Dpbuuds256,
+    // --- AVX-VNNI-INT16 (vpdpwusd/s shared with AVX-VNNI) ---
+    Dpwuud128, Dpwuuds128, Dpwssd128, Dpwssds128,
+    Dpwuud256, Dpwuuds256, Dpwssd256, Dpwssds256,
+    // --- GFNI ---
+    Gf2p8mulb128, Gf2p8affineqb128, Gf2p8affineinvqb128,
+    // --- VAES 256-bit + VPCLMULQDQ 256-bit ---
+    Aesenc256, Aesenclast256, Aesdec256, Aesdeclast256,
+    Vpclmulqdq256,
 }
 
 impl IntrinsicOp {
@@ -343,6 +465,8 @@ impl IntrinsicOp {
         matches!(self,
             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
+            IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
+            IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
             IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128 |

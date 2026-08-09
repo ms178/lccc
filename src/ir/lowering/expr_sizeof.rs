@@ -11,7 +11,7 @@ use crate::frontend::parser::ast::{
     TypeSpecifier,
     UnaryOp,
 };
-use crate::common::types::CType;
+use crate::common::types::{CType, IrType};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -375,7 +375,39 @@ impl Lowerer {
                 let ctype = self.type_spec_to_ctype(ts);
                 match (&ctype, init.as_ref()) {
                     (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
-                        self.ctype_size(elem_ct).max(1) * items.len()
+                        // Char arrays may hold a brace-wrapped string literal,
+                        // which contributes len+1 elements, not 1.
+                        let base_ty = match elem_ct.as_ref() {
+                            CType::Char => IrType::I8,
+                            CType::UChar => IrType::U8,
+                            CType::Int => IrType::I32,
+                            CType::UInt => IrType::U32,
+                            CType::Short => IrType::I16,
+                            CType::UShort => IrType::U16,
+                            _ => IrType::I8,
+                        };
+                        self.ctype_size(elem_ct).max(1)
+                            * self.compute_init_list_array_size_for_char_array(items, base_ty)
+                    }
+                    // sizeof((char[]){"..."}) — the array sized by the literal
+                    // (bytes + NUL). Narrow literals store one C byte per char.
+                    (CType::Array(ref elem_ct, None), Initializer::Expr(init_expr)) => {
+                        let elem_size = self.ctype_size(elem_ct).max(1);
+                        match (elem_ct.as_ref(), init_expr) {
+                            (
+                                CType::Char | CType::UChar,
+                                Expr::StringLiteral(s, _),
+                            ) => elem_size * (s.chars().count() + 1),
+                            (
+                                CType::Int | CType::UInt,
+                                Expr::WideStringLiteral(s, _),
+                            ) => elem_size * (s.chars().count() + 1),
+                            (
+                                CType::Short | CType::UShort,
+                                Expr::Char16StringLiteral(s, _),
+                            ) => elem_size * (s.chars().count() + 1),
+                            _ => self.sizeof_type(ts),
+                        }
                     }
                     _ => self.sizeof_type(ts),
                 }

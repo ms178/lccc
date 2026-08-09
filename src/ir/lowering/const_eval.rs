@@ -90,7 +90,8 @@ impl Lowerer {
             Expr::IntLiteral(..) | Expr::LongLiteral(..) | Expr::LongLongLiteral(..)
             | Expr::UIntLiteral(..) | Expr::ULongLiteral(..) | Expr::ULongLongLiteral(..)
             | Expr::CharLiteral(..) | Expr::FloatLiteral(..)
-            | Expr::FloatLiteralF32(..) | Expr::FloatLiteralLongDouble(..) => {
+            | Expr::FloatLiteralF32(..) | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..) => {
                 shared_const_eval::eval_literal(expr)
             }
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
@@ -98,6 +99,18 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
+                // _Float128 constants are carried as I128 bit patterns
+                // (binary128). Float negation flips the SIGN BIT (bit 127),
+                // not the integer value: -0x3fff8000... (1.5) must become
+                // 0xbfff8000... (-1.5), not 0xc0008000... (-3.0).
+                if self.infer_expr_type(inner) == IrType::F128
+                    || matches!(inner.as_ref(), Expr::FloatLiteralF128(..))
+                {
+                    if let IrConst::I128(bits) = val {
+                        let toggled = (bits as u128) ^ (1u128 << 127);
+                        return Some(IrConst::I128(toggled as i128));
+                    }
+                }
                 let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
                 const_arith::negate_const(promoted)
             }
