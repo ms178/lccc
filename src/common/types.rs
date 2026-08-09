@@ -200,6 +200,9 @@ pub enum CType {
     Float,
     Double,
     LongDouble,
+    /// ISO C _Float128 / __float128: IEEE binary128, 16 bytes.
+    /// Distinct from long double (80-bit x87 on x86-64).
+    Float128,
     /// C99 _Complex float: two f32 values (real, imag)
     ComplexFloat,
     /// C99 _Complex double: two f64 values (real, imag)
@@ -1213,6 +1216,7 @@ impl std::fmt::Display for CType {
             CType::Float => write!(f, "float"),
             CType::Double => write!(f, "double"),
             CType::LongDouble => write!(f, "long double"),
+            CType::Float128 => write!(f, "_Float128"),
             CType::ComplexFloat => write!(f, "_Complex float"),
             CType::ComplexDouble => write!(f, "_Complex double"),
             CType::ComplexLongDouble => write!(f, "_Complex long double"),
@@ -1322,6 +1326,7 @@ impl CType {
             // x86-64: long double is 16 bytes (80-bit x87 with 6 bytes padding)
             // ARM/RISC-V: long double is 16 bytes (IEEE binary128)
             CType::LongDouble => if ptr_sz == 4 { 12 } else { 16 },
+            CType::Float128 => 16,
             CType::ComplexFloat => 8,     // 2 * sizeof(float)
             CType::ComplexDouble => 16,   // 2 * sizeof(double)
             CType::ComplexLongDouble => if ptr_sz == 4 { 24 } else { 32 },
@@ -1356,6 +1361,7 @@ impl CType {
             CType::Double => if ptr_sz == 4 { 4 } else { 8 },
             // i686: long double aligned to 4; LP64: aligned to 16
             CType::LongDouble => if ptr_sz == 4 { 4 } else { 16 },
+            CType::Float128 => 16,
             CType::ComplexFloat => 4,       // align of float component
             CType::ComplexDouble => if ptr_sz == 4 { 4 } else { 8 },
             CType::ComplexLongDouble => if ptr_sz == 4 { 4 } else { 16 },
@@ -1886,6 +1892,11 @@ impl IrType {
             CType::Float => IrType::F32,
             CType::Double => IrType::F64,
             CType::LongDouble => IrType::F128,
+            // _Float128 uses the U128 carrier: 16-byte bit-exact moves keep the
+            // IEEE binary128 representation intact (the F128 path is x87-based
+            // and would round to 80-bit). Arithmetic/comparison/conversion on
+            // Float128 is lowered to libgcc soft-float calls at the CType level.
+            CType::Float128 => IrType::U128,
             // Complex types are handled as aggregate (pointer to stack slot)
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => IrType::Ptr,
             CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,
