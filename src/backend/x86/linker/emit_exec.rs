@@ -10,6 +10,20 @@ use super::elf::*;
 use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
+/// The dynsym NAME for a dynamic symbol reference. Versioned references are
+/// keyed in the global table by their full object-file name ("memcpy@GLIBC_2.2.5"),
+/// but the emitted .dynstr name must be the BARE symbol name: the dynamic
+/// linker hashes the raw dynstr name against the library's .gnu.hash, and
+/// libc's hash contains "memcpy", not "memcpy@GLIBC_2.2.5". The requested
+/// version is conveyed by the .gnu.version (versym) index into .gnu.version_r
+/// (verneed), exactly as GNU ld represents versioned references.
+fn dynsym_emit_name(name: &str) -> &str {
+    match name.find('@') {
+        Some(at) => &name[..at],
+        None => name,
+    }
+}
+
 pub(super) fn emit_executable(
     objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
@@ -79,7 +93,7 @@ pub(super) fn emit_executable(
         }
     }
 
-    for name in &dyn_sym_names { dynstr.add(name); }
+    for name in &dyn_sym_names { dynstr.add(dynsym_emit_name(name)); }
 
     // ── Build .gnu.version (versym) and .gnu.version_r (verneed) data ──
     //
@@ -179,7 +193,7 @@ pub(super) fn emit_executable(
     // Compute hashes for hashed symbols
     let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
         .iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
+        .map(|name| linker_common::gnu_hash(dynsym_emit_name(name).as_bytes()))
         .collect();
 
     // Build bloom filter (single 64-bit word)
@@ -848,7 +862,7 @@ pub(super) fn emit_executable(
         // .dynsym
         let mut ds = dynsym_offset as usize + 24; // skip null entry
         for name in &dyn_sym_names {
-            let no = dynstr.get_offset(name) as u32;
+            let no = dynstr.get_offset(dynsym_emit_name(name)) as u32;
             w32(&mut out, ds, no);
             if let Some(gsym) = globals.get(name) {
                 if gsym.copy_reloc {

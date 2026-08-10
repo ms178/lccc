@@ -365,6 +365,10 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
     // correct backend emission of asm operands.
     if opt_level == 0 {
         resolve_asm::resolve_inline_asm_symbols(module);
+        // _Float128 math builtins lower to libgcc helper calls (__copysigntf3,
+        // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
+        // inline intrinsics even at -O0 (semantics-preserving rename).
+        simplify::fold_math_intrinsic_calls(module);
         return;
     }
 
@@ -378,6 +382,8 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
         }
         constant_fold::run(module);
         copy_prop::run(module);
+        // Same f128-builtin fold as -O0 (see above).
+        simplify::fold_math_intrinsic_calls(module);
         module.for_each_function(dce::eliminate_dead_code);
         resolve_asm::resolve_inline_asm_symbols(module);
         constant_fold::resolve_remaining_is_constant(module);
@@ -390,11 +396,6 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
     }
 
     let optimize_for_size = opt_level >= 4;
-    // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
-    // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
-    // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
-    // even at -Os: run the small-only inliner so helper bodies fold away while
-    // normal/medium callees stay out. -O1/-O2/-O3 keep full inlining.
     // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
     // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
     // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
@@ -667,7 +668,10 @@ macro_rules! preloop_dump {
 
         // Phase 7: If-conversion
         // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
-        if !dis.ifconv && should_run!(7, 0, 4) {
+        // -Os/-Oz: skip if-conversion. `cmov` is 4-6 bytes vs a 2-byte jcc +
+        // the skipped block, so branches are usually smaller (and often faster
+        // on the short branch path); GCC makes the same trade-off at -Os.
+        if !dis.ifconv && !optimize_for_size && should_run!(7, 0, 4) {
             let n = timed_pass!(
                 "if_convert",
                 run_on_visited(

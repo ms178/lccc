@@ -1194,7 +1194,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1260,7 +1260,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        };
+        ret_is_f128_sse: false,};
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1274,7 +1274,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0);
@@ -1328,7 +1328,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        };
+        ret_is_f128_sse: false,};
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1342,7 +1342,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1402,7 +1402,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        };
+        ret_is_f128_sse: false,};
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1416,7 +1416,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1480,7 +1480,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        };
+        ret_is_f128_sse: false,};
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1494,7 +1494,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // GEP CSE disabled
@@ -1558,7 +1558,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        };
+        ret_is_f128_sse: false,};
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1572,7 +1572,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
@@ -1661,7 +1661,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        };
+        ret_is_f128_sse: false,};
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1675,7 +1675,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        };
+        asm_labels: std::collections::HashMap::new(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         // Neither branch dominates the other, so NO CSE should happen
@@ -1740,6 +1740,7 @@ mod tests {
             aliases: vec![],
             toplevel_asm: vec![],
             symbol_attrs: vec![],
+            asm_labels: std::collections::HashMap::new(),
             char16_string_literals: vec![],
             symver_directives: vec![],
         }
@@ -1857,7 +1858,7 @@ mod tests {
                             is_sret: false,
                             is_fastcall: false,
                             ret_eightbyte_classes: Vec::new(),
-                        },
+                        ret_is_f128_sse: false,},
                     },
                     Instruction::Load {
                         dest: Value(3),
@@ -2106,7 +2107,7 @@ mod tests {
                             is_sret: false,
                             is_fastcall: false,
                             ret_eightbyte_classes: Vec::new(),
-                        },
+                        ret_is_f128_sse: false,},
                     },
                     Instruction::Load {
                         dest: Value(2),

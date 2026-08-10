@@ -38,19 +38,62 @@ pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
     let mut lib_needed = false;
     let mut matched_weak_objects: Vec<(u64, u64)> = Vec::new();
 
+    // Versioned undefined references ("name@VER" — produced by `.symver
+    // real, name@VER` directives, e.g. glibc's compat_symbol_reference) must
+    // match the library's BARE dynsym name when the library exports that
+    // symbol with a matching version. GNU ld binds such references to the
+    // requested version; without this, "printf@GLIBC_2.2.5" stays undefined
+    // even though libc.so.6 exports "printf" (as `printf@@GLIBC_2.2.5`).
+    // "name@@VER" is a definition form, never an undefined ref, so only
+    // single-'@' names are considered here.
+    let versioned_refs: Vec<(String, String, String)> = globals
+        .iter()
+        .filter(|(name, s)| !s.is_defined() && !s.is_dynamic() && name.contains('@'))
+        .filter_map(|(name, _)| {
+            let at = name.find('@')?;
+            if name[at + 1..].contains('@') {
+                return None; // "@@": definition form, not a reference
+            }
+            let base = &name[..at];
+            let ver = &name[at + 1..];
+            if base.is_empty() || ver.is_empty() {
+                return None;
+            }
+            Some((base.to_string(), ver.to_string(), name.clone()))
+        })
+        .collect();
+
     // First pass: match undefined symbols against library exports
     for dsym in dyn_syms {
         if let Some(existing) = globals.get(&dsym.name) {
             if !existing.is_defined() && !existing.is_dynamic() {
-                lib_needed = true;
-                globals.insert(dsym.name.clone(), G::new_dynamic(dsym, soname));
-                // Track WEAK STT_OBJECT for alias detection
-                let bind = dsym.info >> 4;
-                let stype = dsym.info & 0xf;
-                if bind == STB_WEAK && stype == STT_OBJECT
-                    && !matched_weak_objects.contains(&(dsym.value, dsym.size))
-                {
-                    matched_weak_objects.push((dsym.value, dsym.size));
+                // An UNVERSIONED reference may only bind to the symbol's
+                // default version (@@), matching GNU ld. Non-default exports
+                // (memcpy@GLIBC_2.2.5) are reachable only via versioned refs.
+                if dsym.is_default_ver {
+                    lib_needed = true;
+                    globals.insert(dsym.name.clone(), G::new_dynamic(dsym, soname));
+                    // Track WEAK STT_OBJECT for alias detection
+                    let bind = dsym.info >> 4;
+                    let stype = dsym.info & 0xf;
+                    if bind == STB_WEAK && stype == STT_OBJECT
+                        && !matched_weak_objects.contains(&(dsym.value, dsym.size))
+                    {
+                        matched_weak_objects.push((dsym.value, dsym.size));
+                    }
+                }
+            }
+        }
+        // Versioned reference matching: "base@VER" binds to the export
+        // (base) when the export carries exactly the requested version —
+        // including non-default versions (memcpy@GLIBC_2.2.5).
+        for (base, ver, full) in &versioned_refs {
+            if *base == dsym.name && dsym.version.as_deref() == Some(ver.as_str()) {
+                if let Some(existing) = globals.get(full) {
+                    if !existing.is_defined() && !existing.is_dynamic() {
+                        lib_needed = true;
+                        globals.insert(full.clone(), G::new_dynamic(dsym, soname));
+                    }
                 }
             }
         }

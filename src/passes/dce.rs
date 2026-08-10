@@ -370,7 +370,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    },
+                    ret_is_f128_sse: false,},
                 },
             ],
             terminator: Terminator::Return(None),

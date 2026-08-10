@@ -156,6 +156,49 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw")
 }
 
+/// Return the register FAMILY an instruction implicitly READS, when the
+/// implicit read can be pinned to one family. Unlike `has_implicit_reg_usage`
+/// (a boolean veto), this lets peephole deadness analysis distinguish e.g.
+/// `cltq` (implicitly reads %eax, family 0) from an unrelated instruction.
+///
+/// Only families that are not already visible via explicit `%reg` text matter;
+/// callers must treat `None` as "no known implicit read of a single family"
+/// (conservative callers may fall back to `has_implicit_reg_usage`).
+pub(super) fn implicit_read_reg_family(trimmed: &str) -> Option<RegId> {
+    let nb = trimmed.as_bytes();
+    if nb.len() < 3 {
+        return None;
+    }
+    // Sign/zero-extension idioms that read the accumulator family implicitly.
+    //   cltq/cdqe: read %eax (family 0), write %rax
+    //   cqto/cqo:  read %rax (family 0), write %rdx
+    //   cdq:       read %eax (family 0), write %edx
+    //   cbw/cwtl/cwd: read %ax (family 0), write wider accumulator
+    if trimmed.starts_with("cltq") || trimmed.starts_with("cdqe")
+        || trimmed.starts_with("cqto") || trimmed.starts_with("cqo")
+        || trimmed.starts_with("cdq") || trimmed.starts_with("cwd")
+        || trimmed.starts_with("cbw") || trimmed.starts_with("cwtl")
+    {
+        return Some(0);
+    }
+    // Integer div/idiv read %rax:%rdx (families 0 and 2); mul reads %rax.
+    // Exclude SSE variants (divsd/mulsd/...) which have explicit operands.
+    if (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p')))
+        || (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i')
+        || (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l'
+            && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p')))
+    {
+        // div/idiv also read %rdx; the caller checks the load's own family.
+        return Some(0);
+    }
+    // Double-precision shifts read %cl implicitly (family 1).
+    if trimmed.starts_with("shld") || trimmed.starts_with("shrd") {
+        return Some(1);
+    }
+    None
+}
+
 /// Check if an instruction is a shift/rotate that implicitly uses %cl.
 pub(super) fn is_shift_or_rotate(trimmed: &str) -> bool {
     let nb = trimmed.as_bytes();

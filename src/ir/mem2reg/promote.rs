@@ -980,7 +980,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    },
+                    ret_is_f128_sse: false,},
                 },
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],

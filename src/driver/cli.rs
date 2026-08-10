@@ -14,6 +14,28 @@ use super::pipeline::{Driver, CompileMode, CliDefine};
 use crate::backend::Target;
 use crate::common::error::ColorMode;
 
+/// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
+///
+/// A lexical sort orders "9.5.0" AFTER "16.1.1"/"12", so
+/// `-print-libgcc-file-name` would probe the OLDEST GCC directory first
+/// instead of the newest. Version directories are dotted decimal, so a
+/// component-wise numeric comparison is the correct order.
+fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match x.parse::<u64>().unwrap_or(0).cmp(&y.parse::<u64>().unwrap_or(0)) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            },
+        }
+    }
+}
+
 impl Driver {
     fn enable_x86_avx_profile(&mut self) {
         self.no_sse=false; self.enable_avx=true; self.enable_sse4_2=true;
@@ -67,8 +89,7 @@ impl Driver {
     /// Parse GCC-compatible command-line arguments and populate driver fields.
     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
-    pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {
-        // Detect target from binary name (argv[0])
+    pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {        // Detect target from binary name (argv[0])
         let binary_name = std::path::Path::new(&args[0])
             .file_name()
             .and_then(|n| n.to_str())
@@ -170,8 +191,8 @@ impl Driver {
                                     .map(|e| e.file_name().to_string_lossy().to_string())
                                     .filter(|n| n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
                                     .collect();
-                                vers.sort();
-                                vers.reverse();
+                                // Numeric version order: newest GCC dir first.
+                                vers.sort_by(|a, b| cmp_version(b, a));
                                 for v in vers {
                                     search_dirs.push(format!("{}{}/", triple_dir, v));
                                 }
@@ -199,8 +220,8 @@ impl Driver {
                                 .filter_map(|e| e.file_name().into_string().ok())
                                 .filter(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.'))
                                 .collect();
-                            vers.sort();
-                            for v in vers.iter().rev() {
+                            vers.sort_by(|a, b| cmp_version(b, a));
+                            for v in vers.iter() {
                                 let a = format!("{}/{}/libgcc.a", dir, v);
                                 let s = format!("{}/{}/libgcc_s.so", dir, v);
                                 if std::path::Path::new(&a).exists()
@@ -523,6 +544,14 @@ impl Driver {
                     if i < args.len() {
                         self.linker_ordered_items.push(format!("-Wl,-e,{}", args[i]));
                     }
+                }
+                // Export-dynamic family. MUST be matched before the greedy
+                // `-e*` entry-point matcher below: `-export-dynamic` would
+                // otherwise be swallowed as `-Wl,-e,xport-dynamic`, silently
+                // dropping the export request and setting a garbage entry
+                // symbol (the binary then exports no dynamic symbols).
+                "-export-dynamic" | "--export-dynamic" => {
+                    self.linker_ordered_items.push("-Wl,--export-dynamic".to_string());
                 }
                 arg if arg.len() > 2 && arg.starts_with("-e") && !arg.starts_with("-E") => {
                     self.linker_ordered_items.push(format!("-Wl,-e,{}", &arg[2..]));
@@ -1093,5 +1122,59 @@ impl Driver {
     /// Add a -I include path from command line.
     pub fn add_include_path(&mut self, path: &str) {
         self.include_paths.push(path.to_string());
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::cmp_version;
+    use crate::driver::pipeline::Driver;
+
+    #[test]
+    fn version_compare_is_numeric() {
+        // Lexical sort would order "9.5.0" after "16.1.1"; numeric must not.
+        assert!(cmp_version("16.1.1", "9.5.0") == std::cmp::Ordering::Greater);
+        assert!(cmp_version("12", "9.5.0") == std::cmp::Ordering::Greater);
+        assert!(cmp_version("16.1.1", "16.1.1") == std::cmp::Ordering::Equal);
+        assert!(cmp_version("16.2.0", "16.1.1") == std::cmp::Ordering::Greater);
+        assert!(cmp_version("10.2.0", "11.4.0") == std::cmp::Ordering::Less);
+        assert!(cmp_version("4.9", "4.10") == std::cmp::Ordering::Less);
+        // Newest-first sort used by -print-libgcc-file-name.
+        let mut v = vec!["10.2.0".to_string(), "9.5.0".to_string(), "16.1.1".to_string(), "12".to_string()];
+        v.sort_by(|a, b| cmp_version(b, a));
+        assert_eq!(v, vec!["16.1.1", "12", "10.2.0", "9.5.0"]);
+    }
+
+    #[test]
+    fn export_dynamic_is_not_swallowed_by_entry_matcher() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["lccc", "-export-dynamic", "x.c"]
+            .iter().map(|s| s.to_string()).collect();
+        d.parse_cli_args(&args).ok();
+        assert!(d.linker_ordered_items.iter().any(|i| i == "-Wl,--export-dynamic"),
+            "linker items: {:?}", d.linker_ordered_items);
+        assert!(!d.linker_ordered_items.iter().any(|i| i.starts_with("-Wl,-e,")),
+            "must not be parsed as an entry-point flag: {:?}", d.linker_ordered_items);
+        // --export-dynamic long form too.
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["lccc", "--export-dynamic", "x.c"]
+            .iter().map(|s| s.to_string()).collect();
+        d2.parse_cli_args(&args2).ok();
+        assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,--export-dynamic"));
+    }
+
+    #[test]
+    fn entry_flag_still_works() {
+        // -e SYMBOL must keep mapping to -Wl,-e,SYMBOL.
+        let mut d = Driver::new();
+        let args: Vec<String> = ["lccc", "-e", "__libc_main", "x.c"]
+            .iter().map(|s| s.to_string()).collect();
+        d.parse_cli_args(&args).ok();
+        assert!(d.linker_ordered_items.iter().any(|i| i == "-Wl,-e,__libc_main"));
+        // -eSYMBOL compact form.
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["lccc", "-emain", "x.c"].iter().map(|s| s.to_string()).collect();
+        d2.parse_cli_args(&args2).ok();
+        assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,-e,main"));
     }
 }
