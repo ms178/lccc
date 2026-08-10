@@ -44,9 +44,11 @@ impl Lowerer {
                 struct_arg_aligns: vec![],
                 struct_arg_classes: Vec::new(),
                 struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
             },
         });
         dest
@@ -81,7 +83,7 @@ impl Lowerer {
         };
 
         let tmp_alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: tmp_alloca, size, ty: store_ty, align: 0, volatile: false });
+        self.emit(Instruction::Alloca { dest: tmp_alloca, size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
 
         let val_v = self.operand_to_value(val);
         self.emit(Instruction::Store { val: Operand::Value(val_v), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default });

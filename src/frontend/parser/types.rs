@@ -199,6 +199,10 @@ impl Parser {
                     self.advance(); flags.has_double = true; any_base_specifier = true;
                     break;
                 }
+                TokenKind::Float128 => {
+                    self.advance();
+                    return Some(TypeSpecifier::Float128);
+                }
                 TokenKind::Bool => {
                     self.advance(); flags.has_bool = true; any_base_specifier = true;
                     break;
@@ -258,6 +262,28 @@ impl Parser {
                         flags.typedef_name = Some("__builtin_va_list".to_string());
                         self.advance();
                         any_base_specifier = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                // ISO C _FloatN/_FloatNx types (GCC 7+). On x86-64 these have
+                // the same formats as existing types, so they map directly:
+                // _Float32==float, _Float64==double, _Float32x==double,
+                // _Float64x==long double (80-bit x87). (_Float128 has its own
+                // TokenKind::Float128 and is a distinct binary128 type.)
+                TokenKind::Identifier(name)
+                    if matches!(name.as_str(), "_Float32" | "_Float64" | "_Float32x" | "_Float64x") =>
+                {
+                    let nm = name.clone();
+                    if !any_base_specifier {
+                        self.advance();
+                        any_base_specifier = true;
+                        match nm.as_str() {
+                            "_Float32" => { flags.has_float = true; }
+                            "_Float64" | "_Float32x" => { flags.has_double = true; }
+                            _ => { flags.has_double = true; }
+                        }
                         break;
                     } else {
                         break;

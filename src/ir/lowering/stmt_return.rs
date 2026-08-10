@@ -61,7 +61,7 @@ impl Lowerer {
         // Default: scalar return with implicit cast
         let val = self.lower_expr(e);
         let ret_ty = self.func_mut().return_type;
-        let expr_ty = self.get_expr_type(e);
+        let expr_ty = self.value_ir_type(e);
         if self.func_mut().return_is_bool {
             // For _Bool return, normalize at the source type before any truncation.
             self.emit_bool_normalize_typed(val, expr_ty)

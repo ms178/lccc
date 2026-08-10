@@ -153,7 +153,7 @@ impl super::InstructionEncoder {
 
         match (&ops[0], &ops[1]) {
             // load: mem/reg -> xmm/ymm
-            (Operand::Register(src), Operand::Register(dst)) if is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) => {
+            (Operand::Register(src), Operand::Register(dst)) if (is_xmm(&src.name) && is_xmm(&dst.name)) || (is_ymm(&src.name) && is_ymm(&dst.name)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
@@ -193,7 +193,7 @@ impl super::InstructionEncoder {
         let pp = if is_66 { 1 } else { 0 };
 
         match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Register(dst)) if is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) => {
+            (Operand::Register(src), Operand::Register(dst)) if (is_xmm(&src.name) && is_xmm(&dst.name)) || (is_ymm(&src.name) && is_ymm(&dst.name)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
@@ -298,6 +298,104 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(dst_num, mem)
             }
             _ => Err("unsupported AVX 3-op operands".to_string()),
+        }
+    }
+
+    /// Encode AVX 3-operand in the 0F38 map with an explicit VEX pp prefix
+    /// (for the VNNI family, whose members use 66/F2/F3/no-prefix forms).
+    pub(crate) fn encode_avx_3op_38_pp(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("AVX 3-op requires 3 operands".to_string());
+        }
+        let l = self.vex_l_from_ops(ops);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_vex(r, false, b, 2, 0, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            _ => Err("unsupported AVX 3-op operands".to_string()),
+        }
+    }
+
+    /// Encode a 0F3A-map AVX instruction with an imm8 where AT&T operands are
+    /// (imm, src2, src1, dst) — vpclmulqdq. vvvv = src1 (NDS first source),
+    /// r/m = src2, modrm.reg = dst.
+    pub(crate) fn encode_avx_3op_3a_pp_imm8(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        pp: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 4 {
+            return Err("AVX 3A imm8 op requires 4 operands (imm, src2, src1, dst)".to_string());
+        }
+        let l = self.vex_l_from_ops(ops);
+        let imm = match &ops[0] {
+            Operand::Immediate(v) => match v {
+                crate::backend::x86::assembler::parser::ImmediateValue::Integer(i) => *i as u8,
+                _ => return Err("AVX 3A imm must be an integer".to_string()),
+            },
+            _ => return Err("AVX 3A imm must be an immediate".to_string()),
+        };
+        match (&ops[1], &ops[2], &ops[3]) {
+            (Operand::Register(src2), Operand::Register(src1), Operand::Register(dst)) => {
+                let src2_num = reg_num(&src2.name).ok_or("bad register")?;
+                let src1_num = reg_num(&src1.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src2.name);
+                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_vex(r, false, b, 3, 0, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src2_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            _ => Err("unsupported AVX 3A imm8 operands".to_string()),
+        }
+    }
+
+    /// Encode a 0F3A-map AVX instruction with an imm8 where AT&T operands are
+    /// (imm, src, dst) and dest doubles as the NDS source — gf2p8affineqb/invqb.
+    /// vvvv = dst, r/m = src, modrm.reg = dst.
+    pub(crate) fn encode_avx_2op_3a_pp_imm8(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        pp: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("AVX 3A 2op imm8 requires 3 operands (imm, src, dst)".to_string());
+        }
+        let l = self.vex_l_from_ops(ops);
+        let imm = match &ops[0] {
+            Operand::Immediate(v) => match v {
+                crate::backend::x86::assembler::parser::ImmediateValue::Integer(i) => *i as u8,
+                _ => return Err("AVX 3A imm must be an integer".to_string()),
+            },
+            _ => return Err("AVX 3A imm must be an immediate".to_string()),
+        };
+        match (&ops[1], &ops[2]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_vex(r, false, b, 3, 0, dst_num, l, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            _ => Err("unsupported AVX 3A 2op imm8 operands".to_string()),
         }
     }
 
@@ -477,7 +575,14 @@ impl super::InstructionEncoder {
     /// Encode AVX scalar 3-operand instruction (e.g. vmulss, vaddss)
     /// pp: 2=F3 (single), 3=F2 (double)
     pub(crate) fn encode_avx_scalar_3op(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
-        if ops.len() != 3 { return Err("AVX scalar 3-op requires 3 operands".to_string()); }
+        // GNU as also accepts the 2-operand form `vdivss src, dst`, which
+        // implies dst == src2 (glibc math-inline-asm.h: `%vdivss %1, %d0`).
+        let ops: &[Operand] = if ops.len() == 2 {
+            &[ops[0].clone(), ops[1].clone(), ops[1].clone()]
+        } else {
+            ops
+        };
+        if ops.len() != 3 { return Err("AVX scalar 3-op requires 2 or 3 operands".to_string()); }
         let l = 0; // LIG - always 128-bit for scalar
 
         match (&ops[0], &ops[1], &ops[2]) {
@@ -842,6 +947,67 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode vpbroadcastw/d/q from a GPR source (VEX.256.66.0F38 7B/7C /r).
+    pub(crate) fn encode_avx_broadcast_gpr(&mut self, ops: &[Operand], opcode: &[u8], w: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("vpbroadcast-gpr requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst))
+                if !is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                // VEX.256.66.0F38.W{0|1} 7B|7C /r (mm=2, pp=1 for 66 prefix)
+                self.emit_vex(r, false, b, 2, w, 0, 1, 1);
+                self.bytes.extend_from_slice(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            _ => Err("unsupported vpbroadcast-gpr operands".to_string()),
+        }
+    }
+
+    /// Encode EVEX GPR-source vpbroadcastb/w/d/q (62 .. 7A/7B/7C /r).
+    /// EVEX.256.66.0F38.W{0|1} 7A|7B|7C /r with a GPR r/m source — the single-
+    /// uop (port-5) scalar->vector splat that has no VEX equivalent.
+    pub(crate) fn encode_avx_broadcast_evex_gpr(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        w: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("evex vpbroadcast-gpr requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst))
+                if !is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                let ll = if dst.name.to_lowercase().starts_with("zmm") {
+                    0b10
+                } else if dst.name.to_lowercase().starts_with("ymm") {
+                    0b01
+                } else {
+                    0
+                };
+                // EVEX: R X B R'=1 00 mm=2 | W vvvv=1111 1 pp=01 | z L'L b V'=1 aaa
+                // (no extended registers, no vvvv operand: reserved fields are 1s)
+                self.emit_evex(r, false, b, false, 2, w, 0, false, 1, ll, false, 0);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            _ => Err("unsupported evex vpbroadcast-gpr operands".to_string()),
+        }
+    }
+
     /// Encode AVX pshufd-like (imm8 + 2 register operands)
     pub(crate) fn encode_avx_shuffle(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
         if ops.len() != 3 { return Err("AVX shuffle requires 3 operands".to_string()); }
@@ -1093,14 +1259,11 @@ impl super::InstructionEncoder {
                             // The DC form for reverse direction:
                             // fadd: DC C0+i, fmul: DC C8+i, fsub: DC E8+i, fdiv: DC F8+i
                             // (fsub/fdiv swap: D8 E0 = fsub st(i),st; DC E8 = fsub st,st(i))
-                            let dc_modrm = match base_modrm {
-                                0xC0 => 0xC0, // fadd
-                                0xC8 => 0xC8, // fmul
-                                0xE0 => 0xE8, // fsub -> fsubr encoding in DC
-                                0xF0 => 0xF8, // fdiv -> fdivr encoding in DC
-                                _ => base_modrm,
-                            };
-                            self.bytes.extend_from_slice(&[opcode_sti, dc_modrm + dst_n]);
+                            // The DC base is the instruction's OWN base
+                            // (verified vs GNU as 2.47): fsub st,st(i) = DC E0+i,
+                            // fsubr = DC E8+i, fdiv = DC F0+i, fdivr = DC F8+i.
+                            // NO swap — the old remap table encoded fsub as fsubr.
+                            self.bytes.extend_from_slice(&[opcode_sti, base_modrm + dst_n]);
                         } else {
                             return Err("x87 arith: one operand must be st(0)".to_string());
                         }

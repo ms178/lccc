@@ -560,6 +560,7 @@ impl Parser {
             TokenKind::Noreturn | TokenKind::Restrict | TokenKind::Complex |
             TokenKind::Atomic | TokenKind::Auto | TokenKind::AutoType | TokenKind::Alignas |
             TokenKind::Builtin | TokenKind::Int128 | TokenKind::UInt128 |
+            TokenKind::Float128 |
             TokenKind::ThreadLocal | TokenKind::SegGs | TokenKind::SegFs => true,
             TokenKind::Identifier(name) => self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name),
             _ => false,
@@ -637,6 +638,50 @@ impl Parser {
         let (_, aligned, _, _) = self.parse_gcc_attributes();
         if let Some(a) = aligned {
             self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+        }
+    }
+
+    /// Consume C23 standard attributes in statement position: `[[fallthrough]]`,
+    /// `[[maybe_unused]]`, `[[gnu::...]]`, `[[clang::...]]`, etc. The lexer
+    /// produces two LBracket tokens for `[[`; consume through the matching
+    /// `]]` pair. These are pure hints for LCCC, so they are skipped entirely
+    /// (glibc's sysdeps/x86/cpu-features.c uses `[[fallthrough]];`).
+    pub(super) fn skip_c23_attribute_lists(&mut self) {
+        loop {
+            if !matches!(self.peek(), TokenKind::LBracket) {
+                break;
+            }
+            // Two-token lookahead: require `[[` (C23 attribute), not a lone `[`.
+            let next_is_lb = self.pos + 1 < self.tokens.len()
+                && matches!(self.tokens[self.pos + 1].kind, TokenKind::LBracket);
+            if !next_is_lb {
+                break;
+            }
+            self.advance(); // first '['
+            self.advance(); // second '['
+            // Consume until the matching ']]' pair (respecting nesting of '[' ']'
+            // inside attribute args, e.g. [[gnu::aligned(8)]]). When depth hits
+            // zero at a ']', consume that ']' and its partner ']', then stop.
+            let mut depth = 1usize;
+            while self.pos < self.tokens.len() {
+                match self.tokens[self.pos].kind {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.advance(); // the ']' that closed the attribute
+                            if self.pos < self.tokens.len()
+                                && matches!(self.tokens[self.pos].kind, TokenKind::RBracket)
+                            {
+                                self.advance(); // partner ']'
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                self.advance();
+            }
         }
     }
 

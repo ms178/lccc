@@ -310,7 +310,8 @@ impl RiscvCodegen {
                 // RISC-V would use RVV (RISC-V Vector extension) differently
                 unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
             }
-        }
+                    _ => { /* x86-only SIMD op on riscv: no-op */ }
+}
     }
 
     /// Emit 128-bit binary op (or, and, xor) using two 64-bit operations.

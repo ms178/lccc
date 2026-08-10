@@ -63,26 +63,16 @@ macro_rules! delegate_to_impl {
     };
 }
 
-use crate::ir::reexports::{
-    AtomicOrdering,
-    AtomicRmwOp,
-    BlockId,
-    Instruction,
-    IntrinsicOp,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrFunction,
-    IrUnaryOp,
-    Operand,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType};
+use super::cast::{classify_float_binop, FloatOp};
 use super::common::PtrDirective;
+use super::generation::is_i128_type;
 use super::regalloc::PhysReg;
 use super::state::{CodegenState, SlotAddr, StackSlot};
-use super::cast::{FloatOp, classify_float_binop};
-use super::generation::is_i128_type;
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{
+    AtomicOrdering, AtomicRmwOp, BlockId, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst,
+    IrFunction, IrUnaryOp, Operand, Value,
+};
 
 /// Minimum number of switch cases required to consider a jump table.
 /// Fewer cases are better served by a linear compare-and-branch chain.
@@ -177,33 +167,47 @@ pub trait ArchCodegen {
     /// internal buffer). Returns false if the instruction should use the default
     /// accumulator-based codegen path.
     /// Default: always false (no MachInst support).
-    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool { false }
+    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool {
+        false
+    }
 
     /// Whether MachInst ISel is enabled. When true, GEP folding is skipped
     /// so that GEPs and Load/Store go through the MachInst path for longer chains.
-    fn is_machinst_enabled(&self) -> bool { false }
+    fn is_machinst_enabled(&self) -> bool {
+        false
+    }
 
     /// Flush the accumulated MachInst buffer: run register allocation and emit assembly.
     /// Called at block boundaries and before instructions that can't be lowered to MachInst.
     /// Default: no-op.
     fn flush_machinst(&mut self) {}
+    /// v5 CCC_ENABLE_VECREG: at the end of a block, flush register-held vector
+    /// values that are live-out to their home slots. Default no-op; only the
+    /// x86-64 backend implements it.
+    fn flush_vecreg_liveout(&mut self) {}
 
     /// Get the physical register assigned to a value, if any.
     /// Returns None when the value is stack-allocated or not register-assigned.
     /// Backends with register allocation must implement this; the default returns
     /// None which makes emit_copy_value fall through to the accumulator path.
-    fn get_phys_reg_for_value(&self, _val_id: u32) -> Option<PhysReg> { None }
+    fn get_phys_reg_for_value(&self, _val_id: u32) -> Option<PhysReg> {
+        None
+    }
 
     /// Emit a register-to-register move between two physical registers.
     /// Only called when get_phys_reg_for_value returns Some for both src and dest.
     fn emit_reg_to_reg_move(&mut self, _src: PhysReg, _dest: PhysReg) {
-        panic!("backend must implement emit_reg_to_reg_move when get_phys_reg_for_value returns Some");
+        panic!(
+            "backend must implement emit_reg_to_reg_move when get_phys_reg_for_value returns Some"
+        );
     }
 
     /// Move the accumulator value into a physical register.
     /// Only called when get_phys_reg_for_value returns Some for the dest.
     fn emit_acc_to_phys_reg(&mut self, _dest: PhysReg) {
-        panic!("backend must implement emit_acc_to_phys_reg when get_phys_reg_for_value returns Some");
+        panic!(
+            "backend must implement emit_acc_to_phys_reg when get_phys_reg_for_value returns Some"
+        );
     }
 
     /// Compute the runtime-aligned address of an over-aligned alloca into the
@@ -253,7 +257,13 @@ pub trait ArchCodegen {
     /// Emit a segment-overridden store using a direct symbol(%rip) reference.
     /// Used when the pointer is a global address, avoiding register-indirect
     /// addressing which would use the absolute address as a segment offset.
-    fn emit_seg_store_symbol(&mut self, _val: &Operand, _sym: &str, _ty: IrType, _seg: AddressSpace) {
+    fn emit_seg_store_symbol(
+        &mut self,
+        _val: &Operand,
+        _sym: &str,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) {
         panic!("segment override stores only supported on x86");
     }
 
@@ -263,6 +273,10 @@ pub trait ArchCodegen {
     fn supports_global_addr_fold(&self) -> bool {
         false
     }
+
+    /// Flush per-function vector constants used by vpbroadcast* .LvcN(%rip)
+    /// splats to .rodata. No-op by default; x86 emits the actual entries.
+    fn emit_vector_const_rodata(&mut self) {}
 
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
@@ -320,7 +334,13 @@ pub trait ArchCodegen {
     ///
     /// Works for both alloca bases (Direct: folded into rbp-relative slot) and
     /// non-alloca bases (Indirect: load base pointer, add offset, store through it).
-    fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) {
+    fn emit_store_with_const_offset(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) {
         self.emit_load_operand(val);
         let addr = self.state_ref().resolve_slot_addr(base.0);
         if let Some(addr) = addr {
@@ -375,15 +395,35 @@ pub trait ArchCodegen {
     /// the multiply temp, freeing registers for ILP.
     ///
     /// Default implementation falls back to separate mul + add.
-    fn emit_fused_mul_add(&mut self, _mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
-                          acc: &Operand, add_dest: &Value, ty: IrType) {
+    fn emit_fused_mul_add(
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        add_dest: &Value,
+        ty: IrType,
+    ) {
         // Default: emit mul then add separately via the standard paths.
         self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
-        self.emit_int_binop(add_dest, IrBinOp::Add, acc, &Operand::Value(Value(_mul_dest.0)), ty);
+        self.emit_int_binop(
+            add_dest,
+            IrBinOp::Add,
+            acc,
+            &Operand::Value(Value(_mul_dest.0)),
+            ty,
+        );
     }
 
     /// Emit a float binary operation (add/sub/mul/div).
-    fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    fn emit_float_binop(
+        &mut self,
+        dest: &Value,
+        op: FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         let mnemonic = self.emit_float_binop_mnemonic(op);
         self.emit_load_operand(lhs);
         self.emit_acc_to_secondary();
@@ -408,7 +448,14 @@ pub trait ArchCodegen {
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType);
 
     /// Emit an integer binary operation (all IrBinOp variants).
-    fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType);
+    fn emit_int_binop(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    );
 
     /// Emit a unary operation.
     /// Default dispatches i128 → F128 neg → float → int to arch-specific primitives.
@@ -439,7 +486,14 @@ pub trait ArchCodegen {
 
     /// Emit a floating-point comparison (F32/F64).
     /// Called by the default emit_cmp for float types (not F128, not i128).
-    fn emit_float_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType);
+    fn emit_float_cmp(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    );
 
     /// Emit an F128 (long double / quad precision) comparison.
     /// Called by the default emit_cmp for F128 types.
@@ -455,21 +509,42 @@ pub trait ArchCodegen {
     /// The default implementation provides the shared algorithmic skeleton that all four
     /// architectures follow: classify args → emit stack args → load register args → call → cleanup → store result.
     /// Backends override the small `emit_call_*` hook methods instead of reimplementing this entire method.
-    fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
-                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>],
-                 struct_arg_aligns: &[Option<usize>],
-                 struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
-                 struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
-                 is_sret: bool,
-                 _is_fastcall: bool,
-                 ret_eightbyte_classes: &[crate::common::types::EightbyteClass]) {
+    fn emit_call(
+        &mut self,
+        args: &[Operand],
+        arg_types: &[IrType],
+        direct_name: Option<&str>,
+        func_ptr: Option<&Operand>,
+        dest: Option<Value>,
+        return_type: IrType,
+        is_variadic: bool,
+        _num_fixed_args: usize,
+        struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        struct_arg_is_f128_sse: &[bool],
+        is_sret: bool,
+        _is_fastcall: bool,
+        ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
+        ret_is_f128_sse: bool,
+    ) {
         // Phase 2b: save caller-saved registers with live values before the call.
         self.emit_pre_call_save_caller_regs();
 
         use super::call_abi::*;
         let config = self.call_abi_config();
-        let mut arg_classes = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, is_variadic, &config);
+        let mut arg_classes = classify_call_args(
+            args,
+            arg_types,
+            struct_arg_sizes,
+            struct_arg_aligns,
+            struct_arg_classes,
+            struct_arg_riscv_float_classes,
+            struct_arg_is_f128_sse,
+            is_variadic,
+            &config,
+        );
 
         // AArch64 ABI: the sret pointer goes in x8 (indirect result register),
         // NOT in x0 as a regular argument.  Reclassify: mark arg[0] as ZeroSizeSkip
@@ -486,9 +561,15 @@ pub trait ArchCodegen {
             let max_int_regs = config.max_int_regs; // 8 for ARM64
             for cls in arg_classes.iter_mut().skip(1) {
                 match cls {
-                    CallArgClass::IntReg { reg_idx } if *reg_idx > 0 => { *reg_idx -= 1; }
-                    CallArgClass::I128RegPair { base_reg_idx } if *base_reg_idx > 0 => { *base_reg_idx -= 1; }
-                    CallArgClass::StructByValReg { base_reg_idx, .. } if *base_reg_idx > 0 => { *base_reg_idx -= 1; }
+                    CallArgClass::IntReg { reg_idx } if *reg_idx > 0 => {
+                        *reg_idx -= 1;
+                    }
+                    CallArgClass::I128RegPair { base_reg_idx } if *base_reg_idx > 0 => {
+                        *base_reg_idx -= 1;
+                    }
+                    CallArgClass::StructByValReg { base_reg_idx, .. } if *base_reg_idx > 0 => {
+                        *base_reg_idx -= 1;
+                    }
                     _ => {}
                 }
             }
@@ -510,7 +591,10 @@ pub trait ArchCodegen {
                     }
                     CallArgClass::StructByValStack { size } if *size <= 8 => {
                         let sz = *size;
-                        arg_classes[i] = CallArgClass::StructByValReg { base_reg_idx: freed_reg, size: sz };
+                        arg_classes[i] = CallArgClass::StructByValReg {
+                            base_reg_idx: freed_reg,
+                            size: sz,
+                        };
                         break;
                     }
                     _ => {}
@@ -531,22 +615,39 @@ pub trait ArchCodegen {
         let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes, arg_types);
 
         // Phase 1: Pre-convert F128 values that need helper calls (before stack args clobber regs).
-        let f128_temp_space = self.emit_call_f128_pre_convert(args, &arg_classes, arg_types, stack_arg_space);
+        let f128_temp_space =
+            self.emit_call_f128_pre_convert(args, &arg_classes, arg_types, stack_arg_space);
 
         // Each phase may clobber the accumulator register (t0 on RISC-V, rax on x86) via
         // helper calls or loading different values, so invalidate the cache at boundaries.
         self.state().reg_cache.invalidate_acc();
 
         // Phase 2: Emit stack overflow args.
-        let total_sp_adjust = self.emit_call_stack_args(args, &arg_classes, arg_types, stack_arg_space,
-                                                        if indirect { self.emit_call_fptr_spill_size() } else { 0 },
-                                                        f128_temp_space);
+        let total_sp_adjust = self.emit_call_stack_args(
+            args,
+            &arg_classes,
+            arg_types,
+            stack_arg_space,
+            if indirect {
+                self.emit_call_fptr_spill_size()
+            } else {
+                0
+            },
+            f128_temp_space,
+        );
 
         self.state().reg_cache.invalidate_acc();
 
         // Phase 3: Load register args (GP, FP, i128, struct-by-val, F128).
-        self.emit_call_reg_args(args, &arg_classes, arg_types, total_sp_adjust, f128_temp_space, stack_arg_space,
-                                struct_arg_riscv_float_classes);
+        self.emit_call_reg_args(
+            args,
+            &arg_classes,
+            arg_types,
+            total_sp_adjust,
+            f128_temp_space,
+            stack_arg_space,
+            struct_arg_riscv_float_classes,
+        );
 
         // Phase 3.5: Set up sret pointer in dedicated register (x8 on AArch64).
         if let Some(sret_op) = sret_operand {
@@ -566,6 +667,7 @@ pub trait ArchCodegen {
         // Phase 6: Store return value.
         if let Some(dest) = dest {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
+            self.set_call_ret_is_f128_sse(ret_is_f128_sse);
             self.emit_call_store_result(&dest, return_type);
         }
 
@@ -589,32 +691,67 @@ pub trait ArchCodegen {
     /// Compute how much stack space to allocate for overflow arguments.
     /// x86 returns raw push bytes; ARM/RISC-V return pre-allocated SP space.
     /// `arg_types` is provided so that i686 can account for F64 taking 8 bytes on the stack.
-    fn emit_call_compute_stack_space(&self, arg_classes: &[super::call_abi::CallArgClass], arg_types: &[IrType]) -> usize;
+    fn emit_call_compute_stack_space(
+        &self,
+        arg_classes: &[super::call_abi::CallArgClass],
+        arg_types: &[IrType],
+    ) -> usize;
 
     /// Spill an indirect function pointer to a safe location before stack manipulation.
     /// No-op on x86 (uses r10). ARM/RISC-V spill to stack.
-    fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) { let _ = func_ptr; }
+    fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {
+        let _ = func_ptr;
+    }
 
     /// Size of the function pointer spill slot (0 for x86, 16 for ARM).
-    fn emit_call_fptr_spill_size(&self) -> usize { 0 }
+    fn emit_call_fptr_spill_size(&self) -> usize {
+        0
+    }
 
     /// Pre-convert F128 variable arguments that need __extenddftf2/__trunctfdf2.
     /// Returns the temp stack space allocated for converted results.
-    fn emit_call_f128_pre_convert(&mut self, _args: &[Operand], _arg_classes: &[super::call_abi::CallArgClass],
-                                   _arg_types: &[IrType], _stack_arg_space: usize) -> usize { 0 }
+    fn emit_call_f128_pre_convert(
+        &mut self,
+        _args: &[Operand],
+        _arg_classes: &[super::call_abi::CallArgClass],
+        _arg_types: &[IrType],
+        _stack_arg_space: usize,
+    ) -> usize {
+        0
+    }
 
     /// Emit stack overflow arguments. Returns total SP adjustment (stack_arg_space + fptr_spill + f128_temp).
-    fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[super::call_abi::CallArgClass],
-                            arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize) -> i64;
+    fn emit_call_stack_args(
+        &mut self,
+        args: &[Operand],
+        arg_classes: &[super::call_abi::CallArgClass],
+        arg_types: &[IrType],
+        stack_arg_space: usize,
+        fptr_spill: usize,
+        f128_temp_space: usize,
+    ) -> i64;
 
     /// Load arguments into registers (GP, FP, i128, struct-by-val, F128).
-    fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[super::call_abi::CallArgClass],
-                          arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize,
-                          struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]);
+    fn emit_call_reg_args(
+        &mut self,
+        args: &[Operand],
+        arg_classes: &[super::call_abi::CallArgClass],
+        arg_types: &[IrType],
+        total_sp_adjust: i64,
+        f128_temp_space: usize,
+        stack_arg_space: usize,
+        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+    );
 
     /// Emit the call/bl/jalr instruction.
     /// `stack_arg_space` is passed so ARM can reload the spilled fptr at the correct offset.
-    fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize);
+    fn emit_call_instruction(
+        &mut self,
+        direct_name: Option<&str>,
+        func_ptr: Option<&Operand>,
+        indirect: bool,
+        stack_arg_space: usize,
+    );
 
     /// Clean up stack space after the call returns.
     fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool);
@@ -622,7 +759,9 @@ pub trait ArchCodegen {
     /// Returns true if this architecture uses a dedicated register (not part of the
     /// normal argument sequence) for the sret pointer.  AArch64 uses x8; x86-64, RISC-V
     /// and i686 pass it as the first normal argument.
-    fn sret_uses_dedicated_reg(&self) -> bool { false }
+    fn sret_uses_dedicated_reg(&self) -> bool {
+        false
+    }
 
     /// Emit the sret pointer into the dedicated register (e.g., x8 on AArch64).
     /// Only called when `sret_uses_dedicated_reg()` returns true.
@@ -631,12 +770,23 @@ pub trait ArchCodegen {
     /// Returns the number of bytes the callee pops from the stack on return.
     /// On i386 SysV, functions returning via sret do `ret $4` to pop the hidden
     /// pointer. All other architectures and non-sret calls return 0.
-    fn callee_pops_bytes_for_sret(&self, _is_sret: bool) -> usize { 0 }
+    fn callee_pops_bytes_for_sret(&self, _is_sret: bool) -> usize {
+        0
+    }
 
     /// Stash the SysV eightbyte classification for the call's return struct.
     /// x86-64 overrides this to store the classes for use in emit_call_store_result.
     /// Other backends ignore it (default no-op).
-    fn set_call_ret_eightbyte_classes(&mut self, _classes: &[crate::common::types::EightbyteClass]) {}
+    fn set_call_ret_eightbyte_classes(
+        &mut self,
+        _classes: &[crate::common::types::EightbyteClass],
+    ) {
+    }
+
+    /// Stash whether the call's return value is _Float128 (ONE 16-byte XMM).
+    /// x86-64 overrides this for use in emit_call_store_result.
+    fn set_call_ret_is_f128_sse(&mut self, _is_f128: bool) {
+    }
 
     /// Store the function's return value from ABI registers to the destination slot.
     ///
@@ -792,8 +942,13 @@ pub trait ArchCodegen {
 
     /// Emit leaq (%base_reg, %index_reg), %dest for GEP with both operands
     /// in registers. Default: falls back to accumulator path.
-    fn emit_leaq_base_index(&mut self, base_reg: PhysReg, index_reg: PhysReg,
-                             dest: &Value, dest_reg: Option<PhysReg>) {
+    fn emit_leaq_base_index(
+        &mut self,
+        base_reg: PhysReg,
+        index_reg: PhysReg,
+        dest: &Value,
+        dest_reg: Option<PhysReg>,
+    ) {
         // Default: load base to secondary, load index to acc, add, store
         self.emit_reg_to_acc(base_reg);
         self.emit_acc_to_secondary();
@@ -901,22 +1056,82 @@ pub trait ArchCodegen {
     }
 
     /// Emit an atomic read-modify-write operation.
-    fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering);
+    fn emit_atomic_rmw(
+        &mut self,
+        dest: &Value,
+        op: AtomicRmwOp,
+        ptr: &Operand,
+        val: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    );
+
+    /// Emit an atomic increment with no SSA result.  This is the primitive used
+    /// by multithreaded PGO; it must not allocate a fake destination.
+    fn emit_atomic_inc(
+        &mut self,
+        ptr: &Operand,
+        offset: i64,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) {
+        let dummy = Value(u32::MAX);
+        let _ = offset;
+        self.emit_atomic_rmw(
+            &dummy,
+            AtomicRmwOp::Add,
+            ptr,
+            &Operand::Const(IrConst::I64(1)),
+            ty,
+            ordering,
+        );
+    }
 
     /// Emit an atomic compare-and-exchange operation.
-    fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool);
+    fn emit_atomic_cmpxchg(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    );
 
     /// Emit an atomic load.
-    fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering);
+    fn emit_atomic_load(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    );
 
     /// Emit an atomic store.
-    fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering);
+    fn emit_atomic_store(
+        &mut self,
+        ptr: &Operand,
+        val: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    );
 
     /// Emit a memory fence.
     fn emit_fence(&mut self, ordering: AtomicOrdering);
 
     /// Emit inline assembly.
-    fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]);
+    fn emit_inline_asm(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+    );
 
     /// Emit raw inline assembly template for naked functions (no operand substitution).
     fn emit_raw_inline_asm(&mut self, template: &str) {
@@ -931,8 +1146,26 @@ pub trait ArchCodegen {
     /// Emit inline assembly with per-operand segment overrides.
     /// Default: delegates to emit_inline_asm (ignoring segment overrides).
     /// x86 backend overrides this to apply %gs:/%fs: prefixes to memory operands.
-    fn emit_inline_asm_with_segs(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>], _seg_overrides: &[AddressSpace]) {
-        self.emit_inline_asm(template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols);
+    fn emit_inline_asm_with_segs(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+        _seg_overrides: &[AddressSpace],
+    ) {
+        self.emit_inline_asm(
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+        );
     }
 
     /// Emit a return terminator.
@@ -987,6 +1220,12 @@ pub trait ArchCodegen {
     /// `src` is the float operand, `to_signed` indicates signed vs unsigned,
     /// `from_ty` is F32 or F64. Result should be left in the acc pair.
     fn emit_float_to_i128_call(&mut self, src: &Operand, to_signed: bool, from_ty: IrType);
+
+    /// Store a _Float128 result still in %xmm0 (single-XMM SysV ABI) to `dest`.
+    /// Only needed for the i128 -> _Float128 cast path; other arches panic.
+    fn emit_store_f128_xmm0(&mut self, _dest: &Value) {
+        unimplemented!("_Float128 i128-cast result storage not implemented on this target")
+    }
 
     // --- Return primitives ---
 
@@ -1079,6 +1318,23 @@ pub trait ArchCodegen {
     /// Emit the actual copy loop/instruction for memcpy.
     fn emit_memcpy_impl(&mut self, size: usize);
 
+    /// Whether this backend can inline a fixed-size `memcpy`-style call
+    /// (dest/src passed as generic operands). Default off: non-x86 backends
+    /// keep such calls as real libc calls.
+    fn supports_inline_memcpy_call(&self) -> bool {
+        false
+    }
+
+    /// Inline a fixed-size memcpy call: `dest = memcpy(dest, src, size)` with
+    /// `dest`/`src` as generic operands. Only called when
+    /// `supports_inline_memcpy_call()` is true.
+    fn emit_inline_memcpy_call(&mut self, _dest: &Operand, _src: &Operand, _size: usize) {}
+
+    /// Inline a fixed-size memmove call. Must handle overlapping ranges:
+    /// copies forward when dest < src, backward when dest > src.
+    /// Only called when `supports_inline_memcpy_call()` is true.
+    fn emit_inline_memmove_call(&mut self, _dest: &Operand, _src: &Operand, _size: usize) {}
+
     // --- Unary operation primitives ---
 
     fn emit_float_neg(&mut self, ty: IrType);
@@ -1122,7 +1378,8 @@ pub trait ArchCodegen {
     /// Emit an unconditional branch.
     fn emit_branch(&mut self, label: &str) {
         let mnemonic = self.jump_mnemonic();
-        self.state().emit_fmt(format_args!("    {} {}", mnemonic, label));
+        self.state()
+            .emit_fmt(format_args!("    {} {}", mnemonic, label));
     }
 
     /// Emit an unconditional branch to a BlockId, avoiding String allocation.
@@ -1147,7 +1404,14 @@ pub trait ArchCodegen {
     ///
     /// Default implementation uses a branch-based sequence. Backends can override
     /// this to emit cmov (x86), csel (ARM), or other conditional move instructions.
-    fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
+    fn emit_select(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        _ty: IrType,
+    ) {
         // Default: branch-based select
         let label_id = self.state().next_label_id();
         let true_label = format!(".Lsel_true_{}", label_id);
@@ -1172,7 +1436,12 @@ pub trait ArchCodegen {
     }
 
     /// Emit a conditional branch to BlockIds, avoiding String allocations.
-    fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) {
+    fn emit_cond_branch_blocks(
+        &mut self,
+        cond: &Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
         self.emit_load_operand(cond);
         // We need the label strings for emit_branch_nonzero which takes &str.
         // Use as_label() here since emit_branch_nonzero is arch-specific.
@@ -1245,13 +1514,27 @@ pub trait ArchCodegen {
     ///   4. Indirect branch to addr
     ///
     /// For sparse cases, falls back to a linear chain of compare-and-branch.
-    fn emit_switch(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId, ty: IrType) {
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
         // Check density for jump table eligibility (disabled by -fno-jump-tables)
         let use_jump_table = if self.state_ref().no_jump_tables {
             false
         } else if cases.len() >= MIN_JUMP_TABLE_CASES {
-            let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
-            let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
+            let min_val = cases
+                .iter()
+                .map(|&(v, _)| v)
+                .min()
+                .expect("switch must have cases");
+            let max_val = cases
+                .iter()
+                .map(|&(v, _)| v)
+                .max()
+                .expect("switch must have cases");
             // Use i128 arithmetic to prevent overflow when min_val is very negative
             // and max_val is very positive (e.g., -2^31 to 2^31).
             let range_i128 = max_val as i128 - min_val as i128 + 1;
@@ -1281,7 +1564,13 @@ pub trait ArchCodegen {
     /// section with pointer-sized absolute entries) to avoid duplicating the table
     /// construction and data emission logic. x86 overrides this entirely to handle
     /// PIC mode (relative .long entries).
-    fn emit_switch_jump_table(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId, ty: IrType);
+    fn emit_switch_jump_table(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    );
 
     /// Emit a compare-and-branch for a single switch case:
     /// compare the accumulator against `case_val` and branch to `label` if equal.
@@ -1314,7 +1603,9 @@ pub trait ArchCodegen {
     fn emit_set_return_f128_second(&mut self, src: &Operand);
 
     /// Emit the function directive for the function type attribute.
-    fn function_type_directive(&self) -> &'static str { "@function" }
+    fn function_type_directive(&self) -> &'static str {
+        "@function"
+    }
 
     /// Emit dynamic stack allocation.
     ///
@@ -1481,13 +1772,27 @@ pub trait ArchCodegen {
 
     /// Emit a target-independent intrinsic operation (fences, SIMD, CRC32, etc.).
     /// Each backend must implement this to emit the appropriate native instructions.
-    fn emit_intrinsic(&mut self, _dest: &Option<Value>, _op: &IntrinsicOp, _dest_ptr: &Option<Value>, _args: &[Operand]) {}
+    fn emit_intrinsic(
+        &mut self,
+        _dest: &Option<Value>,
+        _op: &IntrinsicOp,
+        _dest_ptr: &Option<Value>,
+        _args: &[Operand],
+    ) {
+    }
 
     /// Emit runtime helper stubs needed by this architecture.
     /// Called after all functions are generated, before the .note.GNU-stack section.
     /// The i686 backend uses this to emit __divdi3/__udivdi3/__moddi3/__umoddi3
     /// as weak symbols for standalone builds without libgcc.
     fn emit_runtime_stubs(&mut self) {}
+
+    /// Flush a pending deferred vector-result store (x86 v5 lazy-flush).
+    /// Called at block boundaries, where the straight-line last-store cache is
+    /// invalidated: if a deferred store was never consumed in its own block,
+    /// the slot must be written before another block can read it. No-op on
+    /// backends without the deferred-store mechanism.
+    fn flush_pending_vec_store(&mut self) {}
 }
 
 // ── Shared jump table helpers ─────────────────────────────────────────────────
@@ -1495,18 +1800,36 @@ pub trait ArchCodegen {
 /// Build a jump table from switch cases: maps each index in [min..max] to a BlockId.
 /// Returns (table, min_val, range).
 pub fn build_jump_table(cases: &[(i64, BlockId)], default: &BlockId) -> (Vec<BlockId>, i64, usize) {
-    let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
-    let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
+    let min_val = cases
+        .iter()
+        .map(|&(v, _)| v)
+        .min()
+        .expect("switch must have cases");
+    let max_val = cases
+        .iter()
+        .map(|&(v, _)| v)
+        .max()
+        .expect("switch must have cases");
     // Use i128 to prevent overflow when case values span a wide range.
     let range_i128 = max_val as i128 - min_val as i128 + 1;
-    assert!(range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128,
-        "jump table range overflow: min={}, max={}, range={}", min_val, max_val, range_i128);
+    assert!(
+        range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128,
+        "jump table range overflow: min={}, max={}, range={}",
+        min_val,
+        max_val,
+        range_i128
+    );
     let range = range_i128 as usize;
 
     let mut table = vec![*default; range];
     for &(case_val, target) in cases {
         let idx = (case_val - min_val) as usize;
-        debug_assert!(idx < range, "jump table index out of bounds: idx={}, range={}", idx, range);
+        debug_assert!(
+            idx < range,
+            "jump table index out of bounds: idx={}, range={}",
+            idx,
+            range
+        );
         table[idx] = target;
     }
     (table, min_val, range)
@@ -1537,7 +1860,12 @@ pub fn get_const_i128_shift_amount(rhs: &Operand) -> Option<u32> {
 
 /// Default store implementation: 3-way SlotAddr dispatch for i128 and typed stores.
 /// Backends that override `emit_store` should call this for types they don't handle specially.
-pub fn emit_store_default(cg: &mut (impl ArchCodegen + ?Sized), val: &Operand, ptr: &Value, ty: IrType) {
+pub fn emit_store_default(
+    cg: &mut (impl ArchCodegen + ?Sized),
+    val: &Operand,
+    ptr: &Value,
+    ty: IrType,
+) {
     let addr = cg.state_ref().resolve_slot_addr(ptr.0);
     if is_i128_type(ty) {
         cg.emit_load_acc_pair(val);
@@ -1593,7 +1921,12 @@ pub fn emit_store_default(cg: &mut (impl ArchCodegen + ?Sized), val: &Operand, p
 
 /// Default load implementation: 3-way SlotAddr dispatch for i128 and typed loads.
 /// Backends that override `emit_load` should call this for types they don't handle specially.
-pub fn emit_load_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, ptr: &Value, ty: IrType) {
+pub fn emit_load_default(
+    cg: &mut (impl ArchCodegen + ?Sized),
+    dest: &Value,
+    ptr: &Value,
+    ty: IrType,
+) {
     let addr = cg.state_ref().resolve_slot_addr(ptr.0);
     if is_i128_type(ty) {
         if let Some(addr) = addr {
@@ -1632,7 +1965,35 @@ pub fn emit_load_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, ptr
 /// Default cast implementation: handles i128 widening/narrowing/copy,
 /// and delegates non-i128 casts to emit_cast_instrs.
 /// Backends that override `emit_cast` should call this for types they don't handle specially.
-pub fn emit_cast_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+pub fn emit_cast_default(
+    cg: &mut (impl ArchCodegen + ?Sized),
+    dest: &Value,
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+) {
+    // long double -> anything cast where the source is an x87 bit-pattern
+    // value (LDFabs/LDCopysign results): the 16 bytes ARE the x87 format, so
+    // any cast from the mis-typed integer view to F128 is a no-op. Without
+    // this, the return path converted the bit pattern as an integer
+    // (fildq) — 0xC000000000000000 (-3.0 x87) became -2^62.
+    if to_ty == IrType::F128 {
+        if let Operand::Value(v) = src {
+            if cg.state_ref().f128_direct_slots.contains(&v.0) {
+                cg.state().f128_direct_slots.insert(dest.0);
+                if let (Some(src_slot), Some(dest_slot)) = (
+                    cg.state_ref().get_slot(v.0),
+                    cg.state_ref().get_slot(dest.0),
+                ) {
+                    if src_slot.0 != dest_slot.0 {
+                        cg.state().out.emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
+                        cg.state().out.emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
+                    }
+                }
+                return;
+            }
+        }
+    }
     // float/double -> i128/u128: call compiler-rt __fixdfti/__fixsfti/__fixunsdfti/__fixunssfti
     if is_i128_type(to_ty) && from_ty.is_float() {
         let to_signed = to_ty.is_signed();
@@ -1644,14 +2005,26 @@ pub fn emit_cast_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, src
     if is_i128_type(from_ty) && to_ty.is_float() {
         let from_signed = from_ty.is_signed();
         cg.emit_i128_to_float_call(src, from_signed, to_ty);
-        cg.emit_store_result(dest);
+        if to_ty == IrType::F128 {
+            // _Float128 result stays in %xmm0 (single-XMM SysV ABI).
+            cg.emit_store_f128_xmm0(dest);
+        } else {
+            cg.emit_store_result(dest);
+        }
         return;
     }
     // integer -> i128/u128: widen to 64-bit then sign/zero extend high half
     if is_i128_type(to_ty) && !is_i128_type(from_ty) {
+        if std::env::var("CCC_TRACE_I128").is_ok() {
+            eprintln!("[I128] cast {:?} -> {:?} dest={:?}", from_ty, to_ty, dest.0);
+        }
         cg.emit_load_operand(src);
         if from_ty.size() < 8 {
-            let widen_to = if from_ty.is_signed() { IrType::I64 } else { IrType::U64 };
+            let widen_to = if from_ty.is_signed() {
+                IrType::I64
+            } else {
+                IrType::U64
+            };
             cg.emit_cast_instrs(from_ty, widen_to);
         }
         if from_ty.is_signed() {
@@ -1684,7 +2057,13 @@ pub fn emit_cast_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, src
 /// Default unary operation implementation: dispatches i128 → F128 neg → float → int
 /// to arch-specific primitives.
 /// Backends that override `emit_unaryop` should call this for types they don't handle specially.
-pub fn emit_unaryop_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, op: IrUnaryOp, src: &Operand, ty: IrType) {
+pub fn emit_unaryop_default(
+    cg: &mut (impl ArchCodegen + ?Sized),
+    dest: &Value,
+    op: IrUnaryOp,
+    src: &Operand,
+    ty: IrType,
+) {
     // IsConstant should have been resolved by constant folding.
     // If it survived to codegen, the operand was not constant, so emit 0.
     if op == IrUnaryOp::IsConstant {
@@ -1730,7 +2109,11 @@ pub fn emit_unaryop_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, 
 /// Default return implementation: loads value, moves to appropriate return register,
 /// and emits epilogue. Backends that override `emit_return` should call this for
 /// cases they don't handle specially.
-pub fn emit_return_default(cg: &mut (impl ArchCodegen + ?Sized), val: Option<&Operand>, frame_size: i64) {
+pub fn emit_return_default(
+    cg: &mut (impl ArchCodegen + ?Sized),
+    val: Option<&Operand>,
+    frame_size: i64,
+) {
     if let Some(val) = val {
         let ret_ty = cg.current_return_type();
         if is_i128_type(ret_ty) {

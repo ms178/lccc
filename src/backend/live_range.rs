@@ -9,7 +9,9 @@
 //! maintaining an "active" set of intervals that overlap with the current position.
 //! For each interval, we either assign it a free register or spill it to the stack.
 
-use super::liveness::{LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator};
+use super::liveness::{
+    for_each_operand_in_instruction, for_each_operand_in_terminator, LiveInterval,
+};
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
@@ -44,13 +46,9 @@ impl LiveRange {
         // Uses at depth 1 (one loop): weight = 10
         // Uses at depth 2 (nested loops): weight = 100
         // etc.
-        let loop_weight = match loop_depth {
-            0 => 1u64,
-            1 => 10u64,
-            2 => 100u64,
-            3 => 1000u64,
-            4 => 10_000u64,
-            _ => 10_000u64, // cap at 10K to avoid overflow
+        let loop_weight = {
+            let base: u64 = 10;
+            base.saturating_pow(loop_depth).min(1_000_000_000)
         };
 
         // For now, estimate 2 uses per interval (this will be refined by build_live_ranges)
@@ -222,7 +220,9 @@ impl LinearScanAllocator {
         // Find any free register, rotating the start index to distribute
         // consecutive allocations across different registers for ILP.
         let n = self.available_regs.len();
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         let start = self.next_reg_idx % n;
         for offset in 0..n {
             let idx = (start + offset) % n;
@@ -252,27 +252,41 @@ impl LinearScanAllocator {
         None
     }
 
-    /// Find the best interval to spill when no register is free.
+    /// Find the best active interval to evict (spill) to free a register for the
+    /// incoming range at the current scan position.
     ///
-    /// Returns the active interval with the lowest spill weight (least important).
-    /// Intervals with equal spill weight are broken by next_use (later is better to spill).
-    pub fn find_spill_candidate(&mut self) -> Option<usize> {
+    /// This is the core of the linear-scan interval-splitting heuristic
+    /// (Poletto–Sarkar style, made loop-aware):
+    ///
+    /// 1. Prefer the active interval with the **lowest priority**. `priority`
+    ///    already carries the 10^loop_depth weighting, so values that are cold
+    ///    (outside loops) or lightly used rank lower and are preferred for
+    ///    eviction over hot inner-loop temporaries.
+    /// 2. Break ties by the **farthest next use**: spill the value that will be
+    ///    needed again the latest. This directly avoids the pathological case
+    ///    where eviction forces a hot-loop reload — the reloaded value won't be
+    ///    touched again until well after the incoming value has finished.
+    ///
+    /// Returns the index into `self.active` of the interval to evict, or None if
+    /// the active set is empty.
+    pub fn find_evict_candidate(&self, current_pos: u32) -> Option<usize> {
         if self.active.is_empty() {
             return None;
         }
 
         let mut best_idx = 0;
-        let mut best_weight = self.active[0].range.spill_weight;
-        let mut best_next_use = self.active[0].next_use.unwrap_or(u32::MAX);
+        let mut best_priority = self.active[0].range.priority;
+        let mut best_next_use = next_use_after(&self.active[0].range, current_pos);
 
         for (idx, interval) in self.active.iter().enumerate().skip(1) {
-            let weight = interval.range.spill_weight;
-            let next_use = interval.next_use.unwrap_or(u32::MAX);
+            let priority = interval.range.priority;
+            let next_use = next_use_after(&interval.range, current_pos);
 
-            // Prefer lower spill weight (less important). If tied, prefer later next_use.
-            if weight < best_weight || (weight == best_weight && next_use > best_next_use) {
+            // Prefer lower priority (less important). If tied, prefer the value
+            // whose next use is farthest (least disruptive to evict).
+            if priority < best_priority || (priority == best_priority && next_use > best_next_use) {
                 best_idx = idx;
-                best_weight = weight;
+                best_priority = priority;
                 best_next_use = next_use;
             }
         }
@@ -315,11 +329,91 @@ impl LinearScanAllocator {
                 next_use: None,
             });
         } else {
-            // No free register — spill the incoming range to stack.
-            // We do NOT evict active intervals because the codegen has no
-            // mechanism to reload evicted values. Eviction would leave the
-            // evicted value's register holding a different value while the
-            // codegen still expects the original value in that register.
+            // No free register for the whole of the incoming range. This is the
+            // linear-scan *interval-splitting* decision point.
+            //
+            // Options:
+            //   a) Spill the incoming range (default, always sound).
+            //   b) Interval-split: evict an ACTIVE interval that is less valuable
+            //      (lower priority / farthest next use) and hand its register to
+            //      the incoming range. The evicted value keeps a stack home, so
+            //      codegen reloads it from its slot on its next use. This is
+            //      sound because the FINAL assignment map simply leaves the
+            //      evicted value unregistered (slot_assignment gives every
+            //      unregistered value a slot).
+            //
+            // Mode 3 reassigns a whole lower-priority interval only when its next
+            // use follows the incoming interval. Set mode 0 to disable.
+            let mode: i32 = std::env::var("CCC_EVICT_MODE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            if mode > 0 {
+                if let Some(evict_idx) = self.find_evict_candidate(range.start) {
+                    let cand = &self.active[evict_idx];
+                    let evicted_vid = cand.range.value_id;
+                    let cand_priority = cand.range.priority;
+                    let cand_depth = cand.range.loop_depth;
+                    // The core guard is priority: never evict a value more valuable
+                    // than the incoming. This is what lets a hot loop value (e.g.
+                    // the scan/match induction variables, which have the HIGHEST
+                    // priority) take a register from a cold function-scope value
+                    // that merely defined it earlier in the function.
+                    let ok = if mode >= 2 {
+                        range.priority > cand_priority
+                    } else {
+                        range.priority > cand_priority && cand_depth < range.loop_depth
+                    };
+                    // ms178 mode 3: ALSO require that the evicted value's next
+                    // use is AFTER the incoming range's end. This prevents the
+                    // pathological case that makes eviction regress hot loops:
+                    // if the evicted value is needed INSIDE the incoming
+                    // range's window, it reloads from its slot on every use in
+                    // the hot loop — far worse than the spill it avoided. With
+                    // this guard, the reload happens in cold code (or a later
+                    // loop), so eviction can only help.
+                    let ok = if mode >= 3 {
+                        ok && {
+                            let nxt = next_use_after(&cand.range, range.start);
+                            // next_use_after falls back to range.end when there
+                            // is no use at/after range.start; in that case the
+                            // value is genuinely not needed soon.
+                            nxt > range.end
+                        }
+                    } else {
+                        ok
+                    };
+                    if ok {
+                        let evicted_reg = self.assignments.remove(&evicted_vid);
+                        if let Some(reg) = evicted_reg {
+                            // SOUNDNESS: the evicted value must have a stack home
+                            // so codegen can reload it on its next use. Its
+                            // register is freed but the value persists on the
+                            // stack. (The backend's slot-assignment pass gives
+                            // every non-registered value a slot anyway, but we
+                            // also record it in the allocator's spill_slots map
+                            // to make the eviction self-contained and provably
+                            // sound under every interpretation.)
+                            if !self.spill_slots.contains_key(&evicted_vid) {
+                                self.allocate_spill_slot(evicted_vid);
+                            }
+                            self.assignments.insert(range.value_id, reg);
+                            self.occupy_register(reg, range.end + 1);
+                            if std::env::var("CCC_TRACE_ALLOCSTATS").is_ok() {
+                                eprintln!(
+                                    "[EVICT] val{} reg={} -> val{}[{}]",
+                                    evicted_vid, reg.0, range.value_id, range.start
+                                );
+                            }
+                            self.active[evict_idx] = ActiveInterval {
+                                range,
+                                next_use: None,
+                            };
+                            return;
+                        }
+                    }
+                }
+            }
             self.allocate_spill_slot(range.value_id);
         }
     }
@@ -337,6 +431,21 @@ impl LinearScanAllocator {
             self.allocate_range(range);
         }
     }
+}
+
+/// Return the first use point of `range` at or after `pos`.
+///
+/// If there is no such use (the value is live across `pos` but its recorded uses
+/// all precede `pos`), falls back to `range.end` (its last live point). This is
+/// used by the interval-splitting eviction heuristic to prefer spilling values
+/// that won't be needed again soon.
+fn next_use_after(range: &LiveRange, pos: u32) -> u32 {
+    range
+        .uses
+        .iter()
+        .copied()
+        .find(|&u| u >= pos)
+        .unwrap_or(range.end)
 }
 
 /// Helper to build live ranges from liveness analysis results.
@@ -369,7 +478,9 @@ pub fn build_live_ranges(
     let mut max_use_depth: FxHashMap<u32, u32> = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let bdepth = loop_depth.get(block_idx).copied().unwrap_or(0);
-        if bdepth == 0 { continue; } // Skip non-loop blocks (depth 0 can't increase max)
+        if bdepth == 0 {
+            continue;
+        } // Skip non-loop blocks (depth 0 can't increase max)
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
@@ -392,7 +503,8 @@ pub fn build_live_ranges(
             // Use the maximum of defining block depth and max use-site depth.
             // This ensures values defined outside loops but used inside them
             // get the correct inner-loop priority for register allocation.
-            let def_depth = def_block.get(&interval.value_id)
+            let def_depth = def_block
+                .get(&interval.value_id)
                 .and_then(|&bidx| loop_depth.get(bidx).copied())
                 .unwrap_or(0);
             let use_depth = max_use_depth.get(&interval.value_id).copied().unwrap_or(0);
@@ -407,6 +519,11 @@ pub fn build_live_ranges(
     // Find register hints from Copy sources
     let hints_map = find_register_hints(func);
 
+    // PGO-aware use weighting: exact block-entry counts bias allocation toward
+    // values used in hot loops, while an absent profile is exactly the old
+    // loop-depth heuristic. This changes priorities only, never intervals.
+    let pgo_point_weights = pgo_point_weights(func);
+
     // Update each range with actual uses and hints
     for range in &mut ranges {
         // Collect uses within this range's interval
@@ -418,9 +535,14 @@ pub fn build_live_ranges(
                 .collect();
         }
 
-        // Update priority based on actual use count
+        // Weight uses with a bounded profile factor; loop depth remains dominant.
         let loop_weight = 10u64.pow(range.loop_depth.min(4) as u32);
-        range.priority = (range.uses.len() as u64).max(1) * loop_weight;
+        let weighted_uses: u64 = range
+            .uses
+            .iter()
+            .map(|u| pgo_point_weights.get(u).copied().unwrap_or(1))
+            .sum();
+        range.priority = weighted_uses.max(1).saturating_mul(loop_weight);
 
         // Add register hint if available
         range.reg_hint = hints_map.get(&range.value_id).copied();
@@ -437,6 +559,44 @@ pub fn build_live_ranges(
     });
 
     ranges
+}
+
+/// Map program points to a bounded PGO hotness factor. Profile data is read
+/// after validation, and missing blocks intentionally receive neutral weight.
+fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
+    let mut out = FxHashMap::default();
+    // Exact, CFG-validated profile for this function in the active translation
+    // unit (never a name-suffix match: same-named statics in different TUs
+    // would otherwise bind the wrong profile).
+    let Some(fp) = crate::pgo::active_profile_for_function(func) else {
+        return out;
+    };
+    let max = fp.block_counts.values().copied().max().unwrap_or(0);
+    if max == 0 {
+        return out;
+    }
+    let max_factor = std::env::var("CCC_PGO_WEIGHT_MAX")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let span = max_factor - 1;
+    let mut point = 0u32;
+    for block in &func.blocks {
+        let count = fp.block_count(block.label);
+        let factor = if count == 0 {
+            1
+        } else {
+            1 + (count.saturating_mul(span) / max).min(span)
+        };
+        for _ in &block.instructions {
+            out.insert(point, factor);
+            point += 1;
+        }
+        out.insert(point, factor);
+        point += 1;
+    }
+    out
 }
 
 /// Collect all use points for each value ID in the function.
@@ -545,6 +705,11 @@ fn record_operand_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32,
         }
         Instruction::AtomicRmw { val, .. } => {
             if let Operand::Value(v) = val {
+                record(v.0);
+            }
+        }
+        Instruction::AtomicInc { ptr, .. } => {
+            if let Operand::Value(v) = ptr {
                 record(v.0);
             }
         }

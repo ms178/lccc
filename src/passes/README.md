@@ -5,10 +5,14 @@ pipeline. The pipeline transforms the compiler's intermediate representation (IR
 to produce better machine code by eliminating redundant computation, simplifying
 control flow, and replacing expensive operations with cheaper equivalents.
 
-All optimization levels (`-O0` through `-O3`, `-Os`, `-Oz`) run the same full set
-of passes. While the compiler is still maturing, having separate tiers creates
-hard-to-find bugs where code works at one level but breaks at another. We always
-run all passes to maximize test coverage of the optimizer and catch issues early.
+Optimization levels are tiered conservatively:
+
+- `-O0`: skip the optimization pipeline; only mandatory inline-asm symbol resolution runs.
+- `-O1`: mem2reg, constant folding, copy propagation, and DCE.
+- `-O2`: the default full scalar/interprocedural pipeline.
+- `-O3`: `-O2` plus code-size-increasing loop unrolling.
+- `-Os`: `-O2` with code-size-increasing transforms disabled.
+- `-Oz`: `-Os` with inlining disabled.
 
 ## Table of Contents
 

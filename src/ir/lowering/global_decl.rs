@@ -175,6 +175,9 @@ impl Lowerer {
     /// Handle global register variable. Returns true if handled (caller should continue).
     fn try_lower_register_global(&mut self, decl: &Declaration, declarator: &InitDeclarator) -> bool {
         let Some(ref reg_name) = declarator.attrs.asm_register else { return false };
+        if !crate::ir::lowering::lower::is_x86_register_name(reg_name) {
+            return false;
+        }
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
         let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
         if let Some(vs) = decl.resolve_vector_size(elem_size) {
@@ -348,8 +351,23 @@ impl Lowerer {
             && !da.is_array_of_pointers && !da.is_array_of_func_ptrs;
 
         self.emitted_global_names.insert(declarator.name.clone());
+        // Honour the declaration's asm label (`extern int x __asm("abccb"); int x = 1;`
+        // emits the definition as `abccb:`, matching GCC).
+        // __asm__("label") redirect on a variable DEFINITION: emit the global
+        // under the asm label (glibc configure alias test:
+        // `extern __typeof (dfoo) dfoo __asm ("abccb"); int dfoo = 1;` must
+        // define `abccb`, not `dfoo`). The label may come from an EARLIER
+        // declaration of the same symbol (collected in asm_label_map), or
+        // directly on this declarator; real register names pin globals and
+        // are never used as rename targets.
+        let emit_name = self.asm_label_map
+            .get(&declarator.name)
+            .cloned()
+            .or_else(|| declarator.attrs.asm_register.clone())
+            .filter(|n| !crate::ir::lowering::lower::is_x86_register_name(n))
+            .unwrap_or_else(|| declarator.name.clone());
         self.module.globals.push(IrGlobal {
-            name: declarator.name.clone(),
+            name: emit_name,
             ty: global_ty,
             size: final_size,
             align,

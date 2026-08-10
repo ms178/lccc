@@ -189,6 +189,7 @@ impl Lowerer {
             TypeSpecifier::Float => IrType::F32,
             TypeSpecifier::Double => IrType::F64,
             TypeSpecifier::LongDouble => IrType::F128,
+            TypeSpecifier::Float128 => IrType::U128,
             TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble => IrType::Ptr,
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
@@ -258,6 +259,8 @@ impl Lowerer {
             TypeSpecifier::LongDouble => {
                 if ptr_sz == 4 { Some((12, 4)) } else { Some((16, 16)) }
             }
+            // _Float128 (IEEE binary128): 16 bytes, 16-byte aligned (LP64).
+            TypeSpecifier::Float128 => Some((16, 16)),
             TypeSpecifier::ComplexFloat => Some((8, 4)),
             TypeSpecifier::ComplexDouble => {
                 let align = if ptr_sz == 4 { 4 } else { 8 };

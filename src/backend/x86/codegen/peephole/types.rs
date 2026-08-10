@@ -168,7 +168,14 @@ impl LineInfo {
     pub(super) fn is_barrier(self) -> bool {
         matches!(self.kind,
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive)
+            LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
+            // ms178: push/pop (incl. pushfq/popfq with REG_NONE) read/write the
+            // stack and adjust %rsp. Treating them as barriers keeps every
+            // offset-tracking pass sound in their presence. The codegen keeps
+            // logical slot offsets consistent across pushfq/popfq, but the
+            // barrier only costs a little optimization locality, never
+            // correctness.
+            LineKind::Push { .. } | LineKind::Pop { .. })
     }
     #[inline]
     pub(super) fn is_push(self) -> bool { matches!(self.kind, LineKind::Push { .. }) }
@@ -193,6 +200,27 @@ impl LineInfo {
 #[inline]
 pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
     LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
+}
+
+/// Build a `LineInfo` for a `Cmp`/`test`/`ucomis` line, populating the
+/// memory-operand caches (`has_indirect_mem`, `rbp_offset`) that the other
+/// `line_info*` constructors fill for `Other` lines. Without these, a compare
+/// with a stack operand such as `cmpl 40(%rsp), %eax` would be invisible to the
+/// dead-store pass, which would then wrongly delete the store feeding it.
+#[inline]
+pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
+    let has_indirect = has_indirect_memory_access(s);
+    let rbp_off = if has_indirect { RBP_OFFSET_NONE } else { parse_rbp_offset(s) };
+    let reg_refs = scan_register_refs(sb);
+    LineInfo {
+        kind: LineKind::Cmp,
+        ext_kind: ExtKind::None,
+        trim_start: ts,
+        has_indirect_mem: has_indirect,
+        rbp_offset: rbp_off,
+        reg_refs,
+        pinned: false,
+    }
 }
 
 /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
@@ -323,7 +351,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         }
         // Compare: cmpX
         if sb.len() >= 5 && sb[1] == b'm' && sb[2] == b'p' {
-            return line_info_with_regs(LineKind::Cmp, ts, scan_register_refs(sb));
+            return cmp_line_info(ts, s, sb);
         }
         // cltq - classify as extension producer
         if s == "cltq" {
@@ -339,12 +367,12 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
 
     // Test instructions
     if first == b't' && sb.len() >= 5 && sb[1] == b'e' && sb[2] == b's' && sb[3] == b't' {
-        return line_info_with_regs(LineKind::Cmp, ts, scan_register_refs(sb));
+        return cmp_line_info(ts, s, sb);
     }
 
     // ucomis* instructions
     if first == b'u' && (s.starts_with("ucomisd ") || s.starts_with("ucomiss ")) {
-        return line_info_with_regs(LineKind::Cmp, ts, scan_register_refs(sb));
+        return cmp_line_info(ts, s, sb);
     }
 
     // Push / Pop (extract register for fast checks)
@@ -359,6 +387,22 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             let reg = register_family_fast(rest.trim());
             let rr = if reg <= REG_GP_MAX { 1u16 << reg } else { scan_register_refs(sb) };
             return line_info_with_regs(LineKind::Pop { reg }, ts, rr);
+        }
+        // ms178: pushfq/popfq (and 32-bit pushfl/popfl) are classified with
+        // REG_NONE so they are distinguishable from real register pushes.
+        // Codegen accounts for the %rsp shift by adjusting its logical frame
+        // offsets, so the peephole's slot offsets stay consistent across them;
+        // the passes treat them as barriers (see is_barrier) to be safe.
+        // Previously they fell through to `Other`, which made every pass that
+        // tracks stack offsets unsound in their presence — forcing Phase 2/3
+        // to be skipped globally whenever ANY function used a Select (the
+        // origin of pushfq), which disabled the whole global peephole for
+        // files like gzip's deflate.c.
+        if s.starts_with("pushf") || s.starts_with("pushfl") {
+            return line_info(LineKind::Push { reg: REG_NONE }, ts);
+        }
+        if s.starts_with("popf") || s.starts_with("popfl") {
+            return line_info(LineKind::Pop { reg: REG_NONE }, ts);
         }
     }
 
@@ -808,9 +852,20 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
         if bytes[i] == b'(' && i + 2 < len && bytes[i + 1] == b'%' {
             // Found "(%" - check if it's %rbp or %rsp (which are not indirect aliasing)
             let rest = &s[i + 2..];
-            if !rest.starts_with("rbp") && !rest.starts_with("rsp")
-                && !rest.starts_with("rip") {
+            let is_frame_base = rest.starts_with("rbp") || rest.starts_with("rsp");
+            if rest.starts_with("rip") {
+                // RIP-relative: a fixed global/rodata address, not a stack slot.
+            } else if !is_frame_base {
                 return true;
+            } else {
+                // (%rsp,...) / (%rbp,...): INDEXED addressing computes the slot
+                // at runtime, so no text-level offset can describe it. Treat it
+                // as indirect; a missed marker here let dead-store elimination
+                // drop stores read through an index.
+                let after_base = &rest[3..];
+                if !after_base.starts_with(')') {
+                    return true;
+                }
             }
         }
         i += 1;

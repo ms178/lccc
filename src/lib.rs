@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![allow(dead_code, unused_variables, unused_mut, unused_assignments, unused_imports, unreachable_code)]
 
 pub(crate) mod common;
 pub(crate) mod frontend;
@@ -6,6 +7,7 @@ pub(crate) mod ir;
 pub(crate) mod passes;
 pub mod backend;
 pub mod driver;
+pub(crate) mod pgo;
 
 /// Shared entry point for all compiler binaries. Spawns the real work on a
 /// thread with a large stack so deeply recursive C files don't overflow.

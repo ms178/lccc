@@ -437,6 +437,16 @@ impl X86Codegen {
                 }
                 return;
             }
+            if let Operand::Const(IrConst::I128(c)) = val {
+                // _Float128 constant as a 16-byte bit pattern (huge_valf128 etc.).
+                let bytes = (*c as u128).to_le_bytes();
+                let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                    self.emit_f128_store_raw_bytes(&addr, ptr.0, 0, lo, hi);
+                }
+                return;
+            }
             if let Operand::Value(v) = val {
                 if self.state.f128_direct_slots.contains(&v.0) {
                     if let Some(src_slot) = self.state.get_slot(v.0) {
@@ -542,6 +552,8 @@ impl X86Codegen {
                 }
                 out.newline();
                 self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
                 true
             }
             Some(SlotAddr::Indirect(slot)) => {
@@ -549,6 +561,8 @@ impl X86Codegen {
                 self.emit_load_ptr_from_slot_impl(slot, ptr.0);
                 self.state.emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm));
                 self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
                 true
             }
             _ => false, // OverAligned or no slot — fall back to default
@@ -581,8 +595,7 @@ impl X86Codegen {
                 if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
                     let load_instr = self.mov_load_for_value(ty, dest.0);
                     let p_name = phys_reg_name(p_reg);
-                    let use_32bit_dest = matches!(ty, IrType::U32 | IrType::F32)
-                        || (ty == IrType::I32 && load_instr == "movl");
+                    let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
 
                     // Check if dest has a register — load directly to it.
                     if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
@@ -607,20 +620,62 @@ impl X86Codegen {
             }
         }
 
+        // Accumulator-address load: a preceding GEP/Add often leaves the
+        // pointer in %rax and records it in the accumulator cache.  The legacy
+        // fallback immediately reloaded that same pointer into %rcx before the
+        // dereference, producing `lea/add -> mov %rax,%rcx -> load (%rcx)` in
+        // hot scalar loops.  x86 evaluates a memory address before writing the
+        // load destination, so `movX (%rax),%eax/%rax` is equivalent and avoids
+        // the relay.  This path is restricted to a verified cache hit and
+        // scalar integer/pointer loads; float and wide paths retain their
+        // dedicated ABI handling below.
+        if !ty.is_float()
+            && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
+            && !self.state.is_alloca(ptr.0)
+            && self.state.reg_cache.acc_has(ptr.0, false)
+        {
+            let load_instr = self.mov_load_for_value(ty, dest.0);
+            let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                if !is_xmm_reg(d_reg) {
+                    let d_name = if use_32bit_dest {
+                        phys_reg_name_32(d_reg)
+                    } else {
+                        phys_reg_name(d_reg)
+                    };
+                    self.state.emit_fmt(format_args!("    {} (%rax), %{}", load_instr, d_name));
+                    return;
+                }
+            }
+            let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
+            self.state.emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
+            self.state.reg_cache.set_acc(dest.0, false);
+            self.store_rax_to(dest);
+            return;
+        }
+
         // Register-direct load from alloca: when ptr is a stack-allocated local
         // variable and dest has a register, load directly to the register.
         // This bypasses the accumulator, saving one movq instruction.
+        // SOUNDNESS: over-aligned allocas reserve size+(align-1) bytes and the
+        // data lives at a RUNTIME-aligned address, not the slot base. A direct
+        // slot load reads up to align-1 bytes before the object (zlib-ng
+        // symptom: lanes[0] of an aligned(32) array loaded from the wrong
+        // offset, corrupting the AVX2 adler32 horizontal sum). Fall through to
+        // the default path, which materializes the aligned address.
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
-                if !is_xmm_reg(d_reg) && self.state.is_alloca(ptr.0) {
+                if !is_xmm_reg(d_reg) && self.state.is_alloca(ptr.0)
+                    && self.state.alloca_over_align(ptr.0).is_none() {
                     if let Some(slot) = self.state.get_slot(ptr.0) {
                         let load_instr = Self::mov_load_for_type(ty);
-                        // Match the dest register width to the load instruction:
-                        // movl → 32-bit dest (implicit zero-extend)
-                        // movslq/movsbq/movswq/movzbq/movzwq/movq → 64-bit dest
-                        let d_name = match ty {
-                            IrType::U32 | IrType::F32 => phys_reg_name_32(d_reg),
-                            _ => phys_reg_name(d_reg),
+                        // Match the destination width to the selected opcode.
+                        // movzbl/movzwl and movl write a 32-bit register; the
+                        // sign-extending forms and movq write a 64-bit register.
+                        let d_name = if matches!(load_instr, "movl" | "movzbl" | "movzwl") {
+                            phys_reg_name_32(d_reg)
+                        } else {
+                            phys_reg_name(d_reg)
                         };
                         let sr = self.slot_ref(slot.0);
                         self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, d_name));
@@ -690,6 +745,8 @@ impl X86Codegen {
                                 }
                                 out.newline();
                                 self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
                                 return;
                             }
                             Some(SlotAddr::Indirect(slot)) => {
@@ -708,6 +765,8 @@ impl X86Codegen {
                                     self.state.emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm32));
                                 }
                                 self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
                                 return;
                             }
                             _ => {} // fall through to default path
@@ -1026,6 +1085,8 @@ impl X86Codegen {
         self.state.emit("    addq $15, %rax");
         self.state.emit("    andq $-16, %rax");
         self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_sub_sp_by_acc_impl(&mut self) {
@@ -1035,17 +1096,23 @@ impl X86Codegen {
     pub(super) fn emit_mov_sp_to_acc_impl(&mut self) {
         self.state.emit("    movq %rsp, %rax");
         self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_mov_acc_to_sp_impl(&mut self) {
         self.state.emit("    movq %rax, %rsp");
         self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_align_acc_impl(&mut self, align: usize) {
         self.state.out.emit_instr_imm_reg("    addq", (align - 1) as i64, "rax");
         self.state.out.emit_instr_imm_reg("    andq", -(align as i64), "rax");
         self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
     }
 
     pub(super) fn emit_memcpy_load_dest_addr_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
@@ -1099,9 +1166,79 @@ impl X86Codegen {
         self.state.emit("    movq %rcx, %rsi");
     }
 
-    pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+    /// Inline a fixed-size `memcpy(dest, src, size)` call (from
+    /// `__builtin_memcpy` with a constant size). `dest`/`src` are generic
+    /// pointer operands; load them into rdi/rsi and run the fixed-size copy.
+    /// This turns the bundled SIMD headers' `__builtin_memcpy(&x, &y, 16)`
+    /// software fallbacks into a single movdqu pair instead of a libc call.
+    pub(super) fn emit_inline_memcpy_call_impl(&mut self, dest: &Operand, src: &Operand, size: usize) {
+        self.operand_to_reg(dest, "rdi");
+        self.operand_to_reg(src, "rsi");
+        self.emit_memcpy_impl_impl(size);
+    }
+
+    pub(super) fn emit_inline_memmove_call_impl(&mut self, dest: &Operand, src: &Operand, size: usize) {
+        self.operand_to_reg(dest, "rdi");
+        self.operand_to_reg(src, "rsi");
+        // memmove must handle overlapping ranges. With dst > src, a forward
+        // copy would read source bytes that were already overwritten, so the
+        // copy must run backward (DF=1). Direction flag is restored after.
+        let lbl = self.state.next_label_id();
+        let done = format!(".Lmmv_done_{}", lbl);
+        let bwd = format!(".Lmmv_bwd_{}", lbl);
+        self.state.emit("    cmpq %rsi, %rdi");
+        self.state.emit_fmt(format_args!("    je {}", done));   // same address: nothing to copy
+        self.state.emit_fmt(format_args!("    ja {}", bwd));    // dst > src: backward
         self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
         self.state.emit("    rep movsb");
+        self.state.emit_fmt(format_args!("    jmp {}", done));
+        self.state.emit_fmt(format_args!("{}:", bwd));
+        self.state.emit("    std");
+        self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
+        // rep movsb with DF=1 copies from high to low: source end -> dest end.
+        self.state.emit("    rep movsb");
+        self.state.emit("    cld");
+        self.state.emit_fmt(format_args!("{}:", done));
+    }
+
+    pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+        // ms178: small fixed-size copies use direct register moves instead of
+        // rep movsb (which costs a 3-cycle rep prefix + rcx setup + rdi/rsi
+        // clobbers). rdi/rsi already point at dest/src (set by the caller's
+        // emit_memcpy_load_dest_addr / emit_memcpy_load_src_addr), so a
+        // single movdqu/movq/movl round-trip is both smaller and faster, and
+        // only clobbers xmm0 (never rdi/rsi/rcx, which some surrounding
+        // codegen still needs).
+        match size {
+            32 => {
+                self.state.emit("    vmovdqu (%rsi), %ymm0");
+                self.state.emit("    vmovdqu %ymm0, (%rdi)");
+            }
+            16 => {
+                self.state.emit("    movdqu (%rsi), %xmm0");
+                self.state.emit("    movdqu %xmm0, (%rdi)");
+            }
+            8 => {
+                self.state.emit("    movq (%rsi), %rax");
+                self.state.emit("    movq %rax, (%rdi)");
+            }
+            4 => {
+                self.state.emit("    movl (%rsi), %eax");
+                self.state.emit("    movl %eax, (%rdi)");
+            }
+            2 => {
+                self.state.emit("    movw (%rsi), %ax");
+                self.state.emit("    movw %ax, (%rdi)");
+            }
+            1 => {
+                self.state.emit("    movb (%rsi), %al");
+                self.state.emit("    movb %al, (%rdi)");
+            }
+            _ => {
+                self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
+                self.state.emit("    rep movsb");
+            }
+        }
     }
 
     // ---- Segment-prefixed memory ops ----

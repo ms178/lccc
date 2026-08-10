@@ -19,7 +19,9 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::instruction::{BasicBlock, BlockId, CallInfo, Instruction, Operand, Terminator, Value};
+use crate::ir::instruction::{
+    BasicBlock, BlockId, CallInfo, Instruction, Operand, Terminator, Value,
+};
 use crate::ir::module::{IrFunction, IrModule, IrParam};
 
 /// Minimum number of switch cases to trigger outlining.
@@ -147,7 +149,8 @@ fn detect_end_block(func: &IrFunction, cases: &[(i64, BlockId)], default: BlockI
     }
 
     // The end block is the most-targeted block that is NOT a case entry.
-    target_counts.into_iter()
+    target_counts
+        .into_iter()
         .filter(|(bid, _)| !case_entries.contains(bid) && *bid != default)
         .max_by_key(|(_, count)| *count)
         .map(|(bid, _)| bid)
@@ -203,9 +206,7 @@ fn collect_case_blocks(
 
         // Check if this block escapes the case.
         let escapes = match &block.terminator {
-            Terminator::Branch(target) => {
-                !case_block_set.contains(target) && *target != end_block
-            }
+            Terminator::Branch(target) => !case_block_set.contains(target) && *target != end_block,
             _ => false,
         };
 
@@ -223,7 +224,10 @@ fn collect_case_blocks(
     let mut exit_blocks: Vec<BlockId> = Vec::new();
     let mut exit_set: FxHashSet<BlockId> = FxHashSet::default();
 
-    let check_target = |target: BlockId, exit_set: &mut FxHashSet<BlockId>, exit_blocks: &mut Vec<BlockId>| -> bool {
+    let check_target = |target: BlockId,
+                        exit_set: &mut FxHashSet<BlockId>,
+                        exit_blocks: &mut Vec<BlockId>|
+     -> bool {
         if target == end_block || case_block_set.contains(&target) {
             return true;
         }
@@ -248,7 +252,11 @@ fn collect_case_blocks(
                     return None;
                 }
             }
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 if !check_target(*true_label, &mut exit_set, &mut exit_blocks) {
                     return None;
                 }
@@ -307,7 +315,8 @@ fn find_external_values(
     }
 
     // Sort by value ID for deterministic ordering.
-    let mut externals: Vec<(Value, IrType)> = used_inside.into_iter()
+    let mut externals: Vec<(Value, IrType)> = used_inside
+        .into_iter()
         .map(|(id, ty)| (Value(id), ty))
         .collect();
     externals.sort_by_key(|(v, _)| v.0);
@@ -319,7 +328,9 @@ fn find_external_values(
 fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) {
     macro_rules! vop {
         ($op:expr, $ty:expr) => {
-            if let Operand::Value(v) = $op { f(*v, $ty); }
+            if let Operand::Value(v) = $op {
+                f(*v, $ty);
+            }
         };
     }
 
@@ -350,7 +361,9 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
                 vop!(arg, *ty);
             }
         }
-        Instruction::GetElementPtr { base, offset, ty, .. } => {
+        Instruction::GetElementPtr {
+            base, offset, ty, ..
+        } => {
             f(*base, IrType::Ptr);
             vop!(offset, *ty);
         }
@@ -364,7 +377,13 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
             f(*dest, IrType::Ptr);
             f(*src, IrType::Ptr);
         }
-        Instruction::Select { cond, true_val, false_val, ty, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ty,
+            ..
+        } => {
             vop!(cond, IrType::I32);
             vop!(true_val, *ty);
             vop!(false_val, *ty);
@@ -377,7 +396,11 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
         Instruction::VaArg { va_list_ptr, .. } => {
             f(*va_list_ptr, IrType::Ptr);
         }
-        Instruction::VaArgStruct { va_list_ptr, dest_ptr, .. } => {
+        Instruction::VaArgStruct {
+            va_list_ptr,
+            dest_ptr,
+            ..
+        } => {
             f(*va_list_ptr, IrType::Ptr);
             f(*dest_ptr, IrType::Ptr);
         }
@@ -387,7 +410,9 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
         Instruction::VaEnd { va_list_ptr, .. } => {
             f(*va_list_ptr, IrType::Ptr);
         }
-        Instruction::VaCopy { dest_ptr, src_ptr, .. } => {
+        Instruction::VaCopy {
+            dest_ptr, src_ptr, ..
+        } => {
             f(*dest_ptr, IrType::Ptr);
             f(*src_ptr, IrType::Ptr);
         }
@@ -395,7 +420,14 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
             vop!(ptr, IrType::Ptr);
             vop!(val, *ty);
         }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, ty, .. } => {
+        Instruction::AtomicInc { ptr, .. } => vop!(ptr, IrType::Ptr),
+        Instruction::AtomicCmpxchg {
+            ptr,
+            expected,
+            desired,
+            ty,
+            ..
+        } => {
             vop!(ptr, IrType::Ptr);
             vop!(expected, *ty);
             vop!(desired, *ty);
@@ -413,7 +445,9 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
         Instruction::StackRestore { ptr } => {
             f(*ptr, IrType::Ptr);
         }
-        Instruction::InlineAsm { inputs, outputs, .. } => {
+        Instruction::InlineAsm {
+            inputs, outputs, ..
+        } => {
             for (_, op, _) in inputs {
                 vop!(op, IrType::I64);
             }
@@ -485,7 +519,10 @@ fn outline_switch_cases(
         return 0;
     }
 
-    let block_map: FxHashMap<BlockId, usize> = func.blocks.iter().enumerate()
+    let block_map: FxHashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
         .map(|(i, b)| (b.label, i))
         .collect();
 
@@ -494,9 +531,8 @@ fn outline_switch_cases(
     let debug = std::env::var("CCC_DEBUG_OUTLINE").is_ok();
 
     for switch_info in &candidates {
-        let all_case_entries: FxHashSet<BlockId> = switch_info.cases.iter()
-            .map(|(_, bid)| *bid)
-            .collect();
+        let all_case_entries: FxHashSet<BlockId> =
+            switch_info.cases.iter().map(|(_, bid)| *bid).collect();
 
         if debug {
             eprintln!("[OUTLINE] function: {}, switch with {} cases, end_block: {:?}, global_max_block_id: {}",
@@ -515,10 +551,17 @@ fn outline_switch_cases(
         for &(case_value, case_entry) in &switch_info.cases {
             // Collect blocks belonging to this case.
             let (case_blocks, exit_blocks) = match collect_case_blocks(
-                func, case_entry, &all_case_entries, switch_info.end_block, &block_map,
+                func,
+                case_entry,
+                &all_case_entries,
+                switch_info.end_block,
+                &block_map,
             ) {
                 Some(result) => result,
-                None => { skip_block_collect += 1; continue; }
+                None => {
+                    skip_block_collect += 1;
+                    continue;
+                }
             };
 
             if case_blocks.is_empty() {
@@ -527,13 +570,18 @@ fn outline_switch_cases(
             }
 
             if debug {
-                eprintln!("[OUTLINE]   case {}: entry={:?}, blocks={:?}, ext_count={}",
-                    case_value, case_entry, case_blocks,
-                    find_external_values(func, &case_blocks, &block_map).len());
+                eprintln!(
+                    "[OUTLINE]   case {}: entry={:?}, blocks={:?}, ext_count={}",
+                    case_value,
+                    case_entry,
+                    case_blocks,
+                    find_external_values(func, &case_blocks, &block_map).len()
+                );
             }
 
             // Count instructions.
-            let instruction_count: usize = case_blocks.iter()
+            let instruction_count: usize = case_blocks
+                .iter()
                 .filter_map(|bid| block_map.get(bid))
                 .map(|&idx| func.blocks[idx].instructions.len())
                 .sum();
@@ -644,20 +692,29 @@ fn build_outlined_function(
     global_max_block_id: &mut u32,
 ) -> IrFunction {
     // Build a mapping from external Value IDs to parameter indices.
-    let value_to_param: FxHashMap<u32, usize> = case.external_values.iter().enumerate()
+    let value_to_param: FxHashMap<u32, usize> = case
+        .external_values
+        .iter()
+        .enumerate()
         .map(|(i, (v, _))| (v.0, i))
         .collect();
 
     // Allocate new block IDs for the outlined function.
     let block_offset = *global_max_block_id + 1;
-    let old_to_new_block: FxHashMap<BlockId, BlockId> = case.blocks.iter().enumerate()
+    let old_to_new_block: FxHashMap<BlockId, BlockId> = case
+        .blocks
+        .iter()
+        .enumerate()
         .map(|(i, &bid)| (bid, BlockId(block_offset + i as u32)))
         .collect();
     *global_max_block_id = block_offset + case.blocks.len() as u32;
 
     let debug = std::env::var("CCC_DEBUG_OUTLINE").is_ok();
     if debug {
-        eprintln!("[OUTLINE]   building {}: old_to_new = {:?}", name, old_to_new_block);
+        eprintln!(
+            "[OUTLINE]   building {}: old_to_new = {:?}",
+            name, old_to_new_block
+        );
     }
 
     // Compute value offset: outlined function's values start from 0, but we need
@@ -750,12 +807,8 @@ fn build_outlined_function(
 
         let mut new_instructions = Vec::with_capacity(orig_block.instructions.len());
         for inst in &orig_block.instructions {
-            let remapped = remap_instruction(
-                inst,
-                &value_to_param,
-                param_value_base,
-                &old_to_new_block,
-            );
+            let remapped =
+                remap_instruction(inst, &value_to_param, param_value_base, &old_to_new_block);
             new_instructions.push(remapped);
         }
 
@@ -781,13 +834,16 @@ fn build_outlined_function(
     outlined_blocks.extend(exit_ret_blocks);
 
     // Build parameter list.
-    let params: Vec<IrParam> = case.external_values.iter()
+    let params: Vec<IrParam> = case
+        .external_values
+        .iter()
         .map(|_| IrParam {
             ty: IrType::Ptr,
             struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
+            is_f128_sse: false,
         })
         .collect();
 
@@ -820,6 +876,7 @@ fn build_outlined_function(
         is_gnu_inline_def: false,
         global_init_label_blocks: Vec::new(),
         ret_eightbyte_classes: Vec::new(),
+        ret_is_f128_sse: false,
     }
 }
 
@@ -851,154 +908,305 @@ fn remap_instruction(
     };
 
     match inst {
-        Instruction::Alloca { dest, ty, size, align, volatile } => {
-            Instruction::Alloca { dest: *dest, ty: *ty, size: *size, align: *align, volatile: *volatile }
-        }
-        Instruction::DynAlloca { dest, size, align } => {
-            Instruction::DynAlloca { dest: *dest, size: remap_op(size), align: *align }
-        }
-        Instruction::Store { val, ptr, ty, seg_override } => {
-            Instruction::Store { val: remap_op(val), ptr: remap_val(*ptr), ty: *ty, seg_override: *seg_override }
-        }
-        Instruction::Load { dest, ptr, ty, seg_override } => {
-            Instruction::Load { dest: *dest, ptr: remap_val(*ptr), ty: *ty, seg_override: *seg_override }
-        }
-        Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-            Instruction::BinOp { dest: *dest, op: *op, lhs: remap_op(lhs), rhs: remap_op(rhs), ty: *ty }
-        }
-        Instruction::UnaryOp { dest, op, src, ty } => {
-            Instruction::UnaryOp { dest: *dest, op: *op, src: remap_op(src), ty: *ty }
-        }
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            Instruction::Cmp { dest: *dest, op: *op, lhs: remap_op(lhs), rhs: remap_op(rhs), ty: *ty }
-        }
-        Instruction::Call { func, info } => {
-            Instruction::Call {
-                func: func.clone(),
-                info: remap_call_info(info, &remap_op),
-            }
-        }
-        Instruction::CallIndirect { func_ptr, info } => {
-            Instruction::CallIndirect {
-                func_ptr: remap_op(func_ptr),
-                info: remap_call_info(info, &remap_op),
-            }
-        }
-        Instruction::GetElementPtr { dest, base, offset, ty } => {
-            Instruction::GetElementPtr { dest: *dest, base: remap_val(*base), offset: remap_op(offset), ty: *ty }
-        }
-        Instruction::Cast { dest, src, from_ty, to_ty } => {
-            Instruction::Cast { dest: *dest, src: remap_op(src), from_ty: *from_ty, to_ty: *to_ty }
-        }
-        Instruction::Copy { dest, src } => {
-            Instruction::Copy { dest: *dest, src: remap_op(src) }
-        }
-        Instruction::GlobalAddr { dest, name } => {
-            Instruction::GlobalAddr { dest: *dest, name: name.clone() }
-        }
-        Instruction::Memcpy { dest, src, size } => {
-            Instruction::Memcpy { dest: remap_val(*dest), src: remap_val(*src), size: *size }
-        }
-        Instruction::Select { dest, cond, true_val, false_val, ty } => {
-            Instruction::Select {
-                dest: *dest,
-                cond: remap_op(cond),
-                true_val: remap_op(true_val),
-                false_val: remap_op(false_val),
-                ty: *ty,
-            }
-        }
-        Instruction::Phi { dest, ty, incoming } => {
-            Instruction::Phi {
-                dest: *dest,
-                ty: *ty,
-                incoming: incoming.iter()
-                    .map(|(op, bid)| (remap_op(op), remap_bid(*bid)))
-                    .collect(),
-            }
-        }
-        Instruction::VaArg { dest, va_list_ptr, result_ty } => {
-            Instruction::VaArg { dest: *dest, va_list_ptr: remap_val(*va_list_ptr), result_ty: *result_ty }
-        }
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, size, eightbyte_classes } => {
-            Instruction::VaArgStruct {
-                dest_ptr: remap_val(*dest_ptr),
-                va_list_ptr: remap_val(*va_list_ptr),
-                size: *size,
-                eightbyte_classes: eightbyte_classes.clone(),
-            }
-        }
-        Instruction::VaStart { va_list_ptr } => {
-            Instruction::VaStart { va_list_ptr: remap_val(*va_list_ptr) }
-        }
-        Instruction::VaEnd { va_list_ptr } => {
-            Instruction::VaEnd { va_list_ptr: remap_val(*va_list_ptr) }
-        }
-        Instruction::VaCopy { dest_ptr, src_ptr } => {
-            Instruction::VaCopy { dest_ptr: remap_val(*dest_ptr), src_ptr: remap_val(*src_ptr) }
-        }
-        Instruction::AtomicRmw { dest, op, ptr, val, ty, ordering } => {
-            Instruction::AtomicRmw {
-                dest: *dest, op: *op, ptr: remap_op(ptr), val: remap_op(val), ty: *ty, ordering: *ordering,
-            }
-        }
-        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool } => {
-            Instruction::AtomicCmpxchg {
-                dest: *dest, ptr: remap_op(ptr), expected: remap_op(expected),
-                desired: remap_op(desired), ty: *ty,
-                success_ordering: *success_ordering, failure_ordering: *failure_ordering,
-                returns_bool: *returns_bool,
-            }
-        }
-        Instruction::AtomicLoad { dest, ptr, ty, ordering } => {
-            Instruction::AtomicLoad { dest: *dest, ptr: remap_op(ptr), ty: *ty, ordering: *ordering }
-        }
-        Instruction::AtomicStore { ptr, val, ty, ordering } => {
-            Instruction::AtomicStore { ptr: remap_op(ptr), val: remap_op(val), ty: *ty, ordering: *ordering }
-        }
-        Instruction::Fence { ordering } => {
-            Instruction::Fence { ordering: *ordering }
-        }
-        Instruction::LabelAddr { dest, label } => {
-            Instruction::LabelAddr { dest: *dest, label: remap_bid(*label) }
-        }
-        Instruction::InlineAsm { template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols, seg_overrides } => {
-            Instruction::InlineAsm {
-                template: template.clone(),
-                outputs: outputs.iter().map(|(c, v, n)| (c.clone(), remap_val(*v), n.clone())).collect(),
-                inputs: inputs.iter().map(|(c, op, n)| (c.clone(), remap_op(op), n.clone())).collect(),
-                clobbers: clobbers.clone(),
-                operand_types: operand_types.clone(),
-                goto_labels: goto_labels.iter().map(|(n, b)| (n.clone(), remap_bid(*b))).collect(),
-                input_symbols: input_symbols.clone(),
-                seg_overrides: seg_overrides.clone(),
-            }
-        }
-        Instruction::Intrinsic { dest, op, dest_ptr, args } => {
-            Instruction::Intrinsic {
-                dest: *dest, op: op.clone(),
-                dest_ptr: dest_ptr.map(|p| remap_val(p)),
-                args: args.iter().map(|a| remap_op(a)).collect(),
-            }
-        }
-        Instruction::StackSave { dest } => {
-            Instruction::StackSave { dest: *dest }
-        }
-        Instruction::StackRestore { ptr } => {
-            Instruction::StackRestore { ptr: remap_val(*ptr) }
-        }
-        Instruction::ParamRef { dest, param_idx, ty } => {
-            Instruction::ParamRef { dest: *dest, param_idx: *param_idx, ty: *ty }
-        }
-        Instruction::GetReturnF64Second { dest } => {
-            Instruction::GetReturnF64Second { dest: *dest }
-        }
+        Instruction::Alloca {
+            dest,
+            ty,
+            size,
+            align,
+            volatile,
+            semantic_volatile,
+        } => Instruction::Alloca {
+            dest: *dest,
+            ty: *ty,
+            size: *size,
+            align: *align,
+            volatile: *volatile,
+            semantic_volatile: *semantic_volatile,
+        },
+        Instruction::DynAlloca { dest, size, align } => Instruction::DynAlloca {
+            dest: *dest,
+            size: remap_op(size),
+            align: *align,
+        },
+        Instruction::Store {
+            val,
+            ptr,
+            ty,
+            seg_override,
+        } => Instruction::Store {
+            val: remap_op(val),
+            ptr: remap_val(*ptr),
+            ty: *ty,
+            seg_override: *seg_override,
+        },
+        Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            seg_override,
+        } => Instruction::Load {
+            dest: *dest,
+            ptr: remap_val(*ptr),
+            ty: *ty,
+            seg_override: *seg_override,
+        },
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => Instruction::BinOp {
+            dest: *dest,
+            op: *op,
+            lhs: remap_op(lhs),
+            rhs: remap_op(rhs),
+            ty: *ty,
+        },
+        Instruction::UnaryOp { dest, op, src, ty } => Instruction::UnaryOp {
+            dest: *dest,
+            op: *op,
+            src: remap_op(src),
+            ty: *ty,
+        },
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => Instruction::Cmp {
+            dest: *dest,
+            op: *op,
+            lhs: remap_op(lhs),
+            rhs: remap_op(rhs),
+            ty: *ty,
+        },
+        Instruction::Call { func, info } => Instruction::Call {
+            func: func.clone(),
+            info: remap_call_info(info, &remap_op),
+        },
+        Instruction::CallIndirect { func_ptr, info } => Instruction::CallIndirect {
+            func_ptr: remap_op(func_ptr),
+            info: remap_call_info(info, &remap_op),
+        },
+        Instruction::GetElementPtr {
+            dest,
+            base,
+            offset,
+            ty,
+        } => Instruction::GetElementPtr {
+            dest: *dest,
+            base: remap_val(*base),
+            offset: remap_op(offset),
+            ty: *ty,
+        },
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => Instruction::Cast {
+            dest: *dest,
+            src: remap_op(src),
+            from_ty: *from_ty,
+            to_ty: *to_ty,
+        },
+        Instruction::Copy { dest, src } => Instruction::Copy {
+            dest: *dest,
+            src: remap_op(src),
+        },
+        Instruction::GlobalAddr { dest, name } => Instruction::GlobalAddr {
+            dest: *dest,
+            name: name.clone(),
+        },
+        Instruction::Memcpy { dest, src, size } => Instruction::Memcpy {
+            dest: remap_val(*dest),
+            src: remap_val(*src),
+            size: *size,
+        },
+        Instruction::Select {
+            dest,
+            cond,
+            true_val,
+            false_val,
+            ty,
+        } => Instruction::Select {
+            dest: *dest,
+            cond: remap_op(cond),
+            true_val: remap_op(true_val),
+            false_val: remap_op(false_val),
+            ty: *ty,
+        },
+        Instruction::Phi { dest, ty, incoming } => Instruction::Phi {
+            dest: *dest,
+            ty: *ty,
+            incoming: incoming
+                .iter()
+                .map(|(op, bid)| (remap_op(op), remap_bid(*bid)))
+                .collect(),
+        },
+        Instruction::VaArg {
+            dest,
+            va_list_ptr,
+            result_ty,
+        } => Instruction::VaArg {
+            dest: *dest,
+            va_list_ptr: remap_val(*va_list_ptr),
+            result_ty: *result_ty,
+        },
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            size,
+            eightbyte_classes,
+        } => Instruction::VaArgStruct {
+            dest_ptr: remap_val(*dest_ptr),
+            va_list_ptr: remap_val(*va_list_ptr),
+            size: *size,
+            eightbyte_classes: eightbyte_classes.clone(),
+        },
+        Instruction::VaStart { va_list_ptr } => Instruction::VaStart {
+            va_list_ptr: remap_val(*va_list_ptr),
+        },
+        Instruction::VaEnd { va_list_ptr } => Instruction::VaEnd {
+            va_list_ptr: remap_val(*va_list_ptr),
+        },
+        Instruction::VaCopy { dest_ptr, src_ptr } => Instruction::VaCopy {
+            dest_ptr: remap_val(*dest_ptr),
+            src_ptr: remap_val(*src_ptr),
+        },
+        Instruction::AtomicRmw {
+            dest,
+            op,
+            ptr,
+            val,
+            ty,
+            ordering,
+        } => Instruction::AtomicRmw {
+            dest: *dest,
+            op: *op,
+            ptr: remap_op(ptr),
+            val: remap_op(val),
+            ty: *ty,
+            ordering: *ordering,
+        },
+        Instruction::AtomicInc {
+            ptr,
+            offset,
+            ty,
+            ordering,
+        } => Instruction::AtomicInc {
+            ptr: remap_op(ptr),
+            offset: *offset,
+            ty: *ty,
+            ordering: *ordering,
+        },
+        Instruction::AtomicCmpxchg {
+            dest,
+            ptr,
+            expected,
+            desired,
+            ty,
+            success_ordering,
+            failure_ordering,
+            returns_bool,
+        } => Instruction::AtomicCmpxchg {
+            dest: *dest,
+            ptr: remap_op(ptr),
+            expected: remap_op(expected),
+            desired: remap_op(desired),
+            ty: *ty,
+            success_ordering: *success_ordering,
+            failure_ordering: *failure_ordering,
+            returns_bool: *returns_bool,
+        },
+        Instruction::AtomicLoad {
+            dest,
+            ptr,
+            ty,
+            ordering,
+        } => Instruction::AtomicLoad {
+            dest: *dest,
+            ptr: remap_op(ptr),
+            ty: *ty,
+            ordering: *ordering,
+        },
+        Instruction::AtomicStore {
+            ptr,
+            val,
+            ty,
+            ordering,
+        } => Instruction::AtomicStore {
+            ptr: remap_op(ptr),
+            val: remap_op(val),
+            ty: *ty,
+            ordering: *ordering,
+        },
+        Instruction::Fence { ordering } => Instruction::Fence {
+            ordering: *ordering,
+        },
+        Instruction::LabelAddr { dest, label } => Instruction::LabelAddr {
+            dest: *dest,
+            label: remap_bid(*label),
+        },
+        Instruction::InlineAsm {
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+            seg_overrides,
+        } => Instruction::InlineAsm {
+            template: template.clone(),
+            outputs: outputs
+                .iter()
+                .map(|(c, v, n)| (c.clone(), remap_val(*v), n.clone()))
+                .collect(),
+            inputs: inputs
+                .iter()
+                .map(|(c, op, n)| (c.clone(), remap_op(op), n.clone()))
+                .collect(),
+            clobbers: clobbers.clone(),
+            operand_types: operand_types.clone(),
+            goto_labels: goto_labels
+                .iter()
+                .map(|(n, b)| (n.clone(), remap_bid(*b)))
+                .collect(),
+            input_symbols: input_symbols.clone(),
+            seg_overrides: seg_overrides.clone(),
+        },
+        Instruction::Intrinsic {
+            dest,
+            op,
+            dest_ptr,
+            args,
+        } => Instruction::Intrinsic {
+            dest: *dest,
+            op: op.clone(),
+            dest_ptr: dest_ptr.map(|p| remap_val(p)),
+            args: args.iter().map(|a| remap_op(a)).collect(),
+        },
+        Instruction::StackSave { dest } => Instruction::StackSave { dest: *dest },
+        Instruction::StackRestore { ptr } => Instruction::StackRestore {
+            ptr: remap_val(*ptr),
+        },
+        Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } => Instruction::ParamRef {
+            dest: *dest,
+            param_idx: *param_idx,
+            ty: *ty,
+        },
+        Instruction::GetReturnF64Second { dest } => Instruction::GetReturnF64Second { dest: *dest },
         Instruction::SetReturnF64Second { src } => {
             Instruction::SetReturnF64Second { src: remap_op(src) }
         }
-        Instruction::GetReturnF32Second { dest } => {
-            Instruction::GetReturnF32Second { dest: *dest }
-        }
+        Instruction::GetReturnF32Second { dest } => Instruction::GetReturnF32Second { dest: *dest },
         Instruction::SetReturnF32Second { src } => {
             Instruction::SetReturnF32Second { src: remap_op(src) }
         }
@@ -1024,9 +1232,11 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
         struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
+        struct_arg_is_f128_sse: Vec::new(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
+        ret_is_f128_sse: false,
     }
 }
 
@@ -1070,38 +1280,40 @@ fn remap_terminator(
     };
 
     match term {
-        Terminator::Branch(target) => {
-            Terminator::Branch(remap_bid(*target))
-        }
-        Terminator::CondBranch { cond, true_label, false_label } => {
-            Terminator::CondBranch {
-                cond: remap_op(cond),
-                true_label: remap_bid(*true_label),
-                false_label: remap_bid(*false_label),
-            }
-        }
+        Terminator::Branch(target) => Terminator::Branch(remap_bid(*target)),
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => Terminator::CondBranch {
+            cond: remap_op(cond),
+            true_label: remap_bid(*true_label),
+            false_label: remap_bid(*false_label),
+        },
         Terminator::Return(_op) => {
             // Parent function's return — outlined function returns 1 to signal this.
             // The return value itself should have been stored to an alloca that the
             // parent can read back. For now, just return 1.
-            Terminator::Return(Some(Operand::Const(
-                crate::ir::constants::IrConst::I32(1),
-            )))
+            Terminator::Return(Some(Operand::Const(crate::ir::constants::IrConst::I32(1))))
         }
-        Terminator::Switch { val, cases, default, ty } => {
-            Terminator::Switch {
-                val: remap_op(val),
-                cases: cases.iter().map(|(v, bid)| (*v, remap_bid(*bid))).collect(),
-                default: remap_bid(*default),
-                ty: *ty,
-            }
-        }
-        Terminator::IndirectBranch { target, possible_targets } => {
-            Terminator::IndirectBranch {
-                target: remap_op(target),
-                possible_targets: possible_targets.iter().map(|bid| remap_bid(*bid)).collect(),
-            }
-        }
+        Terminator::Switch {
+            val,
+            cases,
+            default,
+            ty,
+        } => Terminator::Switch {
+            val: remap_op(val),
+            cases: cases.iter().map(|(v, bid)| (*v, remap_bid(*bid))).collect(),
+            default: remap_bid(*default),
+            ty: *ty,
+        },
+        Terminator::IndirectBranch {
+            target,
+            possible_targets,
+        } => Terminator::IndirectBranch {
+            target: remap_op(target),
+            possible_targets: possible_targets.iter().map(|bid| remap_bid(*bid)).collect(),
+        },
         Terminator::Unreachable => Terminator::Unreachable,
     }
 }
@@ -1123,12 +1335,12 @@ fn replace_case_with_call(
     };
 
     // Build the call arguments: pass the external values directly.
-    let args: Vec<Operand> = case.external_values.iter()
+    let args: Vec<Operand> = case
+        .external_values
+        .iter()
         .map(|(v, _)| Operand::Value(*v))
         .collect();
-    let arg_types: Vec<IrType> = case.external_values.iter()
-        .map(|(_, ty)| *ty)
-        .collect();
+    let arg_types: Vec<IrType> = case.external_values.iter().map(|(_, ty)| *ty).collect();
     let num_args = args.len();
 
     let has_exits = !case.exit_blocks.is_empty() || case.has_return;
@@ -1161,9 +1373,11 @@ fn replace_case_with_call(
                 struct_arg_aligns: vec![None; num_args],
                 struct_arg_classes: vec![Vec::new(); num_args],
                 struct_arg_riscv_float_classes: vec![None; num_args],
+                struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
             },
         };
 
@@ -1200,9 +1414,11 @@ fn replace_case_with_call(
                 struct_arg_aligns: vec![None; num_args],
                 struct_arg_classes: vec![Vec::new(); num_args],
                 struct_arg_riscv_float_classes: vec![None; num_args],
+                struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
             },
         };
 

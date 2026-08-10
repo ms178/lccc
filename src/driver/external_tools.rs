@@ -345,9 +345,19 @@ impl Driver {
             } else {
                 dep_path.clone()
             };
-            let input_name = if input_file == "-" { "<stdin>" } else { input_file };
-            let content = format!("{}: {}\n", output_file, input_name);
-            let _ = std::fs::write(&dep_path, content);
+            // Prefer the -MT/-MQ target when given (glibc passes -MT $@).
+            let target = self.dep_target.as_deref().unwrap_or(output_file);
+            if input_file == "-" {
+                // Input came from stdin (glibc compiles syscall stubs with
+                // `-x assembler-with-cpp -`). GCC omits the stdin pseudo-source
+                // from the dependency rule; writing "<stdin>" here makes make
+                // fail with "No rule to make target '<stdin>'". Emit a bare
+                // "target:" rule (valid make syntax) plus no prerequisites.
+                let _ = std::fs::write(&dep_path, format!("{}:\n", target));
+            } else {
+                let content = format!("{}: {}\n", target, input_file);
+                let _ = std::fs::write(&dep_path, content);
+            }
         }
     }
 }

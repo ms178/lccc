@@ -15,6 +15,55 @@ use crate::backend::Target;
 use crate::common::error::ColorMode;
 
 impl Driver {
+    fn enable_x86_avx_profile(&mut self) {
+        self.no_sse=false; self.enable_avx=true; self.enable_sse4_2=true;
+        self.enable_sse4_1=true; self.enable_ssse3=true; self.enable_sse3=true;
+    }
+    fn enable_x86_avx2_profile(&mut self) { self.enable_x86_avx_profile(); self.enable_avx2=true; }
+    fn enable_x86_v3_profile(&mut self) {
+        self.enable_x86_avx2_profile(); self.enable_f16c=true; self.enable_fma=true;
+        self.enable_bmi=true; self.enable_bmi2=true; self.enable_lzcnt=true; self.enable_movbe=true;
+    }
+    fn enable_x86_haswell_profile(&mut self) {
+        self.enable_x86_v3_profile(); self.enable_aes=true; self.enable_pclmul=true; self.enable_rdrnd=true;
+    }
+    fn enable_x86_avx512_profile(&mut self) {
+        self.enable_x86_v3_profile(); self.enable_avx512f=true; self.enable_avx512cd=true;
+        self.enable_avx512dq=true; self.enable_avx512bw=true; self.enable_avx512vl=true;
+    }
+    fn enable_x86_avx512_cpu_profile(&mut self) {
+        self.enable_x86_avx512_profile(); self.enable_aes=true; self.enable_pclmul=true; self.enable_rdrnd=true;
+    }
+    fn enable_x86_cascadelake_profile(&mut self) { self.enable_x86_avx512_cpu_profile(); self.enable_avx512vnni=true; }
+    fn enable_x86_cooperlake_profile(&mut self) { self.enable_x86_cascadelake_profile(); self.enable_avx512bf16=true; }
+    fn enable_x86_icelake_profile(&mut self) {
+        self.enable_x86_cascadelake_profile(); self.enable_avx512ifma=true; self.enable_avx512vbmi=true;
+        self.enable_avx512vbmi2=true; self.enable_avx512bitalg=true; self.enable_avx512vpopcntdq=true;
+        self.enable_gfni=true; self.enable_vaes=true; self.enable_vpclmulqdq=true;
+    }
+    fn enable_x86_sapphirerapids_profile(&mut self) { self.enable_x86_icelake_profile(); self.enable_avx512bf16=true; self.enable_avx512fp16=true; }
+    fn enable_x86_knl_profile(&mut self) {
+        self.enable_x86_v3_profile(); self.enable_pclmul=true; self.enable_rdrnd=true;
+        self.enable_avx512f=true; self.enable_avx512cd=true; self.enable_avx512er=true; self.enable_avx512pf=true;
+    }
+    fn enable_x86_znver3_profile(&mut self) { self.enable_x86_haswell_profile(); self.enable_vaes=true; self.enable_vpclmulqdq=true; }
+    fn enable_x86_znver4_profile(&mut self) { self.enable_x86_icelake_profile(); self.enable_avx512bf16=true; }
+    fn enable_x86_znver5_profile(&mut self) { self.enable_x86_znver4_profile(); self.enable_avxvnni=true; self.enable_avx512vp2intersect=true; }
+    fn enable_x86_nehalem_profile(&mut self) { self.no_sse=false; self.enable_sse3=true; self.enable_ssse3=true; self.enable_sse4_1=true; self.enable_sse4_2=true; }
+    fn enable_x86_westmere_profile(&mut self) { self.enable_x86_nehalem_profile(); self.enable_aes=true; self.enable_pclmul=true; }
+    fn enable_x86_sandybridge_profile(&mut self) { self.enable_x86_westmere_profile(); self.enable_x86_avx_profile(); }
+    fn enable_x86_ivybridge_profile(&mut self) { self.enable_x86_sandybridge_profile(); self.enable_f16c=true; self.enable_rdrnd=true; }
+    fn enable_x86_silvermont_profile(&mut self) { self.enable_x86_nehalem_profile(); self.enable_pclmul=true; self.enable_movbe=true; self.enable_rdrnd=true; }
+    fn enable_x86_goldmont_profile(&mut self) { self.enable_x86_silvermont_profile(); self.enable_aes=true; }
+    fn enable_x86_alderlake_profile(&mut self) {
+        self.enable_x86_haswell_profile(); self.enable_avxvnni=true; self.enable_gfni=true;
+        self.enable_vaes=true; self.enable_vpclmulqdq=true;
+    }
+    fn enable_x86_arrowlake_profile(&mut self) {
+        self.enable_x86_alderlake_profile(); self.enable_avxifma=true; self.enable_avxneconvert=true;
+        self.enable_avxvnniint8=true; self.enable_cmpccxadd=true;
+    }
+
     /// Parse GCC-compatible command-line arguments and populate driver fields.
     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
@@ -75,6 +124,23 @@ impl Driver {
     /// Handle early-exit query flags (--dumpmachine, --version, etc.).
     /// Returns Ok(true) if a query flag was handled and the process should exit.
     fn handle_query_flags(args: &[String], target: &Target) -> Result<bool, String> {
+        // Capture --sysroot / -isysroot so -print-libgcc-file-name resolves
+        // against the sysroot when one is given (glibc cross-style builds).
+        let mut sysroot: Option<String> = None;
+        {
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                if let Some(v) = a.strip_prefix("--sysroot=") {
+                    if !v.is_empty() {
+                        sysroot = Some(v.to_string());
+                    }
+                } else if a == "--sysroot" || a == "-isysroot" {
+                    if let Some(v) = it.next() {
+                        sysroot = Some(v.clone());
+                    }
+                }
+            }
+        }
         for arg in &args[1..] {
             match arg.as_str() {
                 "-dumpmachine" => {
@@ -83,6 +149,123 @@ impl Driver {
                 }
                 "-dumpversion" => {
                     println!("14");
+                    return Ok(true);
+                }
+                "-print-libgcc-file-name" | "--print-libgcc-file-name" => {
+                    // GCC query used by configure scripts (e.g. glibc's "usable
+                    // compiler runtime library" probe) to decide between a
+                    // libgcc and a compiler-rt runtime. Probe the same GCC lib
+                    // directories the built-in linker searches; fall back to a
+                    // bare name (glibc only inspects the basename).
+                    let mut search_dirs: Vec<String> = Vec::new();
+                    if let Some(ref sroot) = sysroot {
+                        for triple_dir in [
+                            format!("{}/usr/lib/gcc/{}/", sroot, target.triple()),
+                            format!("{}/usr/lib/gcc/x86_64-pc-linux-gnu/", sroot),
+                        ] {
+                            if let Ok(rd) = std::fs::read_dir(&triple_dir) {
+                                let mut vers: Vec<String> = rd
+                                    .filter_map(|e| e.ok())
+                                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                                    .map(|e| e.file_name().to_string_lossy().to_string())
+                                    .filter(|n| n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                                    .collect();
+                                vers.sort();
+                                vers.reverse();
+                                for v in vers {
+                                    search_dirs.push(format!("{}{}/", triple_dir, v));
+                                }
+                            }
+                        }
+                        search_dirs.push(format!("{}/usr/lib/", sroot));
+                    }
+                    let triples = ["x86_64-linux-gnu", "x86_64-pc-linux-gnu",
+                                   "x86_64-redhat-linux", "x86_64-linux"];
+                    let mut printed = false;
+                    for dir in &search_dirs {
+                        let a = format!("{}libgcc.a", dir);
+                        let so = format!("{}libgcc_s.so", dir);
+                        if std::path::Path::new(&a).exists() || std::path::Path::new(&so).exists() {
+                            println!("{}", a);
+                            printed = true;
+                            break;
+                        }
+                    }
+                    for triple in triples {
+                        let dir = format!("/usr/lib/gcc/{}", triple);
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            let mut vers: Vec<String> = entries
+                                .filter_map(|e| e.ok())
+                                .filter_map(|e| e.file_name().into_string().ok())
+                                .filter(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                                .collect();
+                            vers.sort();
+                            for v in vers.iter().rev() {
+                                let a = format!("{}/{}/libgcc.a", dir, v);
+                                let s = format!("{}/{}/libgcc_s.so", dir, v);
+                                if std::path::Path::new(&a).exists()
+                                    || std::path::Path::new(&s).exists()
+                                {
+                                    println!("{}", a);
+                                    printed = true;
+                                    break;
+                                }
+                            }
+                            if printed { break; }
+                        }
+                    }
+                    if !printed {
+                        println!("libgcc.a");
+                    }
+                    return Ok(true);
+                }
+                _ if arg.starts_with("-print-file-name=") || arg.starts_with("--print-file-name=") => {
+                    // glibc link rules: `${CC} --print-file-name=crtbeginS.o`.
+                    let name = arg.trim_start_matches('-').trim_start_matches('-');
+                    let name = name.strip_prefix("print-file-name=").unwrap_or(name);
+                    if name == "include" {
+                        if let Some(bundled) = crate::frontend::preprocessor::Preprocessor::bundled_include_dir() {
+                            println!("{}", bundled.display());
+                            return Ok(true);
+                        }
+                    }
+                    let mut search_dirs: Vec<String> = Vec::new();
+                    if let Some(ref sroot) = sysroot {
+                        for gcc_triple in ["x86_64-pc-linux-gnu", target.triple()] {
+                            let base = format!("{}/usr/lib/gcc/{}/", sroot, gcc_triple);
+                            search_dirs.push(base.clone());
+                            if let Ok(rd) = std::fs::read_dir(&base) {
+                                let mut vers: Vec<String> = rd
+                                    .filter_map(|e| e.ok())
+                                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                                    .map(|e| e.file_name().to_string_lossy().to_string())
+                                    .filter(|n| n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                                    .collect();
+                                vers.sort();
+                                vers.reverse();
+                                for v in vers {
+                                    search_dirs.push(format!("{}{}/", base, v));
+                                }
+                            }
+                        }
+                        search_dirs.push(format!("{}/usr/lib/", sroot));
+                    }
+                    let triple = target.triple();
+                    search_dirs.push(format!("/usr/lib/gcc/{}/13/", triple));
+                    search_dirs.push(format!("/usr/lib/{}/", triple));
+                    search_dirs.push("/usr/lib/".to_string());
+                    let mut found = false;
+                    for dir in &search_dirs {
+                        let path = format!("{}{}", dir, name);
+                        if std::path::Path::new(&path).exists() {
+                            println!("{}", path);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        println!("{}", name);
+                    }
                     return Ok(true);
                 }
                 "--version" => {
@@ -113,10 +296,21 @@ impl Driver {
                 }
                 "-v" if args.len() == 2 => {
                     println!("lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0");
+                    // GCC-style line so configure scripts that grep `-v` output
+                    // for "gcc" (e.g. zlib-ng's compiler detection) classify the
+                    // driver as GCC-compatible and enable the -fPIC/-std paths.
+                    println!("gcc version 14.2.0 (lccc)");
                     println!("Target: {}", target.triple());
                     return Ok(true);
                 }
-                "-print-search-dirs" => {
+                "-print-multi-directory" | "--print-multi-directory" => {
+                    // GCC query returning the compiler's multilib directory.
+                    // glibc's configure reads `multidir` from this; an empty
+                    // answer makes its csu rules mis-expand (`; ; ln -s .`).
+                    println!(".");
+                    return Ok(true);
+                }
+                "-print-search-dirs" | "--print-search-dirs" => {
                     println!("install: /usr/lib/gcc/{}/13/", target.triple());
                     println!("programs: /usr/bin/");
                     println!("libraries: {}", target.implicit_library_paths());
@@ -252,32 +446,40 @@ impl Driver {
                 "-P" => self.suppress_line_markers = true,
                 "-dM" => self.dump_defines = true,
 
-                // Optimization levels
-                //
-                // IMPORTANT: All optimization levels internally use the same pipeline
-                // (opt_level=2). This is intentional — see the comment in passes/mod.rs
-                // for the full rationale. In short: having multiple optimization tiers
-                // is exponentially harder to test, and while the compiler is maturing,
-                // running all passes at every level maximizes test coverage and prevents
-                // hard-to-find bugs that only surface at specific tiers.
-                //
-                // The `optimize` and `optimize_size` booleans only control predefined
-                // macros (__OPTIMIZE__, __OPTIMIZE_SIZE__), which build systems like
-                // the Linux kernel rely on.
+                // Optimization levels.  Numeric values are interpreted by
+                // passes::run_passes(): 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
                 "-O0" => {
-                    self.opt_level = 2; // internally always optimize
+                    self.opt_level = 0;
                     self.optimize = false;
                     self.optimize_size = false;
                     self.omit_frame_pointer = false;
                 }
-                "-O" | "-O1" | "-O2" | "-O3" => {
+                "-O" | "-O1" => {
+                    self.opt_level = 1;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-O2" => {
                     self.opt_level = 2;
                     self.optimize = true;
                     self.optimize_size = false;
                     self.omit_frame_pointer = true;
                 }
-                "-Os" | "-Oz" => {
-                    self.opt_level = 2;
+                "-O3" => {
+                    self.opt_level = 3;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-Os" => {
+                    self.opt_level = 4;
+                    self.optimize = true;
+                    self.optimize_size = true;
+                    self.omit_frame_pointer = true;
+                }
+                "-Oz" => {
+                    self.opt_level = 5;
                     self.optimize = true;
                     self.optimize_size = true;
                     self.omit_frame_pointer = true;
@@ -311,6 +513,19 @@ impl Driver {
                     if i < args.len() {
                         self.linker_ordered_items.push(format!("-Wl,{}", args[i]));
                     }
+                }
+
+                // Linker entry point: -e SYMBOL / -eSYMBOL (glibc links libc.so
+                // with `-e __libc_main`). Without this the symbol is treated as
+                // an input file and the link fails.
+                "-e" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.linker_ordered_items.push(format!("-Wl,-e,{}", args[i]));
+                    }
+                }
+                arg if arg.len() > 2 && arg.starts_with("-e") && !arg.starts_with("-E") => {
+                    self.linker_ordered_items.push(format!("-Wl,-e,{}", &arg[2..]));
                 }
 
                 // Assembler pass-through: -Wa,flag1,flag2,...
@@ -429,6 +644,12 @@ impl Driver {
 
                 // Standard version flag: -std=c99 disables GNU extensions,
                 // -std=gnu99 (or no flag) enables them.
+                arg if arg == "-fexceptions" => {
+                    self.exceptions = true;
+                }
+                arg if arg == "-fno-exceptions" => {
+                    self.exceptions = false;
+                }
                 arg if arg.starts_with("-std=") => {
                     let std_value = &arg[5..];
                     // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.
@@ -436,9 +657,12 @@ impl Driver {
                     self.gnu_extensions = std_value.starts_with("gnu");
                     // gnu89 and c89 use GNU inline semantics by default;
                     // gnu99+ and c99+ use C99 inline semantics.
-                    // Note: -fgnu89-inline can override this later on the command line.
-                    self.gnu89_inline = matches!(std_value, "gnu89" | "c89" | "gnu90" | "c90"
-                        | "iso9899:1990" | "iso9899:199409");
+                    // Note: an EXPLICIT -fgnu89-inline / -fno-gnu89-inline overrides
+                    // any -std= (matching GCC: -std= only sets the default model).
+                    if self.gnu89_inline_explicit.is_none() {
+                        self.gnu89_inline = matches!(std_value, "gnu89" | "c89" | "gnu90" | "c90"
+                            | "iso9899:1990" | "iso9899:199409");
+                    }
                 }
 
                 // Machine/target flags
@@ -459,22 +683,92 @@ impl Driver {
                         self.target = Target::I686;
                     }
                 }
-                "-mno-sse" | "-mno-sse2" | "-mno-mmx" | "-mno-sse3" | "-mno-ssse3"
-                | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" | "-mno-avx"
-                | "-mno-avx2" | "-mno-avx512f" | "-mno-3dnow" => {
-                    self.no_sse = true;
-                }
+                "-mno-sse" | "-mno-sse2" => self.no_sse = true,
+                "-mno-mmx" | "-mno-3dnow" => {}
+                "-mno-avx2" => { self.enable_avx2=false; self.enable_avxvnni=false; self.enable_avxvnniint8=false; self.enable_avxvnniint16=false; }
+                "-mno-avx" => { self.enable_avx=false; self.enable_avx2=false; self.enable_avxvnni=false; self.enable_vaes=false; self.enable_vpclmulqdq=false; }
+                "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => { self.enable_sse3=false; self.enable_ssse3=false; self.enable_sse4_1=false; self.enable_sse4_2=false; self.enable_avx=false; self.enable_avx2=false; }
                 // Positive SIMD feature flags: define corresponding macros.
                 // -mavx2 implies -mavx implies -msse4.2 implies -msse4.1 implies
                 // -mssse3 implies -msse3 (matching GCC's implication chain).
-                "-mavx2" => {
-                    self.enable_avx2 = true;
-                    self.enable_avx = true;
-                    self.enable_sse4_2 = true;
-                    self.enable_sse4_1 = true;
-                    self.enable_ssse3 = true;
-                    self.enable_sse3 = true;
-                }
+                "-maes" => self.enable_aes = true,
+                "-mpclmul" => self.enable_pclmul = true,
+                "-mf16c" => self.enable_f16c = true,
+                "-mfma" => self.enable_fma = true,
+                "-mbmi" => self.enable_bmi = true,
+                "-mbmi2" => self.enable_bmi2 = true,
+                "-mlzcnt" => self.enable_lzcnt = true,
+                "-mmovbe" => self.enable_movbe = true,
+                "-mrdrnd" => self.enable_rdrnd = true,
+                // AVX-512 / AVX10 feature flags (completeness; backend coverage
+                // is partial and runtime dispatch must verify the host).
+                "-mavx512f" => self.enable_avx512f = true,
+                "-mavx512cd" => self.enable_avx512cd = true,
+                "-mavx512dq" => self.enable_avx512dq = true,
+                "-mavx512bw" => self.enable_avx512bw = true,
+                "-mavx512vl" => self.enable_avx512vl = true,
+                "-mavx512ifma" => self.enable_avx512ifma = true,
+                "-mavx512vbmi" => self.enable_avx512vbmi = true,
+                "-mavx512vbmi2" => self.enable_avx512vbmi2 = true,
+                "-mavx512vnni" => self.enable_avx512vnni = true,
+                "-mavx512bitalg" => self.enable_avx512bitalg = true,
+                "-mavx512vpopcntdq" => self.enable_avx512vpopcntdq = true,
+                "-mavx512bf16" => self.enable_avx512bf16 = true,
+                "-mavx512fp16" => self.enable_avx512fp16 = true,
+                "-mavx512er" => self.enable_avx512er = true,
+                "-mavx512pf" => self.enable_avx512pf = true,
+                "-mavx512vp2intersect" => self.enable_avx512vp2intersect = true,
+                "-mavxvnni" => self.enable_avxvnni = true,
+                "-mavxifma" => self.enable_avxifma = true,
+                "-mavxneconvert" => self.enable_avxneconvert = true,
+                "-mavx10.1" | "-mavx10.1-256" | "-mavx10.1-512" | "-mavx10.2" | "-mavx10.2-256" | "-mavx10.2-512" => return Err("AVX10 code generation is not implemented".to_string()),
+                "-mgfni" => self.enable_gfni = true,
+                "-mavxvnniint8" => self.enable_avxvnniint8 = true,
+                "-mavxvnniint16" => self.enable_avxvnniint16 = true,
+                "-msha512" => self.enable_sha512 = true,
+                "-msm3" => self.enable_sm3 = true,
+                "-msm4" => self.enable_sm4 = true,
+                "-mmovrs" => self.enable_movrs = true,
+                "-muser_msr" => self.enable_user_msr = true,
+                "-mapxf" => return Err("APX code generation is not implemented".to_string()),
+                "-mamx-tile" => self.enable_amx_tile = true,
+                "-mamx-int8" => self.enable_amx_int8 = true,
+                "-mamx-bf16" => self.enable_amx_bf16 = true,
+                "-mcmpccxadd" => self.enable_cmpccxadd = true,
+                "-mno-avxvnniint8" => self.enable_avxvnniint8 = false,
+                "-mno-avxvnniint16" => self.enable_avxvnniint16 = false,
+                "-mno-sha512" => self.enable_sha512 = false,
+                "-mno-sm3" => self.enable_sm3 = false,
+                "-mno-sm4" => self.enable_sm4 = false,
+                "-mno-movrs" => self.enable_movrs = false,
+                "-mno-user_msr" => self.enable_user_msr = false,
+                "-mno-amx-tile" => self.enable_amx_tile = false,
+                "-mno-amx-int8" => self.enable_amx_int8 = false,
+                "-mno-amx-bf16" => self.enable_amx_bf16 = false,
+                "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
+                "-mvaes" => self.enable_vaes = true,
+                "-mvpclmulqdq" => self.enable_vpclmulqdq = true,
+                "-mno-aes" => self.enable_aes = false,
+                "-mno-pclmul" => self.enable_pclmul = false,
+                "-mno-f16c" => self.enable_f16c = false,
+                "-mno-fma" => self.enable_fma = false,
+                "-mno-bmi" => self.enable_bmi = false,
+                "-mno-bmi2" => self.enable_bmi2 = false,
+                "-mno-lzcnt" => self.enable_lzcnt = false,
+                "-mno-movbe" => self.enable_movbe = false,
+                "-mno-rdrnd" => self.enable_rdrnd = false,
+                "-mno-avx512f" => self.enable_avx512f = false,
+                "-mno-avx512cd" => self.enable_avx512cd = false,
+                "-mno-avx512dq" => self.enable_avx512dq = false,
+                "-mno-avx512bw" => self.enable_avx512bw = false,
+                "-mno-avx512vl" => self.enable_avx512vl = false,
+                "-mno-avx512vnni" => self.enable_avx512vnni = false,
+                "-mno-avx10.1" => self.enable_avx10_1 = false,
+                "-mno-avx10.2" => self.enable_avx10_2 = false,
+                "-mno-gfni" => self.enable_gfni = false,
+                "-mno-vaes" => self.enable_vaes = false,
+                "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
+                "-mavx2" => self.enable_x86_avx2_profile(),
                 "-mavx" => {
                     self.enable_avx = true;
                     self.enable_sse4_2 = true;
@@ -500,6 +794,11 @@ impl Driver {
                 "-msse3" => {
                     self.enable_sse3 = true;
                 }
+                // Baseline x86-64 ISA flags: accepted as no-ops (SSE2/MMX are
+                // always on for x86-64). Build systems (zlib-ng cmake, kernel
+                // Makefiles) probe with them before enabling SIMD sources.
+                "-msse2" | "-msse" | "-mmmx" => {}
+                "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mgeneral-regs-only" => self.general_regs_only = true,
                 "-mcmodel=kernel" => self.code_model_kernel = true,
                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany" | "-mcmodel=large" => {
@@ -509,7 +808,50 @@ impl Driver {
                     self.riscv_abi = Some(arg["-mabi=".len()..].to_string());
                 }
                 arg if arg.starts_with("-march=") => {
-                    self.riscv_march = Some(arg["-march=".len()..].to_string());
+                    let march = &arg["-march=".len()..];
+                    match self.target {
+                        Target::Riscv64 => self.riscv_march = Some(march.to_string()),
+                        Target::X86_64 | Target::I686 => match march {
+                            "x86-64" | "x86-64-v1" | "generic" => {}
+                            "nehalem" => self.enable_x86_nehalem_profile(),
+                            "westmere" => self.enable_x86_westmere_profile(),
+                            "sandybridge" => self.enable_x86_sandybridge_profile(),
+                            "ivybridge" => self.enable_x86_ivybridge_profile(),
+                            "silvermont" => self.enable_x86_silvermont_profile(),
+                            "goldmont" => self.enable_x86_goldmont_profile(),
+                            "x86-64-v2" => { self.enable_x86_nehalem_profile(); }
+                            "x86-64-v3" => self.enable_x86_v3_profile(),
+                            "haswell" | "broadwell" | "skylake" | "znver1" | "znver2" => self.enable_x86_haswell_profile(),
+                            "znver3" => self.enable_x86_znver3_profile(),
+                            "znver4" => self.enable_x86_znver4_profile(),
+                            "znver5" => self.enable_x86_znver5_profile(),
+                            "alderlake" | "raptorlake" | "raptor-lake" => self.enable_x86_alderlake_profile(),
+                            "arrowlake" => self.enable_x86_arrowlake_profile(),
+                            "arrowlake-s" | "lunarlake" | "wildcatlake" => { self.enable_x86_arrowlake_profile(); self.enable_avxvnniint16=true; }
+                            "x86-64-v4" => self.enable_x86_avx512_profile(),
+                            "skylake-avx512" => self.enable_x86_avx512_cpu_profile(),
+                            "cascadelake" => self.enable_x86_cascadelake_profile(),
+                            "cooperlake" => self.enable_x86_cooperlake_profile(),
+                            "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => self.enable_x86_icelake_profile(),
+                            "sapphirerapids" | "graniterapids" | "graniterapids-d" => self.enable_x86_sapphirerapids_profile(),
+                            "knl" => self.enable_x86_knl_profile(),
+                            "knm" => { self.enable_x86_knl_profile(); self.enable_avx512vpopcntdq=true; }
+                            "novalake" | "diamondrapids" => return Err(format!("-march={} requires unimplemented AVX10/APX lowering", march)),
+                            "native" => return Err("-march=native is rejected; pass an explicit profile".to_string()),
+                            _ => return Err(format!("unsupported x86 -march={}", march)),
+                        },
+                        _ => return Err(format!("-march={} is not implemented for target {}", march, self.target.triple())),
+                    }
+                }
+                arg if arg.starts_with("-mtune=") => {
+                    let tune = &arg["-mtune=".len()..];
+                    match self.target {
+                        Target::X86_64 | Target::I686 => match tune {
+                            "generic" | "raptorlake" | "raptor-lake" | "alderlake" | "haswell" | "broadwell" | "skylake" => self.x86_tune = Some(tune.to_string()),
+                            _ => return Err(format!("unsupported x86 -mtune={}; supported tune names are generic, haswell, broadwell, skylake, alderlake, and raptorlake", tune)),
+                        },
+                        _ => return Err(format!("-mtune={} is not implemented for target {}", tune, self.target.triple())),
+                    }
                 }
                 "-mlittle-endian" => {
                     // ARM64 target indicator: only arm64-gcc accepts -mlittle-endian.
@@ -524,7 +866,36 @@ impl Driver {
                     let n: u8 = arg["-mregparm=".len()..].parse().unwrap_or(0);
                     self.regparm = n.min(3);
                 }
-                arg if arg.starts_with("-m") => {}
+                arg if arg.starts_with("-m") => {
+                    return Err(format!("unsupported machine option {}; LCCC refuses to silently ignore target-affecting -m flags", arg));
+                }
+
+                // PGO flags (instrumented profiling)
+                "-fprofile-generate" => self.pgo_generate = Some(".".to_string()),
+                arg if arg.starts_with("-fprofile-generate=") => {
+                    let path = arg["-fprofile-generate=".len()..].to_string();
+                    self.pgo_generate = Some(if path.is_empty() { ".".to_string() } else { path });
+                }
+                "-fprofile-use" => self.pgo_use = Some(".".to_string()),
+                arg if arg.starts_with("-fprofile-use=") => {
+                    let path = arg["-fprofile-use=".len()..].to_string();
+                    self.pgo_use = Some(if path.is_empty() { ".".to_string() } else { path });
+                }
+                "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
+                "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
+                "-fbranch-probabilities" => self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string())),
+                arg if arg.starts_with("-fprofile-dir=") => {
+                    let path = arg["-fprofile-dir=".len()..].to_string();
+                    if self.pgo_generate.is_some() { self.pgo_generate = Some(path.clone()); }
+                    if self.pgo_use.is_some() { self.pgo_use = Some(path); }
+                }
+                "-fauto-profile" => self.pgo_use = Some(".".to_string()),
+                arg if arg.starts_with("-fauto-profile=") => {
+                    let path = arg["-fauto-profile=".len()..].to_string();
+                    self.pgo_use = Some(path);
+                }
+                "-fno-profile-arcs" | "-fno-test-coverage" | "-fno-branch-probabilities" | "-fno-auto-profile" => {},
+                arg if arg.starts_with("-fno-profile") => {},
 
                 // Feature flags
                 "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => self.pic = true,
@@ -549,8 +920,16 @@ impl Driver {
                 "-fno-data-sections" => self.data_sections = false,
                 "-fcommon" => self.fcommon = true,
                 "-fno-common" => self.fcommon = false,
-                "-fgnu89-inline" => self.gnu89_inline = true,
-                "-fno-gnu89-inline" => self.gnu89_inline = false,
+                "-fgnu89-inline" => {
+                    self.gnu89_inline = true;
+                    self.gnu89_inline_explicit = Some(true);
+                }
+                "-fno-gnu89-inline" => {
+                    self.gnu89_inline = false;
+                    self.gnu89_inline_explicit = Some(false);
+                }
+                "-fexceptions" => self.exceptions = true,
+                "-fno-exceptions" => self.exceptions = false,
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}
                 "-fdiagnostics-color" | "-fcolor-diagnostics" => {
                     self.color_mode = ColorMode::Always;

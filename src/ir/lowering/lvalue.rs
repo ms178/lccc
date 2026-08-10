@@ -56,9 +56,13 @@ impl Lowerer {
                         return None;
                     }
                     let addr_space = ginfo.address_space;
-                    // Global variable: emit GlobalAddr to get its address
+                    // Global variable: emit GlobalAddr to get its address.
+                    // Apply __asm__("label") redirect (glibc hidden_proto data:
+                    // `extern const char x[] __asm__("__GI_x")` — &x must be
+                    // the address of __GI_x).
+                    let resolved_name = self.resolve_ref_name(name);
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
                     Some(LValue::Address(addr, addr_space))
                 } else {
                     None
@@ -316,8 +320,13 @@ impl Lowerer {
                     }
                 }
                 if let Some(ginfo) = self.globals.get(name).cloned() {
+                    // Apply __asm__("label") redirect (glibc hidden_proto data
+                    // arrays/pointers: `_dl_argv[0]` in rtld references
+                    // __GI__dl_argv; without this the ld.so link fails with
+                    // R_X86_64_PC32 against undefined `_dl_argv`).
+                    let resolved_name = self.resolve_ref_name(name);
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
+                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
                     let is_inline_data = ginfo.is_array || ginfo.c_type.as_ref().is_some_and(|ct| ct.is_vector());
                     if is_inline_data {
                         return Operand::Value(addr);

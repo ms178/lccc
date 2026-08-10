@@ -86,24 +86,17 @@ impl AsmOperand {
         Self { kind, reg: String::new(), reg_hi: String::new(), name, mem_addr: String::new(), mem_offset: 0, imm_value: None, imm_symbol: None, operand_type: IrType::I64, constraint: String::new(), seg_prefix: String::new() }
     }
 
-    /// Copy register assignment and addressing metadata from another operand.
-    /// Used for tied operands and "+" read-write propagation.
+    /// Copy register assignment and operand metadata from another operand.
+    /// Used for tied operands and `+` read-write propagation.
     pub fn copy_metadata_from(&mut self, source: &AsmOperand) {
+        self.kind = source.kind.clone();
         self.reg = source.reg.clone();
         self.reg_hi = source.reg_hi.clone();
         self.mem_addr = source.mem_addr.clone();
         self.mem_offset = source.mem_offset;
-        if matches!(source.kind, AsmOperandKind::Memory) {
-            self.kind = AsmOperandKind::Memory;
-        } else if matches!(source.kind, AsmOperandKind::Address) {
-            self.kind = AsmOperandKind::Address;
-        } else if matches!(source.kind, AsmOperandKind::FpReg) {
-            self.kind = AsmOperandKind::FpReg;
-        } else if matches!(source.kind, AsmOperandKind::X87St0) {
-            self.kind = AsmOperandKind::X87St0;
-        } else if matches!(source.kind, AsmOperandKind::X87St1) {
-            self.kind = AsmOperandKind::X87St1;
-        }
+        self.imm_value = source.imm_value;
+        self.imm_symbol = source.imm_symbol.clone();
+        self.seg_prefix = source.seg_prefix.clone();
     }
 }
 
@@ -317,6 +310,32 @@ pub fn constraint_needs_address(constraint: &str, is_riscv: bool, is_arm: bool) 
         }
     }
     false
+}
+
+/// Normalize an inline-asm clobber or explicit register name to its bare register token.
+///
+/// GCC-style inline asm commonly accepts any of these spellings in clobber lists:
+/// - `"rcx"`
+/// - `"%rcx"`
+/// - `"~{rcx}"`
+/// - `"{rcx}"`
+///
+/// Internally, scratch allocation and callee-saved scanning operate on bare
+/// register names (`rcx`, `r12`, `ebx`, ...). If `%`/`{}` wrappers are left in
+/// place, the allocator can accidentally assign a supposedly-clobbered register
+/// to an output or input operand. FFmpeg's CABAC inline asm uses `%rcx` clobbers
+/// through `"%" FF_REG_c`, so this normalization is correctness-critical.
+#[inline]
+pub fn normalize_inline_asm_reg_name(name: &str) -> &str {
+    let trimmed = name.trim();
+    let no_percent = trimmed.trim_start_matches('%');
+    if let Some(inner) = no_percent.strip_prefix("~{").and_then(|s| s.strip_suffix('}')) {
+        inner
+    } else if let Some(inner) = no_percent.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        inner
+    } else {
+        no_percent
+    }
 }
 
 /// Expand GCC dialect alternatives in an inline assembly template string.
@@ -638,10 +657,13 @@ fn collect_excluded_registers(
         .collect();
 
     for clobber in clobbers {
+        let clobber = normalize_inline_asm_reg_name(clobber);
         if clobber == "cc" || clobber == "memory" {
             continue;
         }
-        specific_regs.push(clobber.clone());
+        if !specific_regs.iter().any(|r| r == clobber) {
+            specific_regs.push(clobber.to_string());
+        }
         // ARM64: wN and xN are the same physical register
         if let Some(suffix) = clobber.strip_prefix('w') {
             if suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -680,8 +702,9 @@ fn collect_excluded_registers(
         }
         // x86-64: normalize sub-register names to 64-bit canonical form
         if let Some(canonical) = x86_normalize_reg_to_64bit(clobber) {
-            if *canonical != **clobber {
-                specific_regs.push(canonical.into_owned());
+            let canonical = canonical.into_owned();
+            if canonical != clobber && !specific_regs.iter().any(|r| r == &canonical) {
+                specific_regs.push(canonical);
             }
         }
     }
@@ -1066,6 +1089,50 @@ pub fn substitute_goto_labels(line: &str, goto_labels: &[(String, BlockId)], num
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_inline_asm_reg_name_strips_gcc_adornments() {
+        assert_eq!(normalize_inline_asm_reg_name("rcx"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name("%rcx"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name("~{rcx}"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name(" {r12} "), "r12");
+    }
+
+    #[test]
+    fn collect_excluded_registers_treats_percent_prefixed_clobbers_as_real_regs() {
+        let regs = collect_excluded_registers(&[], &["%rcx".to_string(), "memory".to_string()]);
+        assert!(regs.iter().any(|r| r == "rcx"));
+        assert!(!regs.iter().any(|r| r == "%rcx"));
+    }
+
+    #[test]
+    fn copy_metadata_from_preserves_tied_operand_class_and_immediates() {
+        let source = AsmOperand {
+            kind: AsmOperandKind::Immediate,
+            reg: "rcx".to_string(),
+            reg_hi: String::new(),
+            name: None,
+            mem_addr: String::new(),
+            mem_offset: 0,
+            imm_value: Some(7),
+            imm_symbol: Some("sym".to_string()),
+            operand_type: IrType::I64,
+            constraint: "i".to_string(),
+            seg_prefix: "%gs:".to_string(),
+        };
+        let mut dest = AsmOperand::new(AsmOperandKind::Tied(0), None);
+        dest.copy_metadata_from(&source);
+        assert!(matches!(dest.kind, AsmOperandKind::Immediate));
+        assert_eq!(dest.reg, "rcx");
+        assert_eq!(dest.imm_value, Some(7));
+        assert_eq!(dest.imm_symbol.as_deref(), Some("sym"));
+        assert_eq!(dest.seg_prefix, "%gs:");
+    }
 }
 
 /// Normalize an x86 register name to its 64-bit canonical form.

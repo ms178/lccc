@@ -9,9 +9,10 @@
 //! enabling backends to skip redundant stack loads. This is the foundation for
 //! eventually replacing the pure stack-slot model with a register allocator.
 
+use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use super::common::AsmOutput;
+use crate::ir::reexports::BlockId;
 
 /// Stack slot location for a value. Interpretation varies by arch:
 /// - x86: negative offset from %rbp
@@ -56,25 +57,39 @@ impl RegCache {
     /// Record that the accumulator now holds the given value.
     #[inline]
     pub fn set_acc(&mut self, value_id: u32, is_alloca: bool) {
-        self.acc = Some(RegCacheEntry { value_id, is_alloca });
+        self.acc = Some(RegCacheEntry {
+            value_id,
+            is_alloca,
+        });
     }
 
     /// Record that the secondary register now holds the given value.
     #[inline]
     pub fn set_sec(&mut self, value_id: u32, is_alloca: bool) {
-        self.sec = Some(RegCacheEntry { value_id, is_alloca });
+        self.sec = Some(RegCacheEntry {
+            value_id,
+            is_alloca,
+        });
     }
 
     /// Check if the accumulator holds the given value (with matching alloca status).
     #[inline]
     pub fn acc_has(&self, value_id: u32, is_alloca: bool) -> bool {
-        self.acc == Some(RegCacheEntry { value_id, is_alloca })
+        self.acc
+            == Some(RegCacheEntry {
+                value_id,
+                is_alloca,
+            })
     }
 
     /// Check if the secondary register holds the given value.
     #[inline]
     pub fn sec_has(&self, value_id: u32, is_alloca: bool) -> bool {
-        self.sec == Some(RegCacheEntry { value_id, is_alloca })
+        self.sec
+            == Some(RegCacheEntry {
+                value_id,
+                is_alloca,
+            })
     }
 
     /// Invalidate the accumulator cache.
@@ -105,9 +120,11 @@ pub struct CodegenState {
     pub value_locations: FxHashMap<u32, StackSlot>,
     /// Emergency spill slot offset, allocated downward from the bottom of the frame.
     /// Used when store_rax_to encounters a value with no register or stack slot.
-    pub emergency_spill_offset: i64,
     /// Values that are allocas (their stack slot IS the data, not a pointer to data).
     pub alloca_values: FxHashSet<u32>,
+    /// Direct allocas declared volatile in the source.  Their memory accesses
+    /// are observable and must be quarantined from text peephole rewrites.
+    pub volatile_alloca_values: FxHashSet<u32>,
     /// Type associated with each alloca (for type-aware loads/stores).
     pub alloca_types: FxHashMap<u32, IrType>,
     /// Alloca values that need runtime alignment > 16 bytes.
@@ -123,6 +140,55 @@ pub struct CodegenState {
     /// These should be addressed via leaq (to get stack slot address) instead of movq
     /// (which would load scalar bytes), because they hold 128/256-bit vector data.
     pub vector_values: FxHashSet<u32>,
+    /// Vector-register peephole: the stack slot offset that the last
+    /// `avx_store_dest`/`sse_store_dest` wrote from %ymm0/%xmm0, and whether
+    /// that register still provably holds the value. When the very next vector
+    /// operand load targets the same slot, the load is skipped and the register
+    /// is reused directly (kills the store→reload round-trip that the
+    /// slot-based vector codegen otherwise emits for every intrinsic result).
+    /// Cleared conservatively at every call/asm/atomic/memcpy emission (all of
+    /// which may clobber the vector register) and on any actual vector load.
+    pub vec_last_store_slot: Option<i64>,
+    /// The IR value that was stored to `vec_last_store_slot`. The peephole is
+    /// only sound when the subsequent load reads the SAME value: stack slots
+    /// are coalesced/reused across different values, so a slot match alone is
+    /// not enough (a store of A followed by a load of B from the same slot
+    /// must NOT reuse the register).
+    pub vec_last_store_val: Option<u32>,
+    pub vec_last_store_reg: bool,
+    /// Which vector register provably holds `vec_last_store_val` (always
+    /// "ymm0" for the AVX path today; kept as a name so the loaders can rename
+    /// reg-to-reg without a memory round trip).
+    pub vec_last_store_reg_name: Option<&'static str>,
+    /// For 128-bit register peephole (xmm0 variant), same as above.
+    pub sse_last_store_slot: Option<i64>,
+    pub sse_last_store_val: Option<u32>,
+    pub sse_last_store_reg: bool,
+    /// Which xmm register provably holds `sse_last_store_val`. The pblendvb
+    /// handler stores its result from %xmm2; generalizing the tracking to all
+    /// source registers (not just xmm0) makes the reload-skip sound for those
+    /// results too (the "pblendvb xmm2" fix).
+    pub sse_last_store_reg_name: Option<&'static str>,
+    /// Values whose vector result store may be DEFERRED (skipped entirely):
+    /// computed by the v5 IR analysis (`compute_vector_defer_values`) — the
+    /// value's single use is as args[0]/args[1] of the immediately-following
+    /// intrinsic, so the register it was computed in is the only home it ever
+    /// needs. When the store is skipped the value stays in the register and
+    /// the consumer's load becomes a no-op (accumulator renaming).
+    pub vector_defer_values: FxHashSet<u32>,
+    /// Lazy-flush half of the v5 deferred-store mechanism: a skipped vector
+    /// result store is kept PENDING here (value id, holding register, 256-bit
+    /// flag) instead of being dropped. If the consumer really receives the
+    /// value through the last-store cache, the entry is silently discarded
+    /// (pure win: no store ever emitted). Otherwise the store is flushed just
+    /// before anything clobbers the holding register, reads the slot, or
+    /// leaves the block — so a deferred store can never be observed missing.
+    /// This makes deferred stores sound by construction, independent of the
+    /// IR analysis' adjacency precision.
+    pub pending_vec_store: Option<(u32, &'static str, bool)>,
+    /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
+    /// provably holds the vector data (128-bit vector register allocation).
+    pub vec_live_regs: FxHashMap<u32, &'static str>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
     /// Whether position-independent code (PIC) generation is enabled.
@@ -274,6 +340,9 @@ pub struct CodegenState {
     /// FP constants are emitted as .rodata entries and loaded via
     /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
     pub fp_const_pool: FxHashMap<u64, String>,
+    /// Label emitted immediately after the current block, if any. Used to
+    /// elide unconditional jumps on the hot fall-through path.
+    pub next_block_label: Option<BlockId>,
 }
 
 impl CodegenState {
@@ -282,13 +351,24 @@ impl CodegenState {
             out: AsmOutput::new(),
             stack_offset: 0,
             value_locations: FxHashMap::default(),
-            emergency_spill_offset: 0,
             alloca_values: FxHashSet::default(),
+            volatile_alloca_values: FxHashSet::default(),
             alloca_types: FxHashMap::default(),
             alloca_alignments: FxHashMap::default(),
             i128_values: FxHashSet::default(),
             wide_values: FxHashSet::default(),
             vector_values: FxHashSet::default(),
+            vec_last_store_slot: None,
+            vec_last_store_val: None,
+            vec_last_store_reg: false,
+            vec_last_store_reg_name: None,
+            sse_last_store_slot: None,
+            sse_last_store_val: None,
+            sse_last_store_reg: false,
+            sse_last_store_reg_name: None,
+            vector_defer_values: FxHashSet::default(),
+            pending_vec_store: None,
+            vec_live_regs: FxHashMap::default(),
             label_counter: 0,
             pic_mode: false,
             local_symbols: FxHashSet::default(),
@@ -329,6 +409,7 @@ impl CodegenState {
             emit_cfi: true,
             immediately_consumed: FxHashSet::default(),
             fp_const_pool: FxHashMap::default(),
+            next_block_label: None,
         }
     }
 
@@ -374,7 +455,8 @@ impl CodegenState {
         for (bits, label) in entries {
             self.out.emit(".align 8");
             self.out.emit_fmt(format_args!("{}:", label));
-            self.out.emit_fmt(format_args!("    .quad {}", *bits as i64));
+            self.out
+                .emit_fmt(format_args!("    .quad {}", *bits as i64));
         }
     }
 
@@ -413,6 +495,7 @@ impl CodegenState {
         self.stack_offset = 0;
         self.value_locations.clear();
         self.alloca_values.clear();
+        self.volatile_alloca_values.clear();
         self.alloca_types.clear();
         self.alloca_alignments.clear();
         self.i128_values.clear();
@@ -427,7 +510,31 @@ impl CodegenState {
         self.reg_assigned_values.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();
+        self.vec_last_store_slot = None;
+        self.vec_last_store_val = None;
+        self.vec_last_store_reg = false;
+        self.vec_last_store_reg_name = None;
+        self.sse_last_store_slot = None;
+        self.sse_last_store_val = None;
+        self.sse_last_store_reg = false;
+        self.sse_last_store_reg_name = None;
         self.uses_sret = false;
+        self.next_block_label = None;
+    }
+
+    /// Invalidate the vector-register peephole state. Called at every emission
+    /// that may clobber %ymm0/%xmm0 or break straight-line guarantees: calls,
+    /// inline asm, atomics, memcpy, and block boundaries.
+    pub fn invalidate_vec_peephole(&mut self) {
+        self.vec_last_store_slot = None;
+        self.vec_last_store_val = None;
+        self.vec_last_store_reg = false;
+        self.vec_last_store_reg_name = None;
+        self.sse_last_store_slot = None;
+        self.sse_last_store_val = None;
+        self.sse_last_store_reg = false;
+        self.sse_last_store_reg_name = None;
+        self.vec_live_regs.clear();
     }
 
     /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.
@@ -450,40 +557,32 @@ impl CodegenState {
         self.value_locations.get(&v).copied()
     }
 
-    /// Allocate an emergency spill slot for a value that has no register or
-    /// stack slot. Uses the red zone below the frame (extending the stack
-    /// offset downward). The slot is registered in value_locations so
-    /// subsequent reads can find it.
-    pub fn allocate_emergency_slot(&mut self, val_id: u32) -> StackSlot {
-        self.emergency_spill_offset -= 8;
-        let slot = StackSlot(self.stack_offset + self.emergency_spill_offset);
-        // Check for collision with existing slots
-        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            for (&existing_id, &existing_slot) in &self.value_locations {
-                if existing_slot.0 == slot.0 && existing_id != val_id {
-                    eprintln!("[SLOT-COLLISION] Emergency slot for val{} at offset {} collides with val{}",
-                        val_id, slot.0, existing_id);
-                }
-            }
-        }
-        self.value_locations.insert(val_id, slot);
-        slot
-    }
-
     pub fn is_i128_value(&self, v: u32) -> bool {
         self.i128_values.contains(&v)
     }
 
     /// Check if a value uses a 4-byte (small) stack slot.
     /// Used by store/load paths to emit 4-byte instructions instead of 8-byte.
-    /// Currently infrastructure-only: backends don't use this yet because
-    /// store/load paths aren't fully type-safe (some always use 8-byte ops).
-    #[allow(dead_code)]
+    ///
+    /// RE-ENABLED (v1): the previous disable note claimed movl corrupts
+    /// signed I32 values flowing into 64-bit operations. That is solved by
+    /// type-aware loads: signed I32 values that are consumed in 64-bit
+    /// contexts (tracked by the needs-sext analysis) are loaded with
+    /// `movslq` (sign-extending), everything else ≤ 4 bytes is loaded with
+    /// `movl` (zero-extending). All load/store paths are now consistent
+    /// (slots are 8 bytes on x86-64, so a 4-byte access never corrupts a
+    /// neighbour; it only ever reads/writes the low 4 bytes of the slot).
     pub fn is_small_slot(&self, _v: u32) -> bool {
-        // Disabled: small-slot optimization uses movl (32-bit) for loads/stores,
-        // which zero-extends the upper 32 bits. This corrupts signed I32 values
-        // that flow into 64-bit operations through callee-saved registers.
-        // TODO: re-enable with proper signed/unsigned type tracking.
+        // Stores ALWAYS write 8 bytes (movq): a 4-byte store would leave the
+        // slot's upper half stale, and when the slot is REUSED across values
+        // of different types (a 32-bit value sharing a slot with a pointer),
+        // a later 64-bit memory read (`addq mem, %reg` / an ALU memory
+        // operand) would read the stale upper bytes — corrupting pointers
+        // and indices. Loads, in contrast, are width-typed by VALUE TYPE in
+        // value_to_reg (movb/movw/movl/movslq), which is consistent with
+        // both the 8-byte stores here and the type-aware generate_store
+        // (movb/movw/movl) — reading the low N bytes of an 8-byte store is
+        // always correct.
         false
     }
 
@@ -499,14 +598,16 @@ impl CodegenState {
     #[inline]
     pub fn track_f128_load(&mut self, dest_id: u32, source_id: u32, offset: i64) {
         let is_indirect = !self.is_alloca(source_id);
-        self.f128_load_sources.insert(dest_id, (source_id, offset, is_indirect));
+        self.f128_load_sources
+            .insert(dest_id, (source_id, offset, is_indirect));
     }
 
     /// Track that `value_id` has full F128 data stored directly in its own slot.
     /// (Used after operations like negation or cast that produce full-precision F128 results.)
     #[inline]
     pub fn track_f128_self(&mut self, value_id: u32) {
-        self.f128_load_sources.insert(value_id, (value_id, 0, false));
+        self.f128_load_sources
+            .insert(value_id, (value_id, 0, false));
     }
 
     /// Look up the F128 load source for a value: `(source_id, offset, is_indirect)`.
@@ -538,6 +639,13 @@ impl CodegenState {
             return false;
         }
         if name.starts_with('.') {
+            return false;
+        }
+        // Non-PIC executables use direct sym(%rip) + copy reloc (LCCC's own
+        // linker emits R_X86_64_COPY, like GCC's -fPIE); GOT is required only
+        // in -fPIC/-shared where copy relocs are illegal. Saves one load per
+        // global access and enables GlobalAddr+Load folding.
+        if !self.pic_mode {
             return false;
         }
         !self.local_symbols.contains(name)
@@ -597,6 +705,15 @@ impl CodegenState {
                 } else {
                     Some(SlotAddr::Direct(slot))
                 }
+            } else if self.i128_values.contains(&val_id)
+                || self.f128_direct_slots.contains(&val_id)
+            {
+                // 16-byte payload values (i128/U128/F128 bit patterns, x87
+                // bit-op results) live DIRECTLY in their slot — the slot is
+                // the data, not a pointer to it. Treat as Direct so memcpy
+                // and friends take the slot address instead of loading the
+                // first 8 payload bytes as a pointer (SEGV).
+                Some(SlotAddr::Direct(slot))
             } else {
                 Some(SlotAddr::Indirect(slot))
             }
@@ -610,4 +727,5 @@ impl CodegenState {
             None
         }
     }
+
 }

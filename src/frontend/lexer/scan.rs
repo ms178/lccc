@@ -248,8 +248,9 @@ impl Lexer {
         };
         let value = (int_val + frac_val) * (2.0_f64).powi(exp as i32);
 
-        // Check float suffix: f/F = float, l/L = long double
-        let float_kind = self.parse_simple_float_suffix();
+        // Check float suffix: full _FloatN set (f128/q/f16/f32/f64/f32x/f64x),
+        // same as the decimal path. glibc uses `0x1p-65f128` literals.
+        let (float_kind, _is_imaginary) = self.parse_float_suffix();
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         match float_kind {
             1 => Token::new(TokenKind::FloatLiteralF32(value), span),
@@ -257,6 +258,11 @@ impl Lexer {
                 let hex_text = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0x0p0");
                 let f128_bytes = crate::common::long_double::parse_long_double_to_f128_bytes(hex_text);
                 Token::new(TokenKind::FloatLiteralLongDouble(value, f128_bytes), span)
+            }
+            3 => {
+                let hex_text = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0x0p0");
+                let f128_bytes = crate::common::long_double::parse_long_double_to_f128_bytes(hex_text);
+                Token::new(TokenKind::FloatLiteralF128(value, f128_bytes), span)
             }
             _ => Token::new(TokenKind::FloatLiteral(value), span),
         }
@@ -374,16 +380,50 @@ impl Lexer {
     }
 
     /// Parse float suffix with imaginary support (GCC extension).
-    /// Returns (float_kind, is_imaginary) where float_kind: 0=double, 1=float, 2=long double.
+    /// Returns (float_kind, is_imaginary) where float_kind:
+    ///   0=double, 1=float, 2=long double, 3=_Float128 (binary128).
+    /// Supports the GCC 7+ _FloatN suffixes: f16/f32/f64/f32x/f64x/f128/f128x
+    /// (mapped to the x86-64 type of the same format) and q/Q for _Float128.
     fn parse_float_suffix(&mut self) -> (u8, bool) {
         let mut is_imaginary = false;
         let float_kind = if self.pos < self.input.len() && (self.input[self.pos] == b'f' || self.input[self.pos] == b'F') {
+            self.pos += 1;
+            let mut kind = 1u8;
+            let start = self.pos;
+            while self.pos < self.input.len()
+                && (self.input[self.pos].is_ascii_digit()
+                    || self.input[self.pos] == b'x'
+                    || self.input[self.pos] == b'X')
+            {
+                self.pos += 1;
+            }
+            let suffix = &self.input[start..self.pos];
+            if !suffix.is_empty() {
+                let suf = String::from_utf8_lossy(suffix).to_ascii_lowercase();
+                kind = match suf.as_str() {
+                    "16" => 1,
+                    "32" => 1,
+                    "64" => 0,
+                    "32x" => 0,
+                    "64x" => 2,
+                    "128" => 3,
+                    "128x" => 3,
+                    _ => 1,
+                };
+            }
+            if self.pos < self.input.len() && (self.input[self.pos] == b'i' || self.input[self.pos] == b'I') {
+                self.pos += 1;
+                is_imaginary = true;
+            }
+            kind
+        } else if self.pos < self.input.len() && (self.input[self.pos] == b'q' || self.input[self.pos] == b'Q') {
+            // __float128 / _Float128 GNU suffix
             self.pos += 1;
             if self.pos < self.input.len() && (self.input[self.pos] == b'i' || self.input[self.pos] == b'I') {
                 self.pos += 1;
                 is_imaginary = true;
             }
-            1
+            3
         } else if self.pos < self.input.len() && (self.input[self.pos] == b'l' || self.input[self.pos] == b'L') {
             self.pos += 1;
             if self.pos < self.input.len() && (self.input[self.pos] == b'i' || self.input[self.pos] == b'I') {
@@ -433,6 +473,10 @@ impl Lexer {
                 2 => {
                     let f128_bytes = crate::common::long_double::parse_long_double_to_f128_bytes(text);
                     Token::new(TokenKind::FloatLiteralLongDouble(value, f128_bytes), span)
+                }
+                3 => {
+                    let f128_bytes = crate::common::long_double::parse_long_double_to_f128_bytes(text);
+                    Token::new(TokenKind::FloatLiteralF128(value, f128_bytes), span)
                 }
                 _ => Token::new(TokenKind::FloatLiteral(value), span),
             }

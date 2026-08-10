@@ -116,10 +116,13 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
 
     let mut i = 0;
     while i < len {
-        // At basic block boundaries, clear all copies.
-        // Exception: conditional jumps (jCC) don't clobber registers, so
-        // copy state remains valid on the fall-through path.
-        if infos[i].is_barrier() && infos[i].kind != LineKind::CondJmp {
+        // At basic block boundaries, clear all copies. Previously this kept
+        // copy state across a CondJmp, but that is UNSOUND: the branch-taken
+        // target is reached via a separate edge whose copy state may differ,
+        // and when that path falls back into this basic block's successor the
+        // propagated source is stale. Conservative and correct: clear at every
+        // barrier (jump, conditional jump, call, label, ret, directive).
+        if infos[i].is_barrier() {
             copy_src = [REG_NONE; 16];
             i += 1;
             continue;

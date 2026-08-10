@@ -104,10 +104,13 @@ impl super::InstructionEncoder {
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                     }
                     Displacement::SymbolMod(sym, modifier) => {
-                        let reloc_type = match modifier.as_str() {
-                            "GOTPCREL" => R_X86_64_GOTPCREL,
-                            "GOTTPOFF" => R_X86_64_GOTTPOFF,
-                            "PLT" => R_X86_64_PLT32,
+                        // Modifiers are case-insensitive in GNU as: glibc's
+                        // multiarch sources emit lowercase `sym@gottpoff(%rip)`.
+                        let reloc_type = match modifier.to_ascii_lowercase().as_str() {
+                            "gotpcrel" => R_X86_64_GOTPCREL,
+                            "gottpoff" => R_X86_64_GOTTPOFF,
+                            "tpoff" => R_X86_64_TPOFF32,
+                            "plt" => R_X86_64_PLT32,
                             _ => R_X86_64_PC32,
                         };
                         self.add_relocation(sym, reloc_type, -4);
@@ -140,9 +143,10 @@ impl super::InstructionEncoder {
                 (0i64, true, Some((sym.clone(), R_X86_64_32S, *offset)))
             }
             Displacement::SymbolMod(sym, modifier) => {
-                let reloc_type = match modifier.as_str() {
-                    "TPOFF" => R_X86_64_TPOFF32,
-                    "GOTPCREL" => R_X86_64_GOTPCREL,
+                let reloc_type = match modifier.to_ascii_lowercase().as_str() {
+                    "tpoff" => R_X86_64_TPOFF32,
+                    "gotpcrel" => R_X86_64_GOTPCREL,
+                    "gottpoff" => R_X86_64_GOTTPOFF,
                     _ => R_X86_64_32S,
                 };
                 (0i64, true, Some((sym.clone(), reloc_type, 0i64)))

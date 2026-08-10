@@ -11,6 +11,19 @@ const MAX_TRACKED_STORE_LOAD_OFFSETS: usize = 4;
 /// Size of the instruction lookahead window for compare-and-branch fusion.
 const CMP_FUSION_LOOKAHEAD: usize = 8;
 
+fn parse_stack_operand(text: &str, source: bool) -> Option<(u8, i32)> {
+    let (_, operands)=text.split_once(char::is_whitespace)?;
+    let (src,dst)=operands.split_once(',')?;
+    let op=if source {src.trim()} else {dst.trim()};
+    for (suffix,base) in [("(%rsp)",4u8),("(%rbp)",5u8)] {
+        if let Some(n)=op.strip_suffix(suffix) {
+            let off=if n.trim().is_empty(){0}else{n.trim().parse::<i32>().ok()?};
+            return Some((base,off));
+        }
+    }
+    None
+}
+
 pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
@@ -50,7 +63,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         // Track StoreRbp offsets so we can bail out if any store's slot is
         // potentially read by another basic block (no matching load nearby).
         let mut test_idx = None;
-        let mut store_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] = [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
+        let mut store_offsets: [(u8,i32); MAX_TRACKED_STORE_LOAD_OFFSETS] = [(0,0); MAX_TRACKED_STORE_LOAD_OFFSETS];
         let mut store_count = 0usize;
         let mut scan = 2;
         while scan < seq_count {
@@ -65,8 +78,8 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             // Skip store/load to rbp (pre-parsed fast check).
             if let LineKind::StoreRbp { offset, .. } = infos[si].kind {
                 if store_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
-                    store_offsets[store_count] = offset;
-                    store_count += 1;
+                    if let Some(slot)=parse_stack_operand(line,false) { store_offsets[store_count]=slot; store_count+=1; }
+                    else { store_count=usize::MAX; break; }
                 } else {
                     store_count = usize::MAX;
                     break;
@@ -74,15 +87,13 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 scan += 1;
                 continue;
             }
-            if matches!(infos[si].kind, LineKind::LoadRbp { .. }) {
-                scan += 1;
-                continue;
-            }
-            // Skip cltq and movslq
-            if line == "cltq" || line.starts_with("movslq ") {
-                scan += 1;
-                continue;
-            }
+            if matches!(infos[si].kind, LineKind::LoadRbp { .. })
+                || ((line.starts_with("movsbq ") || line.starts_with("movswq ")
+                    || line.starts_with("movzbq ") || line.starts_with("movzwq ")
+                    || line.starts_with("movsbl ") || line.starts_with("movzbl "))
+                    && parse_stack_operand(line,true).is_some())
+            { scan += 1; continue; }
+            if line == "cltq" || line.starts_with("movslq ") { scan += 1; continue; }
             // Check for test
             if line == "testq %rax, %rax" || line == "testl %eax, %eax" {
                 test_idx = Some(scan);
@@ -104,20 +115,19 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         if store_count > 0 {
             let range_start = seq_indices[1];
             let range_end = seq_indices[test_scan];
-            let mut load_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] = [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
+            let mut load_offsets: [(u8,i32); MAX_TRACKED_STORE_LOAD_OFFSETS] = [(0,0); MAX_TRACKED_STORE_LOAD_OFFSETS];
             let mut load_count = 0usize;
             for ri in range_start..=range_end {
-                let off = match infos[ri].kind {
-                    LineKind::LoadRbp { offset, .. } => Some(offset),
-                    LineKind::Nop => {
-                        let orig = classify_line(store.get(ri));
-                        match orig.kind {
-                            LineKind::LoadRbp { offset, .. } => Some(offset),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
+                let text=infos[ri].trimmed(store.get(ri));
+                let off = if matches!(infos[ri].kind,LineKind::LoadRbp{..}) {
+                    parse_stack_operand(text,true)
+                } else if infos[ri].kind==LineKind::Nop {
+                    let raw=store.get(ri).trim(); parse_stack_operand(raw,true)
+                } else if text.starts_with("movsbq ")||text.starts_with("movswq ")
+                    ||text.starts_with("movzbq ")||text.starts_with("movzwq ")
+                    ||text.starts_with("movsbl ")||text.starts_with("movzbl ") {
+                    parse_stack_operand(text,true)
+                } else {None};
                 if let Some(o) = off {
                     if load_count < MAX_TRACKED_STORE_LOAD_OFFSETS { load_offsets[load_count] = o; load_count += 1; }
                 }
@@ -162,4 +172,57 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
     }
 
     changed
+}
+
+/// Late fusion for boolean materializations that survive stack-slot pinning and
+/// frame compaction. The stack slot must occur exactly twice in the function
+/// text (one store and its matching load), proving it is an unobservable
+/// compiler temporary.
+pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
+    let mut lines: Vec<String> = asm.lines().map(str::to_string).collect();
+    let mut changed=false;
+
+    // First collapse a constant-false predecessor of a spilled-boolean join.
+    // This turns the remaining compare path into a single-predecessor fallthrough.
+    let active0:Vec<usize>=(0..lines.len()).filter(|i|!lines[*i].trim().is_empty()).collect();
+    for p in 0..active0.len().saturating_sub(2) {
+        let a=active0[p];let b=active0[p+1];let c=active0[p+2];
+        if lines[a].trim()!="xorl %eax, %eax" {continue;}
+        let Some(slot)=lines[b].trim().strip_prefix("movq %rax, ").map(str::to_string) else{continue;};
+        let Some(join)=lines[c].trim().strip_prefix("jmp ").map(str::to_string) else{continue;};
+        if lines.iter().filter(|l|l.contains(&slot)).count()!=3 {continue;}
+        let Some(li)=lines.iter().position(|l|l.trim()==format!("{}:",join)) else{continue;};
+        let tail:Vec<usize>=((li+1)..lines.len()).filter(|i|!lines[*i].trim().is_empty()).take(3).collect();
+        if tail.len()!=3 {continue;}
+        let load=lines[tail[0]].trim();
+        let load_ok=["movsbq ","movswq ","movslq ","movzbq ","movzwq ","movq "].iter()
+            .any(|q|load.strip_prefix(q).map(|r|r==format!("{}, %rax",slot)).unwrap_or(false));
+        if !load_ok || (lines[tail[1]].trim()!="testq %rax, %rax"&&lines[tail[1]].trim()!="testl %eax, %eax") {continue;}
+        let Some(target)=lines[tail[2]].trim().strip_prefix("je ").map(str::to_string) else{continue;};
+        lines[a].clear();lines[b].clear();lines[c]=format!("    jmp {}",target);changed=true;
+    }
+
+    // Count explicit branch references; labels with none are transparent joins.
+    let mut refs=std::collections::HashMap::<String,usize>::new();
+    for l in &lines {let t=l.trim();if t.starts_with('j') {if let Some(x)=t.split_whitespace().last(){*refs.entry(x.to_string()).or_default()+=1;}}}
+    let active:Vec<usize>=(0..lines.len()).filter(|i|{
+        let t=lines[*i].trim();if t.is_empty(){return false;}
+        if let Some(label)=t.strip_suffix(':'){return refs.get(label).copied().unwrap_or(0)!=0;}
+        true
+    }).collect();
+    let mut p=0;
+    while p+6<active.len() {
+        let ix=&active[p..p+7];let t:Vec<&str>=ix.iter().map(|i|lines[*i].trim()).collect();
+        if !(t[0].starts_with("cmp")||t[0].starts_with("test")){p+=1;continue;}
+        let Some(cc)=parse_setcc(t[1]) else{p+=1;continue;};
+        if !(t[2].starts_with("movzbl %al, %eax")||t[2].starts_with("movzbq %al, %rax")){p+=1;continue;}
+        let Some(slot)=t[3].strip_prefix("movq %rax, ") else{p+=1;continue;};
+        let load_ok=["movsbq ","movswq ","movslq ","movzbq ","movzwq ","movq "].iter().any(|q|t[4].strip_prefix(q).map(|r|r==format!("{}, %rax",slot)).unwrap_or(false));
+        if !load_ok||(t[5]!="testq %rax, %rax"&&t[5]!="testl %eax, %eax"){p+=1;continue;}
+        let (nonzero,target)=if let Some(x)=t[6].strip_prefix("jne "){(true,x)}else if let Some(x)=t[6].strip_prefix("je "){(false,x)}else{p+=1;continue;};
+        if lines.iter().any(|l|l.trim_start().starts_with("leaq ")&&l.contains(slot)){p+=1;continue;}
+        let fused=(if nonzero{cc}else{invert_cc(cc)}).to_string();let target=target.to_string();
+        for q in 1..=5{lines[ix[q]].clear();}lines[ix[6]]=format!("    j{} {}",fused,target);changed=true;p+=7;
+    }
+    if changed{*asm=lines.join("\n")+"\n";}changed
 }

@@ -22,7 +22,7 @@ use crate::backend::elf::{self as elf_mod,
     SHT_PROGBITS,
     SHF_ALLOC, SHF_EXECINSTR,
     STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
+    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS, STT_GNU_IFUNC,
     STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, STV_PROTECTED,
     resolve_numeric_labels, parse_section_flags,
     ElfConfig, ObjSection, ObjSymbol, ObjReloc, SymbolTableInput,
@@ -289,11 +289,21 @@ pub struct ElfWriterCore<A: X86Arch> {
     pending_protected: Vec<String>,
     pending_internal: Vec<String>,
     aliases: HashMap<String, String>,
+    /// `.symver real, name@VER` where `real` is NOT defined in this object:
+    /// GNU-as semantics — every reference to `real` becomes a versioned
+    /// reference `name@VER` (glibc compat_symbol_reference; needed because
+    /// GNU ld 2.47 does not bind unversioned refs to foo@VER under
+    /// --whole-archive). Applied to relocations after all items are parsed.
+    symver_refs: HashMap<String, String>,
     section_stack: Vec<(Option<usize>, Option<usize>)>,
     /// Deferred `.skip` expressions: (section_index, offset, expression, fill_byte).
     deferred_skips: Vec<(usize, usize, String, u8)>,
     /// Deferred byte-sized symbol diffs: (section_index, offset, sym_a, sym_b, size, addend).
     deferred_byte_diffs: Vec<(usize, usize, String, String, usize, i64)>,
+    /// Deferred ULEB/SLEB128 symbol diffs: (section, offset, sym_a, sym_b, addend, signed).
+    /// GNU as folds same-section local-label differences to constants at
+    /// assembly time; we defer until label positions are known (glibc .eh_frame).
+    deferred_leb_diffs: Vec<(usize, usize, String, String, i64, bool)>,
     /// Current code mode (16, 32, or 64). Affects instruction encoding.
     /// Set by `.code16`, `.code32`, `.code64` directives.
     code_mode: u8,
@@ -319,9 +329,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
             pending_protected: Vec::new(),
             pending_internal: Vec::new(),
             aliases: HashMap::new(),
+            symver_refs: HashMap::new(),
             section_stack: Vec::new(),
             deferred_skips: Vec::new(),
             deferred_byte_diffs: Vec::new(),
+            deferred_leb_diffs: Vec::new(),
             code_mode: A::default_code_mode(),
             _arch: std::marker::PhantomData,
         }
@@ -332,6 +344,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let items = resolve_numeric_labels(items);
         for item in &items {
             self.process_item(item)?;
+        }
+        // GNU-as .symver references: if `real` was never defined as a label,
+        // rewrite relocations against it to the versioned name (foo@VER).
+        // `@@` in a reference selects the default version -> single @.
+        if !self.symver_refs.is_empty() {
+            let defined: std::collections::HashSet<&String> =
+                self.label_positions.keys().collect();
+            for sec in self.sections.iter_mut() {
+                for reloc in sec.relocations.iter_mut() {
+                    if let Some(ver) = self.symver_refs.get(&reloc.symbol) {
+                        if !defined.contains(&reloc.symbol) {
+                            reloc.symbol = ver.replace("@@", "@");
+                        }
+                    }
+                }
+            }
         }
         self.emit_elf()
     }
@@ -474,6 +502,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             AsmItem::Quad(vals) => {
                 self.emit_data_values(vals, 8)?;
             }
+            AsmItem::Uleb128(vals) => {
+                self.emit_leb_values(vals, false)?;
+            }
+            AsmItem::Sleb128(vals) => {
+                self.emit_leb_values(vals, true)?;
+            }
             AsmItem::Zero(n) => {
                 self.ensure_section()?;
                 let section = self.current_section_mut()?;
@@ -521,13 +555,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.aliases.insert(alias.clone(), target.clone());
             }
             AsmItem::Symver(name, ver_string) => {
-                // .symver name, alias@@VERSION  -> default version: create alias from "alias" to "name"
-                // .symver name, alias@VERSION   -> compat version: create alias from "alias" to "name"
-                // Extract the unversioned alias name from the version string
-                if let Some(at_pos) = ver_string.find('@') {
-                    let alias = &ver_string[..at_pos];
-                    if !alias.is_empty() {
-                        self.aliases.insert(alias.to_string(), name.clone());
+                // GNU as semantics (verified against binutils 2.47):
+                //   .symver real, name@@V  -> symbols `real` AND `name@@V`
+                //   .symver real, name@V   -> symbols `real` AND `name@V`
+                // The FULL version string (including @ / @@) is the alias
+                // symbol; `name` itself is never renamed. Truncating at '@'
+                // produced self-aliases for `local == symbol` cases and
+                // duplicate definitions in one object; dropping the @@ alias
+                // for base == name broke glibc default_symbol_version
+                // (no __libc_start_main@@GLIBC_2.34 in the object).
+                if ver_string.contains('@') {
+                    if !ver_string.is_empty() {
+                        self.aliases.insert(ver_string.clone(), name.clone());
+                        // Candidate versioned REFERENCE: applied only when
+                        // `name` is never defined in this object (checked in
+                        // build() after all items are parsed).
+                        self.symver_refs.insert(name.clone(), ver_string.clone());
                     }
                 }
             }
@@ -632,6 +675,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 Some(SymbolKind::Function) => STT_FUNC,
                 Some(SymbolKind::Object) => STT_OBJECT,
                 Some(SymbolKind::TlsObject) => STT_TLS,
+                Some(SymbolKind::GnuIndirectFunction) => STT_GNU_IFUNC,
                 Some(SymbolKind::NoType) | None => STT_NOTYPE,
             };
 
@@ -772,6 +816,54 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(())
     }
 
+    /// Emit ULEB128/SLEB128 data values. Integer values are encoded directly;
+    /// symbol differences are deferred and folded once label positions are known.
+    fn emit_leb_values(&mut self, vals: &[DataValue], signed: bool) -> Result<(), String> {
+        self.ensure_section()?;
+        let sec_idx = self.current_section.unwrap();
+        for val in vals {
+            match val {
+                DataValue::Integer(v) => {
+                    let section = &mut self.sections[sec_idx];
+                    if signed {
+                        encode_sleb128(&mut section.data, *v);
+                    } else {
+                        encode_uleb128(&mut section.data, *v as u64);
+                    }
+                }
+                DataValue::SymbolDiff(a, b) => {
+                    self.defer_leb_diff(sec_idx, a, b, 0, signed)?;
+                }
+                DataValue::SymbolDiffAddend(a, b, addend) => {
+                    self.defer_leb_diff(sec_idx, a, b, *addend, signed)?;
+                }
+                DataValue::Symbol(sym) | DataValue::SymbolOffset(sym, _) => {
+                    return Err(format!(
+                        "unsupported symbol reference {} in .uleb128/.sleb128", sym
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn defer_leb_diff(
+        &mut self, sec_idx: usize, a: &str, b: &str, addend: i64, signed: bool,
+    ) -> Result<(), String> {
+        let a_resolved = self.aliases.get(a).cloned().unwrap_or_else(|| a.to_string());
+        let b_resolved = self.aliases.get(b).cloned().unwrap_or_else(|| b.to_string());
+        let offset = self.sections[sec_idx].data.len();
+        if b_resolved == "." {
+            return Err("symbol minus current position in .uleb128 is unsupported".to_string());
+        }
+        // Forward references are fine: resolution happens after all items
+        // are processed and every label position is known. Reserve the
+        // maximum LEB128 width (10 bytes for u64); resolve shrinks to fit.
+        self.deferred_leb_diffs.push((sec_idx, offset, a_resolved, b_resolved, addend, signed));
+        self.sections[sec_idx].data.extend(std::iter::repeat_n(0, 10));
+        Ok(())
+    }
+
     fn encode_instruction(&mut self, instr: &Instruction) -> Result<(), String> {
         self.ensure_section()?;
         let sec_idx = self.current_section.unwrap();
@@ -892,11 +984,88 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     *boff += count;
                 }
             }
+            for (bsec, boff, _, _, _, _) in self.deferred_leb_diffs.iter_mut() {
+                if *bsec == *sec_idx && *boff >= *offset {
+                    *boff += count;
+                }
+            }
         }
         Ok(())
     }
 
+    /// Shift offsets >= `from` in section `sec_idx` by `-delta` (used when
+    /// LEB128 placeholders shrink). Keeps labels, numeric labels, relocations,
+    /// jumps, alignment markers and deferred skips consistent after splicing.
+    fn shift_section_offsets(&mut self, sec_idx: usize, from: usize, delta: u64) {
+        for (_, (lsec, loff)) in self.label_positions.iter_mut() {
+            if *lsec == sec_idx && (*loff as usize) >= from {
+                *loff -= delta;
+            }
+        }
+        for (_, positions) in self.numeric_label_positions.iter_mut() {
+            for (lsec, loff) in positions.iter_mut() {
+                if *lsec == sec_idx && (*loff as usize) >= from {
+                    *loff -= delta;
+                }
+            }
+        }
+        for reloc in self.sections[sec_idx].relocations.iter_mut() {
+            if (reloc.offset as usize) >= from {
+                reloc.offset -= delta;
+            }
+        }
+        for jump in self.sections[sec_idx].jumps.iter_mut() {
+            if jump.offset >= from {
+                jump.offset -= delta as usize;
+            }
+        }
+        for marker in self.sections[sec_idx].align_markers.iter_mut() {
+            if marker.offset >= from {
+                marker.offset -= delta as usize;
+            }
+        }
+        for (skip_sec, skip_off, _, _) in self.deferred_skips.iter_mut() {
+            if *skip_sec == sec_idx && *skip_off >= from {
+                *skip_off -= delta as usize;
+            }
+        }
+    }
+
     fn resolve_deferred_byte_diffs(&mut self) -> Result<(), String> {
+        // Fold deferred LEB128 diffs once label positions are known.
+        // Resolve from the END of each section backwards so shrinking the
+        // 10-byte placeholder does not invalidate earlier offsets.
+        let mut leb_diffs = std::mem::take(&mut self.deferred_leb_diffs);
+        leb_diffs.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let mut diffs = std::mem::take(&mut self.deferred_byte_diffs);
+        for (sec_idx, offset, sym_a, sym_b, addend, signed) in &leb_diffs {
+            let pos_a = self.label_positions.get(sym_a)
+                .ok_or_else(|| format!("undefined label in .uleb128 diff: {}", sym_a))?;
+            let pos_b = self.label_positions.get(sym_b)
+                .ok_or_else(|| format!("undefined label in .uleb128 diff: {}", sym_b))?;
+            let diff = (pos_a.1 as i64) - (pos_b.1 as i64) + addend;
+            let mut encoded: Vec<u8> = Vec::new();
+            if *signed {
+                encode_sleb128(&mut encoded, diff);
+            } else {
+                encode_uleb128(&mut encoded, diff as u64);
+            }
+            const PLACE: usize = 10;
+            if *offset + PLACE > self.sections[*sec_idx].data.len() {
+                return Err("internal: .uleb128 diff placeholder overflow".to_string());
+            }
+            self.sections[*sec_idx].data.splice(*offset..*offset + PLACE, encoded.iter().copied());
+            let delta = PLACE - encoded.len();
+            if delta > 0 {
+                let from = *offset + encoded.len();
+                self.shift_section_offsets(*sec_idx, from, delta as u64);
+                for (dsec, doff, _, _, _, _) in diffs.iter_mut() {
+                    if *dsec == *sec_idx && *doff >= from {
+                        *doff -= delta;
+                    }
+                }
+            }
+        }
         let diffs = std::mem::take(&mut self.deferred_byte_diffs);
         for (sec_idx, offset, sym_a, sym_b, size, addend) in &diffs {
             let pos_a = self.label_positions.get(sym_a)
@@ -917,6 +1086,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     let bytes = (diff as i16).to_le_bytes();
                     self.sections[*sec_idx].data[*offset] = bytes[0];
                     self.sections[*sec_idx].data[*offset + 1] = bytes[1];
+                }
+                4 => {
+                    let bytes = (diff as i32).to_le_bytes();
+                    for (k, b) in bytes.iter().enumerate() {
+                        self.sections[*sec_idx].data[*offset + k] = *b;
+                    }
+                }
+                8 => {
+                    let bytes = diff.to_le_bytes();
+                    for (k, b) in bytes.iter().enumerate() {
+                        self.sections[*sec_idx].data[*offset + k] = *b;
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -1117,6 +1298,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.resolve_deferred_byte_diffs()?;
         }
 
+        // Fix alignment/org markers for EVERY section (the jump-relaxation
+        // path only does this for sections with jumps; .eh_frame never had
+        // its `.align` padding fixed up otherwise).
+        for sec_idx in 0..self.sections.len() {
+            self.fixup_alignment_markers(sec_idx);
+        }
+
         // Resolve internal relocations
         self.resolve_internal_relocations();
 
@@ -1201,6 +1389,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     SymbolKind::Function => STT_FUNC,
                     SymbolKind::Object => STT_OBJECT,
                     SymbolKind::TlsObject => STT_TLS,
+                    SymbolKind::GnuIndirectFunction => STT_GNU_IFUNC,
                     SymbolKind::NoType => STT_NOTYPE,
                 };
                 (name.clone(), stt)
@@ -1631,7 +1820,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             self.label_positions.get(diff_sym),
                         ) {
                             if a_sec == b_sec {
-                                let val = a_off as i64 - b_off as i64;
+                                let val = a_off as i64 - b_off as i64 + reloc.addend;
                                 resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
                                 continue;
                             }
@@ -1696,5 +1885,35 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
             self.sections[sec_idx].relocations = unresolved;
         }
+    }
+}
+
+/// ULEB128 encode (used by .uleb128 data emission).
+pub(crate) fn encode_uleb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let mut byte = (v & 0x7F) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+/// SLEB128 encode (used by .sleb128 data emission).
+pub(crate) fn encode_sleb128(out: &mut Vec<u8>, mut val: i64) {
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        let sign = byte & 0x40 != 0;
+        if (val == 0 && !sign) || (val == -1 && sign) {
+            out.push(byte);
+            break;
+        }
+        byte |= 0x80;
+        out.push(byte);
     }
 }

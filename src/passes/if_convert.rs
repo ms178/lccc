@@ -828,7 +828,7 @@ mod tests {
                     ty: IrType::I32,
                     size: 4,
                     align: 4,
-                    volatile: false,
+                    volatile: false, semantic_volatile: false,
                 },
             ],
             terminator: Terminator::CondBranch {

@@ -126,7 +126,7 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
             .position(|i| !matches!(i, Instruction::Alloca { .. }))
             .unwrap_or(func.blocks[0].instructions.len());
         func.blocks[0].instructions.insert(insert_pos, Instruction::Alloca {
-            dest: alloca_val, ty: val_type, size: val_type.size(), align: 0, volatile: false,
+            dest: alloca_val, ty: val_type, size: val_type.size(), align: 0, volatile: false, semantic_volatile: false,
         });
         func.blocks[0].source_spans.clear();
 

@@ -84,13 +84,25 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                // x87 instructions don't use REX.W
+                // x87 memory forms accept the normal memory-prefix machinery (FS/GS
+                // segment overrides and REX.B/X for r8-r15 addressing), but never REX.W.
+                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, "", mem);
                 self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(ext, mem)
             }
             _ => Err("x87 mem op requires memory operand".to_string()),
         }
+    }
+
+    /// Encode a waiting x87 memory form.  GAS mnemonics without the `fn` prefix
+    /// (for example `fstenv`, `fsave`, `fstsw`, `fclex`, and `finit`) are not
+    /// distinct opcodes; they are `fwait` followed by the corresponding no-wait
+    /// instruction.  The prefix is a separate instruction, so any segment/REX
+    /// prefixes for the x87 memory instruction must be emitted after 0x9B.
+    pub(crate) fn encode_x87_wait_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+        self.bytes.push(0x9B);
+        self.encode_x87_mem(ops, opcode, ext)
     }
 
     pub(crate) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
@@ -128,6 +140,25 @@ impl super::InstructionEncoder {
             Ok(())
         } else {
             Err("fucomi requires 0-2 operands".to_string())
+        }
+    }
+
+    /// Encode fcomi/fucomi (compare, no pop): fcomi = DB F0+i, fucomi = DB E8+i.
+    pub(crate) fn encode_fcomi(&mut self, ops: &[Operand], base: u8) -> Result<(), String> {
+        if ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xDB, base + n]);
+                    Ok(())
+                }
+                _ => Err("fcomi requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xDB, base + 1]);
+            Ok(())
+        } else {
+            Err("fcomi requires 0 or 2 operands".to_string())
         }
     }
 
@@ -174,6 +205,122 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             _ => Err("fstp requires st register".to_string()),
+        }
+    }
+
+    /// Encode fnstsw (no-wait store FPU status word).
+    pub(crate) fn encode_fnstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.is_empty() {
+            // GAS accepts bare `fnstsw` as `fnstsw %ax`.
+            self.bytes.extend_from_slice(&[0xDF, 0xE0]);
+            return Ok(());
+        }
+        if ops.len() != 1 {
+            return Err("fnstsw requires 0 or 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) if reg.name == "ax" => {
+                self.bytes.extend_from_slice(&[0xDF, 0xE0]);
+                Ok(())
+            }
+            Operand::Memory(_) => self.encode_x87_mem(ops, &[0xDD], 7),
+            _ => Err("fnstsw requires %ax or memory operand".to_string()),
+        }
+    }
+
+    /// Encode fstsw (waiting store FPU status word).
+    pub(crate) fn encode_fstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        self.bytes.push(0x9B);
+        self.encode_fnstsw(ops)
+    }
+
+    /// Encode x87 instructions whose ModR/M byte is formed from ST(i).
+    pub(crate) fn encode_x87_st_i(&mut self, ops: &[Operand], opcode: &[u8], base: u8, name: &str) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err(format!("{} requires 1 st register operand", name));
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let n = parse_st_num(&reg.name)?;
+                self.bytes.extend_from_slice(opcode);
+                self.bytes.push(base + n);
+                Ok(())
+            }
+            _ => Err(format!("{} requires st register", name)),
+        }
+    }
+
+    /// Encode fcom (compare real, no pop).  Handles the register forms emitted
+    /// by GCC/clang-style inline assembly: no operand defaults to ST(1), one
+    /// operand is ST(i), and two-operand AT&T syntax uses the first operand as
+    /// ST(i) with ST(0) implicit as the other operand.
+    pub(crate) fn encode_fcom(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xD8, 0xD1]);
+            return Ok(());
+        }
+        if ops.len() == 1 || ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD8, 0xD0 + n]);
+                    Ok(())
+                }
+                Operand::Memory(mem) => {
+                    // fcom m32: D8 /2 (default for a bare memory operand).
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_rex_rm(0, "", mem);
+                    self.bytes.extend_from_slice(&[0xD8]);
+                    self.encode_modrm_mem(2, mem)
+                }
+                _ => Err("fcom requires st register or memory operand".to_string()),
+            }
+        } else {
+            Err("fcom requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    /// Encode a sized x87 memory compare: fcoms/fcoml (opcode D8/DC, /2) and
+    /// fcomps/fcompl (D8/DC, /3). AT&T suffixes: s=m32, l=m64.
+    pub(crate) fn encode_fcom_mem(&mut self, ops: &[Operand], opcode: u8, ext: u8) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("sized fcom requires 1 memory operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("sized fcom requires memory operand".to_string()),
+        }
+    }
+
+    /// Encode fcomp (compare real and pop).  Operand handling mirrors fcom.
+    pub(crate) fn encode_fcomp(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xD8, 0xD9]);
+            return Ok(());
+        }
+        if ops.len() == 1 || ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD8, 0xD8 + n]);
+                    Ok(())
+                }
+                Operand::Memory(mem) => {
+                    // fcomp m32: D8 /3 (default for a bare memory operand).
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_rex_rm(0, "", mem);
+                    self.bytes.extend_from_slice(&[0xD8]);
+                    self.encode_modrm_mem(3, mem)
+                }
+                _ => Err("fcomp requires st register or memory operand".to_string()),
+            }
+        } else {
+            Err("fcomp requires 0, 1 or 2 operands".to_string())
         }
     }
 

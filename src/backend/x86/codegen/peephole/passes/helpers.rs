@@ -18,6 +18,29 @@ pub(super) fn is_callee_saved_reg(reg: RegId) -> bool {
     matches!(reg, 3 | 12 | 13 | 14 | 15)
 }
 
+/// True for instructions that change RSP at runtime (`push*`, `pop*`, or
+/// `subq/addq $N, %rsp`).
+///
+/// The text-based peephole passes reason about `%rsp`-relative stack-slot
+/// offsets as if they were absolute. A runtime RSP shift makes every offset
+/// inside the shifted window refer to a DIFFERENT physical slot, so slot-based
+/// reasoning (dead-store elimination, store forwarding, memory folding) must
+/// stop conservatively at these lines. The codegen used to emit
+/// `pushq/popfq` around i128 binop operand prep — those windows are gone, but
+/// F128 conversions still use `subq/addq %rsp`, and prologue pushes occur at
+/// function start (harmless: reasoning starts after the prologue).
+#[inline]
+pub(super) fn is_rsp_shift_line(t: &str) -> bool {
+    let t = t.trim();
+    if t.starts_with("push") || t.starts_with("pop") {
+        return true;
+    }
+    if t.starts_with("subq $") || t.starts_with("addq $") {
+        return t.ends_with("%rsp");
+    }
+    false
+}
+
 /// Check if a line of assembly text references a given register family.
 /// Uses the pre-computed reg_refs bitmask for O(1) lookup.
 #[inline]
@@ -122,6 +145,8 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     trimmed.starts_with("wrmsr") ||
     trimmed.starts_with("xchg") || trimmed.starts_with("cmpxchg") ||
     trimmed.starts_with("lock ") ||
+    // shld/shrd use %cl implicitly (i128 shifts); treat like other shifts.
+    trimmed.starts_with("shld") || trimmed.starts_with("shrd") ||
     // x87 FPU status/control instructions that write to %ax or memory.
     // fnstsw writes to %ax (implicit destination), and the peephole's
     // copy propagation must not rewrite %ax to another register since

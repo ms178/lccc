@@ -93,9 +93,12 @@ impl InstructionEncoder {
 
     /// Main mnemonic dispatch.
     fn encode_mnemonic(&mut self, instr: &Instruction) -> Result<(), String> {
+        // GNU as treats mnemonics case-insensitively (glibc .S files use
+        // uppercase `LOCK`); normalize before dispatch.
+        let mnemonic_raw = instr.mnemonic.to_ascii_lowercase();
         // Infer suffix for unsuffixed mnemonics (e.g., push -> pushq, mov -> movl)
         // This enables assembling hand-written .s files that omit AT&T size suffixes.
-        let suffixed = infer_suffix(&instr.mnemonic, &instr.operands);
+        let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
 
@@ -149,6 +152,10 @@ impl InstructionEncoder {
             "movswl" => self.encode_movsx(ops, 2, 4),
             "movzbq" | "movzbl" => self.encode_movzx(ops, 1, if mnemonic == "movzbq" { 8 } else { 4 }),
             "movzwq" | "movzwl" => self.encode_movzx(ops, 2, if mnemonic == "movzwq" { 8 } else { 4 }),
+            "movzb" => self.encode_movzx_infer_dst(ops, 1),
+            "movzw" => self.encode_movzx_infer_dst(ops, 2),
+            "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
+            "movsw" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 2),
 
             // LEA
             "leaq" => self.encode_lea(ops, 8),
@@ -193,7 +200,9 @@ impl InstructionEncoder {
             "decb" => self.encode_inc_dec(ops, 1, 1),
 
             // Shifts
-            "shlq" | "shll" | "shlw" | "shlb" => self.encode_shift(ops, mnemonic, 4),
+            // GNU as aliases: sal* == shl* (same opcode 4)
+            "shlq" | "shll" | "shlw" | "shlb"
+            | "salq" | "sall" | "salw" | "salb" => self.encode_shift(ops, mnemonic, 4),
             "shrq" | "shrl" | "shrw" | "shrb" => self.encode_shift(ops, mnemonic, 5),
             "sarq" | "sarl" | "sarw" | "sarb" => self.encode_shift(ops, mnemonic, 7),
             "rolq" | "roll" | "rolw" | "rolb" => self.encode_shift(ops, mnemonic, 0),
@@ -243,6 +252,16 @@ impl InstructionEncoder {
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
             | "jc" | "jnc" => {
+                self.encode_jcc(ops, mnemonic)
+            }
+            // GAS accepts every canonical and negated condition-code alias:
+            // jna/jnbe, jng/jnle, jnge/jnl, jpe/jpo, etc.  Keep this guarded
+            // fallback next to the explicit hot set so future aliases are handled
+            // without routing non-Jcc mnemonics such as jmp/jrcxz/loop here.
+            _ if mnemonic.starts_with('j')
+                && mnemonic.len() > 1
+                && cc_from_mnemonic(&mnemonic[1..]).is_ok() =>
+            {
                 self.encode_jcc(ops, mnemonic)
             }
 
@@ -350,6 +369,59 @@ impl InstructionEncoder {
                     Err("rdsspd requires a 32-bit register operand".to_string())
                 }
             }
+            // CET shadow stack increment: incsspq %r64 / incsspd %r32
+            // (F3 [REX.W] 0F AE /6 — same family as rdssp with reg field 6).
+            "incsspq" => {
+                if let Some(Operand::Register(reg)) = ops.first() {
+                    let rm = reg_num(&reg.name).ok_or_else(|| format!("unknown register: {}", reg.name))?;
+                    self.bytes.push(0xF3);
+                    let rex_b = if needs_rex_ext(&reg.name) { 1 } else { 0 };
+                    self.bytes.push(0x48 | rex_b);
+                    self.bytes.extend_from_slice(&[0x0F, 0xAE]);
+                    self.bytes.push(0xE8 | rm);
+                    Ok(())
+                } else {
+                    Err("incsspq requires a 64-bit register operand".to_string())
+                }
+            }
+            "incsspd" => {
+                if let Some(Operand::Register(reg)) = ops.first() {
+                    let rm = reg_num(&reg.name).ok_or_else(|| format!("unknown register: {}", reg.name))?;
+                    self.bytes.push(0xF3);
+                    if needs_rex_ext(&reg.name) {
+                        self.bytes.push(0x41);
+                    }
+                    self.bytes.extend_from_slice(&[0x0F, 0xAE]);
+                    self.bytes.push(0xE8 | rm);
+                    Ok(())
+                } else {
+                    Err("incsspd requires a 32-bit register operand".to_string())
+                }
+            }
+            // CET shadow-stack family (encodings verified against GNU binutils 2.44)
+            "rstorssp" => self.encode_rstorssp(ops),
+            "clrssbsy" => self.encode_clrssbsy(ops),
+            "saveprevssp" => {
+                if ops.is_empty() {
+                    self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xEA]);
+                    Ok(())
+                } else {
+                    Err("saveprevssp takes no operands".to_string())
+                }
+            }
+            "setssbsy" => {
+                if ops.is_empty() {
+                    self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xE8]);
+                    Ok(())
+                } else {
+                    Err("setssbsy takes no operands".to_string())
+                }
+            }
+            "wrssd" => self.encode_wrss(ops, 4, false),
+            "wrssq" => self.encode_wrss(ops, 8, false),
+            "wrussd" => self.encode_wrss(ops, 4, true),
+            "wrussq" => self.encode_wrss(ops, 8, true),
+
             "pause" => { self.bytes.extend_from_slice(&[0xF3, 0x90]); Ok(()) }
             "mfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF0]); Ok(()) }
             "lfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xE8]); Ok(()) }
@@ -361,7 +433,7 @@ impl InstructionEncoder {
             "std" => { self.bytes.push(0xFD); Ok(()) }
 
             // String ops
-            "movsb" => { self.bytes.push(0xA4); Ok(()) }
+            "movsb" if ops.is_empty() => { self.bytes.push(0xA4); Ok(()) }
             "movsd" if ops.is_empty() => { self.bytes.push(0xA5); Ok(()) }
             "movsq" => { self.bytes.extend_from_slice(&[0x48, 0xA5]); Ok(()) }
             "stosb" => { self.bytes.push(0xAA); Ok(()) }
@@ -477,6 +549,19 @@ impl InstructionEncoder {
             "paddsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xED]),
             "pmuludq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF4]),
             "pmullw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xD5]),
+            "paddb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xFC]),
+            "psubb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF8]),
+            "psadbw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF6]),
+            "pmaddubsw" => self.encode_sse_op_38(ops, 0x04),
+            "phaddw" => self.encode_sse_op_38(ops, 0x01),
+            "phaddd" => self.encode_sse_op_38(ops, 0x02),
+            "pabsb" => self.encode_sse_op_38(ops, 0x1C),
+            "pabsw" => self.encode_sse_op_38(ops, 0x1D),
+            "pabsd" => self.encode_sse_op_38(ops, 0x1E),
+            "pblendvb" => self.encode_sse_op_38(ops, 0x10),
+            "pmovzxbw" => self.encode_sse_op_38(ops, 0x30),
+            "pmovzxwd" => self.encode_sse_op_38(ops, 0x33),
+            "palignr" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0F]),
             "pmulld" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x40]),
             "pminub" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xDA]),
             "pmaxub" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xDE]),
@@ -484,7 +569,6 @@ impl InstructionEncoder {
             "pmaxsd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x3D]),
             "pavgb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE0]),
             "pavgw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE3]),
-            "psadbw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF6]),
             "paddq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xD4]),
             "psubq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xFB]),
             "punpcklqdq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x6C]),
@@ -537,6 +621,7 @@ impl InstructionEncoder {
             "psrldq" => self.encode_sse_shift_imm_only(ops, 3, &[0x66, 0x0F, 0x73]),
 
             // SSE shuffles
+            "pshufw" => self.encode_sse_op_imm8(ops, &[0x0F, 0x70]),
             "pshufd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x70]),
             "pshuflw" => self.encode_sse_op_imm8(ops, &[0xF2, 0x0F, 0x70]),
             "pshufhw" => self.encode_sse_op_imm8(ops, &[0xF3, 0x0F, 0x70]),
@@ -568,6 +653,7 @@ impl InstructionEncoder {
             // Non-temporal stores and loads
             "movnti" | "movntil" => self.encode_movnti(ops),
             "movntiq" => self.encode_movnti_q(ops),
+            "movntq" => self.encode_sse_store(ops, &[0x0F, 0xE7]),
             "movntdq" => self.encode_sse_store(ops, &[0x66, 0x0F, 0xE7]),
             "movntdqa" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2A]),
             "movntpd" => self.encode_sse_store(ops, &[0x66, 0x0F, 0x2B]),
@@ -598,7 +684,9 @@ impl InstructionEncoder {
             "fdivp" => { self.bytes.extend_from_slice(&[0xDE, 0xF1]); Ok(()) }
             "fdivrp" => { self.bytes.extend_from_slice(&[0xDE, 0xF9]); Ok(()) }
             "fchs" => { self.bytes.extend_from_slice(&[0xD9, 0xE0]); Ok(()) }
+            "fcomi" => self.encode_fcomi(ops, 0xF0),
             "fcomip" => self.encode_fcomip(ops),
+            "fucomi" => self.encode_fcomi(ops, 0xE8),
             "fucomip" => self.encode_fucomip(ops),
             "fld" => self.encode_fld_st(ops),
             "fstp" => self.encode_fstp_st(ops),
@@ -647,7 +735,7 @@ impl InstructionEncoder {
             "fldcw" => self.encode_x87_mem(ops, &[0xD9], 5),
 
             // ---- String operations (additional sizes) ----
-            "movsw" => { self.bytes.extend_from_slice(&[0x66, 0xA5]); Ok(()) }
+            "movsw" if ops.is_empty() => { self.bytes.extend_from_slice(&[0x66, 0xA5]); Ok(()) }
             "stosw" => { self.bytes.extend_from_slice(&[0x66, 0xAB]); Ok(()) }
             "stosl" => { self.bytes.push(0xAB); Ok(()) }
             "movsl" => { self.bytes.push(0xA5); Ok(()) }
@@ -730,7 +818,6 @@ impl InstructionEncoder {
             "emms" => { self.bytes.extend_from_slice(&[0x0F, 0x77]); Ok(()) }
 
             // ---- SSE: palignr, pshufb ----
-            "palignr" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0F]),
             "pshufb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x00]),
 
             // ---- SSE: shufps, shufpd, movapd, unpcklpd, unpckhpd, movups ----
@@ -750,7 +837,6 @@ impl InstructionEncoder {
             // blendv instructions use xmm0 as implicit mask; 3-op form names it explicitly
             "blendvpd" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x15]) }
             "blendvps" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x14]) }
-            "pblendvb" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x10]) }
             "roundsd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0B]),
             "roundss" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0A]),
             "roundpd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x09]),
@@ -786,10 +872,8 @@ impl InstructionEncoder {
             "cvtpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
 
             // SSE4.1 zero/sign extension
-            "pmovzxbw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x30]),
             "pmovzxbd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x31]),
             "pmovzxbq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x32]),
-            "pmovzxwd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x33]),
             "pmovzxwq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x34]),
             "pmovzxdq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x35]),
             "pmovsxbw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x20]),
@@ -801,17 +885,18 @@ impl InstructionEncoder {
             "pcmpgtq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x37]),
 
             // SSSE3 instructions
-            "pabsb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x1C]),
-            "pabsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x1D]),
-            "pabsd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x1E]),
-            "phaddw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x01]),
-            "phaddd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x02]),
+            "psignb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x08]),
+            "psignw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x09]),
+            "psignd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0A]),
             "phsubw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x05]),
             "phsubd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x06]),
             "pmulhrsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0B]),
 
             // ---- AVX instructions (VEX-encoded) ----
             "vmovdqa" => self.encode_avx_mov(ops, 0x6F, 0x7F, true),
+            // EVEX (AVX-512): glibc's dl-trampoline saves zmm regs with these
+            "vmovdqa64" => self.encode_evex_vmovdqa(ops, true),
+            "vmovdqa32" => self.encode_evex_vmovdqa(ops, false),
             "vmovdqu" => self.encode_avx_mov(ops, 0x6F, 0x7F, false),
             "vmovaps" => self.encode_avx_mov_np(ops, 0x28, 0x29, false),
             "vmovapd" => self.encode_avx_mov_np(ops, 0x28, 0x29, true),
@@ -862,6 +947,9 @@ impl InstructionEncoder {
             "vblendpd" => self.encode_avx_3op_3a_imm8(ops, 0x0D, true),
             "vinserti128" => self.encode_avx_3op_3a_imm8(ops, 0x38, true),
             "vextracti128" => self.encode_avx_extract_imm8(ops, 0x39, true),
+            "vpsignb" => self.encode_avx_3op_38(ops, 0x08, true),
+            "vpsignw" => self.encode_avx_3op_38(ops, 0x09, true),
+            "vpsignd" => self.encode_avx_3op_38(ops, 0x0A, true),
             "vpabsb" => self.encode_avx_2op_38(ops, 0x1C, true),
             "vpabsw" => self.encode_avx_2op_38(ops, 0x1D, true),
             "vpabsd" => self.encode_avx_2op_38(ops, 0x1E, true),
@@ -893,10 +981,34 @@ impl InstructionEncoder {
             "vpcmpgtq" => self.encode_avx_3op_38(ops, 0x37, true),
 
             // AVX2 broadcast
-            "vpbroadcastb" => self.encode_avx_broadcast(ops, &[0x78]),
-            "vpbroadcastw" => self.encode_avx_broadcast(ops, &[0x79]),
-            "vpbroadcastd" => self.encode_avx_broadcast(ops, &[0x58]),
-            "vpbroadcastq" => self.encode_avx_broadcast(ops, &[0x59]),
+            "vpbroadcastb" => {
+                if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
+                    self.encode_avx_broadcast_evex_gpr(ops, 0x7A, 0)
+                } else {
+                    self.encode_avx_broadcast(ops, &[0x78])
+                }
+            }
+            "vpbroadcastw" => {
+                if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
+                    self.encode_avx_broadcast_evex_gpr(ops, 0x7B, 0)
+                } else {
+                    self.encode_avx_broadcast(ops, &[0x79])
+                }
+            }
+            "vpbroadcastd" => {
+                if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
+                    self.encode_avx_broadcast_evex_gpr(ops, 0x7C, 0)
+                } else {
+                    self.encode_avx_broadcast(ops, &[0x58])
+                }
+            }
+            "vpbroadcastq" => {
+                if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
+                    self.encode_avx_broadcast_evex_gpr(ops, 0x7C, 1)
+                } else {
+                    self.encode_avx_broadcast(ops, &[0x59])
+                }
+            }
 
             // AVX2 permute
             "vperm2i128" => self.encode_avx_3op_3a_imm8(ops, 0x46, true),
@@ -911,16 +1023,11 @@ impl InstructionEncoder {
             "vpblendvb" => self.encode_avx_4op_3a(ops, 0x4C, true),
 
             // AVX2 broadcast from 128-bit memory
-            "vbroadcasti128" => self.encode_avx_broadcast(ops, &[0x5A]),
+            "vbroadcasti128" => { if !matches!(ops.first(), Some(Operand::Memory(_))) { return Err("vbroadcasti128 requires memory source".to_string()); } self.encode_avx_broadcast(ops, &[0x5A]) }
 
             // AVX AES-NI
-            "vaesenc" => self.encode_avx_3op_38(ops, 0xDC, true),
-            "vaesenclast" => self.encode_avx_3op_38(ops, 0xDD, true),
-            "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
-            "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
 
             // AVX PCLMULQDQ
-            "vpclmulqdq" => self.encode_avx_3op_3a_imm8(ops, 0x44, true),
 
             // Additional AVX packed integer
             "vpminub" => self.encode_avx_3op(ops, 0xDA, true),
@@ -938,6 +1045,40 @@ impl InstructionEncoder {
             "vpavgb" => self.encode_avx_3op(ops, 0xE0, true),
             "vpavgw" => self.encode_avx_3op(ops, 0xE3, true),
             "vpsadbw" => self.encode_avx_3op(ops, 0xF6, true),
+            "vpmaddubsw" => self.encode_avx_3op_38(ops, 0x04, true),
+            // AVX-VNNI (66 pp) — Raptor Lake+
+            "vpdpbusd" => self.encode_avx_3op_38_pp(ops, 0x50, 1),
+            "vpdpbusds" => self.encode_avx_3op_38_pp(ops, 0x51, 1),
+            "vpdpwusd" => self.encode_avx_3op_38_pp(ops, 0xD2, 1),
+            "vpdpwusds" => self.encode_avx_3op_38_pp(ops, 0xD3, 1),
+            // AVX-VNNI-INT8 (F2/F3/none pp)
+            "vpdpbssd" => self.encode_avx_3op_38_pp(ops, 0x50, 3),
+            "vpdpbssds" => self.encode_avx_3op_38_pp(ops, 0x51, 3),
+            "vpdpbsud" => self.encode_avx_3op_38_pp(ops, 0x50, 2),
+            "vpdpbsuds" => self.encode_avx_3op_38_pp(ops, 0x51, 2),
+            "vpdpbuud" => self.encode_avx_3op_38_pp(ops, 0x50, 0),
+            "vpdpbuuds" => self.encode_avx_3op_38_pp(ops, 0x51, 0),
+            // AVX-VNNI-INT16
+            "vpdpwuud" => self.encode_avx_3op_38_pp(ops, 0xD2, 0),
+            "vpdpwuuds" => self.encode_avx_3op_38_pp(ops, 0xD3, 0),
+            "vpdpwssd" => self.encode_avx_3op_38_pp(ops, 0x52, 1),
+            "vpdpwssds" => self.encode_avx_3op_38_pp(ops, 0x53, 1),
+            // GFNI: binutils/GCC emit the legacy SSE forms for 128-bit
+            // (66 0F38/0F3A); VEX forms exist in the ISA but binutils 2.44
+            // neither assembles nor disassembles them. Match GNU as exactly.
+            "gf2p8mulb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xCF]),
+            "gf2p8affineqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCE]),
+            "gf2p8affineinvqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCF]),
+            "vaesimc" => self.encode_avx_2op_38(ops, 0xDB, true),
+            "vaeskeygenassist" => self.encode_avx_2op_3a_pp_imm8(ops, 0xDF, 1),
+            // VAES 256 + VPCLMULQDQ 256
+            "vaesenc" => self.encode_avx_3op_38(ops, 0xDC, true),
+            "vaesenclast" => self.encode_avx_3op_38(ops, 0xDD, true),
+            "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
+            "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
+            "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1),
+            "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
+            "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
             "vpmaddwd" => self.encode_avx_3op(ops, 0xF5, true),
             "vpmulhw" => self.encode_avx_3op(ops, 0xE5, true),
             "vpsubusb" => self.encode_avx_3op(ops, 0xD8, true),
@@ -1353,28 +1494,6 @@ impl InstructionEncoder {
                 }
             }
 
-            // ---- MMX paddb ----
-            "paddb" if ops.iter().any(|op| matches!(op, Operand::Register(r) if is_mmx(&r.name))) => {
-                // MMX form: 0F FC /r
-                if ops.len() != 2 { return Err("paddb requires 2 operands".to_string()); }
-                match (&ops[0], &ops[1]) {
-                    (Operand::Register(src), Operand::Register(dst)) if is_mmx(&src.name) && is_mmx(&dst.name) => {
-                        let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        self.bytes.extend_from_slice(&[0x0F, 0xFC]);
-                        self.bytes.push(self.modrm(3, dst_num, src_num));
-                        Ok(())
-                    }
-                    (Operand::Memory(mem), Operand::Register(dst)) if is_mmx(&dst.name) => {
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        self.bytes.extend_from_slice(&[0x0F, 0xFC]);
-                        self.encode_modrm_mem(dst_num, mem)
-                    }
-                    _ => Err("unsupported mmx paddb operands".to_string()),
-                }
-            }
-            "paddb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xFC]),
-
             // ---- Additional suffixless forms ----
             "bt" => self.encode_bt(ops, "btq"),
             "bts" => self.encode_bt(ops, "btsq"),
@@ -1431,30 +1550,55 @@ impl InstructionEncoder {
             "fadd" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xC0),
             "fmul" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xC8),
             "fsub" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xE0),
+            "fsubr" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xE8),
             "fdiv" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xF0),
+            "fdivr" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xF8),
 
             // x87 exchange
             "fxch" => self.encode_fxch(ops),
 
             // x87 control word / environment
             "fnclex" => { self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
+            "fclex" => { self.bytes.push(0x9B); self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
+            "finit" => { self.bytes.push(0x9B); self.bytes.extend_from_slice(&[0xDB, 0xE3]); Ok(()) }
             "fnstenv" => self.encode_x87_mem(ops, &[0xD9], 6),
+            "fstenv" => self.encode_x87_wait_mem(ops, &[0xD9], 6),
             "fldenv" => self.encode_x87_mem(ops, &[0xD9], 4),
-            "fnstsw" => {
-                // fnstsw %ax -> DF E0
-                // fnstsw mem -> DD /7
-                if let Some(Operand::Register(r)) = ops.first() {
-                    if r.name == "ax" {
-                        self.bytes.extend_from_slice(&[0xDF, 0xE0]);
-                        return Ok(());
-                    }
-                }
-                self.encode_x87_mem(ops, &[0xDD], 7)
+            "fnsave" => self.encode_x87_mem(ops, &[0xDD], 6),
+            "fsave" => self.encode_x87_wait_mem(ops, &[0xDD], 6),
+            "frstor" => self.encode_x87_mem(ops, &[0xDD], 4),
+            "fnstsw" => self.encode_fnstsw(ops),
+            "fstsw" => self.encode_fstsw(ops),
+            "fnop" => { self.bytes.extend_from_slice(&[0xD9, 0xD0]); Ok(()) }
+            "fincstp" => { self.bytes.extend_from_slice(&[0xD9, 0xF7]); Ok(()) }
+            "fdecstp" => { self.bytes.extend_from_slice(&[0xD9, 0xF6]); Ok(()) }
+            "ffree" => self.encode_x87_st_i(ops, &[0xDD], 0xC0, "ffree"),
+            "fcom" => self.encode_fcom(ops),
+            "fcoms" => self.encode_fcom_mem(ops, 0xD8, 2),
+            "fcoml" => self.encode_fcom_mem(ops, 0xDC, 2),
+            "fcomp" => self.encode_fcomp(ops),
+            "fcomps" => self.encode_fcom_mem(ops, 0xD8, 3),
+            "fcompl" => self.encode_fcom_mem(ops, 0xDC, 3),
+            "fcompp" => { self.bytes.extend_from_slice(&[0xDE, 0xD9]); Ok(()) }
+            // ffreep %st(i): undocumented AMD/Intel encoding DF /0 (pop without
+            // compare; glibc e_powl.S uses it to drop x87 stack entries).
+            "ffreep" => {
+                let n = match ops.first() {
+                    Some(Operand::Register(reg)) => parse_st_num(&reg.name)?,
+                    _ => 0,
+                };
+                self.bytes.extend_from_slice(&[0xDF, 0xC0 + n]);
+                Ok(())
             }
+            "fucompp" => { self.bytes.extend_from_slice(&[0xDA, 0xE9]); Ok(()) }
+            "fsincos" => { self.bytes.extend_from_slice(&[0xD9, 0xFB]); Ok(()) }
 
             // SSE MXCSR control register
             "ldmxcsr" => self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 2),
             "stmxcsr" => self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 3),
+            // VEX.128.0F.WIG 0F AE /2 /3 (AVX forms; glibc math uses vstmxcsr)
+            "vldmxcsr" => self.encode_vex_mem_only(ops, &[0x0F, 0xAE], 2),
+            "vstmxcsr" => self.encode_vex_mem_only(ops, &[0x0F, 0xAE], 3),
 
             // Prefetch instructions (0F 18 /0-3)
             "prefetcht0" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 1),
@@ -1482,7 +1626,6 @@ impl InstructionEncoder {
             // x87 additional from i686
             "ftst" => { self.bytes.extend_from_slice(&[0xD9, 0xE4]); Ok(()) }
             "fxam" => { self.bytes.extend_from_slice(&[0xD9, 0xE5]); Ok(()) }
-            "fucomi" => self.encode_fucomi(ops),
             "fstl" => self.encode_x87_mem(ops, &[0xDD], 2),
 
             // x87 reverse memory arithmetic
@@ -1498,7 +1641,6 @@ impl InstructionEncoder {
             // SSE packed integer (missing from x86)
             "pcmpgtd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x66]),
             "pmulhuw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE4]),
-            "psubb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF8]),
 
             // System instructions
             "rdmsr" => { self.bytes.extend_from_slice(&[0x0F, 0x32]); Ok(()) }
@@ -1521,6 +1663,21 @@ impl InstructionEncoder {
             "fxrstor" => self.encode_mem_only(ops, &[0x0F, 0xAE], 1), // 0F AE /1
             "fxsaveq" | "fxsave64" => self.encode_fxsaveq(ops),   // REX.W + 0F AE /0
             "fxrstorq" | "fxrstor64" => self.encode_fxrstorq(ops),  // REX.W + 0F AE /1
+            // XSAVE family (encodings verified against GNU as 2.44)
+            "xsave" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 4, false),
+            "xsave64" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 4, true),
+            "xrstor" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 5, false),
+            "xrstor64" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 5, true),
+            "xsaveopt" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 6, false),
+            "xsaveopt64" => self.encode_xsave_family(ops, &[0x0F, 0xAE], 6, true),
+            "xsavec" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 4, false),
+            "xsavec64" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 4, true),
+            // Note: binutils encodes xsaves with ModRM /5 and xrstors with
+            // /3 (empirically verified against GNU as 2.44) — byte-identical.
+            "xsaves" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 5, false),
+            "xsaves64" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 5, true),
+            "xrstors" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 3, false),
+            "xrstors64" => self.encode_xsave_family(ops, &[0x0F, 0xC7], 3, true),
 
             // System table instructions
             "sgdt" | "sidt" | "lgdt" | "lidt"

@@ -38,6 +38,10 @@ pub enum AsmItem {
     Short(Vec<DataValue>),
     /// Emit 32-bit values: `.long val, ...` (can be symbol references)
     Long(Vec<DataValue>),
+    /// Emit ULEB128-encoded values: `.uleb128 val, ...` (DWARF/.eh_frame)
+    Uleb128(Vec<DataValue>),
+    /// Emit SLEB128-encoded values: `.sleb128 val, ...` (DWARF/.eh_frame)
+    Sleb128(Vec<DataValue>),
     /// Emit 64-bit values: `.quad val, ...` (can be symbol references)
     Quad(Vec<DataValue>),
     /// Emit zero bytes: `.zero N`
@@ -110,6 +114,9 @@ pub enum SymbolKind {
     Object,
     TlsObject,
     NoType,
+    /// STT_GNU_IFUNC (10): indirect function resolved at load time by its
+    /// resolver (glibc uses `.type foo, %gnu_indirect_function`).
+    GnuIndirectFunction,
 }
 
 /// Size expression: either a constant or `.-name` (current position minus symbol).
@@ -531,6 +538,14 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let vals = parse_data_values(args)?;
             Ok(AsmItem::Long(vals))
         }
+        ".uleb128" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Uleb128(vals))
+        }
+        ".sleb128" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Sleb128(vals))
+        }
         ".quad" | ".8byte" => {
             let vals = parse_data_values(args)?;
             Ok(AsmItem::Quad(vals))
@@ -627,24 +642,25 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".cfi_startproc" => Ok(AsmItem::Cfi(CfiDirective::StartProc)),
         ".cfi_endproc" => Ok(AsmItem::Cfi(CfiDirective::EndProc)),
         ".cfi_def_cfa_offset" => {
-            let val: i32 = args.trim().parse()
+            // Accept full constant expressions (e.g. "8*2", "N*8+N").
+            let val = parse_integer_expr(args.trim())
                 .map_err(|_| format!("bad cfi offset: {}", args))?;
-            Ok(AsmItem::Cfi(CfiDirective::DefCfaOffset(val)))
+            Ok(AsmItem::Cfi(CfiDirective::DefCfaOffset(val as i32)))
         }
         ".cfi_def_cfa_register" => {
             let reg = args.trim().trim_start_matches('%').to_string();
             Ok(AsmItem::Cfi(CfiDirective::DefCfaRegister(reg)))
         }
         ".cfi_offset" => {
-            // .cfi_offset %rbp, -16
+            // .cfi_offset %rbp, -16  (offset may be a constant expression)
             let parts: Vec<&str> = args.splitn(2, ',').collect();
             if parts.len() != 2 {
                 return Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())));
             }
             let reg = parts[0].trim().trim_start_matches('%').to_string();
-            let off: i32 = parts[1].trim().parse()
+            let off = parse_integer_expr(parts[1].trim())
                 .map_err(|_| format!("bad cfi offset value: {}", args))?;
-            Ok(AsmItem::Cfi(CfiDirective::Offset(reg, off)))
+            Ok(AsmItem::Cfi(CfiDirective::Offset(reg, off as i32)))
         }
         ".file" => {
             // .file N "filename"
@@ -698,6 +714,14 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                 Some(parts[2].trim().parse::<u64>().unwrap_or(0))
             } else { None };
             Ok(AsmItem::Incbin { path, skip, count })
+        }
+        d if d.starts_with(".cfi_") => {
+            // Any other .cfi_* directive (restore, adjust_cfa_offset, def_cfa,
+            // register, undefined, escape, personality, lsda, sections,
+            // signal_frame, remember/restore_state, val_offset, expression):
+            // record tolerantly — CFI is parsed but not emitted by the builtin
+            // assembler, so no argument shape may abort glibc/GCC-generated .S.
+            Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())))
         }
         _ => {
             // Unknown directive - just ignore it with a warning
@@ -794,6 +818,8 @@ fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
         "@object" | "%object" | "STT_OBJECT" => SymbolKind::Object,
         "@tls_object" | "%tls_object" | "STT_TLS" => SymbolKind::TlsObject,
         "@notype" | "%notype" | "STT_NOTYPE" => SymbolKind::NoType,
+        "@gnu_indirect_function" | "%gnu_indirect_function" | "STT_GNU_IFUNC"
+        | "@gnu_indirect_function," | "%gnu_indirect_function," => SymbolKind::GnuIndirectFunction,
         _ => return Err(format!("unknown symbol type: {}", kind_str)),
     };
     Ok(AsmItem::SymbolType(name, kind))
@@ -900,12 +926,36 @@ fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, Stri
 
 /// Split a line into mnemonic and operand string.
 fn split_mnemonic_operands(line: &str) -> (&str, &str) {
-    if let Some(pos) = line.find(|c: char| c.is_whitespace()) {
-        let mnemonic = &line[..pos];
-        let rest = line[pos..].trim();
+    // Strip GNU as encoding-prefix hints ({vex}, {vex3}, {vex2}, {evex}).
+    // LCCC's encoders emit the shortest valid VEX encoding for 128/256-bit
+    // instructions, which is semantically identical to the hinted form; the
+    // prefixes are accepted so GCC/LLVM-generated assembly assembles cleanly.
+    let trimmed = line.trim_start();
+    let trimmed = if let Some(rest) = trimmed.strip_prefix("{vex} ")
+        .or_else(|| trimmed.strip_prefix("{vex3} "))
+        .or_else(|| trimmed.strip_prefix("{vex2} "))
+        .or_else(|| trimmed.strip_prefix("{evex} "))
+    {
+        rest
+    } else {
+        trimmed
+    };
+    let trimmed = if (trimmed.starts_with("%v") || trimmed.starts_with("%x"))
+        && trimmed.len() > 2
+        && trimmed.as_bytes()[2].is_ascii_alphabetic()
+    {
+        // Keep the v: "%vstmxcsr" -> "vstmxcsr" (GNU as selects the VEX
+        // encoding for the %v hint; LCCC's v* encoders match).
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+    if let Some(pos) = trimmed.find(|c: char| c.is_whitespace()) {
+        let mnemonic = &trimmed[..pos];
+        let rest = trimmed[pos..].trim();
         (mnemonic, rest)
     } else {
-        (line, "")
+        (trimmed, "")
     }
 }
 
@@ -996,7 +1046,9 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
 
 /// Parse a register operand like %rax, %st(0).
 fn parse_register_operand(s: &str) -> Result<Operand, String> {
-    let name = &s[1..]; // strip %
+    // GNU as tolerates whitespace between '%' and the register name
+    // (glibc emits `mov % r13, ...` from `% " R13_LP "` macro splicing).
+    let name = s[1..].trim_start(); // strip % and any following spaces
 
     // Handle %st(N)
     if name.starts_with("st(") && name.ends_with(')') {
@@ -1051,10 +1103,8 @@ fn parse_immediate_operand(s: &str) -> Result<Operand, String> {
         return Ok(Operand::Immediate(ImmediateValue::Integer(val)));
     }
 
-    // Symbol with modifier: symbol@GOTPCREL, etc.
-    if let Some(at_pos) = s.find('@') {
-        let sym = s[..at_pos].to_string();
-        let modifier = s[at_pos + 1..].to_string();
+    // Symbol with modifier: symbol@GOTPCREL, sym@VER@GOTPCREL, etc.
+    if let Some((sym, modifier)) = split_sym_modifier(s) {
         return Ok(Operand::Immediate(ImmediateValue::SymbolMod(sym, modifier)));
     }
 
@@ -1071,6 +1121,34 @@ fn parse_immediate_operand(s: &str) -> Result<Operand, String> {
 
     // Plain symbol
     Ok(Operand::Immediate(ImmediateValue::Symbol(s.to_string())))
+}
+
+/// Known relocation modifiers (GNU as). `sym@VER@GOTPCREL` must split at the
+/// LAST '@' (the modifier), keeping `sym@VER` as the versioned symbol name;
+/// a bare `sym@VER` (suffix not in this list) stays a plain symbol.
+fn is_known_reloc_modifier(m: &str) -> bool {
+    matches!(m.to_ascii_uppercase().as_str(),
+        "GOT" | "GOTPCREL" | "GOTPCRELX" | "GOTOFF" | "GOTTPOFF" | "GOTNTPOFF"
+        | "PLT" | "TPOFF" | "TPREL" | "NTPOFF" | "INDNTPOFF" | "TLSGD"
+        | "TLSLD" | "DTPMOD" | "DTPOFF" | "TLSDESC" | "PLTOFF"
+        | "SECREL" | "SIZE" | "CALL" | "PAGEOFF" | "PAGE" | "GOTPLT")
+}
+
+/// Split `sym@mod` at the LAST '@' when the suffix is a known relocation
+/// modifier; otherwise return the whole string as a plain symbol.
+fn split_sym_modifier(s: &str) -> Option<(String, String)> {
+    let mut last = None;
+    for (i, c) in s.char_indices() {
+        if c == '@' {
+            last = Some(i);
+        }
+    }
+    let i = last?;
+    let modifier = &s[i + 1..];
+    if modifier.is_empty() || !is_known_reloc_modifier(modifier) {
+        return None;
+    }
+    Some((s[..i].to_string(), modifier.to_string()))
 }
 
 /// Try to parse a symbol difference expression in an immediate value.
@@ -1097,7 +1175,7 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
     // Check for segment prefix: %fs:..., %gs:...
     if s.starts_with('%') {
         if let Some(colon_pos) = s.find(':') {
-            let seg = &s[1..colon_pos];
+            let seg = s[1..colon_pos].trim_start();
             if seg == "fs" || seg == "gs" {
                 let rest = &s[colon_pos + 1..];
                 let mut mem = parse_memory_inner(rest)?;
@@ -1163,8 +1241,38 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
         // Parse base, index, scale from inside parens
         let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
 
+        // Segment override may appear inside the parens, e.g. the TLS
+        // initial-exec access `g_tls@TPOFF(%fs:0)` (or `%gs:...`). The first
+        // part `%fs:0` must set the segment and leave the base empty — the
+        // address is seg:disp32 with no base/index. Previously this parsed
+        // "fs:0" as a base register name, which the encoder defaulted to %rax
+        // and silently dropped the segment prefix (miscompiled TLS reads).
+        let mut seg_override: Option<String> = None;
         let base = if !parts.is_empty() && !parts[0].is_empty() {
-            Some(Register::new(parts[0].trim_start_matches('%')))
+            let p0 = parts[0];
+            if let Some(colon) = p0.find(':') {
+                if p0.starts_with('%') {
+                    let seg = &p0[1..colon];
+                    if seg == "fs" || seg == "gs" {
+                        seg_override = Some(seg.to_string());
+                        let seg_val = p0[colon + 1..].trim();
+                        if !seg_val.is_empty() && seg_val != "0"
+                            && seg_val.starts_with('%')
+                        {
+                            // `%fs:%reg` form: keep the register as base.
+                            Some(Register::new(seg_val.trim_start_matches('%')))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(Register::new(p0.trim_start_matches('%')))
+                    }
+                } else {
+                    Some(Register::new(p0.trim_start_matches('%')))
+                }
+            } else {
+                Some(Register::new(p0.trim_start_matches('%')))
+            }
         } else {
             None
         };
@@ -1183,7 +1291,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
         };
 
         Ok(MemoryOperand {
-            segment: None,
+            segment: seg_override,
             displacement,
             base,
             index,
@@ -1241,10 +1349,8 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
         return Ok(Displacement::Integer(val));
     }
 
-    // Symbol with modifier: symbol@GOTPCREL, symbol@TPOFF, etc.
-    if let Some(at_pos) = s.find('@') {
-        let sym = s[..at_pos].to_string();
-        let modifier = s[at_pos + 1..].to_string();
+    // Symbol with modifier: symbol@GOTPCREL, sym@VER@GOTPCREL, etc.
+    if let Some((sym, modifier)) = split_sym_modifier(s) {
         return Ok(Displacement::SymbolMod(sym, modifier));
     }
 
@@ -1495,10 +1601,86 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // GNU as symbol-difference forms without spaces or with parentheses
+        // (glibc .eh_frame emits `(.LSTART_restore_rt-1)-.`,
+        //  `.LEND_restore_rt-(.LSTART_restore_rt-1)`, `.LENDCIE_-.LSTARTCIE_`).
+        if let Some(val) = try_parse_sym_diff(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
         // Symbol reference
         vals.push(DataValue::Symbol(trimmed.to_string()));
     }
     Ok(vals)
+}
+
+/// Split `sym`, `sym+N`, `sym-N`, `(sym±N)` into (symbol, addend) where the
+/// value equals `symbol + addend`. Returns None for non-label strings.
+fn parse_sym_addend(s: &str) -> Option<(String, i64)> {
+    let t = s.trim();
+    let t = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    for (i, c) in t.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let sym = t[..i].trim();
+            if !is_label_like(sym) {
+                continue;
+            }
+            let num_raw: String = t[i..].chars().filter(|c| !c.is_whitespace()).collect();
+            let v: i64 = if let Some(r) = num_raw.strip_prefix('+') {
+                r.parse().ok()?
+            } else if let Some(r) = num_raw.strip_prefix('-') {
+                -r.parse::<i64>().ok()?
+            } else {
+                continue;
+            };
+            return Some((sym.to_string(), v));
+        }
+    }
+    if is_label_like(t) {
+        Some((t.to_string(), 0))
+    } else {
+        None
+    }
+}
+
+/// Parse GNU-as symbol-difference expressions that lack spaces around the
+/// operator or use parentheses: `(a-1)-.`, `a-(b-1)`, `(a+2)-b`, `a-b`.
+/// Returns DataValue::SymbolDiffAddend(a, b, add) meaning `a - b + add`.
+fn try_parse_sym_diff(s: &str) -> Option<DataValue> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..bytes.len() {
+        let c = bytes[i] as char;
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        } else if c == '-' && depth == 0 && i > 0 {
+            let lhs = &s[..i];
+            let rhs = &s[i + 1..];
+            let (a, add_a) = parse_sym_addend(lhs)?;
+            if rhs.trim() == "." {
+                // (a ± N) - .  ==  a - . ± N   (PC-relative, GNU as encodes as
+                // a PC32 reloc with the addend folded in)
+                return Some(DataValue::SymbolDiffAddend(a, ".".to_string(), add_a));
+            }
+            if let Some((b, add_b)) = parse_sym_addend(rhs) {
+                // a + add_a - (b + add_b) = a - b + (add_a - add_b)
+                return Some(DataValue::SymbolDiffAddend(a, b, add_a - add_b));
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Parse symbol+offset or symbol-offset expressions (e.g., GD_struct+128).
@@ -1746,6 +1928,56 @@ fn expand_gas_macros_with_state(
                     chosen_lines = blines;
                     break;
                 }
+            }
+            let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
+            result.extend(expanded);
+            i += 1;
+            continue;
+        }
+
+        // .ifb string / .ifnb string / .endif
+        // GAS tests whether the argument text is blank after macro substitution.
+        // Linux/FFmpeg x86 macro code uses these heavily for optional operands.
+        if trimmed == ".ifb" || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb	")
+            || trimmed == ".ifnb" || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb	")
+        {
+            let is_ifnb = trimmed.starts_with(".ifnb");
+            let rest = if is_ifnb {
+                trimmed[".ifnb".len()..].trim()
+            } else {
+                trimmed[".ifb".len()..].trim()
+            };
+            let cond = if is_ifnb { !eval_ifb(rest) } else { eval_ifb(rest) };
+            let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
+            let mut current_idx = 0;
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(&lines[i]).trim().to_string();
+                if is_if_start(&inner) {
+                    depth += 1;
+                    branches[current_idx].1.push(lines[i].clone());
+                } else if inner == ".endif" {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                    branches[current_idx].1.push(lines[i].clone());
+                } else if depth == 1 && (inner.starts_with(".elseif ") || inner.starts_with(".elseif	")) {
+                    let elseif_rest = inner[".elseif".len()..].trim();
+                    let elseif_cond = eval_if_expr(elseif_rest, symbols);
+                    branches.push((elseif_cond, Vec::new()));
+                    current_idx += 1;
+                } else if inner == ".else" && depth == 1 {
+                    branches.push((true, Vec::new()));
+                    current_idx += 1;
+                } else {
+                    branches[current_idx].1.push(lines[i].clone());
+                }
+                i += 1;
+            }
+            let empty: Vec<String> = Vec::new();
+            let mut chosen_lines: &Vec<String> = &empty;
+            for (bcond, blines) in &branches {
+                if *bcond { chosen_lines = blines; break; }
             }
             let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
             result.extend(expanded);
@@ -2046,6 +2278,17 @@ fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
     Ok((var, items))
 }
 
+/// Evaluate .ifb/.ifnb blank-argument test.  GAS treats an omitted
+/// argument, empty string, or macro argument that expands to nothing as blank.
+fn eval_ifb(rest: &str) -> bool {
+    let t = rest.trim();
+    if t.is_empty() { return true; }
+    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
+        return t.len() <= 2;
+    }
+    false
+}
+
 /// Evaluate .ifc string comparison: "str1, str2" => true if equal
 fn eval_ifc(rest: &str) -> bool {
     if let Some(comma_pos) = rest.find(',') {
@@ -2115,6 +2358,8 @@ fn is_ident_char(b: u8) -> bool {
 fn is_if_start(trimmed: &str) -> bool {
     trimmed.starts_with(".if ") || trimmed.starts_with(".if\t") || trimmed.starts_with(".if(")
         || trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t")
+        || trimmed == ".ifb" || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb\t")
+        || trimmed == ".ifnb" || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb\t")
         || trimmed.starts_with(".ifdef ") || trimmed.starts_with(".ifndef ")
 }
 

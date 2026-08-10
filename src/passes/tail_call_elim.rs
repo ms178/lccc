@@ -44,7 +44,9 @@
 //! - The tail call is not in the entry block (would create duplicate predecessors)
 
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value};
+use crate::ir::reexports::{
+    BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+};
 
 /// Run tail-call-to-loop on a single function.
 /// Returns the number of tail calls eliminated (0 = no change).
@@ -65,7 +67,12 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     let mut param_refs: Vec<Option<(Value, crate::common::types::IrType)>> = vec![None; num_params];
 
     for inst in &func.blocks[0].instructions {
-        if let Instruction::ParamRef { dest, param_idx, ty } = inst {
+        if let Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } = inst
+        {
             if *param_idx < num_params {
                 param_refs[*param_idx] = Some((*dest, *ty));
             }
@@ -99,9 +106,11 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
         }
 
         // Find the last Call to self in this block.
-        let Some(call_idx) = block.instructions.iter().rposition(|inst| {
-            matches!(inst, Instruction::Call { func: f, .. } if f == &func_name)
-        }) else {
+        let Some(call_idx) = block
+            .instructions
+            .iter()
+            .rposition(|inst| matches!(inst, Instruction::Call { func: f, .. } if f == &func_name))
+        else {
             continue;
         };
 
@@ -136,9 +145,7 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
         // Verify the block's terminator is Return(call_result) or Return(None).
         let is_tail = match &block.terminator {
             Terminator::Return(None) => call_dest.is_none(),
-            Terminator::Return(Some(Operand::Value(rv))) => {
-                call_dest.map(|d| d.0) == Some(rv.0)
-            }
+            Terminator::Return(Some(Operand::Value(rv))) => call_dest.map(|d| d.0) == Some(rv.0),
             _ => false,
         };
         if !is_tail {
@@ -166,8 +173,7 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
         })
         .collect();
 
-    let loop_header_label =
-        BlockId(func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1);
+    let loop_header_label = BlockId(func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1);
     let entry_label = func.blocks[0].label;
 
     // ── 4. Build replacement map: paramref Value → phi Value ───────────────
@@ -210,18 +216,26 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     for (i, inst) in entry_block.instructions.drain(..).enumerate() {
         let is_anchor = matches!(
             inst,
-            Instruction::ParamRef { .. } | Instruction::Alloca { .. } | Instruction::DynAlloca { .. }
+            Instruction::ParamRef { .. }
+                | Instruction::Alloca { .. }
+                | Instruction::DynAlloca { .. }
         );
         if is_anchor {
             keep_in_entry.push(inst);
-            if has_spans { keep_spans.push(old_spans[i]); }
+            if has_spans {
+                keep_spans.push(old_spans[i]);
+            }
         } else {
             move_to_header.push(inst);
-            if has_spans { header_spans.push(old_spans[i]); }
+            if has_spans {
+                header_spans.push(old_spans[i]);
+            }
         }
     }
     entry_block.instructions = keep_in_entry;
-    if has_spans { entry_block.source_spans = keep_spans; }
+    if has_spans {
+        entry_block.source_spans = keep_spans;
+    }
 
     // ── 7. Redirect entry block terminator → loop header ───────────────────
     let entry_original_terminator = std::mem::replace(
@@ -385,7 +399,12 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
         }
 
         // ── Select ───────────────────────────────────────────────────────
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             replace_op(cond, map);
             replace_op(true_val, map);
             replace_op(false_val, map);
@@ -396,7 +415,13 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
             replace_op(ptr, map);
             replace_op(val, map);
         }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
+        Instruction::AtomicInc { ptr, .. } => replace_op(ptr, map),
+        Instruction::AtomicCmpxchg {
+            ptr,
+            expected,
+            desired,
+            ..
+        } => {
             replace_op(ptr, map);
             replace_op(expected, map);
             replace_op(desired, map);
@@ -409,7 +434,11 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
 
         // ── varargs ──────────────────────────────────────────────────────
         Instruction::VaArg { va_list_ptr, .. } => replace_val(va_list_ptr, map),
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => {
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            ..
+        } => {
             replace_val(dest_ptr, map);
             replace_val(va_list_ptr, map);
         }
@@ -469,6 +498,7 @@ mod tests {
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
+                is_f128_sse: false,
             })
             .collect();
         IrFunction::new(name.to_string(), IrType::I64, ir_params, false)
@@ -509,8 +539,16 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
-                Instruction::ParamRef { dest: Value(1), param_idx: 1, ty: IrType::I64 },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I64,
+                },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Eq,
@@ -572,6 +610,7 @@ mod tests {
                         struct_arg_aligns: vec![None, None],
                         struct_arg_classes: vec![vec![], vec![]],
                         struct_arg_riscv_float_classes: vec![None, None],
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: vec![],
@@ -618,10 +657,15 @@ mod tests {
         tail_calls_to_loops(&mut func);
         // The last block pushed is the loop header.
         let header = func.blocks.last().unwrap();
-        let phi_count = header.instructions.iter()
+        let phi_count = header
+            .instructions
+            .iter()
             .filter(|i| matches!(i, Instruction::Phi { .. }))
             .count();
-        assert_eq!(phi_count, 2, "loop header should have 2 phi nodes (one per param)");
+        assert_eq!(
+            phi_count, 2,
+            "loop header should have 2 phi nodes (one per param)"
+        );
     }
 
     #[test]
@@ -635,10 +679,14 @@ mod tests {
             "tail-call block terminator should be Branch after TCE"
         );
         // The Call instruction should be removed.
-        let has_self_call = rec_block.instructions.iter().any(|inst| {
-            matches!(inst, Instruction::Call { func: f, .. } if f == "sum")
-        });
-        assert!(!has_self_call, "self-recursive Call should be removed by TCE");
+        let has_self_call = rec_block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Call { func: f, .. } if f == "sum"));
+        assert!(
+            !has_self_call,
+            "self-recursive Call should be removed by TCE"
+        );
     }
 
     #[test]
@@ -648,12 +696,28 @@ mod tests {
         // Value(0) was %n (ParamRef). Value(2) (the compare) used it.
         // After TCE, that compare should use a phi value, not Value(0).
         let header = func.blocks.last().unwrap();
-        let phi_dests: Vec<u32> = header.instructions.iter()
-            .filter_map(|i| if let Instruction::Phi { dest, .. } = i { Some(dest.0) } else { None })
+        let phi_dests: Vec<u32> = header
+            .instructions
+            .iter()
+            .filter_map(|i| {
+                if let Instruction::Phi { dest, .. } = i {
+                    Some(dest.0)
+                } else {
+                    None
+                }
+            })
             .collect();
         // The Cmp (originally in entry, now moved to loop header) should use a phi val.
-        let cmp_inst = header.instructions.iter().find(|i| matches!(i, Instruction::Cmp { .. })).unwrap();
-        if let Instruction::Cmp { lhs: Operand::Value(lhs_val), .. } = cmp_inst {
+        let cmp_inst = header
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Cmp { .. }))
+            .unwrap();
+        if let Instruction::Cmp {
+            lhs: Operand::Value(lhs_val),
+            ..
+        } = cmp_inst
+        {
             assert!(
                 phi_dests.contains(&lhs_val.0),
                 "Cmp should use a phi value after renaming, got Value({})",
@@ -671,8 +735,16 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
-                Instruction::ParamRef { dest: Value(1), param_idx: 1, ty: IrType::I32 },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I32,
+                },
                 Instruction::BinOp {
                     dest: Value(2),
                     op: IrBinOp::Add,
@@ -688,7 +760,11 @@ mod tests {
 
         let n = tail_calls_to_loops(&mut func);
         assert_eq!(n, 0);
-        assert_eq!(func.blocks.len(), 1, "non-recursive function should be unchanged");
+        assert_eq!(
+            func.blocks.len(),
+            1,
+            "non-recursive function should be unchanged"
+        );
     }
 
     #[test]
@@ -697,9 +773,11 @@ mod tests {
         let mut func = make_func("fib", vec![IrType::I32]);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
-            ],
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -720,6 +798,7 @@ mod tests {
                         struct_arg_aligns: vec![None],
                         struct_arg_classes: vec![vec![]],
                         struct_arg_riscv_float_classes: vec![None],
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: vec![],

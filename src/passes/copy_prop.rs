@@ -12,18 +12,11 @@
 //!
 //! After this pass runs, the dead Copy instructions are cleaned up by DCE.
 //!
-//! Performance: Uses a flat Vec<Option<Operand>> indexed by Value ID instead of
+//! Performance: Uses a flat `Vec<Option<Operand>>` indexed by Value ID instead of
 //! FxHashMap, since Value IDs are dense sequential u32s. This eliminates hashing
 //! overhead and gives O(1) lookups with better cache locality.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrFunction,
-    IrModule,
-    Operand,
-    Terminator,
-    Value,
-};
+use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Terminator, Value};
 
 /// Run copy propagation on the entire module.
 /// Returns the number of operand replacements made.
@@ -132,7 +125,11 @@ fn resolve_chain_with_compression(copies: &mut [Option<Operand>], start: u32) {
         }
 
         let idx = current as usize;
-        match if idx < copies.len() { copies[idx] } else { None } {
+        match if idx < copies.len() {
+            copies[idx]
+        } else {
+            None
+        } {
             Some(Operand::Value(v)) => {
                 if v.0 == current {
                     // Self-reference (multi-def or cycle)
@@ -255,7 +252,11 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
             count += replace_value_in_place(dest_ptr, copy_map);
             count += replace_value_in_place(src_ptr, copy_map);
         }
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => {
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            ..
+        } => {
             count += replace_value_in_place(dest_ptr, copy_map);
             count += replace_value_in_place(va_list_ptr, copy_map);
         }
@@ -263,7 +264,15 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
             count += replace_operand(ptr, copy_map);
             count += replace_operand(val, copy_map);
         }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
+        Instruction::AtomicInc { ptr, .. } => {
+            count += replace_operand(ptr, copy_map);
+        }
+        Instruction::AtomicCmpxchg {
+            ptr,
+            expected,
+            desired,
+            ..
+        } => {
             count += replace_operand(ptr, copy_map);
             count += replace_operand(expected, copy_map);
             count += replace_operand(desired, copy_map);
@@ -294,17 +303,40 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
         Instruction::SetReturnF128Second { src } => {
             count += replace_operand(src, copy_map);
         }
-        Instruction::InlineAsm { inputs, .. } => {
+        Instruction::InlineAsm { outputs, inputs, .. } => {
+            // Output pointers are address operands (e.g. "=r"(*p) derefs): they
+            // must participate in copy propagation like Intrinsic dest_ptr
+            // below. Without this, a Copy/Load that materialized the pointer
+            // becomes the asm output's only def; DCE then removes it (the asm
+            // output is treated as a use, but propagation never rewrote it),
+            // leaving a dangling output that slot_assignment promotes to a
+            // direct slot, so the asm result is stored into the wrong slot
+            // instead of through the pointer (wrong code, e.g. cpuid.h).
+            for (_constraint, ptr, _name) in outputs.iter_mut() {
+                count += replace_value_in_place(ptr, copy_map);
+            }
             for (_constraint, op, _name) in inputs.iter_mut() {
                 count += replace_operand(op, copy_map);
             }
         }
-        Instruction::Intrinsic { args, .. } => {
+        Instruction::Intrinsic { dest_ptr, args, .. } => {
+            // dest_ptr is an address operand (e.g. Storedqu's target); it must
+            // participate in copy propagation or a surviving `Copy p = q`
+            // leaves p with no register and no slot, and the backend emits a
+            // store through a stale register (wrong-code).
+            if let Some(dp) = dest_ptr.as_mut() {
+                count += replace_value_in_place(dp, copy_map);
+            }
             for arg in args.iter_mut() {
                 count += replace_operand(arg, copy_map);
             }
         }
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             count += replace_operand(cond, copy_map);
             count += replace_operand(true_val, copy_map);
             count += replace_operand(false_val, copy_map);
@@ -369,6 +401,271 @@ fn replace_value_in_place(val: &mut Value, copy_map: &[Option<Operand>]) -> usiz
     0
 }
 
+/// ms178: Post-phi-elimination copy cleanup.
+///
+/// `eliminate_phis` runs LAST in the pipeline, so the copy-backs it introduces
+/// are never optimized: every phi copy-back becomes a store→load→store relay in
+/// the emitted asm (huge spill churn in hot loops; gzip's `longest_match` had
+/// 120 copies surviving to codegen).
+///
+/// We cannot naively run `propagate_copies` here — the IR is no longer in SSA
+/// form, and a copy dest may be used before its copy executes in a loop (that
+/// is precisely the phi semantics). Instead we apply two provably sound
+/// transforms, in a fixpoint loop:
+///
+/// 1. **Dead-copy elimination**: remove `Copy(dest, src)` when `dest` has zero
+///    uses anywhere. No use, no semantics.
+///
+/// 2. **Same-block, after-copy propagation through single-def values**: for
+///    `Copy(dest, src)` at instruction index `i` in block B, if every use of
+///    `dest` is an instruction operand in B at an index > `i` (never in a
+///    terminator, never in another block) AND `src` is single-def (defined by
+///    exactly one instruction, or a constant/parameter — hence never modified
+///    between the copy and any use), then replacing those uses with `src` is
+///    equivalent. Removes the copy.
+///
+/// The single-def requirement on `src` restores the SSA guarantee that the
+/// source's value is invariant, which is what makes the substitution sound
+/// despite the IR no longer being SSA. Loop-carried phi copy-backs (src
+/// multi-def) are conservatively kept.
+///
+/// Returns the number of copies removed.
+pub fn propagate_copies_post_phi(func: &mut IrFunction) -> usize {
+    let mut total = 0usize;
+    // Fixpoint: chains (Copy(a,b); Copy(b,c)) collapse one link per round, and
+    // dead copies cascade. Chains are short; cap at 8 rounds.
+    for _ in 0..8 {
+        let removed = one_round_post_phi(func);
+        total += removed;
+        if removed == 0 {
+            break;
+        }
+    }
+    total
+}
+
+fn one_round_post_phi(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
+    let mut def_count = vec![0u32; max_id + 1];
+    let mut def_position: Vec<Option<(usize, usize)>> = vec![None; max_id + 1];
+    let mut use_count = vec![0u32; max_id + 1];
+    let mut use_positions: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_id + 1];
+    let mut copies: Vec<(usize, usize, Value, Operand)> = Vec::new(); // (bi, ii, dest, src)
+
+    // Count definitions (single-def test) and uses.
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Copy { dest, src } => {
+                    if (dest.0 as usize) <= max_id {
+                        def_count[dest.0 as usize] += 1;
+                        def_position[dest.0 as usize] = Some((bi, ii));
+                    }
+                    if let Operand::Value(v) = src {
+                        if (v.0 as usize) <= max_id {
+                            use_count[v.0 as usize] += 1;
+                            use_positions[v.0 as usize].push((bi, ii));
+                        }
+                    }
+                    copies.push((bi, ii, *dest, *src));
+                }
+                _ => {
+                    if let Some(d) = inst.dest() {
+                        if (d.0 as usize) <= max_id {
+                            def_count[d.0 as usize] += 1;
+                            def_position[d.0 as usize] = Some((bi, ii));
+                        }
+                    }
+                    // Operand uses (BinOp/Cmp/Call args/Cast src/GEP offset/...)
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            if (v.0 as usize) <= max_id {
+                                use_count[v.0 as usize] += 1;
+                                use_positions[v.0 as usize].push((bi, ii));
+                            }
+                        }
+                    });
+                    // Value-only uses (Load.ptr, Store.ptr, GEP.base, Memcpy,
+                    // CallIndirect func_ptr, va_* pointers, atomic ptrs). These
+                    // are uses too — missing them made the pass think a copy
+                    // dest was dead and remove a copy that a Store/Load still
+                    // depended on (miscompiled inflate/deflate).
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                        if (v.0 as usize) <= max_id {
+                            use_count[v.0 as usize] += 1;
+                            use_positions[v.0 as usize].push((bi, ii));
+                        }
+                    });
+                }
+            }
+        }
+        // Terminator uses (Return value, CondBranch cond, Switch val,
+        // IndirectBranch target) — recorded at (bi, usize::MAX) so they count
+        // as "after any instruction in the block".
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if (v.0 as usize) <= max_id {
+                    use_count[v.0 as usize] += 1;
+                    use_positions[v.0 as usize].push((bi, usize::MAX));
+                }
+            }
+        });
+    }
+
+    // Decide which copies to remove.
+    let mut to_remove: Vec<(usize, usize, Value, Operand)> = Vec::new();
+    let mut dbg_kept = [0usize; 4]; // [other_block, use_before, src_multidef, would_change]
+    for &(bi, ii, dest, ref src) in &copies {
+        let id = dest.0 as usize;
+        let empty: &[(usize, usize)] = &[];
+        let uses: &[(usize, usize)] = if id < use_positions.len() {
+            use_positions[id].as_slice()
+        } else {
+            empty
+        };
+        // Case 1: dead copy.
+        if uses.is_empty() {
+            to_remove.push((bi, ii, dest, *src));
+            continue;
+        }
+        // ms178 debug: restrict to dead-copy-only mode when asked.
+        if std::env::var("CCC_PHICLEANUP_DEADONLY").is_ok() {
+            continue;
+        }
+        // Case 2: same-block-after AND src provably available before the copy
+        // AND dest single-def.
+        //
+        // SOUNDNESS: the IR is not SSA here. A loop-carried src may be defined
+        // AFTER the copy in program order (its def executes at the end of the
+        // previous iteration) — substituting it would read an undefined value on
+        // the first iteration. So we require src to be a constant, a parameter,
+        // or defined in the SAME block at an index BEFORE the copy. That
+        // guarantees src holds the same value at every rewritten use.
+        let src_available = match src {
+            Operand::Const(_) => true,
+            Operand::Value(v) => {
+                if (v.0 as usize) > max_id {
+                    false
+                } else {
+                    match def_position[v.0 as usize] {
+                        Some((db, di)) => db == bi && di < ii,
+                        None => false, // undefined value
+                    }
+                }
+            }
+        };
+        if !src_available {
+            dbg_kept[2] += 1;
+            continue;
+        }
+        if def_count[id] != 1 {
+            continue;
+        }
+        let mut all_after = true;
+        let mut reason = 0usize; // 0=other block, 1=use before
+        for &(ub, ui) in uses {
+            if ub != bi {
+                all_after = false;
+                reason = 0;
+                break;
+            }
+            if ui <= ii {
+                all_after = false;
+                reason = 1;
+                break;
+            }
+        }
+        if all_after {
+            to_remove.push((bi, ii, dest, *src));
+        } else {
+            dbg_kept[reason] += 1;
+        }
+    }
+    if std::env::var("CCC_DEBUG_PHICLEANUP").is_ok() {
+        eprintln!("[PHICLEANUP] fn={} copies={} removed={} kept_other_block={} kept_use_before={} kept_src_multidef={}",
+            func.name, copies.len(), to_remove.len(), dbg_kept[0], dbg_kept[1], dbg_kept[2]);
+    }
+
+    if to_remove.is_empty() {
+        return 0;
+    }
+
+    // Apply: replace same-block-after uses of removed copies with their
+    // RESOLVED source. Chained copies (d1=Copy(s1); d2=Copy(d1)) must resolve
+    // d2's source to s1 — substituting the intermediate d1 would leave a
+    // dangling reference once d1's own copy is removed.
+    let removed = to_remove.len();
+    let resolved_src: Vec<Operand> = to_remove
+        .iter()
+        .map(|&(_, _, dest, src)| {
+            let mut cur = src;
+            let mut depth = 0;
+            while depth < 32 {
+                match cur {
+                    Operand::Value(v) => {
+                        if let Some(&(_, _, d2, s2)) =
+                            to_remove.iter().find(|&&(_, _, d, _)| d == v)
+                        {
+                            cur = s2;
+                            depth += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            cur
+        })
+        .collect();
+    for (idx, (bi, ii, dest, _)) in to_remove.iter().enumerate() {
+        // Replace uses of dest in block bi at indices > ii — INCLUDING the
+        // block's terminator (a terminator use is recorded at (bi, usize::MAX),
+        // passes the "after" check, and executes after all instructions in the
+        // block; leaving it unreplaced would dangle after the copy is removed).
+        let map = copy_single_map(*dest, resolved_src[idx]);
+        let block = &mut func.blocks[*bi];
+        for inst in block.instructions.iter_mut().skip(ii + 1) {
+            replace_operands_in_instruction(inst, &map);
+        }
+        let term = &mut func.blocks[*bi].terminator;
+        replace_operands_in_terminator(term, &map);
+    }
+
+    // Remove the copies themselves (rebuild each block's instruction list,
+    // dropping the marked copy indices).
+    {
+        use std::collections::HashSet;
+        let mut per_block: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
+        for &(bi, ii, _, _) in &to_remove {
+            if bi < per_block.len() {
+                per_block[bi].insert(ii);
+            }
+        }
+        for (bi, block) in func.blocks.iter_mut().enumerate() {
+            let to_drop = &per_block[bi];
+            let mut new_list: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
+            for (ii, inst) in block.instructions.drain(..).enumerate() {
+                if !to_drop.contains(&ii) {
+                    new_list.push(inst);
+                }
+            }
+            block.instructions = new_list;
+        }
+    }
+
+    removed
+}
+
+/// A tiny single-entry copy map used by the post-phi substitution.
+fn copy_single_map(dest: Value, src: Operand) -> Vec<Option<Operand>> {
+    let mut m = Vec::new();
+    let cap = dest.0 as usize + 1;
+    m.resize(cap, None);
+    m[dest.0 as usize] = Some(src);
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,7 +704,10 @@ mod tests {
 
         // The BinOp should now reference %0 directly
         match &func.blocks[0].instructions[1] {
-            Instruction::BinOp { lhs: Operand::Value(v), .. } => {
+            Instruction::BinOp {
+                lhs: Operand::Value(v),
+                ..
+            } => {
                 assert_eq!(v.0, 0, "Should reference original value %0");
             }
             other => panic!("Expected BinOp, got {:?}", other),
@@ -449,7 +749,10 @@ mod tests {
 
         // The BinOp should now reference %0 directly
         match &func.blocks[0].instructions[2] {
-            Instruction::BinOp { lhs: Operand::Value(v), .. } => {
+            Instruction::BinOp {
+                lhs: Operand::Value(v),
+                ..
+            } => {
                 assert_eq!(v.0, 0, "Should resolve chain to original value %0");
             }
             other => panic!("Expected BinOp, got {:?}", other),
@@ -486,7 +789,10 @@ mod tests {
 
         // The BinOp should now have const(42) as lhs
         match &func.blocks[0].instructions[1] {
-            Instruction::BinOp { lhs: Operand::Const(IrConst::I32(42)), .. } => {}
+            Instruction::BinOp {
+                lhs: Operand::Const(IrConst::I32(42)),
+                ..
+            } => {}
             other => panic!("Expected BinOp with const 42, got {:?}", other),
         }
     }
@@ -499,12 +805,10 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::Copy {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                },
-            ],
+            instructions: vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Value(Value(0)),
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
         });
@@ -525,15 +829,13 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::BinOp {
-                    dest: Value(0),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Const(IrConst::I32(1)),
-                    rhs: Operand::Const(IrConst::I32(2)),
-                    ty: IrType::I32,
-                },
-            ],
+            instructions: vec![Instruction::BinOp {
+                dest: Value(0),
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I32(1)),
+                rhs: Operand::Const(IrConst::I32(2)),
+                ty: IrType::I32,
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
             source_spans: Vec::new(),
         });

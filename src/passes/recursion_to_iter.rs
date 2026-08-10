@@ -437,6 +437,7 @@ mod tests {
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
+            is_f128_sse: false,
         }];
         let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, false);
         func.next_value_id = 20;
@@ -513,6 +514,7 @@ mod tests {
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
@@ -541,6 +543,7 @@ mod tests {
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
@@ -616,6 +619,7 @@ mod tests {
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
+            is_f128_sse: false,
         }];
         let mut func = IrFunction::new("factorial".to_string(), IrType::I64, params, false);
         func.next_value_id = 10;
@@ -662,6 +666,7 @@ mod tests {
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
@@ -684,6 +689,7 @@ mod tests {
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
+            is_f128_sse: false,
         }];
         let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, true); // variadic
         func.next_value_id = 20;
@@ -703,6 +709,7 @@ mod tests {
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
+                is_f128_sse: false,
             },
             IrParam {
                 ty: IrType::I32,
@@ -710,6 +717,7 @@ mod tests {
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
+                is_f128_sse: false,
             },
         ];
         let mut func = IrFunction::new("fib2".to_string(), IrType::I64, params, false);
@@ -733,6 +741,7 @@ mod tests {
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
+            is_f128_sse: false,
         }];
         let mut func = IrFunction::new("fib".to_string(), IrType::I64, params, false);
         func.is_declaration = true;

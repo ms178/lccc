@@ -40,7 +40,7 @@ impl Lowerer {
         // Store switch value in an alloca for dispatch chain reloading
         let switch_alloca = self.fresh_value();
         let switch_size = switch_expr_ty.size();
-        self.emit(Instruction::Alloca { dest: switch_alloca, ty: switch_expr_ty, size: switch_size, align: 0, volatile: false });
+        self.emit(Instruction::Alloca { dest: switch_alloca, ty: switch_expr_ty, size: switch_size, align: 0, volatile: false, semantic_volatile: false });
         self.emit(Instruction::Store { val, ptr: switch_alloca, ty: switch_expr_ty, seg_override: AddressSpace::Default });
 
         let dispatch_label = self.fresh_label();

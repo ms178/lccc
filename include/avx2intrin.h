@@ -233,6 +233,13 @@ _mm256_add_epi8(__m256i __a, __m256i __b)
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_add_epi16(__m256i a, __m256i b) { __m256i r; unsigned short *x=(unsigned short*)&a,*y=(unsigned short*)&b,*z=(unsigned short*)&r; for(int i=0;i<16;i++)z[i]=x[i]+y[i]; return r; }
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sub_epi8(__m256i a, __m256i b) { __m256i r; unsigned char *x=(unsigned char*)&a,*y=(unsigned char*)&b,*z=(unsigned char*)&r; for(int i=0;i<32;i++)z[i]=x[i]-y[i]; return r; }
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sub_epi16(__m256i a, __m256i b) { __m256i r; unsigned short *x=(unsigned short*)&a,*y=(unsigned short*)&b,*z=(unsigned short*)&r; for(int i=0;i<16;i++)z[i]=x[i]-y[i]; return r; }
+
+static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_add_epi32(__m256i __a, __m256i __b)
 {
     unsigned int *__pa = (unsigned int *)&__a;
@@ -1190,6 +1197,54 @@ _mm256_i32gather_epi32(int const *__base, __m256i __index, int __scale)
     for (int __i = 0; __i < 8; __i++)
         __pr[__i] = *(int *)(__b + (long long)__pi[__i] * __scale);
     return __r;
+}
+
+
+/* === Cast / move between 128-bit and 256-bit === */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_zextsi128_si256(__m128i __a)
+{
+    return _mm256_castsi128_si256(__a);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_broadcastsi128_si256(__m128i __a)
+{
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(__a), __a, 1);
+}
+
+/* Set 8 x 32-bit lanes in low-to-high order. */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_setr_epi32(int __e0, int __e1, int __e2, int __e3,
+                  int __e4, int __e5, int __e6, int __e7)
+{
+    __m256i __r;
+    int *__p = (int *)&__r;
+    __p[0] = __e0; __p[1] = __e1; __p[2] = __e2; __p[3] = __e3;
+    __p[4] = __e4; __p[5] = __e5; __p[6] = __e6; __p[7] = __e7;
+    return __r;
+}
+
+/* Two SSE2 halves preserve AVX2 PSADBW lane semantics. */
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_sad_epu8(__m256i __a, __m256i __b)
+{
+    __m128i __lo = _mm_sad_epu8(_mm256_extracti128_si256(__a, 0),
+                                 _mm256_extracti128_si256(__b, 0));
+    __m128i __hi = _mm_sad_epu8(_mm256_extracti128_si256(__a, 1),
+                                 _mm256_extracti128_si256(__b, 1));
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(__lo), __hi, 1);
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_subs_epu16(__m256i __a, __m256i __b)
+{
+    __m128i __lo = _mm_subs_epu16(_mm256_extracti128_si256(__a, 0),
+                                   _mm256_extracti128_si256(__b, 0));
+    __m128i __hi = _mm_subs_epu16(_mm256_extracti128_si256(__a, 1),
+                                   _mm256_extracti128_si256(__b, 1));
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(__lo), __hi, 1);
 }
 
 #endif /* _AVX2INTRIN_H_INCLUDED */

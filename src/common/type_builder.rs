@@ -76,6 +76,7 @@ pub trait TypeConvertContext {
             TypeSpecifier::UnsignedInt128 => CType::UInt128,
             TypeSpecifier::Float => CType::Float,
             TypeSpecifier::Double => CType::Double,
+            TypeSpecifier::Float128 => CType::Float128,
             TypeSpecifier::LongDouble => CType::LongDouble,
             TypeSpecifier::ComplexFloat => CType::ComplexFloat,
             TypeSpecifier::ComplexDouble => CType::ComplexDouble,

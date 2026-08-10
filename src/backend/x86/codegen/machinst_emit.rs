@@ -434,7 +434,32 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
 /// Emit a sequence of allocated MachInsts as AT&T assembly.
 pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
+    // Raptor Lake Optimization: Identify loop headers (labels targeted by backward branches)
+    // and align them to 32-byte boundaries (.p2align 5) to maximize instruction fetch and
+    // uOP cache port bandwidth!
+    let mut defined_labels = std::collections::HashSet::new();
+    let mut loop_headers = std::collections::HashSet::new();
+
     for inst in insts {
+        match inst {
+            MachInst::Label(name) => {
+                defined_labels.insert(name.clone());
+            }
+            MachInst::Jmp { target } | MachInst::Jcc { target, .. } => {
+                if defined_labels.contains(target) {
+                    loop_headers.insert(target.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for inst in insts {
+        if let MachInst::Label(name) = inst {
+            if loop_headers.contains(name) {
+                out.emit("    .p2align 5");
+            }
+        }
         emit_machinst(inst, out);
     }
 }

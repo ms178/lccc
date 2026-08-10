@@ -28,6 +28,7 @@
 //!         Branch header
 //! ```
 
+use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
@@ -35,19 +36,18 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator,
     Value,
 };
-use super::loop_analysis;
 
 /// Maximum number of body-work blocks (body excluding header and latch) for
 /// a loop to be eligible. Prevents excessive code size growth.
-const MAX_UNROLL_BODY_BLOCKS: usize = 8;
+const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
 
 /// Choose the unroll factor based on total instruction count in body-work blocks.
 fn choose_unroll_factor(body_inst_count: usize) -> u32 {
     match body_inst_count {
-        0..=8   => 8,
-        9..=20  => 4,
+        0..=8 => 8,
+        9..=20 => 4,
         21..=60 => 2,
-        _       => 1, // too large — skip
+        _ => 1, // too large — skip
     }
 }
 
@@ -96,9 +96,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
         return 0;
     }
     let cfg = CfgAnalysis::build(func);
-    let raw = loop_analysis::find_natural_loops(
-        cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom,
-    );
+    let raw = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     if raw.is_empty() {
         return 0;
     }
@@ -115,7 +113,21 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
     candidates.sort_by_key(|c| c.body_work.len());
 
     let mut count = 0;
+    let pgo_profile = crate::pgo::get_pgo_profile();
     for c in candidates {
+        // PGO gating
+        if let Some(profile) = pgo_profile {
+            if let Some(should) = crate::pgo::unroll_pgo::should_unroll_loop(
+                func,
+                c.header,
+                c.body_work.len(),
+                Some(profile),
+            ) {
+                if !should {
+                    continue;
+                }
+            }
+        }
         if do_unroll(func, c) {
             count += 1;
         }
@@ -179,6 +191,42 @@ fn analyze_loop(
         }
     }
 
+    // Cloning currently re-plumbs only the header exit. Reject body exits
+    // until exit-phi remapping is implemented.
+    {
+        let label_to_idx: FxHashMap<BlockId, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label, i))
+            .collect();
+        for &bi in &body_work {
+            let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
+                Terminator::Branch(l) => vec![*l],
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => vec![*true_label, *false_label],
+                Terminator::Switch { default, cases, .. } => {
+                    let mut v = vec![*default];
+                    v.extend(cases.iter().map(|(_, l)| *l));
+                    v
+                }
+                _ => vec![],
+            };
+            for s in succs {
+                let in_loop = label_to_idx
+                    .get(&s)
+                    .map(|&idx| lp.body.contains(&idx))
+                    .unwrap_or(false);
+                if !in_loop {
+                    return None;
+                }
+            }
+        }
+    }
+
     // 6. No disqualifying instructions in body_work.
     for &bi in &body_work {
         for inst in &func.blocks[bi].instructions {
@@ -203,8 +251,15 @@ fn analyze_loop(
         find_iv_in_loop(func, header, latch, latch_label)?;
 
     // 8. Detect the exit condition from the header's CondBranch.
-    let (exit_target, body_entry, exit_cmp_op, exit_cmp_ty, exit_limit, iv_is_lhs, exit_cond_positive) =
-        find_exit_condition(func, header, &lp.body, iv_phi)?;
+    let (
+        exit_target,
+        body_entry,
+        exit_cmp_op,
+        exit_cmp_ty,
+        exit_limit,
+        iv_is_lhs,
+        exit_cond_positive,
+    ) = find_exit_condition(func, header, &lp.body, iv_phi)?;
 
     // 9. Count body instructions and select the unroll factor.
     let body_inst_count: usize = body_work
@@ -261,14 +316,20 @@ fn analyze_loop(
         let has_iv_widening = body_work.iter().any(|&bi| {
             func.blocks[bi].instructions.iter().any(|inst| {
                 match inst {
-                    Instruction::Cast { src: Operand::Value(v), from_ty, to_ty, .. } => {
+                    Instruction::Cast {
+                        src: Operand::Value(v),
+                        from_ty,
+                        to_ty,
+                        ..
+                    } => {
                         v.0 == iv_phi.0
                             && matches!(from_ty, IrType::I32 | IrType::U32)
                             && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr)
                     }
-                    Instruction::GetElementPtr { offset: Operand::Value(v), .. } => {
-                        v.0 == iv_phi.0
-                    }
+                    // Direct GEP uses of the IV are cloned through the
+                    // per-clone value map in do_unroll, so they are legal. The
+                    // historical blanket rejection made the core counted-array
+                    // loop test permanently unreachable.
                     _ => false,
                 }
             })
@@ -318,7 +379,11 @@ fn find_iv_in_loop(
             .iter()
             .find(|(_, lbl)| *lbl == latch_label)
             .and_then(|(op, _)| {
-                if let Operand::Value(v) = op { Some(*v) } else { None }
+                if let Operand::Value(v) = op {
+                    Some(*v)
+                } else {
+                    None
+                }
             });
         let back_val = back_val?;
 
@@ -326,7 +391,14 @@ fn find_iv_in_loop(
         // in the latch that produces `back_val`.
         let phi_id = phi_dest.0;
         for (idx, latch_inst) in func.blocks[latch].instructions.iter().enumerate() {
-            if let Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, .. } = latch_inst {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } = latch_inst
+            {
                 if *dest != back_val {
                     continue;
                 }
@@ -357,9 +429,11 @@ fn find_exit_condition(
     let header_block = &func.blocks[header];
 
     let (cond_op, true_label, false_label) = match &header_block.terminator {
-        Terminator::CondBranch { cond, true_label, false_label } => {
-            (*cond, *true_label, *false_label)
-        }
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => (*cond, *true_label, *false_label),
         _ => return None,
     };
 
@@ -407,32 +481,44 @@ fn find_exit_condition(
 
     // Look through one Cast.
     let cmp_id = match hdr_defs.get(&cond_id) {
-        Some(Instruction::Cast { src: Operand::Value(v), .. }) => v.0,
+        Some(Instruction::Cast {
+            src: Operand::Value(v),
+            ..
+        }) => v.0,
         _ => cond_id,
     };
 
     let (cmp_op, cmp_lhs, cmp_rhs, cmp_ty) = match hdr_defs.get(&cmp_id) {
-        Some(Instruction::Cmp { op, lhs, rhs, ty, .. }) => (*op, *lhs, *rhs, *ty),
+        Some(Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        }) => (*op, *lhs, *rhs, *ty),
         _ => return None,
     };
 
     let iv_id = iv_phi.0;
 
     // One Cmp operand must be exactly the IV phi; the other must be loop-invariant.
-    let (iv_is_lhs, limit_op) =
-        if matches!(cmp_lhs, Operand::Value(v) if v.0 == iv_id)
-            && is_loop_invariant_op(cmp_rhs, loop_body, func)
-        {
-            (true, cmp_rhs)
-        } else if matches!(cmp_rhs, Operand::Value(v) if v.0 == iv_id)
-            && is_loop_invariant_op(cmp_lhs, loop_body, func)
-        {
-            (false, cmp_lhs)
-        } else {
-            return None;
-        };
+    let (iv_is_lhs, limit_op) = if matches!(cmp_lhs, Operand::Value(v) if v.0 == iv_id)
+        && is_loop_invariant_op(cmp_rhs, loop_body, func)
+    {
+        (true, cmp_rhs)
+    } else if matches!(cmp_rhs, Operand::Value(v) if v.0 == iv_id)
+        && is_loop_invariant_op(cmp_lhs, loop_body, func)
+    {
+        (false, cmp_lhs)
+    } else {
+        return None;
+    };
 
-    Some((exit_target, body_entry, cmp_op, cmp_ty, limit_op, iv_is_lhs, exit_cond_positive))
+    Some((
+        exit_target,
+        body_entry,
+        cmp_op,
+        cmp_ty,
+        limit_op,
+        iv_is_lhs,
+        exit_cond_positive,
+    ))
 }
 
 // ── CFG helpers ───────────────────────────────────────────────────────────────
@@ -462,9 +548,11 @@ fn is_defined_in_body(val_id: u32, loop_body: &FxHashSet<usize>, func: &IrFuncti
 fn block_has_succ(term: &Terminator, target: BlockId) -> bool {
     match term {
         Terminator::Branch(lbl) => *lbl == target,
-        Terminator::CondBranch { true_label, false_label, .. } => {
-            *true_label == target || *false_label == target
-        }
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => *true_label == target || *false_label == target,
         _ => false,
     }
 }
@@ -473,7 +561,11 @@ fn block_has_succ(term: &Terminator, target: BlockId) -> bool {
 fn redirect_label(term: &mut Terminator, old: BlockId, new: BlockId) {
     match term {
         Terminator::Branch(lbl) if *lbl == old => *lbl = new,
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             if *true_label == old {
                 *true_label = new;
             }
@@ -493,7 +585,11 @@ fn replace_block_ids(term: &mut Terminator, map: &FxHashMap<BlockId, BlockId>) {
                 *lbl = new;
             }
         }
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             if let Some(&new) = map.get(true_label) {
                 *true_label = new;
             }
@@ -537,18 +633,34 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
     // ec_labels[j]  = label of exit_check_{j+1}
     // cl_labels[j]  = labels of clone[j]'s body_work blocks (parallel to body_work)
     let iv_vals: Vec<Value> = (0..num_new)
-        .map(|_| { let v = Value(next_val); next_val += 1; v })
+        .map(|_| {
+            let v = Value(next_val);
+            next_val += 1;
+            v
+        })
         .collect();
     let cond_vals: Vec<Value> = (0..num_new)
-        .map(|_| { let v = Value(next_val); next_val += 1; v })
+        .map(|_| {
+            let v = Value(next_val);
+            next_val += 1;
+            v
+        })
         .collect();
     let ec_labels: Vec<BlockId> = (0..num_new)
-        .map(|_| { let l = BlockId(next_label); next_label += 1; l })
+        .map(|_| {
+            let l = BlockId(next_label);
+            next_label += 1;
+            l
+        })
         .collect();
     let cl_labels: Vec<Vec<BlockId>> = (0..num_new)
         .map(|_| {
             (0..c.body_work.len())
-                .map(|_| { let l = BlockId(next_label); next_label += 1; l })
+                .map(|_| {
+                    let l = BlockId(next_label);
+                    next_label += 1;
+                    l
+                })
                 .collect()
         })
         .collect();
@@ -594,8 +706,16 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         let clone_entry = cl_labels[j][c.body_entry_work_idx];
 
         // ── Build exit_check_{j+1} ────────────────────────────────────────
-        let cmp_lhs = if c.iv_is_lhs { Operand::Value(iv_j) } else { c.exit_limit };
-        let cmp_rhs = if c.iv_is_lhs { c.exit_limit } else { Operand::Value(iv_j) };
+        let cmp_lhs = if c.iv_is_lhs {
+            Operand::Value(iv_j)
+        } else {
+            c.exit_limit
+        };
+        let cmp_rhs = if c.iv_is_lhs {
+            c.exit_limit
+        } else {
+            Operand::Value(iv_j)
+        };
         let (ec_true, ec_false) = if c.exit_cond_positive {
             (c.exit_target, clone_entry)
         } else {
@@ -691,8 +811,12 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
 
     // Step 4: Update latch's IV increment: swap iv_phi → iv_{K-1} (= iv_vals[num_new-1]).
     let last_iv = iv_vals[num_new - 1];
-    if let Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } =
-        &mut func.blocks[c.latch].instructions[c.latch_iv_incr_idx]
+    if let Instruction::BinOp {
+        op: IrBinOp::Add,
+        lhs,
+        rhs,
+        ..
+    } = &mut func.blocks[c.latch].instructions[c.latch_iv_incr_idx]
     {
         if matches!(lhs, Operand::Value(v) if v.0 == c.iv_phi.0) {
             *lhs = Operand::Value(last_iv);
@@ -787,6 +911,7 @@ fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
         | Instruction::VaEnd { .. }
         | Instruction::VaCopy { .. }
         | Instruction::AtomicStore { .. }
+        | Instruction::AtomicInc { .. }
         | Instruction::Fence { .. }
         | Instruction::SetReturnF64Second { .. }
         | Instruction::SetReturnF32Second { .. }
@@ -878,7 +1003,12 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
         }
 
         // Select.
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             replace_op(cond, map);
             replace_op(true_val, map);
             replace_op(false_val, map);
@@ -889,7 +1019,13 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
             replace_op(ptr, map);
             replace_op(val, map);
         }
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
+        Instruction::AtomicInc { ptr, .. } => replace_op(ptr, map),
+        Instruction::AtomicCmpxchg {
+            ptr,
+            expected,
+            desired,
+            ..
+        } => {
             replace_op(ptr, map);
             replace_op(expected, map);
             replace_op(desired, map);
@@ -902,7 +1038,11 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
 
         // Varargs.
         Instruction::VaArg { va_list_ptr, .. } => replace_val(va_list_ptr, map),
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => {
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            ..
+        } => {
             replace_val(dest_ptr, map);
             replace_val(va_list_ptr, map);
         }
@@ -980,8 +1120,7 @@ mod tests {
     ///
     /// The limit is a constant so it is loop-invariant (not defined in loop.body).
     fn make_counting_loop(n_val: i32) -> IrFunction {
-        let mut func =
-            IrFunction::new("loop_test".to_string(), IrType::Void, vec![], false);
+        let mut func = IrFunction::new("loop_test".to_string(), IrType::Void, vec![], false);
 
         // B0: preheader — init i = 0
         func.blocks.push(BasicBlock {
@@ -1017,7 +1156,7 @@ mod tests {
             ],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(3)),
-                true_label: BlockId(2), // continue (body)
+                true_label: BlockId(2),  // continue (body)
                 false_label: BlockId(4), // exit
             },
             source_spans: Vec::new(),
@@ -1088,7 +1227,15 @@ mod tests {
         let iv_incr = latch
             .instructions
             .iter()
-            .find(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Add, .. }))
+            .find(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        ..
+                    }
+                )
+            })
             .unwrap();
         if let Instruction::BinOp { lhs, .. } = iv_incr {
             assert!(
@@ -1115,6 +1262,7 @@ mod tests {
                 struct_arg_aligns: vec![],
                 struct_arg_classes: vec![],
                 struct_arg_riscv_float_classes: vec![],
+                struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: vec![],
@@ -1137,7 +1285,10 @@ mod tests {
             });
         }
         let n = unroll_loops(&mut func);
-        assert_eq!(n, 0, "loop with > 60 body instructions should not be unrolled");
+        assert_eq!(
+            n, 0,
+            "loop with > 60 body instructions should not be unrolled"
+        );
     }
 
     #[test]
@@ -1171,8 +1322,7 @@ mod tests {
         // Inner loop: {B2, B2b, B3}, body_work={B2b}, header=B2, latch=B3 → can unroll.
         // Outer loop: {B1, B2, B2b, B3, B5}, body_work={B2, B2b, B3}, header=B1, latch=B5
         //   → body_work contains B2 which is a loop header → outer NOT unrolled.
-        let mut func =
-            IrFunction::new("nested".to_string(), IrType::Void, vec![], false);
+        let mut func = IrFunction::new("nested".to_string(), IrType::Void, vec![], false);
 
         // B0: outer preheader
         func.blocks.push(BasicBlock {
@@ -1207,7 +1357,7 @@ mod tests {
             ],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(2)),
-                true_label: BlockId(2), // inner header
+                true_label: BlockId(2),  // inner header
                 false_label: BlockId(6), // outer exit
             },
             source_spans: Vec::new(),

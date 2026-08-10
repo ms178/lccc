@@ -343,11 +343,23 @@ impl InlineAsmEmitter for X86Codegen {
                         }
                     }
                 }
-                Operand::Const(_) => {
-                    // TODO: non-zero float constants need to be materialized via
-                    // memory (e.g., load from .rodata). For now, zero the register.
-                    // In practice, inline asm "x" inputs are almost always variables.
-                    self.state.out.emit_instr_reg_reg("    xorpd", reg, reg);
+                Operand::Const(c) => {
+                    // Materialize float constants bit-exact (constant
+                    // propagation can turn inline-asm "x" inputs into
+                    // Const(F32/F64) — glibc divss_inline_asm(1.0f, 0.0f)).
+                    let bits = match ty {
+                        IrType::F32 => {
+                            let f = c.to_f64().unwrap_or(0.0) as f32;
+                            f.to_bits() as u64
+                        }
+                        IrType::F64 => {
+                            let f = c.to_f64().unwrap_or(0.0);
+                            f.to_bits()
+                        }
+                        _ => 0,
+                    };
+                    self.state.out.emit_instr_imm_reg("    movabsq", bits as i64, "rax");
+                    self.state.emit_fmt(format_args!("    movq %rax, %{}", reg));
                 }
             }
             return;
@@ -432,7 +444,7 @@ impl InlineAsmEmitter for X86Codegen {
                     IrType::F128 => "fldt",
                     _ => "fldl",
                 };
-                if self.state.is_alloca(ptr.0) {
+                if self.state.is_direct_slot(ptr.0) {
                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}", fld_instr, sr)); }
                 } else {
                     let scratch = "rcx";
@@ -448,11 +460,9 @@ impl InlineAsmEmitter for X86Codegen {
         let ty = op.operand_type;
         let is_xmm = reg.starts_with("xmm");
         if let Some(slot) = self.state.get_slot(ptr.0) {
-            if self.state.is_alloca(ptr.0) {
-                // Alloca: stack slot IS the variable's storage — load directly
+            if self.state.is_direct_slot(ptr.0) {
+                // Direct slot: the current value lives directly in this stack slot.
                 if is_xmm {
-                    // Use movdqu for vector types (full 128-bit, unaligned-safe),
-                    // movss/movsd for scalar floats.
                     let load_instr = match ty {
                         IrType::F32 => "movss",
                         IrType::F64 => "movsd",
@@ -468,16 +478,20 @@ impl InlineAsmEmitter for X86Codegen {
                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg)); }
                 }
             } else {
-                // Non-alloca: stack slot holds a pointer — do indirect load
-                self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
+                // Indirect slot: the slot contains a pointer to the live storage.
                 if is_xmm {
                     let load_instr = match ty {
                         IrType::F32 => "movss",
                         IrType::F64 => "movsd",
                         _ => "movdqu",
                     };
-                    self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg, reg));
+                    let scratch = "rcx";
+                    self.state.out.emit_instr_reg("    pushq", scratch);
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, scratch);
+                    self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, scratch, reg));
+                    self.state.out.emit_instr_reg("    popq", scratch);
                 } else {
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
                     let load_instr = Self::mov_load_for_type(ty);
                     let dest_reg = match ty {
                         IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
@@ -522,7 +536,7 @@ impl InlineAsmEmitter for X86Codegen {
         Self::substitute_x86_asm_operands(line, &op_regs, &op_names, &op_is_memory, &op_mem_addrs, &op_types, gcc_to_internal, goto_labels, &op_imm_values, &op_imm_symbols)
     }
 
-    fn store_output_from_reg(&mut self, op: &AsmOperand, ptr: &Value, _constraint: &str, _all_output_regs: &[&str]) {
+    fn store_output_from_reg(&mut self, op: &AsmOperand, ptr: &Value, _constraint: &str, all_output_regs: &[&str]) {
         if matches!(op.kind, AsmOperandKind::Memory) {
             return;
         }
@@ -541,18 +555,49 @@ impl InlineAsmEmitter for X86Codegen {
                 if self.state.is_direct_slot(ptr.0) {
                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}", fstp_instr, sr)); }
                 } else {
-                    // Non-alloca: slot holds a pointer, store through it
-                    let scratch = "rcx";
-                    self.state.out.emit_instr_reg("    pushq", scratch);
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, scratch);
+                    // Non-alloca: slot holds a pointer, store through it.
+                    // Load the pointer BEFORE pushing (with -fomit-frame-pointer
+                    // slots are %rsp-relative and a push shifts every offset),
+                    // then push the pointer and fstp through (%rsp).
+                    let scratch = self.asm_output_scratch(all_output_regs, &op.reg);
+                    let preserve = all_output_regs.contains(&scratch.as_str());
+                    if preserve { self.state.out.emit_instr_reg("    pushq", &scratch); }
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, &scratch);
                     self.state.emit_fmt(format_args!("    {} (%{})", fstp_instr, scratch));
-                    self.state.out.emit_instr_reg("    popq", scratch);
+                    if preserve { self.state.out.emit_instr_reg("    popq", &scratch); }
                 }
+            } else {
+                // No slot: `ptr` is an address value; materialize it and fstp through it.
+                let ty = op.operand_type;
+                let fstp_instr = match ty {
+                    IrType::F32 => "fstps",
+                    IrType::F128 => "fstpt",
+                    _ => "fstpl",
+                };
+                let scratch = self.asm_output_scratch(all_output_regs, &op.reg);
+                let preserve = all_output_regs.contains(&scratch.as_str());
+                if preserve { self.state.out.emit_instr_reg("    pushq", &scratch); }
+                self.value_to_reg(ptr, &scratch);
+                self.state.emit_fmt(format_args!("    {} (%{})", fstp_instr, scratch));
+                if preserve { self.state.out.emit_instr_reg("    popq", &scratch); }
             }
             return;
         }
         // Handle =@cc<cond> condition code outputs: emit SETcc + movzbl
         if let AsmOperandKind::ConditionCode(ref cond) = op.kind {
+            // `ptr` may be an address value with no stack slot (e.g., a
+            // register-resident pointer from cpuid.h's `__cpuid(level, *a, ...)`
+            // pattern); store through it instead of silently dropping the
+            // result. Emit SETcc + movzbl first, then the through-pointer store.
+            if self.state.get_slot(ptr.0).is_none() {
+                let reg = &op.reg;
+                let reg8 = Self::reg_to_8l(reg);
+                let x86_cond = Self::gcc_cc_to_x86(cond);
+                self.state.emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
+                self.state.out.emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
+                self.store_reg_through_ptr_value(reg, IrType::I32, ptr, all_output_regs);
+                return;
+            }
             let reg = &op.reg;
             let reg8 = Self::reg_to_8l(reg);
             // Map GCC condition suffix to x86 SETcc instruction suffix
@@ -577,9 +622,10 @@ impl InlineAsmEmitter for X86Codegen {
                     // full 8-byte store to match value_to_reg's movq load.
                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    movq %{}, {}", reg, sr)); }
                 } else {
-                    let scratch = if reg != "rcx" { "rcx" } else { "rdx" };
-                    self.state.out.emit_instr_reg("    pushq", scratch);
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, scratch);
+                    let scratch = self.asm_output_scratch(all_output_regs, reg);
+                    let preserve = all_output_regs.contains(&scratch.as_str());
+                    if preserve { self.state.out.emit_instr_reg("    pushq", &scratch); }
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, &scratch);
                     let store_instr = Self::mov_store_for_type(ty);
                     let src_reg = match ty {
                         IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
@@ -588,7 +634,7 @@ impl InlineAsmEmitter for X86Codegen {
                         _ => format!("%{}", reg),
                     };
                     self.state.emit_fmt(format_args!("    {} {}, (%{})", store_instr, src_reg, scratch));
-                    self.state.out.emit_instr_reg("    popq", scratch);
+                    if preserve { self.state.out.emit_instr_reg("    popq", &scratch); }
                 }
             }
             return;
@@ -616,11 +662,12 @@ impl InlineAsmEmitter for X86Codegen {
                         IrType::F64 => "movsd",
                         _ => "movdqu",
                     };
-                    let scratch = "rcx";
-                    self.state.out.emit_instr_reg("    pushq", scratch);
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, scratch);
+                    let scratch = self.asm_output_scratch(all_output_regs, reg);
+                    let preserve = all_output_regs.contains(&scratch.as_str());
+                    if preserve { self.state.out.emit_instr_reg("    pushq", &scratch); }
+                    self.state.out.emit_instr_rbp_reg("    movq", slot.0, &scratch);
                     self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, reg, scratch));
-                    self.state.out.emit_instr_reg("    popq", scratch);
+                    if preserve { self.state.out.emit_instr_reg("    popq", &scratch); }
                 }
             } else if self.state.is_direct_slot(ptr.0) {
                 if self.state.is_alloca(ptr.0) {
@@ -657,9 +704,12 @@ impl InlineAsmEmitter for X86Codegen {
                 }
             } else {
                 // Non-alloca: slot holds a pointer, store through it.
-                let scratch = if reg != "rcx" { "rcx" } else { "rdx" };
-                self.state.out.emit_instr_reg("    pushq", scratch);
-                self.state.out.emit_instr_rbp_reg("    movq", slot.0, scratch);
+                // Load the pointer BEFORE pushing (FPO: %rsp-relative slots
+                // shift under push), then push the pointer and store via (%rsp).
+                let scratch = self.asm_output_scratch(all_output_regs, reg);
+                let preserve = all_output_regs.contains(&scratch.as_str());
+                if preserve { self.state.out.emit_instr_reg("    pushq", &scratch); }
+                self.state.out.emit_instr_rbp_reg("    movq", slot.0, &scratch);
                 let store_instr = Self::mov_store_for_type(ty);
                 let src_reg = match ty {
                     IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
@@ -668,13 +718,88 @@ impl InlineAsmEmitter for X86Codegen {
                     _ => format!("%{}", reg),
                 };
                 self.state.emit_fmt(format_args!("    {} {}, (%{})", store_instr, src_reg, scratch));
-                self.state.out.emit_instr_reg("    popq", scratch);
+                if preserve { self.state.out.emit_instr_reg("    popq", &scratch); }
             }
+        } else {
+            // Destination has no stack slot: `ptr` is an address VALUE (a
+            // register-resident pointer, as in cpuid.h's
+            // `__cpuid(level, *a, *b, *c, *d)` outputs). Previously this case
+            // silently dropped the store, so the asm result never reached the
+            // pointed-to variable (zlib-ng's CPU-feature detection read
+            // all-zero features and never dispatched its AVX2 paths).
+            self.store_reg_through_ptr_value(reg, ty, ptr, all_output_regs);
         }
     }
 
     fn reset_scratch_state(&mut self) {
         self.asm_scratch_idx = 0;
         self.asm_xmm_scratch_idx = 0;
+    }
+}
+
+impl X86Codegen {
+    /// Store an asm output register through a destination that has no stack
+    /// slot: the destination is an address VALUE (a register-resident pointer,
+    /// e.g., cpuid.h's `__cpuid(level, *a, *b, *c, *d)` outputs). The pointer
+    /// is materialized into a scratch register and the result is stored
+    /// through it. The scratch is push/pop-protected so other output
+    /// registers (and the pointer itself) are preserved.
+    /// Pick a caller-saved scratch register that is NOT claimed by any asm
+    /// output. Using an output register as the address scratch clobbers that
+    /// output's value before its store (cpuid's "=c"/"=d" outputs were
+    /// destroyed by the `mov slot, %rcx`/`mov slot, %rdx` address loads, so
+    /// outputs 2 and 3 stored garbage). Prefer r10/r11/r8/r9/rsi/rdi; fall
+    /// back to the legacy rcx/rdx pair (push/pop-protected) only if all safe
+    /// registers are taken by outputs.
+    fn asm_output_scratch(&self, all_output_regs: &[&str], reg: &str) -> String {
+        const SAFE: [&str; 6] = ["r10", "r11", "r8", "r9", "rsi", "rdi"];
+        for cand in SAFE {
+            if !all_output_regs.contains(&cand) {
+                return cand.to_string();
+            }
+        }
+        if reg != "rcx" { "rcx".to_string() } else { "rdx".to_string() }
+    }
+
+    /// Store an asm output register through a destination that has no stack
+    /// slot: the destination is an address VALUE (a register-resident pointer,
+    /// e.g., cpuid.h's `__cpuid(level, *a, *b, *c, *d)` outputs). The pointer
+    /// is materialized into a scratch register chosen to avoid all output
+    /// registers, and the result is stored through it. The store goes through
+    /// the REGISTER, never via (%rsp) (a (%rsp) store would overwrite a
+    /// pushed pointer, not the pointed-to memory).
+    fn store_reg_through_ptr_value(
+        &mut self,
+        reg: &str,
+        ty: IrType,
+        ptr: &Value,
+        all_output_regs: &[&str],
+    ) {
+        let scratch = self.asm_output_scratch(all_output_regs, reg);
+        let needs_preserve = all_output_regs.contains(&scratch.as_str());
+        if needs_preserve {
+            self.state.out.emit_instr_reg("    pushq", &scratch);
+        }
+        self.value_to_reg(ptr, &scratch);
+        if reg.starts_with("xmm") {
+            let store_instr = match ty {
+                IrType::F32 => "movss",
+                IrType::F64 => "movsd",
+                _ => "movdqu",
+            };
+            self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, reg, scratch));
+        } else {
+            let store_instr = Self::mov_store_for_type(ty);
+            let src_reg = match ty {
+                IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
+                IrType::I16 | IrType::U16 => format!("%{}", Self::reg_to_16(reg)),
+                IrType::I32 | IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
+                _ => format!("%{}", reg),
+            };
+            self.state.emit_fmt(format_args!("    {} {}, (%{})", store_instr, src_reg, scratch));
+        }
+        if needs_preserve {
+            self.state.out.emit_instr_reg("    popq", &scratch);
+        }
     }
 }

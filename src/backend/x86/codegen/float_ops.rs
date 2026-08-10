@@ -37,13 +37,9 @@ impl X86Codegen {
         }
         let mnemonic = self.emit_float_binop_mnemonic_impl(op);
         let suffix = if ty == IrType::F64 { "sd" } else { "ss" };
-        let (mov_rax_to_xmm0, mov_xmm0_to_rax) = if ty == IrType::F32 {
-            ("movd %eax, %xmm0", "movd %xmm0, %eax")
-        } else {
-            ("movq %rax, %xmm0", "movq %xmm0, %rax")
-        };
+        let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
 
-        // Load LHS to %xmm0 — use constant pool for FP constants
+        // Load LHS to %xmm0 directly
         match lhs {
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
@@ -63,13 +59,30 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm0", label));
                 }
             }
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot.0);
+                    self.state.emit_fmt(format_args!("    {} {}, %xmm0", mov_instr, sr));
+                } else {
+                    self.operand_to_rax(lhs);
+                    if ty == IrType::F32 {
+                        self.state.emit("    movd %eax, %xmm0");
+                    } else {
+                        self.state.emit("    movq %rax, %xmm0");
+                    }
+                }
+            }
             _ => {
                 self.operand_to_rax(lhs);
-                self.state.emit_fmt(format_args!("    {}", mov_rax_to_xmm0));
+                if ty == IrType::F32 {
+                    self.state.emit("    movd %eax, %xmm0");
+                } else {
+                    self.state.emit("    movq %rax, %xmm0");
+                }
             }
         }
 
-        // Load RHS to %xmm1 — use constant pool for FP constants
+        // Use a legal RHS memory source when the value has a stack home.
         match rhs {
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
@@ -79,6 +92,7 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
                 }
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
@@ -88,18 +102,47 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
                 }
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+            }
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot.0);
+                    self.state.emit_fmt(format_args!("    {}{} {}, %xmm0", mnemonic, suffix, sr));
+                } else {
+                    self.operand_to_rcx(rhs);
+                    if ty == IrType::F32 {
+                        self.state.emit("    movd %ecx, %xmm1");
+                    } else {
+                        self.state.emit("    movq %rcx, %xmm1");
+                    }
+                    self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+                }
             }
             _ => {
                 self.operand_to_rcx(rhs);
-                let mov_rcx_to_xmm1 = if ty == IrType::F32 { "movd %ecx, %xmm1" } else { "movq %rcx, %xmm1" };
-                self.state.emit_fmt(format_args!("    {}", mov_rcx_to_xmm1));
+                if ty == IrType::F32 {
+                    self.state.emit("    movd %ecx, %xmm1");
+                } else {
+                    self.state.emit("    movq %rcx, %xmm1");
+                }
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
             }
         }
 
-        self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
-        self.state.emit_fmt(format_args!("    {}", mov_xmm0_to_rax));
-        self.state.reg_cache.invalidate_acc();
-        self.store_rax_to(dest);
+        // Store result directly to dest stack slot if available
+        if let Some(dest_slot) = self.state.get_slot(dest.0) {
+            let sr = self.slot_ref(dest_slot.0);
+            self.state.emit_fmt(format_args!("    {} %xmm0, {}", mov_instr, sr));
+            self.state.reg_cache.invalidate_acc();
+        } else {
+            if ty == IrType::F32 {
+                self.state.emit("    movd %xmm0, %eax");
+            } else {
+                self.state.emit("    movq %xmm0, %rax");
+            }
+            self.state.reg_cache.invalidate_acc();
+            self.store_rax_to(dest);
+        }
     }
 
     pub(super) fn emit_float_binop_impl_impl(&mut self, _mnemonic: &str, _ty: IrType) {

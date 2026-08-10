@@ -592,6 +592,195 @@ pub(super) fn emit_executable(
 
     let entry_addr = globals.get("_start").map(|s| s.value).unwrap_or(text_page_addr);
 
+    // === .symtab / .strtab (debug symbol table) ===
+    // ms178: previously the executable emitted ONLY .dynsym, so nm/gdb/perf
+    // saw no symbol table at all. Every defined global symbol (function or
+    // data) is now emitted into a full SHT_SYMTAB/.strtab pair, giving
+    // profilers and debuggers address → name resolution. Section indices are
+    // mapped to the OUTPUT section header order (mirrors the write loop
+    // below). Symbols that resolve to linker-provided addresses (or common/
+    // absolute) use SHN_ABS/SHN_COMMON as appropriate.
+    let mut symtab_entries: Vec<[u8; 24]> = Vec::new();
+    let mut symtab_names: Vec<u8> = vec![0u8]; // strtab with leading NUL
+    symtab_entries.push([0u8; 24]); // NULL symbol at index 0
+
+    // Map output_sections index → section-header index, in write order.
+    let mut out_sec_to_hdr: HashMap<usize, u16> = HashMap::new();
+    {
+        let mut h = 1usize; // [0] = NULL
+        if !is_static {
+            h += 4; // .interp .gnu.hash .dynsym .dynstr
+        }
+        if !is_static && verneed_size > 0 {
+            h += 2;
+        }
+        if !is_static && rela_dyn_size > 0 {
+            h += 1;
+        }
+        if !is_static && rela_plt_size > 0 {
+            h += 1;
+        }
+        if !is_static && plt_size > 0 {
+            h += 1;
+        }
+        for (i, sec) in output_sections.iter().enumerate() {
+            if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
+                && sec.name != ".init_array" && sec.name != ".fini_array"
+            {
+                out_sec_to_hdr.insert(i, h as u16);
+                h += 1;
+            }
+        }
+        for (i, sec) in output_sections.iter().enumerate() {
+            if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
+                out_sec_to_hdr.insert(i, h as u16);
+                h += 1;
+            }
+        }
+        for (i, sec) in output_sections.iter().enumerate() {
+            if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
+                out_sec_to_hdr.insert(i, h as u16);
+                h += 1;
+            }
+        }
+        if has_init_array {
+            h += 1;
+        }
+        if has_fini_array {
+            h += 1;
+        }
+        if !is_static {
+            h += 1; // .dynamic
+        }
+        if got_size > 0 {
+            h += 1; // .got
+        }
+        if !is_static {
+            h += 1; // .got.plt
+        }
+        if iplt_total_size > 0 {
+            h += 1; // .iplt
+        }
+        if rela_iplt_size > 0 {
+            h += 1; // .rela.iplt
+        }
+        for (i, sec) in output_sections.iter().enumerate() {
+            if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
+                out_sec_to_hdr.insert(i, h as u16);
+                h += 1;
+            }
+        }
+        // .symtab and .strtab come next (before .shstrtab).
+    }
+    // The .symtab/.strtab header indices are computed below precisely from
+    // the same header-order walk used by the write loop.
+    let symtab_shidx;
+    let strtab_shidx;
+    {
+        let mut h = 1usize;
+        if !is_static { h += 4; }
+        if !is_static && verneed_size > 0 { h += 2; }
+        if !is_static && rela_dyn_size > 0 { h += 1; }
+        if !is_static && rela_plt_size > 0 { h += 1; }
+        if !is_static && plt_size > 0 { h += 1; }
+        for sec in output_sections.iter() {
+            if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
+                && sec.name != ".init_array" && sec.name != ".fini_array" { h += 1; }
+        }
+        for sec in output_sections.iter() {
+            if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS { h += 1; }
+        }
+        for sec in output_sections.iter() {
+            if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS { h += 1; }
+        }
+        if has_init_array { h += 1; }
+        if has_fini_array { h += 1; }
+        if !is_static { h += 1; }
+        if got_size > 0 { h += 1; }
+        if !is_static { h += 1; }
+        if iplt_total_size > 0 { h += 1; }
+        if rela_iplt_size > 0 { h += 1; }
+        for sec in output_sections.iter() {
+            if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 { h += 1; }
+        }
+        symtab_shidx = h as u16;
+        strtab_shidx = h as u16 + 1;
+    }
+
+    // ELF requires every STB_LOCAL entry before the first global entry.
+    // Preserve named local FUNC/OBJECT/NOTYPE symbols from each input object so
+    // perf, gdb, addr2line-like tools and callgrind can resolve static hot
+    // functions (e.g. gzip's longest_match). Local names may repeat across
+    // objects, which is legal; their object-local identity is retained here.
+    let mut locals: Vec<(usize, &Symbol)> = objects
+        .iter()
+        .enumerate()
+        .flat_map(|(obj_idx, obj)| {
+            obj.symbols
+                .iter()
+                .filter(move |sym| {
+                    sym.is_local()
+                        && !sym.name.is_empty()
+                        && sym.shndx != SHN_UNDEF
+                        && sym.shndx != SHN_ABS
+                        && section_map.contains_key(&(obj_idx, sym.shndx as usize))
+                })
+                .map(move |sym| (obj_idx, sym))
+        })
+        .collect();
+    locals.sort_by(|(oa, a), (ob, b)| {
+        oa.cmp(ob)
+            .then_with(|| a.value.cmp(&b.value))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    for (obj_idx, sym) in locals {
+        let (oi, sec_off) = section_map[&(obj_idx, sym.shndx as usize)];
+        let Some(&shndx) = out_sec_to_hdr.get(&oi) else { continue };
+        let off = symtab_names.len() as u32;
+        symtab_names.extend_from_slice(sym.name.as_bytes());
+        symtab_names.push(0);
+        let mut e = [0u8; 24];
+        e[0..4].copy_from_slice(&off.to_le_bytes());
+        e[4] = sym.info;
+        e[5] = sym.other;
+        e[6..8].copy_from_slice(&shndx.to_le_bytes());
+        let value = output_sections[oi].addr + sec_off + sym.value;
+        e[8..16].copy_from_slice(&value.to_le_bytes());
+        e[16..24].copy_from_slice(&sym.size.to_le_bytes());
+        symtab_entries.push(e);
+    }
+    let n_local = symtab_entries.len();
+
+    let mut sym_names: Vec<(&String, &GlobalSymbol)> = globals
+        .iter()
+        .filter(|(_, g)| g.defined_in.is_some() && !g.is_dynamic)
+        .collect();
+    sym_names.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, gsym) in &sym_names {
+        let off = symtab_names.len() as u32;
+        symtab_names.extend_from_slice(name.as_bytes());
+        symtab_names.push(0);
+        let shndx: u16 = if gsym.defined_in == Some(usize::MAX) || gsym.section_idx == SHN_ABS {
+            SHN_ABS
+        } else if gsym.section_idx == SHN_COMMON {
+            SHN_COMMON
+        } else if let Some(obj_idx) = gsym.defined_in {
+            match section_map.get(&(obj_idx, gsym.section_idx as usize)) {
+                Some(&(oi, _)) => out_sec_to_hdr.get(&oi).copied().unwrap_or(SHN_ABS),
+                None => SHN_ABS,
+            }
+        } else {
+            SHN_ABS
+        };
+        let mut e = [0u8; 24];
+        e[0..4].copy_from_slice(&off.to_le_bytes());
+        e[4] = gsym.info;
+        e[5] = 0; // st_other
+        e[6..8].copy_from_slice(&shndx.to_le_bytes());
+        e[8..16].copy_from_slice(&gsym.value.to_le_bytes());
+        e[16..24].copy_from_slice(&gsym.size.to_le_bytes());
+        symtab_entries.push(e);
+    }
     // === Build output buffer ===
     let file_size = offset as usize;
     let mut out = vec![0u8; file_size];
@@ -1014,6 +1203,7 @@ pub(super) fn emit_executable(
         ".got", ".got.plt", ".init_array", ".fini_array",
         ".tdata", ".tbss", ".bss", ".shstrtab",
         ".iplt", ".rela.iplt",
+        ".symtab", ".strtab",
     ];
     for name in &known_names {
         let off = shstrtab.len() as u32;
@@ -1076,16 +1266,27 @@ pub(super) fn emit_executable(
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 { sh_count += 1; }
     }
+    sh_count += 2; // .symtab + .strtab
     let shstrtab_shidx = sh_count; // .shstrtab is the last section
     sh_count += 1;
 
+    // Align and append .symtab + .strtab data (before .shstrtab)
+    while out.len() % 8 != 0 { out.push(0); }
+    let symtab_data_offset = out.len() as u64;
+    let symtab_data_size = (symtab_entries.len() * 24) as u64;
+    for e in &symtab_entries {
+        out.extend_from_slice(e);
+    }
+    let strtab_data_offset = out.len() as u64;
+    out.extend_from_slice(&symtab_names);
+
     // Align and append .shstrtab data
-    while !out.len().is_multiple_of(8) { out.push(0); }
+    while out.len() % 8 != 0 { out.push(0); }
     let shstrtab_data_offset = out.len() as u64;
     out.extend_from_slice(&shstrtab);
 
     // Align section header table to 8 bytes
-    while !out.len().is_multiple_of(8) { out.push(0); }
+    while out.len() % 8 != 0 { out.push(0); }
     let shdr_offset = out.len() as u64;
 
     // Write section headers
@@ -1199,6 +1400,13 @@ pub(super) fn emit_executable(
                        sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
         }
     }
+    // .symtab (defined symbols for profilers/debuggers)
+    write_shdr(&mut out, get_shname(".symtab"), SHT_SYMTAB, 0,
+               0, symtab_data_offset, symtab_data_size,
+               strtab_shidx as u32, n_local as u32, 8, 24);
+    // .strtab
+    write_shdr(&mut out, get_shname(".strtab"), SHT_STRTAB, 0,
+               0, strtab_data_offset, symtab_names.len() as u64, 0, 0, 1, 0);
     // .shstrtab (last section)
     write_shdr(&mut out, get_shname(".shstrtab"), SHT_STRTAB, 0,
                0, shstrtab_data_offset, shstrtab.len() as u64, 0, 0, 1, 0);

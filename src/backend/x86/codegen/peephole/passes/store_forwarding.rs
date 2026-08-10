@@ -126,29 +126,6 @@ fn invalidate_all_mappings(slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut 
     }
 }
 
-/// Invalidate only caller-saved register mappings, preserving callee-saved ones.
-/// Callee-saved registers (rbx=3, r12=12, r13=13, r14=14, r15=15) are never
-/// clobbered implicitly, so their stack-slot mappings remain valid across
-/// jump-target labels (e.g., loop headers).
-fn invalidate_caller_saved_mappings(slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut [SmallVec; 16]) {
-    // Remove entries for caller-saved registers, keep callee-saved
-    slot_entries.retain(|entry| {
-        if entry.active && is_callee_saved_reg(entry.mapping.reg_id) {
-            true // keep
-        } else if entry.active {
-            // Caller-saved: remove from per-register tracking
-            reg_offsets[entry.mapping.reg_id as usize].remove_val(entry.offset);
-            false
-        } else {
-            false // already inactive
-        }
-    });
-    // Clear per-register offset lists for caller-saved registers
-    for reg in [0u8, 1, 2, 6, 7, 8, 9, 10, 11] {
-        reg_offsets[reg as usize].clear();
-    }
-}
-
 /// Deactivate a single slot entry and remove its offset from the per-register tracking.
 #[inline]
 fn deactivate_entry(entry: &mut SlotEntry, reg_offsets: &mut [SmallVec; 16]) {
@@ -252,14 +229,16 @@ fn gsf_handle_label(
     } else {
         targets.has_non_numeric_jump_targets
     };
-    if prev_was_unconditional_jump {
-        // After an unconditional jump, we don't know which path was taken, so clear all.
+    if prev_was_unconditional_jump || is_target {
+        // A label with a non-fallthrough predecessor is a CFG merge.  ABI
+        // callee-saved status says nothing about values assigned to that
+        // register on different *intra-function* paths: a loop back-edge can
+        // overwrite %rbx/r12-r15 while an entry edge still carries an older
+        // slot->register equality.  Retaining that equality would rewrite a
+        // stack reload on every later iteration to the back-edge's unrelated
+        // register value.  Until this text pass has path-sensitive join-state
+        // intersection, only a proven fallthrough label may retain mappings.
         invalidate_all_mappings(slot_entries, reg_offsets);
-    } else if is_target {
-        // At a jump target (e.g., loop header), callee-saved register mappings are
-        // still valid because callee-saved registers are never clobbered implicitly.
-        // Only invalidate caller-saved register mappings.
-        invalidate_caller_saved_mappings(slot_entries, reg_offsets);
     }
 }
 
@@ -291,14 +270,21 @@ fn gsf_handle_load(
         .find(|e| e.active && e.offset == load_offset)
         .map(|e| e.mapping);
     if let Some(mapping) = mapping {
-        if mapping.size == load_size && mapping.reg_id != REG_NONE {
+        // A qword store followed by a dword load is also forwardable: x86
+        // `movl` observes exactly the low 32 bits and zero-extends its
+        // destination.  Keep the forwarded move at the LOAD width; turning a
+        // same-family Q->L load into a no-op would be wrong because the movl
+        // zero-extension is architecturally observable.
+        let exact_width = mapping.size == load_size;
+        let qword_to_dword = mapping.size == MoveSize::Q && load_size == MoveSize::L;
+        if (exact_width || qword_to_dword) && mapping.reg_id != REG_NONE {
             let is_epilogue_restore = matches!(load_reg, 3 | 12 | 13 | 14 | 15)
                 && load_offset < 0
                 && is_near_epilogue(infos, i);
-            if load_reg == mapping.reg_id && !is_epilogue_restore {
+            if exact_width && load_reg == mapping.reg_id && !is_epilogue_restore {
                 mark_nop(&mut infos[i]);
                 changed = true;
-            } else if load_reg != REG_NONE && load_reg != mapping.reg_id {
+            } else if load_reg != REG_NONE {
                 let store_reg_str = reg_id_to_name(mapping.reg_id, load_size);
                 let load_reg_str = reg_id_to_name(load_reg, load_size);
                 let new_text = format!("    {} {}, {}",
@@ -317,7 +303,16 @@ fn gsf_handle_load(
 fn gsf_handle_other(
     store: &LineStore, infos: &[LineInfo], i: usize, dest_reg: RegId,
     slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut [SmallVec; 16],
+    rbp_is_frame: bool,
 ) {
+    // SOUNDNESS (v7): if rbp is NOT the frame pointer, any %rbp reference in an
+    // Other instruction is a pointer dereference / address computation that may
+    // read or write arbitrary memory. Invalidate ALL mappings so a stack slot is
+    // never forwarded across a potentially-aliasing pointer operation.
+    if !rbp_is_frame && infos[i].reg_refs & (1u16 << 5) != 0 {
+        invalidate_all_mappings(slot_entries, reg_offsets);
+    }
+
     if is_valid_gp_reg(dest_reg) {
         invalidate_reg_flat(slot_entries, reg_offsets, dest_reg);
         if dest_reg == 0 {
@@ -344,11 +339,50 @@ fn gsf_handle_other(
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
+/// Returns true if the given line's base register is `%rbp`.
+/// Used to decide whether a StoreRbp/LoadRbp line is a genuine stack-slot
+/// access (base %rsp, or base %rbp with rbp as frame pointer) vs a pointer
+/// dereference (base %rbp with rbp as a data register under -fomit-frame-pointer).
+fn line_base_is_rbp(trimmed: &str) -> bool {
+    // Look for a parenthesized memory operand containing "%rbp" (e.g. "(%rbp)",
+    // "8(%rbp)", "(%rbp,%rax,4)"). A bare register move "movq %rax, %rbp" has no
+    // parenthesized operand and returns false.
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let start = i;
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < bytes.len() && depth > 0 {
+                if bytes[j] == b'(' { depth += 1; }
+                else if bytes[j] == b')' { depth -= 1; }
+                j += 1;
+            }
+            if trimmed[start..j].contains("%rbp") {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     if len == 0 {
         return false;
     }
+
+    // SOUNDNESS (v7): if rbp is NOT the frame pointer (e.g. -fomit-frame-pointer
+    // with rbp used as a general register), then `offset(%rbp)` accesses are
+    // pointer dereferences. We must not store-forward them as stack slots, and
+    // they must be treated as opaque indirect memory (alias anything).
+    // Track per-function: reset at each .cfi_startproc; set true at
+    // `movq %rsp, %rbp` (frame-pointer establishment).
+    let mut rbp_is_frame = false;
 
     let jump_targets = collect_jump_targets(store, infos, len);
 
@@ -362,6 +396,19 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
 
+        // Per-function frame-pointer tracking.
+        if infos[i].kind == LineKind::Directive {
+            let dt = infos[i].trimmed(store.get(i));
+            if dt == ".cfi_startproc" {
+                rbp_is_frame = false;
+            }
+        } else if matches!(infos[i].kind, LineKind::Other { .. }) {
+            let ot = infos[i].trimmed(store.get(i));
+            if ot == "movq %rsp, %rbp" || ot == "movl %esp, %ebp" {
+                rbp_is_frame = true;
+            }
+        }
+
         let was_uncond_jump = prev_was_unconditional_jump;
         prev_was_unconditional_jump = false;
 
@@ -372,13 +419,30 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             }
 
             LineKind::StoreRbp { reg, offset, size } => {
-                gsf_handle_store(reg, offset, size,
-                    &mut slot_entries, &mut reg_offsets);
+                // If this is a pointer dereference (rbp not the frame pointer),
+                // it may write ANY memory, so invalidate all mappings and do not
+                // record a stack-slot mapping.
+                if !rbp_is_frame && line_base_is_rbp(infos[i].trimmed(store.get(i))) {
+                    invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+                } else {
+                    gsf_handle_store(reg, offset, size,
+                        &mut slot_entries, &mut reg_offsets);
+                }
             }
 
             LineKind::LoadRbp { reg: load_reg, offset: load_offset, size: load_size } => {
-                changed |= gsf_handle_load(store, infos, i, load_reg, load_offset, load_size,
-                    &mut slot_entries, &mut reg_offsets);
+                // A pointer-deref load (rbp not the frame pointer) must not be
+                // forwarded from a slot mapping.
+                if !rbp_is_frame && line_base_is_rbp(infos[i].trimmed(store.get(i))) {
+                    // Treat as opaque read; still invalidate the dest register
+                    // mapping for the loaded reg.
+                    if is_valid_gp_reg(load_reg) {
+                        invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, load_reg);
+                    }
+                } else {
+                    changed |= gsf_handle_load(store, infos, i, load_reg, load_offset, load_size,
+                        &mut slot_entries, &mut reg_offsets);
+                }
             }
 
             LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret => {
@@ -387,12 +451,24 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             }
 
             LineKind::Call => {
-                for &r in &[0u8, 1, 2, 6, 7, 8, 9, 10, 11] {
-                    invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, r);
-                }
+                // SOUND FIX: a function call may write through a pointer that
+                // aliases ANY stack slot whose address escaped this function
+                // (a local passed by reference, or an alloca). Forwarding a
+                // stack-slot store across a call would then produce a stale
+                // value. Invalidate ALL slot mappings on a call, not just the
+                // caller-saved registers. (Registers too, conservatively.)
+                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
             }
 
-            LineKind::Pop { reg } | LineKind::SetCC { reg } => {
+            // SOUNDNESS (v1): push/pop shift RSP, so every %rsp-relative slot
+            // offset in the shifted window refers to a different physical
+            // slot. Any mapping recorded before the push is stale after it;
+            // invalidate everything (conservative).
+            LineKind::Push { .. } | LineKind::Pop { .. } => {
+                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+            }
+
+            LineKind::SetCC { reg } => {
                 if is_valid_gp_reg(reg) {
                     invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, reg);
                 }
@@ -400,11 +476,18 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
 
             LineKind::Other { dest_reg } => {
                 gsf_handle_other(store, infos, i, dest_reg,
-                    &mut slot_entries, &mut reg_offsets);
+                    &mut slot_entries, &mut reg_offsets, rbp_is_frame);
             }
 
-            LineKind::CondJmp | LineKind::Cmp | LineKind::Push { .. }
-            | LineKind::Directive => {}
+            LineKind::CondJmp => {
+                // Keep state on the *linear fall-through* edge. The following
+                // instruction is reached only when this branch falls through;
+                // a taken edge always enters through a label, where
+                // gsf_handle_label invalidates mappings at the merge. Clearing
+                // here loses a provably local store-to-load forwarding win.
+            }
+
+            LineKind::Cmp | LineKind::Directive => {}
 
             _ => {}
         }

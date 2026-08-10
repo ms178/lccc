@@ -78,7 +78,7 @@ impl Lowerer {
             ty: IrType::Ptr,
             size,
             align: 0,
-            volatile: false,
+            volatile: false, semantic_volatile: false,
         });
         alloca
     }

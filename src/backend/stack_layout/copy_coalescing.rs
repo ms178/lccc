@@ -8,6 +8,7 @@
 
 use crate::ir::reexports::{
     Instruction,
+    IrConst,
     IrFunction,
     Operand,
     Terminator,
@@ -19,6 +20,404 @@ use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_value_use_in_instruction,
     for_each_operand_in_terminator,
 };
+
+/// Return true unless the CFG-aware coalescer is explicitly disabled for
+/// bisection.  v4 made this default after project gates, source regressions,
+/// and two differential fuzz families established that the graph proof is
+/// materially better than the v3 textual interval approximation.
+fn cfg_copy_coalesce_enabled() -> bool {
+    std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoalesceClass {
+    /// Eight-byte scalar stack representation: integer or pointer values only.
+    Scalar,
+}
+
+fn scalar_type(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr
+    )
+}
+
+fn scalar_const(c: IrConst) -> bool {
+    matches!(
+        c,
+        IrConst::I8(_)
+            | IrConst::I16(_)
+            | IrConst::I32(_)
+            | IrConst::I64(_)
+            | IrConst::Zero
+    )
+}
+
+/// Classify values that have the same scalar stack representation in all
+/// relevant paths.  Floats, vectors, i128/F128, allocas, and opaque results
+/// are intentionally excluded: a missed coalescing opportunity is harmless,
+/// whereas widening a slot-sharing rule beyond codegen's exact ABI paths is not.
+fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
+    let mut classes: FxHashMap<u32, CoalesceClass> = FxHashMap::default();
+    let mut allocas: FxHashSet<u32> = FxHashSet::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                allocas.insert(dest.0);
+            }
+            let class = match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Cast { dest, to_ty: ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::Select { dest, ty, .. }
+                | Instruction::AtomicLoad { dest, ty, .. }
+                | Instruction::AtomicRmw { dest, ty, .. }
+                | Instruction::AtomicCmpxchg { dest, ty, .. }
+                | Instruction::ParamRef { dest, ty, .. } if scalar_type(*ty) => Some(dest.0),
+                Instruction::Cmp { dest, .. }
+                | Instruction::GetElementPtr { dest, .. }
+                | Instruction::GlobalAddr { dest, .. }
+                | Instruction::LabelAddr { dest, .. } => Some(dest.0),
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                    if info.dest.is_some() && scalar_type(info.return_type) => info.dest.map(|v| v.0),
+                _ => None,
+            };
+            if let Some(id) = class {
+                classes.insert(id, CoalesceClass::Scalar);
+            }
+        }
+    }
+
+    // Copy and phi-lowering chains have no type field. Propagate the scalar
+    // classification to a fixed point through values and scalar constants.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src } = inst {
+                    if allocas.contains(&dest.0) || classes.contains_key(&dest.0) {
+                        continue;
+                    }
+                    let source_is_scalar = match src {
+                        Operand::Value(v) => classes.contains_key(&v.0),
+                        Operand::Const(c) => scalar_const(*c),
+                    };
+                    if source_is_scalar {
+                        classes.insert(dest.0, CoalesceClass::Scalar);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for id in allocas {
+        classes.remove(&id);
+    }
+    classes
+}
+
+fn instruction_value_uses(inst: &Instruction) -> Vec<u32> {
+    let mut uses = Vec::new();
+    for_each_operand_in_instruction(inst, |op| {
+        if let Operand::Value(v) = op {
+            uses.push(v.0);
+        }
+    });
+    for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
+    uses.sort_unstable();
+    uses.dedup();
+    uses
+}
+
+fn terminator_value_uses(term: &Terminator) -> Vec<u32> {
+    let mut uses = Vec::new();
+    for_each_operand_in_terminator(term, |op| {
+        if let Operand::Value(v) = op {
+            uses.push(v.0);
+        }
+    });
+    uses.sort_unstable();
+    uses.dedup();
+    uses
+}
+
+fn insert_interference(
+    graph: &mut FxHashMap<u32, FxHashSet<u32>>,
+    lhs: u32,
+    rhs: u32,
+) {
+    if lhs == rhs {
+        return;
+    }
+    graph.entry(lhs).or_default().insert(rhs);
+    graph.entry(rhs).or_default().insert(lhs);
+}
+
+/// Build an SSA-style, CFG-aware interference graph after phi lowering.
+///
+/// Unlike the former textual interval heuristic, this solves backward liveness
+/// over actual successor edges and then uses copy-aware interference insertion:
+/// for `d = copy s`, `d` interferes with every value live after the copy except
+/// `s` itself.  This is the standard move-coalescing rule: source and
+/// destination may share a location at the handoff, but any other reaching
+/// definition/path that keeps them simultaneously live creates an edge and
+/// blocks the merge.
+fn cfg_copy_interference(
+    func: &IrFunction,
+    tracked: &FxHashSet<u32>,
+) -> Option<FxHashMap<u32, FxHashSet<u32>>> {
+    use crate::ir::analysis;
+
+    let label_map = analysis::build_label_map(func);
+    let (_preds, succs) = analysis::build_cfg(func, &label_map);
+    let succs: Vec<Vec<usize>> = (0..func.blocks.len())
+        .map(|idx| succs.row(idx).iter().map(|&v| v as usize).collect())
+        .collect();
+
+    let mut block_use: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
+    let mut block_def: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            for value in instruction_value_uses(inst) {
+                if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
+                    block_use[block_idx].insert(value);
+                }
+            }
+            if let Some(dest) = inst.dest() {
+                if tracked.contains(&dest.0) {
+                    block_def[block_idx].insert(dest.0);
+                }
+            }
+        }
+        for value in terminator_value_uses(&block.terminator) {
+            if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
+                block_use[block_idx].insert(value);
+            }
+        }
+    }
+
+    let mut live_in: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
+    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
+    let mut changed = true;
+    let mut iterations = 0usize;
+    // A conservative cap guards malformed irreducible CFGs. Failure to
+    // converge merely under-optimizes because callers reject the empty graph.
+    while changed && iterations < 256 {
+        changed = false;
+        iterations += 1;
+        for block_idx in (0..func.blocks.len()).rev() {
+            let mut out = FxHashSet::default();
+            for &succ in &succs[block_idx] {
+                out.extend(live_in[succ].iter().copied());
+            }
+            let mut input = block_use[block_idx].clone();
+            for value in &out {
+                if !block_def[block_idx].contains(value) {
+                    input.insert(*value);
+                }
+            }
+            if out != live_out[block_idx] {
+                live_out[block_idx] = out;
+                changed = true;
+            }
+            if input != live_in[block_idx] {
+                live_in[block_idx] = input;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        // Do not use partially converged dataflow for a correctness proof.
+        return None;
+    }
+
+    let mut graph: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let mut live = live_out[block_idx].clone();
+        for value in terminator_value_uses(&block.terminator) {
+            if tracked.contains(&value) {
+                live.insert(value);
+            }
+        }
+        for inst in block.instructions.iter().rev() {
+            let copy_source = match inst {
+                Instruction::Copy { src: Operand::Value(source), .. } => Some(source.0),
+                _ => None,
+            };
+            if let Some(dest) = inst.dest() {
+                if tracked.contains(&dest.0) {
+                    for &other in &live {
+                        if copy_source != Some(other) {
+                            insert_interference(&mut graph, dest.0, other);
+                        }
+                    }
+                    live.remove(&dest.0);
+                }
+            }
+            for value in instruction_value_uses(inst) {
+                if tracked.contains(&value) {
+                    live.insert(value);
+                }
+            }
+        }
+    }
+    Some(graph)
+}
+
+fn find_root(parent: &mut FxHashMap<u32, u32>, value: u32) -> u32 {
+    let mut root = value;
+    while parent.get(&root).copied() != Some(root) {
+        root = parent.get(&root).copied().unwrap_or(root);
+    }
+    let mut cursor = value;
+    while parent.get(&cursor).copied().is_some_and(|p| p != root) {
+        let next = parent[&cursor];
+        parent.insert(cursor, root);
+        cursor = next;
+    }
+    root
+}
+
+fn class_members(parent: &mut FxHashMap<u32, u32>, root: u32) -> Vec<u32> {
+    let values: Vec<u32> = parent.keys().copied().collect();
+    values.into_iter()
+        .filter(|value| find_root(parent, *value) == root)
+        .collect()
+}
+
+fn classes_interfere(
+    parent: &mut FxHashMap<u32, u32>,
+    interference: &FxHashMap<u32, FxHashSet<u32>>,
+    lhs_root: u32,
+    rhs_root: u32,
+) -> bool {
+    let lhs = class_members(parent, lhs_root);
+    let rhs = class_members(parent, rhs_root);
+    lhs.iter().any(|value| {
+        interference.get(value).is_some_and(|neighbors| {
+            rhs.iter().any(|other| neighbors.contains(other))
+        })
+    })
+}
+
+/// CFG-aware stack-copy coalescing.
+///
+/// This replaces only the stack-slot alias decision.  It does not change phi
+/// lowering order, register allocation, or emitted copy semantics; it merely
+/// lets provably non-interfering scalar copy webs use one stack home.  Every
+/// alias is marked forceable because the proof is graph-based rather than the
+/// old linear `def <= last_use` approximation.
+fn build_cfg_copy_alias_map(
+    func: &IrFunction,
+    multi_def_values: &FxHashSet<u32>,
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
+    let classes = collect_scalar_values(func);
+    let mut candidates: Vec<(u32, u32)> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Copy { dest, src: Operand::Value(source) } = inst {
+                if dest.0 == source.0
+                    || reg_assigned.contains_key(&dest.0)
+                    || reg_assigned.contains_key(&source.0)
+                    || !classes.contains_key(&dest.0)
+                    || !classes.contains_key(&source.0)
+                {
+                    continue;
+                }
+                candidates.push((dest.0, source.0));
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return (FxHashMap::default(), FxHashSet::default());
+    }
+
+    let tracked: FxHashSet<u32> = candidates
+        .iter()
+        .flat_map(|(dest, source)| [*dest, *source])
+        .collect();
+    let Some(interference) = cfg_copy_interference(func, &tracked) else {
+        // A non-converged dataflow result is never used as an optimization proof.
+        return (FxHashMap::default(), FxHashSet::default());
+    };
+
+    let mut parent: FxHashMap<u32, u32> = tracked.iter().map(|&id| (id, id)).collect();
+    for (dest, source) in candidates {
+        let dest_root = find_root(&mut parent, dest);
+        let source_root = find_root(&mut parent, source);
+        if dest_root == source_root
+            || classes_interfere(&mut parent, &interference, dest_root, source_root)
+        {
+            continue;
+        }
+        // Keep a multi-def phi destination as the group owner. It has the
+        // cross-block lifetime that phi incoming values must feed. Otherwise
+        // use the lower ID to make the output deterministic.
+        let owner = match (
+            multi_def_values.contains(&dest_root),
+            multi_def_values.contains(&source_root),
+        ) {
+            (true, false) => dest_root,
+            (false, true) => source_root,
+            _ => dest_root.min(source_root),
+        };
+        let other = if owner == dest_root { source_root } else { dest_root };
+        parent.insert(other, owner);
+    }
+
+    let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for &value in &tracked {
+        let root = find_root(&mut parent, value);
+        groups.entry(root).or_default().push(value);
+    }
+
+    let mut aliases = FxHashMap::default();
+    let mut force_aliases = FxHashSet::default();
+    for (root, mut members) in groups {
+        members.sort_unstable();
+        if members.len() < 2 {
+            continue;
+        }
+        let preferred_root = members.iter().copied()
+            .filter(|id| multi_def_values.contains(id))
+            .min()
+            .unwrap_or(root);
+        for member in members {
+            if member != preferred_root {
+                aliases.insert(member, preferred_root);
+                force_aliases.insert(member);
+            }
+        }
+    }
+
+    if std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok() && !aliases.is_empty() {
+        let mut pairs: Vec<(u32, u32)> = aliases.iter().map(|(&a, &b)| (a, b)).collect();
+        pairs.sort_unstable();
+        eprintln!(
+            "[CFG-SLOT-COALESCE] fn={} candidates={} aliases={} pairs={:?}",
+            func.name,
+            tracked.len(),
+            pairs.len(),
+            pairs,
+        );
+    }
+    (aliases, force_aliases)
+}
 
 /// Build the copy alias map: dest_id -> root_id for Copy instructions where
 /// dest and src can share the same stack slot.
@@ -36,6 +435,10 @@ pub(super) fn build_copy_alias_map(
     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
     cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
 ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
+    if cfg_copy_coalesce_enabled() {
+        return build_cfg_copy_alias_map(func, multi_def_values, reg_assigned);
+    }
+
     // Count uses of each value across all instructions.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
@@ -379,6 +782,20 @@ pub(super) fn build_copy_alias_map(
         copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
     }
 
+    if std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok() && !copy_alias.is_empty() {
+        let mut aliases: Vec<(u32, u32)> = copy_alias.iter()
+            .map(|(&dest, &root)| (dest, root))
+            .collect();
+        aliases.sort_unstable();
+        eprintln!(
+            "[SLOT-COALESCE] fn={} aliases={} phi_web_aliases={} pairs={:?}",
+            func.name,
+            aliases.len(),
+            phi_web_aliases.len(),
+            aliases,
+        );
+    }
+
     (copy_alias, phi_web_aliases)
 }
 
@@ -556,4 +973,525 @@ fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
         Terminator::IndirectBranch { target: Operand::Value(v), .. } => v.0 == value_id,
         _ => false,
     }
+}
+
+#[cfg(test)]
+mod cfg_copy_coalesce_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            source_spans: Vec::new(),
+            terminator,
+        }
+    }
+
+    fn scalar_def(dest: u32, value: i32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Const(IrConst::I32(value)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn cfg_copy_coalesces_a_straight_line_copy() {
+        let mut func = IrFunction::new("straight".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 7),
+                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let (aliases, force) = build_cfg_copy_alias_map(
+            &func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+        );
+        assert_eq!(aliases.get(&1), Some(&0));
+        assert!(force.contains(&1));
+    }
+
+    #[test]
+    fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
+        // d is a lowered phi: d = x on the left edge, d = y on the right.
+        // x is also used after the join, so x and d must never share a slot.
+        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![scalar_def(0, 11)],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                2,
+                vec![
+                    scalar_def(1, 22),
+                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
+                ],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                vec![Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        let mut multi_def = FxHashSet::default();
+        multi_def.insert(2);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
+        assert_ne!(aliases.get(&0), Some(&2));
+        assert_ne!(aliases.get(&2), Some(&0));
+        // y is edge-local and may safely use the phi web's home.
+        assert_eq!(aliases.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn cfg_copy_coalesces_loop_carried_phi_sources() {
+        // Lowered loop phi: state is initialized from `init` on entry and
+        // from `next` on the back-edge. Neither incoming value is used after
+        // its edge copy, so both may share the phi web's stack home.
+        let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    scalar_def(0, 3),
+                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, vec![], Terminator::Return(Some(Operand::Value(Value(2))))),
+        ];
+        let mut multi_def = FxHashSet::default();
+        multi_def.insert(2);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
+        assert_eq!(aliases.get(&0), Some(&2));
+        // `next` is redefined at the loop header on the next iteration, so
+        // the CFG liveness proof conservatively keeps it distinct from the
+        // phi web instead of relying on textual interval order.
+        assert_ne!(aliases.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn cfg_copy_excludes_i128_from_scalar_slot_aliasing() {
+        let mut func = IrFunction::new("wide".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I128(1)),
+                    rhs: Operand::Const(IrConst::I128(2)),
+                    ty: IrType::I128,
+                },
+                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
+            ],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        ));
+        let (aliases, _) = build_cfg_copy_alias_map(
+            &func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+        );
+        assert!(aliases.is_empty());
+    }
+}
+
+/// True if the intrinsic's codegen reads its args OUTSIDE the cache-aware
+/// loaders (sse_load_arg/avx_load_arg_to) — i.e. it invalidates the vector
+/// last-store peephole and would observe a deferred (never-written) slot.
+pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::Pblendvb128
+            | O::Loadldi128
+            | O::Storeldi128
+            | O::FmaF64x2
+            | O::FmaF64x4
+            | O::FmaF64x4Hoisted
+            | O::FmaF64x4SIB
+            | O::BroadcastLoadF64
+            | O::LoadF64x2
+            | O::LoadF64x4
+            | O::LoadI32x4
+            | O::LoadI32x8
+            | O::HorizontalAddF64x2
+            | O::HorizontalAddF64x4
+            | O::HorizontalAddI32x4
+            | O::HorizontalAddI32x8
+            | O::VecLoadF64x2
+            | O::VecLoadF64x4
+            | O::VecLoadI32x4
+            | O::VecLoadI32x8
+            | O::VecAddF64x2
+            | O::VecAddF64x4
+            | O::VecAddI32x4
+            | O::VecAddI32x8
+            | O::VecMulF64x2
+            | O::VecMulF64x4
+            | O::VecHorizontalAddF64x2
+            | O::VecHorizontalAddF64x4
+            | O::VecHorizontalAddI32x4
+            | O::VecHorizontalAddI32x8
+    )
+}
+
+/// Ops whose codegen goes through `emit_sse_binary_128` / `emit_avx_binary_256`
+/// — the two-operand emitters that load the last-stored operand FIRST into
+/// %xmm1/%ymm1 when args[1] is still in %xmm0/%ymm0 (the v5 load-order swap).
+/// Only these can soundly consume a deferred value from args[1].
+fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        // emit_sse_binary_128
+        O::Pcmpeqb128 | O::Pcmpeqd128 | O::Psubusb128 | O::Psubsb128
+        | O::Por128 | O::Pand128 | O::Pxor128
+        | O::AddPs128 | O::SubPs128 | O::MulPs128
+        | O::AddPd128 | O::SubPd128 | O::MulPd128
+        | O::Paddw128 | O::Psubw128 | O::Pmulhw128 | O::Pmullw128
+        | O::Pmuludq128 | O::Pmuldq128 | O::Pmulld128
+        | O::Pmaddwd128 | O::Pmaddubsw128
+        | O::Pcmpgtw128 | O::Pcmpgtb128
+        | O::Paddd128 | O::Psubd128
+        | O::Paddb128 | O::Psubb128 | O::Psubusw128
+        | O::Psadbw128
+        | O::Pshufb128
+        | O::Pmaxub128 | O::Pminub128
+        | O::Pmovzxbw128 | O::Pmovzxwd128
+        | O::Packssdw128 | O::Packsswb128 | O::Packuswb128
+        | O::Punpcklbw128 | O::Punpckhbw128
+        | O::Punpcklwd128 | O::Punpckhwd128
+        | O::Aesenc128 | O::Aesenclast128 | O::Aesdec128 | O::Aesdeclast128
+        | O::AddF64x2 | O::MulF64x2 | O::AddI32x4
+        // emit_avx_binary_256
+        | O::Paddb256 | O::Paddw256 | O::Paddd256
+        | O::Psubb256 | O::Psubw256 | O::Psubusw256
+        | O::Psadbw256 | O::Pmaddubsw256 | O::Pmaddwd256
+        | O::Pcmpeqb256 | O::Pcmpgtb256 | O::Pshufb256
+        | O::Pmaxub256 | O::Pminub256
+        | O::Pxor256 | O::Por256 | O::Pand256
+        | O::AddF64x4 | O::MulF64x4 | O::AddI32x8
+    )
+}
+
+/// Values whose vector-result store can be DEFERRED (skipped entirely) — the
+/// v5 "accumulator renaming" optimization.
+///
+/// A vector intrinsic (e.g. `_mm_xor_si128`) computes its result in
+/// %xmm0/%ymm0 and normally stores it to its dest slot; the single-entry
+/// last-store peephole then lets the immediately-following load of the same
+/// value skip the reload. When that following load is the value's ONLY use,
+/// the intermediate store is pure overhead: the store is skipped and the
+/// register carries the value straight into the consumer (a net store+load
+/// elimination).
+///
+/// Soundness (each condition is load-bearing):
+/// 1. V is the dest alloca of a vector intrinsic P (never a user pointer —
+///    excludes `_mm_storeu_*`-style ops whose dest_ptr is a real store target).
+/// 2. V has exactly one ARG use (intrinsic dest_ptr is a write, not counted).
+/// 3. That use is args[0] (or args[1] of a two-operand binary emitter, whose
+///    codegen loads the last-stored operand FIRST into %xmm1/%ymm1) of the
+///    instruction IMMEDIATELY following P in the same block (adjacency ⇒
+///    nothing can clobber the register or read the slot in between).
+/// 4. The consumer's args[0] load goes through sse_load_arg/avx_load_arg_to
+///    into %xmm0/%ymm0 as its FIRST vector op. Excluded raw readers (FMA /
+///    load / horizontal-reduction / auto-vectorizer family, the raw movq
+///    load/store helpers, Pblendvb128) bypass the loaders and would read the
+///    never-written slot or clobber the held register first.
+/// 5. V is not volatile, not written through other paths (no value-ref use,
+///    no copy-alias root, not an address-taken alloca).
+/// 6. ALL def sites of V qualify individually. The defer set is keyed by
+///    slot: codegen skips the store at every instruction writing the slot, so
+///    one non-adjacent site (C temporaries reused across two loop bodies)
+///    disqualifies the slot entirely — otherwise that site's consumer would
+///    read a never-written slot (adler32_ssse3 miscompile, fixed 2026-08).
+pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp;
+    let mut result = FxHashSet::default();
+
+    // Pass 0: collect alloca dests (and volatile ones) + copy-alias roots.
+    let mut allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_alias_roots: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca {
+                    dest,
+                    volatile,
+                    semantic_volatile,
+                    ..
+                } => {
+                    allocas.insert(dest.0);
+                    if *volatile || *semantic_volatile {
+                        volatile_allocas.insert(dest.0);
+                    }
+                }
+                Instruction::Copy { src: Operand::Value(v), .. } => {
+                    copy_alias_roots.insert(v.0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 1: collect every Operand use site (block, inst index) per value,
+    // plus global flags for non-ARG uses. Intrinsic dest_ptr is a WRITE (not a
+    // use); Call args / Store val / Memcpy / terminator uses are ARG uses but
+    // NOT cache-aware (the slot is really read), so the per-producer scan below
+    // rejects them.
+    let mut uses: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut has_value_ref_use: FxHashSet<u32> = FxHashSet::default();
+    let mut non_intrinsic_arg_use: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Intrinsic { args, .. } => {
+                    for arg in args {
+                        if let Operand::Value(v) = arg {
+                            uses.entry(v.0).or_default().push((bi, ii));
+                        }
+                    }
+                }
+                other => {
+                    for_each_operand_in_instruction(other, |op| {
+                        if let Operand::Value(v) = op {
+                            uses.entry(v.0).or_default().push((bi, ii));
+                            non_intrinsic_arg_use.insert(v.0);
+                        }
+                    });
+                    for_each_value_use_in_instruction(other, |v| {
+                        has_value_ref_use.insert(v.0);
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                uses.entry(v.0).or_default().push((bi, usize::MAX));
+                non_intrinsic_arg_use.insert(v.0);
+            }
+        });
+    }
+
+    // Instructions that clear the vector-register peephole (the last-store
+    // cache). A cache-aware load AFTER one of these does a REAL memory load,
+    // so a deferred store would be observed. Includes the raw-reader
+    // intrinsics, which invalidate the peephole by design.
+    let is_vec_invalidator = |inst: &Instruction| -> bool {
+        match inst {
+            Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. } | Instruction::Memcpy { .. }
+            | Instruction::DynAlloca { .. } | Instruction::Store { .. }
+            | Instruction::AtomicLoad { .. } | Instruction::AtomicStore { .. }
+            | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicInc { .. } => true,
+            Instruction::Intrinsic { op, .. } => is_raw_reader_intrinsic(op),
+            _ => false,
+        }
+    };
+
+    // Pass 2: per-DEF window analysis. A slot (alloca) may be written by
+    // multiple producers (loop unrolling reuses the same __m256i variable),
+    // each in possibly different blocks. A producer's store is observable only
+    // by the reads that occur after THIS write and before the NEXT write of the
+    // same slot (its "window"). The vector last-store cache is SINGLE-ENTRY:
+    // a real vector load of any other value evicts it, and a cache hit
+    // consumes it — so a store may be deferred only when the def has EXACTLY
+    // ONE use, with no intervening vector-loading instruction (intrinsic) and
+    // no loop-carried read of the slot in the same block (a use before the
+    // def means the block re-enters via a backedge and the slot is the
+    // loop-carried home that must be updated every iteration).
+    let mut defs: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Intrinsic {
+                dest_ptr: Some(d),
+                op,
+                ..
+            } = inst
+            {
+                if matches!(
+                    op,
+                    IntrinsicOp::Storedqu
+                        | IntrinsicOp::Storeu256
+                        | IntrinsicOp::Store256
+                        | IntrinsicOp::Storeldi128
+                        | IntrinsicOp::Movntdq
+                        | IntrinsicOp::Movntpd
+                ) {
+                    continue;
+                }
+                if allocas.contains(&d.0) {
+                    defs.entry(d.0).or_default().push((bi, ii));
+                    def_blocks.entry(d.0).or_default().insert(bi);
+                }
+            }
+        }
+    }
+
+    for (&slot, sites) in &defs {
+        // Global soundness: no deferral if the slot is volatile, copy-aliased,
+        // address-taken (value-ref use), or read by a non-Intrinsic instruction
+        // (call arg / Store val / Memcpy / terminator) anywhere in the function.
+        if volatile_allocas.contains(&slot)
+            || copy_alias_roots.contains(&slot)
+            || has_value_ref_use.contains(&slot)
+            || non_intrinsic_arg_use.contains(&slot)
+        {
+            continue;
+        }
+        let mut sites = sites.clone();
+        sites.sort();
+        // Orphan reads: uses of the slot in a block that never writes it.
+        let mut orphan = false;
+        if let Some(use_sites) = uses.get(&slot) {
+            for &(ubi, _) in use_sites {
+                if !def_blocks.get(&slot).map(|b| b.contains(&ubi)).unwrap_or(false) {
+                    orphan = true;
+                    break;
+                }
+            }
+        }
+        if orphan {
+            continue; // no store may be deferred for this slot
+        }
+        // The defer set is keyed by SLOT, and codegen skips the result store
+        // at EVERY instruction writing the slot. Deferral is therefore sound
+        // only when ALL def sites of the slot satisfy the adjacent-consumer
+        // contract. If any single site is non-adjacent (a C temporary reused
+        // across two loop bodies where one body runs another vector intrinsic
+        // between producer and consumer), the slot must not be deferred at
+        // all: the non-adjacent site's consumer would otherwise read a slot
+        // that was never written (the adler32_ssse3 miscompile).
+        let mut all_sites_ok = true;
+        for &(bi, i) in &sites {
+            let insts = &func.blocks[bi].instructions;
+            // Loop-carried / RMW guard: a use of the slot in this block at or
+            // before the def means the block re-enters via a backedge (or the
+            // def itself is read-modify-write); the slot must stay updated.
+            let earlier_use = uses
+                .get(&slot)
+                .map(|u| u.iter().any(|&(ubi, uii)| ubi == bi && uii <= i))
+                .unwrap_or(false);
+            if earlier_use {
+                all_sites_ok = false;
+                break;
+            }
+            // Window uses: same block, after i, before the next def of the slot.
+            let window_uses: Vec<usize> = uses
+                .get(&slot)
+                .map(|u| {
+                    u.iter()
+                        .filter(|&&(ubi, uii)| {
+                            ubi == bi
+                                && uii > i
+                                && !sites.iter().any(|&(db, di)| db == bi && di > i && di < uii)
+                        })
+                        .map(|&(_, uii)| uii)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The single-entry cache can serve EXACTLY ONE use.
+            if window_uses.len() != 1 {
+                all_sites_ok = false;
+                break;
+            }
+            let u = window_uses[0];
+            // No invalidator and NO intervening intrinsic (any intrinsic may
+            // perform a real vector load and evict the single-entry cache)
+            // strictly between the def and the use.
+            let mut ok = true;
+            for k in (i + 1)..u {
+                let ik = &insts[k];
+                if is_vec_invalidator(ik) || matches!(ik, Instruction::Intrinsic { .. }) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                all_sites_ok = false;
+                break;
+            }
+            // The single use must be a cache-aware consumer at a sound position.
+            let (cop, cargs) = match insts.get(u) {
+                Some(Instruction::Intrinsic { op, args, .. }) => (op, args),
+                _ => {
+                    all_sites_ok = false;
+                    break;
+                }
+            };
+            let pos = cargs
+                .iter()
+                .position(|a| matches!(a, Operand::Value(v) if v.0 == slot))
+                .unwrap_or(usize::MAX);
+            let cache_aware = if pos == 0 {
+                !is_raw_reader_intrinsic(cop) && !matches!(cop, IntrinsicOp::Pblendvb128)
+            } else {
+                is_two_operand_binary(cop)
+            };
+            if !cache_aware {
+                all_sites_ok = false;
+                break;
+            }
+            if std::env::var("CCC_DEBUG_VDEFER").is_ok() {
+                eprintln!(
+                    "[VDEFER] slot={} def=({},{})(uses_in_window={:?}) consumer=({},{})({:?}) site-ok",
+                    slot, bi, i, window_uses, bi, u, cop
+                );
+            }
+        }
+        if all_sites_ok {
+            result.insert(slot);
+        }
+    }
+
+    result
 }

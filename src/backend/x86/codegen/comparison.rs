@@ -1,13 +1,28 @@
 //! X86Codegen: comparison and select operations.
 
-use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
+use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, X86Codegen};
+use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
-use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, is_xmm_reg};
+use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 
 impl X86Codegen {
-    pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let swap_operands = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
-        let (first, second) = if swap_operands { (rhs, lhs) } else { (lhs, rhs) };
+    pub(super) fn emit_float_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        let swap_operands = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
+        let (first, second) = if swap_operands {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
 
         // Load first operand → %xmm0 (use constant pool for FP constants)
         self.emit_fp_operand_to_xmm(first, ty, "xmm0");
@@ -42,8 +57,17 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
-    pub(super) fn emit_f128_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {
-        let swap_x87 = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
+    pub(super) fn emit_f128_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        let swap_x87 = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
         let (first_x87, second_x87) = if swap_x87 { (lhs, rhs) } else { (rhs, lhs) };
         self.emit_f128_load_to_x87(first_x87);
         self.emit_f128_load_to_x87(second_x87);
@@ -72,9 +96,51 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
-    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_int_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
+
+        // FLAG FUSION: when this Cmp's boolean result is consumed ONLY by the
+        // immediately-following Select or CondBranch (precomputed in
+        // fused_cmp_dests from the IR adjacency), skip the boolean
+        // materialization entirely — the flags set by the cmp/test above are
+        // still live, and the consumer emits jcc/cmovcc directly. This saves
+        // setcc + movzbl + (movq/testq) per comparison in branch-heavy hot
+        // loops (gzip's longest_match). The dispatch loop runs instructions
+        // strictly in order, so the consumer is guaranteed to be the next
+        // emission; if anything else intervenes (cannot happen by
+        // construction), the consumer falls back to materializing the bool —
+        // but that path is unreachable for fused cmps.
+        //
+        // SOUNDNESS (v13): flag fusion is DISABLED when a select fallback that
+        // materializes the condition via `operand_to_rax(cond)` is forced
+        // (CCC_V9_SELECT = legacy v9 select emission; CCC_NO_INPLACE_SELECT =
+        // disable the in-place condition test). Those legacy paths READ the
+        // materialized boolean from the Cmp's register/slot, so the Cmp MUST
+        // emit the setcc+movzbl — otherwise the legacy select reads a stale
+        // register (it was never written because the Cmp skipped the
+        // materialization). Without this gate, setting either flag produced
+        // wrong select results (differential test: got 660 vs expected 1320).
+        let fusion_disabled = std::env::var("CCC_NO_FLAG_FUSION").is_ok()
+            || std::env::var("CCC_V9_SELECT").is_ok()
+            || std::env::var("CCC_NO_INPLACE_SELECT").is_ok();
+        if !fusion_disabled {
+            if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
+                // The consumer is the next instruction(s) (possibly after a
+                // flag-neutral Copy chain); record pending flags under the
+                // chain-end value so the consumer's cond matches.
+                self.pending_cmp = Some((chain_end, op));
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
 
         let set_instr = match op {
             IrCmpOp::Eq => "sete",
@@ -95,7 +161,8 @@ impl X86Codegen {
         if let Some(d_reg) = self.dest_reg(dest) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name_32(d_reg);
-                self.state.emit_fmt(format_args!("    movzbl %al, %{}", d_name));
+                self.state
+                    .emit_fmt(format_args!("    movzbl %al, %{}", d_name));
                 self.state.reg_cache.invalidate_acc();
                 return;
             }
@@ -119,8 +186,8 @@ impl X86Codegen {
         self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
 
         let jcc = match op {
-            IrCmpOp::Eq  => "je",
-            IrCmpOp::Ne  => "jne",
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
             IrCmpOp::Slt => "jl",
             IrCmpOp::Sle => "jle",
             IrCmpOp::Sgt => "jg",
@@ -130,7 +197,8 @@ impl X86Codegen {
             IrCmpOp::Ugt => "ja",
             IrCmpOp::Uge => "jae",
         };
-        self.state.emit_fmt(format_args!("    {} {}", jcc, true_label));
+        self.state
+            .emit_fmt(format_args!("    {} {}", jcc, true_label));
         self.state.out.emit_jmp_label(false_label);
         self.state.reg_cache.invalidate_all();
     }
@@ -148,104 +216,450 @@ impl X86Codegen {
         self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
 
         let jcc = match op {
-            IrCmpOp::Eq  => "    je",
-            IrCmpOp::Ne  => "    jne",
-            IrCmpOp::Slt => "    jl",
-            IrCmpOp::Sle => "    jle",
-            IrCmpOp::Sgt => "    jg",
-            IrCmpOp::Sge => "    jge",
-            IrCmpOp::Ult => "    jb",
-            IrCmpOp::Ule => "    jbe",
-            IrCmpOp::Ugt => "    ja",
-            IrCmpOp::Uge => "    jae",
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
+            IrCmpOp::Slt => "jl",
+            IrCmpOp::Sle => "jle",
+            IrCmpOp::Sgt => "jg",
+            IrCmpOp::Sge => "jge",
+            IrCmpOp::Ult => "jb",
+            IrCmpOp::Ule => "jbe",
+            IrCmpOp::Ugt => "ja",
+            IrCmpOp::Uge => "jae",
         };
-        self.state.out.emit_jcc_block(jcc, true_block.0);
-        self.state.out.emit_jmp_block(false_block.0);
+        if self.state.next_block_label == Some(true_block) {
+            self.state
+                .out
+                .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
+        } else {
+            self.state.out.emit_jcc_block(jcc, true_block.0);
+            if self.state.next_block_label != Some(false_block) {
+                self.state.out.emit_jmp_block(false_block.0);
+            }
+        }
         self.state.reg_cache.invalidate_all();
     }
 
-    pub(super) fn emit_cond_branch_blocks_impl(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) {
+    /// Map an integer comparison opcode to the jcc mnemonic for the
+    /// condition "the comparison is true".
+    fn cmp_jcc(op: IrCmpOp) -> &'static str {
+        match op {
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
+            IrCmpOp::Slt => "jl",
+            IrCmpOp::Sle => "jle",
+            IrCmpOp::Sgt => "jg",
+            IrCmpOp::Sge => "jge",
+            IrCmpOp::Ult => "jb",
+            IrCmpOp::Ule => "jbe",
+            IrCmpOp::Ugt => "ja",
+            IrCmpOp::Uge => "jae",
+        }
+    }
+
+    /// Map an integer comparison opcode to the cmov CONDITION CODE (the part
+    /// between "cmov" and the size suffix, e.g. "g" for cmovgq). The caller
+    /// composes `cmov{cc}q`.
+    fn cmp_cmov(op: IrCmpOp) -> &'static str {
+        match op {
+            IrCmpOp::Eq => "e",
+            IrCmpOp::Ne => "ne",
+            IrCmpOp::Slt => "l",
+            IrCmpOp::Sle => "le",
+            IrCmpOp::Sgt => "g",
+            IrCmpOp::Sge => "ge",
+            IrCmpOp::Ult => "b",
+            IrCmpOp::Ule => "be",
+            IrCmpOp::Ugt => "a",
+            IrCmpOp::Uge => "ae",
+        }
+    }
+
+    /// If `cond` is the destination of a fused Cmp whose flags are still
+    /// pending, consume the pending flags and return the comparison opcode.
+    fn take_pending_cmp(&mut self, cond: &Operand) -> Option<IrCmpOp> {
+        if let Operand::Value(v) = cond {
+            if let Some((dest, op)) = self.pending_cmp {
+                if dest == v.0 {
+                    self.pending_cmp = None;
+                    return Some(op);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn invert_jcc(cc: &str) -> &'static str {
+        match cc {
+            "je" => "jne",
+            "jne" => "je",
+            "jl" => "jge",
+            "jge" => "jl",
+            "jle" => "jg",
+            "jg" => "jle",
+            "jb" => "jae",
+            "jae" => "jb",
+            "jbe" => "ja",
+            "ja" => "jbe",
+            _ => "jne",
+        }
+    }
+
+    pub(super) fn emit_cond_branch_blocks_impl(
+        &mut self,
+        cond: &Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        let next = self.state.next_block_label;
+        // If the false edge is the next emitted block, branch only on true.
+        // If the true edge is next, invert the condition and branch only on
+        // false. This removes the unconditional jump from the hot path.
+        let false_fallthrough = next == Some(false_block);
+        let true_fallthrough = next == Some(true_block);
+
+        // FLAG FUSION: the condition is the direct result of the immediately
+        // preceding Cmp; its flags are live — branch on them directly,
+        // skipping the testq of the materialized boolean.
+        if let Some(op) = self.take_pending_cmp(cond) {
+            let jcc = Self::cmp_jcc(op);
+            if true_fallthrough {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc, true_block.0);
+                if !false_fallthrough {
+                    self.state.out.emit_jmp_block(false_block.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
         // Register-direct: test the condition register directly, skip %rax relay.
         if let Operand::Value(v) = cond {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if !is_xmm_reg(reg) {
                     let name = phys_reg_name(reg);
-                    self.state.emit_fmt(format_args!("    testq %{}, %{}", name, name));
-                    self.state.out.emit_jcc_block("    jne", true_block.0);
-                    self.state.out.emit_jmp_block(false_block.0);
+                    self.state
+                        .emit_fmt(format_args!("    testq %{}, %{}", name, name));
+                    if true_fallthrough {
+                        self.state.out.emit_jcc_block("je", false_block.0);
+                    } else {
+                        self.state.out.emit_jcc_block("jne", true_block.0);
+                        if !false_fallthrough {
+                            self.state.out.emit_jmp_block(false_block.0);
+                        }
+                    }
                     return;
                 }
             }
         }
         self.operand_to_rax(cond);
         self.state.emit("    testq %rax, %rax");
-        self.state.out.emit_jcc_block("    jne", true_block.0);
-        self.state.out.emit_jmp_block(false_block.0);
+        if true_fallthrough {
+            self.state.out.emit_jcc_block("je", false_block.0);
+        } else {
+            self.state.out.emit_jcc_block("jne", true_block.0);
+            if !false_fallthrough {
+                self.state.out.emit_jmp_block(false_block.0);
+            }
+        }
     }
 
-    pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
+    /// Test the select condition in place, WITHOUT materializing it into a
+    /// register and WITHOUT `pushfq`/`popfq`:
+    ///
+    ///   * register-allocated cond → `testq %reg, %reg` (no clobbers)
+    ///   * stack-slot cond         → `cmpl $0, off(%rsp/%rbp)` (no clobbers;
+    ///                               bools are stored as zero-extended I32)
+    ///   * accumulator-cached cond → `testq %rax, %rax`
+    ///
+    /// Returns true when the flags were set in place (so the caller can emit a
+    /// cmov directly). `pushfq`/`popfq` are serializing (~20-50 cycles each) and
+    /// additionally disable the store-forwarding peephole phases, so avoiding
+    /// them in the common case is a large hot-loop win.
+    fn test_select_cond_in_place(&mut self, cond: &Operand) -> bool {
+        if let Operand::Value(v) = cond {
+            if !self.state.is_alloca(v.0) {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if !is_xmm_reg(reg) {
+                        let name = phys_reg_name(reg);
+                        self.state
+                            .emit_fmt(format_args!("    testq %{}, %{}", name, name));
+                        return true;
+                    }
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.state.out.emit_cmp_zero_mem(slot.0);
+                    return true;
+                }
+                if self.state.reg_cache.acc_has(v.0, false)
+                    || self.state.reg_cache.acc_has(v.0, true)
+                {
+                    self.state.emit("    testq %rax, %rax");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Materialize a select operand into a register using ONLY flag-neutral
+    /// instructions. The generic `operand_to_rcx`/`operand_to_callee_reg`
+    /// materialize zero constants as `xorl %reg, %reg`, which clobbers the
+    /// condition flags — unacceptable between the in-place condition test and
+    /// the cmov (that is exactly why the legacy path needed pushfq/popfq).
+    /// Value operands are always flag-neutral in the existing helpers
+    /// (mov/movl/movslq/leaq family), so only constants are handled here.
+    fn select_operand_to_reg(&mut self, op: &Operand, reg64: &str, reg32: &str) {
+        if let Operand::Const(c) = op {
+            if c.is_zero() {
+                self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
+                return;
+            }
+            match c {
+                IrConst::I8(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
+                }
+                IrConst::I16(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
+                }
+                IrConst::I32(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
+                }
+                IrConst::I64(v) => {
+                    if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                        self.state.out.emit_instr_imm_reg("    movq", *v, reg64);
+                    } else {
+                        self.state.out.emit_instr_imm_reg("    movabsq", *v, reg64);
+                    }
+                }
+                IrConst::F32(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", v.to_bits() as i64, reg64);
+                }
+                IrConst::F64(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movabsq", v.to_bits() as i64, reg64);
+                }
+                IrConst::LongDouble(v, _) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movabsq", v.to_bits() as i64, reg64);
+                }
+                IrConst::I128(v) => {
+                    let low = *v as i64;
+                    if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                        self.state.out.emit_instr_imm_reg("    movq", low, reg64);
+                    } else {
+                        self.state.out.emit_instr_imm_reg("    movabsq", low, reg64);
+                    }
+                }
+                IrConst::Zero => {
+                    self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
+                }
+            }
+            let _ = reg32;
+            return;
+        }
+        if reg64 == "rcx" {
+            self.operand_to_rcx(op);
+        } else if reg64 == "rax" {
+            self.operand_to_rax(op);
+        } else {
+            // Register-direct destination: find the PhysReg by name.
+            let phys = match reg64 {
+                "rbx" => Some(PhysReg(1)),
+                "r12" => Some(PhysReg(2)),
+                "r13" => Some(PhysReg(3)),
+                "r14" => Some(PhysReg(4)),
+                "r15" => Some(PhysReg(5)),
+                "rbp" => Some(PhysReg(6)),
+                "r11" => Some(PhysReg(10)),
+                "r10" => Some(PhysReg(11)),
+                "r8" => Some(PhysReg(12)),
+                "r9" => Some(PhysReg(13)),
+                "rdi" => Some(PhysReg(14)),
+                "rsi" => Some(PhysReg(15)),
+                "rdx" => Some(PhysReg(16)),
+                _ => None,
+            };
+            if let Some(p) = phys {
+                self.operand_to_callee_reg(op, p);
+            } else {
+                self.operand_to_rax(op);
+            }
+        }
+    }
+
+    pub(super) fn emit_select_impl(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        _ty: IrType,
+    ) {
+        // V9-compat path (debugging): exact v9 emission order.
+        if std::env::var("CCC_V9_SELECT").is_ok() {
+            if let Some(d_reg) = self.dest_reg(dest) {
+                if !is_xmm_reg(d_reg) {
+                    let d_name = phys_reg_name(d_reg);
+                    self.operand_to_rax(cond);
+                    self.state.emit("    testq %rax, %rax");
+                    self.state.emit("    pushfq");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 8;
+                    }
+                    self.operand_to_callee_reg(false_val, d_reg);
+                    self.operand_to_rcx(true_val);
+                    self.state.emit("    popfq");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size -= 8;
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+            self.operand_to_rax(cond);
+            self.state.emit("    testq %rax, %rax");
+            self.state.emit("    pushfq");
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += 8;
+            }
+            self.operand_to_rax(false_val);
+            self.operand_to_rcx(true_val);
+            self.state.emit("    popfq");
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= 8;
+            }
+            self.state.emit("    cmovneq %rcx, %rax");
+            self.state.reg_cache.invalidate_acc();
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Constant condition: statically select the operand. Both operands are
+        // pure SSA values (already computed by earlier instructions), so only
+        // the chosen one needs to be loaded — no test/cmov/branch at all.
+        if let Operand::Const(c) = cond {
+            let chosen = if c.is_zero() { false_val } else { true_val };
+            if let Some(d_reg) = self.dest_reg(dest) {
+                if !is_xmm_reg(d_reg) {
+                    self.operand_to_callee_reg(chosen, d_reg);
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+            self.operand_to_rax(chosen);
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // FLAG FUSION: the condition is the direct result of the immediately
+        // preceding Cmp whose flags are live — use the comparison's condition
+        // code directly for the cmov, no test needed.
+        let fused_op = self.take_pending_cmp(cond);
+        // Test the condition in place (no pushfq). Only when the condition is
+        // not directly testable (rare) do we fall back to the legacy
+        // materialize + pushfq/popfq path.
+        let tested_in_place = if std::env::var("CCC_NO_INPLACE_SELECT").is_ok() {
+            false
+        } else if fused_op.is_some() {
+            true
+        } else {
+            self.test_select_cond_in_place(cond)
+        };
+        let cmov_cc = match fused_op {
+            Some(op) => Self::cmp_cmov(op),
+            None => "ne",
+        };
+
         // Register-direct: when dest has a register, operate directly on it.
         if let Some(d_reg) = self.dest_reg(dest) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name(d_reg);
-
-                // Check for register conflicts: if true_val is in dest reg,
-                // we must load it to %rcx BEFORE loading false_val to dest.
-                let true_in_dest = match true_val {
-                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied() == Some(d_reg),
-                    _ => false,
-                };
-
-                // Load condition FIRST, then true/false vals.
-                // operand_to_rax(cond) must run before loading true_val
-                // to rcx, because the condition load may clobber registers
-                // that the register allocator assigned to true_val (the
-                // allocator doesn't model simultaneous liveness of Select operands).
-
-                // Step 1: load and test condition
+                if tested_in_place {
+                    // Load order (all alias-safe):
+                    //   1. true_val → %rcx   (clobbers rcx only; rcx is never
+                    //      register-allocated, and this only READS other regs)
+                    //   2. false_val → dest  (clobbers dest; cond was already
+                    //      tested, so flags are safe; if true_val lived in dest,
+                    //      rcx already holds a copy)
+                    //   3. cmovcc — reads flags (set by the in-place test or the
+                    //      fused Cmp; not modified by any of the above moves,
+                    //      which are flag-neutral) and rcx.
+                    // All materialization is flag-neutral (select_operand_to_reg
+                    // avoids `xorl` for zero constants, which would clobber the
+                    // flags between the test and the cmov).
+                    self.select_operand_to_reg(true_val, "rcx", "ecx");
+                    self.select_operand_to_reg(
+                        false_val,
+                        phys_reg_name(d_reg),
+                        phys_reg_name_32(d_reg),
+                    );
+                    self.state
+                        .emit_fmt(format_args!("    cmov{}q %rcx, %{}", cmov_cc, d_name));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+                // Legacy path: condition not testable in place.
                 self.operand_to_rax(cond);
                 self.state.emit("    testq %rax, %rax");
-                // Save flags (condition result) — pushfq preserves ZF
                 self.state.emit("    pushfq");
                 if self.state.out.use_rsp_addressing {
                     self.state.out.rsp_frame_size += 8;
                 }
-
-                // Step 2: load false_val to dest
                 self.operand_to_callee_reg(false_val, d_reg);
-
-                // Step 3: load true_val to rcx
                 self.operand_to_rcx(true_val);
-
-                // Step 4: restore flags and cmov
                 self.state.emit("    popfq");
                 if self.state.out.use_rsp_addressing {
                     self.state.out.rsp_frame_size -= 8;
                 }
-                self.state.emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
+                self.state
+                    .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
                 self.state.reg_cache.invalidate_acc();
                 return;
             }
         }
 
-        // Accumulator fallback — same pushfq approach as register-direct path
-        // to prevent condition loading from clobbering true_val's register.
+        // Accumulator fallback.
+        if tested_in_place {
+            // false_val → %rax, true_val → %rcx: both loads only clobber
+            // rax/rcx and never modify the flags set by the in-place test or
+            // the fused Cmp (flag-neutral materialization, see
+            // select_operand_to_reg).
+            self.select_operand_to_reg(false_val, "rax", "eax");
+            self.select_operand_to_reg(true_val, "rcx", "ecx");
+            self.state
+                .emit_fmt(format_args!("    cmov{}q %rcx, %rax", cmov_cc));
+            self.state.reg_cache.invalidate_acc();
+            self.store_rax_to(dest);
+            return;
+        }
 
-        // Step 1: load and test condition FIRST
+        // Legacy pushfq fallback (condition not testable in place).
         self.operand_to_rax(cond);
         self.state.emit("    testq %rax, %rax");
         self.state.emit("    pushfq");
         if self.state.out.use_rsp_addressing {
             self.state.out.rsp_frame_size += 8;
         }
-
-        // Step 2: load false_val to rax
         self.operand_to_rax(false_val);
-
-        // Step 3: load true_val to rcx (safe — condition already tested)
         self.operand_to_rcx(true_val);
-
-        // Step 4: restore flags and cmov
         self.state.emit("    popfq");
         if self.state.out.use_rsp_addressing {
             self.state.out.rsp_frame_size -= 8;

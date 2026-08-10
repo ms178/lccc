@@ -226,6 +226,8 @@ pub fn link_shared(
     let mut use_runpath = false; // --enable-new-dtags -> DT_RUNPATH instead of DT_RPATH
     let mut pending_rpath = false; // for -Wl,-rpath -Wl,/path two-arg form
     let mut pending_soname = false; // for -Wl,-soname -Wl,name two-arg form
+    let mut pending_version_script = false; // for -Wl,--version-script -Wl,path
+    let mut version_script: Option<String> = None;
     let mut whole_archive = false;
 
     // Ordered list of items to load: (path_or_lib, is_lib, whole_archive_state)
@@ -244,14 +246,17 @@ pub fn link_shared(
             ordered_items.push((l.to_string(), true, whole_archive));
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
-            // Handle -Wl,-rpath -Wl,/path and -Wl,-soname -Wl,name two-arg forms
-            if (pending_rpath || pending_soname) && !parts.is_empty() {
+            // Handle -Wl,-rpath/-soname/--version-script split across -Wl arguments.
+            if (pending_rpath || pending_soname || pending_version_script) && !parts.is_empty() {
                 if pending_rpath {
                     rpath_entries.push(parts[0].to_string());
                     pending_rpath = false;
                 } else if pending_soname {
                     soname = Some(parts[0].to_string());
                     pending_soname = false;
+                } else if pending_version_script {
+                    version_script = Some(parts[0].to_string());
+                    pending_version_script = false;
                 }
                 i += 1;
                 continue;
@@ -277,6 +282,13 @@ pub fn link_shared(
                     use_runpath = true;
                 } else if part == "--disable-new-dtags" {
                     use_runpath = false;
+                } else if let Some(vs) = part.strip_prefix("--version-script=") {
+                    version_script = Some(vs.to_string());
+                } else if part == "--version-script" && j + 1 < parts.len() {
+                    j += 1;
+                    version_script = Some(parts[j].to_string());
+                } else if part == "--version-script" {
+                    pending_version_script = true;
                 } else if let Some(lpath) = part.strip_prefix("-L") {
                     extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = part.strip_prefix("-l") {
@@ -387,5 +399,6 @@ pub fn link_shared(
     emit_shared_library(
         &objects, &mut globals, &mut output_sections, &section_map,
         &needed_sonames, output_path, soname, &rpath_entries, use_runpath,
+        version_script.as_deref(),
     )
 }

@@ -35,7 +35,7 @@
 
 mod analysis;
 mod alloca_coalescing;
-mod copy_coalescing;
+pub(crate) mod copy_coalescing;
 mod graph_coloring;
 mod slot_assignment;
 mod inline_asm;
@@ -109,6 +109,11 @@ struct StackLayoutContext {
     /// as the first operand loaded into the accumulator. These values don't need
     /// stack slots — the accumulator register cache keeps them alive.
     immediately_consumed: FxHashSet<u32>,
+    /// Values (vector-intrinsic result allocas) whose single use is args[0]/
+    /// args[1] of the immediately-following intrinsic: the v5 deferred-store
+    /// set. The backend may skip their slot store entirely (accumulator
+    /// renaming).
+    vector_defer_values: FxHashSet<u32>,
     /// Values that appear as incoming operands in Phi instructions.
     /// These must NOT be classified as block-local (Tier 3) because phi
     /// elimination places Copies at predecessor block ends. If the source
@@ -261,6 +266,10 @@ pub fn calculate_stack_space_common(
     // store_rax_to / store_eax_to can skip the store for these values.
     state.immediately_consumed = ctx.immediately_consumed.clone();
 
+    // v5: vector-intrinsic results that can skip their slot store (their only
+    // use is the adjacent intrinsic's args[0]/args[1] load).
+    state.vector_defer_values = ctx.vector_defer_values.clone();
+
     // Phase 2: Classify all instructions into the three tiers.
     let mut non_local_space = initial_offset;
     let mut deferred_slots: Vec<DeferredSlot> = Vec::new();
@@ -281,6 +290,13 @@ pub fn calculate_stack_space_common(
         &block_local_values, &mut deferred_slots,
         &mut block_space, &mut max_block_local_space, &assign_slot,
     );
+
+    // Raptor Lake Optimization: Protect cross-block vector slots
+    for mbv in &multi_block_values {
+        if state.vector_values.contains(&mbv.dest_id) {
+            state.protected_slot_values.insert(mbv.dest_id);
+        }
+    }
 
     // Phase 4: Tier 2 — liveness-based packing for multi-block values.
     slot_assignment::assign_tier2_liveness_packed_slots(
@@ -363,6 +379,35 @@ fn build_layout_context(
 
     // Immediately-consumed value analysis: identify values that can skip stack slots.
     let immediately_consumed = copy_coalescing::compute_immediately_consumed(func, lhs_first_binop);
+
+    // v5 deferred-store analysis: vector-intrinsic results whose single use is
+    // args[0]/args[1] of the immediately-following intrinsic (accumulator renaming).
+    if std::env::var("CCC_DEBUG_VDEFER").is_ok() {
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                match inst {
+                    crate::ir::instruction::Instruction::Intrinsic { op, dest_ptr, args, .. } => {
+                        let argids: Vec<String> = args.iter().map(|a| match a {
+                            crate::ir::instruction::Operand::Value(v) => v.0.to_string(),
+                            _ => "_".to_string(),
+                        }).collect();
+                        eprintln!("[VDEFER-IR] b{} i{} Intrinsic {:?} dp={:?} args=[{}]",
+                            bi, ii, op, dest_ptr.map(|v| v.0), argids.join(","));
+                    }
+                    crate::ir::instruction::Instruction::Memcpy { dest, src, size } => {
+                        eprintln!("[VDEFER-IR] b{} i{} Memcpy dest={} src={} size={}", bi, ii, dest.0, src.0, size);
+                    }
+                    crate::ir::instruction::Instruction::Copy { src, dest, .. } => {
+                        eprintln!("[VDEFER-IR] b{} i{} Copy dest={} src={:?}", bi, ii, dest.0, src);
+                    }
+                    other => {
+                        eprintln!("[VDEFER-IR] b{} i{} {:?}", bi, ii, std::mem::discriminant(other));
+                    }
+                }
+            }
+        }
+    }
+    let vector_defer_values = copy_coalescing::compute_vector_defer_values(func);
 
     // Propagate copy-alias uses into use_blocks_map so that root values account
     // for their aliases' use sites when deciding block-local vs. multi-block.
@@ -458,6 +503,7 @@ fn build_layout_context(
         dead_param_allocas,
         coalescable_allocas,
         immediately_consumed,
+        vector_defer_values,
         phi_incoming_values,
         large_blocks,
     }

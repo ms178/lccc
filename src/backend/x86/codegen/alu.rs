@@ -123,7 +123,7 @@ impl X86Codegen {
                                 return;
                             }
                             // Try immediate source: op $imm, mem
-                            if let Some(imm) = Self::const_as_imm32(rhs) {
+                            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
                                 if use_32bit {
                                     self.state.emit_fmt(format_args!("    {}l ${}, {}", mnem, imm, sref));
                                 } else {
@@ -154,8 +154,13 @@ impl X86Codegen {
         };
         if let Some(mnem) = mem_op_mnem {
             if let Operand::Value(rhs_val) = rhs {
-                // Check if rhs has a stack slot and is NOT register-allocated
-                if self.dest_reg(&rhs_val).is_none() {
+                // Check if rhs has a stack slot and is NOT register-allocated.
+                // An alloca's stack slot IS its data, but the alloca's VALUE is its
+                // ADDRESS (a pointer), so folding an alloca as a memory source here
+                // (`opq slot, %rax`) would read the array's first element instead of
+                // adding the base address. Skip allocas so the general path below
+                // materializes them with `lea` (value_to_reg/operand_to_rax).
+                if self.dest_reg(&rhs_val).is_none() && !self.state.is_alloca(rhs_val.0) {
                     if let Some(slot) = self.state.get_slot(rhs_val.0) {
                         if use_32bit { self.operand_to_eax(lhs); } else { self.operand_to_rax(lhs); }
                         let sref = self.slot_ref(slot.0);
@@ -171,11 +176,14 @@ impl X86Codegen {
                 }
             }
             // Also try memory-operand for lhs (swap: rhs to rax, lhs from memory)
-            // for commutative ops: Add, Mul, And, Or, Xor (NOT Sub — non-commutative)
+            // for commutative ops: Add, Mul, And, Or, Xor (NOT Sub — non-commutative).
+            // Same alloca caveat as above: an alloca lhs is a base-address pointer and
+            // must NOT be folded as a memory source (that would read its data, not its
+            // address).
             let is_commutative = !matches!(op, IrBinOp::Sub);
             if is_commutative {
                 if let Operand::Value(lhs_val) = lhs {
-                    if self.dest_reg(&lhs_val).is_none() {
+                    if self.dest_reg(&lhs_val).is_none() && !self.state.is_alloca(lhs_val.0) {
                         if let Some(slot) = self.state.get_slot(lhs_val.0) {
                             if use_32bit { self.operand_to_eax(rhs); } else { self.operand_to_rax(rhs); }
                             let sref = self.slot_ref(slot.0);

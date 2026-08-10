@@ -111,6 +111,32 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
+    pub(super) fn emit_store_f128_xmm0(&mut self, dest: &Value) {
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(reg) && reg.0 != 0 {
+                self.state
+                    .emit_fmt(format_args!("    movdqa %xmm0, %{}", phys_reg_name(reg)));
+                return;
+            }
+        }
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.state.out.emit_instr_reg_rbp("    movdqu", "xmm0", slot.0);
+            return;
+        }
+        self.operand_to_reg(&Operand::Value(*dest), "rax");
+        self.state.emit("    movdqu %xmm0, (%rax)");
+    }
+
     fn emit_load_operand_impl(&mut self, op: &Operand) {
         self.operand_to_rax(op);
     }

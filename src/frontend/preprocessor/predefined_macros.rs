@@ -119,6 +119,22 @@ impl Preprocessor {
             ("__LDBL_HAS_DENORM__", "1"),
             ("__FLT_DECIMAL_DIG__", "9"), ("__DBL_DECIMAL_DIG__", "17"),
             ("__LDBL_DECIMAL_DIG__", "21"), ("__DECIMAL_DIG__", "21"),
+            // _Float128 characteristics (IEEE binary128; GCC-compatible values).
+            // glibc's float128_private.h keys off __FLT128_MANT_DIG__ etc.
+            ("__SIZEOF_FLOAT128__", "16"),
+            ("__FLT128_MANT_DIG__", "113"), ("__FLT128_DIG__", "33"),
+            ("__FLT128_MIN_EXP__", "(-16381)"), ("__FLT128_MIN_10_EXP__", "(-4931)"),
+            ("__FLT128_MAX_EXP__", "16384"), ("__FLT128_MAX_10_EXP__", "4932"),
+            ("__FLT128_DECIMAL_DIG__", "36"),
+            ("__FLT128_MAX__", "1.18973149535723176508575932662800702e+4932F128"),
+            ("__FLT128_NORM_MAX__", "1.18973149535723176508575932662800702e+4932F128"),
+            ("__FLT128_EPSILON__", "1.92592994438723585305597794258492732e-34F128"),
+            ("__FLT128_MIN__", "3.36210314311209350626267781732175260e-4932F128"),
+            ("__FLT128_DENORM_MIN__", "6.47517511943802511092443895822764655e-4966F128"),
+            ("__FLT128_TRUE_MIN__", "6.47517511943802511092443895822764655e-4966F128"),
+            ("__FLT128_HAS_INFINITY__", "1"), ("__FLT128_HAS_QUIET_NAN__", "1"),
+            ("__FLT128_HAS_DENORM__", "1"),
+            ("__STDC_IEC_60559_TYPES_EXT__", "202311L"),
             // GCC extensions
             ("__GNUC_VA_LIST", "1"), ("__extension__", ""),
             // NOTE: GNU keyword aliases (__inline__, __volatile__, __asm__, __const__,
@@ -130,15 +146,12 @@ impl Preprocessor {
             // which differs from C11 _Alignof on i686.
             // Named address spaces (Linux kernel): __seg_gs/__seg_fs are handled
             // as keyword tokens in the lexer (token.rs), not as macros.
-            // __float128 -> long double (glibc compat)
-            ("__float128", "long double"), ("__SIZEOF_FLOAT128__", "16"),
-            // _Float* types: For GCC >= 7, glibc expects the compiler to provide these
-            // natively. We define them as macros to the corresponding standard C types.
-            // TODO: Implement _Float* as proper builtin types with correct semantics
-            // (e.g., _Float128 should be true IEEE binary128, not 80-bit long double
-            // on x86-64). The macro approach works for glibc header compatibility but
-            // loses precision for _Float128 operations on x86-64.
-            ("_Float128", "long double"),
+            // _Float128 / __float128 are REAL builtin types (lexer keyword
+            // TokenKind::Float128, IEEE binary128, soft-float arithmetic via the
+            // libgcc __addtf3 family) — NOT macros. Defining them as macros
+            // would shadow the keyword and silently convert to 80-bit long
+            // double. _Float32/_Float64/_Float32x/_Float64x share the formats
+            // of standard types on x86-64, so they map via macros (GCC-compatible).
             ("_Float32", "float"),
             ("_Float64", "double"),
             ("_Float32x", "double"),
@@ -150,8 +163,8 @@ impl Preprocessor {
             ("__USER_LABEL_PREFIX__", ""),
             // GNU C attribute macros (strip)
             ("__LEAF", ""), ("__LEAF_ATTR", ""), ("__wur", ""),
-            // Date/time
-            ("__DATE__", "\"Jan  1 2025\""), ("__TIME__", "\"00:00:00\""),
+            // Date/time: __DATE__ and __TIME__ are defined dynamically below
+            // so they reflect either SOURCE_DATE_EPOCH or the current compile time.
             // GCC atomic lock-free macros
             ("__GCC_ATOMIC_BOOL_LOCK_FREE", "2"),
             ("__GCC_ATOMIC_CHAR_LOCK_FREE", "2"),
@@ -186,6 +199,10 @@ impl Preprocessor {
         for &(name, body) in PREDEFINED_OBJECT_MACROS {
             self.define_simple_macro(name, body);
         }
+
+        let (date_macro, time_macro) = Self::current_date_time_macros();
+        self.define_simple_macro("__DATE__", &date_macro);
+        self.define_simple_macro("__TIME__", &time_macro);
 
         // Function-like predefined macros: (name, params, body)
         // Note: __builtin_expect is handled as a real builtin (not a macro)
@@ -223,6 +240,54 @@ impl Preprocessor {
         });
     }
 
+    /// Return C-standard `__DATE__` and `__TIME__` macro replacement lists.
+    ///
+    /// `SOURCE_DATE_EPOCH` is honored for reproducible builds.  Without it we
+    /// use the current system time.  The conversion is UTC-only and uses safe
+    /// `std` code to preserve CCC's zero-dependency / no-new-unsafe policy.
+    fn current_date_time_macros() -> (String, String) {
+        let secs = std::env::var("SOURCE_DATE_EPOCH")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            });
+        let (year, month, day, hour, min, sec) = Self::unix_utc_to_ymdhms(secs);
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let month_name = MONTHS[(month.saturating_sub(1) as usize).min(11)];
+        (format!("\"{} {:>2} {}\"", month_name, day, year),
+         format!("\"{:02}:{:02}:{:02}\"", hour, min, sec))
+    }
+
+    /// Convert a Unix timestamp to UTC calendar components using Howard
+    /// Hinnant's civil date algorithm.  Handles pre-epoch values too, which is
+    /// useful for SOURCE_DATE_EPOCH test cases.
+    fn unix_utc_to_ymdhms(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+        let days = secs.div_euclid(86_400);
+        let sod = secs.rem_euclid(86_400);
+        let hour = (sod / 3600) as u32;
+        let min = ((sod % 3600) / 60) as u32;
+        let sec = (sod % 60) as u32;
+
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096).div_euclid(365);
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2).div_euclid(153);
+        let d = doy - (153 * mp + 2).div_euclid(5) + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + if m <= 2 { 1 } else { 0 };
+        (year, m as u32, d as u32, hour, min, sec)
+    }
+
     /// Locate the bundled `include/` directory shipped alongside the binary.
     ///
     /// Walks up to 5 parent directories from the canonicalized executable path
@@ -248,6 +313,12 @@ impl Preprocessor {
             }
         }
 
+        // Standard system package fallback on Arch/CachyOS
+        let pkg_fallback = PathBuf::from("/usr/lib/lccc/include");
+        if pkg_fallback.join("emmintrin.h").is_file() {
+            return Some(pkg_fallback);
+        }
+
         // Compile-time fallback: CARGO_MANIFEST_DIR/include
         let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include");
         if fallback.join("emmintrin.h").is_file() {
@@ -264,17 +335,28 @@ impl Preprocessor {
         if let Some(bundled) = Self::bundled_include_dir() {
             paths.push(bundled);
         }
+
+        // Dynamically find GCC include directories (highly robust and future-proof)
+        for gcc_target in &[
+            "x86_64-pc-linux-gnu", "x86_64-linux-gnu", "x86_64-redhat-linux",
+            "i686-linux-gnu", "i686-redhat-linux", "aarch64-linux-gnu", "riscv64-linux-gnu",
+        ] {
+            let gcc_dir = format!("/usr/lib/gcc/{}", gcc_target);
+            if let Ok(entries) = std::fs::read_dir(&gcc_dir) {
+                for entry in entries.flatten() {
+                    let candidate = entry.path().join("include");
+                    if candidate.is_dir() {
+                        paths.push(candidate);
+                    }
+                }
+            }
+        }
+
         // Only include arch-neutral paths here; arch-specific paths are added by set_target
         let candidates = [
             "/usr/local/include",
-            // x86_64 multiarch (default, removed by set_target for other arches)
+            "/usr/include/x86_64-pc-linux-gnu",
             "/usr/include/x86_64-linux-gnu",
-            // GCC headers (common versions)
-            "/usr/lib/gcc/x86_64-linux-gnu/12/include",
-            "/usr/lib/gcc/x86_64-linux-gnu/11/include",
-            "/usr/lib/gcc/x86_64-linux-gnu/13/include",
-            "/usr/lib/gcc/x86_64-linux-gnu/14/include",
-            "/usr/lib/gcc/x86_64-linux-gnu/10/include",
             "/usr/include",
         ];
         for candidate in &candidates {
@@ -310,6 +392,18 @@ impl Preprocessor {
         } else {
             self.macros.undefine("__GNUC_GNU_INLINE__");
             self.define_simple_macro("__GNUC_STDC_INLINE__", "1");
+        }
+    }
+
+    /// Define/undefine `__EXCEPTIONS` based on `-fexceptions` (GCC-compatible).
+    /// GCC defines `__EXCEPTIONS` when exceptions are enabled (-fexceptions for C,
+    /// always for C++ unless -fno-exceptions). glibc's stdio-lock.h selects its
+    /// lock-helper variant via `#ifdef __EXCEPTIONS`.
+    pub fn set_exceptions(&mut self, enabled: bool) {
+        if enabled {
+            self.define_simple_macro("__EXCEPTIONS", "1");
+        } else {
+            self.macros.undefine("__EXCEPTIONS");
         }
     }
 
@@ -395,6 +489,50 @@ impl Preprocessor {
         sse4_2: bool,
         avx: bool,
         avx2: bool,
+        aes: bool,
+        pclmul: bool,
+        f16c: bool,
+        fma: bool,
+        bmi: bool,
+        bmi2: bool,
+        lzcnt: bool,
+        movbe: bool,
+        rdrnd: bool,
+        avx512f: bool,
+        avx512cd: bool,
+        avx512dq: bool,
+        avx512bw: bool,
+        avx512vl: bool,
+        avx512ifma: bool,
+        avx512vbmi: bool,
+        avx512vbmi2: bool,
+        avx512vnni: bool,
+        avx512bitalg: bool,
+        avx512vpopcntdq: bool,
+        avx512bf16: bool,
+        avx512fp16: bool,
+        avx512er: bool,
+        avx512pf: bool,
+        avx512vp2intersect: bool,
+        avxvnni: bool,
+        avxifma: bool,
+        avxneconvert: bool,
+        avx10_1: bool,
+        avx10_2: bool,
+        gfni: bool,
+        vaes: bool,
+        vpclmulqdq: bool,
+        avxvnniint8: bool,
+        avxvnniint16: bool,
+        sha512: bool,
+        sm3: bool,
+        sm4: bool,
+        movrs: bool,
+        amx_tile: bool,
+        amx_int8: bool,
+        amx_bf16: bool,
+        cmpccxadd: bool,
+        apxf: bool,
     ) {
         // Only define SSE/AVX macros for x86 targets.
         let is_x86 = self.macros.is_defined("__x86_64__") || self.macros.is_defined("__i386__");
@@ -419,6 +557,70 @@ impl Preprocessor {
         if avx2 {
             self.define_simple_macro("__AVX2__", "1");
         }
+        if aes {
+            self.define_simple_macro("__AES__", "1");
+        }
+        if pclmul {
+            self.define_simple_macro("__PCLMUL__", "1");
+        }
+        if f16c {
+            self.define_simple_macro("__F16C__", "1");
+        }
+        if fma {
+            self.define_simple_macro("__FMA__", "1");
+        }
+        if bmi {
+            self.define_simple_macro("__BMI__", "1");
+        }
+        if bmi2 {
+            self.define_simple_macro("__BMI2__", "1");
+        }
+        if lzcnt {
+            self.define_simple_macro("__LZCNT__", "1");
+        }
+        if movbe {
+            self.define_simple_macro("__MOVBE__", "1");
+        }
+        if rdrnd {
+            self.define_simple_macro("__RDRND__", "1");
+        }
+        // AVX-512 family macros.
+        if avx512f { self.define_simple_macro("__AVX512F__", "1"); }
+        if avx512cd { self.define_simple_macro("__AVX512CD__", "1"); }
+        if avx512dq { self.define_simple_macro("__AVX512DQ__", "1"); }
+        if avx512bw { self.define_simple_macro("__AVX512BW__", "1"); }
+        if avx512vl { self.define_simple_macro("__AVX512VL__", "1"); }
+        if avx512ifma { self.define_simple_macro("__AVX512IFMA__", "1"); }
+        if avx512vbmi { self.define_simple_macro("__AVX512VBMI__", "1"); }
+        if avx512vbmi2 { self.define_simple_macro("__AVX512VBMI2__", "1"); }
+        if avx512vnni { self.define_simple_macro("__AVX512VNNI__", "1"); }
+        if avx512bitalg { self.define_simple_macro("__AVX512BITALG__", "1"); }
+        if avx512vpopcntdq { self.define_simple_macro("__AVX512VPOPCNTDQ__", "1"); }
+        if avx512bf16 { self.define_simple_macro("__AVX512BF16__", "1"); }
+        if avx512fp16 { self.define_simple_macro("__AVX512FP16__", "1"); }
+        if avx512er { self.define_simple_macro("__AVX512ER__", "1"); }
+        if avx512pf { self.define_simple_macro("__AVX512PF__", "1"); }
+        if avx512vp2intersect { self.define_simple_macro("__AVX512VP2INTERSECT__", "1"); }
+        // AVX-VNNI / AVX10 / GFNI / VAES / VPCLMULQDQ macros.
+        if avxvnni { self.define_simple_macro("__AVXVNNI__", "1"); }
+        if avxifma { self.define_simple_macro("__AVXIFMA__", "1"); }
+        if avxneconvert { self.define_simple_macro("__AVXNECONVERT__", "1"); }
+        if avx10_1 { self.define_simple_macro("__AVX10_1__", "1"); }
+        if avx10_2 { self.define_simple_macro("__AVX10_2__", "1"); }
+        if gfni { self.define_simple_macro("__GFNI__", "1"); }
+        if vaes { self.define_simple_macro("__VAES__", "1"); }
+        if vpclmulqdq { self.define_simple_macro("__VPCLMULQDQ__", "1"); }
+        if avxvnniint8 { self.define_simple_macro("__AVXVNNIINT8__", "1"); }
+        if avxvnniint16 { self.define_simple_macro("__AVXVNNIINT16__", "1"); }
+        if sha512 { self.define_simple_macro("__SHA512__", "1"); }
+        if sm3 { self.define_simple_macro("__SM3__", "1"); }
+        if sm4 { self.define_simple_macro("__SM4__", "1"); }
+        if movrs { self.define_simple_macro("__MOVRS__", "1"); }
+        if amx_tile { self.define_simple_macro("__AMX_TILE__", "1"); }
+        if amx_int8 { self.define_simple_macro("__AMX_INT8__", "1"); }
+        if amx_bf16 { self.define_simple_macro("__AMX_BF16__", "1"); }
+        if cmpccxadd { self.define_simple_macro("__CMPCCXADD__", "1"); }
+        if apxf { self.define_simple_macro("__APX_F__", "1"); }
     }
 
     /// Set the target architecture, updating predefined macros and include paths.
@@ -470,10 +672,18 @@ impl Preprocessor {
                     !s.contains("x86_64")
                 });
                 let aarch64_paths = [
-                    "/usr/lib/gcc-cross/aarch64-linux-gnu/11/include",
-                    "/usr/lib/gcc-cross/aarch64-linux-gnu/12/include",
-                    "/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
+                    "/usr/lib/gcc/aarch64-linux-gnu/16/include",
+                    "/usr/lib/gcc/aarch64-linux-gnu/15/include",
+                    "/usr/lib/gcc/aarch64-linux-gnu/14/include",
+                    "/usr/lib/gcc/aarch64-linux-gnu/13/include",
+                    "/usr/lib/gcc/aarch64-linux-gnu/12/include",
+                    "/usr/lib/gcc/aarch64-linux-gnu/11/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/16/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/15/include",
                     "/usr/lib/gcc-cross/aarch64-linux-gnu/14/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/12/include",
+                    "/usr/lib/gcc-cross/aarch64-linux-gnu/11/include",
                     "/usr/aarch64-linux-gnu/include",
                     "/usr/include/aarch64-linux-gnu",
                 ];
@@ -524,10 +734,18 @@ impl Preprocessor {
                     !s.contains("x86_64")
                 });
                 let riscv_paths = [
-                    "/usr/lib/gcc-cross/riscv64-linux-gnu/11/include",
-                    "/usr/lib/gcc-cross/riscv64-linux-gnu/12/include",
-                    "/usr/lib/gcc-cross/riscv64-linux-gnu/13/include",
+                    "/usr/lib/gcc/riscv64-linux-gnu/16/include",
+                    "/usr/lib/gcc/riscv64-linux-gnu/15/include",
+                    "/usr/lib/gcc/riscv64-linux-gnu/14/include",
+                    "/usr/lib/gcc/riscv64-linux-gnu/13/include",
+                    "/usr/lib/gcc/riscv64-linux-gnu/12/include",
+                    "/usr/lib/gcc/riscv64-linux-gnu/11/include",
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/16/include",
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/15/include",
                     "/usr/lib/gcc-cross/riscv64-linux-gnu/14/include",
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/13/include",
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/12/include",
+                    "/usr/lib/gcc-cross/riscv64-linux-gnu/11/include",
                     "/usr/riscv64-linux-gnu/include",
                     "/usr/include/riscv64-linux-gnu",
                 ];
@@ -610,14 +828,18 @@ impl Preprocessor {
                     !s.contains("x86_64")
                 });
                 let i686_paths = [
-                    "/usr/lib/gcc-cross/i686-linux-gnu/11/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/12/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/13/include",
+                    "/usr/lib/gcc-cross/i686-linux-gnu/16/include",
+                    "/usr/lib/gcc-cross/i686-linux-gnu/15/include",
                     "/usr/lib/gcc-cross/i686-linux-gnu/14/include",
-                    "/usr/lib/gcc/i686-linux-gnu/11/include",
-                    "/usr/lib/gcc/i686-linux-gnu/12/include",
-                    "/usr/lib/gcc/i686-linux-gnu/13/include",
+                    "/usr/lib/gcc-cross/i686-linux-gnu/13/include",
+                    "/usr/lib/gcc-cross/i686-linux-gnu/12/include",
+                    "/usr/lib/gcc-cross/i686-linux-gnu/11/include",
+                    "/usr/lib/gcc/i686-linux-gnu/16/include",
+                    "/usr/lib/gcc/i686-linux-gnu/15/include",
                     "/usr/lib/gcc/i686-linux-gnu/14/include",
+                    "/usr/lib/gcc/i686-linux-gnu/13/include",
+                    "/usr/lib/gcc/i686-linux-gnu/12/include",
+                    "/usr/lib/gcc/i686-linux-gnu/11/include",
                     "/usr/i686-linux-gnu/include",
                     "/usr/include/i386-linux-gnu",
                 ];

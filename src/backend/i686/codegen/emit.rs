@@ -103,10 +103,11 @@ pub(super) fn i686_constraint_to_phys(constraint: &str) -> Option<PhysReg> {
 
 /// Map inline asm clobber register names to callee-saved PhysReg indices.
 pub(super) fn i686_clobber_to_phys(clobber: &str) -> Option<PhysReg> {
+    let clobber = crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber);
     match clobber {
-        "ebx" | "~{ebx}" => Some(PhysReg(0)),
-        "esi" | "~{esi}" => Some(PhysReg(1)),
-        "edi" | "~{edi}" => Some(PhysReg(2)),
+        "ebx" => Some(PhysReg(0)),
+        "esi" => Some(PhysReg(1)),
+        "edi" => Some(PhysReg(2)),
         _ => None,
     }
 }
@@ -1421,16 +1422,18 @@ impl ArchCodegen for I686Codegen {
                  struct_arg_aligns: &[Option<usize>],
                  struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
                  struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+                 _struct_arg_is_f128_sse: &[bool],
                  is_sret: bool,
                  is_fastcall: bool,
-                 ret_eightbyte_classes: &[crate::common::types::EightbyteClass]) {
+                 ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
+                 _ret_is_f128_sse: bool) {
         if is_fastcall {
             self.emit_fastcall(args, arg_types, direct_name, func_ptr, dest, return_type);
             return;
         }
         use crate::backend::call_abi::*;
         let config = self.call_abi_config();
-        let arg_classes_vec = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, is_variadic, &config);
+        let arg_classes_vec = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, &[], is_variadic, &config);
         let indirect = func_ptr.is_some() && direct_name.is_none();
         if indirect {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));

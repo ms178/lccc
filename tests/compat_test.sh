@@ -248,6 +248,44 @@ int sum_n(int n, ...) {
 int main() { printf("sum=%d\n", sum_n(4, 10, 20, 30, 40)); return 0; }
 '
 
+test_program "inline asm percent clobber" '
+#include <stdio.h>
+static int clobber_test(int in) {
+    int out = -1;
+#if defined(__x86_64__)
+    asm volatile (
+        "mov %1, %0\n\t"
+        "mov $99, %%ecx"
+        : "=&r"(out)
+        : "r"(in)
+        : "%rcx");
+#elif defined(__i386__)
+    asm volatile (
+        "mov %1, %0\n\t"
+        "mov $99, %%ecx"
+        : "=&r"(out)
+        : "r"(in)
+        : "%ecx");
+#else
+    out = in;
+#endif
+    return out;
+}
+int main() { printf("%d\n", clobber_test(7)); return 0; }
+'
+
+test_program "inline asm readwrite local" '
+#include <stdio.h>
+int main() {
+    int x = 5;
+#if defined(__x86_64__) || defined(__i386__)
+    asm volatile ("addl $3, %0" : "+r"(x));
+#endif
+    printf("%d\n", x);
+    return 0;
+}
+'
+
 test_program "setjmp/longjmp" '
 #include <stdio.h>
 #include <setjmp.h>

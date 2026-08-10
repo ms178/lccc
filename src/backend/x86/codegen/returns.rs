@@ -9,6 +9,29 @@ impl X86Codegen {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
+            // _Float128 (IEEE binary128): the 16-byte value returns in xmm0.
+            if self.func_ret_is_f128_sse {
+                match val {
+                    Operand::Value(v) => {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
+                        }
+                    }
+                    Operand::Const(IrConst::I128(c)) => {
+                        let bytes = (*c as u128).to_le_bytes();
+                        let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                        let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                        self.state.out.emit_instr_imm_reg("    movabsq", lo as i64, "rax");
+                        self.state.emit("    movq %rax, %xmm0");
+                        self.state.out.emit_instr_imm_reg("    movabsq", hi as i64, "rax");
+                        self.state.emit("    movq %rax, %xmm1");
+                        self.state.emit("    movlhps %xmm1, %xmm0");
+                    }
+                    _ => {}
+                }
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
             if ret_ty.is_long_double() {
                 if let Operand::Value(v) = val {
                     if self.state.f128_direct_slots.contains(&v.0) {

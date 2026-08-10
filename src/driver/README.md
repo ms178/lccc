@@ -80,12 +80,12 @@ populated exclusively by `parse_cli_args()`. The struct is created with
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `opt_level` | `u32` | `2` | Internal optimization level (always 2; all levels run the same passes) |
+| `opt_level` | `u32` | `2` | Internal optimization level: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz |
 | `optimize` | `bool` | `false` | Whether user passed `-O1` or higher (defines `__OPTIMIZE__`) |
 | `optimize_size` | `bool` | `false` | Whether `-Os`/`-Oz` (defines `__OPTIMIZE_SIZE__`) |
 
-The internal `opt_level` is always 2 regardless of the CLI flag. The `optimize`
-and `optimize_size` booleans only control predefined macros (`__OPTIMIZE__`,
+The `opt_level` selects a distinct pass tier. The `optimize` and
+`optimize_size` booleans additionally control predefined macros (`__OPTIMIZE__`,
 `__OPTIMIZE_SIZE__`), which build systems like the Linux kernel rely on (e.g.,
 `BUILD_BUG()` uses `__OPTIMIZE__` to select between a noreturn function call
 and a no-op).
@@ -235,6 +235,20 @@ The `--version` output includes "Free Software Foundation" text because Meson
 detects GCC by grepping for that string. It also prints the backend mode
 ("standalone" or a list of enabled GCC fallback features like `gcc_linker`,
 `gcc_assembler`, `gcc_m16`).
+
+### x86 `-march` and `-mtune` policy
+
+`-march=raptorlake` is accepted as an **explicit AVX2-safe subset profile**:
+it enables the existing SSE3 → SSSE3 → SSE4.1 → SSE4.2 → AVX → AVX2 lowering
+and predefined macros. It intentionally does **not** enable AVX-512 (the
+Raptor Lake deployment profile forbids it) or claim unsupported FMA/BMI
+intrinsics. Unsupported x86 `-march=` and target-affecting `-m` options are
+rejected rather than silently ignored.
+
+`-mtune=raptorlake` is accepted and recorded as a diagnostic scheduling hint.
+LCCC currently has no x86 instruction scheduler model, so `-mtune` does not
+change emitted instructions; `-v` reports that fact. ISA-changing behavior is
+owned solely by `-march`/explicit `-m` feature flags.
 
 ### SIMD Feature Flag Implication Chain
 

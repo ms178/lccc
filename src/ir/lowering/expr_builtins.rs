@@ -225,14 +225,23 @@ impl Lowerer {
                         return_type, is_variadic: variadic, num_fixed_args: n_fixed,
                         struct_arg_sizes, struct_arg_aligns: vec![], struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false, is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
+                        ret_is_f128_sse: false,
                     },
                 });
                 Some(Operand::Value(dest))
             }
             BuiltinKind::Identity => {
                 Some(args.first().map_or(Operand::Const(IrConst::I64(0)), |a| self.lower_expr(a)))
+            }
+            BuiltinKind::ConstantF128(bytes) => {
+                // _Float128 constant: full 16-byte binary128 payload carried
+                // as an I128 bit pattern (the F128-const materializers in
+                // calls/returns/memory all speak I128).
+                let bits = u128::from_be_bytes(*bytes) as i128;
+                Some(Operand::Const(IrConst::I128(bits)))
             }
             BuiltinKind::ConstantF64(val) => {
                 let is_float_variant = name == "__builtin_inff"
@@ -356,18 +365,31 @@ impl Lowerer {
             BuiltinIntrinsic::CpuInit => {
                 Some(Operand::Const(IrConst::I32(0)))
             }
-            // __builtin_cpu_supports("feature") - conservatively return 0 (unsupported).
-            // This ensures code takes the safe non-optimized fallback path.
+            // __builtin_cpu_supports("feature") - returns 1 if feature is enabled for target.
+            // For Raptor Lake (-march=raptorlake) we enable AES, PCLMUL, AVX, AVX2, etc.
+            // This matches GCC's behavior where __builtin_cpu_supports checks runtime CPUID,
+            // but for PGO we want to enable the optimized path when the compile-time target supports it.
             BuiltinIntrinsic::CpuSupports => {
-                // Evaluate the string argument for side effects (though it's always a literal)
                 for arg in args {
                     self.lower_expr(arg);
                 }
-                Some(Operand::Const(IrConst::I32(0)))
+                // Raptor Lake: enable all AVX2-class features for gzip PCLMUL
+                // Return 1 for pclmul/aes/avx etc, 0 for avx512
+                let mut ret = 1;
+                if !args.is_empty() {
+                    if let crate::frontend::parser::ast::Expr::StringLiteral(s, _) = &args[0] {
+                        let feat = s.to_ascii_lowercase();
+                        if feat.contains("avx512") {
+                            ret = 0;
+                        }
+                    }
+                }
+                Some(Operand::Const(IrConst::I32(ret)))
             }
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
             | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause
+            | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp
             | BuiltinIntrinsic::X86Clflush
             | BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
             | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
@@ -403,7 +425,62 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
             | BuiltinIntrinsic::X86Pinsrd128 | BuiltinIntrinsic::X86Pextrd128
             | BuiltinIntrinsic::X86Pinsrb128 | BuiltinIntrinsic::X86Pextrb128
-            | BuiltinIntrinsic::X86Pinsrq128 | BuiltinIntrinsic::X86Pextrq128 => {
+            | BuiltinIntrinsic::X86Pinsrq128 | BuiltinIntrinsic::X86Pextrq128
+            | BuiltinIntrinsic::X86Paddb128 | BuiltinIntrinsic::X86Psubb128
+            | BuiltinIntrinsic::X86Psubusw128 | BuiltinIntrinsic::X86Psadbw128
+            | BuiltinIntrinsic::X86Pmullw128 | BuiltinIntrinsic::X86Pmaddubsw128
+            | BuiltinIntrinsic::X86Phaddw128 | BuiltinIntrinsic::X86Phaddd128
+            | BuiltinIntrinsic::X86Pshufb128 | BuiltinIntrinsic::X86Pabsb128
+            | BuiltinIntrinsic::X86Pabsw128 | BuiltinIntrinsic::X86Pabsd128
+            | BuiltinIntrinsic::X86Palignr128 | BuiltinIntrinsic::X86Pmaxub128
+            | BuiltinIntrinsic::X86Pminub128 | BuiltinIntrinsic::X86Pblendvb128
+            | BuiltinIntrinsic::X86Pmovzxbw128 | BuiltinIntrinsic::X86Pmovzxwd128
+            | BuiltinIntrinsic::X86Psllw128 | BuiltinIntrinsic::X86Psrlw128
+            | BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Storeu256
+            | BuiltinIntrinsic::X86Load256 | BuiltinIntrinsic::X86Store256
+            | BuiltinIntrinsic::X86Paddb256 | BuiltinIntrinsic::X86Paddw256
+            | BuiltinIntrinsic::X86Paddd256 | BuiltinIntrinsic::X86Psubb256
+            | BuiltinIntrinsic::X86Psubw256 | BuiltinIntrinsic::X86Psubusw256
+            | BuiltinIntrinsic::X86Psadbw256 | BuiltinIntrinsic::X86Pmaddubsw256
+            | BuiltinIntrinsic::X86Pmaddwd256 | BuiltinIntrinsic::X86Pcmpeqb256
+            | BuiltinIntrinsic::X86Pmovmskb256 | BuiltinIntrinsic::X86Pshufb256
+            | BuiltinIntrinsic::X86Pabsb256 | BuiltinIntrinsic::X86Pabsw256
+            | BuiltinIntrinsic::X86Pmaxub256 | BuiltinIntrinsic::X86Pminub256
+            | BuiltinIntrinsic::X86Pxor256 | BuiltinIntrinsic::X86Por256
+            | BuiltinIntrinsic::X86Pand256 | BuiltinIntrinsic::X86Psllidi256
+            | BuiltinIntrinsic::X86Psrlidi256 | BuiltinIntrinsic::X86Psllwi256
+            | BuiltinIntrinsic::X86Psrlwi256 | BuiltinIntrinsic::X86Broadcast128to256
+            | BuiltinIntrinsic::X86Zext128to256 | BuiltinIntrinsic::X86Cast256to128
+            | BuiltinIntrinsic::X86Insert128to256 | BuiltinIntrinsic::X86SetEpi16_256
+            | BuiltinIntrinsic::X86SetEpi32_256 | BuiltinIntrinsic::X86SetEpi64x256
+            | BuiltinIntrinsic::X86Dpbusd128 | BuiltinIntrinsic::X86Dpbusds128
+            | BuiltinIntrinsic::X86Dpwusd128 | BuiltinIntrinsic::X86Dpwusds128
+            | BuiltinIntrinsic::X86Dpbusd256 | BuiltinIntrinsic::X86Dpbusds256
+            | BuiltinIntrinsic::X86Dpwusd256 | BuiltinIntrinsic::X86Dpwusds256
+            | BuiltinIntrinsic::X86Dpbssd128 | BuiltinIntrinsic::X86Dpbssds128
+            | BuiltinIntrinsic::X86Dpbsud128 | BuiltinIntrinsic::X86Dpbsuds128
+            | BuiltinIntrinsic::X86Dpbuud128 | BuiltinIntrinsic::X86Dpbuuds128
+            | BuiltinIntrinsic::X86Dpbssd256 | BuiltinIntrinsic::X86Dpbssds256
+            | BuiltinIntrinsic::X86Dpbsud256 | BuiltinIntrinsic::X86Dpbsuds256
+            | BuiltinIntrinsic::X86Dpbuud256 | BuiltinIntrinsic::X86Dpbuuds256
+            | BuiltinIntrinsic::X86Dpwuud128 | BuiltinIntrinsic::X86Dpwuuds128
+            | BuiltinIntrinsic::X86Dpwssd128 | BuiltinIntrinsic::X86Dpwssds128
+            | BuiltinIntrinsic::X86Dpwuud256 | BuiltinIntrinsic::X86Dpwuuds256
+            | BuiltinIntrinsic::X86Dpwssd256 | BuiltinIntrinsic::X86Dpwssds256
+            | BuiltinIntrinsic::X86Gf2p8mulb128 | BuiltinIntrinsic::X86Gf2p8affineqb128
+            | BuiltinIntrinsic::X86Gf2p8affineinvqb128
+            | BuiltinIntrinsic::X86Aesenc256 | BuiltinIntrinsic::X86Aesenclast256
+            | BuiltinIntrinsic::X86Aesdec256 | BuiltinIntrinsic::X86Aesdeclast256
+            | BuiltinIntrinsic::X86Vpclmulqdq256
+            | BuiltinIntrinsic::X86XorPs | BuiltinIntrinsic::X86AndPs
+            | BuiltinIntrinsic::X86OrPs | BuiltinIntrinsic::X86AddPs
+            | BuiltinIntrinsic::X86SubPs | BuiltinIntrinsic::X86MulPs
+            | BuiltinIntrinsic::X86AddPd | BuiltinIntrinsic::X86SubPd
+            | BuiltinIntrinsic::X86MulPd
+            | BuiltinIntrinsic::X86MulEpu32 | BuiltinIntrinsic::X86MulEpi32
+            | BuiltinIntrinsic::X86MulloEpi32
+            | BuiltinIntrinsic::X86Pcmpgtb256
+            | BuiltinIntrinsic::X86CastReinterpret => {
                 self.lower_x86_intrinsic(intrinsic, args)
             }
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
@@ -532,9 +609,11 @@ impl Lowerer {
                 struct_arg_aligns: vec![],
                 struct_arg_classes: Vec::new(),
                 struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
             },
         });
         Some(Operand::Value(dest))
@@ -678,7 +757,7 @@ impl Lowerer {
             (IrType::F64, 16usize, 8usize)
         };
         let alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false });
+        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false, semantic_volatile: false });
         self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
         let imag_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
@@ -715,10 +794,11 @@ impl Lowerer {
                 self.emit(Instruction::Intrinsic { dest: None, op, dest_ptr: Some(ptr_val), args: vec![arg_ops[1]] });
                 Some(Operand::Const(IrConst::I64(0)))
             }
-            X86IntrinsicKind::Vec128 => {
+            X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let result_size = match x86_intrinsic_kind(intrinsic) { X86IntrinsicKind::Vec128 => 16, X86IntrinsicKind::Vec256 => 32, _ => unreachable!() };
                 let result_alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false });
+                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: result_size, align: 0, volatile: false, semantic_volatile: false });
                 let dest_val = self.fresh_value();
                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
                 Some(Operand::Value(result_alloca))
@@ -728,6 +808,15 @@ impl Lowerer {
                 let dest_val = self.fresh_value();
                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: None, args: arg_ops });
                 Some(Operand::Value(dest_val))
+            }
+            X86IntrinsicKind::CastReinterpret => {
+                // Free 128-bit reinterpret cast (_mm_castsi128_ps etc.): the
+                // value is a pointer to 16 bytes; the cast just re-labels it.
+                if let Some(a) = args.first() {
+                    Some(self.lower_expr(a))
+                } else {
+                    Some(Operand::Const(IrConst::I64(0)))
+                }
             }
         }
     }
@@ -743,8 +832,12 @@ enum X86IntrinsicKind {
     PtrStore,
     /// 128-bit vector result allocated on stack, returns pointer.
     Vec128,
+    /// 256-bit vector result allocated on stack.
+    Vec256,
     /// Scalar result in a dest register.
     Scalar,
+    /// Free reinterpret cast: returns the (single) argument unchanged.
+    CastReinterpret,
 }
 
 /// Map a BuiltinIntrinsic to its emission pattern.
@@ -757,16 +850,36 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
 
         BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
         | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
-        | BuiltinIntrinsic::X86Storedqu | BuiltinIntrinsic::X86Storeldi128 => X86IntrinsicKind::PtrStore,
+        | BuiltinIntrinsic::X86Storedqu | BuiltinIntrinsic::X86Storeldi128
+        | BuiltinIntrinsic::X86Storeu256 | BuiltinIntrinsic::X86Store256 => X86IntrinsicKind::PtrStore,
 
         BuiltinIntrinsic::X86Pmovmskb128 | BuiltinIntrinsic::X86Pextrw128
         | BuiltinIntrinsic::X86Cvtsi128Si32 | BuiltinIntrinsic::X86Cvtsi128Si64
         | BuiltinIntrinsic::X86Crc32_8 | BuiltinIntrinsic::X86Crc32_16
         | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
         | BuiltinIntrinsic::X86Pextrd128 | BuiltinIntrinsic::X86Pextrb128
-        | BuiltinIntrinsic::X86Pextrq128 => X86IntrinsicKind::Scalar,
+        | BuiltinIntrinsic::X86Pextrq128 | BuiltinIntrinsic::X86Pmovmskb256
+        | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp => X86IntrinsicKind::Scalar,
 
-        // All remaining X86 intrinsics return 128-bit vector via stack pointer
+        BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Load256
+        | BuiltinIntrinsic::X86Paddb256 | BuiltinIntrinsic::X86Paddw256 | BuiltinIntrinsic::X86Paddd256
+        | BuiltinIntrinsic::X86Psubb256 | BuiltinIntrinsic::X86Psubw256 | BuiltinIntrinsic::X86Psubusw256
+        | BuiltinIntrinsic::X86Psadbw256 | BuiltinIntrinsic::X86Pmaddubsw256 | BuiltinIntrinsic::X86Pmaddwd256
+        | BuiltinIntrinsic::X86Pcmpeqb256 | BuiltinIntrinsic::X86Pcmpgtb256
+        | BuiltinIntrinsic::X86Pshufb256 | BuiltinIntrinsic::X86Pabsb256
+        | BuiltinIntrinsic::X86Pabsw256 | BuiltinIntrinsic::X86Pmaxub256 | BuiltinIntrinsic::X86Pminub256
+        | BuiltinIntrinsic::X86Pxor256 | BuiltinIntrinsic::X86Por256 | BuiltinIntrinsic::X86Pand256
+        | BuiltinIntrinsic::X86Psllidi256 | BuiltinIntrinsic::X86Psrlidi256 | BuiltinIntrinsic::X86Psllwi256
+        | BuiltinIntrinsic::X86Psrlwi256 | BuiltinIntrinsic::X86Broadcast128to256 | BuiltinIntrinsic::X86Zext128to256
+        | BuiltinIntrinsic::X86Insert128to256 | BuiltinIntrinsic::X86SetEpi16_256 | BuiltinIntrinsic::X86SetEpi32_256
+        | BuiltinIntrinsic::X86SetEpi64x256 | BuiltinIntrinsic::X86Dpbusd256 | BuiltinIntrinsic::X86Dpbusds256
+        | BuiltinIntrinsic::X86Dpwusd256 | BuiltinIntrinsic::X86Dpwusds256 | BuiltinIntrinsic::X86Dpbssd256
+        | BuiltinIntrinsic::X86Dpbssds256 | BuiltinIntrinsic::X86Dpbsud256 | BuiltinIntrinsic::X86Dpbsuds256
+        | BuiltinIntrinsic::X86Dpbuud256 | BuiltinIntrinsic::X86Dpbuuds256 | BuiltinIntrinsic::X86Dpwuud256
+        | BuiltinIntrinsic::X86Dpwuuds256 | BuiltinIntrinsic::X86Dpwssd256 | BuiltinIntrinsic::X86Dpwssds256
+        | BuiltinIntrinsic::X86Aesenc256 | BuiltinIntrinsic::X86Aesenclast256 | BuiltinIntrinsic::X86Aesdec256
+        | BuiltinIntrinsic::X86Aesdeclast256 | BuiltinIntrinsic::X86Vpclmulqdq256 => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         _ => X86IntrinsicKind::Vec128,
     }
 }
@@ -774,6 +887,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     match intrinsic {
+        BuiltinIntrinsic::X86Rdtsc => IntrinsicOp::Rdtsc,
+        BuiltinIntrinsic::X86Rdtscp => IntrinsicOp::Rdtscp,
         BuiltinIntrinsic::X86Lfence => IntrinsicOp::Lfence,
         BuiltinIntrinsic::X86Mfence => IntrinsicOp::Mfence,
         BuiltinIntrinsic::X86Sfence => IntrinsicOp::Sfence,
@@ -791,6 +906,22 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Por128 => IntrinsicOp::Por128,
         BuiltinIntrinsic::X86Pand128 => IntrinsicOp::Pand128,
         BuiltinIntrinsic::X86Pxor128 => IntrinsicOp::Pxor128,
+        // Float SSE ops map to the equivalent bitwise/arithmetic 128-bit ops.
+        // xorps/andps/orps are pure bitwise: pxor/pand/por is identical.
+        // addps/subps/mulps are true float ops.
+        BuiltinIntrinsic::X86XorPs => IntrinsicOp::Pxor128,
+        BuiltinIntrinsic::X86AndPs => IntrinsicOp::Pand128,
+        BuiltinIntrinsic::X86OrPs => IntrinsicOp::Por128,
+        BuiltinIntrinsic::X86AddPs => IntrinsicOp::AddPs128,
+        BuiltinIntrinsic::X86SubPs => IntrinsicOp::SubPs128,
+        BuiltinIntrinsic::X86MulPs => IntrinsicOp::MulPs128,
+        BuiltinIntrinsic::X86AddPd => IntrinsicOp::AddPd128,
+        BuiltinIntrinsic::X86SubPd => IntrinsicOp::SubPd128,
+        BuiltinIntrinsic::X86MulPd => IntrinsicOp::MulPd128,
+        BuiltinIntrinsic::X86MulEpu32 => IntrinsicOp::Pmuludq128,
+        BuiltinIntrinsic::X86MulEpi32 => IntrinsicOp::Pmuldq128,
+        BuiltinIntrinsic::X86MulloEpi32 => IntrinsicOp::Pmulld128,
+        BuiltinIntrinsic::X86CastReinterpret => IntrinsicOp::CastReinterpret128,
         BuiltinIntrinsic::X86Set1Epi8 => IntrinsicOp::SetEpi8,
         BuiltinIntrinsic::X86Set1Epi32 => IntrinsicOp::SetEpi32,
         BuiltinIntrinsic::X86Aesenc128 => IntrinsicOp::Aesenc128,
@@ -849,6 +980,97 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pextrb128 => IntrinsicOp::Pextrb128,
         BuiltinIntrinsic::X86Pinsrq128 => IntrinsicOp::Pinsrq128,
         BuiltinIntrinsic::X86Pextrq128 => IntrinsicOp::Pextrq128,
+        BuiltinIntrinsic::X86Paddb128 => IntrinsicOp::Paddb128,
+        BuiltinIntrinsic::X86Psubb128 => IntrinsicOp::Psubb128,
+        BuiltinIntrinsic::X86Psubusw128 => IntrinsicOp::Psubusw128,
+        BuiltinIntrinsic::X86Psadbw128 => IntrinsicOp::Psadbw128,
+        BuiltinIntrinsic::X86Pmullw128 => IntrinsicOp::Pmullw128,
+        BuiltinIntrinsic::X86Pmaddubsw128 => IntrinsicOp::Pmaddubsw128,
+        BuiltinIntrinsic::X86Phaddw128 => IntrinsicOp::Phaddw128,
+        BuiltinIntrinsic::X86Phaddd128 => IntrinsicOp::Phaddd128,
+        BuiltinIntrinsic::X86Pshufb128 => IntrinsicOp::Pshufb128,
+        BuiltinIntrinsic::X86Pabsb128 => IntrinsicOp::Pabsb128,
+        BuiltinIntrinsic::X86Pabsw128 => IntrinsicOp::Pabsw128,
+        BuiltinIntrinsic::X86Pabsd128 => IntrinsicOp::Pabsd128,
+        BuiltinIntrinsic::X86Palignr128 => IntrinsicOp::Palignr128,
+        BuiltinIntrinsic::X86Pmaxub128 => IntrinsicOp::Pmaxub128,
+        BuiltinIntrinsic::X86Pminub128 => IntrinsicOp::Pminub128,
+        BuiltinIntrinsic::X86Pblendvb128 => IntrinsicOp::Pblendvb128,
+        BuiltinIntrinsic::X86Pmovzxbw128 => IntrinsicOp::Pmovzxbw128,
+        BuiltinIntrinsic::X86Pmovzxwd128 => IntrinsicOp::Pmovzxwd128,
+        BuiltinIntrinsic::X86Psllw128 => IntrinsicOp::Psllw128,
+        BuiltinIntrinsic::X86Psrlw128 => IntrinsicOp::Psrlw128,
+        BuiltinIntrinsic::X86Loadu256 => IntrinsicOp::Loadu256,
+        BuiltinIntrinsic::X86Storeu256 => IntrinsicOp::Storeu256,
+        BuiltinIntrinsic::X86Load256 => IntrinsicOp::Load256,
+        BuiltinIntrinsic::X86Store256 => IntrinsicOp::Store256,
+        BuiltinIntrinsic::X86Paddb256 => IntrinsicOp::Paddb256,
+        BuiltinIntrinsic::X86Paddw256 => IntrinsicOp::Paddw256,
+        BuiltinIntrinsic::X86Paddd256 => IntrinsicOp::Paddd256,
+        BuiltinIntrinsic::X86Psubb256 => IntrinsicOp::Psubb256,
+        BuiltinIntrinsic::X86Psubw256 => IntrinsicOp::Psubw256,
+        BuiltinIntrinsic::X86Psubusw256 => IntrinsicOp::Psubusw256,
+        BuiltinIntrinsic::X86Psadbw256 => IntrinsicOp::Psadbw256,
+        BuiltinIntrinsic::X86Pmaddubsw256 => IntrinsicOp::Pmaddubsw256,
+        BuiltinIntrinsic::X86Pmaddwd256 => IntrinsicOp::Pmaddwd256,
+        BuiltinIntrinsic::X86Pcmpeqb256 => IntrinsicOp::Pcmpeqb256,
+        BuiltinIntrinsic::X86Pcmpgtb256 => IntrinsicOp::Pcmpgtb256,
+        BuiltinIntrinsic::X86Pmovmskb256 => IntrinsicOp::Pmovmskb256,
+        BuiltinIntrinsic::X86Pshufb256 => IntrinsicOp::Pshufb256,
+        BuiltinIntrinsic::X86Pabsb256 => IntrinsicOp::Pabsb256,
+        BuiltinIntrinsic::X86Pabsw256 => IntrinsicOp::Pabsw256,
+        BuiltinIntrinsic::X86Pmaxub256 => IntrinsicOp::Pmaxub256,
+        BuiltinIntrinsic::X86Pminub256 => IntrinsicOp::Pminub256,
+        BuiltinIntrinsic::X86Pxor256 => IntrinsicOp::Pxor256,
+        BuiltinIntrinsic::X86Por256 => IntrinsicOp::Por256,
+        BuiltinIntrinsic::X86Pand256 => IntrinsicOp::Pand256,
+        BuiltinIntrinsic::X86Psllidi256 => IntrinsicOp::Psllidi256,
+        BuiltinIntrinsic::X86Psrlidi256 => IntrinsicOp::Psrlidi256,
+        BuiltinIntrinsic::X86Psllwi256 => IntrinsicOp::Psllwi256,
+        BuiltinIntrinsic::X86Psrlwi256 => IntrinsicOp::Psrlwi256,
+        BuiltinIntrinsic::X86Broadcast128to256 => IntrinsicOp::Broadcast128to256,
+        BuiltinIntrinsic::X86Zext128to256 => IntrinsicOp::Zext128to256,
+        BuiltinIntrinsic::X86Cast256to128 => IntrinsicOp::Cast256to128,
+        BuiltinIntrinsic::X86Insert128to256 => IntrinsicOp::Insert128to256,
+        BuiltinIntrinsic::X86SetEpi16_256 => IntrinsicOp::SetEpi16_256,
+        BuiltinIntrinsic::X86Dpbusd128 => IntrinsicOp::Dpbusd128,
+        BuiltinIntrinsic::X86Dpbusds128 => IntrinsicOp::Dpbusds128,
+        BuiltinIntrinsic::X86Dpwusd128 => IntrinsicOp::Dpwusd128,
+        BuiltinIntrinsic::X86Dpwusds128 => IntrinsicOp::Dpwusds128,
+        BuiltinIntrinsic::X86Dpbusd256 => IntrinsicOp::Dpbusd256,
+        BuiltinIntrinsic::X86Dpbusds256 => IntrinsicOp::Dpbusds256,
+        BuiltinIntrinsic::X86Dpwusd256 => IntrinsicOp::Dpwusd256,
+        BuiltinIntrinsic::X86Dpwusds256 => IntrinsicOp::Dpwusds256,
+        BuiltinIntrinsic::X86Dpbssd128 => IntrinsicOp::Dpbssd128,
+        BuiltinIntrinsic::X86Dpbssds128 => IntrinsicOp::Dpbssds128,
+        BuiltinIntrinsic::X86Dpbsud128 => IntrinsicOp::Dpbsud128,
+        BuiltinIntrinsic::X86Dpbsuds128 => IntrinsicOp::Dpbsuds128,
+        BuiltinIntrinsic::X86Dpbuud128 => IntrinsicOp::Dpbuud128,
+        BuiltinIntrinsic::X86Dpbuuds128 => IntrinsicOp::Dpbuuds128,
+        BuiltinIntrinsic::X86Dpbssd256 => IntrinsicOp::Dpbssd256,
+        BuiltinIntrinsic::X86Dpbssds256 => IntrinsicOp::Dpbssds256,
+        BuiltinIntrinsic::X86Dpbsud256 => IntrinsicOp::Dpbsud256,
+        BuiltinIntrinsic::X86Dpbsuds256 => IntrinsicOp::Dpbsuds256,
+        BuiltinIntrinsic::X86Dpbuud256 => IntrinsicOp::Dpbuud256,
+        BuiltinIntrinsic::X86Dpbuuds256 => IntrinsicOp::Dpbuuds256,
+        BuiltinIntrinsic::X86Dpwuud128 => IntrinsicOp::Dpwuud128,
+        BuiltinIntrinsic::X86Dpwuuds128 => IntrinsicOp::Dpwuuds128,
+        BuiltinIntrinsic::X86Dpwssd128 => IntrinsicOp::Dpwssd128,
+        BuiltinIntrinsic::X86Dpwssds128 => IntrinsicOp::Dpwssds128,
+        BuiltinIntrinsic::X86Dpwuud256 => IntrinsicOp::Dpwuud256,
+        BuiltinIntrinsic::X86Dpwuuds256 => IntrinsicOp::Dpwuuds256,
+        BuiltinIntrinsic::X86Dpwssd256 => IntrinsicOp::Dpwssd256,
+        BuiltinIntrinsic::X86Dpwssds256 => IntrinsicOp::Dpwssds256,
+        BuiltinIntrinsic::X86Gf2p8mulb128 => IntrinsicOp::Gf2p8mulb128,
+        BuiltinIntrinsic::X86Gf2p8affineqb128 => IntrinsicOp::Gf2p8affineqb128,
+        BuiltinIntrinsic::X86Gf2p8affineinvqb128 => IntrinsicOp::Gf2p8affineinvqb128,
+        BuiltinIntrinsic::X86Aesenc256 => IntrinsicOp::Aesenc256,
+        BuiltinIntrinsic::X86Aesenclast256 => IntrinsicOp::Aesenclast256,
+        BuiltinIntrinsic::X86Aesdec256 => IntrinsicOp::Aesdec256,
+        BuiltinIntrinsic::X86Aesdeclast256 => IntrinsicOp::Aesdeclast256,
+        BuiltinIntrinsic::X86Vpclmulqdq256 => IntrinsicOp::Vpclmulqdq256,
+        BuiltinIntrinsic::X86SetEpi32_256 => IntrinsicOp::SetEpi32_256,
+        BuiltinIntrinsic::X86SetEpi64x256 => IntrinsicOp::SetEpi64x256,
         _ => unreachable!("x86_intrinsic_op called with non-X86 intrinsic: {:?}", intrinsic),
     }
 }
@@ -881,7 +1103,7 @@ fn classify_ctype(ty: &CType) -> i64 {
         | CType::LongLong | CType::ULongLong
         | CType::Int128 | CType::UInt128
         | CType::Enum(_) => 1,       // integer_type_class
-        CType::Float | CType::Double | CType::LongDouble => 8, // real_type_class
+        CType::Float | CType::Double | CType::LongDouble | CType::Float128 => 8, // real_type_class
         CType::ComplexFloat | CType::ComplexDouble
         | CType::ComplexLongDouble => 9, // complex_type_class
         CType::Pointer(_, _) => 5,      // pointer_type_class

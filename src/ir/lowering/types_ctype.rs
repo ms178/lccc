@@ -37,6 +37,7 @@ impl Lowerer {
             CType::Float => TypeSpecifier::Float,
             CType::Double => TypeSpecifier::Double,
             CType::LongDouble => TypeSpecifier::LongDouble,
+            CType::Float128 => TypeSpecifier::Float128,
             CType::ComplexFloat => TypeSpecifier::ComplexFloat,
             CType::ComplexDouble => TypeSpecifier::ComplexDouble,
             CType::ComplexLongDouble => TypeSpecifier::ComplexLongDouble,

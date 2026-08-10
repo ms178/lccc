@@ -96,6 +96,11 @@ impl Parser {
         // after case/default, and other contexts where parse_stmt() is called.
         // We skip __extension__ first since it can precede declarations.
         self.skip_gcc_extensions();
+        // C23 standard attributes in statement position: `[[fallthrough]];`,
+        // `[[maybe_unused]] int x;`, `[[gnu::...]]` etc. are hints; consume the
+        // whole `[[ ... ]]` list so the guarded statement parses normally
+        // (glibc's cpu-features.c uses `[[fallthrough]]`).
+        self.skip_c23_attribute_lists();
         if self.is_type_specifier() && !self.is_typedef_label() {
             if let Some(decl) = self.parse_local_declaration() {
                 return Stmt::Declaration(decl);
@@ -418,8 +423,13 @@ impl Parser {
             return clobbers;
         }
         while let TokenKind::StringLiteral(ref s) = self.peek() {
-            clobbers.push(s.clone());
+            let mut full = s.clone();
             self.advance();
+            while let TokenKind::StringLiteral(ref s2) = self.peek() {
+                full.push_str(s2);
+                self.advance();
+            }
+            clobbers.push(full);
             if !self.consume_if(&TokenKind::Comma) {
                 break;
             }

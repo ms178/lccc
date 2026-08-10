@@ -126,7 +126,15 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
                 size: target_sym.size,
                 binding: alias_binding.unwrap_or(target_sym.binding),
                 sym_type: alias_type.unwrap_or(target_sym.sym_type),
-                visibility: alias_vis.unwrap_or(target_sym.visibility),
+                // Visibility comes only from an explicit .hidden/.protected
+                // directive on the alias itself (GNU as semantics). Copying the
+                // target's visibility would make strong_aliases of hidden
+                // objects hidden too — e.g. glibc rtld.c's
+                // `strong_alias (__pointer_chk_guard_local, __pointer_chk_guard)`
+                // would produce a hidden __pointer_chk_guard that the ld.map
+                // version script cannot export (GLIBC_PRIVATE), leaving
+                // libc.so with an undefined __pointer_chk_guard.
+                visibility: alias_vis.unwrap_or(STV_DEFAULT),
                 section_name: target_sym.section_name.clone(),
             });
         } else if let Some((section, offset)) = input.labels.get(resolved) {
@@ -139,18 +147,42 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
                 visibility: alias_vis.unwrap_or(STV_DEFAULT),
                 section_name: section.clone(),
             });
+        } else if let Ok(abs_val) = resolved.parse::<i64>() {
+            // `.set sym, <integer>` defines an ABSOLUTE symbol (GNU as
+            // semantics). glibc localeinfo.h `_NL_CURRENT_DEFINE` emits
+            // `.set _nl_current_LC_CTYPE_used, 2` in inline asm; without the
+            // absolute symbol the static libc link fails with undefined
+            // references from setlocale.o.
+            symbols.push(ObjSymbol {
+                name: alias.clone(),
+                value: abs_val as u64,
+                size: 0,
+                binding: alias_binding.unwrap_or(STB_GLOBAL),
+                sym_type: alias_type.unwrap_or(STT_NOTYPE),
+                visibility: alias_vis.unwrap_or(STV_DEFAULT),
+                section_name: "*ABS*".to_string(),
+            });
         }
     }
 
     // Add undefined symbols (referenced in relocations but not defined)
     let mut referenced: HashSet<String> = HashSet::new();
+    // Symbols referenced by TLS relocations must be STT_TLS in the symbol
+    // table; otherwise the linker rejects the object with
+    // "TLS definition ... mismatches non-TLS reference" (glibc's errno.os /
+    // __libc_errno via @GOTTPOFF hits this).
+    let mut tls_referenced: HashSet<String> = HashSet::new();
     for sec in input.sections.values() {
         for reloc in &sec.relocs {
             if reloc.symbol_name.is_empty() {
                 continue;
             }
-            if !reloc.symbol_name.starts_with(".L") && !reloc.symbol_name.starts_with(".l") {
-                referenced.insert(reloc.symbol_name.clone());
+            if reloc.symbol_name.starts_with(".L") || reloc.symbol_name.starts_with(".l") {
+                continue;
+            }
+            referenced.insert(reloc.symbol_name.clone());
+            if is_tls_reloc(reloc.reloc_type) {
+                tls_referenced.insert(reloc.symbol_name.clone());
             }
         }
     }
@@ -172,7 +204,9 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
                 value: 0,
                 size: 0,
                 binding,
-                sym_type: input.symbol_types.get(name).copied().unwrap_or(STT_NOTYPE),
+                sym_type: input.symbol_types.get(name).copied().unwrap_or_else(|| {
+                    if tls_referenced.contains(name) { STT_TLS } else { STT_NOTYPE }
+                }),
                 visibility: input.symbol_visibility.get(name).copied().unwrap_or(STV_DEFAULT),
                 section_name: "*UND*".to_string(),
             });
@@ -180,4 +214,18 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
     }
 
     symbols
+}
+
+/// True if the relocation type is a TLS relocation (x86-64 and i386).
+/// Undefined symbols referenced by these must be emitted as STT_TLS so the
+/// static linker can match them against TLS definitions.
+fn is_tls_reloc(rtype: u32) -> bool {
+    // x86-64: R_X86_64_DTPMOD64=16, DTPOFF64=17, TPOFF64=18, TPOFF32=23,
+    //          DTPOFF32=21, GOTTPOFF=22, TLSDESC=36, TLSDESC_CALL=42
+    // i386:    R_386_TLS_TPOFF=14, TLS_IE=15, TLS_GOTIE=16, TLS_LE=17,
+    //          TLS_GD=18, TLS_LDM=19, TLS_GD_32=24..TLS_TPOFF32=35
+    // Deduplicated union of the two arch sets: the 16/17/18 overlap between
+    // x86-64 and i386 made the original arms unreachable (rustc warning).
+    // x86-64 {16,17,18,21,22,23,36,42} ∪ i386 {14..19, 24..35} = {14..19, 21..23, 24..35, 36, 42}
+    matches!(rtype, 14..=19 | 21..=23 | 24..=35 | 36 | 42)
 }

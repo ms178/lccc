@@ -11,6 +11,46 @@
 use super::super::types::*;
 use super::helpers::*;
 
+// SOUNDNESS (v7): LCCC compiles with -fomit-frame-pointer, so %rbp is a general
+// data register unless a function explicitly establishes a frame pointer
+// (`pushq %rbp` + `movq %rsp, %rbp`). When %rbp is NOT the frame pointer, a
+// memory operand such as `movl %eax, 28(%rbp)` is a POINTER DEREFERENCE through
+// the value in %rbp (e.g. an array/struct access), NOT a stack-slot access.
+// The StoreRbp/LoadRbp classification (which also accepts `(%rsp)`) would
+// otherwise treat such an access as a stack slot and could wrongly delete a
+// live store. These helpers let the dead-store passes stay frame-pointer aware.
+//
+/// Returns true if `trimmed` contains a memory operand that dereferences `%rbp`
+/// (e.g. `movl %eax, 28(%rbp)` or `movl 28(%rbp), %eax` or `(%rbp, %rax, 4)`).
+/// A bare register move such as `movq %rax, %rbp` has no parenthesized operand,
+/// so it returns false.
+fn uses_rbp_mem_operand(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let start = i;
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < bytes.len() && depth > 0 {
+                if bytes[j] == b'(' {
+                    depth += 1;
+                } else if bytes[j] == b')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            if trimmed[start..j].contains("%rbp") {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 // ── Dead register move elimination ──────────────────────────────────────────
 
 /// Maximum forward scan window for dead register move detection.
@@ -187,11 +227,40 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
 
     let mut pattern_bytes = [0u8; 24];
 
+    // Frame-pointer status (v7): reset at each .cfi_startproc, set true when a
+    // function establishes a frame pointer (`movq %rsp, %rbp`). When %rbp is NOT
+    // the frame pointer, `offset(%rbp)` accesses are pointer dereferences and
+    // must never be treated as stack slots.
+    let mut rbp_is_frame = false;
+
     for i in 0..len {
+        match infos[i].kind {
+            LineKind::Directive => {
+                let d = infos[i].trimmed(store.get(i));
+                if d == ".cfi_startproc" {
+                    rbp_is_frame = false;
+                }
+            }
+            LineKind::Other { .. } => {
+                let o = infos[i].trimmed(store.get(i));
+                if o == "movq %rsp, %rbp" || o == "movl %esp, %ebp" {
+                    rbp_is_frame = true;
+                }
+            }
+            _ => {}
+        }
+
         let (store_offset, store_size) = match infos[i].kind {
             LineKind::StoreRbp { offset, size, .. } => (offset, size),
             _ => continue,
         };
+
+        // SOUNDNESS (v7): if %rbp is not the frame pointer and this store uses an
+        // `(%rbp)` memory operand, it writes ARBITRARY memory (pointer deref), not
+        // a stack slot. Never delete it as a dead stack store.
+        if !rbp_is_frame && uses_rbp_mem_operand(infos[i].trimmed(store.get(i))) {
+            continue;
+        }
 
         let store_bytes = store_size.byte_size();
 
@@ -202,10 +271,57 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
 
         for j in (i + 1)..end {
             if infos[j].is_nop() {
+                // ms178 SOUNDNESS FIX: another pass (store_fwd / copy_prop /
+                // dead_regs / phase-1 locals) may have NOP'd this line, but the
+                // LineStore preserves its original text. If that line was a LOAD
+                // or STORE of OUR slot, then our store's value was consumed (or
+                // the slot was rewritten) — deleting our store would orphan the
+                // forwarded value / reintroduce a live store. Check the
+                // preserved text (trimmed: NOP'd lines may retain their original
+                // indentation, which the line parsers do not tolerate): any
+                // same-slot access on a nop'd line counts as a read
+                // (conservative) or overwrite.
+                let nt = infos[j].trimmed(store.get(j)).trim();
+                if let Some((off_str, _reg, sz)) = parse_load_from_rbp_str(nt) {
+                    let off = fast_parse_i32(off_str);
+                    if ranges_overlap(store_offset, store_bytes, off, sz.byte_size()) {
+                        slot_read = true;
+                        break;
+                    }
+                }
+                if let Some((_reg, off_str, sz)) = parse_store_to_rbp_str(nt) {
+                    let off = fast_parse_i32(off_str);
+                    let nb = sz.byte_size();
+                    if off <= store_offset && off + nb >= store_offset + store_bytes {
+                        slot_overwritten = true;
+                        break;
+                    }
+                    if ranges_overlap(store_offset, store_bytes, off, nb) {
+                        slot_read = true;
+                        break;
+                    }
+                }
                 continue;
             }
 
             if infos[j].is_barrier() {
+                slot_read = true;
+                break;
+            }
+
+            // SOUNDNESS (v1): an RSP-shifting line between the store and this
+            // point makes the store's %rsp-relative address ambiguous (the
+            // offsets inside the shifted window refer to different physical
+            // slots). Treat as a read so the store is never deleted.
+            if is_rsp_shift_line(infos[j].trimmed(store.get(j))) {
+                slot_read = true;
+                break;
+            }
+
+            // SOUNDNESS (v7): a `(%rbp)` access when %rbp is not the frame pointer
+            // is an opaque pointer dereference that may READ or WRITE the slot.
+            // Conservatively treat it as a read.
+            if !rbp_is_frame && uses_rbp_mem_operand(infos[j].trimmed(store.get(j))) {
                 slot_read = true;
                 break;
             }
@@ -305,7 +421,13 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // 2. Frame-pointer-less: subq $N,%rsp (without push %rbp)
         let body_start;
 
+        // Frame-pointer status (v7): Form 1 establishes a frame pointer (so
+        // `(%rbp)` is a genuine stack slot); Form 2 does not (so %rbp is a free
+        // data register and `(%rbp)` is a pointer dereference, never a stack slot).
+        let mut rbp_is_frame;
+
         if matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+            rbp_is_frame = true;
             // Form 1: frame pointer prologue
             let mut j = next_non_nop(infos, i + 1, len);
             if j >= len {
@@ -355,6 +477,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             body_start = callee_save_end;
         } else {
             // Form 2: frame-pointer-less prologue (subq $N, %rsp)
+            rbp_is_frame = false;
             let line = infos[i].trimmed(store.get(i));
             let is_subq_rsp = if let Some(rest) = line.strip_prefix("subq $") {
                 rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some()
@@ -433,6 +556,20 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 continue;
             }
 
+            // SOUNDNESS (v1): an RSP-shifting instruction (push/pop/subq/addq
+            // on %rsp) changes the effective address of every %rsp-relative
+            // slot after it. Offsets are compared verbatim, so a read of slot
+            // X before the shift and a read of slot X after the shift refer
+            // to different physical slots — and, worse, a store before the
+            // shift can be (wrongly) matched against a read of a shifted
+            // offset. The codegen no longer pushes around i128 ops, but F128
+            // conversions still adjust RSP; conservatively skip never-read
+            // elimination for functions containing such lines.
+            if is_rsp_shift_line(infos[k].trimmed(store.get(k))) {
+                has_unparseable_indirect = true;
+                break;
+            }
+
             if infos[k].has_indirect_mem {
                 // Truly indirect memory access (e.g., (%rax) where rax is unknown).
                 // Mark the whole function as having indirect access.
@@ -441,8 +578,21 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
 
             match infos[k].kind {
-                LineKind::StoreRbp { .. } => {}
+                LineKind::StoreRbp { .. } => {
+                    // SOUNDNESS (v7): when %rbp is not the frame pointer, an
+                    // `(%rbp)` store is a pointer write to arbitrary memory — it
+                    // may read/alias any stack slot. Bail out of never-read
+                    // elimination entirely.
+                    if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
+                }
                 LineKind::LoadRbp { offset, size, .. } => {
+                    if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
                     read_ranges.push((offset, size.byte_size()));
                 }
                 LineKind::Other { .. } => {
@@ -491,6 +641,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 continue;
             }
             if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
+                // SOUNDNESS (v7): never delete an `(%rbp)` store when %rbp is a
+                // data register (pointer store to arbitrary memory).
+                if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                    continue;
+                }
                 let store_bytes = size.byte_size();
                 let is_read = read_ranges.iter().any(|&(r_off, r_sz)| {
                     ranges_overlap(offset, store_bytes, r_off, r_sz)

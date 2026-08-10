@@ -834,7 +834,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 // store 42, %0
                 Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
@@ -874,7 +874,7 @@ mod tests {
         let mut func = IrFunction::new(
             "f".to_string(),
             IrType::I32,
-            vec![IrParam { ty: IrType::I32, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None }],
+            vec![IrParam { ty: IrType::I32, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None, is_f128_sse: false }],
             false,
         );
 
@@ -883,9 +883,9 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32 (param)
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 // %1 = alloca i32 (x)
-                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false },
+                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 // %2 = load %0 (read param)
                 Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
                 // %3 = cmp ne %2, 0
@@ -959,7 +959,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
                 // Pass address to a function (address-taken)
@@ -976,6 +976,7 @@ mod tests {
                         struct_arg_aligns: vec![],
                         struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
@@ -1008,8 +1009,8 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false }, // sum
-                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false }, // i
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false }, // sum
+                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false }, // i
                 Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
                 Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
@@ -1094,7 +1095,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32 (volatile)
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: true },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: true, semantic_volatile: true },
                 Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
@@ -1110,7 +1111,7 @@ mod tests {
         // The volatile alloca should NOT be promoted
         let func = &module.functions[0];
         let has_alloca = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Alloca { dest: Value(0), volatile: true, .. })
+            matches!(inst, Instruction::Alloca { dest: Value(0), volatile: true, semantic_volatile: true, .. })
         );
         assert!(has_alloca, "Volatile alloca should not be promoted");
         // Store should still exist
@@ -1185,7 +1186,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i64
-                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false, semantic_volatile: false },
                 // inline_asm outputs=[("=r", %0)]
                 Instruction::InlineAsm {
                     template: String::new(),
@@ -1259,7 +1260,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i64
-                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false, semantic_volatile: false },
                 // store 42, %0
                 Instruction::Store {
                     val: Operand::Const(IrConst::I64(42)),
@@ -1313,7 +1314,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32 (for "=m" output)
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false, semantic_volatile: false },
                 // inline_asm outputs=[("=m", %0)] inputs=[("r", const 42)]
                 // Output is memory-only; alloca must NOT be promoted.
                 Instruction::InlineAsm {

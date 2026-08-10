@@ -29,6 +29,8 @@ pub enum CallArgClass {
     I128RegPair { base_reg_idx: usize },
     /// F128 (long double) — handling is arch-specific (x87 on x86, Q-reg on ARM, GP pair on RISC-V).
     F128Reg { reg_idx: usize },
+    /// _Float128 (binary128) in ONE 16-byte XMM register (SysV psABI).
+    F128SseReg { reg_idx: usize },
     /// Small struct (<=16 bytes) passed by value in 1-2 GP registers.
     StructByValReg { base_reg_idx: usize, size: usize },
     /// Small struct (<=16 bytes) where all fields are float/double (SSE class per SysV ABI).
@@ -108,6 +110,8 @@ pub enum ParamClass {
     StructByValReg { base_reg_idx: usize, size: usize },
     /// Small struct where all eightbytes are SSE class -> 1-2 XMM registers.
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
+    /// _Float128 (binary128) arrives in ONE 16-byte XMM register (SysV psABI).
+    F128SseReg { reg_idx: usize },
     /// Small struct: first eightbyte INTEGER, second SSE.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
     #[allow(dead_code)] // size field not yet read by any backend
@@ -329,6 +333,8 @@ pub(crate) struct ArgInfo<'a> {
     pub(crate) is_float: bool,
     pub(crate) is_i128: bool,
     pub(crate) is_long_double: bool,
+    /// True for _Float128 (IEEE binary128): ONE 16-byte XMM register (SysV psABI).
+    pub(crate) is_f128_sse: bool,
     /// If this is a struct/union by value: Some(byte_size). None otherwise.
     pub(crate) struct_size: Option<usize>,
     /// Struct alignment in bytes (for RISC-V even-register alignment). None for non-struct.
@@ -354,6 +360,8 @@ enum CoreArgClass {
     F128FpReg { reg_idx: usize },
     F128GpPair { base_reg_idx: usize },
     F128Stack,
+    /// _Float128 (binary128) in ONE 16-byte XMM register (SysV psABI).
+    F128SseReg { reg_idx: usize },
     StructByValReg { base_reg_idx: usize, size: usize },
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
     StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
@@ -398,6 +406,20 @@ fn classify_args_core(
             // Zero-size structs consume no register or stack space per GCC behavior.
             if size == 0 {
                 result.push(CoreArgClass::ZeroSizeSkip);
+                continue;
+            }
+
+            // _Float128 (IEEE binary128): ONE 16-byte XMM register per the
+            // SysV psABI (not a two-eightbyte SSE struct). Overflow (all XMM
+            // regs consumed) goes to a 16-byte stack slot.
+            if info.is_f128_sse && size == 16 {
+                if float_idx < config.max_float_regs {
+                    result.push(CoreArgClass::F128SseReg { reg_idx: float_idx });
+                    float_idx += 1;
+                } else {
+                    result.push(CoreArgClass::StructByValStack { size });
+                    int_idx = config.max_int_regs;
+                }
                 continue;
             }
 
@@ -476,7 +498,7 @@ fn classify_args_core(
                     // Note: ARM AAPCS64 does NOT require even-aligned pairs for composites.
                     if regs_needed == 2 && config.align_struct_pairs {
                         let struct_align = info.struct_align.unwrap_or(slot_size);
-                        if struct_align > slot_size && !int_idx.is_multiple_of(2) {
+                        if struct_align > slot_size && int_idx % 2 != 0 {
                             int_idx += 1; // skip to even register
                         }
                     }
@@ -503,7 +525,7 @@ fn classify_args_core(
                 result.push(CoreArgClass::LargeStructStack { size });
             }
         } else if info.is_i128 {
-            if config.align_i128_pairs && !int_idx.is_multiple_of(2) {
+            if config.align_i128_pairs && int_idx % 2 != 0 {
                 int_idx += 1;
             }
             if int_idx + 1 < config.max_int_regs {
@@ -522,7 +544,7 @@ fn classify_args_core(
                     result.push(CoreArgClass::F128Stack);
                 }
             } else if config.f128_in_gp_pairs {
-                if config.align_i128_pairs && !int_idx.is_multiple_of(2) {
+                if config.align_i128_pairs && int_idx % 2 != 0 {
                     int_idx += 1;
                 }
                 if int_idx + 1 < config.max_int_regs {
@@ -571,6 +593,7 @@ pub fn classify_call_args(
     struct_arg_aligns: &[Option<usize>],
     struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
     struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+    struct_arg_is_f128_sse: &[bool],
     is_variadic: bool,
     config: &CallAbiConfig,
 ) -> Vec<CallArgClass> {
@@ -589,6 +612,7 @@ pub fn classify_call_args(
             struct_align: struct_arg_aligns.get(i).copied().flatten(),
             eightbyte_classes: struct_arg_classes.get(i).map(|v| v.as_slice()).unwrap_or(&[]),
             riscv_float_class: struct_arg_riscv_float_classes.get(i).copied().flatten(),
+            is_f128_sse: struct_arg_is_f128_sse.get(i).copied().unwrap_or(false),
         }
     }).collect();
 
@@ -602,6 +626,7 @@ pub fn classify_call_args(
         CoreArgClass::I128RegPair { base_reg_idx } => CallArgClass::I128RegPair { base_reg_idx },
         CoreArgClass::F128FpReg { reg_idx } | CoreArgClass::F128GpPair { base_reg_idx: reg_idx } => CallArgClass::F128Reg { reg_idx },
         CoreArgClass::F128Stack => CallArgClass::F128Stack,
+        CoreArgClass::F128SseReg { reg_idx } => CallArgClass::F128SseReg { reg_idx },
         CoreArgClass::StructByValReg { base_reg_idx, size } => CallArgClass::StructByValReg { base_reg_idx, size },
         CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
         CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
@@ -653,6 +678,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             struct_align: param.struct_align,
             eightbyte_classes: &param.struct_eightbyte_classes,
             riscv_float_class: param.riscv_float_class,
+            is_f128_sse: param.is_f128_sse,
         }
     }).collect();
 
@@ -714,6 +740,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },
             CoreArgClass::F128FpReg { reg_idx } => ParamClass::F128FpReg { reg_idx },
             CoreArgClass::F128GpPair { base_reg_idx } => ParamClass::F128GpPair { lo_reg_idx: base_reg_idx, hi_reg_idx: base_reg_idx + 1 },
+            CoreArgClass::F128SseReg { reg_idx } => ParamClass::F128SseReg { reg_idx },
             CoreArgClass::LargeStructByRefReg { reg_idx, size } => ParamClass::LargeStructByRefReg { reg_idx, size },
             CoreArgClass::ZeroSizeSkip => ParamClass::ZeroSizeSkip,
 

@@ -504,6 +504,13 @@ impl Parser {
                 self.advance();
                 Expr::FloatLiteralLongDouble(val, bytes, span)
             }
+            TokenKind::FloatLiteralF128(val, bytes) => {
+                let val = *val;
+                let bytes = *bytes;
+                let span = self.peek_span();
+                self.advance();
+                Expr::FloatLiteralF128(val, bytes, span)
+            }
             TokenKind::ImaginaryLiteral(val) => {
                 let val = *val;
                 let span = self.peek_span();

@@ -334,9 +334,11 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
+                ret_is_f128_sse: false,
                 param_struct_sizes,
                 param_struct_classes,
                 param_riscv_float_classes,
+                param_is_f128_sse: Vec::new(),
             }
         } else {
             FuncSig {
@@ -349,9 +351,11 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes,
+                ret_is_f128_sse: false,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
                 param_riscv_float_classes: Vec::new(),
+                param_is_f128_sse: Vec::new(),
             }
         };
         // Don't overwrite an existing, more complete sig from the first pass
@@ -403,7 +407,7 @@ impl Lowerer {
                     // Packed register value: store to alloca, then memcpy from alloca
                     let tmp_alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(total_size);
-                    self.emit(Instruction::Alloca { dest: tmp_alloca, size: total_size, ty: store_ty, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: tmp_alloca, size: total_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val: Operand::Value(src_val), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default });
                     self.emit(Instruction::Memcpy { dest: alloca, src: tmp_alloca, size: total_size });
                 } else {
@@ -536,11 +540,11 @@ impl Lowerer {
             // For _Bool targets, normalize at the source type before any truncation.
             // Truncating first (e.g. 0x100 -> U8 = 0) then normalizing gives wrong results.
             let val = self.lower_expr(expr);
-            let expr_ty = self.get_expr_type(expr);
+            let expr_ty = self.value_ir_type(expr);
             self.emit_bool_normalize_typed(val, expr_ty)
         } else {
             let val = self.lower_expr(expr);
-            let expr_ty = self.get_expr_type(expr);
+            let expr_ty = self.value_ir_type(expr);
             self.emit_implicit_cast(val, expr_ty, da.var_ty)
         };
         self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });

@@ -97,6 +97,16 @@ fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
             } else {
                 while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
             }
+            // C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos) are valid
+            // in assembler constant expressions (e.g. `$(1U<<1)` from glibc).
+            let mut suffix_len = 0;
+            while i + suffix_len < bytes.len()
+                && matches!(bytes[i + suffix_len], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z')
+                && suffix_len < 4
+            {
+                suffix_len += 1;
+            }
+            i += suffix_len;
             let num_str = &s[start..i];
             let val = parse_single_integer(num_str)?;
             tokens.push(ExprToken::Num(val));
@@ -228,6 +238,19 @@ fn parse_single_integer(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty integer".to_string());
+    }
+
+    // Strip C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos).
+    let s = {
+        let bytes = s.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
+            end -= 1;
+        }
+        &s[..end]
+    };
+    if s.is_empty() {
+        return Err("integer has only a suffix".to_string());
     }
 
     // Character literal: 'c' or '\n' etc. Must be the entire string

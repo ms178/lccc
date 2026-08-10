@@ -216,7 +216,7 @@ impl Lowerer {
         // For sret calls, allocate space and prepend hidden pointer argument
         let sret_alloca = if let Some(size) = sret_size {
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size, align: 0, volatile: false });
+            self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size, align: 0, volatile: false, semantic_volatile: false });
             arg_vals.insert(0, Operand::Value(alloca));
             arg_types.insert(0, IrType::Ptr);
             struct_arg_sizes.insert(0, None); // sret pointer is not a struct arg
@@ -227,6 +227,17 @@ impl Lowerer {
         } else {
             None
         };
+
+        // _Float128 call args: ONE 16-byte XMM register each (SysV psABI).
+        // Derived from the argument expression's C type so it also covers
+        // indirect/function-pointer calls and variadic positions.
+        let struct_arg_is_f128_sse: Vec<bool> = args.iter().map(|a| {
+            matches!(self.get_expr_ctype(a), Some(CType::Float128))
+        }).collect();
+        let mut struct_arg_is_f128_sse = struct_arg_is_f128_sse;
+        if sret_alloca.is_some() {
+            struct_arg_is_f128_sse.insert(0, false);
+        }
 
         // Determine number of fixed args for variadic calls
         let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = stripped_func {
@@ -269,7 +280,7 @@ impl Lowerer {
         };
 
         // Dispatch: direct call, function pointer call, or indirect call
-        let call_ret_ty = self.emit_call_instruction(effective_func, dest, arg_vals, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, call_variadic, num_fixed_args, two_reg_size, sret_size, call_ret_classes);
+        let call_ret_ty = self.emit_call_instruction(effective_func, dest, arg_vals, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, struct_arg_is_f128_sse, call_variadic, num_fixed_args, two_reg_size, sret_size, call_ret_classes);
 
         // After call to noreturn function, emit unreachable and start dead block.
         // Unlike error_functions (which skip the call entirely), noreturn functions
@@ -318,7 +329,7 @@ impl Lowerer {
     /// Unpack a two-register (I128) struct return into a struct alloca.
     fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
         let alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size, align: 0, volatile: false });
+        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size, align: 0, volatile: false, semantic_volatile: false });
         // Extract low 8 bytes (rax)
         let lo = self.fresh_value();
         self.emit(Instruction::Cast { dest: lo, src: Operand::Value(dest), from_ty: IrType::I128, to_ty: IrType::I64 });
@@ -345,14 +356,14 @@ impl Lowerer {
                     // x86-64: two packed F32 returned in xmm0 as F64
                     // Store the raw 8 bytes (two F32s) into an alloca
                     let alloca = self.fresh_value();
-                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
                     Some(Operand::Value(alloca))
                 } else if !self.decomposes_complex_float() {
                     // i686: two packed F32 returned in eax:edx as I64
                     // Store the raw 8 bytes (two F32s) into an alloca
                     let alloca = self.fresh_value();
-                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::I64 , seg_override: AddressSpace::Default });
                     Some(Operand::Value(alloca))
                 } else {
@@ -360,7 +371,7 @@ impl Lowerer {
                     let imag_val = self.fresh_value();
                     self.emit(Instruction::GetReturnF32Second { dest: imag_val });
                     let alloca = self.fresh_value();
-                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false, semantic_volatile: false });
                     // Store real part (F32) at offset 0
                     self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F32 , seg_override: AddressSpace::Default });
                     // Store imag part (F32) at offset 4
@@ -381,7 +392,7 @@ impl Lowerer {
                 let imag_val = self.fresh_value();
                 self.emit(Instruction::GetReturnF64Second { dest: imag_val });
                 let alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false });
+                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
                 self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
                 let imag_ptr = self.fresh_value();
                 let ptr_int_ty = crate::common::types::target_int_ir_type();
@@ -400,7 +411,7 @@ impl Lowerer {
                 let imag_val = self.fresh_value();
                 self.emit(Instruction::GetReturnF128Second { dest: imag_val });
                 let alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 32, align: 16, volatile: false });
+                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 32, align: 16, volatile: false, semantic_volatile: false });
                 // Store real part (F128) at offset 0
                 self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F128, seg_override: AddressSpace::Default });
                 // Store imag part (F128) at offset 16
@@ -534,7 +545,7 @@ impl Lowerer {
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(alloc_size);
-                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
+                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
                     self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                     val = Operand::Value(alloca);
                 }
@@ -724,6 +735,7 @@ impl Lowerer {
         struct_arg_aligns: Vec<Option<usize>>,
         struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>>,
         struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
+        struct_arg_is_f128_sse: Vec<bool>,
         is_variadic: bool,
         num_fixed_args: usize,
         two_reg_size: Option<usize>,
@@ -749,16 +761,16 @@ impl Lowerer {
                             return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                             struct_arg_sizes, struct_arg_aligns, struct_arg_classes,
                             struct_arg_riscv_float_classes,
+                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(), is_fastcall: false,
                             ret_eightbyte_classes: call_ret_classes,
+                            ret_is_f128_sse: false,
                         },
                     });
                     indirect_ret_ty
                 } else {
                     // Direct call - apply __asm__("label") linker symbol redirect if present
-                    let call_name = self.asm_label_map.get(name.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| name.clone());
+                    let call_name = self.resolve_ref_name(name.as_str());
                     let sig = self.func_meta.sigs.get(name.as_str());
                     let mut ret_ty = sig.map(|s| s.return_type).unwrap_or(target_int_ir_type());
                     if sig.and_then(|s| s.two_reg_ret_size).is_some() {
@@ -780,6 +792,7 @@ impl Lowerer {
                         }
                     }
                     let callee_is_fastcall = self.fastcall_functions.contains(name.as_str());
+                    let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -787,8 +800,10 @@ impl Lowerer {
                             return_type: ret_ty, is_variadic, num_fixed_args,
                             struct_arg_sizes, struct_arg_aligns, struct_arg_classes,
                             struct_arg_riscv_float_classes,
+                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(), is_fastcall: callee_is_fastcall,
                             ret_eightbyte_classes: call_ret_classes,
+                            ret_is_f128_sse: call_ret_is_f128_sse,
                         },
                     });
                     ret_ty
@@ -820,8 +835,10 @@ impl Lowerer {
                         return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
                         struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
                         struct_arg_riscv_float_classes: sarfc,
+                        struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: sret_size.is_some(), is_fastcall: false,
                         ret_eightbyte_classes: call_ret_classes,
+                        ret_is_f128_sse: false,
                     },
                 });
                 indirect_ret_ty
@@ -856,9 +873,7 @@ impl Lowerer {
 
                 if let Some(call_name) = direct_func_name {
                     // Emit a direct call instead of indirect.
-                    let call_name = self.asm_label_map.get(call_name.as_str())
-                        .cloned()
-                        .unwrap_or(call_name);
+                    let call_name = self.resolve_ref_name(call_name.as_str());
                     let sig = self.func_meta.sigs.get(call_name.as_str());
                     let mut ret_ty = sig.map(|s| s.return_type).unwrap_or(indirect_ret_ty);
                     if sig.and_then(|s| s.two_reg_ret_size).is_some() {
@@ -876,6 +891,7 @@ impl Lowerer {
                         }
                     }
                     let callee_is_fastcall = self.fastcall_functions.contains(call_name.as_str());
+                    let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -883,8 +899,10 @@ impl Lowerer {
                             return_type: ret_ty, is_variadic, num_fixed_args,
                             struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
                             struct_arg_riscv_float_classes: sarfc,
+                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(), is_fastcall: callee_is_fastcall,
                             ret_eightbyte_classes: call_ret_classes,
+                            ret_is_f128_sse: call_ret_is_f128_sse,
                         },
                     });
                     ret_ty
@@ -896,8 +914,10 @@ impl Lowerer {
                             return_type: indirect_ret_ty, is_variadic, num_fixed_args,
                             struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
                             struct_arg_riscv_float_classes: sarfc,
+                            struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(), is_fastcall: false,
                             ret_eightbyte_classes: call_ret_classes,
+                            ret_is_f128_sse: false,
                         },
                     });
                     indirect_ret_ty

@@ -26,7 +26,7 @@
 use super::live_range::{self, LinearScanAllocator};
 use super::liveness::{
     compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
-    LiveInterval, LivenessResult,
+    for_each_value_use_in_instruction, LiveInterval, LivenessResult,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -85,6 +85,196 @@ fn filter_eligible_intervals(
         .filter(|iv| iv.end > iv.start)
         .copied()
         .collect()
+}
+
+/// ms178: Build Copy-coalescing groups.
+///
+/// Union-find over `Copy { dest, src: Value(v) }` instructions where both ends
+/// are eligible for register allocation. A group is only kept when its members'
+/// live intervals are pairwise DISJOINT — only then can a single register
+/// legally hold all members at distinct times (the copy becomes a no-op).
+/// Members that overlap another member of their group are split out.
+///
+/// Returns map: group leader value id -> all member value ids (incl. leader).
+fn build_coalesce_groups(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    eligible: &FxHashSet<u32>,
+) -> FxHashMap<u32, Vec<u32>> {
+    use std::collections::HashMap;
+    if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
+        eprintln!("[COALESCE] fn={} build_coalesce_groups ENTERED", func.name);
+    }
+    // interval lookup
+    let iv_of = |vid: u32| -> Option<(u32, u32)> {
+        liveness
+            .intervals
+            .iter()
+            .find(|iv| iv.value_id == vid)
+            .map(|iv| (iv.start, iv.end))
+    };
+    // union-find
+    let mut parent: HashMap<u32, u32> = HashMap::new();
+    fn find(parent: &mut HashMap<u32, u32>, x: u32) -> u32 {
+        let mut r = x;
+        while parent.get(&r).copied() != Some(r) {
+            r = parent.get(&r).copied().unwrap_or(r);
+        }
+        // path compression
+        let mut c = x;
+        while parent.get(&c).copied().map(|p| p != r).unwrap_or(false) {
+            let next = parent.get(&c).copied().unwrap_or(c);
+            parent.insert(c, r);
+            c = next;
+        }
+        r
+    }
+    fn union(parent: &mut HashMap<u32, u32>, a: u32, b: u32) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent.insert(rb, ra);
+        }
+    }
+    let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 < b.1 && b.0 < a.1;
+
+    // Pass 1: union copy pairs.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(v),
+            } = inst
+            {
+                let d = dest.0;
+                let s = v.0;
+                if eligible.contains(&d) && eligible.contains(&s) {
+                    parent.entry(d).or_insert(d);
+                    parent.entry(s).or_insert(s);
+                    union(&mut parent, d, s);
+                }
+            }
+        }
+    }
+    if parent.is_empty() {
+        if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
+            let n_copies = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i, Instruction::Copy { .. }))
+                .count();
+            eprintln!(
+                "[COALESCE] fn={} no eligible copy pairs (copies={})",
+                func.name, n_copies
+            );
+        }
+        return FxHashMap::default();
+    }
+    // Debug: show eligible copies whose endpoints' intervals OVERLAP (the
+    // pairs coalescing cannot merge) — points at conservative liveness.
+    if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
+        let mut n_rej = 0usize;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(v) } = inst {
+                    let d = dest.0; let sv = v.0;
+                    if eligible.contains(&d) && eligible.contains(&sv) {
+                        if let (Some(di), Some(si)) = (iv_of(d), iv_of(sv)) {
+                            if overlaps(di, si) {
+                                if n_rej < 12 {
+                                    eprintln!("[COALESCE] {} overlap copy v{}[{}-{}] <- v{}[{}-{}]",
+                                        func.name, d, di.0, di.1, sv, si.0, si.1);
+                                }
+                                n_rej += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[COALESCE] {} overlapping eligible copies: {}", func.name, n_rej);
+    }
+
+    // Pass 2: group members by leader.
+    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+    let vids: Vec<u32> = parent.keys().copied().collect();
+    for vid in vids {
+        let leader = find(&mut parent, vid);
+        groups.entry(leader).or_default().push(vid);
+    }
+    // Pass 3: split overlapping members out of their groups.
+    let mut result: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (leader, members) in groups {
+        // sort by start for the greedy disjoint check
+        let mut sorted = members.clone();
+        sorted.sort_by_key(|&m| iv_of(m).map(|x| x.0).unwrap_or(0));
+        let mut accepted: Vec<u32> = Vec::new();
+        let mut rejected: Vec<u32> = Vec::new();
+        for m in sorted {
+            let mi = iv_of(m);
+            let mut ok = true;
+            if let Some(mi) = mi {
+                for &a in &accepted {
+                    if let Some(ai) = iv_of(a) {
+                        if overlaps(mi, ai) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                accepted.push(m);
+            } else {
+                rejected.push(m);
+            }
+        }
+        if accepted.len() > 1 {
+            // The group representative is the union-find leader IF it is among
+            // the accepted (pairwise-disjoint) members; otherwise use the
+            // earliest-start accepted member. CRITICAL: the representative's
+            // value id must be a member whose interval is covered by the merged
+            // [min,max] interval — a rejected leader whose original interval
+            // extends beyond the merged range would otherwise keep uses outside
+            // the merged interval with no register coverage (miscompile).
+            let rep = if accepted.contains(&leader) {
+                leader
+            } else {
+                accepted[0]
+            };
+            result.insert(rep, accepted);
+        }
+        // rejected members keep their own intervals (not coalesced)
+        let _ = rejected;
+    }
+    if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
+        let mut n_merged = 0usize;
+        let mut n_members = 0usize;
+        for (_, members) in &result {
+            n_merged += 1;
+            n_members += members.len();
+        }
+        eprintln!(
+            "[COALESCE] fn={} groups={} members={}",
+            func.name, n_merged, n_members
+        );
+        for (leader, members) in &result {
+            let ivs: Vec<String> = members
+                .iter()
+                .map(|m| {
+                    liveness
+                        .intervals
+                        .iter()
+                        .find(|x| x.value_id == *m)
+                        .map(|x| format!("val{}[{}-{}]", x.value_id, x.start, x.end))
+                        .unwrap_or_else(|| format!("val{}[?]", m))
+                })
+                .collect();
+            eprintln!("[COALESCE]   group leader={} members={:?}", leader, ivs);
+        }
+    }
+    result
 }
 
 /// Run the register allocator on a function.
@@ -315,18 +505,112 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let call_points = &liveness.call_points;
 
-    // Phase 1: callee-saved linear scan.
-    let phase1_intervals = filter_eligible_intervals(&liveness, &eligible);
-    let phase1_ranges =
+    // ms178: pre-allocation COPY COALESCING.
+    //
+    // Linear scan allocates registers per SSA value; Copy instructions whose
+    // dest/src are disjoint should share a register so the copy disappears.
+    // The existing hint mechanism only works when the copy DEST finds a free
+    // register at its (late, in-loop) start point — under register pressure it
+    // never does, so every loop-carried phi copy-back round-trips through a
+    // stack slot (gzip's longest_match: ~922 spill refs in the hot loop).
+    //
+    // Here we union Copy-related values into a single coalesced interval
+    // BEFORE allocation (dest's range extends back to src's start), so the
+    // coalesced interval is allocated as one unit with the src's early start.
+    // Soundness: members are only merged when their live intervals are pairwise
+    // disjoint (then one register provably holds all of them at distinct
+    // times). Any member that overlaps another in its group is split out and
+    // keeps its own interval. The final assignments map then maps every member
+    // to the group leader's register, making the copies no-ops in codegen.
+    // Opt-in (CCC_COALESCE=1): measured neutral on gzip (loop-carried values
+    // genuinely overlap, so only ~2 groups coalesce in longest_match), sound
+    // after the representative fix, and a net win on copy-heavy non-loop code.
+    // Kept OFF by default so the default codegen matches the fully-validated
+    // v14 baseline.
+    let coalesce_groups: FxHashMap<u32, Vec<u32>> = if std::env::var("CCC_COALESCE").is_ok() {
+        build_coalesce_groups(func, &liveness, &eligible)
+    } else {
+        FxHashMap::default()
+    };
+
+    // Phase 1: callee-saved registers only for call-spanning values (they pay
+    // a whole-function push/pop; non-spanning values prefer the free
+    // caller-saved pool in Phase 2, with callee-saved spillover in Phase 2c).
+    let mut phase1_intervals: Vec<LiveInterval> = liveness
+        .intervals
+        .iter()
+        .filter(|iv| eligible.contains(&iv.value_id))
+        .filter(|iv| iv.end > iv.start)
+        .filter(|iv| spans_any_call(iv, call_points))
+        .copied()
+        .collect();
+    // Replace each coalesced group's member intervals with ONE merged interval
+    // whose id is the group leader, and record the member→leader map for
+    // assignment propagation.
+    let mut coalesce_member_of: FxHashMap<u32, u32> = FxHashMap::default();
+    if !coalesce_groups.is_empty() {
+        let mut removed: FxHashSet<u32> = FxHashSet::default();
+        for (leader, members) in &coalesce_groups {
+            let mut start = u32::MAX;
+            let mut end = 0u32;
+            for m in members {
+                removed.insert(*m);
+                if let Some(iv) = liveness.intervals.iter().find(|x| x.value_id == *m) {
+                    if iv.start < start {
+                        start = iv.start;
+                    }
+                    if iv.end > end {
+                        end = iv.end;
+                    }
+                }
+            }
+            for m in members {
+                if *m != *leader {
+                    coalesce_member_of.insert(*m, *leader);
+                }
+            }
+            phase1_intervals.push(LiveInterval {
+                value_id: *leader,
+                start,
+                end,
+            });
+        }
+        phase1_intervals.retain(|iv| !removed.contains(&iv.value_id));
+    }
+    let mut phase1_ranges =
         live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
+    // Bump coalesced leaders' priority by group size so merged intervals with
+    // many uses (sum of member uses) aren't underweighted vs their single
+    // interval peers.
+    if !coalesce_groups.is_empty() {
+        for r in phase1_ranges.iter_mut() {
+            if let Some(members) = coalesce_groups.get(&r.value_id) {
+                let n = members.len().max(1) as u64;
+                r.priority = r.priority.saturating_mul(n.min(8));
+                r.calculate_spill_weight();
+            }
+        }
+    }
     let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
     allocator.run();
 
     let mut assignments = allocator.assignments;
+    // Propagate coalesced registers to all group members.
+    if !coalesce_member_of.is_empty() {
+        for (member, leader) in &coalesce_member_of {
+            if let Some(&reg) = assignments.get(leader) {
+                assignments.insert(*member, reg);
+            }
+        }
+    }
+    // `used_regs_set` is deliberately the ABI callee-saved set. It feeds the
+    // x86 prologue/epilogue save list, so caller-saved allocations must never
+    // enter it. Keep a separate exclusion set for Phase 2b instead.
     let mut used_regs_set: FxHashSet<u8> = FxHashSet::default();
     for &reg in assignments.values() {
         used_regs_set.insert(reg.0);
     }
+    let mut caller_used_regs_set: FxHashSet<u8> = FxHashSet::default();
 
     // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
     if !config.caller_saved_regs.is_empty() {
@@ -341,18 +625,55 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
 
         if !phase2_intervals.is_empty() {
-            let phase2_ranges = live_range::build_live_ranges(
-                &phase2_intervals,
-                &liveness.block_loop_depth,
-                func,
-            );
+            let phase2_ranges =
+                live_range::build_live_ranges(&phase2_intervals, &liveness.block_loop_depth, func);
             let mut caller_allocator =
                 LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
             caller_allocator.run();
 
             for (vid, reg) in caller_allocator.assignments {
                 assignments.insert(vid, reg);
-                used_regs_set.insert(reg.0);
+                // Phase 2 values are proven not to span calls; their ABI
+                // caller-saved registers need neither entry save nor exit
+                // restore. The old insertion into used_regs_set caused every
+                // such register to be pushed/popped as if callee-saved.
+                caller_used_regs_set.insert(reg.0);
+            }
+        }
+    }
+
+    // Phase 2c: give call-free hot-loop overflow the unused callee-saved
+    // registers instead of stack slots (one push/pop amortizes over the loop;
+    // a spill costs a store+load per iteration). Runs after Phase 2 so the
+    // free caller-saved pool is always preferred.
+    {
+        let phase2c_intervals: Vec<LiveInterval> = liveness
+            .intervals
+            .iter()
+            .filter(|iv| eligible.contains(&iv.value_id))
+            .filter(|iv| iv.end > iv.start)
+            .filter(|iv| !assignments.contains_key(&iv.value_id))
+            .filter(|iv| !spans_any_call(iv, call_points))
+            .copied()
+            .collect();
+        if !phase2c_intervals.is_empty() {
+            let free_callee: Vec<PhysReg> = config
+                .available_regs
+                .iter()
+                .filter(|r| !used_regs_set.contains(&r.0))
+                .copied()
+                .collect();
+            if !free_callee.is_empty() {
+                let phase2c_ranges =
+                    live_range::build_live_ranges(&phase2c_intervals, &liveness.block_loop_depth, func);
+                let mut spill_allocator = LinearScanAllocator::new(phase2c_ranges, free_callee);
+                spill_allocator.run();
+                for (vid, reg) in spill_allocator.assignments {
+                    assignments.insert(vid, reg);
+                    // These ARE callee-saved: the prologue/epilogue must
+                    // save/restore them.
+                    used_regs_set.insert(reg.0);
+                }
             }
         }
     }
@@ -360,23 +681,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Debug: count overlaps BEFORE phi coalesce
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
         let mut pre_count = 0;
-        let mut pre_reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> = std::collections::HashMap::new();
+        let mut pre_reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> =
+            std::collections::HashMap::new();
         for iv in &liveness.intervals {
             if let Some(&reg) = assignments.get(&iv.value_id) {
-                pre_reg_ivs.entry(reg.0).or_default().push((iv.start, iv.end, iv.value_id));
+                pre_reg_ivs
+                    .entry(reg.0)
+                    .or_default()
+                    .push((iv.start, iv.end, iv.value_id));
             }
         }
         for (_, intervals) in &pre_reg_ivs {
             for i in 0..intervals.len() {
-                for j in (i+1)..intervals.len() {
+                for j in (i + 1)..intervals.len() {
                     let (s1, e1, _) = intervals[i];
                     let (s2, e2, _) = intervals[j];
-                    if s1 < e2 && s2 < e1 { pre_count += 1; }
+                    if s1 < e2 && s2 < e1 {
+                        pre_count += 1;
+                    }
                 }
             }
         }
         if pre_count > 0 {
-            eprintln!("[REGALLOC-PRE-PHI] {} overlaps BEFORE phi coalesce", pre_count);
+            eprintln!(
+                "[REGALLOC-PRE-PHI] {} overlaps BEFORE phi coalesce",
+                pre_count
+            );
         }
     }
 
@@ -388,22 +718,64 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     for &(phi_dest, backedge_src) in &phi_coalesce {
         if let Some(&reg) = assignments.get(&phi_dest) {
             // Find backedge_src's interval
-            let src_interval = liveness.intervals.iter()
+            let src_interval = liveness
+                .intervals
+                .iter()
                 .find(|iv| iv.value_id == backedge_src);
             if let Some(src_iv) = src_interval {
                 // Additional: check overlap with the phi dest's own interval
                 // (they share a register, so they should not overlap)
-                let dest_iv = liveness.intervals.iter()
-                    .find(|iv| iv.value_id == phi_dest);
-                if let Some(div) = dest_iv {
-                    if src_iv.start < div.end && div.start < src_iv.end {
-                        // Phi dest and backedge source intervals overlap — skip
+                let dest_iv = liveness.intervals.iter().find(|iv| iv.value_id == phi_dest);
+                if let Some(_div) = dest_iv {
+                    // The coarse interval-overlap test rejects the common
+                    // loop-carried pattern (head/condition use of the phi dest
+                    // precedes the backedge source's definition, so sharing a
+                    // register is safe). Only a real "lost copy" is a hazard:
+                    // the OLD phi-dest value used AFTER the new value is
+                    // computed and BEFORE the backedge copy. That window lies
+                    // in the copy block and the source's defining block, which
+                    // the group detector already checks; re-verify here.
+                    let phi_dest_used_after_src = {
+                        let src_def_block = func.blocks.iter().enumerate().find_map(
+                            |(bi, b)| {
+                                b.instructions
+                                    .iter()
+                                    .any(|i| i.dest().is_some_and(|d| d.0 == backedge_src))
+                                    .then_some(bi)
+                            },
+                        );
+                        let copy_block = func.blocks.iter().enumerate().find_map(|(bi, b)| {
+                            b.instructions.iter().any(|i| {
+                                matches!(i, Instruction::Copy { dest, src: Operand::Value(sv) }
+                                    if dest.0 == phi_dest && sv.0 == backedge_src)
+                            })
+                            .then_some(bi)
+                        });
+                        let mut hazard = false;
+                        for bi in [src_def_block, copy_block].into_iter().flatten() {
+                            let mut src_defined = false;
+                            for inst in &func.blocks[bi].instructions {
+                                if !src_defined {
+                                    if inst.dest().is_some_and(|d| d.0 == backedge_src) {
+                                        src_defined = true;
+                                    }
+                                } else if uses_value(inst, phi_dest) {
+                                    hazard = true;
+                                }
+                            }
+                        }
+                        hazard
+                    };
+                    if phi_dest_used_after_src {
+                        // Genuine lost-copy hazard — keep them apart.
                         continue;
                     }
                 }
                 // Check for conflicts with other values in the same register
                 let has_conflict = liveness.intervals.iter().any(|iv| {
-                    if iv.value_id == backedge_src || iv.value_id == phi_dest { return false; }
+                    if iv.value_id == backedge_src || iv.value_id == phi_dest {
+                        return false;
+                    }
                     if let Some(&other_reg) = assignments.get(&iv.value_id) {
                         other_reg.0 == reg.0 && iv.start < src_iv.end && src_iv.start < iv.end
                     } else {
@@ -423,23 +795,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Debug: count overlaps after phi coalesce
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
         let mut overlap_count = 0;
-        let mut reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> = std::collections::HashMap::new();
+        let mut reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> =
+            std::collections::HashMap::new();
         for iv in &liveness.intervals {
             if let Some(&reg) = assignments.get(&iv.value_id) {
-                reg_ivs.entry(reg.0).or_default().push((iv.start, iv.end, iv.value_id));
+                reg_ivs
+                    .entry(reg.0)
+                    .or_default()
+                    .push((iv.start, iv.end, iv.value_id));
             }
         }
         for (_, intervals) in &reg_ivs {
             for i in 0..intervals.len() {
-                for j in (i+1)..intervals.len() {
+                for j in (i + 1)..intervals.len() {
                     let (s1, e1, _) = intervals[i];
                     let (s2, e2, _) = intervals[j];
-                    if s1 < e2 && s2 < e1 { overlap_count += 1; }
+                    if s1 < e2 && s2 < e1 {
+                        overlap_count += 1;
+                    }
                 }
             }
         }
         if overlap_count > 0 {
-            eprintln!("[REGALLOC-POST-PHI] {} overlaps after phi coalesce", overlap_count);
+            eprintln!(
+                "[REGALLOC-POST-PHI] {} overlaps after phi coalesce",
+                overlap_count
+            );
         }
     }
 
@@ -459,14 +840,20 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| {
                 // Check if this value is produced by a F64-typed instruction
                 func.blocks.iter().any(|block| {
-                    block.instructions.iter().any(|inst| {
-                        match inst {
-                            Instruction::BinOp { dest, ty, .. }
-                            | Instruction::UnaryOp { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
-                            Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => dest.0 == iv.value_id,
-                            Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => dest.0 == iv.value_id,
-                            _ => false,
+                    block.instructions.iter().any(|inst| match inst {
+                        Instruction::BinOp { dest, ty, .. }
+                        | Instruction::UnaryOp { dest, ty, .. }
+                            if *ty == IrType::F64 =>
+                        {
+                            dest.0 == iv.value_id
                         }
+                        Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
+                            dest.0 == iv.value_id
+                        }
+                        Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
+                            dest.0 == iv.value_id
+                        }
+                        _ => false,
                     })
                 })
             })
@@ -474,18 +861,54 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
 
         if !f64_intervals.is_empty() {
-            let f64_ranges = live_range::build_live_ranges(
-                &f64_intervals,
-                &liveness.block_loop_depth,
-                func,
-            );
-            let mut xmm_allocator =
-                LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
+            let f64_ranges =
+                live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
+            let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
             xmm_allocator.run();
 
             for (vid, reg) in xmm_allocator.assignments {
                 assignments.insert(vid, reg);
                 // XMM regs (20+) are caller-saved, no prologue save needed
+            }
+        }
+
+        // Phase 3b (v5, opt-in CCC_ENABLE_VECREG): XMM allocation for 128-bit
+        // VECTOR values. Runs AFTER the F64 scan so it sees the F64 assignments
+        // and avoids them. Pool = xmm3-xmm7 (PhysReg 21-25): xmm0/xmm1 are the
+        // accumulator/scratch pair, xmm2 is pblendvb/VNNI scratch. Candidates
+        // are strictly guarded by collect_vecreg_candidates (the phase-3
+        // candidate guards matching the non-GPR collector — a candidate outside
+        // that whitelist miscompiles, e.g. the fold_4 class).
+        if std::env::var("CCC_ENABLE_VECREG").is_ok() {
+            let vec_candidates = collect_vecreg_candidates(func);
+            if !vec_candidates.is_empty() {
+                let mut vec_pool: Vec<PhysReg> = (21..=25).map(PhysReg).collect();
+                vec_pool.retain(|r| !assignments.values().any(|a| a.0 == r.0));
+                if !vec_pool.is_empty() {
+                    // Alloca values have no liveness intervals (liveness is
+                    // computed for non-alloca values only). Build synthetic
+                    // intervals with the SAME program-point convention
+                    // (per-instruction +1, per-terminator +1) so the
+                    // call-span check and the linear scan are consistent.
+                    let vec_intervals = synthetic_vec_intervals(func, &vec_candidates);
+                    let vec_intervals: Vec<LiveInterval> = vec_intervals
+                        .into_iter()
+                        .filter(|iv| !assignments.contains_key(&iv.value_id))
+                        .filter(|iv| !spans_any_call(iv, call_points))
+                        .collect();
+                    if !vec_intervals.is_empty() {
+                        let vec_ranges = live_range::build_live_ranges(
+                            &vec_intervals,
+                            &liveness.block_loop_depth,
+                            func,
+                        );
+                        let mut vec_allocator = LinearScanAllocator::new(vec_ranges, vec_pool);
+                        vec_allocator.run();
+                        for (vid, reg) in vec_allocator.assignments {
+                            assignments.insert(vid, reg);
+                        }
+                    }
+                }
             }
         }
     }
@@ -498,8 +921,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
     if !config.caller_saved_regs.is_empty() && std::env::var("CCC_CALLER_SAVE_SPANNING").is_ok() {
         // Use all available caller-saved registers (not just r10/r11)
-        let span_regs: Vec<PhysReg> = config.caller_saved_regs.iter()
-            .filter(|r| !used_regs_set.contains(&r.0)) // exclude any already used as callee-saved
+        let span_regs: Vec<PhysReg> = config
+            .caller_saved_regs
+            .iter()
+            // Do not independently allocate a Phase 2b call-spanning value
+            // to a register already owned by the Phase 2 non-spanning scan.
+            // This is an allocation-conflict guard, not a prologue-save rule.
+            .filter(|r| !caller_used_regs_set.contains(&r.0))
             .copied()
             .collect();
 
@@ -517,7 +945,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
             if !phase2b_intervals.is_empty() {
                 // Build interval map for live-at-call checks
-                let interval_map: FxHashMap<u32, (u32, u32)> = phase2b_intervals.iter()
+                let interval_map: FxHashMap<u32, (u32, u32)> = phase2b_intervals
+                    .iter()
                     .map(|iv| (iv.value_id, (iv.start, iv.end)))
                     .collect();
 
@@ -525,7 +954,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // The full build_live_ranges scans ALL function instructions for
                 // use-site data, which is too slow for 4000+ Phase 2b intervals
                 // in large functions like sqlite3VdbeExec.
-                let mut phase2b_ranges: Vec<live_range::LiveRange> = phase2b_intervals.iter()
+                let mut phase2b_ranges: Vec<live_range::LiveRange> = phase2b_intervals
+                    .iter()
                     .map(|iv| {
                         let mut r = live_range::LiveRange::from_interval(*iv, 0);
                         // Priority: inverse range length (shorter ranges = higher priority)
@@ -535,16 +965,19 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         r
                     })
                     .collect();
-                phase2b_ranges.sort_by(|a, b| a.start.cmp(&b.start).then(b.priority.cmp(&a.priority)));
-                let mut span_allocator =
-                    LinearScanAllocator::new(phase2b_ranges, span_regs);
+                phase2b_ranges
+                    .sort_by(|a, b| a.start.cmp(&b.start).then(b.priority.cmp(&a.priority)));
+                let mut span_allocator = LinearScanAllocator::new(phase2b_ranges, span_regs);
                 span_allocator.run();
 
                 for (vid, reg) in span_allocator.assignments {
                     assignments.insert(vid, reg);
                     // Record the interval for this register for selective save/restore
                     if let Some(&(start, end)) = interval_map.get(&vid) {
-                        caller_save_spans.entry(reg.0).or_default().push((start, end));
+                        caller_save_spans
+                            .entry(reg.0)
+                            .or_default()
+                            .push((start, end));
                     }
                     // Do NOT add to used_regs_set (not prologue-saved)
                 }
@@ -555,23 +988,61 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
 
+    // Diagnostic: dump eligible vs assigned per value, gated by CCC_DUMP_IR_FUNC.
+    if let Ok(want) = std::env::var("CCC_DUMP_IR_FUNC") {
+        if func.name.contains(&want) {
+            let mut ev: Vec<_> = eligible.iter().copied().collect();
+            ev.sort();
+            let mut n_assigned = 0;
+            for vid in &ev {
+                let assigned = assignments
+                    .get(vid)
+                    .map(|r| r.0.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let iv = liveness.intervals.iter().find(|x| x.value_id == *vid);
+                let (s, e) = iv.map(|x| (x.start, x.end)).unwrap_or((0, 0));
+                let pri = use_count.get(vid).copied().unwrap_or(0);
+                if assignments.contains_key(vid) {
+                    n_assigned += 1;
+                }
+                eprintln!(
+                    "[ELIG] val{} [{}..{}] pri={} -> reg={}",
+                    vid, s, e, pri, assigned
+                );
+            }
+            eprintln!(
+                "[ELIG-SUM] func={} eligible={} assigned={} regs={:?}",
+                func.name,
+                ev.len(),
+                n_assigned,
+                used_regs.iter().map(|r| r.0).collect::<Vec<_>>()
+            );
+        }
+    }
+
     // Verify: no two assigned values should have overlapping live intervals
     // in the same physical register.
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
-        let mut reg_intervals: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> = std::collections::HashMap::new();
+        let mut reg_intervals: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> =
+            std::collections::HashMap::new();
         for iv in &liveness.intervals {
             if let Some(&reg) = assignments.get(&iv.value_id) {
-                reg_intervals.entry(reg.0).or_default().push((iv.start, iv.end, iv.value_id));
+                reg_intervals
+                    .entry(reg.0)
+                    .or_default()
+                    .push((iv.start, iv.end, iv.value_id));
             }
         }
         for (&reg_id, intervals) in &reg_intervals {
             for i in 0..intervals.len() {
-                for j in (i+1)..intervals.len() {
+                for j in (i + 1)..intervals.len() {
                     let (s1, e1, v1) = intervals[i];
                     let (s2, e2, v2) = intervals[j];
                     if s1 < e2 && s2 < e1 {
-                        eprintln!("[REGALLOC-OVERLAP] reg={} val{}[{}-{}] overlaps val{}[{}-{}]",
-                            reg_id, v1, s1, e1, v2, s2, e2);
+                        eprintln!(
+                            "[REGALLOC-OVERLAP] reg={} val{}[{}-{}] overlaps val{}[{}-{}]",
+                            reg_id, v1, s1, e1, v2, s2, e2
+                        );
                     }
                 }
             }
@@ -582,11 +1053,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let total_eligible = eligible.len();
         let total_assigned = assignments.len();
         let total_intervals = liveness.intervals.len();
-        let non_call_spanning = liveness.intervals.iter()
-            .filter(|iv| eligible.contains(&iv.value_id) && !spans_any_call(iv, call_points) && iv.end > iv.start)
+        let non_call_spanning = liveness
+            .intervals
+            .iter()
+            .filter(|iv| {
+                eligible.contains(&iv.value_id)
+                    && !spans_any_call(iv, call_points)
+                    && iv.end > iv.start
+            })
             .count();
-        let call_spanning = liveness.intervals.iter()
-            .filter(|iv| eligible.contains(&iv.value_id) && spans_any_call(iv, call_points) && iv.end > iv.start)
+        let call_spanning = liveness
+            .intervals
+            .iter()
+            .filter(|iv| {
+                eligible.contains(&iv.value_id)
+                    && spans_any_call(iv, call_points)
+                    && iv.end > iv.start
+            })
             .count();
         eprintln!("[REGALLOC] {} eligible, {} assigned ({:.0}%), {} call-spanning, {} non-call, {} callee, {} caller",
             total_eligible, total_assigned,
@@ -601,6 +1084,261 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         caller_save_spans,
         liveness: Some(liveness),
     }
+}
+
+/// v5 CCC_ENABLE_VECREG: collect the 128-bit VECTOR VALUES that are safe to
+/// hold in an XMM register for their whole live range.
+///
+/// A vector value here is the ALLOCA that a SIMD intrinsic writes its 16-byte
+/// result into (the `dest_ptr` of e.g. Pcmpeqb128 / Pxor128). The backend
+/// redirects the intrinsic's `movdqu %xmm0, slot` into `movdqa %xmm0, %xmmN`
+/// and every subsequent cache-aware vector load of the value into
+/// `movdqa %xmmN, %xmm0`; live-out values are flushed to their slot at block
+/// ends.
+///
+/// Candidate guards (each mirrors a codegen constraint — the "phase-3
+/// candidate guards matching the non-GPR collector" fix; a candidate outside
+/// this whitelist miscompiles, e.g. the fold_4 class):
+/// 1. V is the dest_ptr of at least one 128-bit vector-producing intrinsic
+///    (NOT a store-target op like Storedqu, whose dest_ptr is a user pointer).
+/// 2. V is not volatile and not over-aligned beyond 16 (runtime-alignment
+///    dance conflicts with the redirect).
+/// 3. V has >= 2 intrinsic-ARG uses (single-use values are already handled by
+///    the deferred-store optimization — allocating a register to them is the
+///    "net-negative on cast-heavy/single-use code" regression).
+/// 4. Every use of V is either an intrinsic dest_ptr (a write) or an
+///    intrinsic ARG of a cache-aware consumer (sse_load_arg/avx_load_arg_to).
+///    Excluded consumers read V through the scalar address path or through
+///    direct slot reads (stale under the redirect): the FMA / load /
+///    horizontal-reduction / auto-vectorizer family, plus the raw movq
+///    load/store helpers.
+/// 5. V is never used by a non-Intrinsic instruction (no scalar operand use,
+///    no ptr/base use, no memcpy src/dest, no call arg) and never used by a
+///    terminator.
+/// 6. Non-call-spanning (XMM regs are caller-saved) — enforced by the caller.
+fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp;
+    use crate::backend::liveness::{
+        for_each_operand_in_instruction, for_each_value_use_in_instruction,
+        for_each_operand_in_terminator,
+    };
+    let mut allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut over_align_allocas: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                volatile,
+                semantic_volatile,
+                align,
+                ..
+            } = inst
+            {
+                allocas.insert(dest.0);
+                if *volatile || *semantic_volatile {
+                    volatile_allocas.insert(dest.0);
+                }
+                if *align > 16 {
+                    over_align_allocas.insert(dest.0);
+                }
+            }
+        }
+    }
+
+    let is_128_producer = |op: &IntrinsicOp| -> bool {
+        use IntrinsicOp as O;
+        matches!(
+            op,
+            O::Pcmpeqb128 | O::Pcmpeqd128 | O::Psubusb128 | O::Psubsb128
+            | O::Por128 | O::Pand128 | O::Pxor128
+            | O::AddPs128 | O::SubPs128 | O::MulPs128
+            | O::AddPd128 | O::SubPd128 | O::MulPd128
+            | O::Paddw128 | O::Psubw128 | O::Pmulhw128 | O::Pmullw128
+            | O::Pmuludq128 | O::Pmuldq128 | O::Pmulld128
+            | O::Pmaddwd128 | O::Pmaddubsw128
+            | O::Pcmpgtw128 | O::Pcmpgtb128
+            | O::Paddd128 | O::Psubd128
+            | O::Paddb128 | O::Psubb128 | O::Psubusw128
+            | O::Psadbw128
+            | O::Pshufb128 | O::Pabsb128 | O::Pabsw128 | O::Pabsd128
+            | O::Pmaxub128 | O::Pminub128
+            | O::Pmovzxbw128 | O::Pmovzxwd128
+            | O::Packssdw128 | O::Packsswb128 | O::Packuswb128
+            | O::Punpcklbw128 | O::Punpckhbw128
+            | O::Punpcklwd128 | O::Punpckhwd128
+            | O::Phaddw128 | O::Phaddd128 | O::Palignr128
+            | O::Psllw128 | O::Psrlw128
+            | O::Pblendvb128
+            | O::Aesenc128 | O::Aesenclast128 | O::Aesdec128 | O::Aesdeclast128
+            | O::Aesimc128 | O::Aeskeygenassist128
+            | O::Pclmulqdq128
+            | O::Gf2p8mulb128 | O::Gf2p8affineqb128 | O::Gf2p8affineinvqb128
+            | O::Psllwi128 | O::Psrlwi128 | O::Psrawi128 | O::Psradi128
+            | O::Pslldi128 | O::Psrldi128 | O::Pslldqi128 | O::Psrldqi128
+            | O::Psllqi128 | O::Psrlqi128
+            | O::Pshufd128 | O::Pshuflw128 | O::Pshufhw128
+            | O::Loaddqu | O::Loadldi128
+            | O::SetEpi8 | O::SetEpi16 | O::SetEpi32 | O::Cvtsi32Si128
+            | O::Cast256to128
+            | O::AddF64x2 | O::MulF64x2 | O::AddI32x4
+            | O::Dpbusd128 | O::Dpbusds128 | O::Dpwusd128 | O::Dpwusds128
+            | O::Dpbssd128 | O::Dpbssds128 | O::Dpbsud128 | O::Dpbsuds128
+            | O::Dpbuud128 | O::Dpbuuds128 | O::Dpwuud128 | O::Dpwuuds128
+            | O::Dpwssd128 | O::Dpwssds128
+        )
+    };
+    let is_store_target = |op: &IntrinsicOp| -> bool {
+        matches!(
+            op,
+            IntrinsicOp::Storedqu
+                | IntrinsicOp::Storeu256
+                | IntrinsicOp::Store256
+                | IntrinsicOp::Storeldi128
+                | IntrinsicOp::Movntdq
+                | IntrinsicOp::Movntpd
+        )
+    };
+    let is_raw_reader = |op: &IntrinsicOp| -> bool {
+        use IntrinsicOp as O;
+        matches!(
+            op,
+            O::FmaF64x2 | O::FmaF64x4 | O::FmaF64x4Hoisted | O::FmaF64x4SIB
+            | O::BroadcastLoadF64
+            | O::LoadF64x2 | O::LoadF64x4 | O::LoadI32x4 | O::LoadI32x8
+            | O::HorizontalAddF64x2 | O::HorizontalAddF64x4
+            | O::HorizontalAddI32x4 | O::HorizontalAddI32x8
+            | O::VecLoadF64x2 | O::VecLoadF64x4 | O::VecLoadI32x4 | O::VecLoadI32x8
+            | O::VecAddF64x2 | O::VecAddF64x4 | O::VecAddI32x4 | O::VecAddI32x8
+            | O::VecMulF64x2 | O::VecMulF64x4
+            | O::VecHorizontalAddF64x2 | O::VecHorizontalAddF64x4
+            | O::VecHorizontalAddI32x4 | O::VecHorizontalAddI32x8
+        )
+    };
+
+    let mut produced: FxHashSet<u32> = FxHashSet::default();
+    let mut store_target: FxHashSet<u32> = FxHashSet::default();
+    let mut arg_uses: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut bad_use: FxHashSet<u32> = FxHashSet::default();
+    let mut raw_consume: FxHashSet<u32> = FxHashSet::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Intrinsic {
+                    dest_ptr: Some(d),
+                    op,
+                    args,
+                    ..
+                } => {
+                    if is_128_producer(op) {
+                        produced.insert(d.0);
+                    }
+                    if is_store_target(op) {
+                        store_target.insert(d.0);
+                    }
+                    if is_raw_reader(op) {
+                        for arg in args {
+                            if let Operand::Value(v) = arg {
+                                raw_consume.insert(v.0);
+                            }
+                        }
+                    }
+                    for arg in args {
+                        if let Operand::Value(v) = arg {
+                            *arg_uses.entry(v.0).or_insert(0) += 1;
+                        }
+                    }
+                }
+                other => {
+                    for_each_operand_in_instruction(other, |op| {
+                        if let Operand::Value(v) = op {
+                            bad_use.insert(v.0);
+                        }
+                    });
+                    for_each_value_use_in_instruction(other, |v| {
+                        bad_use.insert(v.0);
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                bad_use.insert(v.0);
+            }
+        });
+    }
+
+    let mut result = FxHashSet::default();
+    for &v in &produced {
+        if store_target.contains(&v)
+            || volatile_allocas.contains(&v)
+            || over_align_allocas.contains(&v)
+            || bad_use.contains(&v)
+            || raw_consume.contains(&v)
+        {
+            continue;
+        }
+        if arg_uses.get(&v).copied().unwrap_or(0) < 2 {
+            continue; // single-use: deferred-store handles it, register is waste
+        }
+        result.insert(v);
+    }
+    result
+}
+
+/// Build synthetic live intervals for the vecreg candidates (alloca values,
+/// which the liveness analysis deliberately excludes). Uses the same
+/// program-point convention as `liveness::assign_program_points`: every
+/// instruction advances the point by 1, and every block terminator by 1, so
+/// the resulting intervals are comparable with `call_points` and drive the
+/// existing `LinearScanAllocator` unchanged.
+///
+/// Interval = [first intrinsic WRITE of V, last ARG use of V] in program
+/// points. Read-modify-write patterns (e.g. a loop-carried `acc` that is both
+/// the dest_ptr and an arg of the same intrinsic) naturally produce an
+/// interval covering the loop.
+fn synthetic_vec_intervals(
+    func: &IrFunction,
+    candidates: &FxHashSet<u32>,
+) -> Vec<LiveInterval> {
+    let mut first_write: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut last_use: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest_ptr: Some(d), ..
+            } = inst
+            {
+                if candidates.contains(&d.0) {
+                    first_write.entry(d.0).or_insert(point);
+                }
+            }
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if candidates.contains(&v.0) {
+                        last_use.insert(v.0, point);
+                    }
+                }
+            });
+            point += 1;
+        }
+        point += 1; // terminator point (matches assign_program_points)
+    }
+    let mut result = Vec::new();
+    for &v in candidates {
+        if let (Some(&s), Some(&e)) = (first_write.get(&v), last_use.get(&v)) {
+            if e > s {
+                result.push(LiveInterval {
+                    value_id: v,
+                    start: s,
+                    end: e,
+                });
+            }
+        }
+    }
+    result
 }
 
 /// Collect values whose types don't fit in a single GPR (floats, i128, and
@@ -659,18 +1397,28 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                         non_gpr_values.insert(dest.0);
                     }
                 }
-                Instruction::Intrinsic { dest: Some(d), op, .. } => {
+                Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                } => {
                     // Vector intrinsics produce 128/256-bit values that cannot be
                     // stored in scalar GPRs. Exclude them from register allocation.
                     use crate::ir::intrinsics::IntrinsicOp;
-                    let is_vector = matches!(op,
-                        IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
-                        IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
-                        IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
-                        IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-                        IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
-                        IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-                        IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
+                    let is_vector = matches!(
+                        op,
+                        IntrinsicOp::VecZeroF64x4
+                            | IntrinsicOp::VecZeroF64x2
+                            | IntrinsicOp::VecZeroI32x8
+                            | IntrinsicOp::VecZeroI32x4
+                            | IntrinsicOp::VecLoadF64x4
+                            | IntrinsicOp::VecLoadF64x2
+                            | IntrinsicOp::VecLoadI32x8
+                            | IntrinsicOp::VecLoadI32x4
+                            | IntrinsicOp::VecAddF64x4
+                            | IntrinsicOp::VecAddF64x2
+                            | IntrinsicOp::VecAddI32x8
+                            | IntrinsicOp::VecAddI32x4
+                            | IntrinsicOp::VecMulF64x4
+                            | IntrinsicOp::VecMulF64x2
                     );
                     if is_vector {
                         non_gpr_values.insert(d.0);
@@ -760,6 +1508,12 @@ fn remove_ineligible_operands(
                     eligible.remove(&va_list_ptr.0);
                 }
                 Instruction::AtomicRmw {
+                    ptr: Operand::Value(v),
+                    ..
+                } => {
+                    eligible.remove(&v.0);
+                }
+                Instruction::AtomicInc {
                     ptr: Operand::Value(v),
                     ..
                 } => {
@@ -932,7 +1686,12 @@ fn exclude_every_third_mul_temp(func: &IrFunction, eligible: &mut FxHashSet<u32>
     for block in &func.blocks {
         for (idx, inst) in block.instructions.iter().enumerate() {
             let (mul_dest, mul_ty) = match inst {
-                Instruction::BinOp { dest, op: crate::ir::reexports::IrBinOp::Mul, ty, .. } => (dest, ty),
+                Instruction::BinOp {
+                    dest,
+                    op: crate::ir::reexports::IrBinOp::Mul,
+                    ty,
+                    ..
+                } => (dest, ty),
                 _ => continue,
             };
             if mul_ty.is_float() || matches!(mul_ty, IrType::I128 | IrType::U128) {
@@ -941,7 +1700,14 @@ fn exclude_every_third_mul_temp(func: &IrFunction, eligible: &mut FxHashSet<u32>
             if use_count.get(&mul_dest.0).copied().unwrap_or(0) != 1 {
                 continue;
             }
-            if let Some(Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty: add_ty, .. }) = block.instructions.get(idx + 1) {
+            if let Some(Instruction::BinOp {
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: add_ty,
+                ..
+            }) = block.instructions.get(idx + 1)
+            {
                 let mul_is_operand = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
                     || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
                 if mul_is_operand && mul_ty == add_ty {
@@ -968,14 +1734,13 @@ fn exclude_every_third_mul_temp(func: &IrFunction, eligible: &mut FxHashSet<u32>
 
 /// Count weighted uses per value in loop blocks.
 /// Returns a map: value_id -> weighted_use_count (uses * 10^loop_depth).
-fn count_value_uses_in_loop(
-    func: &IrFunction,
-    block_loop_depth: &[u32],
-) -> FxHashMap<u32, u64> {
+fn count_value_uses_in_loop(func: &IrFunction, block_loop_depth: &[u32]) -> FxHashMap<u32, u64> {
     let mut uses: FxHashMap<u32, u64> = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let depth = block_loop_depth.get(block_idx).copied().unwrap_or(0);
-        if depth == 0 { continue; }
+        if depth == 0 {
+            continue;
+        }
         let weight = match depth {
             1 => 10u64,
             2 => 100,
@@ -1005,10 +1770,7 @@ fn count_value_uses_in_loop(
 /// becomes a no-op, eliminating a register-to-register move or stack round-trip.
 ///
 /// Returns a list of (phi_dest, backedge_src) pairs that should share a register.
-fn detect_phi_coalesce_groups(
-    func: &IrFunction,
-    liveness: &LivenessResult,
-) -> Vec<(u32, u32)> {
+fn detect_phi_coalesce_groups(func: &IrFunction, liveness: &LivenessResult) -> Vec<(u32, u32)> {
     // Step 1: Find multi-def values (phi dests after phi elimination).
     // A value is multi-def if it has Copy definitions in multiple blocks.
     let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
@@ -1038,42 +1800,17 @@ fn detect_phi_coalesce_groups(
     let mut src_use_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
-            // Skip Copy dests — we care about OPERAND uses, not definitions
-            let check_operands = |inst: &Instruction| {
-                let mut uses = Vec::new();
-                match inst {
-                    Instruction::BinOp { lhs, rhs, .. } => {
-                        if let Operand::Value(v) = lhs { uses.push(v.0); }
-                        if let Operand::Value(v) = rhs { uses.push(v.0); }
-                    }
-                    Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-                        if let Operand::Value(v) = src { uses.push(v.0); }
-                    }
-                    Instruction::Store { val, .. } => {
-                        if let Operand::Value(v) = val { uses.push(v.0); }
-                    }
-                    Instruction::Copy { src, .. } => {
-                        if let Operand::Value(v) = src { uses.push(v.0); }
-                    }
-                    Instruction::Cmp { lhs, rhs, .. } => {
-                        if let Operand::Value(v) = lhs { uses.push(v.0); }
-                        if let Operand::Value(v) = rhs { uses.push(v.0); }
-                    }
-                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                        for a in &info.args {
-                            if let Operand::Value(v) = a { uses.push(v.0); }
-                        }
-                    }
-                    Instruction::Select { cond, true_val, false_val, .. } => {
-                        if let Operand::Value(v) = cond { uses.push(v.0); }
-                        if let Operand::Value(v) = true_val { uses.push(v.0); }
-                        if let Operand::Value(v) = false_val { uses.push(v.0); }
-                    }
-                    _ => {}
+            // Skip Copy dests — we care about OPERAND uses, not definitions.
+            // Canonical traversal covers every instruction form (Intrinsic
+            // args, Memcpy endpoints, InlineAsm inputs included).
+            let mut uses = Vec::new();
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    uses.push(v.0);
                 }
-                uses
-            };
-            for vid in check_operands(inst) {
+            });
+            for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
+            for vid in uses {
                 src_use_blocks.entry(vid).or_default().insert(block_idx);
             }
         }
@@ -1107,13 +1844,21 @@ fn detect_phi_coalesce_groups(
     let mut seen_phi_dests: FxHashSet<u32> = FxHashSet::default();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        let depth = liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
+        let depth = liveness
+            .block_loop_depth
+            .get(block_idx)
+            .copied()
+            .unwrap_or(0);
         if depth == 0 {
             continue;
         }
 
         for inst in &block.instructions {
-            if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src_val),
+            } = inst
+            {
                 if multi_def.contains(&dest.0) && !seen_phi_dests.contains(&dest.0) {
                     // Don't coalesce if src is itself a multi-def (swap cycle temporaries)
                     if !multi_def.contains(&src_val.0) {
@@ -1219,28 +1964,27 @@ fn detect_phi_coalesce_groups(
 }
 
 /// Check if an instruction uses a given value ID as an operand (not as dest).
+/// Uses the canonical operand/value traversal so EVERY instruction form is
+/// covered (Intrinsic args, Memcpy endpoints, InlineAsm inputs, atomics...).
+/// A hand-maintained match previously missed `Intrinsic` args, letting phi
+/// coalescing merge a pointer phi with its backedge increment while the phi
+/// was still live as an intrinsic operand (zlib-ng adler32_avx2 miscompile:
+/// the in-place `addq $32` clobbered the load address).
 fn uses_value(inst: &Instruction, val_id: u32) -> bool {
-    let check_op = |op: &Operand| -> bool {
-        matches!(op, Operand::Value(v) if v.0 == val_id)
-    };
-    match inst {
-        Instruction::Store { val, ptr, .. } => check_op(val) || ptr.0 == val_id,
-        Instruction::Load { ptr, .. } => ptr.0 == val_id,
-        Instruction::BinOp { lhs, rhs, .. } => check_op(lhs) || check_op(rhs),
-        Instruction::UnaryOp { src, .. } => check_op(src),
-        Instruction::Cmp { lhs, rhs, .. } => check_op(lhs) || check_op(rhs),
-        Instruction::Cast { src, .. } => check_op(src),
-        Instruction::Copy { src, .. } => check_op(src),
-        Instruction::GetElementPtr { base, offset, .. } => base.0 == val_id || check_op(offset),
-        Instruction::Select { cond, true_val, false_val, .. } =>
-            check_op(cond) || check_op(true_val) || check_op(false_val),
-        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } =>
-            info.args.iter().any(|a| check_op(a)),
-        Instruction::AtomicStore { val, ptr, .. } => check_op(val) || check_op(ptr),
-        Instruction::AtomicLoad { ptr, .. } => check_op(ptr),
-        Instruction::AtomicRmw { ptr, val, .. } => check_op(ptr) || check_op(val),
-        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } =>
-            check_op(ptr) || check_op(expected) || check_op(desired),
-        _ => false,
+    let mut found = false;
+    for_each_operand_in_instruction(inst, |op| {
+        if let Operand::Value(v) = op {
+            if v.0 == val_id {
+                found = true;
+            }
+        }
+    });
+    if !found {
+        for_each_value_use_in_instruction(inst, |v| {
+            if v.0 == val_id {
+                found = true;
+            }
+        });
     }
+    found
 }

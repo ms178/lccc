@@ -52,6 +52,11 @@ pub fn eval_literal(expr: &Expr) -> Option<IrConst> {
         Expr::FloatLiteralLongDouble(val, bytes, _) => {
             Some(IrConst::long_double_with_bytes(*val, *bytes))
         }
+        Expr::FloatLiteralF128(_, bytes, _) => {
+            // _Float128 literal: the 16 bytes ARE the IEEE binary128 value,
+            // carried bit-exact in an I128 constant.
+            Some(IrConst::I128(u128::from_le_bytes(*bytes) as i128))
+        }
         _ => None,
     }
 }
@@ -72,6 +77,19 @@ pub fn eval_builtin_call(
     eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
 ) -> Option<IrConst> {
     match name {
+        "__builtin_strlen" | "strlen" => {
+            // String literal -> compile-time length (without the NUL).
+            // glibc startup.h: __builtin_constant_p(__builtin_strlen(msg)).
+            // Narrow literals are stored one C byte per Rust char (see
+            // lex_string), so the byte length is chars().count() — String::len()
+            // returns the UTF-8 encoded size and over-counts bytes >= 0x80
+            // (expat symptom: strlen("\xEF\xBB\xBF...") folded 3 too long).
+            if let Some(crate::frontend::parser::ast::Expr::StringLiteral(text, _)) = args.first() {
+                Some(IrConst::I64(text.chars().count() as i64))
+            } else {
+                None
+            }
+        }
         "__builtin_choose_expr" if args.len() >= 3 => {
             let cond = eval_fn(&args[0])?;
             if cond.is_nonzero() {

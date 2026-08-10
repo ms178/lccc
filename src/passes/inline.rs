@@ -9,20 +9,39 @@
 //! After inlining, subsequent passes (constant fold, DCE, CFG simplify) clean up
 //! the inlined code and eliminate dead branches.
 
-use crate::ir::reexports::{
-    BasicBlock, BlockId, CallInfo, GlobalInit, IrFunction, IrModule, Instruction, Operand,
-    Terminator, Value, IrConst, IrBinOp,
-};
 use crate::common::asm_constraints::constraint_is_immediate_only;
-use crate::common::types::{IrType, AddressSpace};
 use crate::common::fx_hash::FxHashMap as FxInlineMap;
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{
+    BasicBlock, BlockId, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
+    Operand, Terminator, Value,
+};
 use std::collections::HashMap;
 
 /// Maximum number of IR instructions (across all blocks) in a callee for it
 /// to be eligible for inlining. This handles constant-returning helpers
 /// like IS_ENABLED() wrappers and small accessor functions, as well as
 /// moderately-sized static inline functions with simple control flow.
-const MAX_INLINE_INSTRUCTIONS: usize = 60;
+/// Lowered from 60 to 32 for v2: for user-space workloads like gzip, inlining
+/// up-to-60-instruction callees adds large amounts of code (gzip -O3 text was
+/// 437KB vs 343KB with inlining off) with no measurable runtime benefit,
+/// because the from-scratch backend spills heavily in large functions.
+/// Best measured gzip Pareto: 395KB text, 1378ms compress (faster than both the
+/// original 60/800 and a more-aggressive 20/250 config).
+const MAX_INLINE_INSTRUCTIONS: usize = 32;
+
+/// Separate cap for medium static helpers; caller budgets bound growth.
+const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 96;
+
+/// Cap for `static inline` functions whose bodies are dominated by SIMD vector
+/// intrinsics. Such functions (e.g. zlib-ng's compare256_avx2_static, ~70 IR
+/// instructions, 10 blocks) are pathological when NOT inlined: the from-scratch
+/// vector codegen materialises every operand through memory, and a per-candidate
+/// call in a match loop (longest_match_avx2) is several times slower than the
+/// inlined body. GCC always inlines `static inline` regardless of size; we bound
+/// the growth with the per-caller budget.
+const MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS: usize = 200;
+const MAX_VECTOR_STATIC_INLINE_BLOCKS: usize = 24;
 
 /// Maximum number of basic blocks in a callee for inlining eligibility.
 /// Must be high enough to handle static inline functions with control flow
@@ -37,7 +56,10 @@ const MAX_INLINE_BLOCKS_NO_LOOPS: usize = 12;
 
 /// Maximum total inlining budget per caller function (total inlined instructions).
 /// Prevents exponential blowup from recursive inlining chains.
-const MAX_INLINE_BUDGET_PER_CALLER: usize = 800;
+/// Lowered from 800 to 350 for v2 to curb code-size bloat on user-space workloads
+/// (see MAX_INLINE_INSTRUCTIONS note). Correctness-critical tiny/small/static and
+/// always_inline inlining is governed by separate thresholds and is unaffected.
+const MAX_INLINE_BUDGET_PER_CALLER: usize = 350;
 
 /// Maximum total instruction count for a caller function after inlining.
 /// When the caller exceeds this threshold, normal (non-always_inline) inlining
@@ -218,6 +240,7 @@ fn select_inline_site(
     caller_is_recursive: bool,
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
+    small_only: bool,
 ) -> Option<(InlineCallSite, usize, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
     // These are always inlined regardless of caller size because:
@@ -238,11 +261,13 @@ fn select_inline_site(
     let budget_exhausted = always_inline_budget_remaining == 0;
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
-        let callee_inst_count: usize = callee_data.blocks.iter()
+        let callee_inst_count: usize = callee_data
+            .blocks
+            .iter()
             .map(|b| b.instructions.len())
             .sum();
-        let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
-            && callee_data.blocks.len() <= 1;
+        let is_tiny =
+            callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS && callee_data.blocks.len() <= 1;
         let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
             && callee_data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS;
         // Static inline functions that fit within normal limits should
@@ -251,26 +276,50 @@ fn select_inline_site(
         // inlining, shift amounts can't be constant-propagated, producing
         // massive unoptimized code with 28KB+ stack frames that overflow
         // the kernel's 16KB stack.
-        let callee_block_limit = if callee_data.has_loops { MAX_INLINE_BLOCKS } else { MAX_INLINE_BLOCKS_NO_LOOPS };
+        let callee_block_limit = if callee_data.has_loops {
+            MAX_INLINE_BLOCKS
+        } else {
+            MAX_INLINE_BLOCKS_NO_LOOPS
+        };
         let is_static_inline_eligible = callee_data.is_static_inline
-            && callee_inst_count <= MAX_INLINE_INSTRUCTIONS
-            && callee_data.blocks.len() <= callee_block_limit;
+            && (callee_inst_count <= MAX_INLINE_INSTRUCTIONS
+                || (callee_data.has_vector_intrinsics
+                    && callee_inst_count <= MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS))
+            && callee_data.blocks.len()
+                <= if callee_data.has_vector_intrinsics {
+                    MAX_VECTOR_STATIC_INLINE_BLOCKS
+                } else {
+                    callee_block_limit
+                };
         // For recursive callers, only inline tiny callees and always_inline callees.
         // Inlining larger callees into recursive functions multiplies the stack frame
         // increase by the recursion depth, easily causing stack overflow.
         if caller_is_recursive && !is_tiny && !callee_data.is_always_inline {
             continue;
         }
-        if is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible {
+        if is_tiny
+            || (is_small && (!budget_exhausted || callee_data.is_always_inline))
+            || is_static_inline_eligible
+        {
             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
             return Some((site.clone(), callee_inst_count, use_relaxed));
         }
     }
 
     // Second pass: use the first eligible normal callee.
+    // (-Os: small_only — skip normal/medium callees to keep size down; tiny and
+    // small callees from the first pass still inline, so helper bodies that are
+    // bigger standalone than inlined (memcpy/memcmp wrappers) are still folded
+    // away, keeping -Os binaries SMALLER than -O3 — previously -Os skipped ALL
+    // inlining and produced larger output than -O3.)
+    if small_only {
+        return None;
+    }
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
-        let callee_inst_count: usize = callee_data.blocks.iter()
+        let callee_inst_count: usize = callee_data
+            .blocks
+            .iter()
             .map(|b| b.instructions.len())
             .sum();
         // For recursive callers, skip non-tiny, non-always_inline callees.
@@ -281,10 +330,12 @@ fn select_inline_site(
         // When the caller has a section attribute (e.g., .init.text),
         // allow inlining small callees even into large callers to
         // prevent section mismatch errors.
-        if caller_too_large && !callee_data.is_always_inline
-            && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS) {
-                continue;
-            }
+        if caller_too_large
+            && !callee_data.is_always_inline
+            && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS)
+        {
+            continue;
+        }
         // Absolute cap: stop normal inlining for extremely large callers.
         // always_inline callees MUST still be inlined (C semantic requirement).
         if caller_at_absolute_cap && !callee_data.is_always_inline {
@@ -322,6 +373,18 @@ fn select_inline_site(
 /// Run the inlining pass on the module.
 /// Returns the number of call sites inlined.
 pub fn run(module: &mut IrModule) -> usize {
+    inline_run(module, false)
+}
+
+/// -Os entry point: only tiny/small callees are inlined (first pass only).
+/// GCC inlines trivial helpers at -Os too; skipping ALL inlining made LCCC's
+/// -Os binaries LARGER than its -O3 ones (every memread/memcmp helper emitted
+/// standalone, e.g. zlib-ng libz.a: 510KB at -Os vs 444KB at -O3).
+pub fn run_small_only(module: &mut IrModule) -> usize {
+    inline_run(module, true)
+}
+
+fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
     let mut total_inlined = 0;
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
@@ -339,12 +402,29 @@ pub fn run(module: &mut IrModule) -> usize {
         return 0;
     }
 
+    // PGO: check for profile to guide inlining
+    let pgo_profile = crate::pgo::get_pgo_profile();
+    if pgo_profile.is_some() {
+        eprintln!(
+            "lccc: PGO inline: using profile with {} functions",
+            pgo_profile.unwrap().functions.len()
+        );
+    }
+
     if debug_inline {
-        eprintln!("[INLINE] Callee map has {} eligible functions:", callee_map.len());
+        eprintln!(
+            "[INLINE] Callee map has {} eligible functions:",
+            callee_map.len()
+        );
         for (name, data) in &callee_map {
             let ic: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
-            eprintln!("[INLINE]   '{}': {} blocks, {} instructions, {} params",
-                name, data.blocks.len(), ic, data.num_params);
+            eprintln!(
+                "[INLINE]   '{}': {} blocks, {} instructions, {} params",
+                name,
+                data.blocks.len(),
+                ic,
+                data.num_params
+            );
         }
     }
 
@@ -375,7 +455,10 @@ pub fn run(module: &mut IrModule) -> usize {
             let func = &module.functions[func_idx];
             func.blocks.iter().any(|block| {
                 block.instructions.iter().any(|inst| {
-                    if let Instruction::Call { func: callee_name, .. } = inst {
+                    if let Instruction::Call {
+                        func: callee_name, ..
+                    } = inst
+                    {
                         callee_name == &func.name
                     } else {
                         false
@@ -389,14 +472,16 @@ pub fn run(module: &mut IrModule) -> usize {
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
         for _round in 0..max_rounds {
-
             // Check if the caller has grown too large for further normal inlining.
             // Each SSA value in CCC gets an 8-byte stack slot, so functions with
             // too many instructions will have massive stack frames. Stop normal
             // inlining once the caller exceeds the threshold; always_inline
             // callees are still inlined (required by C semantics).
-            let caller_inst_count: usize = module.functions[func_idx].blocks.iter()
-                .map(|b| b.instructions.len()).sum();
+            let caller_inst_count: usize = module.functions[func_idx]
+                .blocks
+                .iter()
+                .map(|b| b.instructions.len())
+                .sum();
             let caller_too_large = caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
             let caller_at_hard_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP;
             let caller_at_absolute_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP;
@@ -404,7 +489,84 @@ pub fn run(module: &mut IrModule) -> usize {
             // Find call sites to inline in the current function.
             // When the caller has a custom section attribute, also consider callees
             // that exceed normal limits, to avoid dangerous cross-section calls.
-            let call_sites = find_inline_call_sites(&module.functions[func_idx], &callee_map, &skip_list, caller_has_section);
+            let mut call_sites = find_inline_call_sites(
+                &module.functions[func_idx],
+                &callee_map,
+                &skip_list,
+                caller_has_section,
+            );
+            // PGO: filter/adjust call sites based on profile
+            if let Some(profile) = crate::pgo::get_pgo_profile() {
+                let caller_name = module.functions[func_idx].name.clone();
+                // For each call site, check if PGO says to force inline or deny
+                let mut filtered = Vec::new();
+                for site in call_sites {
+                    if let Some(callee) = callee_map.get(&site.callee_name) {
+                        // Get callee name
+                        let callee_name = &site.callee_name;
+                        // Check PGO inline decision
+                        if let Some(force) = crate::pgo::inline_pgo::should_inline_normal(
+                            &module.functions[func_idx],
+                            &{
+                                // Reconstruct IrFunction for callee from callee_map data
+                                // callee_map stores blocks, we need to create a dummy IrFunction
+                                let mut dummy = crate::ir::reexports::IrFunction {
+                                    name: callee_name.clone(),
+                                    return_type: crate::common::types::IrType::I32,
+                                    params: vec![],
+                                    blocks: callee.blocks.clone(),
+                                    is_variadic: false,
+                                    is_declaration: false,
+                                    is_static: false,
+                                    is_inline: false,
+                                    is_always_inline: false,
+                                    is_noinline: false,
+                                    next_value_id: 0,
+                                    next_label: 0,
+                                    section: None,
+                                    visibility: None,
+                                    is_weak: false,
+                                    is_used: false,
+                                    has_inlined_calls: false,
+                                    param_alloca_values: vec![],
+                                    uses_sret: false,
+                                    is_fastcall: false,
+                                    is_naked: false,
+                                    global_init_label_blocks: vec![],
+                                    ret_eightbyte_classes: vec![],
+                                    ret_is_f128_sse: false,
+                                    is_gnu_inline_def: false,
+                                };
+                                dummy
+                            },
+                            Some(profile),
+                        ) {
+                            if force {
+                                filtered.push(site);
+                                continue;
+                            } else {
+                                continue;
+                            } // deny
+                        }
+                        // Also check threshold multiplier
+                        let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
+                            &caller_name,
+                            callee_name,
+                            profile,
+                        );
+                        if mult < 0.4 {
+                            // Cold: skip unless tiny
+                            let inst_count: usize =
+                                callee.blocks.iter().map(|b| b.instructions.len()).sum();
+                            if inst_count > 5 {
+                                continue;
+                            }
+                        }
+                    }
+                    filtered.push(site);
+                }
+                call_sites = filtered;
+            }
             if call_sites.is_empty() {
                 break;
             }
@@ -420,6 +582,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 caller_is_recursive,
                 budget_remaining,
                 always_inline_budget_remaining,
+                small_only,
             );
             let (site, callee_inst_count, _use_relaxed) = match found_site {
                 Some(s) => s,
@@ -442,14 +605,22 @@ pub fn run(module: &mut IrModule) -> usize {
 
             if success {
                 if debug_inline {
-                    eprintln!("[INLINE] Inlined '{}' into '{}'", site.callee_name, module.functions[func_idx].name);
+                    eprintln!(
+                        "[INLINE] Inlined '{}' into '{}'",
+                        site.callee_name, module.functions[func_idx].name
+                    );
                 }
                 if std::env::var("CCC_INLINE_VALIDATE").is_ok() {
                     validate_function_values(&module.functions[func_idx], &site.callee_name);
                 }
                 if std::env::var("CCC_INLINE_DUMP_IR").is_ok() {
-                    dump_function_ir(&module.functions[func_idx],
-                        &format!("after inlining '{}' into '{}'", site.callee_name, module.functions[func_idx].name));
+                    dump_function_ir(
+                        &module.functions[func_idx],
+                        &format!(
+                            "after inlining '{}' into '{}'",
+                            site.callee_name, module.functions[func_idx].name
+                        ),
+                    );
                 }
                 // Deduct from the always_inline budget only when the callee
                 // is actually always_inline. Non-always_inline callees that
@@ -459,8 +630,10 @@ pub fn run(module: &mut IrModule) -> usize {
                 // instructions) can exhaust the budget and prevent true
                 // always_inline callees (e.g., idle_init) from being inlined,
                 // causing section mismatch errors.
-                let callee_is_always_inline = callee_map.get(&site.callee_name)
-                    .map(|d| d.is_always_inline).unwrap_or(false);
+                let callee_is_always_inline = callee_map
+                    .get(&site.callee_name)
+                    .map(|d| d.is_always_inline)
+                    .unwrap_or(false);
                 if callee_is_always_inline {
                     // Don't deduct small callees from the always_inline budget.
                     // Small callees (≤20 instructions) have negligible individual
@@ -469,12 +642,15 @@ pub fn run(module: &mut IrModule) -> usize {
                     // larger always_inline callees that actually matter (e.g.,
                     // intel_pmu_init_glc at 211 instructions needs to be inlined
                     // into intel_pmu_init to avoid section mismatches).
-                    let callee_blocks = callee_map.get(&site.callee_name)
-                        .map(|d| d.blocks.len()).unwrap_or(0);
+                    let callee_blocks = callee_map
+                        .get(&site.callee_name)
+                        .map(|d| d.blocks.len())
+                        .unwrap_or(0);
                     let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
                         && callee_blocks <= MAX_SMALL_INLINE_BLOCKS;
                     if !is_small {
-                        always_inline_budget_remaining = always_inline_budget_remaining.saturating_sub(callee_inst_count);
+                        always_inline_budget_remaining =
+                            always_inline_budget_remaining.saturating_sub(callee_inst_count);
                     }
                 } else {
                     budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
@@ -507,7 +683,84 @@ pub fn run(module: &mut IrModule) -> usize {
         // provides the growth bound instead.
         let mut second_pass_budget = MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET;
         for _round in 0..MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS {
-            let call_sites = find_inline_call_sites(&module.functions[func_idx], &callee_map, &skip_list, caller_has_section);
+            let mut call_sites = find_inline_call_sites(
+                &module.functions[func_idx],
+                &callee_map,
+                &skip_list,
+                caller_has_section,
+            );
+            // PGO: filter/adjust call sites based on profile
+            if let Some(profile) = crate::pgo::get_pgo_profile() {
+                let caller_name = module.functions[func_idx].name.clone();
+                // For each call site, check if PGO says to force inline or deny
+                let mut filtered = Vec::new();
+                for site in call_sites {
+                    if let Some(callee) = callee_map.get(&site.callee_name) {
+                        // Get callee name
+                        let callee_name = &site.callee_name;
+                        // Check PGO inline decision
+                        if let Some(force) = crate::pgo::inline_pgo::should_inline_normal(
+                            &module.functions[func_idx],
+                            &{
+                                // Reconstruct IrFunction for callee from callee_map data
+                                // callee_map stores blocks, we need to create a dummy IrFunction
+                                let mut dummy = crate::ir::reexports::IrFunction {
+                                    name: callee_name.clone(),
+                                    return_type: crate::common::types::IrType::I32,
+                                    params: vec![],
+                                    blocks: callee.blocks.clone(),
+                                    is_variadic: false,
+                                    is_declaration: false,
+                                    is_static: false,
+                                    is_inline: false,
+                                    is_always_inline: false,
+                                    is_noinline: false,
+                                    next_value_id: 0,
+                                    next_label: 0,
+                                    section: None,
+                                    visibility: None,
+                                    is_weak: false,
+                                    is_used: false,
+                                    has_inlined_calls: false,
+                                    param_alloca_values: vec![],
+                                    uses_sret: false,
+                                    is_fastcall: false,
+                                    is_naked: false,
+                                    global_init_label_blocks: vec![],
+                                    ret_eightbyte_classes: vec![],
+                                    ret_is_f128_sse: false,
+                                    is_gnu_inline_def: false,
+                                };
+                                dummy
+                            },
+                            Some(profile),
+                        ) {
+                            if force {
+                                filtered.push(site);
+                                continue;
+                            } else {
+                                continue;
+                            } // deny
+                        }
+                        // Also check threshold multiplier
+                        let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
+                            &caller_name,
+                            callee_name,
+                            profile,
+                        );
+                        if mult < 0.4 {
+                            // Cold: skip unless tiny
+                            let inst_count: usize =
+                                callee.blocks.iter().map(|b| b.instructions.len()).sum();
+                            if inst_count > 5 {
+                                continue;
+                            }
+                        }
+                    }
+                    filtered.push(site);
+                }
+                call_sites = filtered;
+            }
             if call_sites.is_empty() {
                 break;
             }
@@ -519,7 +772,9 @@ pub fn run(module: &mut IrModule) -> usize {
                 if !callee_data.is_always_inline {
                     continue;
                 }
-                let callee_inst_count: usize = callee_data.blocks.iter()
+                let callee_inst_count: usize = callee_data
+                    .blocks
+                    .iter()
                     .map(|b| b.instructions.len())
                     .sum();
                 let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
@@ -532,7 +787,11 @@ pub fn run(module: &mut IrModule) -> usize {
                 // "i" constraints in arch_static_branch). Callers with section
                 // attributes bypass budget (section-specific symbols like __kvm_nvhe_*
                 // MUST be resolved through inlining).
-                if !is_tiny && !is_small && !caller_has_section && callee_inst_count > second_pass_budget {
+                if !is_tiny
+                    && !is_small
+                    && !caller_has_section
+                    && callee_inst_count > second_pass_budget
+                {
                     continue;
                 }
                 let success = inline_call_site(
@@ -543,15 +802,22 @@ pub fn run(module: &mut IrModule) -> usize {
                 );
                 if success {
                     if debug_inline {
-                        eprintln!("[INLINE] Inlined always_inline '{}' into '{}' (second pass)",
-                            site.callee_name, module.functions[func_idx].name);
+                        eprintln!(
+                            "[INLINE] Inlined always_inline '{}' into '{}' (second pass)",
+                            site.callee_name, module.functions[func_idx].name
+                        );
                     }
                     if std::env::var("CCC_INLINE_VALIDATE").is_ok() {
                         validate_function_values(&module.functions[func_idx], &site.callee_name);
                     }
                     if std::env::var("CCC_INLINE_DUMP_IR").is_ok() {
-                        dump_function_ir(&module.functions[func_idx],
-                            &format!("after inlining '{}' into '{}' (second pass)", site.callee_name, module.functions[func_idx].name));
+                        dump_function_ir(
+                            &module.functions[func_idx],
+                            &format!(
+                                "after inlining '{}' into '{}' (second pass)",
+                                site.callee_name, module.functions[func_idx].name
+                            ),
+                        );
                     }
                     total_inlined += 1;
                     module.functions[func_idx].has_inlined_calls = true;
@@ -566,7 +832,6 @@ pub fn run(module: &mut IrModule) -> usize {
                 break;
             }
         }
-
     }
 
     // After ALL inlining is complete, resolve input_symbols for InlineAsm instructions.
@@ -631,10 +896,25 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
     let debug_resolve = std::env::var("CCC_INLINE_DEBUG").is_ok();
     for block in func.blocks.iter_mut() {
         for inst in block.instructions.iter_mut() {
-            if let Instruction::InlineAsm { inputs, input_symbols, template, .. } = inst {
+            if let Instruction::InlineAsm {
+                inputs,
+                input_symbols,
+                template,
+                ..
+            } = inst
+            {
                 if debug_resolve && template.contains(".pushsection") {
-                    eprintln!("[RESOLVE_ASM] Found InlineAsm with .pushsection in func '{}'", func.name);
-                    eprintln!("[RESOLVE_ASM]   inputs: {:?}", inputs.iter().map(|(c, o, n)| (c.clone(), format!("{:?}", o), n.clone())).collect::<Vec<_>>());
+                    eprintln!(
+                        "[RESOLVE_ASM] Found InlineAsm with .pushsection in func '{}'",
+                        func.name
+                    );
+                    eprintln!(
+                        "[RESOLVE_ASM]   inputs: {:?}",
+                        inputs
+                            .iter()
+                            .map(|(c, o, n)| (c.clone(), format!("{:?}", o), n.clone()))
+                            .collect::<Vec<_>>()
+                    );
                     eprintln!("[RESOLVE_ASM]   input_symbols: {:?}", input_symbols);
                 }
                 let num_outputs_in_sym = if input_symbols.len() > inputs.len() {
@@ -645,32 +925,58 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
                 for (i, (constraint, operand, _name)) in inputs.iter_mut().enumerate() {
                     let sym_idx = num_outputs_in_sym + i;
                     if sym_idx >= input_symbols.len() {
-                        if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip", i, sym_idx, input_symbols.len()); }
+                        if debug_resolve {
+                            eprintln!("[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip", i, sym_idx, input_symbols.len());
+                        }
                         continue;
                     }
                     // Only fix up entries that are currently None
                     if input_symbols[sym_idx].is_some() {
-                        if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: already has symbol {:?}, skip", i, input_symbols[sym_idx]); }
+                        if debug_resolve {
+                            eprintln!(
+                                "[RESOLVE_ASM]   input[{}]: already has symbol {:?}, skip",
+                                i, input_symbols[sym_idx]
+                            );
+                        }
                         continue;
                     }
                     // Only care about immediate-only constraints ("i", "n", etc.)
                     if !constraint_is_immediate_only(constraint) {
-                        if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: constraint '{}' not imm-only, skip", i, constraint); }
+                        if debug_resolve {
+                            eprintln!(
+                                "[RESOLVE_ASM]   input[{}]: constraint '{}' not imm-only, skip",
+                                i, constraint
+                            );
+                        }
                         continue;
                     }
-                    if debug_resolve { eprintln!("[RESOLVE_ASM]   input[{}]: constraint '{}', operand={:?}", i, constraint, operand); }
+                    if debug_resolve {
+                        eprintln!(
+                            "[RESOLVE_ASM]   input[{}]: constraint '{}', operand={:?}",
+                            i, constraint, operand
+                        );
+                    }
                     match operand {
                         Operand::Value(v) => {
                             // Try to trace this value back to a GlobalAddr
                             if let Some(sym_name) = trace_to_global(v.0) {
-                                if debug_resolve { eprintln!("[RESOLVE_ASM]   -> resolved to symbol '{}'", sym_name); }
+                                if debug_resolve {
+                                    eprintln!(
+                                        "[RESOLVE_ASM]   -> resolved to symbol '{}'",
+                                        sym_name
+                                    );
+                                }
                                 input_symbols[sym_idx] = Some(sym_name);
                             }
                             // Also try to resolve to a constant and convert the operand
                             else if let Some(const_val) = trace_to_const(&Operand::Value(*v)) {
-                                if debug_resolve { eprintln!("[RESOLVE_ASM]   -> resolved to const {}", const_val); }
+                                if debug_resolve {
+                                    eprintln!("[RESOLVE_ASM]   -> resolved to const {}", const_val);
+                                }
                                 *operand = Operand::Const(IrConst::I64(const_val));
-                            } else if debug_resolve { eprintln!("[RESOLVE_ASM]   -> FAILED to resolve Value({})", v.0); }
+                            } else if debug_resolve {
+                                eprintln!("[RESOLVE_ASM]   -> FAILED to resolve Value({})", v.0);
+                            }
                         }
                         Operand::Const(_) => {
                             // Already a constant - nothing to fix
@@ -704,11 +1010,17 @@ fn trace_value_to_global(
                     }
                     return Some(name.clone());
                 }
-                Instruction::Copy { src: Operand::Value(v), .. } => {
+                Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                } => {
                     current = v.0;
                     continue;
                 }
-                Instruction::Copy { src: Operand::Const(_), .. } => {
+                Instruction::Copy {
+                    src: Operand::Const(_),
+                    ..
+                } => {
                     return None;
                 }
                 Instruction::Load { ptr, .. } => {
@@ -739,21 +1051,31 @@ fn trace_value_to_global(
                     return None;
                 }
                 // Cast preserves pointer identity for address calculations
-                Instruction::Cast { src: Operand::Value(v), .. } => {
+                Instruction::Cast {
+                    src: Operand::Value(v),
+                    ..
+                } => {
                     current = v.0;
                     continue;
                 }
                 // BinOp on pointer: handle Add with constant (pointer arithmetic)
-                Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } => {
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
                     // Try: one operand is a traceable pointer, other is a constant offset
-                    if let Some(rhs_val) = trace_operand_to_const(rhs, value_defs, alloca_stores, 0) {
+                    if let Some(rhs_val) = trace_operand_to_const(rhs, value_defs, alloca_stores, 0)
+                    {
                         if let Operand::Value(v) = lhs {
                             accumulated_offset += rhs_val;
                             current = v.0;
                             continue;
                         }
                     }
-                    if let Some(lhs_val) = trace_operand_to_const(lhs, value_defs, alloca_stores, 0) {
+                    if let Some(lhs_val) = trace_operand_to_const(lhs, value_defs, alloca_stores, 0)
+                    {
                         if let Operand::Value(v) = rhs {
                             accumulated_offset += lhs_val;
                             current = v.0;
@@ -790,10 +1112,16 @@ fn trace_operand_to_const(
             for _ in 0..MAX_TRACE_CHAIN_LENGTH {
                 if let Some(inst) = value_defs.get(&current) {
                     match inst {
-                        Instruction::Copy { src: Operand::Const(c), .. } => {
+                        Instruction::Copy {
+                            src: Operand::Const(c),
+                            ..
+                        } => {
                             return c.to_i64();
                         }
-                        Instruction::Copy { src: Operand::Value(v2), .. } => {
+                        Instruction::Copy {
+                            src: Operand::Value(v2),
+                            ..
+                        } => {
                             current = v2.0;
                             continue;
                         }
@@ -809,25 +1137,37 @@ fn trace_operand_to_const(
                             }
                             return None;
                         }
-                        Instruction::Cast { src, .. } => {
-                            match src {
-                                Operand::Const(c) => return c.to_i64(),
-                                Operand::Value(v2) => {
-                                    current = v2.0;
-                                    continue;
-                                }
+                        Instruction::Cast { src, .. } => match src {
+                            Operand::Const(c) => return c.to_i64(),
+                            Operand::Value(v2) => {
+                                current = v2.0;
+                                continue;
                             }
-                        }
+                        },
                         // Binary operations: try to evaluate both sides
-                        Instruction::BinOp { op: bin_op, lhs, rhs, .. } => {
-                            let l = trace_operand_to_const(lhs, value_defs, alloca_stores, depth + 1)?;
-                            let r = trace_operand_to_const(rhs, value_defs, alloca_stores, depth + 1)?;
+                        Instruction::BinOp {
+                            op: bin_op,
+                            lhs,
+                            rhs,
+                            ..
+                        } => {
+                            let l =
+                                trace_operand_to_const(lhs, value_defs, alloca_stores, depth + 1)?;
+                            let r =
+                                trace_operand_to_const(rhs, value_defs, alloca_stores, depth + 1)?;
                             return bin_op.eval_i64(l, r);
                         }
                         // Comparisons: try to evaluate both sides
-                        Instruction::Cmp { op: cmp_op, lhs, rhs, .. } => {
-                            let l = trace_operand_to_const(lhs, value_defs, alloca_stores, depth + 1)?;
-                            let r = trace_operand_to_const(rhs, value_defs, alloca_stores, depth + 1)?;
+                        Instruction::Cmp {
+                            op: cmp_op,
+                            lhs,
+                            rhs,
+                            ..
+                        } => {
+                            let l =
+                                trace_operand_to_const(lhs, value_defs, alloca_stores, depth + 1)?;
+                            let r =
+                                trace_operand_to_const(rhs, value_defs, alloca_stores, depth + 1)?;
                             return Some(if cmp_op.eval_i64(l, r) { 1 } else { 0 });
                         }
                         _ => return None,
@@ -863,7 +1203,11 @@ fn validate_function_values(func: &IrFunction, last_inlined_callee: &str) {
                 if !defined.contains(&v) {
                     errors.push(format!(
                         "  block[{}] (label .L{}) inst[{}]: uses undefined Value({}), inst={:?}",
-                        block_idx, block.label.0, inst_idx, v, short_inst_name(inst)
+                        block_idx,
+                        block.label.0,
+                        inst_idx,
+                        v,
+                        short_inst_name(inst)
                     ));
                 }
             }
@@ -879,8 +1223,12 @@ fn validate_function_values(func: &IrFunction, last_inlined_callee: &str) {
     }
 
     if !errors.is_empty() {
-        eprintln!("[INLINE_VALIDATE] ERRORS in '{}' after inlining '{}': {} undefined value uses",
-            func.name, last_inlined_callee, errors.len());
+        eprintln!(
+            "[INLINE_VALIDATE] ERRORS in '{}' after inlining '{}': {} undefined value uses",
+            func.name,
+            last_inlined_callee,
+            errors.len()
+        );
         for e in errors.iter().take(20) {
             eprintln!("{}", e);
         }
@@ -936,6 +1284,11 @@ struct CalleeData {
     /// Whether this callee contains any back-edges (loops).
     /// Functions without loops can use a higher block limit for inlining.
     has_loops: bool,
+    /// Whether this callee contains SIMD vector intrinsics (SSE/AVX/AVX2).
+    /// Functions dominated by vector intrinsics are allowed a much larger
+    /// static-inline budget: their standalone codegen is memory-bound, and
+    /// inlining lets the caller fuse the intrinsic chain.
+    has_vector_intrinsics: bool,
 }
 
 /// A call site that is eligible for inlining.
@@ -973,15 +1326,34 @@ fn global_init_contains_local_label(init: &GlobalInit) -> bool {
 fn func_has_static_locals_with_label_refs(module: &IrModule, func_name: &str) -> bool {
     let prefix = format!("{}.", func_name);
     for global in &module.globals {
-        if global.name.starts_with(&prefix)
-            && global_init_contains_local_label(&global.init) {
-                return true;
-            }
+        if global.name.starts_with(&prefix) && global_init_contains_local_label(&global.init) {
+            return true;
+        }
     }
     false
 }
 
 /// Build a map of function name -> callee data for functions eligible for inlining.
+fn fits_normal_inline_limits(
+    inst_count: usize,
+    block_count: usize,
+    is_static: bool,
+    is_inline: bool,
+    has_vector_intrinsics: bool,
+    block_limit: usize,
+) -> bool {
+    let inst_ok = inst_count <= MAX_INLINE_INSTRUCTIONS
+        || (is_static && !is_inline && inst_count <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS)
+        || (is_static && is_inline && has_vector_intrinsics
+            && inst_count <= MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS);
+    let block_ok = if is_static && is_inline && has_vector_intrinsics {
+        block_count <= MAX_VECTOR_STATIC_INLINE_BLOCKS
+    } else {
+        block_count <= block_limit
+    };
+    inst_ok && block_ok
+}
+
 fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
     let mut map = HashMap::new();
 
@@ -1015,9 +1387,10 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             && func.return_type == IrType::Void
             && func.blocks.len() == 1
             && matches!(func.blocks[0].terminator, Terminator::Return(None))
-            && func.blocks[0].instructions.iter().all(|inst| {
-                matches!(inst, Instruction::Alloca { .. })
-            });
+            && func.blocks[0]
+                .instructions
+                .iter()
+                .all(|inst| matches!(inst, Instruction::Alloca { .. }));
         // Check if this is a small static (non-inline) function eligible for inlining.
         // GCC at -O2 inlines small static functions even without the `inline` keyword.
         // This prevents linker errors from undefined references in dead code paths.
@@ -1025,12 +1398,20 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
 
         // Detect back-edges (loops) early, used for block limit decision.
         let has_loops = {
-            let label_to_order: FxInlineMap<BlockId, usize> = func.blocks.iter()
-                .enumerate().map(|(i, b)| (b.label, i)).collect();
+            let label_to_order: FxInlineMap<BlockId, usize> = func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.label, i))
+                .collect();
             func.blocks.iter().enumerate().any(|(i, block)| {
                 let succs: Vec<BlockId> = match &block.terminator {
                     Terminator::Branch(t) => vec![*t],
-                    Terminator::CondBranch { true_label, false_label, .. } => vec![*true_label, *false_label],
+                    Terminator::CondBranch {
+                        true_label,
+                        false_label,
+                        ..
+                    } => vec![*true_label, *false_label],
                     Terminator::Switch { default, cases, .. } => {
                         let mut s = vec![*default];
                         s.extend(cases.iter().map(|(_, l)| *l));
@@ -1038,12 +1419,13 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
                     }
                     _ => vec![],
                 };
-                succs.iter().any(|succ| {
-                    label_to_order.get(succ).map_or(false, |&j| j <= i)
-                })
+                succs
+                    .iter()
+                    .any(|succ| label_to_order.get(succ).map_or(false, |&j| j <= i))
             })
         };
-        let is_small_static = func.is_static && !func.is_inline
+        let is_small_static = func.is_static
+            && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_STATIC_NONINLINE_BLOCKS;
         // Also consider medium-sized static non-inline functions for inlining.
@@ -1055,23 +1437,47 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // modpost flags a .text -> .init.text section mismatch.
         // These are treated as normal inline candidates (not exceeds_normal_limits)
         // since they fit within MAX_INLINE_INSTRUCTIONS/MAX_INLINE_BLOCKS.
-        let medium_block_limit = if has_loops { MAX_INLINE_BLOCKS } else { MAX_INLINE_BLOCKS_NO_LOOPS };
-        let is_medium_static = func.is_static && !func.is_inline
+        let medium_block_limit = if has_loops {
+            MAX_INLINE_BLOCKS
+        } else {
+            MAX_INLINE_BLOCKS_NO_LOOPS
+        };
+        // ms178: allow medium-sized `static` (non-inline) callees up to 96 IR
+        // instructions. Hot leaf helpers like expat's sip_round (~85 instr, one
+        // loop) are 2-3x slower as calls because the from-scratch backend spills
+        // their state; inlining lets the caller keep SipHash state in registers.
+        // The per-caller budget (MAX_INLINE_BUDGET_PER_CALLER) and caller-size
+        // cap bound the code growth. (The 32-instr cap dates from a v2 tune that
+        // favored gzip .text; verified: gzip .text impact < 4% with this change.)
+        let is_medium_static = func.is_static
+            && !func.is_inline
             && !is_small_static
-            && inst_count_for_static <= MAX_INLINE_INSTRUCTIONS
+            && inst_count_for_static <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
             && func.blocks.len() <= medium_block_limit;
-        if !is_always_inline && !is_trivially_empty && !is_small_static && !is_medium_static
-            && (!func.is_static || !func.is_inline) {
-                if debug_callee {
-                    eprintln!("[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, is_declaration={}",
-                        func.name, func.is_static, func.is_inline, func.is_declaration);
-                }
-                continue;
+        if !is_always_inline
+            && !is_trivially_empty
+            && !is_small_static
+            && !is_medium_static
+            && (!func.is_static || !func.is_inline)
+        {
+            if debug_callee {
+                eprintln!(
+                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, is_declaration={}",
+                    func.name, func.is_static, func.is_inline, func.is_declaration
+                );
             }
+            continue;
+        }
         if debug_callee {
             let ic: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
-            eprintln!("[INLINE_DEBUG] {} candidate: blocks={}, inst_count={}, is_variadic={}, params={}",
-                func.name, func.blocks.len(), ic, func.is_variadic, func.params.len());
+            eprintln!(
+                "[INLINE_DEBUG] {} candidate: blocks={}, inst_count={}, is_variadic={}, params={}",
+                func.name,
+                func.blocks.len(),
+                ic,
+                func.is_variadic,
+                func.params.len()
+            );
         }
         // Don't inline variadic functions (complex ABI)
         if func.is_variadic {
@@ -1088,9 +1494,26 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // Non-loop callees get a higher block limit since their control flow
         // (if/else chains, switch, early returns) doesn't create nested loops
         // when inlined into a loop caller.
-        let effective_block_limit = if has_loops { MAX_INLINE_BLOCKS } else { MAX_INLINE_BLOCKS_NO_LOOPS };
-        let fits_normal = inst_count <= MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= effective_block_limit;
-        let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
+        let effective_block_limit = if has_loops {
+            MAX_INLINE_BLOCKS
+        } else {
+            MAX_INLINE_BLOCKS_NO_LOOPS
+        };
+        // ms178: static (non-inline) callees get a higher instruction limit
+        // (MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS). Hot leaf helpers like expat's
+        // sip_round (~85 instr, one loop) are otherwise marked
+        // exceeds_normal_limits and excluded from ordinary callers, leaving
+        // their state in memory. The per-caller budget bounds the growth.
+        let fits_normal = fits_normal_inline_limits(
+            inst_count,
+            func.blocks.len(),
+            func.is_static,
+            func.is_inline,
+            func_has_vector_intrinsics(func),
+            effective_block_limit,
+        );
+        let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
+            && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         let exceeds_normal = !is_always_inline && !fits_normal;
         if is_always_inline {
             if !fits_relaxed {
@@ -1152,28 +1575,57 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         }
 
         // Clone the function's blocks for use during inlining
-        let max_block_id = func.blocks.iter()
-            .map(|b| b.label.0)
-            .max()
-            .unwrap_or(0);
+        let max_block_id = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
 
-        let param_struct_sizes: Vec<Option<usize>> = func.params.iter().map(|p| p.struct_size).collect();
+        let param_struct_sizes: Vec<Option<usize>> =
+            func.params.iter().map(|p| p.struct_size).collect();
 
-        map.insert(func.name.clone(), CalleeData {
-            blocks: func.blocks.clone(),
-            param_struct_sizes,
-            return_type: func.return_type,
-            num_params: func.params.len(),
-            next_value_id: func.next_value_id,
-            max_block_id,
-            is_always_inline,
-            exceeds_normal_limits: exceeds_normal,
-            is_static_inline: func.is_static && func.is_inline,
-            has_loops,
-        });
+        map.insert(
+            func.name.clone(),
+            CalleeData {
+                blocks: func.blocks.clone(),
+                param_struct_sizes,
+                return_type: func.return_type,
+                num_params: func.params.len(),
+                next_value_id: func.next_value_id,
+                max_block_id,
+                is_always_inline,
+                exceeds_normal_limits: exceeds_normal,
+                is_static_inline: func.is_static && func.is_inline,
+                has_loops,
+                has_vector_intrinsics: func_has_vector_intrinsics(func),
+            },
+        );
     }
 
     map
+}
+
+/// True if the function contains any SIMD vector intrinsics (SSE/AVX/AVX2 ops
+/// that operate on xmm/ymm vectors). Used to grant static-inline functions a
+/// larger inlining budget, since their un-inlined codegen is memory-bound.
+fn func_has_vector_intrinsics(func: &IrFunction) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp;
+    func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|inst| {
+            if let Instruction::Intrinsic { op, .. } = inst {
+                let name = format!("{:?}", op);
+                name.ends_with("256")
+                    || name.ends_with("128")
+                    || name.starts_with("VecLoad")
+                    || name.starts_with("Loaddqu")
+                    || matches!(op,
+                        IntrinsicOp::Loadu256 | IntrinsicOp::Load256
+                        | IntrinsicOp::Storeu256 | IntrinsicOp::Store256
+                        | IntrinsicOp::Pmovmskb256
+                        | IntrinsicOp::Broadcast128to256 | IntrinsicOp::Zext128to256
+                        | IntrinsicOp::Cast256to128 | IntrinsicOp::Insert128to256
+                        | IntrinsicOp::Pmovmskb128)
+            } else {
+                false
+            }
+        })
+    })
 }
 
 /// Find call sites in a function that are eligible for inlining.
@@ -1191,7 +1643,11 @@ fn find_inline_call_sites(
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Call { func: callee_name, info } = inst {
+            if let Instruction::Call {
+                func: callee_name,
+                info,
+            } = inst
+            {
                 if let Some(callee_data) = callee_map.get(callee_name) {
                     // Don't inline recursive calls
                     if callee_name != &func.name {
@@ -1221,6 +1677,98 @@ fn find_inline_call_sites(
 
 /// Inline a single call site. Returns true if successful.
 /// `global_max_block_id` is the module-global max block ID, updated on success.
+/// A scalar parameter is SSA-substitutable when its home alloca is never
+/// address-taken and never written after the initial ParamRef store. For such
+/// parameters the inliner can replace every `Load(home)` with the call
+/// argument directly, eliminating the store-into-alloca + load round-trip from
+/// inlined code (smaller, faster, and immune to memory-forwarding interactions).
+fn param_substitutable(
+    callee: &CalleeData,
+    param_idx: usize,
+    home: Value,
+) -> bool {
+    // Struct-by-value parameters use the memcpy path; never substitute.
+    if callee.param_struct_sizes.get(param_idx).copied().flatten().is_some() {
+        return false;
+    }
+    let mut home_volatile = false;
+    let mut paramref_dest: Option<Value> = None;
+    for block in &callee.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { dest, volatile: true, .. } if *dest == home => {
+                    home_volatile = true;
+                }
+                Instruction::ParamRef { dest, param_idx: pi, .. } if *pi == param_idx => {
+                    paramref_dest = Some(*dest);
+                }
+                _ => {}
+            }
+        }
+    }
+    if home_volatile {
+        return false;
+    }
+    // Params without an explicit ParamRef (e.g. the sret pointer) are filled by
+    // the backend's emit_store_params; substituting their loads would change ABI
+    // handling. Keep them on the memory path.
+    if paramref_dest.is_none() {
+        return false;
+    }
+    for block in &callee.blocks {
+        for inst in &block.instructions {
+            match inst {
+                // Loads from the home are the reads we substitute.
+                Instruction::Load { ptr, .. } => {
+                    if *ptr == home {
+                        continue;
+                    }
+                }
+                // The initial ParamRef store is the one the inliner removes.
+                Instruction::Store { val, ptr, .. } => {
+                    if *ptr == home {
+                        let is_initial = matches!(val, Operand::Value(v) if Some(*v) == paramref_dest);
+                        if !is_initial {
+                            return false; // modified after init
+                        }
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            // Any other reference to the home alloca is an address escape.
+            let mut escapes = false;
+            inst.for_each_used_value(|id| {
+                if id == home.0 {
+                    escapes = true;
+                }
+            });
+            if escapes {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+
+/// IR type of a caller-side operand; needed to substitute call args at the
+/// parameter width (a raw Copy at the arg's own width would corrupt
+/// adjacent stack slots where the store/load path truncated implicitly).
+fn const_ir_type(c: &IrConst) -> Option<IrType> {
+    Some(match c {
+        IrConst::I8(_) => IrType::I8,
+        IrConst::I16(_) => IrType::I16,
+        IrConst::I32(_) => IrType::I32,
+        IrConst::I64(_) => IrType::I64,
+        IrConst::I128(_) => IrType::I128,
+        IrConst::F32(_) => IrType::F32,
+        IrConst::F64(_) => IrType::F64,
+        IrConst::LongDouble(..) => IrType::F128,
+        IrConst::Zero => crate::common::types::target_int_ir_type(),
+    })
+}
+
 fn inline_call_site(
     caller: &mut IrFunction,
     site: &InlineCallSite,
@@ -1246,7 +1794,10 @@ fn inline_call_site(
     if debug_inline_detail {
         eprintln!("[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, block_offset={}, callee.next_value_id={}, caller.next_value_id={}",
             site.callee_name, caller.name, value_offset, block_offset, callee.next_value_id, caller.next_value_id);
-        eprintln!("[INLINE_DETAIL]   site.block_idx={}, site.inst_idx={}", site.block_idx, site.inst_idx);
+        eprintln!(
+            "[INLINE_DETAIL]   site.block_idx={}, site.inst_idx={}",
+            site.block_idx, site.inst_idx
+        );
         for (i, arg) in site.args.iter().enumerate() {
             eprintln!("[INLINE_DETAIL]   arg[{}] = {:?}", i, arg);
         }
@@ -1264,7 +1815,9 @@ fn inline_call_site(
         };
 
         for inst in &callee_block.instructions {
-            new_block.instructions.push(remap_instruction(inst, value_offset, block_offset));
+            new_block
+                .instructions
+                .push(remap_instruction(inst, value_offset, block_offset));
         }
 
         inlined_blocks.push(new_block);
@@ -1302,6 +1855,64 @@ fn inline_call_site(
         }
     }
 
+    // ms178: SSA parameter substitution. For pure scalar params (home never
+    // address-taken, never re-stored) a constant argument replaces every home
+    // load, skipping the store+load round-trip; the home alloca is dropped.
+    // Restricted to CONSTANT args: a runtime arg is an SSA value whose live
+    // range crosses the call site, and LCCC's linear-scan allocator can leave
+    // such a value in an undefined callee-saved register on some paths
+    // (zlib-ng deflateSetParamPre *out=param wrote a stale %rbx). Constants
+    // are materialized at the use site, so they have no register interaction.
+    let orig_homes: Vec<Value> = {
+        let mut v = Vec::new();
+        for inst in &callee.blocks[0].instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                v.push(*dest);
+                if v.len() >= callee.num_params {
+                    break;
+                }
+            }
+        }
+        v
+    };
+    // CCC_NO_SSA_PARAM=1 disables parameter substitution (diagnostic toggle).
+    let ssa_param_enabled = std::env::var("CCC_NO_SSA_PARAM").is_err();
+    // CCC_SSA_PARAM_SKIP=callee1,callee2 disables substitution for named
+    // callees; CCC_SSA_PARAM_LOG=1 traces substitutions (diagnostics).
+    let ssa_skip: std::collections::HashSet<String> = std::env::var("CCC_SSA_PARAM_SKIP")
+        .unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let ssa_log = std::env::var("CCC_SSA_PARAM_LOG").is_ok();
+    let substitutable: Vec<bool> = (0..param_alloca_info.len())
+        .map(|i| {
+            let ok = ssa_param_enabled
+                && !ssa_skip.contains(&site.callee_name)
+                && i < site.args.len()
+                && orig_homes.get(i).is_some_and(|h| param_substitutable(callee, i, *h));
+            if ok && ssa_log {
+                eprintln!("[SSA_PARAM] {} arg{} substituted", site.callee_name, i);
+            }
+            ok
+        })
+        .collect();
+    // home_subst: home id -> (arg, arg_ir_type). Substitution is restricted
+    // to COMPILE-TIME CONSTANT arguments: a substituted runtime value is an
+    // SSA value whose live range crosses the call site (and often loop
+    // boundaries); LCCC's linear-scan allocator can then assign it a
+    // callee-saved register that is never defined on some path (regression:
+    // zlib-ng deflateSetParamPre *out=param wrote a stale %rbx). Constants
+    // are materialized at the use site, so they have no register/liveness
+    // interaction and are unconditionally safe.
+    let mut home_subst: FxInlineMap<u32, (Operand, IrType)> = FxInlineMap::default();
+    for i in 0..param_alloca_info.len() {
+        if substitutable[i] {
+            if let Operand::Const(c) = &site.args[i] {
+                if let Some(at) = const_ir_type(c) {
+                    home_subst.insert(param_alloca_info[i].0 .0, (site.args[i], at));
+                }
+            }
+        }
+    }
+
     // Insert stores/memcpys of arguments into param allocas at the beginning of the
     // entry block (after the allocas themselves)
     let mut insert_pos = 0;
@@ -1318,18 +1929,26 @@ fn inline_call_site(
     let has_spans = !entry_block.source_spans.is_empty();
     let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
     for i in (0..num_args_to_store).rev() {
+        if home_subst.contains_key(&param_alloca_info[i].0 .0) {
+            continue; // value flows via SSA substitution, no home store needed
+        }
         let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
         if let Some(struct_size) = param_struct_size {
             // Struct-by-value parameter: the caller passes a pointer to the struct data.
             // We must copy the struct data from that pointer into the callee's param alloca.
             if let Operand::Value(src_ptr) = site.args[i] {
-                entry_block.instructions.insert(insert_pos, Instruction::Memcpy {
-                    dest: param_alloca_info[i].0,
-                    src: src_ptr,
-                    size: struct_size,
-                });
+                entry_block.instructions.insert(
+                    insert_pos,
+                    Instruction::Memcpy {
+                        dest: param_alloca_info[i].0,
+                        src: src_ptr,
+                        size: struct_size,
+                    },
+                );
                 if has_spans {
-                    entry_block.source_spans.insert(insert_pos, crate::common::source::Span::dummy());
+                    entry_block
+                        .source_spans
+                        .insert(insert_pos, crate::common::source::Span::dummy());
                 }
             } else {
                 // Struct arg should always be a Value (pointer), not a Const.
@@ -1339,14 +1958,19 @@ fn inline_call_site(
         } else {
             // Scalar parameter: store the value directly into the param alloca.
             let store_ty = param_alloca_info[i].1;
-            entry_block.instructions.insert(insert_pos, Instruction::Store {
-                val: site.args[i],
-                ptr: param_alloca_info[i].0,
-                ty: store_ty,
-                seg_override: AddressSpace::Default,
-            });
+            entry_block.instructions.insert(
+                insert_pos,
+                Instruction::Store {
+                    val: site.args[i],
+                    ptr: param_alloca_info[i].0,
+                    ty: store_ty,
+                    seg_override: AddressSpace::Default,
+                },
+            );
             if has_spans {
-                entry_block.source_spans.insert(insert_pos, crate::common::source::Span::dummy());
+                entry_block
+                    .source_spans
+                    .insert(insert_pos, crate::common::source::Span::dummy());
             }
         }
     }
@@ -1358,9 +1982,11 @@ fn inline_call_site(
     // instructions (and their associated stores to param allocas) are redundant.
     // We also remove the Store that immediately follows each ParamRef since it
     // stores the (now-removed) ParamRef dest into a param alloca.
-    let param_alloca_set: std::collections::HashSet<u32> = param_alloca_info.iter().map(|(v, _, _)| v.0).collect();
+    let param_alloca_set: std::collections::HashSet<u32> =
+        param_alloca_info.iter().map(|(v, _, _)| v.0).collect();
     for block in &mut inlined_blocks {
-        let has_spans = block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
+        let has_spans =
+            block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
         let old_spans = std::mem::take(&mut block.source_spans);
         let mut new_insts = Vec::with_capacity(block.instructions.len());
         let mut new_spans = Vec::new();
@@ -1372,8 +1998,39 @@ fn inline_call_site(
                 continue;
             }
             // Skip stores of ParamRef dests to param allocas
-            if let Instruction::Store { val: Operand::Value(v), ptr, .. } = &inst {
+            if let Instruction::Store {
+                val: Operand::Value(v),
+                ptr,
+                ..
+            } = &inst
+            {
                 if paramref_dests.contains(&v.0) && param_alloca_set.contains(&ptr.0) {
+                    continue;
+                }
+            }
+            // ms178: SSA parameter substitution — replace loads from a pure
+            // scalar param home with the call argument, and drop the now-dead
+            // home alloca.
+            if let Instruction::Alloca { dest, .. } = &inst {
+                if home_subst.contains_key(&dest.0) {
+                    continue;
+                }
+            }
+            if let Instruction::Load { dest, ptr, ty, .. } = &inst {
+                if let Some(&(arg, at)) = home_subst.get(&ptr.0) {
+                    if at == *ty {
+                        new_insts.push(Instruction::Copy { dest: *dest, src: arg });
+                    } else {
+                        new_insts.push(Instruction::Cast {
+                            dest: *dest,
+                            src: arg,
+                            from_ty: at,
+                            to_ty: *ty,
+                        });
+                    }
+                    if has_spans {
+                        new_spans.push(old_spans[idx]);
+                    }
                     continue;
                 }
             }
@@ -1483,13 +2140,13 @@ fn inline_call_site(
     // Update caller's next_value_id to account for the new values
     let new_next_value_id = value_offset + callee.next_value_id;
     if caller.next_value_id > 0 || new_next_value_id > caller.next_value_id {
-        caller.next_value_id = std::cmp::max(
-            new_next_value_id,
-            caller.next_value_id,
-        );
+        caller.next_value_id = std::cmp::max(new_next_value_id, caller.next_value_id);
     }
     if debug_inline_detail {
-        eprintln!("[INLINE_DETAIL]   after inline: caller.next_value_id={}", caller.next_value_id);
+        eprintln!(
+            "[INLINE_DETAIL]   after inline: caller.next_value_id={}",
+            caller.next_value_id
+        );
     }
 
     // Update the global max block ID so subsequent inlines use fresh IDs.
@@ -1530,40 +2187,66 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
         struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
+        struct_arg_is_f128_sse: Vec::new(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
+        ret_is_f128_sse: false,
     }
 }
 
 /// Remap all values and block references in an instruction.
 fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
     match inst {
-        Instruction::Alloca { dest, ty, size, align, volatile } => Instruction::Alloca {
+        Instruction::Alloca {
+            dest,
+            ty,
+            size,
+            align,
+            volatile,
+            semantic_volatile,
+        } => Instruction::Alloca {
             dest: remap_value(*dest, vo),
             ty: *ty,
             size: *size,
             align: *align,
             volatile: *volatile,
+            semantic_volatile: *semantic_volatile,
         },
         Instruction::DynAlloca { dest, size, align } => Instruction::DynAlloca {
             dest: remap_value(*dest, vo),
             size: remap_operand(size, vo),
             align: *align,
         },
-        Instruction::Store { val, ptr, ty, seg_override } => Instruction::Store {
+        Instruction::Store {
+            val,
+            ptr,
+            ty,
+            seg_override,
+        } => Instruction::Store {
             val: remap_operand(val, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
             seg_override: *seg_override,
         },
-        Instruction::Load { dest, ptr, ty, seg_override } => Instruction::Load {
+        Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            seg_override,
+        } => Instruction::Load {
             dest: remap_value(*dest, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
             seg_override: *seg_override,
         },
-        Instruction::BinOp { dest, op, lhs, rhs, ty } => Instruction::BinOp {
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => Instruction::BinOp {
             dest: remap_value(*dest, vo),
             op: *op,
             lhs: remap_operand(lhs, vo),
@@ -1576,7 +2259,13 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             src: remap_operand(src, vo),
             ty: *ty,
         },
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => Instruction::Cmp {
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => Instruction::Cmp {
             dest: remap_value(*dest, vo),
             op: *op,
             lhs: remap_operand(lhs, vo),
@@ -1591,13 +2280,23 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             func_ptr: remap_operand(func_ptr, vo),
             info: remap_call_info(info, vo),
         },
-        Instruction::GetElementPtr { dest, base, offset, ty } => Instruction::GetElementPtr {
+        Instruction::GetElementPtr {
+            dest,
+            base,
+            offset,
+            ty,
+        } => Instruction::GetElementPtr {
             dest: remap_value(*dest, vo),
             base: remap_value(*base, vo),
             offset: remap_operand(offset, vo),
             ty: *ty,
         },
-        Instruction::Cast { dest, src, from_ty, to_ty } => Instruction::Cast {
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => Instruction::Cast {
             dest: remap_value(*dest, vo),
             src: remap_operand(src, vo),
             from_ty: *from_ty,
@@ -1616,7 +2315,11 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             src: remap_value(*src, vo),
             size: *size,
         },
-        Instruction::VaArg { dest, va_list_ptr, result_ty } => Instruction::VaArg {
+        Instruction::VaArg {
+            dest,
+            va_list_ptr,
+            result_ty,
+        } => Instruction::VaArg {
             dest: remap_value(*dest, vo),
             va_list_ptr: remap_value(*va_list_ptr, vo),
             result_ty: *result_ty,
@@ -1631,13 +2334,25 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             dest_ptr: remap_value(*dest_ptr, vo),
             src_ptr: remap_value(*src_ptr, vo),
         },
-        Instruction::VaArgStruct { dest_ptr, va_list_ptr, size, ref eightbyte_classes } => Instruction::VaArgStruct {
+        Instruction::VaArgStruct {
+            dest_ptr,
+            va_list_ptr,
+            size,
+            ref eightbyte_classes,
+        } => Instruction::VaArgStruct {
             dest_ptr: remap_value(*dest_ptr, vo),
             va_list_ptr: remap_value(*va_list_ptr, vo),
             size: *size,
             eightbyte_classes: eightbyte_classes.clone(),
         },
-        Instruction::AtomicRmw { dest, op, ptr, val, ty, ordering } => Instruction::AtomicRmw {
+        Instruction::AtomicRmw {
+            dest,
+            op,
+            ptr,
+            val,
+            ty,
+            ordering,
+        } => Instruction::AtomicRmw {
             dest: remap_value(*dest, vo),
             op: *op,
             ptr: remap_operand(ptr, vo),
@@ -1645,7 +2360,27 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             ty: *ty,
             ordering: *ordering,
         },
-        Instruction::AtomicCmpxchg { dest, ptr, expected, desired, ty, success_ordering, failure_ordering, returns_bool } => Instruction::AtomicCmpxchg {
+        Instruction::AtomicInc {
+            ptr,
+            offset,
+            ty,
+            ordering,
+        } => Instruction::AtomicInc {
+            ptr: remap_operand(ptr, vo),
+            offset: *offset,
+            ty: *ty,
+            ordering: *ordering,
+        },
+        Instruction::AtomicCmpxchg {
+            dest,
+            ptr,
+            expected,
+            desired,
+            ty,
+            success_ordering,
+            failure_ordering,
+            returns_bool,
+        } => Instruction::AtomicCmpxchg {
             dest: remap_value(*dest, vo),
             ptr: remap_operand(ptr, vo),
             expected: remap_operand(expected, vo),
@@ -1655,13 +2390,23 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             failure_ordering: *failure_ordering,
             returns_bool: *returns_bool,
         },
-        Instruction::AtomicLoad { dest, ptr, ty, ordering } => Instruction::AtomicLoad {
+        Instruction::AtomicLoad {
+            dest,
+            ptr,
+            ty,
+            ordering,
+        } => Instruction::AtomicLoad {
             dest: remap_value(*dest, vo),
             ptr: remap_operand(ptr, vo),
             ty: *ty,
             ordering: *ordering,
         },
-        Instruction::AtomicStore { ptr, val, ty, ordering } => Instruction::AtomicStore {
+        Instruction::AtomicStore {
+            ptr,
+            val,
+            ty,
+            ordering,
+        } => Instruction::AtomicStore {
             ptr: remap_operand(ptr, vo),
             val: remap_operand(val, vo),
             ty: *ty,
@@ -1673,9 +2418,10 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
         Instruction::Phi { dest, ty, incoming } => Instruction::Phi {
             dest: remap_value(*dest, vo),
             ty: *ty,
-            incoming: incoming.iter().map(|(op, bid)| {
-                (remap_operand(op, vo), remap_block(*bid, bo))
-            }).collect(),
+            incoming: incoming
+                .iter()
+                .map(|(op, bid)| (remap_operand(op, vo), remap_block(*bid, bo)))
+                .collect(),
         },
         Instruction::LabelAddr { dest, label } => Instruction::LabelAddr {
             dest: remap_value(*dest, vo),
@@ -1699,23 +2445,52 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
         Instruction::SetReturnF128Second { src } => Instruction::SetReturnF128Second {
             src: remap_operand(src, vo),
         },
-        Instruction::InlineAsm { template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols, seg_overrides } => Instruction::InlineAsm {
+        Instruction::InlineAsm {
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+            seg_overrides,
+        } => Instruction::InlineAsm {
             template: template.clone(),
-            outputs: outputs.iter().map(|(c, v, n)| (c.clone(), remap_value(*v, vo), n.clone())).collect(),
-            inputs: inputs.iter().map(|(c, op, n)| (c.clone(), remap_operand(op, vo), n.clone())).collect(),
+            outputs: outputs
+                .iter()
+                .map(|(c, v, n)| (c.clone(), remap_value(*v, vo), n.clone()))
+                .collect(),
+            inputs: inputs
+                .iter()
+                .map(|(c, op, n)| (c.clone(), remap_operand(op, vo), n.clone()))
+                .collect(),
             clobbers: clobbers.clone(),
             operand_types: operand_types.clone(),
-            goto_labels: goto_labels.iter().map(|(name, bid)| (name.clone(), remap_block(*bid, bo))).collect(),
+            goto_labels: goto_labels
+                .iter()
+                .map(|(name, bid)| (name.clone(), remap_block(*bid, bo)))
+                .collect(),
             input_symbols: input_symbols.clone(),
             seg_overrides: seg_overrides.clone(),
         },
-        Instruction::Intrinsic { dest, op, dest_ptr, args } => Instruction::Intrinsic {
+        Instruction::Intrinsic {
+            dest,
+            op,
+            dest_ptr,
+            args,
+        } => Instruction::Intrinsic {
             dest: dest.map(|v| remap_value(v, vo)),
             op: *op,
             dest_ptr: dest_ptr.map(|v| remap_value(v, vo)),
             args: args.iter().map(|a| remap_operand(a, vo)).collect(),
         },
-        Instruction::Select { dest, cond, true_val, false_val, ty } => Instruction::Select {
+        Instruction::Select {
+            dest,
+            cond,
+            true_val,
+            false_val,
+            ty,
+        } => Instruction::Select {
             dest: remap_value(*dest, vo),
             cond: remap_operand(cond, vo),
             true_val: remap_operand(true_val, vo),
@@ -1728,7 +2503,11 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
         Instruction::StackRestore { ptr } => Instruction::StackRestore {
             ptr: remap_value(*ptr, vo),
         },
-        Instruction::ParamRef { dest, param_idx, ty } => Instruction::ParamRef {
+        Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } => Instruction::ParamRef {
             dest: remap_value(*dest, vo),
             param_idx: *param_idx,
             ty: *ty,
@@ -1741,18 +2520,36 @@ fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
     match term {
         Terminator::Return(op) => Terminator::Return(op.map(|o| remap_operand(&o, vo))),
         Terminator::Branch(bid) => Terminator::Branch(remap_block(*bid, bo)),
-        Terminator::CondBranch { cond, true_label, false_label } => Terminator::CondBranch {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => Terminator::CondBranch {
             cond: remap_operand(cond, vo),
             true_label: remap_block(*true_label, bo),
             false_label: remap_block(*false_label, bo),
         },
-        Terminator::IndirectBranch { target, possible_targets } => Terminator::IndirectBranch {
+        Terminator::IndirectBranch {
+            target,
+            possible_targets,
+        } => Terminator::IndirectBranch {
             target: remap_operand(target, vo),
-            possible_targets: possible_targets.iter().map(|b| remap_block(*b, bo)).collect(),
+            possible_targets: possible_targets
+                .iter()
+                .map(|b| remap_block(*b, bo))
+                .collect(),
         },
-        Terminator::Switch { val, cases, default, ty } => Terminator::Switch {
+        Terminator::Switch {
+            val,
+            cases,
+            default,
+            ty,
+        } => Terminator::Switch {
             val: remap_operand(val, vo),
-            cases: cases.iter().map(|&(v, bid)| (v, remap_block(bid, bo))).collect(),
+            cases: cases
+                .iter()
+                .map(|&(v, bid)| (v, remap_block(bid, bo)))
+                .collect(),
             default: remap_block(*default, bo),
             ty: *ty,
         },
@@ -1763,7 +2560,10 @@ fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
 /// Debug: dump function IR in a readable text format.
 fn dump_function_ir(func: &IrFunction, context: &str) {
     eprintln!("=== IR DUMP {} ===", context);
-    eprintln!("function {} (next_value_id={})", func.name, func.next_value_id);
+    eprintln!(
+        "function {} (next_value_id={})",
+        func.name, func.next_value_id
+    );
     for (bi, block) in func.blocks.iter().enumerate() {
         eprintln!("  block[{}] .L{}:", bi, block.label.0);
         for (ii, inst) in block.instructions.iter().enumerate() {
@@ -1783,8 +2583,17 @@ fn format_operand(op: &Operand) -> String {
 
 fn format_instruction(inst: &Instruction) -> String {
     match inst {
-        Instruction::Alloca { dest, ty, size, align, .. } => {
-            format!("v{} = alloca {:?} size={} align={}", dest.0, ty, size, align)
+        Instruction::Alloca {
+            dest,
+            ty,
+            size,
+            align,
+            ..
+        } => {
+            format!(
+                "v{} = alloca {:?} size={} align={}",
+                dest.0, ty, size, align
+            )
         }
         Instruction::Store { val, ptr, ty, .. } => {
             format!("store {:?} {} -> v{}", ty, format_operand(val), ptr.0)
@@ -1792,14 +2601,40 @@ fn format_instruction(inst: &Instruction) -> String {
         Instruction::Load { dest, ptr, ty, .. } => {
             format!("v{} = load {:?} v{}", dest.0, ty, ptr.0)
         }
-        Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-            format!("v{} = {:?} {:?} {}, {}", dest.0, op, ty, format_operand(lhs), format_operand(rhs))
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
+            format!(
+                "v{} = {:?} {:?} {}, {}",
+                dest.0,
+                op,
+                ty,
+                format_operand(lhs),
+                format_operand(rhs)
+            )
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
             format!("v{} = {:?} {:?} {}", dest.0, op, ty, format_operand(src))
         }
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            format!("v{} = cmp {:?} {:?} {}, {}", dest.0, op, ty, format_operand(lhs), format_operand(rhs))
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
+            format!(
+                "v{} = cmp {:?} {:?} {}, {}",
+                dest.0,
+                op,
+                ty,
+                format_operand(lhs),
+                format_operand(rhs)
+            )
         }
         Instruction::Call { func, info } => {
             let args_str: Vec<String> = info.args.iter().map(format_operand).collect();
@@ -1809,17 +2644,40 @@ fn format_instruction(inst: &Instruction) -> String {
                 format!("call {}({})", func, args_str.join(", "))
             }
         }
-        Instruction::Cast { dest, src, from_ty, to_ty } => {
-            format!("v{} = cast {:?}->{:?} {}", dest.0, from_ty, to_ty, format_operand(src))
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => {
+            format!(
+                "v{} = cast {:?}->{:?} {}",
+                dest.0,
+                from_ty,
+                to_ty,
+                format_operand(src)
+            )
         }
         Instruction::Copy { dest, src } => {
             format!("v{} = copy {}", dest.0, format_operand(src))
         }
-        Instruction::GetElementPtr { dest, base, offset, ty } => {
-            format!("v{} = gep {:?} v{}, {}", dest.0, ty, base.0, format_operand(offset))
+        Instruction::GetElementPtr {
+            dest,
+            base,
+            offset,
+            ty,
+        } => {
+            format!(
+                "v{} = gep {:?} v{}, {}",
+                dest.0,
+                ty,
+                base.0,
+                format_operand(offset)
+            )
         }
         Instruction::Phi { dest, ty, incoming } => {
-            let inc_str: Vec<String> = incoming.iter()
+            let inc_str: Vec<String> = incoming
+                .iter()
                 .map(|(op, bid)| format!("[{}, .L{}]", format_operand(op), bid.0))
                 .collect();
             format!("v{} = phi {:?} {}", dest.0, ty, inc_str.join(", "))
@@ -1830,8 +2688,21 @@ fn format_instruction(inst: &Instruction) -> String {
         Instruction::Memcpy { dest, src, size } => {
             format!("memcpy v{}, v{}, {}", dest.0, src.0, size)
         }
-        Instruction::Select { dest, cond, true_val, false_val, ty } => {
-            format!("v{} = select {:?} {}, {}, {}", dest.0, ty, format_operand(cond), format_operand(true_val), format_operand(false_val))
+        Instruction::Select {
+            dest,
+            cond,
+            true_val,
+            false_val,
+            ty,
+        } => {
+            format!(
+                "v{} = select {:?} {}, {}, {}",
+                dest.0,
+                ty,
+                format_operand(cond),
+                format_operand(true_val),
+                format_operand(false_val)
+            )
         }
         _ => format!("{:?}", inst),
     }
@@ -1842,18 +2713,63 @@ fn format_terminator(term: &Terminator) -> String {
         Terminator::Return(Some(op)) => format!("ret {}", format_operand(op)),
         Terminator::Return(None) => "ret void".to_string(),
         Terminator::Branch(bid) => format!("br .L{}", bid.0),
-        Terminator::CondBranch { cond, true_label, false_label } => {
-            format!("condbr {}, .L{}, .L{}", format_operand(cond), true_label.0, false_label.0)
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            format!(
+                "condbr {}, .L{}, .L{}",
+                format_operand(cond),
+                true_label.0,
+                false_label.0
+            )
         }
         Terminator::IndirectBranch { target, .. } => {
             format!("indirectbr {}", format_operand(target))
         }
-        Terminator::Switch { val, cases, default, .. } => {
-            let cases_str: Vec<String> = cases.iter()
+        Terminator::Switch {
+            val,
+            cases,
+            default,
+            ..
+        } => {
+            let cases_str: Vec<String> = cases
+                .iter()
                 .map(|(v, bid)| format!("{} => .L{}", v, bid.0))
                 .collect();
-            format!("switch {}, default .L{}, [{}]", format_operand(val), default.0, cases_str.join(", "))
+            format!(
+                "switch {}, default .L{}, [{}]",
+                format_operand(val),
+                default.0,
+                cases_str.join(", ")
+            )
         }
         Terminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+
+#[cfg(test)]
+mod inline_limit_tests {
+    use super::*;
+    #[test]
+    fn normal_limit_always_checks_blocks() {
+        assert!(!fits_normal_inline_limits(5, 20, false, false, false, 12));
+        assert!(fits_normal_inline_limits(5, 3, false, false, false, 12));
+    }
+    #[test]
+    fn medium_limit_is_static_only() {
+        assert!(fits_normal_inline_limits(80, 5, true, false, false, 6));
+        assert!(!fits_normal_inline_limits(80, 5, false, false, false, 6));
+        assert!(!fits_normal_inline_limits(80, 7, true, false, false, 6));
+    }
+    #[test]
+    fn vector_static_inline_limit() {
+        assert!(fits_normal_inline_limits(150, 12, true, true, true, 6));
+        assert!(fits_normal_inline_limits(199, 24, true, true, true, 6));
+        assert!(!fits_normal_inline_limits(201, 12, true, true, true, 6));
+        assert!(!fits_normal_inline_limits(150, 25, true, true, true, 6));
+        assert!(!fits_normal_inline_limits(150, 12, true, true, false, 6));
     }
 }

@@ -6,17 +6,9 @@
 //! in only a single block can safely share stack space with other block-local
 //! values.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrFunction,
-    Operand,
-    Terminator,
-    Value,
-};
+use crate::backend::liveness::for_each_operand_in_terminator;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::liveness::{
-    for_each_operand_in_terminator,
-};
+use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 
 /// Result of alloca coalescability analysis.
 pub(super) struct CoalescableAllocas {
@@ -37,7 +29,11 @@ struct AllocaEscapeAnalysis {
 }
 
 impl AllocaEscapeAnalysis {
-    fn new(func: &IrFunction, dead_param_allocas: &FxHashSet<u32>, param_alloca_values: &[Value]) -> Self {
+    fn new(
+        func: &IrFunction,
+        dead_param_allocas: &FxHashSet<u32>,
+        param_alloca_values: &[Value],
+    ) -> Self {
         let param_set: FxHashSet<u32> = param_alloca_values.iter().map(|v| v.0).collect();
         let mut alloca_set: FxHashSet<u32> = FxHashSet::default();
         for block in &func.blocks {
@@ -81,7 +77,9 @@ impl AllocaEscapeAnalysis {
         if let Some(root) = self.resolve_root(val_id) {
             self.escaped.insert(root);
             let blocks = self.use_blocks.entry(root).or_default();
-            if blocks.last() != Some(&block_idx) { blocks.push(block_idx); }
+            if blocks.last() != Some(&block_idx) {
+                blocks.push(block_idx);
+            }
         }
     }
 
@@ -138,57 +136,109 @@ impl AllocaEscapeAnalysis {
                 self.record_use(ptr.0, block_idx);
             }
             Instruction::Memcpy { dest, src, .. } => {
-                for v in [dest, src] { self.record_use(v.0, block_idx); }
+                for v in [dest, src] {
+                    self.record_use(v.0, block_idx);
+                }
             }
-            Instruction::InlineAsm { outputs, inputs, .. } => {
-                for (_, v, _) in outputs { self.mark_escaped(v.0, block_idx); }
+            Instruction::InlineAsm {
+                outputs, inputs, ..
+            } => {
+                for (_, v, _) in outputs {
+                    self.mark_escaped(v.0, block_idx);
+                }
                 for (_, op, _) in inputs {
-                    if let Operand::Value(v) = op { self.mark_escaped(v.0, block_idx); }
+                    if let Operand::Value(v) = op {
+                        self.mark_escaped(v.0, block_idx);
+                    }
                 }
             }
             Instruction::Intrinsic { dest_ptr, args, .. } => {
-                if let Some(dp) = dest_ptr { self.record_use(dp.0, block_idx); }
+                if let Some(dp) = dest_ptr {
+                    self.record_use(dp.0, block_idx);
+                }
                 for arg in args {
-                    if let Operand::Value(v) = arg { self.record_use(v.0, block_idx); }
+                    if let Operand::Value(v) = arg {
+                        self.record_use(v.0, block_idx);
+                    }
                 }
             }
             Instruction::AtomicRmw { ptr, val, .. } => {
                 self.mark_operand_escaped(val);
-                if let Operand::Value(v) = ptr { self.record_use(v.0, block_idx); }
+                if let Operand::Value(v) = ptr {
+                    self.record_use(v.0, block_idx);
+                }
             }
-            Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
-                for op in [expected, desired] { self.mark_operand_escaped(op); }
-                if let Operand::Value(v) = ptr { self.record_use(v.0, block_idx); }
+            Instruction::AtomicInc { ptr, .. } => {
+                if let Operand::Value(v) = ptr {
+                    self.record_use(v.0, block_idx);
+                }
             }
-            Instruction::AtomicLoad { ptr: Operand::Value(v), .. } => {
+            Instruction::AtomicCmpxchg {
+                ptr,
+                expected,
+                desired,
+                ..
+            } => {
+                for op in [expected, desired] {
+                    self.mark_operand_escaped(op);
+                }
+                if let Operand::Value(v) = ptr {
+                    self.record_use(v.0, block_idx);
+                }
+            }
+            Instruction::AtomicLoad {
+                ptr: Operand::Value(v),
+                ..
+            } => {
                 self.record_use(v.0, block_idx);
             }
             Instruction::AtomicStore { ptr, val, .. } => {
                 self.mark_operand_escaped(val);
-                if let Operand::Value(v) = ptr { self.record_use(v.0, block_idx); }
+                if let Operand::Value(v) = ptr {
+                    self.record_use(v.0, block_idx);
+                }
             }
-            Instruction::VaStart { va_list_ptr } | Instruction::VaEnd { va_list_ptr } | Instruction::VaArg { va_list_ptr, .. } => {
+            Instruction::VaStart { va_list_ptr }
+            | Instruction::VaEnd { va_list_ptr }
+            | Instruction::VaArg { va_list_ptr, .. } => {
                 self.mark_direct_escaped(va_list_ptr.0);
             }
             Instruction::VaCopy { dest_ptr, src_ptr } => {
                 self.mark_direct_escaped(dest_ptr.0);
                 self.mark_direct_escaped(src_ptr.0);
             }
-            Instruction::VaArgStruct { dest_ptr, va_list_ptr, .. } => {
+            Instruction::VaArgStruct {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            } => {
                 self.mark_direct_escaped(dest_ptr.0);
                 self.mark_direct_escaped(va_list_ptr.0);
             }
-            Instruction::Cast { src, .. } | Instruction::Copy { src, .. } | Instruction::UnaryOp { src, .. } => {
+            Instruction::Cast { src, .. }
+            | Instruction::Copy { src, .. }
+            | Instruction::UnaryOp { src, .. } => {
                 self.mark_operand_escaped(src);
             }
             Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-                for op in [lhs, rhs] { self.mark_operand_escaped(op); }
+                for op in [lhs, rhs] {
+                    self.mark_operand_escaped(op);
+                }
             }
-            Instruction::Select { cond, true_val, false_val, .. } => {
-                for op in [cond, true_val, false_val] { self.mark_operand_escaped(op); }
+            Instruction::Select {
+                cond,
+                true_val,
+                false_val,
+                ..
+            } => {
+                for op in [cond, true_val, false_val] {
+                    self.mark_operand_escaped(op);
+                }
             }
             Instruction::Phi { incoming, .. } => {
-                for (op, _) in incoming { self.mark_operand_escaped(op); }
+                for (op, _) in incoming {
+                    self.mark_operand_escaped(op);
+                }
             }
             _ => {}
         }
@@ -240,7 +290,10 @@ pub(super) fn compute_coalescable_allocas(
 ) -> CoalescableAllocas {
     let mut analysis = AllocaEscapeAnalysis::new(func, dead_param_allocas, param_alloca_values);
     if analysis.alloca_set.is_empty() {
-        return CoalescableAllocas { single_block: FxHashMap::default(), dead: FxHashSet::default() };
+        return CoalescableAllocas {
+            single_block: FxHashMap::default(),
+            dead: FxHashSet::default(),
+        };
     }
     analysis.scan_instructions(func);
     analysis.into_result()

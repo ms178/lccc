@@ -16,13 +16,13 @@
 //!   pred_block:
 //!     %phi1_dest = copy src1
 //!     %phi2_dest = copy src2
-//!     <terminator>
+//!     `<terminator>`
 //!
 //! For conflicting phis (cycles), we use shared temporaries and a two-phase
 //! copy sequence to avoid the lost-copy problem:
 //!   pred_block:
 //!     %tmp1 = copy src1  // save source before it's overwritten
-//!     <terminator>
+//!     `<terminator>`
 //!   target_block:
 //!     %phi1_dest = copy %tmp1  // restore from temporary
 //!     ... rest of block ...

@@ -373,6 +373,39 @@ impl MacroTable {
             } else if b == BLUE_PAINT_MARKER {
                 i = Self::copy_blue_painted(bytes, i, &mut result);
             } else if is_ident_start_byte(b) && !(self.asm_mode && b == b'$') {
+                // `defined X` / `defined(X)` operands must not be macro-expanded
+                // (C11 6.10.1p1). This matters when a macro BODY contains
+                // `defined X` (e.g. glibc's ISA_SHOULD_BUILD): expanding the
+                // operand here would turn `defined FOO` into `defined 1` and
+                // the #if evaluator could no longer resolve it.
+                if bytes[i..].starts_with(b"defined")
+                    && (i + 7 >= len || !is_ident_cont_byte(bytes[i + 7]))
+                {
+                    let mut j = i + 7;
+                    while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') { j += 1; }
+                    let has_paren = j < len && bytes[j] == b'(';
+                    if has_paren {
+                        j += 1;
+                        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') { j += 1; }
+                    }
+                    let name_start = j;
+                    while j < len && is_ident_cont_byte(bytes[j]) { j += 1; }
+                    if name_start == j {
+                        // Not a valid defined-operand; fall back to normal expansion.
+                        i = self.expand_identifier(text, bytes, i, &mut result, expanding);
+                        continue;
+                    }
+                    result.push_str(&text[i..j]); // "defined X" or "defined (X"
+                    i = j;
+                    if has_paren {
+                        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') { i += 1; }
+                        if i < len && bytes[i] == b')' {
+                            result.push(')');
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
                 i = self.expand_identifier(text, bytes, i, &mut result, expanding);
             } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
                 i = Self::copy_block_comment(bytes, i, &mut result);
