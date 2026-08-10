@@ -262,12 +262,10 @@ impl X86Codegen {
         // consumer emits `jcc`/`cmovcc` directly. This is the single biggest
         // instruction-count win in branch-heavy code (gzip's longest_match).
         //
-        // Soundness: the Cmp handler only skips the setcc when the map says
-        // the consumer is the next instruction, and the dispatch loop runs
-        // instructions in order with nothing inserted in between (the
-        // machinst lowering path is opt-in via CCC_USE_MACHINST and bypasses
-        // both handlers, so the map is ignored there — the Cmp then takes the
-        // normal path and the bool is materialized).
+        // Soundness: the Cmp handler only skips setcc when the map proves the
+        // consumer is next, and the dispatch loop emits that pair adjacently.
+        // MachInst explicitly declines fused Cmp and Select candidates so it
+        // cannot bypass this pending-flags handshake.
         {
             let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
             let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
@@ -415,6 +413,38 @@ impl X86Codegen {
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
         );
+
+        // MachInst is profitable on straight-line and modest-CFG code, but its
+        // current local scheduler regressed gzip's large hot loops by ~3% even
+        // while shrinking them. Keep it default-on selectively: functions with
+        // a large static loop body use the mature backend. This is a target-
+        // independent cost decision, not a function-name exception.
+        let max_loop_insts = std::env::var("CCC_MI_MAX_LOOP_INSTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32);
+        let loop_insts = cached_liveness
+            .as_ref()
+            .map(|liveness| {
+                func.blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        liveness.block_loop_depth.get(*index).copied().unwrap_or(0) > 0
+                    })
+                    .map(|(_, block)| block.instructions.len() + 1)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        self.machinst_function_enabled = self.machinst_enabled
+            && (loop_insts <= max_loop_insts
+                || std::env::var("CCC_MI_FORCE_LOOPS").is_ok());
+        if std::env::var("CCC_MI_DEBUG").is_ok() {
+            eprintln!(
+                "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={}",
+                func.name, loop_insts, max_loop_insts, self.machinst_function_enabled
+            );
+        }
 
 
             // W2 Load->Cast fold (2026-08-10): when a Load's result is used

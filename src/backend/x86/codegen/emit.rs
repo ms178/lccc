@@ -371,8 +371,75 @@ pub struct X86Codegen {
     /// path instead of being silently deleted (which miscompiled gzip:
     /// missing loads/ALU -> segfault).
     pub(super) machinst_buf_ir: Vec<crate::ir::reexports::Instruction>,
-    /// Whether MachInst ISel is enabled (CCC_USE_MACHINST env var).
+    /// Whether MachInst ISel is globally enabled. Default-on after gzip and
+    /// SQLite correctness bring-up; CCC_NO_MACHINST=1 is the fail-safe switch.
     pub(super) machinst_enabled: bool,
+    /// Per-function profitability decision. Large loop bodies stay on the
+    /// mature backend until MachInst has loop-aware scheduling.
+    pub(super) machinst_function_enabled: bool,
+    /// Diagnostic/profitability mask from CCC_MI_DISABLE_KINDS. Each bit
+    /// disables one IR instruction family without disabling whole functions.
+    pub(super) machinst_disabled_kinds: u16,
+}
+
+const MI_BINOP: u16 = 1 << 0;
+const MI_LOAD: u16 = 1 << 1;
+const MI_STORE: u16 = 1 << 2;
+const MI_COPY: u16 = 1 << 3;
+const MI_CMP: u16 = 1 << 4;
+const MI_CAST: u16 = 1 << 5;
+const MI_UNARY: u16 = 1 << 6;
+const MI_SELECT: u16 = 1 << 7;
+const MI_GEP: u16 = 1 << 8;
+const MI_ALLOCA: u16 = 1 << 9;
+const MI_CAST_WIDEN: u16 = 1 << 10;
+const MI_CAST_NARROW: u16 = 1 << 11;
+const MI_CAST_SAME: u16 = 1 << 12;
+const MI_CAST_SIGNED_SOURCE: u16 = 1 << 13;
+const MI_CAST_UNSIGNED_SOURCE: u16 = 1 << 14;
+
+fn parse_machinst_disabled_kinds() -> u16 {
+    std::env::var("CCC_MI_DISABLE_KINDS")
+        .unwrap_or_default()
+        .split(',')
+        .fold(0, |mask, name| {
+            mask | match name.trim() {
+                "binop" => MI_BINOP,
+                "load" => MI_LOAD,
+                "store" => MI_STORE,
+                "copy" => MI_COPY,
+                "cmp" => MI_CMP,
+                "cast" => MI_CAST,
+                "unary" => MI_UNARY,
+                "select" => MI_SELECT,
+                "gep" => MI_GEP,
+                "alloca" => MI_ALLOCA,
+                "cast-widen" => MI_CAST_WIDEN,
+                "cast-narrow" => MI_CAST_NARROW,
+                "cast-same" => MI_CAST_SAME,
+                "cast-signed-source" => MI_CAST_SIGNED_SOURCE,
+                "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
+                "all" => u16::MAX,
+                _ => 0,
+            }
+        })
+}
+
+fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u16 {
+    use crate::ir::reexports::Instruction;
+    match inst {
+        Instruction::BinOp { .. } => MI_BINOP,
+        Instruction::Load { .. } => MI_LOAD,
+        Instruction::Store { .. } => MI_STORE,
+        Instruction::Copy { .. } => MI_COPY,
+        Instruction::Cmp { .. } => MI_CMP,
+        Instruction::Cast { .. } => MI_CAST,
+        Instruction::UnaryOp { .. } => MI_UNARY,
+        Instruction::Select { .. } => MI_SELECT,
+        Instruction::GetElementPtr { .. } => MI_GEP,
+        Instruction::Alloca { .. } => MI_ALLOCA,
+        _ => 0,
+    }
 }
 
 /// Information about an IVSR-transformed pointer induction variable
@@ -425,7 +492,9 @@ impl X86Codegen {
             caller_save_intervals: FxHashMap::default(),
             machinst_buf: Vec::new(),
             machinst_buf_ir: Vec::new(),
-            machinst_enabled: std::env::var("CCC_USE_MACHINST").is_ok(),
+            machinst_enabled: std::env::var("CCC_NO_MACHINST").is_err(),
+            machinst_function_enabled: false,
+            machinst_disabled_kinds: parse_machinst_disabled_kinds(),
         }
     }
 
@@ -2837,17 +2906,17 @@ fn resolve_stack_vregs(
     }
 }
 
-/// Check if a MachInst contains any virtual registers that don't have
-/// register assignments (would produce `%vregN` in the output).
-fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, PhysReg>) -> bool {
+/// Check whether a MachInst still contains any virtual register.
+///
+/// Instruction selection converts every usable main-allocator GPR assignment
+/// to `MachReg::Phys`. A remaining `Vreg` is therefore unresolved even when the
+/// main assignment map contains the value (notably when that assignment is an
+/// XMM register, which integer MachInst deliberately maps back to a Vreg).
+/// Treating `ra.contains_key(id)` as resolution allowed `%vregN` to reach the
+/// assembler and caused SQLite's MachInst build to fail on unary operations.
+fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, PhysReg>) -> bool {
     use super::machinst::{MachInst, MachOperand, MachReg};
-    let check_reg = |r: &MachReg| -> bool {
-        if let MachReg::Vreg(id) = r {
-            !ra.contains_key(id)
-        } else {
-            false
-        }
-    };
+    let check_reg = |r: &MachReg| -> bool { matches!(r, MachReg::Vreg(_)) };
     let check_op = |o: &MachOperand| -> bool {
         match o {
             MachOperand::Reg(r) => check_reg(r),
@@ -2932,7 +3001,7 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn is_machinst_enabled(&self) -> bool {
-        self.machinst_enabled
+        self.machinst_enabled && self.machinst_function_enabled
     }
 
     fn supports_inline_memcpy_call(&self) -> bool {
@@ -2944,8 +3013,69 @@ impl ArchCodegen for X86Codegen {
         inst: &crate::ir::reexports::Instruction,
         folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
     ) -> bool {
-        if !self.machinst_enabled {
+        if !self.machinst_enabled
+            || !self.machinst_function_enabled
+            || self.machinst_disabled_kinds & machinst_kind_bit(inst) != 0
+        {
             return false;
+        }
+        // W2 Load->Cast folding is a two-instruction runtime handshake: the
+        // default Load emitter redirects into the Cast destination and arms
+        // fold_skip_cast; the default Cast emitter consumes that handshake.
+        // Lowering the Cast through MachInst bypasses the consumer and emits a
+        // second conversion from the load's stale original home. This corrupted
+        // gzip's gzip_deflate/compress_block byte loads. Keep candidate Casts on
+        // the default path; if a particular Load could not redirect, the default
+        // Cast simply emits normally.
+        if let crate::ir::reexports::Instruction::Cast {
+            dest,
+            from_ty,
+            to_ty,
+            ..
+        } = inst
+        {
+            if self.folded_cast_dests.contains(&dest.0) {
+                return false;
+            }
+            // Signed widening remains on the mature path. Although the raw
+            // movsx selection is straightforward, SQLite's optimized VDBE has
+            // overlapping allocator locations where the mature cast emitter's
+            // type-aware relay/liveness handling is required; MachInst corrupted
+            // an UnpackedRecord pointer before sqlite3BtreeIndexMoveto. Category
+            // bisection proved this exact class, while unsigned widening,
+            // narrowing, and same-width casts pass. This guard is narrow and
+            // preserves all measured-safe MachInst coverage.
+            if to_ty.size() > from_ty.size() && !from_ty.is_unsigned() {
+                return false;
+            }
+            let shape_bit = match to_ty.size().cmp(&from_ty.size()) {
+                std::cmp::Ordering::Greater => MI_CAST_WIDEN,
+                std::cmp::Ordering::Less => MI_CAST_NARROW,
+                std::cmp::Ordering::Equal => MI_CAST_SAME,
+            };
+            let sign_bit = if from_ty.is_unsigned() {
+                MI_CAST_UNSIGNED_SOURCE
+            } else {
+                MI_CAST_SIGNED_SOURCE
+            };
+            if self.machinst_disabled_kinds & (shape_bit | sign_bit) != 0 {
+                return false;
+            }
+        }
+        // Keep Select on the mature path. MachInst's current lowering reserves
+        // rax for the true value, but resolving a stack-backed condition also
+        // uses rax as a relay, clobbering that true value before cmov. The mature
+        // path additionally consumes pending Cmp flags directly and is both
+        // smaller and faster. Keep the preceding fused Cmp there as well so the
+        // boolean is never needlessly materialized (gzip huft_build regression).
+        match inst {
+            crate::ir::reexports::Instruction::Select { .. } => return false,
+            crate::ir::reexports::Instruction::Cmp { dest, .. }
+                if self.fused_cmp_dests.contains_key(&dest.0) =>
+            {
+                return false;
+            }
+            _ => {}
         }
         // Debug knob: CCC_MI_SKIP_FUNC=name1,name2 disables the MachInst path
         // for whole functions (diagnostic bisection aid).
@@ -3027,7 +3157,15 @@ impl ArchCodegen for X86Codegen {
                     reject = true;
                 }
             }
-            crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
+            crate::ir::reexports::Instruction::GetElementPtr { base, offset, .. } => {
+                // GetElementPtr does not encode the variable index's effective
+                // signed width. Feeding an I32 -1 directly to 64-bit LEA turns
+                // it into +0xffffffff (SQLite FTS5 porter Step1B2 crash).
+                // Constant offsets remain MachInst-safe; variable offsets stay
+                // on mature codegen until machine IR carries a typed index.
+                if matches!(offset, crate::ir::reexports::Operand::Value(_)) {
+                    reject = true;
+                }
                 // Over-aligned alloca bases need the aligned address; the
                 // default path computes it, MachInst would use the raw slot.
                 if state.is_alloca(base.0) {
@@ -3702,5 +3840,31 @@ impl ArchCodegen for X86Codegen {
 impl Default for X86Codegen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod machinst_resolution_tests {
+    use super::*;
+    use super::super::machinst::{MachInst, MachReg, OpSize};
+
+    #[test]
+    fn vreg_is_unresolved_even_if_main_map_has_xmm_assignment() {
+        let inst = MachInst::Neg {
+            dst: MachReg::Vreg(7),
+            size: OpSize::S64,
+        };
+        let mut assignments = FxHashMap::default();
+        assignments.insert(7, PhysReg(20));
+        assert!(has_unresolvable_vreg(&inst, &assignments));
+    }
+
+    #[test]
+    fn physical_unary_register_is_resolved() {
+        let inst = MachInst::Not {
+            dst: MachReg::Phys(PhysReg(1)),
+            size: OpSize::S64,
+        };
+        assert!(!has_unresolvable_vreg(&inst, &FxHashMap::default()));
     }
 }

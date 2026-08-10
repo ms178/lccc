@@ -209,7 +209,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // unaffected but other code with certain loop shapes was). It also does not
     // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
     let skip_phase4 = !std::env::var("CCC_PEEPHOLE_PHASE4").is_ok()
-        || std::env::var("CCC_USE_MACHINST").is_ok(); // Phase 4 has a register renaming bug triggered by MachInst
+        || std::env::var("CCC_NO_MACHINST").is_err(); // Phase 4 renaming is not MachInst-safe
     let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
     let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
     let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
@@ -1698,6 +1698,23 @@ mod regression_tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("movq %rax, -24(%rbp)"), "{}", result);
         assert!(result.contains("movq -24(%rbp), %rax"), "{}", result);
+    }
+
+    #[test]
+    fn test_volatile_unknown_dest_invalidates_rax_zero_fact() {
+        // pin_volatile_stack_slots deliberately turns the load into opaque
+        // Other{REG_NONE}. It still writes eax, so the second zeroing operation
+        // is required before pushq. This is the reduced sqlite3MultiValues
+        // outgoing-stack-argument corruption pattern.
+        let asm = [
+            "    # LCCC_VOLATILE_SLOT 8(%rsp)",
+            "    xorl %eax, %eax",
+            "    movl 8(%rsp), %eax",
+            "    xorl %eax, %eax",
+            "    pushq %rax",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("xorl %eax, %eax").count(), 2, "{}", result);
     }
 
     #[test]

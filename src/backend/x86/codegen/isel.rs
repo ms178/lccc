@@ -183,6 +183,47 @@ pub fn lower_binop(
     let size = OpSize::from_ir_type(ty);
     let dst = value_to_reg(dest, ra);
 
+    // 64-bit Add is an address-generation operation regardless of whether the
+    // C source spells it as pointer arithmetic or integer arithmetic. Use LEA
+    // whenever both inputs fit its base/index/displacement form. Unlike the old
+    // mov+add sequence this is one uop and does not create a flags dependency.
+    if op == IrBinOp::Add && size == OpSize::S64 {
+        match (lhs, rhs) {
+            (Operand::Value(base), Operand::Value(index)) => {
+                out.push(MachInst::Lea {
+                    base: value_to_reg(base, ra),
+                    index: Some((value_to_reg(index, ra), 1)),
+                    offset: 0,
+                    dst,
+                });
+                return;
+            }
+            (Operand::Value(base), Operand::Const(_)) => {
+                if let Some(offset) = const_as_imm32(rhs) {
+                    out.push(MachInst::Lea {
+                        base: value_to_reg(base, ra),
+                        index: None,
+                        offset,
+                        dst,
+                    });
+                    return;
+                }
+            }
+            (Operand::Const(_), Operand::Value(base)) => {
+                if let Some(offset) = const_as_imm32(lhs) {
+                    out.push(MachInst::Lea {
+                        base: value_to_reg(base, ra),
+                        index: None,
+                        offset,
+                        dst,
+                    });
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ── Simple ALU operations (two-address form) ─────────────────────
     if let Some(alu_op) = binop_to_alu(op) {
         if op == IrBinOp::Mul {
@@ -234,7 +275,18 @@ pub fn lower_binop(
         IrBinOp::SDiv | IrBinOp::SRem => {
             emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
             out.push(MachInst::Cqto { size });
-            let divisor_op = lower_operand_with_regs(rhs, ra);
+            let mut divisor_op = lower_operand_with_regs(rhs, ra);
+            // x86 div/idiv has no immediate form. Materialize constants in the
+            // dedicated rcx scratch register rather than emitting invalid
+            // `idivq $imm` text (SQLite amalgamation assembler failure).
+            if let MachOperand::Imm(value) = divisor_op {
+                out.push(MachInst::Mov {
+                    src: MachOperand::Imm(value),
+                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                    size,
+                });
+                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
+            }
             out.push(MachInst::Div { divisor: divisor_op, signed: true, size });
             let result_phys = if op == IrBinOp::SDiv { RAX } else { RDX };
             out.push(MachInst::Mov {
@@ -245,7 +297,15 @@ pub fn lower_binop(
         IrBinOp::UDiv | IrBinOp::URem => {
             emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
             out.push(MachInst::XorRdx);
-            let divisor_op = lower_operand_with_regs(rhs, ra);
+            let mut divisor_op = lower_operand_with_regs(rhs, ra);
+            if let MachOperand::Imm(value) = divisor_op {
+                out.push(MachInst::Mov {
+                    src: MachOperand::Imm(value),
+                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                    size,
+                });
+                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
+            }
             out.push(MachInst::Div { divisor: divisor_op, signed: false, size });
             let result_phys = if op == IrBinOp::UDiv { RAX } else { RDX };
             out.push(MachInst::Mov {
@@ -337,8 +397,30 @@ pub fn lower_cmp(
     let size = OpSize::from_ir_type(ty);
     let dst = value_to_reg(dest, ra);
     let cc = cmp_to_cc(op);
-    let lhs_op = lower_operand_with_regs(lhs, ra);
-    let rhs_op = lower_operand_with_regs(rhs, ra);
+    let mut lhs_op = lower_operand_with_regs(lhs, ra);
+    let mut rhs_op = lower_operand_with_regs(rhs, ra);
+
+    // AT&T cmp encodes `cmp rhs,lhs`; lhs is the ModRM destination and cannot
+    // be an immediate. Materialize it in rax. A rhs immediate wider than imm32
+    // uses rcx so it cannot overwrite an lhs already materialized in rax.
+    if let MachOperand::Imm(value) = lhs_op {
+        out.push(MachInst::Mov {
+            src: MachOperand::Imm(value),
+            dst: MachOperand::Reg(MachReg::Phys(RAX)),
+            size,
+        });
+        lhs_op = MachOperand::Reg(MachReg::Phys(RAX));
+    }
+    if let MachOperand::Imm(value) = rhs_op {
+        if value < i32::MIN as i64 || value > i32::MAX as i64 {
+            out.push(MachInst::Mov {
+                src: MachOperand::Imm(value),
+                dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                size,
+            });
+            rhs_op = MachOperand::Reg(MachReg::Phys(RCX));
+        }
+    }
     out.push(MachInst::Cmp { lhs: lhs_op, rhs: rhs_op, size });
     out.push(MachInst::SetCC { cc, dst });
     out.push(MachInst::Movzx { src: MachOperand::Reg(dst), dst, from_size: OpSize::S8, to_size: OpSize::S32 });
@@ -391,7 +473,13 @@ pub fn lower_cast(
         }
     };
 
-    if to_ty.is_unsigned() || from_ty.is_unsigned() {
+    // Widening extension is determined solely by the SOURCE type. C converts
+    // a signed negative source to its mathematical value before conversion to
+    // a wider unsigned destination, so I32(-1)->U64 must sign-extend to
+    // UINT64_MAX. Conversely U32->I64 zero-extends. Including destination
+    // unsignedness here zero-extended negative SQLite VDBE values and caused
+    // PRAGMA integrity_check to produce no result row.
+    if from_ty.is_unsigned() {
         out.push(MachInst::Movzx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
     } else {
         out.push(MachInst::Movsx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
@@ -480,6 +568,21 @@ pub fn lower_gep(
         return;
     }
 
+    if let Operand::Value(index) = offset {
+        // x86 has a native base+index addressing calculation. The old
+        // MachInst lowering emitted `mov base,dst; add index,dst`, doubling
+        // instruction count in pointer-heavy gzip/SQLite loops and creating an
+        // unnecessary flags dependency. LEA is one flag-neutral instruction.
+        out.push(MachInst::Lea {
+            base: base_reg,
+            index: Some((value_to_reg(index, ra), 1)),
+            offset: 0,
+            dst,
+        });
+        return;
+    }
+
+    // Defensive fallback for any future non-constant/non-value operand kind.
     out.push(MachInst::Mov {
         src: MachOperand::Reg(base_reg),
         dst: MachOperand::Reg(dst),
@@ -701,5 +804,177 @@ pub fn lower_instruction_ctx(
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widening_cast_uses_source_signedness() {
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        assignments.insert(2, PhysReg(2));
+
+        let mut signed_to_unsigned = Vec::new();
+        lower_cast(
+            &Value(2),
+            &Operand::Value(Value(1)),
+            IrType::I32,
+            IrType::U64,
+            &assignments,
+            &mut signed_to_unsigned,
+        );
+        assert!(matches!(
+            signed_to_unsigned.as_slice(),
+            [MachInst::Movsx {
+                from_size: OpSize::S32,
+                to_size: OpSize::S64,
+                ..
+            }]
+        ));
+
+        let mut unsigned_to_signed = Vec::new();
+        lower_cast(
+            &Value(2),
+            &Operand::Value(Value(1)),
+            IrType::U32,
+            IrType::I64,
+            &assignments,
+            &mut unsigned_to_signed,
+        );
+        assert!(matches!(
+            unsigned_to_signed.as_slice(),
+            [MachInst::Movzx {
+                from_size: OpSize::S32,
+                to_size: OpSize::S64,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn compare_with_immediate_lhs_materializes_destination_operand() {
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        let mut out = Vec::new();
+        lower_cmp(
+            &Value(1),
+            IrCmpOp::Eq,
+            &Operand::Const(IrConst::I64(0)),
+            &Operand::Const(IrConst::I64(0)),
+            IrType::I64,
+            &assignments,
+            &mut out,
+        );
+        assert!(matches!(
+            out.first(),
+            Some(MachInst::Mov {
+                src: MachOperand::Imm(0),
+                dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                size: OpSize::S64,
+            })
+        ));
+        assert!(out.iter().any(|inst| matches!(
+            inst,
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(MachReg::Phys(RAX)),
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64,
+            }
+        )));
+    }
+
+    #[test]
+    fn immediate_divisor_is_materialized_in_rcx() {
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        assignments.insert(2, PhysReg(2));
+        let mut out = Vec::new();
+        lower_binop(
+            &Value(2),
+            IrBinOp::SDiv,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I64(8)),
+            IrType::I64,
+            &assignments,
+            &mut out,
+        );
+        assert!(out.iter().any(|inst| matches!(
+            inst,
+            MachInst::Mov {
+                src: MachOperand::Imm(8),
+                dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                size: OpSize::S64,
+            }
+        )));
+        assert!(out.iter().any(|inst| matches!(
+            inst,
+            MachInst::Div {
+                divisor: MachOperand::Reg(MachReg::Phys(RCX)),
+                signed: true,
+                size: OpSize::S64,
+            }
+        )));
+        assert!(!out.iter().any(|inst| matches!(
+            inst,
+            MachInst::Div {
+                divisor: MachOperand::Imm(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn i64_add_lowers_to_single_lea() {
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        assignments.insert(2, PhysReg(2));
+        assignments.insert(3, PhysReg(3));
+        let mut out = Vec::new();
+        lower_binop(
+            &Value(3),
+            IrBinOp::Add,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            IrType::I64,
+            &assignments,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [MachInst::Lea {
+                base: MachReg::Phys(PhysReg(1)),
+                index: Some((MachReg::Phys(PhysReg(2)), 1)),
+                offset: 0,
+                dst: MachReg::Phys(PhysReg(3)),
+            }]
+        ));
+    }
+
+    #[test]
+    fn variable_gep_lowers_to_single_lea() {
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        assignments.insert(2, PhysReg(2));
+        assignments.insert(3, PhysReg(3));
+        let mut out = Vec::new();
+        lower_gep(
+            &Value(3),
+            &Value(1),
+            &Operand::Value(Value(2)),
+            &assignments,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [MachInst::Lea {
+                base: MachReg::Phys(PhysReg(1)),
+                index: Some((MachReg::Phys(PhysReg(2)), 1)),
+                offset: 0,
+                dst: MachReg::Phys(PhysReg(3)),
+            }]
+        ));
     }
 }

@@ -169,8 +169,19 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 let trimmed = infos[i].trimmed(store.get(i));
                 rax_is_zero = trimmed == "xorl %eax, %eax";
             }
-            LineKind::Other { dest_reg } if dest_reg != 0 => {
-                // Writes to a non-rax register, rax_is_zero unchanged.
+            LineKind::Other { dest_reg: REG_NONE } => {
+                // REG_NONE is not a known non-rax destination; it means line
+                // classification could not determine the destination. This is
+                // intentional for volatile stack accesses quarantined by
+                // pin_volatile_stack_slots and also occurs for unrecognized
+                // memory-source forms. Such a line MAY write rax/eax, so no
+                // register-value fact survives it. Keeping rax_is_zero here
+                // removed the required zero before a pushq in sqlite3MultiValues
+                // and corrupted an outgoing stack argument.
+                rax_is_zero = false;
+            }
+            LineKind::Other { dest_reg: _ } => {
+                // Writes to a known non-rax register, rax_is_zero unchanged.
                 // But check if it also reads/clobbers rax implicitly.
                 // Most Other instructions only write their dest_reg.
                 // Conservative: only keep rax_is_zero if the instruction
