@@ -1,0 +1,1 @@
+volatile call argument zeroing (regression: volatile slot demotion corrupts rax_is_zero tracking)
