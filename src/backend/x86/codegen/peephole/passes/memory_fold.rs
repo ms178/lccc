@@ -16,7 +16,7 @@
 //! rcx=1, rdx=2) to avoid breaking live register values.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, is_read_modify_write, is_rsp_shift_line};
+use super::helpers::{get_dest_reg, is_read_modify_write, is_rsp_shift_line, implicit_read_reg_family};
 
 /// Format a stack slot as an assembly memory operand string.
 /// Uses (%rbp) or (%rsp) depending on the original instruction text.
@@ -915,8 +915,10 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
 
 /// Fuse a register-memory load with a following dead single-use register copy:
 ///
+/// ```text
 ///     movzbl (%rcx,%r9), %esi      movzbl (%rcx,%r9), %r8d
 ///     movl   %esi, %r8d        =>  (copy removed)
+/// ```
 ///
 /// Dominant redundant-copy shape in hot byte loops (gzip longest_match).
 /// Soundness: the copy must be the load's ONLY consumer — the loaded register
@@ -1087,8 +1089,19 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
                     break;
                 }
                 _ => {
+                    // Instructions with implicit register usage (cltq/cqto/cdq/
+                    // cqo read %eax, div/idiv/mul read %rax:%rdx, shld/shrd read
+                    // %cl) can read the loaded register even when the text names
+                    // no register of this family. They are never a pure write, so
+                    // they must veto the fuse: retargeting the load would leave
+                    // the implicit read seeing an un-loaded register.
+                    // (Regression: gzip 1.14 pqdownheap/gen_codes SIGBUS/SIGSEGV
+                    // when `cltq` after a relayed load read undefined %eax.)
+                    let td = infos[k].trimmed(store.get(k));
+                    if implicit_read_reg_family(td) == Some(load_fam) {
+                        break;
+                    }
                     if infos[k].reg_refs & (1u16 << load_fam) != 0 {
-                        let td = infos[k].trimmed(store.get(k));
                         // A pure write to the register family (dest-only) kills it.
                         let writes = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == load_fam);
                         let reads_src = reg_names_family(load_fam)
@@ -1163,5 +1176,67 @@ fn reg_names_family(fam: u8) -> &'static [&'static str] {
         14 => &["%r14", "%r14d", "%r14w", "%r14b"],
         15 => &["%r15", "%r15d", "%r15w", "%r15b"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod fold_load_copy_relay_tests {
+    use super::super::super::types::classify_line;
+    use crate::backend::peephole_common::LineStore;
+    use super::fold_load_copy_relay;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_load_copy_relay(&mut store, &mut infos);
+        let out = (0..store.len()).map(|i| store.get(i).to_string()).collect();
+        (changed, out)
+    }
+
+    /// Regression: gzip 1.14 pqdownheap prologue. After a redundant-copy
+    /// elimination the sequence is:
+    ///   movslq 40(%rsp), %rax ; movq %rax, %rbp ; cltq ; movq %rax, 16(%rsp)
+    /// `cltq` implicitly READS %eax (the loaded value's low 32 bits) and then
+    /// writes %rax. Treating it as a pure write to %rax let the pass retarget
+    /// the load to %rbp, leaving `cltq` reading undefined %eax and storing
+    /// garbage (SIGBUS in pqdownheap / SIGSEGV in gen_codes).
+    #[test]
+    fn refuses_fuse_when_cltq_reads_loaded_register() {
+        let asm = "\
+    movslq 40(%rsp), %rax\n\
+    movq %rax, %rbp\n\
+    cltq\n\
+    movq %rax, 16(%rsp)\n\
+    leaq heap(%rip), %r9\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "fuse must be refused: cltq reads %eax implicitly");
+    }
+
+    /// A plain dead copy with no implicit reader MAY be fused.
+    #[test]
+    fn fuses_when_loaded_register_is_truly_dead() {
+        let asm = "\
+    movslq 40(%rsp), %rax\n\
+    movq %rax, %rbp\n\
+    movslq 8(%rsp), %rax\n\
+    movslq heap_len(%rip), %r10\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "safe relay should fuse");
+        assert!(out[0].contains("%rbp"), "load retargeted to copy dest: {out:?}");
+    }
+
+    /// Shifts reading %cl must veto a relay of a %rcx-family load.
+    #[test]
+    fn refuses_fuse_when_shld_reads_cl() {
+        let asm = "\
+    movslq 8(%rsp), %rcx\n\
+    movq %rcx, %rdx\n\
+    shldq $1, %rdx, %rax\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "shld reads %cl implicitly; fuse must be refused");
     }
 }

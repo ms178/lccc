@@ -1266,7 +1266,7 @@ mod tests {
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: vec![],
-            },
+            ret_is_f128_sse: false,},
         });
         let n = unroll_loops(&mut func);
         assert_eq!(n, 0, "loop with call should not be unrolled");

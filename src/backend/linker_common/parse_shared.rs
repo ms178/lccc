@@ -133,22 +133,12 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 
                     if shndx == SHN_UNDEF { continue; }
 
-                    // Check .gnu.version: if the hidden bit (0x8000) is set and
-                    // the version index is >= 2, this is a non-default version
-                    // (symbol@VERSION, not symbol@@VERSION). Such symbols should
-                    // not be available for linking, matching GNU ld behavior.
-                    if let Some((vs_off, vs_size)) = versym_shdr {
-                        if vs_size >= sym_count * 2 && vs_off + vs_size <= data.len() {
-                            let ver_entry = vs_off + j * 2;
-                            let raw_ver = read_u16(data, ver_entry);
-                            let hidden = raw_ver & 0x8000 != 0;
-                            let ver_idx = raw_ver & 0x7fff;
-                            if hidden && ver_idx >= 2 {
-                                continue;
-                            }
-                        }
-                    }
-
+                    // Versioned exports include non-default (hidden) versions
+                    // such as memcpy@GLIBC_2.2.5 alongside memcpy@@GLIBC_2.14.
+                    // They are KEPT here (marked via is_default_ver); binding
+                    // policy lives in the linker: unversioned references may
+                    // only bind to the default version, while versioned
+                    // references (name@VER) bind to the exact version.
                     let name = read_cstr(strtab, name_idx);
                     if name.is_empty() { continue; }
 
@@ -298,23 +288,25 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
 
         if shndx == SHN_UNDEF { continue; }
 
-        // Check versym: skip non-default (hidden) versioned symbols
+        // Versym: keep non-default (hidden) exports but mark them so the
+        // linker only binds them to explicitly versioned references. The
+        // phdr fallback has no verdef section, so the exact version name is
+        // unknown (version: None) — such symbols stay unbindable, which is the
+        // conservative choice for a stripped library.
+        let mut is_default_ver = true;
         if versym_addr != 0 {
             let ver_entry = versym_file_offset + j * 2;
             if ver_entry + 2 <= data.len() {
                 let raw_ver = read_u16(data, ver_entry);
                 let hidden = raw_ver & 0x8000 != 0;
-                let ver_idx = raw_ver & 0x7fff;
-                if hidden && ver_idx >= 2 {
-                    continue;
-                }
+                is_default_ver = !hidden;
             }
         }
 
         let name = read_cstr(strtab, name_idx);
         if name.is_empty() { continue; }
 
-        symbols.push(DynSymbol { name, info, value, size, version: None, is_default_ver: true });
+        symbols.push(DynSymbol { name, info, value, size, version: None, is_default_ver });
     }
 
     Ok(symbols)

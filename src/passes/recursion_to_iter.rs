@@ -518,7 +518,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    },
+                    ret_is_f128_sse: false,},
                 },
                 Instruction::BinOp {
                     dest: Value(7), op: IrBinOp::Sub,
@@ -547,7 +547,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    },
+                    ret_is_f128_sse: false,},
                 },
                 Instruction::BinOp {
                     dest: Value(11), op: IrBinOp::Add,
@@ -670,7 +670,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    },
+                    ret_is_f128_sse: false,},
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),

@@ -614,7 +614,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: vec![],
-                    },
+                    ret_is_f128_sse: false,},
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
@@ -802,7 +802,7 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: vec![],
-                    },
+                    ret_is_f128_sse: false,},
                 },
                 // %2 = %1 + 1   (uses call result — NOT a tail call)
                 Instruction::BinOp {
