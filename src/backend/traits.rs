@@ -97,6 +97,13 @@ pub trait ArchCodegen {
     /// Immutable access to the shared codegen state.
     fn state_ref(&self) -> &CodegenState;
 
+    /// Whether `vid` holds its value in a physical register (register
+    /// allocation result). Copy elision and slot-sharing decisions must
+    /// consult this: a same-slot copy is only a no-op when NEITHER side is
+    /// register-resident (otherwise the register side is the live home and
+    /// the copy must move the value into/out of it).
+    fn is_value_reg_assigned(&self, _vid: u32) -> bool { false }
+
     /// The pointer directive for this architecture's data emission.
     fn ptr_directive(&self) -> PtrDirective;
 

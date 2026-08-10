@@ -1250,6 +1250,10 @@ impl I686Codegen {
 // ─── ArchCodegen trait implementation ────────────────────────────────────────
 
 impl ArchCodegen for I686Codegen {
+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
+        self.reg_assignments.contains_key(&vid)
+    }
+
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
 

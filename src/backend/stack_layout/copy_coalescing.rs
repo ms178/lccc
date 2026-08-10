@@ -648,6 +648,19 @@ pub(super) fn build_copy_alias_map(
             };
 
             for &(src_id, _src_blk, src_copy_pp) in sources {
+                // SOUNDNESS (maketrees miscompile, 2026-08): only loop-carried
+                // WEB MEMBERS may be aliased into the web. An external feed
+                // value (single-def, defined outside the web — e.g. the
+                // GlobalAddr of the final-iteration separator string) has its
+                // own home; aliasing it in makes the elided phi Copy leave
+                // the web home holding a STALE earlier value, which later
+                // reads of the dest then return. Web membership = src is
+                // itself a phi dest (multi-def loop-carried value).
+                if !phi_copies.contains_key(&src_id)
+                    && !multi_def_values.contains(&src_id)
+                {
+                    continue;
+                }
                 // Get src's liveness interval.
                 let src_interval = interval_map.get(&src_id);
 

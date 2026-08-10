@@ -2037,15 +2037,24 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
     }
 
     // Skip Copy when dest and src share the same stack slot (from copy coalescing).
+    // SOUNDNESS (maketrees #2, 2026-08): the elision is valid ONLY when neither
+    // side is register-resident. A register-assigned side has its live home in
+    // the register, not the slot: if dest holds a register, the copy must move
+    // src's value INTO that register (eliding leaves it stale — this is how the
+    // exchange eviction exposed the bug); if src holds a register, the slot
+    // content is stale and dest must receive the register's value. Same-slot
+    // identity alone is not proof of no-op once allocation can re-home values.
     if let Operand::Value(src_val) = src {
-        let dest_slot = cg.state_ref().get_slot(dest.0);
-        let src_slot = cg.state_ref().get_slot(src_val.0);
-        if let (Some(ds), Some(ss)) = (dest_slot, src_slot) {
-            if ds.0 == ss.0 {
-                if cg.state_ref().reg_cache.acc_has(src_val.0, false) {
-                    cg.state().reg_cache.set_acc(dest.0, false);
+        if !cg.is_value_reg_assigned(dest.0) && !cg.is_value_reg_assigned(src_val.0) {
+            let dest_slot = cg.state_ref().get_slot(dest.0);
+            let src_slot = cg.state_ref().get_slot(src_val.0);
+            if let (Some(ds), Some(ss)) = (dest_slot, src_slot) {
+                if ds.0 == ss.0 {
+                    if cg.state_ref().reg_cache.acc_has(src_val.0, false) {
+                        cg.state().reg_cache.set_acc(dest.0, false);
+                    }
+                    return;
                 }
-                return;
             }
         }
     }

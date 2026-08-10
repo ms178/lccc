@@ -10,7 +10,8 @@
 //! For each interval, we either assign it a free register or spill it to the stack.
 
 use super::liveness::{
-    for_each_operand_in_instruction, for_each_operand_in_terminator, LiveInterval,
+    for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction, LiveInterval,
 };
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
@@ -34,6 +35,12 @@ pub struct LiveRange {
     pub priority: u64,             // uses.len() * 10^loop_depth (higher priority = allocate first)
     pub reg_hint: Option<PhysReg>, // Preferred register (from Copy sources)
     pub spill_weight: f64,         // Cost of spilling: priority / range_length
+    /// Cascade number for eviction-chain suppression (LLVM RegAllocGreedy
+    /// lineage): an interval that took a register by eviction carries
+    /// victim.cascade + 1, and may only be evicted again by an interval with
+    /// an equal or higher cascade. Bounds eviction chains, killing the
+    /// ping-pong that plain priority eviction (old mode 2) exhibited.
+    pub cascade: u32,
 }
 
 impl LiveRange {
@@ -65,6 +72,7 @@ impl LiveRange {
             priority: uses,
             reg_hint: None,
             spill_weight,
+            cascade: 0,
         }
     }
 
@@ -134,6 +142,17 @@ pub struct LinearScanAllocator {
     // Rotation index for register selection: start searching from this index
     // instead of 0 to distribute consecutive allocations across different registers.
     pub next_reg_idx: usize,
+
+    /// Use future-value exchange eviction instead of the mode-3 next-use guard.
+    /// Enabled only for the callee-saved overflow phase (Phase 2c), where the
+    /// mode-3 guard makes economically catastrophic decisions: it demotes
+    /// loop-carried values with dozens of remaining uses to make room for
+    /// late-starting values used once or twice (measured in gzip's
+    /// longest_match: chains evicted from rbx/r14/r15 by post-loop
+    /// single-use temporaries). The exchange rule only evicts when the
+    /// incoming range has strictly more future uses than the victim, so every
+    /// eviction provably reduces total slot traffic.
+    pub exchange_eviction: bool,
 }
 
 impl LinearScanAllocator {
@@ -150,6 +169,7 @@ impl LinearScanAllocator {
             next_spill_slot: 0,
             enable_splitting: false,
             next_reg_idx: 0,
+            exchange_eviction: false,
         }
     }
 
@@ -252,6 +272,71 @@ impl LinearScanAllocator {
         None
     }
 
+    /// Remaining (future) weighted use count of a range at scan position `pos`:
+    /// the number of uses strictly after `pos`. Under LCCC's lifetime-demotion
+    /// spill model (a demoted value pays slot traffic at EVERY remaining use;
+    /// there is no reload-at-next-use), this is exactly the cost of demoting
+    /// the range at this point.
+    fn future_uses(range: &LiveRange, pos: u32) -> u32 {
+        range.uses.iter().filter(|&&u| u > pos).count() as u32
+    }
+
+    /// Exchange-based eviction candidate selection (W1 redesign, default).
+    ///
+    /// Literature basis: Poletto & Sarkar's linear scan spills the interval
+    /// with the furthest endpoint; Braun & Hack's MIN rule (spilling the
+    /// interval with the furthest NEXT use) improves it markedly; LLVM's
+    /// RegAllocGreedy orders by spill weight and suppresses eviction chains
+    /// with cascade numbers. Under LCCC's lifetime-demotion model the exact
+    /// exchange argument is: evicting active C in favor of incoming I changes
+    /// total slot traffic by +future(C) - future(I), so the demotion is
+    /// profitable iff future(I) > future(C), and cascades are bounded by
+    /// requiring C.cascade <= I.cascade (a once-evicted interval cannot be
+    /// re-displaced by a fresh cascade-0 arrival).
+    ///
+    /// Returns the index into `self.active` of the victim, or None when no
+    /// profitable, cascade-legal victim exists (the incoming then spills).
+    ///
+    /// MEASURED & REJECTED as the default (2026-08-10): on gzip 1.14
+    /// (raptorlake, 13.2MB corpus, 5-run paired medians) CCC_EVICT_MODE=5
+    /// regressed -6 by +4.5% (0.835s vs 0.799s) and -9 by +3.3% (2.648s vs
+    /// 2.564s) relative to the mode-3 default, and additionally exposed
+    /// latent copy-alias/slot-pack unsoundness (maketrees miscompile). Under
+    /// LCCC's lifetime-demotion model the locally-profitable exchange
+    /// cascades into NET higher slot traffic in hot loops. Kept reachable via
+    /// CCC_EVICT_MODE=5 for future work on reload-at-next-use / splitting.
+    pub fn find_exchange_candidate(&self, range: &LiveRange) -> Option<usize> {
+        if self.active.is_empty() {
+            return None;
+        }
+        let incoming_future = range.uses.len() as u32;
+        let mut best_idx: Option<usize> = None;
+        let mut best_future = u32::MAX;
+        let mut best_next_use = 0u32;
+        for (idx, interval) in self.active.iter().enumerate() {
+            // Cascade legality: never displace an interval that already won
+            // its register by eviction from a lower-cascade newcomer.
+            if interval.range.cascade > range.cascade {
+                continue;
+            }
+            let fut = Self::future_uses(&interval.range, range.start);
+            let nxt = next_use_after(&interval.range, range.start);
+            // Minimum future cost wins; ties break to the farthest next use
+            // (MIN rule): demoting it disturbs the nearest-future code least.
+            if fut < best_future || (fut == best_future && nxt > best_next_use) {
+                best_idx = Some(idx);
+                best_future = fut;
+                best_next_use = nxt;
+            }
+        }
+        // Profitability: the incoming must have strictly more future uses than
+        // the victim (each future use is one slot access under demotion).
+        match best_idx {
+            Some(idx) if best_future < incoming_future => Some(idx),
+            _ => None,
+        }
+    }
+
     /// Find the best active interval to evict (spill) to free a register for the
     /// incoming range at the current scan position.
     ///
@@ -347,7 +432,39 @@ impl LinearScanAllocator {
             let mode: i32 = std::env::var("CCC_EVICT_MODE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(3);
+                .unwrap_or(if self.exchange_eviction { 5 } else { 3 });
+            if mode == 5 {
+                // Default: future-value exchange with cascade suppression.
+                if let Some(evict_idx) = self.find_exchange_candidate(&range) {
+                    let (evicted_vid, evicted_cascade) = {
+                        let cand = &self.active[evict_idx];
+                        (cand.range.value_id, cand.range.cascade)
+                    };
+                    if let Some(reg) = self.assignments.remove(&evicted_vid) {
+                        if !self.spill_slots.contains_key(&evicted_vid) {
+                            self.allocate_spill_slot(evicted_vid);
+                        }
+                        if std::env::var("CCC_TRACE_ALLOCSTATS").is_ok() {
+                            eprintln!(
+                                "[EVICT5] val{} reg={} -> val{}[{}] fut_in={} ",
+                                evicted_vid, reg.0, range.value_id, range.start,
+                                range.uses.len()
+                            );
+                        }
+                        let mut incoming = range;
+                        incoming.cascade = evicted_cascade + 1;
+                        self.assignments.insert(incoming.value_id, reg);
+                        self.occupy_register(reg, incoming.end + 1);
+                        self.active[evict_idx] = ActiveInterval {
+                            range: incoming,
+                            next_use: None,
+                        };
+                        return;
+                    }
+                }
+                self.allocate_spill_slot(range.value_id);
+                return;
+            }
             if mode > 0 {
                 if let Some(evict_idx) = self.find_evict_candidate(range.start) {
                     let cand = &self.active[evict_idx];
@@ -487,6 +604,13 @@ pub fn build_live_ranges(
                     let entry = max_use_depth.entry(v.0).or_insert(0);
                     *entry = (*entry).max(bdepth);
                 }
+            });
+            // W1: address-side uses (Load/Store ptr, GEP base) earn loop depth
+            // exactly like data operands — a pointer consumed as an addressing
+            // base inside the loop is as hot as any scalar operand.
+            for_each_value_use_in_instruction(inst, |v| {
+                let entry = max_use_depth.entry(v.0).or_insert(0);
+                *entry = (*entry).max(bdepth);
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {

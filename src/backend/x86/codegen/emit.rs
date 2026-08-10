@@ -2817,6 +2817,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
 }
 
 impl ArchCodegen for X86Codegen {
+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
+        self.reg_assignments.contains_key(&vid)
+    }
+
     fn state(&mut self) -> &mut CodegenState {
         &mut self.state
     }

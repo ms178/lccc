@@ -446,6 +446,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     *use_count.entry(v.0).or_insert(0) += weight;
                 }
             });
+            // W1: address-side uses (Load/Store ptr, GEP base) carry the same
+            // loop-weighted heat — hot addressing bases must rank high in the
+            // allocation/spill-order decisions driven by this count.
+            for_each_value_use_in_instruction(inst, |v| {
+                *use_count.entry(v.0).or_insert(0) += weight;
+            });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
@@ -667,6 +673,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 let phase2c_ranges =
                     live_range::build_live_ranges(&phase2c_intervals, &liveness.block_loop_depth, func);
                 let mut spill_allocator = LinearScanAllocator::new(phase2c_ranges, free_callee);
+                // NOTE: future-value exchange eviction was measured here too
+                // (2026-08-10) and ALSO regressed gzip (+5.75%/-6, +5.36%/-9;
+                // longest_match 304->339 insns, 92->128 rsp refs): hot chains
+                // evicting each other cancels out and second-order effects lose.
+                // Mode-3's next-use guard remains the best-measured policy.
                 spill_allocator.run();
                 for (vid, reg) in spill_allocator.assignments {
                     assignments.insert(vid, reg);

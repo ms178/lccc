@@ -473,6 +473,10 @@ impl RiscvCodegen {
 }
 
 impl ArchCodegen for RiscvCodegen {
+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
+        self.reg_assignments.contains_key(&vid)
+    }
+
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
     fn ptr_directive(&self) -> PtrDirective { PtrDirective::Dword }
