@@ -1,14 +1,14 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
 use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::liveness::{for_each_operand_in_instruction, for_each_operand_in_terminator};
 use crate::backend::regalloc::PhysReg;
 use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
-                     phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS};
+                     phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS, is_xmm_reg};
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -405,6 +405,8 @@ impl X86Codegen {
             }
             self.fused_cmp_dests = fused;
             self.value_use_counts = use_counts;
+
+
             self.value_types = value_types;
         }
 
@@ -414,6 +416,158 @@ impl X86Codegen {
             false,
         );
 
+
+            // W2 Load->Cast fold (2026-08-10): when a Load's result is used
+            // EXACTLY ONCE and that sole use is an ADJACENT Cast whose
+            // zero-extension is already provided by the load opcode
+            // (movzbl/movzwl write a fully zero-extended 32-bit register;
+            // movl zero-extends to 64), AND the cast's dest holds a GPR
+            // register, the load targets that register directly and the cast
+            // emits nothing. Removes the `movzbl (%p),%rX; mov %rX,%rYd`
+            // staging pair — 33% of gzip-9 cycles sat in that pattern in
+            // longest_match.
+            //
+            // SOUNDNESS (debugged 2026-08-10 on simd_crc_adler):
+            // (a) runs AFTER regalloc so reg_assignments is THIS function's;
+            // (b) ADJACENCY: the cast must immediately follow the load, so no
+            //     program point exists between them;
+            // (c) REGISTER-FREE-AT-LOAD: no OTHER value assigned to the cast
+            //     dest's register may have a live interval covering the load
+            //     point — otherwise the early load clobbers a value still
+            //     needed (the simd_crc_adler corruption: fold loaded into r13
+            //     which still held a value consumed by the next instruction).
+            // use_counts includes terminator uses, so "exactly one use" is
+            // faithful; the load's dest keeps its own (now never-written)
+            // home, which nothing reads.
+            let mut cast_by_src: FxHashMap<u32, (Value, IrType, IrType)> =
+                FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Cast {
+                        dest,
+                        src: Operand::Value(sv),
+                        from_ty,
+                        to_ty,
+                    } = inst
+                    {
+                        cast_by_src
+                            .entry(sv.0)
+                            .or_insert((*dest, *from_ty, *to_ty));
+                    }
+                }
+            }
+            let mut lcf: FxHashMap<u32, (PhysReg, u32)> = FxHashMap::default();
+            let mut fcd: FxHashSet<u32> = FxHashSet::default();
+            if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_err() {
+                // Program-point numbering matching liveness.rs (1 per
+                // instruction + 1 per terminator, in block order).
+                let intervals: Vec<(u32, u32, u32)> = cached_liveness
+                    .as_ref()
+                    .map(|l| {
+                        l.intervals
+                            .iter()
+                            .map(|iv| (iv.value_id, iv.start, iv.end))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut pp: u32 = 0;
+                for block in &func.blocks {
+                    let insts = &block.instructions;
+                    for ii in 0..insts.len() {
+                        let load_pp = pp;
+                        if let Instruction::Load {
+                            dest,
+                            ty,
+                            seg_override,
+                            ..
+                        } = &insts[ii]
+                        {
+                            let ok_ty = matches!(
+                                ty,
+                                IrType::U8 | IrType::U16 | IrType::U32
+                            ) && *seg_override == AddressSpace::Default;
+                            let single_use = self
+                                .value_use_counts
+                                .get(&dest.0)
+                                .copied()
+                                .unwrap_or(0)
+                                == 1;
+                            let adjacent_cast = matches!(
+                                insts.get(ii + 1),
+                                Some(Instruction::Cast {
+                                    src: Operand::Value(sv),
+                                    ..
+                                }) if sv.0 == dest.0
+                            );
+                            if ok_ty && single_use && adjacent_cast {
+                                if let Some((cd, from, to)) = cast_by_src.get(&dest.0) {
+                                    let width_ok = *from == *ty
+                                        && matches!(
+                                            (ty, to),
+                                            (IrType::U8, IrType::I32)
+                                                | (IrType::U8, IrType::U32)
+                                                | (IrType::U8, IrType::I64)
+                                                | (IrType::U8, IrType::U64)
+                                                | (IrType::U16, IrType::I32)
+                                                | (IrType::U16, IrType::U32)
+                                                | (IrType::U16, IrType::I64)
+                                                | (IrType::U16, IrType::U64)
+                                                | (IrType::U32, IrType::I32)
+                                                | (IrType::U32, IrType::U32)
+                                                | (IrType::U32, IrType::I64)
+                                                | (IrType::U32, IrType::U64)
+                                        );
+                                    if width_ok {
+                                        if let Some(reg) =
+                                            self.reg_assignments.get(&cd.0).copied()
+                                        {
+                                            if !is_xmm_reg(reg) {
+                                                // Register-free-at-load guard.
+                                                let mut conflict = false;
+                                                for &(vid, s, e) in &intervals {
+                                                    if vid != cd.0
+                                                        && s <= load_pp
+                                                        && load_pp <= e
+                                                    {
+                                                        if let Some(&r) = self
+                                                            .reg_assignments
+                                                            .get(&vid)
+                                                        {
+                                                            if r == reg {
+                                                                conflict = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if !conflict {
+                                                    lcf.insert(dest.0, (reg, cd.0));
+                                                    fcd.insert(cd.0);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        pp += 1;
+                    }
+                    pp += 1; // terminator
+                }
+                if std::env::var("CCC_DEBUG_LOAD_CAST_FOLD").is_ok() && !lcf.is_empty() {
+                    eprintln!(
+                        "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
+                        func.name,
+                        lcf.len()
+                    );
+                }
+                if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_ok() {
+                    lcf.clear();
+                    fcd.clear();
+                }
+            }
+            self.load_cast_fold = lcf;
+            self.folded_cast_dests = fcd;
         // FPO (RSP mode): callee saves are movq'd into the frame at offsets -8..-N*8
         // from the virtual rbp. callee_save_reserve shifts local slots below them.
         // RBP (push mode): pushes go BEFORE subq and are at -8(%rbp)..-N*8(%rbp).

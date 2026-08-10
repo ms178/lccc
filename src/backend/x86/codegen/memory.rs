@@ -570,6 +570,10 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        // W2 fold handshake: only a redirecting path below may re-arm the
+        // cast-skip; anything else leaves it None so the adjacent cast emits.
+        self.fold_skip_cast = None;
+        let fold_target = self.load_cast_fold.get(&dest.0).copied();
         if ty == IrType::F128 {
             if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
                 self.emit_f128_fldt(&addr, ptr.0, 0);
@@ -597,8 +601,12 @@ impl X86Codegen {
                     let p_name = phys_reg_name(p_reg);
                     let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
 
-                    // Check if dest has a register — load directly to it.
-                    if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                    // W2 Load->Cast fold target takes precedence: load straight
+                    // into the consumer Cast dest's register.
+                    let fold_reg = fold_target.map(|(r, _)| r);
+                    let d_reg_opt =
+                        fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
+                    if let Some(d_reg) = d_reg_opt {
                         if !is_xmm_reg(d_reg) {
                             let d_name = if use_32bit_dest {
                                 phys_reg_name_32(d_reg)
@@ -606,11 +614,14 @@ impl X86Codegen {
                                 phys_reg_name(d_reg)
                             };
                             self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, p_name, d_name));
+                            if fold_reg.is_some() {
+                                self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                            }
                             return;
                         }
                     }
 
-                    // Dest is on stack — load to rax as before.
+                    // Dest is on stack — load to rax as before (no fold target).
                     let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
                     self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, p_name, dest_reg));
                     self.state.reg_cache.set_acc(dest.0, false);
@@ -636,7 +647,11 @@ impl X86Codegen {
         {
             let load_instr = self.mov_load_for_value(ty, dest.0);
             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
-            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+            // W2 Load->Cast fold target takes precedence over dest's own home.
+            let fold_reg = fold_target.map(|(r, _)| r);
+            let d_reg_opt =
+                fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
+            if let Some(d_reg) = d_reg_opt {
                 if !is_xmm_reg(d_reg) {
                     let d_name = if use_32bit_dest {
                         phys_reg_name_32(d_reg)
@@ -644,6 +659,9 @@ impl X86Codegen {
                         phys_reg_name(d_reg)
                     };
                     self.state.emit_fmt(format_args!("    {} (%rax), %{}", load_instr, d_name));
+                    if fold_reg.is_some() {
+                        self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                    }
                     return;
                 }
             }
@@ -664,7 +682,11 @@ impl X86Codegen {
         // offset, corrupting the AVX2 adler32 horizontal sum). Fall through to
         // the default path, which materializes the aligned address.
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
-            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+            // W2 Load->Cast fold target takes precedence over dest's own home.
+            let fold_reg = fold_target.map(|(r, _)| r);
+            let d_reg_opt =
+                fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
+            if let Some(d_reg) = d_reg_opt {
                 if !is_xmm_reg(d_reg) && self.state.is_alloca(ptr.0)
                     && self.state.alloca_over_align(ptr.0).is_none() {
                     if let Some(slot) = self.state.get_slot(ptr.0) {
@@ -680,6 +702,9 @@ impl X86Codegen {
                         let sr = self.slot_ref(slot.0);
                         self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, d_name));
                         self.state.reg_cache.invalidate_acc();
+                        if fold_reg.is_some() {
+                            self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                        }
                         return;
                     }
                 }

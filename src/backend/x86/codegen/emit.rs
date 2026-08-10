@@ -327,6 +327,19 @@ pub struct X86Codegen {
     pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
     /// Number of uses of each SSA value (instructions + terminators).
     pub(super) value_use_counts: FxHashMap<u32, u32>,
+    /// W2 Load->Cast fold (2026-08-10): load dest value id -> the register of
+    /// its single consumer Cast's dest. The load emits directly into that
+    /// register and the Cast emits nothing — kills the `movzbl (%p),%rX;
+    /// mov %rX,%rYd` staging pair that was 33% of gzip-9 runtime cycles in
+    /// longest_match's first-match-check blocks.
+    pub(super) load_cast_fold: FxHashMap<u32, (PhysReg, u32)>,
+    pub(super) folded_cast_dests: FxHashSet<u32>,
+    /// Runtime handshake for the Load->Cast fold: set to the cast dest when a
+    /// load ACTUALLY emitted the redirected register load; the adjacent Cast
+    /// skips itself only when this matches (sound by construction: the cast is
+    /// never skipped unless the load truly delivered the value). Cleared by
+    /// every non-redirecting load and by every emitted cast.
+    pub(super) fold_skip_cast: Option<u32>,
     /// Type of each SSA value (for type-aware stack slot loads/stores).
     pub(super) value_types: FxHashMap<u32, IrType>,
     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
@@ -399,6 +412,9 @@ impl X86Codegen {
             needs_sext_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
+            load_cast_fold: FxHashMap::default(),
+            folded_cast_dests: FxHashSet::default(),
+            fold_skip_cast: None,
             value_types: FxHashMap::default(),
             pending_cmp: None,
             current_func: None,
