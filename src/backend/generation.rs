@@ -160,10 +160,30 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
             }
         }
     }
-    gep_map.retain(|_, info| {
+    // A multi-def phi-web base is also safe when a single-use address producer
+    // and its sole memory consumer are adjacent in one block: no redefinition
+    // can occur in that zero-length window. Never extend this proof to a second
+    // memory use later in the block; the base could be redefined in between.
+    let mut adjacent_base_stable: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for pair in block.instructions.windows(2) {
+            let Some(dest) = pair[0].dest() else { continue };
+            if !gep_map.contains_key(&dest.0)
+                || use_counts.get(dest.0 as usize).copied().unwrap_or(0) != 1
+            {
+                continue;
+            }
+            if matches!(pair[1], Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } if ptr.0 == dest.0)
+            {
+                adjacent_base_stable.insert(dest.0);
+            }
+        }
+    }
+    gep_map.retain(|dest, info| {
         is_alloca_set.contains(&info.base.0)
             || is_param_set.contains(&info.base.0)
             || def_count.get(&info.base.0).copied().unwrap_or(0) == 1
+            || adjacent_base_stable.contains(dest)
     });
 
     // Phase 2: Verify that each candidate GEP dest is ONLY used as Load/Store ptr.
@@ -1613,7 +1633,7 @@ fn emit_loc_directive(
 ///
 /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
 /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
-pub(crate) fn generate_instruction(
+pub(super) fn generate_instruction(
     cg: &mut dyn ArchCodegen,
     inst: &Instruction,
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,

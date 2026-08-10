@@ -746,6 +746,40 @@ fn extend_gep_base_liveness(
                     }
                     gep_info.insert(dest.0, (base.0, 0));
                 }
+                // build_gep_fold_map also recognizes integer Add(base, const).
+                // Mirror it here so the base register stays live through the
+                // folded memory operation (the old GEP-only analysis could let
+                // linear scan reuse it one point too early).
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(base),
+                    rhs: Operand::Const(c),
+                    ty,
+                }
+                | Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(c),
+                    rhs: Operand::Value(base),
+                    ty,
+                } if !ty.is_float() && !ty.is_long_double() => {
+                    if alloca_set.contains(&base.0) {
+                        continue;
+                    }
+                    if let Some(offset) = c.to_i64() {
+                        let offset = if offset >= i32::MIN as i64 && offset <= i32::MAX as i64 {
+                            Some(offset)
+                        } else if offset > i32::MAX as i64 && offset <= u32::MAX as i64 {
+                            Some(offset as i32 as i64)
+                        } else {
+                            None
+                        };
+                        if let Some(offset) = offset {
+                            gep_info.insert(dest.0, (base.0, offset));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1450,4 +1484,41 @@ mod tests {
             "Empty inline asm barriers should NOT be call points"
         );
     }
+
+    #[test]
+    fn binop_address_fold_extends_base_through_load() {
+        let mut func = IrFunction::new("binop_gep_liveness".to_string(), IrType::U8, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(1),
+                    ty: IrType::U8,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let result = compute_live_intervals(&func);
+        let base = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
+        // ParamRef is point 0, Add is point 1, and the folded Load is point 2.
+        assert!(base.end >= 2, "base ended before folded Load: {base:?}");
+    }
+
 }

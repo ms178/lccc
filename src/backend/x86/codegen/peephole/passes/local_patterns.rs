@@ -2061,7 +2061,14 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
             if let Some((src, _dst)) = rest.split_once(',') {
                 let src = src.trim();
                 let fam = register_family_fast(src);
-                if fam != REG_NONE && fam != 0 { fam } else { REG_NONE }
+                // This fusion indexes the 16-entry GPR name table. XMM/MMX
+                // register families are recognized by the parser but have no
+                // 8/16/32-bit GPR aliases and must take the unfused path.
+                if fam != REG_NONE && fam != 0 && fam <= REG_GP_MAX {
+                    fam
+                } else {
+                    REG_NONE
+                }
             } else { REG_NONE }
         } else { REG_NONE };
 

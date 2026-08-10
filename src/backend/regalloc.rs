@@ -883,14 +883,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
 
-        // Phase 3b (v5, opt-in CCC_ENABLE_VECREG): XMM allocation for 128-bit
-        // VECTOR values. Runs AFTER the F64 scan so it sees the F64 assignments
-        // and avoids them. Pool = xmm3-xmm7 (PhysReg 21-25): xmm0/xmm1 are the
-        // accumulator/scratch pair, xmm2 is pblendvb/VNNI scratch. Candidates
-        // are strictly guarded by collect_vecreg_candidates (the phase-3
-        // candidate guards matching the non-GPR collector — a candidate outside
-        // that whitelist miscompiles, e.g. the fold_4 class).
-        if std::env::var("CCC_ENABLE_VECREG").is_ok() {
+        // Phase 3b (W6): XMM allocation for 128-bit VECTOR values. Runs AFTER
+        // the F64 scan so it sees those assignments and avoids them. Pool =
+        // xmm3-xmm7 (PhysReg 21-25): xmm0/xmm1 are accumulator/scratch and
+        // xmm2 is an implicit pblendvb/VNNI/F128 scratch. Candidates are
+        // strictly guarded by collect_vecreg_candidates; widening this set
+        // without matching every consumer is unsound. Enabled after regression,
+        // differential-CFG fuzz, gzip, and expat validation; retain an absolute
+        // diagnostic kill switch for reproducibility.
+        let vecreg_enabled = std::env::var("CCC_NO_VECREG").is_err();
+        if vecreg_enabled {
             let vec_candidates = collect_vecreg_candidates(func);
             if !vec_candidates.is_empty() {
                 let mut vec_pool: Vec<PhysReg> = (21..=25).map(PhysReg).collect();
