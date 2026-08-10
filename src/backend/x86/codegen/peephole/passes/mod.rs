@@ -95,26 +95,57 @@ fn direct_stack_slot_in_line(line: &str) -> Option<(u8, i32)> {
 /// Mark every direct memory access to a codegen-identified volatile alloca as
 /// opaque.  Volatile access is observable even when an ordinary dataflow pass
 /// believes the slot value is available in a register.
+///
+/// SOUNDNESS (v9): the `# LCCC_VOLATILE_SLOT` markers describe THIS function's
+/// frame only, but stack offsets repeat across functions.  A file-wide slot set
+/// demoted unrelated accesses in other functions (e.g. a `movl 24(%rsp), %eax`
+/// load in sqlite3MultiValues matched the `24(%rsp)` marker emitted by
+/// kahanBabuskaNeumaierStep).  A demoted LOAD-into-%rax was classified as
+/// `Other { dest_reg: REG_NONE }`, which combined_local_pass's rax_is_zero
+/// tracking read as "rax not written" -> the following `xorl %eax, %eax`
+/// (call-argument setup) was deemed redundant and removed, pushing stale data
+/// as a stack argument.  Two-part fix:
+///   1. Scope the volatile set to the current function (bounded by
+///      .cfi_startproc / .cfi_endproc) so markers never leak across functions.
+///   2. Preserve the destination register when demoting: a volatile load still
+///      WRITES its destination, and rax_is_zero must observe that.  Only the
+///      stack-specialized classification (StoreRbp/LoadRbp) is removed, which
+///      is what blocks slot-based forwarding/folding passes.
 fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
-    let mut volatile_slots = Vec::new();
+    let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
     for i in 0..store.len() {
         let trimmed = infos[i].trimmed(store.get(i));
+        // Function boundary: volatile markers are function-local.
+        if trimmed.starts_with(".cfi_startproc") {
+            volatile_slots.clear();
+            continue;
+        }
         if let Some(slot_text) = trimmed.strip_prefix("# LCCC_VOLATILE_SLOT ") {
             if let Some(slot) = direct_stack_slot(slot_text) {
                 volatile_slots.push(slot);
             }
+            continue;
         }
-    }
-    if volatile_slots.is_empty() {
-        return;
-    }
-    for i in 0..store.len() {
-        if let Some(slot) = direct_stack_slot_in_line(infos[i].trimmed(store.get(i))) {
+        if trimmed.starts_with(".cfi_endproc") {
+            volatile_slots.clear();
+            continue;
+        }
+        if volatile_slots.is_empty() {
+            continue;
+        }
+        if let Some(slot) = direct_stack_slot_in_line(trimmed) {
             if volatile_slots.contains(&slot) {
                 // Remove the stack-specialized classification as well as pinning.
                 // This blocks forwarding/folding of both volatile loads and stores.
+                // Keep the REAL destination register: the instruction still
+                // writes it, and register-taint tracking (rax_is_zero in
+                // combined_local_pass) depends on that.  REG_NONE here made a
+                // volatile load into %rax look like a non-rax write, letting a
+                // later `xorl %eax, %eax` be removed as "redundant" even though
+                // %rax held a live value (miscompiled call argument setup).
+                let dest_reg = parse_dest_reg_fast(trimmed);
                 infos[i].pinned = true;
-                infos[i].kind = LineKind::Other { dest_reg: REG_NONE };
+                infos[i].kind = LineKind::Other { dest_reg };
                 infos[i].has_indirect_mem = true;
                 infos[i].rbp_offset = RBP_OFFSET_NONE;
             }
