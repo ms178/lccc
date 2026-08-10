@@ -2187,11 +2187,11 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
         struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
-        struct_arg_is_f128_sse: Vec::new(),
+        struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
-        ret_is_f128_sse: false,
+        ret_is_f128_sse: info.ret_is_f128_sse,
     }
 }
 

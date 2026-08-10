@@ -1728,6 +1728,7 @@ mod tests {
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
+                ret_is_f128_sse: false,
                 ret_eightbyte_classes: Vec::new(),
             },
         }

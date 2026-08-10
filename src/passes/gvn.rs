@@ -1177,8 +1177,8 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
-            ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
 
@@ -1193,6 +1193,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1258,6 +1259,7 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
+            ret_is_f128_sse: false,
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
@@ -1273,6 +1275,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1326,6 +1329,7 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
+            ret_is_f128_sse: false,
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
@@ -1341,6 +1345,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1400,6 +1405,7 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
+            ret_is_f128_sse: false,
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
@@ -1415,6 +1421,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1478,6 +1485,7 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
+            ret_is_f128_sse: false,
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
@@ -1493,6 +1501,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1556,6 +1565,7 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
+            ret_is_f128_sse: false,
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
@@ -1571,6 +1581,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1659,6 +1670,7 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
+            ret_is_f128_sse: false,
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         };
@@ -1674,6 +1686,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         };
 
@@ -1723,8 +1736,8 @@ mod tests {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             global_init_label_blocks: Vec::new(),
-            ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
         }
     }
@@ -1741,6 +1754,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             char16_string_literals: vec![],
+            asm_labels: std::collections::HashMap::new(),
             symver_directives: vec![],
         }
     }
@@ -1856,6 +1870,7 @@ mod tests {
                             struct_arg_is_f128_sse: Vec::new(),
                             is_sret: false,
                             is_fastcall: false,
+                            ret_is_f128_sse: false,
                             ret_eightbyte_classes: Vec::new(),
                         },
                     },
@@ -2105,6 +2120,7 @@ mod tests {
                             struct_arg_is_f128_sse: Vec::new(),
                             is_sret: false,
                             is_fastcall: false,
+                            ret_is_f128_sse: false,
                             ret_eightbyte_classes: Vec::new(),
                         },
                     },
