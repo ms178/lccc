@@ -5,7 +5,7 @@
 //! ELF writing (Phases 4-14) to produce a statically or dynamically linked
 //! ELF64 executable.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::{
     GlobalSym, MergedSection,
@@ -54,12 +54,12 @@ const INTERP: &[u8] = b"/lib/ld-linux-riscv64-lp64d.so.1\0";
 pub fn emit_executable(
     input_objs: &[(String, ElfObject)],
     merged_sections: &mut Vec<MergedSection>,
-    merged_map: &mut HashMap<String, usize>,
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
-    global_syms: &mut HashMap<String, GlobalSym>,
+    merged_map: &mut FxHashMap<String, usize>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
+    global_syms: &mut FxHashMap<String, GlobalSym>,
     got_symbols: &[String],
-    tls_got_symbols: &HashSet<String>,
-    local_got_sym_info: &HashMap<String, (usize, usize, i64)>,
+    tls_got_symbols: &FxHashSet<String>,
+    local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
     plt_symbols: &[String],
     copy_symbols: &[(String, u64)],
     sec_indices: &[usize],
@@ -173,7 +173,7 @@ pub fn emit_executable(
 
         // Build dynstr
         dynstr_data = vec![0u8];
-        let mut dynstr_offsets: HashMap<String, u32> = HashMap::new();
+        let mut dynstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
         for name in &dynsym_names {
             if !dynstr_offsets.contains_key(name) {
                 let off = dynstr_data.len() as u32;
@@ -191,7 +191,7 @@ pub fn emit_executable(
 
         // Build dynsym (in hash-sorted order)
         dynsym_data = vec![0u8; 24]; // null entry
-        let copy_sym_set: HashSet<String> = copy_sym_names.iter().cloned().collect();
+        let copy_sym_set: FxHashSet<String> = copy_sym_names.iter().cloned().collect();
         for name in dynsym_names.iter() {
             let mut entry = [0u8; 24];
             let name_off = dynstr_offsets.get(name).copied().unwrap_or(0);
@@ -301,7 +301,7 @@ pub fn emit_executable(
 
     // Layout RW sections: init/fini arrays first (for RELRO)
     let init_array_sections = [".preinit_array", ".init_array", ".fini_array"];
-    let mut init_array_vaddrs: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut init_array_vaddrs: FxHashMap<String, (u64, u64)> = FxHashMap::default();
 
     for sect_name in &init_array_sections {
         if let Some(&si) = merged_map.get(*sect_name) {
@@ -447,7 +447,7 @@ pub fn emit_executable(
     }
 
     // Allocate COPY-relocated symbols in .bss
-    let mut copy_sym_addrs: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut copy_sym_addrs: FxHashMap<String, (u64, u64)> = FxHashMap::default();
     for (name, size) in copy_symbols {
         let sz = if *size > 0 { *size } else { 8 };
         let align = sz.min(8);
@@ -594,8 +594,8 @@ pub fn emit_executable(
 
     // ── Phase 6: Apply relocations ──────────────────────────────────────
 
-    let mut gd_tls_relax_info: HashMap<u64, (u64, i64)> = HashMap::new();
-    let mut gd_tls_call_nop: HashSet<u64> = HashSet::new();
+    let mut gd_tls_relax_info: FxHashMap<u64, (u64, i64)> = FxHashMap::default();
+    let mut gd_tls_call_nop: FxHashSet<u64> = FxHashSet::default();
     if is_static {
         reloc::collect_gd_tls_relax_info(
             input_objs, sec_mapping, &section_vaddrs,
@@ -604,8 +604,8 @@ pub fn emit_executable(
         );
     }
 
-    let empty_got_offsets = HashMap::new();
-    let empty_plt_addrs = HashMap::new();
+    let empty_got_offsets = FxHashMap::default();
+    let empty_plt_addrs = FxHashMap::default();
     let ctx = reloc::RelocContext {
         sec_mapping,
         section_vaddrs: &section_vaddrs,
@@ -919,7 +919,7 @@ pub fn emit_executable(
 
     // Build section header string table
     let mut shstrtab = vec![0u8];
-    let mut shstr_offsets: HashMap<String, u32> = HashMap::new();
+    let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
     let sh_names = [
         "", ".interp", ".gnu.hash", ".dynsym", ".dynstr",
         ".gnu.version", ".gnu.version_r", ".rela.dyn", ".rela.plt", ".plt",

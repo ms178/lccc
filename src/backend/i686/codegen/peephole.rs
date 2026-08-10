@@ -876,7 +876,7 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
     let mut slots: [(RegId, MoveSize); SLOT_COUNT] = [(REG_NONE, MoveSize::L); SLOT_COUNT];
 
     // Collect jump targets so we can invalidate at them
-    let mut jump_targets = std::collections::HashSet::new();
+    let mut jump_targets = crate::common::fx_hash::FxHashSet::default();
     for i in 0..len {
         if infos[i].is_nop() { continue; }
         let s = trimmed(store, &infos[i], i);

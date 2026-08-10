@@ -587,7 +587,7 @@ impl X86Codegen {
         // so they let the pending value pass untouched).
         match op {
             IntrinsicOp::Lfence | IntrinsicOp::Mfence | IntrinsicOp::Sfence
-            | IntrinsicOp::Pause | IntrinsicOp::Rdtsc => {}
+            | IntrinsicOp::Pause | IntrinsicOp::Rdtsc | IntrinsicOp::Vzeroupper => {}
             _ => self.service_pending_vec_store(op, args),
         }
         match op {
@@ -595,6 +595,7 @@ impl X86Codegen {
             IntrinsicOp::Mfence => { self.state.emit("    mfence"); }
             IntrinsicOp::Sfence => { self.state.emit("    sfence"); }
             IntrinsicOp::Pause => { self.state.emit("    pause"); }
+            IntrinsicOp::Vzeroupper => { self.state.emit("    vzeroupper"); }
             IntrinsicOp::Rdtsc => {
                 // rdtsc: EDX:EAX -> RAX (matches GCC __builtin_ia32_rdtsc)
                 self.state.emit("    rdtsc");

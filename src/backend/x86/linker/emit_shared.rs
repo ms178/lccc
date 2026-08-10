@@ -3,7 +3,8 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs,
 //! `.dynamic` section, and GNU hash tables.
 
-use std::collections::{HashMap, HashSet, BTreeSet};
+use std::collections::BTreeSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
 use super::types::{GlobalSymbol, PAGE_SIZE};
@@ -151,9 +152,9 @@ fn elf_hash_name(name: &str) -> u32 {
 
 
 pub(super) fn emit_shared_library(
-    objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     needed_sonames: &[String], output_path: &str,
     soname: Option<String>, rpath_entries: &[String], use_runpath: bool,
     version_script_path: Option<&str>,
@@ -229,7 +230,7 @@ pub(super) fn emit_shared_library(
     // For undefined symbols, these need R_X86_64_GLOB_DAT relocations
     // (or R_X86_64_TPOFF64 for TLS symbols referenced via GOTTPOFF).
     let mut got_needed_names: Vec<String> = Vec::new();
-    let mut tls_got_names: HashSet<String> = HashSet::new();
+    let mut tls_got_names: FxHashSet<String> = FxHashSet::default();
     for obj in objects.iter() {
         for sec_relas in &obj.relocations {
             for rela in sec_relas {
@@ -530,7 +531,7 @@ pub(super) fn emit_shared_library(
     // Identify output sections that have R_X86_64_64 relocations (need RELATIVE
     // relocations at load time). These must go in a writable segment so the
     // dynamic linker can patch them. We track them by output section index.
-    let mut sections_with_abs_relocs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut sections_with_abs_relocs: crate::common::fx_hash::FxHashSet<usize> = crate::common::fx_hash::FxHashSet::default();
     for obj in objects.iter() {
         for (sec_idx, sec_relas) in obj.relocations.iter().enumerate() {
             for rela in sec_relas {
@@ -1017,7 +1018,7 @@ pub(super) fn emit_shared_library(
     }
 
     // Build GOT entries map
-    let mut got_sym_addrs: HashMap<String, u64> = HashMap::new();
+    let mut got_sym_addrs: FxHashMap<String, u64> = FxHashMap::default();
     for (i, name) in got_needed.iter().enumerate() {
         let gea = got_addr + i as u64 * 8;
         got_sym_addrs.insert(name.clone(), gea);
@@ -1032,7 +1033,7 @@ pub(super) fn emit_shared_library(
     }
 
     // Apply relocations and collect dynamic relocation entries
-    let globals_snap: HashMap<String, GlobalSymbol> = globals.clone();
+    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
     let mut rela_dyn_entries: Vec<(u64, u64)> = Vec::new(); // (offset, value) for RELATIVE relocs
     let mut glob_dat_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for GLOB_DAT relocs
     let mut tpoff64_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for R_X86_64_TPOFF64 relocs
@@ -1286,7 +1287,7 @@ pub(super) fn emit_shared_library(
     // === Append section headers ===
     // Build .shstrtab string table
     let mut shstrtab = vec![0u8]; // null byte at offset 0
-    let mut shstr_offsets: HashMap<String, u32> = HashMap::new();
+    let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
     let known_names = [
         ".gnu.hash", ".dynsym", ".dynstr", ".gnu.version", ".gnu.version_d",
         ".rela.dyn", ".rela.plt", ".plt", ".dynamic",
@@ -1320,7 +1321,7 @@ pub(super) fn emit_shared_library(
     let dynstr_shidx: u32 = 3; // .dynstr=3
 
     // Map merged output sections to their final section-header indices.
-    let mut out_sec_to_hdr: HashMap<usize, u16> = HashMap::new();
+    let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
     let mut next_hdr = 4usize;
     if versym_size > 0 { next_hdr += 1; }
     if verdef_size > 0 { next_hdr += 1; }

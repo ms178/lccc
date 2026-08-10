@@ -1392,7 +1392,7 @@ impl Driver {
         // This fixes a bug where optimization passes can create duplicate labels
         {
             use crate::ir::instruction::BlockId;
-            use std::collections::HashMap;
+            use crate::common::fx_hash::FxHashMap;
             let mut next_global_label = 0u32;
 
             for func in &mut module.functions {
@@ -1401,7 +1401,7 @@ impl Driver {
                 }
 
                 // Build a map from old labels to new globally-unique labels
-                let mut label_map: HashMap<BlockId, BlockId> = HashMap::new();
+                let mut label_map: FxHashMap<BlockId, BlockId> = FxHashMap::default();
                 for block in &func.blocks {
                     if !label_map.contains_key(&block.label) {
                         label_map.insert(block.label, BlockId(next_global_label));

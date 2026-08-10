@@ -1,6 +1,6 @@
 //! ELF string table builder for .strtab, .shstrtab, and .dynstr sections.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 /// ELF string table builder. Used for .strtab, .shstrtab, and .dynstr sections.
 ///
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 /// a null byte (index 0 = empty string), matching ELF convention.
 pub struct StringTable {
     data: Vec<u8>,
-    offsets: HashMap<String, u32>,
+    offsets: FxHashMap<String, u32>,
 }
 
 impl StringTable {
@@ -16,7 +16,7 @@ impl StringTable {
     pub fn new() -> Self {
         Self {
             data: vec![0],
-            offsets: HashMap::new(),
+            offsets: FxHashMap::default(),
         }
     }
 

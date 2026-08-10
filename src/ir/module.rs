@@ -31,7 +31,7 @@ pub struct IrModule {
     /// __asm__("label") linker-symbol redirects on declarations
     /// (C name -> asm label). Filled during lowering; consumed by the
     /// backend when emitting symbol names.
-    pub asm_labels: std::collections::HashMap<String, String>,
+    pub asm_labels: crate::common::fx_hash::FxHashMap<String, String>,
     /// Symbol version directives: (function_name, symver_string)
     /// From __attribute__((symver("name@@VERSION"))) - emitted as .symver directives
     pub symver_directives: Vec<(String, String)>,
@@ -270,7 +270,7 @@ impl IrModule {
             aliases: Vec::new(),
             toplevel_asm: Vec::new(),
             symbol_attrs: Vec::new(),
-            asm_labels: std::collections::HashMap::new(),
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
             symver_directives: Vec::new(),
         }
     }

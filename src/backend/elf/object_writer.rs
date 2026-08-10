@@ -8,7 +8,7 @@
 //! arch-specific logic (instruction encoding, branch resolution, etc.), then
 //! calls `write_relocatable_object` for the final ELF serialization step.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use super::constants::*;
 use super::string_table::StringTable;
 use super::io::*;
@@ -83,7 +83,7 @@ struct SymEntry {
 pub fn write_relocatable_object(
     config: &ElfConfig,
     section_order: &[String],
-    sections: &HashMap<String, ObjSection>,
+    sections: &FxHashMap<String, ObjSection>,
     symbols: &[ObjSymbol],
 ) -> Result<Vec<u8>, String> {
     let is_32bit = config.elf_class == ELFCLASS32;
@@ -107,7 +107,7 @@ pub fn write_relocatable_object(
     // Map: group_name -> list of member content section names
     let mut comdat_groups: Vec<(String, Vec<String>)> = Vec::new();
     {
-        let mut group_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut group_map: FxHashMap<String, Vec<String>> = FxHashMap::default();
         let mut group_order: Vec<String> = Vec::new();
         for sec_name in section_order {
             if let Some(section) = sections.get(sec_name) {

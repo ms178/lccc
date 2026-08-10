@@ -4,7 +4,7 @@
 //! marks PLT/GOT needs for dynamic linking, and identifies GOT entries for
 //! PC-relative GOT references.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::{
     GlobalSym, MergedSection,
@@ -19,11 +19,11 @@ use super::relocations::{
 /// and defined symbols. Weak-to-strong overrides are applied.
 pub fn build_global_symbols(
     input_objs: &[(String, ElfObject)],
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     merged_sections: &mut Vec<MergedSection>,
-    merged_map: &mut HashMap<String, usize>,
-) -> HashMap<String, GlobalSym> {
-    let mut global_syms: HashMap<String, GlobalSym> = HashMap::new();
+    merged_map: &mut FxHashMap<String, usize>,
+) -> FxHashMap<String, GlobalSym> {
+    let mut global_syms: FxHashMap<String, GlobalSym> = FxHashMap::default();
 
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for sym in &obj.symbols {
@@ -98,9 +98,9 @@ pub fn build_global_symbols(
 /// Allocate a COMMON symbol in .bss.
 fn allocate_common_symbol(
     sym: &Symbol,
-    global_syms: &mut HashMap<String, GlobalSym>,
+    global_syms: &mut FxHashMap<String, GlobalSym>,
     merged_sections: &mut Vec<MergedSection>,
-    merged_map: &mut HashMap<String, usize>,
+    merged_map: &mut FxHashMap<String, usize>,
 ) {
     let bss_idx = *merged_map.entry(".bss".into()).or_insert_with(|| {
         let idx = merged_sections.len();
@@ -141,8 +141,8 @@ fn allocate_common_symbol(
 /// Mark symbols that need PLT entries (undefined functions found in shared libs)
 /// and collect symbols that need COPY relocations (undefined data objects).
 pub fn mark_plt_and_copy_symbols(
-    global_syms: &mut HashMap<String, GlobalSym>,
-    shared_lib_syms: &HashMap<String, DynSymbol>,
+    global_syms: &mut FxHashMap<String, GlobalSym>,
+    shared_lib_syms: &FxHashMap<String, DynSymbol>,
 ) -> (Vec<String>, Vec<(String, u64)>) {
     let mut plt_symbols: Vec<String> = Vec::new();
     let mut copy_symbols: Vec<(String, u64)> = Vec::new();
@@ -170,12 +170,12 @@ pub fn mark_plt_and_copy_symbols(
 /// and a map of local GOT symbol info for resolving local GOT entries.
 pub fn collect_got_entries(
     input_objs: &[(String, ElfObject)],
-) -> (Vec<String>, HashSet<String>, HashMap<String, (usize, usize, i64)>) {
+) -> (Vec<String>, FxHashSet<String>, FxHashMap<String, (usize, usize, i64)>) {
     let mut got_symbols: Vec<String> = Vec::new();
-    let mut tls_got_symbols: HashSet<String> = HashSet::new();
-    let mut local_got_sym_info: HashMap<String, (usize, usize, i64)> = HashMap::new();
+    let mut tls_got_symbols: FxHashSet<String> = FxHashSet::default();
+    let mut local_got_sym_info: FxHashMap<String, (usize, usize, i64)> = FxHashMap::default();
 
-    let mut got_set: HashSet<String> = HashSet::new();
+    let mut got_set: FxHashSet<String> = FxHashSet::default();
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for relocs in &obj.relocations {
             for reloc in relocs {
@@ -211,9 +211,9 @@ pub fn collect_got_entries(
 /// Build local symbol virtual address table for relocation resolution.
 pub fn build_local_sym_vaddrs(
     input_objs: &[(String, ElfObject)],
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
-    global_syms: &HashMap<String, GlobalSym>,
+    global_syms: &FxHashMap<String, GlobalSym>,
 ) -> Vec<Vec<u64>> {
     let mut local_sym_vaddrs: Vec<Vec<u64>> = Vec::new();
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
@@ -243,8 +243,8 @@ pub fn build_local_sym_vaddrs(
 
 /// Check for truly undefined symbols (not dynamic, not weak, not linker-defined).
 pub fn check_undefined_symbols(
-    global_syms: &HashMap<String, GlobalSym>,
-    shared_lib_syms: &HashMap<String, DynSymbol>,
+    global_syms: &FxHashMap<String, GlobalSym>,
+    shared_lib_syms: &FxHashMap<String, DynSymbol>,
 ) -> Result<(), String> {
     let mut truly_undefined: Vec<&String> = global_syms.iter()
         .filter(|(name, sym)| {

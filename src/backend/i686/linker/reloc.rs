@@ -8,14 +8,14 @@
 //! (R_386_PC32, R_386_PLT32), GOT-related (R_386_GOT32, R_386_GOT32X,
 //! R_386_GOTPC, R_386_GOTOFF), and TLS relocations.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::types::*;
 
 /// Context for relocation application, containing all addresses needed
 /// to resolve relocations.
 pub(super) struct RelocContext<'a> {
-    pub global_symbols: &'a HashMap<String, LinkerSymbol>,
+    pub global_symbols: &'a FxHashMap<String, LinkerSymbol>,
     pub output_sections: &'a mut Vec<OutputSection>,
     pub section_map: &'a SectionMap,
     pub got_base: u32,

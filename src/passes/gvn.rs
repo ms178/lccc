@@ -1194,7 +1194,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1274,7 +1274,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0);
@@ -1342,7 +1342,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1416,7 +1416,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1494,7 +1494,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // GEP CSE disabled
@@ -1572,7 +1572,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
@@ -1675,7 +1675,7 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: std::collections::HashMap::new(),};
+        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
         // Neither branch dominates the other, so NO CSE should happen
@@ -1740,7 +1740,7 @@ mod tests {
             aliases: vec![],
             toplevel_asm: vec![],
             symbol_attrs: vec![],
-            asm_labels: std::collections::HashMap::new(),
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
             char16_string_literals: vec![],
             symver_directives: vec![],
         }

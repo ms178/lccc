@@ -172,9 +172,9 @@ impl WarningKind {
 #[derive(Debug, Clone)]
 pub struct WarningConfig {
     /// Per-warning enabled state. Warnings not in this set are suppressed.
-    enabled: std::collections::HashSet<WarningKind>,
+    enabled: crate::common::fx_hash::FxHashSet<WarningKind>,
     /// Per-warning error promotion. Warnings in this set are emitted as errors.
-    errors: std::collections::HashSet<WarningKind>,
+    errors: crate::common::fx_hash::FxHashSet<WarningKind>,
     /// Global -Werror flag: promote ALL warnings to errors.
     pub werror_all: bool,
 }
@@ -182,13 +182,13 @@ pub struct WarningConfig {
 impl WarningConfig {
     /// Create a default config with all warnings enabled and none promoted to errors.
     pub fn new() -> Self {
-        let mut enabled = std::collections::HashSet::new();
+        let mut enabled = crate::common::fx_hash::FxHashSet::default();
         for &kind in WarningKind::all() {
             enabled.insert(kind);
         }
         Self {
             enabled,
-            errors: std::collections::HashSet::new(),
+            errors: crate::common::fx_hash::FxHashSet::default(),
             werror_all: false,
         }
     }

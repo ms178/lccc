@@ -4,17 +4,17 @@
 //! into output sections, handling COMDAT group deduplication and section
 //! type/flag assignment.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::types::*;
 
 pub(super) fn merge_sections(
     inputs: &[InputObject],
-) -> (Vec<OutputSection>, HashMap<String, usize>, SectionMap) {
+) -> (Vec<OutputSection>, FxHashMap<String, usize>, SectionMap) {
     let mut output_sections: Vec<OutputSection> = Vec::new();
-    let mut section_name_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut section_map: SectionMap = HashMap::new();
-    let mut included_comdat_sections: HashSet<String> = HashSet::new();
+    let mut section_name_to_idx: FxHashMap<String, usize> = FxHashMap::default();
+    let mut section_map: SectionMap = FxHashMap::default();
+    let mut included_comdat_sections: FxHashSet<String> = FxHashSet::default();
 
     // COMDAT group deduplication
     let comdat_skip = compute_comdat_skip(inputs);
@@ -79,9 +79,9 @@ pub(super) fn merge_sections(
     (output_sections, section_name_to_idx, section_map)
 }
 
-pub(super) fn compute_comdat_skip(inputs: &[InputObject]) -> HashSet<(usize, usize)> {
-    let mut comdat_skip = HashSet::new();
-    let mut seen_groups: HashSet<String> = HashSet::new();
+pub(super) fn compute_comdat_skip(inputs: &[InputObject]) -> FxHashSet<(usize, usize)> {
+    let mut comdat_skip = FxHashSet::default();
+    let mut seen_groups: FxHashSet<String> = FxHashSet::default();
 
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in obj.sections.iter() {

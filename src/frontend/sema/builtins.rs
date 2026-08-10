@@ -453,6 +453,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("_mm_sfence", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Sfence));
     m.insert("_mm_clflush", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Clflush));
     m.insert("_mm_pause", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pause));
+    m.insert("_mm256_zeroupper", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vzeroupper));
     m.insert("_mm_crc32_u8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_8));
     m.insert("_mm_crc32_u16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_16));
     m.insert("_mm_crc32_u32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_32));
@@ -864,6 +865,7 @@ pub enum BuiltinIntrinsic {
     X86Mfence,
     X86Sfence,
     X86Pause,
+    X86Vzeroupper,
     X86Clflush,
     X86Movnti,
     X86Movnti64,

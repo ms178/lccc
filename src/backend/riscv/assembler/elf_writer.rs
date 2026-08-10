@@ -11,7 +11,7 @@
 // ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::parser::{AsmStatement, Operand, Directive, DataValue, SymbolType, Visibility, SizeExpr};
 use super::encoder::{encode_instruction, encode_insn_directive, EncodeResult, RelocType};
 use super::compress;
@@ -48,7 +48,7 @@ pub struct ElfWriter {
     /// Counter for generating synthetic pcrel_hi labels
     pcrel_hi_counter: u32,
     /// GNU numeric labels: e.g., "1" -> [(section, offset), ...] in definition order.
-    numeric_labels: HashMap<String, Vec<(String, u64)>>,
+    numeric_labels: FxHashMap<String, Vec<(String, u64)>>,
     /// Deferred data expressions that reference forward labels (resolved after all statements).
     deferred_exprs: Vec<DeferredExpr>,
     /// ELF e_flags to use (default: RVC + double-float ABI)
@@ -110,8 +110,8 @@ fn parse_numeric_label_ref(symbol: &str) -> Option<(&str, bool)> {
 /// (backward) and `1f` (forward) must resolve to the nearest matching definition.
 fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> {
     // First pass: collect all numeric label definition positions
-    let mut label_defs: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    let mut instance_counter: HashMap<String, usize> = HashMap::new();
+    let mut label_defs: FxHashMap<String, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut instance_counter: FxHashMap<String, usize> = FxHashMap::default();
 
     for (i, stmt) in statements.iter().enumerate() {
         if let AsmStatement::Label(name) = stmt {
@@ -175,7 +175,7 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
 fn rewrite_numeric_ref_in_operand(
     op: &Operand,
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
 ) -> Operand {
     match op {
         Operand::Symbol(s) => {
@@ -207,7 +207,7 @@ fn rewrite_numeric_ref_in_operand(
 fn resolve_numeric_ref_name(
     symbol: &str,
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
 ) -> Option<String> {
     let (label_name, is_backward) = parse_numeric_label_ref(symbol)?;
     let defs = label_defs.get(label_name)?;
@@ -235,7 +235,7 @@ fn resolve_numeric_ref_name(
 fn rewrite_symbol_name(
     name: &str,
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
     dot_counter: &mut usize,
     needs_dot_label: &mut Option<String>,
 ) -> String {
@@ -289,7 +289,7 @@ fn decompose_symbol_addend(name: &str) -> (String, i64) {
 fn rewrite_data_value(
     dv: &DataValue,
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
     dot_counter: &mut usize,
     dot_labels: &mut Vec<String>,
 ) -> DataValue {
@@ -321,7 +321,7 @@ fn rewrite_data_value(
 fn rewrite_expr_numeric_refs(
     expr: &str,
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
     dot_counter: &mut usize,
     dot_labels: &mut Vec<String>,
 ) -> String {
@@ -378,7 +378,7 @@ fn rewrite_expr_numeric_refs(
 fn rewrite_data_values(
     values: &[DataValue],
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
     dot_counter: &mut usize,
     dot_labels: &mut Vec<String>,
 ) -> Vec<DataValue> {
@@ -390,7 +390,7 @@ fn rewrite_data_values(
 fn rewrite_numeric_refs_in_directive(
     dir: &Directive,
     stmt_idx: usize,
-    label_defs: &HashMap<String, Vec<(usize, usize)>>,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
     dot_counter: &mut usize,
 ) -> Vec<AsmStatement> {
     let mut dot_labels: Vec<String> = Vec::new();
@@ -428,7 +428,7 @@ impl ElfWriter {
             base: ElfWriterBase::new(RISCV_NOP, 2),
             pending_branch_relocs: Vec::new(),
             pcrel_hi_counter: 0,
-            numeric_labels: HashMap::new(),
+            numeric_labels: FxHashMap::default(),
             deferred_exprs: Vec::new(),
             elf_flags: EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC,
             elf_class: ELFCLASS64,
@@ -1139,7 +1139,7 @@ impl ElfWriter {
             .collect();
 
         for sec_name in &exec_sections {
-            let mut reloc_offsets = HashSet::new();
+            let mut reloc_offsets = FxHashSet::default();
 
             for pr in &self.pending_branch_relocs {
                 if pr.section == *sec_name {

@@ -101,7 +101,7 @@ fn build_coalesce_groups(
     liveness: &LivenessResult,
     eligible: &FxHashSet<u32>,
 ) -> FxHashMap<u32, Vec<u32>> {
-    use std::collections::HashMap;
+    use crate::common::fx_hash::FxHashMap;
     if std::env::var("CCC_DEBUG_COALESCE").is_ok() {
         eprintln!("[COALESCE] fn={} build_coalesce_groups ENTERED", func.name);
     }
@@ -114,8 +114,8 @@ fn build_coalesce_groups(
             .map(|iv| (iv.start, iv.end))
     };
     // union-find
-    let mut parent: HashMap<u32, u32> = HashMap::new();
-    fn find(parent: &mut HashMap<u32, u32>, x: u32) -> u32 {
+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    fn find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
         let mut r = x;
         while parent.get(&r).copied() != Some(r) {
             r = parent.get(&r).copied().unwrap_or(r);
@@ -129,7 +129,7 @@ fn build_coalesce_groups(
         }
         r
     }
-    fn union(parent: &mut HashMap<u32, u32>, a: u32, b: u32) {
+    fn union(parent: &mut FxHashMap<u32, u32>, a: u32, b: u32) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
@@ -197,7 +197,7 @@ fn build_coalesce_groups(
     }
 
     // Pass 2: group members by leader.
-    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let vids: Vec<u32> = parent.keys().copied().collect();
     for vid in vids {
         let leader = find(&mut parent, vid);
@@ -681,8 +681,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Debug: count overlaps BEFORE phi coalesce
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
         let mut pre_count = 0;
-        let mut pre_reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> =
-            std::collections::HashMap::new();
+        let mut pre_reg_ivs: crate::common::fx_hash::FxHashMap<u8, Vec<(u32, u32, u32)>> =
+            crate::common::fx_hash::FxHashMap::default();
         for iv in &liveness.intervals {
             if let Some(&reg) = assignments.get(&iv.value_id) {
                 pre_reg_ivs
@@ -795,8 +795,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Debug: count overlaps after phi coalesce
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
         let mut overlap_count = 0;
-        let mut reg_ivs: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> =
-            std::collections::HashMap::new();
+        let mut reg_ivs: crate::common::fx_hash::FxHashMap<u8, Vec<(u32, u32, u32)>> =
+            crate::common::fx_hash::FxHashMap::default();
         for iv in &liveness.intervals {
             if let Some(&reg) = assignments.get(&iv.value_id) {
                 reg_ivs
@@ -1023,8 +1023,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Verify: no two assigned values should have overlapping live intervals
     // in the same physical register.
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
-        let mut reg_intervals: std::collections::HashMap<u8, Vec<(u32, u32, u32)>> =
-            std::collections::HashMap::new();
+        let mut reg_intervals: crate::common::fx_hash::FxHashMap<u8, Vec<(u32, u32, u32)>> =
+            crate::common::fx_hash::FxHashMap::default();
         for iv in &liveness.intervals {
             if let Some(&reg) = assignments.get(&iv.value_id) {
                 reg_intervals

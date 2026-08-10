@@ -7,7 +7,7 @@
 //! Shared between executable and shared library linking, with context-specific
 //! behavior controlled by `RelocContext`.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::{
     GlobalSym, MergedSection,
@@ -30,24 +30,24 @@ use super::relocations::{
 /// Context for relocation application, providing all the resolved addresses
 /// and symbol tables needed to patch instructions.
 pub struct RelocContext<'a> {
-    pub sec_mapping: &'a HashMap<(usize, usize), (usize, u64)>,
+    pub sec_mapping: &'a FxHashMap<(usize, usize), (usize, u64)>,
     pub section_vaddrs: &'a [u64],
     pub local_sym_vaddrs: &'a [Vec<u64>],
-    pub global_syms: &'a HashMap<String, GlobalSym>,
+    pub global_syms: &'a FxHashMap<String, GlobalSym>,
     pub got_vaddr: u64,
     pub got_symbols: &'a [String],
     pub got_plt_vaddr: u64,
     pub tls_vaddr: u64,
     /// For executable linking: GD->LE TLS relaxation info (auipc_vaddr -> (sym_value, addend))
-    pub gd_tls_relax_info: &'a HashMap<u64, (u64, i64)>,
+    pub gd_tls_relax_info: &'a FxHashMap<u64, (u64, i64)>,
     /// For executable linking: vaddrs of __tls_get_addr calls to NOP out
-    pub gd_tls_call_nop: &'a HashSet<u64>,
+    pub gd_tls_call_nop: &'a FxHashSet<u64>,
     /// Whether to collect R_RISCV_RELATIVE dynamic relocations (shared lib mode)
     pub collect_relatives: bool,
     /// For shared library linking: additional GOT offset mapping
-    pub got_sym_offsets: &'a HashMap<String, u64>,
+    pub got_sym_offsets: &'a FxHashMap<String, u64>,
     /// For shared library linking: PLT stub addresses for undefined symbols
-    pub plt_sym_addrs: &'a HashMap<String, u64>,
+    pub plt_sym_addrs: &'a FxHashMap<String, u64>,
 }
 
 /// Result of applying relocations to one object.
@@ -538,12 +538,12 @@ fn apply_sub_uleb128(data: &mut [u8], off: usize, sub_val: u64) {
 /// to Local-Exec (LUI + ADD) during relocation application.
 pub fn collect_gd_tls_relax_info(
     input_objs: &[(String, super::elf_read::ElfObject)],
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
-    global_syms: &HashMap<String, GlobalSym>,
-    gd_tls_relax_info: &mut HashMap<u64, (u64, i64)>,
-    gd_tls_call_nop: &mut HashSet<u64>,
+    global_syms: &FxHashMap<String, GlobalSym>,
+    gd_tls_relax_info: &mut FxHashMap<u64, (u64, i64)>,
+    gd_tls_call_nop: &mut FxHashSet<u64>,
 ) {
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for (sec_idx, relocs) in obj.relocations.iter().enumerate() {

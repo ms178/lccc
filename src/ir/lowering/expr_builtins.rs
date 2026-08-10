@@ -388,7 +388,7 @@ impl Lowerer {
             }
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
-            | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause
+            | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause | BuiltinIntrinsic::X86Vzeroupper
             | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp
             | BuiltinIntrinsic::X86Clflush
             | BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
@@ -844,7 +844,7 @@ enum X86IntrinsicKind {
 fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     match intrinsic {
         BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
-        | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause => X86IntrinsicKind::Fence,
+        | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause | BuiltinIntrinsic::X86Vzeroupper => X86IntrinsicKind::Fence,
 
         BuiltinIntrinsic::X86Clflush => X86IntrinsicKind::VoidArgs,
 
@@ -893,6 +893,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Mfence => IntrinsicOp::Mfence,
         BuiltinIntrinsic::X86Sfence => IntrinsicOp::Sfence,
         BuiltinIntrinsic::X86Pause => IntrinsicOp::Pause,
+        BuiltinIntrinsic::X86Vzeroupper => IntrinsicOp::Vzeroupper,
         BuiltinIntrinsic::X86Clflush => IntrinsicOp::Clflush,
         BuiltinIntrinsic::X86Movnti => IntrinsicOp::Movnti,
         BuiltinIntrinsic::X86Movnti64 => IntrinsicOp::Movnti64,

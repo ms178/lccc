@@ -3,12 +3,12 @@
 //! Scans object file relocations to determine which symbols need PLT stubs
 //! or GOT entries, and collects IFUNC symbols for IRELATIVE relocations.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::types::GlobalSymbol;
 
-pub(super) fn collect_ifunc_symbols(globals: &HashMap<String, GlobalSymbol>, is_static: bool) -> Vec<String> {
+pub(super) fn collect_ifunc_symbols(globals: &FxHashMap<String, GlobalSymbol>, is_static: bool) -> Vec<String> {
     if !is_static { return Vec::new(); }
     let mut ifunc_symbols: Vec<String> = globals.iter()
         .filter(|(_, g)| g.defined_in.is_some() && (g.info & 0xf) == STT_GNU_IFUNC)
@@ -19,7 +19,7 @@ pub(super) fn collect_ifunc_symbols(globals: &HashMap<String, GlobalSymbol>, is_
 }
 
 pub(super) fn create_plt_got(
-    objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
 ) -> (Vec<String>, Vec<(String, bool)>) {
     let mut plt_names: Vec<String> = Vec::new();
     let mut got_only_names: Vec<String> = Vec::new();

@@ -5,7 +5,7 @@
 //! (relocation types, dynamic tags with i32 types for ELF32) live here rather
 //! than in the shared `elf` module which uses u64/i64 for ELF64.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 // Re-export shared ELF constants used throughout the linker
 pub(super) use crate::backend::elf::{
@@ -220,7 +220,7 @@ pub(super) struct OutputSection {
 }
 
 /// Maps (object_index, section_index) -> (output_section_index, offset_in_output).
-pub(super) type SectionMap = HashMap<(usize, usize), (usize, u32)>;
+pub(super) type SectionMap = FxHashMap<(usize, usize), (usize, u32)>;
 
 /// Info about a dynamic symbol from a shared library.
 pub(super) struct DynSymInfo {

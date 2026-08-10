@@ -7,13 +7,13 @@ pub(crate) mod profile;
 pub(crate) mod unroll_pgo;
 use crate::ir::reexports::{BlockId, IrFunction, IrModule};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default)]
 pub struct FunctionProfile {
     pub total_count: u64,
-    pub block_counts: HashMap<u32, u64>,
+    pub block_counts: FxHashMap<u32, u64>,
     pub cfg_hash: u64,
     pub entry_label: u32,
 }
@@ -24,7 +24,7 @@ impl FunctionProfile {
 }
 #[derive(Debug, Clone, Default)]
 pub struct ProfileData {
-    pub functions: HashMap<String, FunctionProfile>,
+    pub functions: FxHashMap<String, FunctionProfile>,
 }
 impl ProfileData {
     pub fn is_empty(&self) -> bool {
@@ -177,7 +177,7 @@ mod tests {
             "a::x".into(),
             FunctionProfile {
                 total_count: 10,
-                block_counts: HashMap::new(),
+                block_counts: FxHashMap::default(),
                 cfg_hash: 1,
                 entry_label: 0,
             },
@@ -186,7 +186,7 @@ mod tests {
             "b::y".into(),
             FunctionProfile {
                 total_count: 9,
-                block_counts: HashMap::new(),
+                block_counts: FxHashMap::default(),
                 cfg_hash: 2,
                 entry_label: 0,
             },

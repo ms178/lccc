@@ -4,7 +4,7 @@
 //! libraries. Resolves undefined symbols by demand-loading archive members, with
 //! group iteration to handle circular dependencies between libraries.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::resolve_archive_members;
 use crate::backend::linker_common;
@@ -39,8 +39,8 @@ pub fn load_input_files(
 /// Scan input objects to build initial defined/undefined symbol sets.
 pub fn collect_initial_symbols(
     input_objs: &[(String, ElfObject)],
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
 ) {
     for (_, obj) in input_objs {
         for sym in &obj.symbols {
@@ -71,9 +71,9 @@ pub fn discover_shared_lib_symbols(
     needed_libs: &[String],
     lib_search_paths: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
-    shared_lib_syms: &mut HashMap<String, DynSymbol>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
+    shared_lib_syms: &mut FxHashMap<String, DynSymbol>,
     actual_needed_libs: &mut Vec<String>,
 ) {
     use super::relocations::find_versioned_soname;
@@ -124,9 +124,9 @@ fn process_linker_script(
     dir: &str,
     lib_search_paths: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
-    shared_lib_syms: &mut HashMap<String, DynSymbol>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
+    shared_lib_syms: &mut FxHashMap<String, DynSymbol>,
 ) {
     let text = String::from_utf8_lossy(data);
     for token in text.split_whitespace() {
@@ -181,8 +181,8 @@ fn process_linker_script(
 fn load_nonshared_archive(
     path: &str,
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
 ) {
     if let Ok(archive_data) = std::fs::read(path) {
         if archive_data.len() >= 8 && &archive_data[0..8] == b"!<arch>\n" {
@@ -206,12 +206,12 @@ pub fn resolve_archives(
     needed_libs: &[String],
     lib_search_paths: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
-    shared_lib_syms: &HashMap<String, DynSymbol>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
+    shared_lib_syms: &FxHashMap<String, DynSymbol>,
 ) {
     let mut archive_paths: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
 
     // Add inline archives first
     for path in inline_archive_paths {
@@ -284,13 +284,13 @@ pub fn load_shared_lib_inputs(
     object_files: &[&str],
     extra_object_files: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
 ) -> Result<(), String> {
     let load = |path: &str,
                 objs: &mut Vec<(String, ElfObject)>,
-                defs: &mut HashSet<String>,
-                undefs: &mut HashSet<String>| -> Result<(), String> {
+                defs: &mut FxHashSet<String>,
+                undefs: &mut FxHashSet<String>| -> Result<(), String> {
         let data = std::fs::read(path)
             .map_err(|e| format!("failed to read '{}': {}", path, e))?;
         if data.len() < 4 {
@@ -322,8 +322,8 @@ pub fn load_shared_lib_inputs(
 /// Register an object's symbols in the defined/undefined sets.
 fn register_obj_symbols(
     obj: &ElfObject,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
 ) {
     for sym in &obj.symbols {
         if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
@@ -345,8 +345,8 @@ pub fn resolve_shared_lib_deps(
     libs_to_load: &[String],
     all_lib_paths: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut HashSet<String>,
-    undefined_syms: &mut HashSet<String>,
+    defined_syms: &mut FxHashSet<String>,
+    undefined_syms: &mut FxHashSet<String>,
     needed_sonames: &mut Vec<String>,
 ) -> Result<(), String> {
     for lib_name in libs_to_load {
@@ -383,8 +383,8 @@ pub fn resolve_shared_lib_deps(
                 // Relocatable object
                 let load_fn = |path: &str,
                                objs: &mut Vec<(String, ElfObject)>,
-                               defs: &mut HashSet<String>,
-                               undefs: &mut HashSet<String>| -> Result<(), String> {
+                               defs: &mut FxHashSet<String>,
+                               undefs: &mut FxHashSet<String>| -> Result<(), String> {
                     let data = std::fs::read(path)
                         .map_err(|e| format!("failed to read '{}': {}", path, e))?;
                     if data.starts_with(&[0x7f, b'E', b'L', b'F']) {

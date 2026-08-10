@@ -3,7 +3,7 @@
 //! Used by linkers that produce dynamically-linked executables (x86, i686, RISC-V).
 //! Deduplicates strings and tracks offsets.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 /// Dynamic string table builder.
 ///
@@ -11,12 +11,12 @@ use std::collections::HashMap;
 /// Deduplicates strings and tracks offsets for .dynstr section emission.
 pub struct DynStrTab {
     data: Vec<u8>,
-    offsets: HashMap<String, usize>,
+    offsets: FxHashMap<String, usize>,
 }
 
 impl DynStrTab {
     pub fn new() -> Self {
-        Self { data: vec![0], offsets: HashMap::new() }
+        Self { data: vec![0], offsets: FxHashMap::default() }
     }
 
     pub fn add(&mut self, s: &str) -> usize {

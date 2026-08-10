@@ -306,7 +306,7 @@ pub struct X86Codegen {
     /// vpbroadcast{w,d,q} .LvcN(%rip), %ymm0 (1 uop on the load port) instead
     /// of movl+vmovd+vpbroadcastd (3 uops, two of them port-5). Entries are
     /// flushed to .rodata by emit_vector_const_rodata after the function body.
-    pub(super) vec_const_labels: std::collections::HashMap<(u64, u8), String>,
+    pub(super) vec_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8), String>,
     pub(super) vec_const_counter: u32,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
@@ -385,7 +385,7 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_sse: false,
-            vec_const_labels: std::collections::HashMap::new(),
+            vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
             avx512_enabled: false,
             skip_i32_sext: false,

@@ -3,7 +3,7 @@
 //! Validates that all required symbols have been resolved after linking,
 //! filtering out dynamic, weak, and linker-defined symbols.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use crate::backend::elf::STB_WEAK;
 use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
@@ -15,7 +15,7 @@ use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 /// using the `GlobalSymbolOps` trait methods. `max_report` limits how many
 /// symbols are shown in the error message (typically 20).
 pub fn check_undefined_symbols_elf64<G: GlobalSymbolOps>(
-    globals: &HashMap<String, G>,
+    globals: &FxHashMap<String, G>,
     max_report: usize,
 ) -> Result<(), String> {
     let mut truly_undefined: Vec<&String> = globals.iter()

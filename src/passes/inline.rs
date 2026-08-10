@@ -16,7 +16,7 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
     Operand, Terminator, Value,
 };
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 /// Maximum number of IR instructions (across all blocks) in a callee for it
 /// to be eligible for inlining. This handles constant-returning helpers
@@ -232,7 +232,7 @@ const MAX_TRACE_RECURSION_DEPTH: u32 = 10;
 /// Returns `(site, callee_inst_count, use_relaxed)` or `None` if no eligible site.
 fn select_inline_site(
     call_sites: &[InlineCallSite],
-    callee_map: &HashMap<String, CalleeData>,
+    callee_map: &FxHashMap<String, CalleeData>,
     caller_too_large: bool,
     caller_at_hard_cap: bool,
     caller_at_absolute_cap: bool,
@@ -862,10 +862,10 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
 fn resolve_inline_asm_symbols(func: &mut IrFunction) {
     // Build a map from Value -> defining instruction for the whole function.
     // We store the instruction itself (cloned) for lookup.
-    let mut value_defs: HashMap<u32, Instruction> = HashMap::new();
+    let mut value_defs: FxHashMap<u32, Instruction> = FxHashMap::default();
     // Also track Store instructions: alloca_ptr -> stored value
     // This lets us trace: Load(alloca) -> Store(val, alloca) -> val
-    let mut alloca_stores: HashMap<u32, Operand> = HashMap::new();
+    let mut alloca_stores: FxHashMap<u32, Operand> = FxHashMap::default();
 
     for block in func.blocks.iter() {
         for inst in &block.instructions {
@@ -994,8 +994,8 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
 /// GEP with Value offsets are resolved via trace_operand_to_const.
 fn trace_value_to_global(
     start_val: u32,
-    value_defs: &HashMap<u32, Instruction>,
-    alloca_stores: &HashMap<u32, Operand>,
+    value_defs: &FxHashMap<u32, Instruction>,
+    alloca_stores: &FxHashMap<u32, Operand>,
 ) -> Option<String> {
     let mut current = start_val;
     let mut accumulated_offset: i64 = 0;
@@ -1098,8 +1098,8 @@ fn trace_value_to_global(
 /// `depth` limits recursion for BinOp/Cmp where both sides need tracing.
 fn trace_operand_to_const(
     op: &Operand,
-    value_defs: &HashMap<u32, Instruction>,
-    alloca_stores: &HashMap<u32, Operand>,
+    value_defs: &FxHashMap<u32, Instruction>,
+    alloca_stores: &FxHashMap<u32, Operand>,
     depth: u32,
 ) -> Option<i64> {
     if depth > MAX_TRACE_RECURSION_DEPTH {
@@ -1183,10 +1183,10 @@ fn trace_operand_to_const(
 
 /// Debug validation: check that every Value used as an operand is defined by some instruction.
 fn validate_function_values(func: &IrFunction, last_inlined_callee: &str) {
-    use std::collections::HashSet;
+    use crate::common::fx_hash::FxHashSet;
 
     // Collect all defined values
-    let mut defined: HashSet<u32> = HashSet::new();
+    let mut defined: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Some(v) = inst.dest() {
@@ -1354,8 +1354,8 @@ fn fits_normal_inline_limits(
     inst_ok && block_ok
 }
 
-fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
-    let mut map = HashMap::new();
+fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+    let mut map = FxHashMap::default();
 
     let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
     for func in &module.functions {
@@ -1635,7 +1635,7 @@ fn func_has_vector_intrinsics(func: &IrFunction) -> bool {
 /// (e.g., .head.text, .noinstr.text) can cause boot/runtime failures.
 fn find_inline_call_sites(
     func: &IrFunction,
-    callee_map: &HashMap<String, CalleeData>,
+    callee_map: &FxHashMap<String, CalleeData>,
     skip_list: &[String],
     caller_has_section: bool,
 ) -> Vec<InlineCallSite> {
@@ -1879,7 +1879,7 @@ fn inline_call_site(
     let ssa_param_enabled = std::env::var("CCC_NO_SSA_PARAM").is_err();
     // CCC_SSA_PARAM_SKIP=callee1,callee2 disables substitution for named
     // callees; CCC_SSA_PARAM_LOG=1 traces substitutions (diagnostics).
-    let ssa_skip: std::collections::HashSet<String> = std::env::var("CCC_SSA_PARAM_SKIP")
+    let ssa_skip: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_SSA_PARAM_SKIP")
         .unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     let ssa_log = std::env::var("CCC_SSA_PARAM_LOG").is_ok();
     let substitutable: Vec<bool> = (0..param_alloca_info.len())
@@ -1982,7 +1982,7 @@ fn inline_call_site(
     // instructions (and their associated stores to param allocas) are redundant.
     // We also remove the Store that immediately follows each ParamRef since it
     // stores the (now-removed) ParamRef dest into a param alloca.
-    let param_alloca_set: std::collections::HashSet<u32> =
+    let param_alloca_set: crate::common::fx_hash::FxHashSet<u32> =
         param_alloca_info.iter().map(|(v, _, _)| v.0).collect();
     for block in &mut inlined_blocks {
         let has_spans =
@@ -1990,7 +1990,7 @@ fn inline_call_site(
         let old_spans = std::mem::take(&mut block.source_spans);
         let mut new_insts = Vec::with_capacity(block.instructions.len());
         let mut new_spans = Vec::new();
-        let mut paramref_dests: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut paramref_dests: crate::common::fx_hash::FxHashSet<u32> = crate::common::fx_hash::FxHashSet::default();
         for (idx, inst) in block.instructions.drain(..).enumerate() {
             if let Instruction::ParamRef { dest, .. } = &inst {
                 paramref_dests.insert(dest.0);

@@ -4,7 +4,7 @@
 //! alignment, sorts output sections by permission profile, and allocates
 //! SHN_COMMON symbols into `.bss`.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
     SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL,
@@ -23,9 +23,9 @@ use super::section_map::map_section_name;
 /// by permission profile: RO -> Exec -> RW(progbits) -> RW(nobits).
 pub fn merge_sections_elf64(
     objects: &[Elf64Object], output_sections: &mut Vec<OutputSection>,
-    section_map: &mut HashMap<(usize, usize), (usize, u64)>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
 ) {
-    let no_dead = HashSet::new();
+    let no_dead = FxHashSet::default();
     merge_sections_elf64_gc(objects, output_sections, section_map, &no_dead);
 }
 
@@ -35,10 +35,10 @@ pub fn merge_sections_elf64(
 /// are excluded from the output, effectively garbage-collecting unreferenced code.
 pub fn merge_sections_elf64_gc(
     objects: &[Elf64Object], output_sections: &mut Vec<OutputSection>,
-    section_map: &mut HashMap<(usize, usize), (usize, u64)>,
-    dead_sections: &HashSet<(usize, usize)>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+    dead_sections: &FxHashSet<(usize, usize)>,
 ) {
-    let mut output_map: HashMap<String, usize> = HashMap::new();
+    let mut output_map: FxHashMap<String, usize> = FxHashMap::default();
 
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
@@ -106,7 +106,7 @@ pub fn merge_sections_elf64_gc(
         else { (2, is_nobits as u32) }
     });
 
-    let mut index_remap: HashMap<usize, usize> = HashMap::new();
+    let mut index_remap: FxHashMap<usize, usize> = FxHashMap::default();
     for (new_idx, &old_idx) in sort_indices.iter().enumerate() {
         index_remap.insert(old_idx, new_idx);
     }
@@ -124,7 +124,7 @@ pub fn merge_sections_elf64_gc(
 
 /// Allocate SHN_COMMON symbols into the .bss output section.
 pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
-    globals: &mut HashMap<String, G>, output_sections: &mut Vec<OutputSection>,
+    globals: &mut FxHashMap<String, G>, output_sections: &mut Vec<OutputSection>,
 ) {
     let common_syms: Vec<(String, u64, u64)> = globals.iter()
         .filter(|(_, sym)| sym.section_idx() == SHN_COMMON && sym.is_defined())

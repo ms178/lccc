@@ -296,7 +296,7 @@ fn estimate_line_bytes_generic(trimmed: &str, comment_style: &CommentStyle, defa
 /// Substitutes each backward reference with its byte position, then evaluates the expression.
 fn resolve_rept_label_expr(
     count_str: &str,
-    label_positions: &std::collections::HashMap<String, Vec<u64>>,
+    label_positions: &crate::common::fx_hash::FxHashMap<String, Vec<u64>>,
     parse_int: fn(&str) -> Result<i64, String>,
 ) -> Result<i64, String> {
     // First try direct evaluation (handles simple integer expressions)
@@ -378,7 +378,7 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
-    let mut label_positions: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> = crate::common::fx_hash::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i], comment_style).trim().to_string();
@@ -750,8 +750,8 @@ pub fn expand_macros(
     lines: &[&str],
     comment_style: &CommentStyle,
 ) -> Result<Vec<String>, String> {
-    use std::collections::HashMap;
-    let mut macros: HashMap<String, MacroDef> = HashMap::new();
+    use crate::common::fx_hash::FxHashMap;
+    let mut macros: FxHashMap<String, MacroDef> = FxHashMap::default();
     let mut result = Vec::new();
     let mut i = 0;
 
@@ -874,7 +874,7 @@ pub fn replace_macro_param(text: &str, pattern: &str, replacement: &str) -> Stri
 /// Re-expand macro invocations using already-collected macro definitions.
 fn expand_macros_with(
     lines: &[&str],
-    macros: &std::collections::HashMap<String, MacroDef>,
+    macros: &crate::common::fx_hash::FxHashMap<String, MacroDef>,
     comment_style: &CommentStyle,
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();

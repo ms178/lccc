@@ -637,7 +637,7 @@ fn creg_num(reg: u32) -> u32 {
 /// instruction size.
 pub fn compress_section(
     data: &[u8],
-    reloc_offsets: &std::collections::HashSet<u64>,
+    reloc_offsets: &crate::common::fx_hash::FxHashSet<u64>,
 ) -> (Vec<u8>, Vec<(u64, u64)>) {
     let mut new_data = Vec::with_capacity(data.len());
     let mut offset_map = Vec::new(); // (old_offset, new_offset)

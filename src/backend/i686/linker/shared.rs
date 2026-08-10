@@ -3,7 +3,7 @@
 //! Produces ELF32 shared libraries (ET_DYN) with PLT/GOT, PIC relocations,
 //! `.dynamic` section, GNU hash tables, and GLIBC version tables.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use super::types::*;
@@ -17,7 +17,7 @@ use crate::backend::linker_common;
 /// Discover NEEDED shared library dependencies for a shared library build.
 pub(super) fn resolve_dynamic_symbols_for_shared(
     inputs: &[InputObject],
-    global_symbols: &HashMap<String, LinkerSymbol>,
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
     needed_sonames: &mut Vec<String>,
     lib_paths: &[String],
 ) {
@@ -86,9 +86,9 @@ pub(super) fn resolve_dynamic_symbols_for_shared(
 /// - R_386_RELATIVE relocations for internal absolute addresses
 pub(super) fn emit_shared_library_32(
     inputs: &[InputObject],
-    global_symbols: &mut HashMap<String, LinkerSymbol>,
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
     output_sections: &mut Vec<OutputSection>,
-    section_name_to_idx: &HashMap<String, usize>,
+    section_name_to_idx: &FxHashMap<String, usize>,
     section_map: &SectionMap,
     needed_sonames: &[String],
     output_path: &str,
@@ -261,7 +261,7 @@ pub(super) fn emit_shared_library_32(
         }
     }
 
-    let dynsym_map: HashMap<String, usize> = dynsym_names.iter().enumerate()
+    let dynsym_map: FxHashMap<String, usize> = dynsym_names.iter().enumerate()
         .map(|(i, n)| (n.clone(), i + 1))
         .collect();
 
