@@ -1388,6 +1388,23 @@ impl Driver {
             }
         }
 
+        // W5: phi elimination appends mutually-exclusive edge-copy blocks at
+        // function end. Place each beside its sole predecessor so contiguous
+        // live intervals reflect the real CFG lifetime rather than overlapping
+        // every intervening branch arm. Enabled after the full gzip/expat,
+        // regression, and differential-fuzz campaign; retain a diagnostic kill
+        // switch for downstream bisection.
+        if self.target == Target::X86_64
+            && self.opt_level >= 2
+            && std::env::var("CCC_NO_EDGE_COPY_LAYOUT").is_err()
+        {
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    crate::backend::split_ranges::place_edge_copy_blocks(func);
+                }
+            }
+        }
+
         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
         // This fixes a bug where optimization passes can create duplicate labels
         {

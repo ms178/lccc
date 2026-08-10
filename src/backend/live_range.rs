@@ -958,6 +958,7 @@ mod tests {
             priority: 1,
             reg_hint: None,
             spill_weight: 0.1,
+            cascade: 0,
         };
 
         // Overlapping: starts within range
@@ -1004,6 +1005,7 @@ mod tests {
             priority: 100,
             reg_hint: None,
             spill_weight: 100.0 / 11.0, // 100 / range_length
+            cascade: 0,
         };
 
         let long_range = LiveRange {
@@ -1015,6 +1017,7 @@ mod tests {
             priority: 100,
             reg_hint: None,
             spill_weight: 100.0 / 101.0, // 100 / range_length
+            cascade: 0,
         };
 
         // Short ranges have higher spill weight (less painful to keep in register)
@@ -1034,6 +1037,7 @@ mod tests {
                 priority: 3,
                 reg_hint: None,
                 spill_weight: 0.3,
+                cascade: 0,
             },
             LiveRange {
                 value_id: 2,
@@ -1044,6 +1048,7 @@ mod tests {
                 priority: 3,
                 reg_hint: None,
                 spill_weight: 0.3,
+                cascade: 0,
             },
             LiveRange {
                 value_id: 3,
@@ -1054,6 +1059,7 @@ mod tests {
                 priority: 3,
                 reg_hint: None,
                 spill_weight: 0.3,
+                cascade: 0,
             },
         ];
 
@@ -1081,6 +1087,7 @@ mod tests {
                 priority: 3, // High priority
                 reg_hint: None,
                 spill_weight: 0.03,
+                cascade: 0,
             },
             LiveRange {
                 value_id: 2,
@@ -1091,6 +1098,7 @@ mod tests {
                 priority: 2, // Lower priority - should spill
                 reg_hint: None,
                 spill_weight: 0.02,
+                cascade: 0,
             },
         ];
 
@@ -1117,6 +1125,7 @@ mod tests {
             priority: 1,
             reg_hint: None,
             spill_weight: 0.1,
+            cascade: 0,
         }];
 
         let regs = vec![]; // No registers available

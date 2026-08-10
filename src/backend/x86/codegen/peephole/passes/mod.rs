@@ -1865,5 +1865,13 @@ mod regression_tests {
             "reg-reg move with different regs must stay: {}", out);
     }
 
+
+    #[test]
+    fn xmm_source_is_not_indexed_as_a_gpr_in_extension_fusion() {
+        let asm = "    movq %xmm2, %rax\n    movl %eax, %eax\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("%xmm2"));
+    }
+
 }
 

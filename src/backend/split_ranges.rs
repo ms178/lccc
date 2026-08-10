@@ -261,6 +261,116 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
     splits
 }
 
+/// Place single-predecessor phi edge-copy blocks next to their predecessor.
+///
+/// Phi elimination appends edge blocks to the end of the function.  In the
+/// linear program-point order this makes a value defined in a branch arm look
+/// live across every intervening arm until its copy in the appended edge block.
+/// The paths are mutually exclusive, but a contiguous-interval allocator sees
+/// all those artificial ranges overlap (gzip `longest_match`: eight byte-compare
+/// arms alone consumed most of the GPR budget).
+///
+/// Reordering an explicit basic block is semantics-preserving: every block has
+/// an explicit terminator and labels are stable.  Keeping an edge-copy block
+/// adjacent to its sole predecessor makes the source range end at the edge,
+/// which is the lifetime the SSA program actually has.  This is a layout form
+/// of live-range splitting with no inserted loads, stores, or runtime copies.
+pub fn place_edge_copy_blocks(func: &mut IrFunction) -> usize {
+    let n = func.blocks.len();
+    if n < 3 {
+        return 0;
+    }
+    let label_map = analysis::build_label_map(func);
+    let (preds, _succs) = analysis::build_cfg(func, &label_map);
+
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut is_edge_copy = vec![false; n];
+    for (block_idx, edge_flag) in is_edge_copy.iter_mut().enumerate().skip(1) {
+        let block = &func.blocks[block_idx];
+        if block.instructions.is_empty()
+            || !block
+                .instructions
+                .iter()
+                .all(|inst| matches!(inst, Instruction::Copy { .. }))
+            || preds.len(block_idx) != 1
+        {
+            continue;
+        }
+        let Terminator::Branch(target_label) = block.terminator else {
+            continue;
+        };
+        let Some(&merge_idx) = label_map.get(&target_label) else {
+            continue;
+        };
+        // Phi edge blocks feed a merge.  Requiring multiple incoming edges
+        // avoids perturbing ordinary source blocks that happen to contain only
+        // a user-visible Copy and an unconditional branch.
+        if preds.len(merge_idx) < 2 {
+            continue;
+        }
+        let pred_idx = preds.row(block_idx)[0] as usize;
+        if pred_idx == block_idx {
+            continue;
+        }
+        children[pred_idx].push(block_idx);
+        *edge_flag = true;
+    }
+    if !is_edge_copy.iter().any(|&v| v) {
+        return 0;
+    }
+    for list in &mut children {
+        list.sort_unstable();
+    }
+
+    fn emit_block_and_edges(
+        idx: usize,
+        children: &[Vec<usize>],
+        blocks: &mut [Option<BasicBlock>],
+        emitted: &mut [bool],
+        out: &mut Vec<BasicBlock>,
+    ) {
+        if emitted[idx] {
+            return;
+        }
+        emitted[idx] = true;
+        if let Some(block) = blocks[idx].take() {
+            out.push(block);
+        }
+        for &child in &children[idx] {
+            emit_block_and_edges(child, children, blocks, emitted, out);
+        }
+    }
+
+    let old_blocks = std::mem::take(&mut func.blocks);
+    let mut blocks: Vec<Option<BasicBlock>> = old_blocks.into_iter().map(Some).collect();
+    let mut emitted = vec![false; n];
+    let mut reordered = Vec::with_capacity(n);
+    for (idx, &edge_copy) in is_edge_copy.iter().enumerate() {
+        if !edge_copy {
+            emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
+        }
+    }
+    // Conservatively retain any candidate cycle/unreachable component in its
+    // original relative order.  Normal phi edge blocks are all emitted above.
+    for idx in 0..n {
+        emit_block_and_edges(idx, &children, &mut blocks, &mut emitted, &mut reordered);
+    }
+    debug_assert_eq!(reordered.len(), n);
+
+    let moved = reordered
+        .iter()
+        .enumerate()
+        .filter(|(new_idx, block)| {
+            label_map
+                .get(&block.label)
+                .is_some_and(|&old_idx| old_idx != *new_idx)
+                && is_edge_copy[label_map[&block.label]]
+        })
+        .count();
+    func.blocks = reordered;
+    moved
+}
+
 fn find_value_type(func: &IrFunction, val_id: u32) -> Option<IrType> {
     for b in &func.blocks {
         for i in &b.instructions {
@@ -295,5 +405,67 @@ fn inst_uses_value(inst: &Instruction, v: u32) -> bool {
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.args.iter().any(|a| c(a)),
         Instruction::Select { cond, true_val, false_val, .. } => c(cond) || c(true_val) || c(false_val),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod edge_layout_tests {
+    use super::*;
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn places_single_predecessor_phi_edge_beside_predecessor() {
+        let mut func = IrFunction::new("edge_layout".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(1)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                Vec::new(),
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(4),
+                },
+            ),
+            block(2, Vec::new(), Terminator::Branch(BlockId(3))),
+            block(
+                3,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(10)))),
+            ),
+            block(
+                4,
+                vec![Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+        ];
+        func.next_value_id = 11;
+
+        assert_eq!(place_edge_copy_blocks(&mut func), 1);
+        let labels: Vec<u32> = func.blocks.iter().map(|b| b.label.0).collect();
+        assert_eq!(labels, vec![0, 1, 4, 2, 3]);
+        assert!(matches!(
+            func.blocks[2].instructions.as_slice(),
+            [Instruction::Copy { dest, src: Operand::Value(src) }]
+                if dest.0 == 10 && src.0 == 1
+        ));
     }
 }
