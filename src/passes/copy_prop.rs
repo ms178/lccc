@@ -635,8 +635,8 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
     // Remove the copies themselves (rebuild each block's instruction list,
     // dropping the marked copy indices).
     {
-        use std::collections::HashSet;
-        let mut per_block: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
+        use crate::common::fx_hash::FxHashSet;
+        let mut per_block: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); func.blocks.len()];
         for &(bi, ii, _, _) in &to_remove {
             if bi < per_block.len() {
                 per_block[bi].insert(ii);

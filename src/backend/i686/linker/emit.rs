@@ -3,7 +3,8 @@
 //! Phase 10: lays out segments, assigns addresses, applies relocations,
 //! builds PLT/GOT/dynamic sections, and writes the final ELF32 executable.
 
-use std::collections::{HashMap, BTreeSet};
+use std::collections::BTreeSet;
+use crate::common::fx_hash::FxHashMap;
 
 use super::types::*;
 use super::reloc::{self, RelocContext};
@@ -14,11 +15,11 @@ use crate::backend::linker_common;
 pub(super) fn emit_executable(
     inputs: &[InputObject],
     output_sections: &mut Vec<OutputSection>,
-    section_name_to_idx: &HashMap<String, usize>,
+    section_name_to_idx: &FxHashMap<String, usize>,
     section_map: &SectionMap,
-    global_symbols: &mut HashMap<String, LinkerSymbol>,
-    _sym_resolution: &HashMap<(usize, usize), String>,
-    _dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    _sym_resolution: &FxHashMap<(usize, usize), String>,
+    _dynlib_syms: &FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
     plt_symbols: &[String],
     got_dyn_symbols: &[String],
     got_local_symbols: &[String],
@@ -54,7 +55,7 @@ pub(super) fn emit_executable(
     let mut dynsym_entries: Vec<Elf32Sym> = Vec::new();
     dynsym_entries.push(Elf32Sym { name: 0, value: 0, size: 0, info: 0, other: 0, shndx: 0 });
 
-    let mut dynsym_map: HashMap<String, usize> = HashMap::new();
+    let mut dynsym_map: FxHashMap<String, usize> = FxHashMap::default();
     let mut dynsym_names: Vec<String> = Vec::new();
 
     // PLT symbols (unhashed imports)
@@ -160,7 +161,7 @@ pub(super) fn emit_executable(
     }
 
     // ── Build version tables ──────────────────────────────────────────────
-    let mut lib_versions: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut lib_versions: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
     for name in &dynsym_names {
         if let Some(gs) = global_symbols.get(name) {
             if gs.is_dynamic {
@@ -171,7 +172,7 @@ pub(super) fn emit_executable(
         }
     }
 
-    let mut ver_index_map: HashMap<(String, String), u16> = HashMap::new();
+    let mut ver_index_map: FxHashMap<(String, String), u16> = FxHashMap::default();
     let mut ver_idx: u16 = 2;
     let mut lib_ver_list: Vec<(String, Vec<String>)> = Vec::new();
     let mut sorted_libs: Vec<String> = lib_versions.keys().cloned().collect();
@@ -967,7 +968,7 @@ pub(super) fn emit_executable(
 
 pub(super) fn layout_section(
     name: &str,
-    section_name_to_idx: &HashMap<String, usize>,
+    section_name_to_idx: &FxHashMap<String, usize>,
     output_sections: &mut [OutputSection],
     file_offset: &mut u32,
     vaddr: &mut u32,
@@ -1001,7 +1002,7 @@ pub(super) fn layout_section(
 ///   - 0: custom read-only sections (placed in rodata segment, no write/exec)
 ///   - SHF_WRITE: custom writable sections (placed in data segment)
 pub(super) fn layout_custom_sections(
-    section_name_to_idx: &HashMap<String, usize>,
+    section_name_to_idx: &FxHashMap<String, usize>,
     output_sections: &mut [OutputSection],
     file_offset: &mut u32,
     vaddr: &mut u32,
@@ -1038,7 +1039,7 @@ pub(super) fn layout_custom_sections(
 }
 
 pub(super) fn layout_tls(
-    section_name_to_idx: &HashMap<String, usize>,
+    section_name_to_idx: &FxHashMap<String, usize>,
     output_sections: &mut [OutputSection],
     file_offset: &mut u32,
     vaddr: &mut u32,
@@ -1107,7 +1108,7 @@ fn count_dynamic_entries(
 }
 
 fn assign_symbol_addresses(
-    global_symbols: &mut HashMap<String, LinkerSymbol>,
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
     output_sections: &[OutputSection],
     got_base: u32,
     plt_vaddr: u32, plt_header_size: u32, plt_entry_size: u32,
@@ -1146,7 +1147,7 @@ fn assign_symbol_addresses(
         rela_iplt_size: rel_iplt_size as u64,
     };
     let standard_syms = get_standard_linker_symbols(&linker_addrs);
-    let linker_sym_map: HashMap<&str, u64> = standard_syms.iter()
+    let linker_sym_map: FxHashMap<&str, u64> = standard_syms.iter()
         .filter(|s| !s.name.starts_with("__rela_iplt"))
         .map(|s| (s.name, s.value))
         .collect();

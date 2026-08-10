@@ -4,7 +4,7 @@
 //! PLT/GOT marking, undefined symbol checking, PLT/GOT list building,
 //! and IFUNC collection.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::types::*;
 use crate::backend::linker_common;
@@ -13,10 +13,10 @@ pub(super) fn resolve_symbols(
     inputs: &[InputObject],
     _output_sections: &[OutputSection],
     section_map: &SectionMap,
-    dynlib_syms: &HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
-) -> (HashMap<String, LinkerSymbol>, HashMap<(usize, usize), String>) {
-    let mut global_symbols: HashMap<String, LinkerSymbol> = HashMap::new();
-    let mut sym_resolution: HashMap<(usize, usize), String> = HashMap::new();
+    dynlib_syms: &FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
+) -> (FxHashMap<String, LinkerSymbol>, FxHashMap<(usize, usize), String>) {
+    let mut global_symbols: FxHashMap<String, LinkerSymbol> = FxHashMap::default();
+    let mut sym_resolution: FxHashMap<(usize, usize), String> = FxHashMap::default();
 
     // First pass: collect definitions
     for (obj_idx, obj) in inputs.iter().enumerate() {
@@ -168,8 +168,8 @@ pub(super) fn resolve_symbols(
 pub(super) fn allocate_common_symbols(
     inputs: &[InputObject],
     output_sections: &mut Vec<OutputSection>,
-    section_name_to_idx: &mut HashMap<String, usize>,
-    global_symbols: &mut HashMap<String, LinkerSymbol>,
+    section_name_to_idx: &mut FxHashMap<String, usize>,
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
 ) {
     // Collect COMMON symbols: (name, alignment, size)
     // For COMMON symbols, InputSymbol.value is the alignment requirement, .size is the size.
@@ -240,7 +240,7 @@ pub(super) fn allocate_common_symbols(
 
 pub(super) fn mark_plt_got_needs(
     inputs: &[InputObject],
-    global_symbols: &mut HashMap<String, LinkerSymbol>,
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
     _is_static: bool,
 ) {
     for obj in inputs.iter() {
@@ -278,7 +278,7 @@ pub(super) fn mark_plt_got_needs(
     }
 }
 
-pub(super) fn check_undefined_symbols(global_symbols: &HashMap<String, LinkerSymbol>) -> Result<(), String> {
+pub(super) fn check_undefined_symbols(global_symbols: &FxHashMap<String, LinkerSymbol>) -> Result<(), String> {
     let truly_undefined: Vec<&String> = global_symbols.iter()
         .filter(|(n, s)| !s.is_defined && !s.is_dynamic && s.binding != STB_WEAK
             && !linker_common::is_linker_defined_symbol(n))
@@ -297,7 +297,7 @@ pub(super) fn check_undefined_symbols(global_symbols: &HashMap<String, LinkerSym
 // ══════════════════════════════════════════════════════════════════════════════
 
 pub(super) fn build_plt_got_lists(
-    global_symbols: &mut HashMap<String, LinkerSymbol>,
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
 ) -> (Vec<String>, Vec<String>, Vec<String>, usize, usize) {
     let mut plt_symbols: Vec<String> = Vec::new();
     let mut got_dyn_symbols: Vec<String> = Vec::new();
@@ -343,7 +343,7 @@ pub(super) fn build_plt_got_lists(
 }
 
 pub(super) fn collect_ifunc_symbols(
-    global_symbols: &HashMap<String, LinkerSymbol>,
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
     is_static: bool,
 ) -> Vec<String> {
     if !is_static { return Vec::new(); }

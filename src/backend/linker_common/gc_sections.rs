@@ -4,7 +4,8 @@
 //! arrays, following relocations transitively to find all reachable sections.
 //! Returns the set of dead (unreachable) input sections to discard.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::elf::{
     SHF_ALLOC, SHF_EXCLUDE,
     SHT_NULL, SHT_STRTAB, SHT_SYMTAB, SHT_RELA, SHT_REL, SHT_GROUP,
@@ -20,9 +21,9 @@ use super::Elf64Object;
 /// arrays, follows relocations transitively to find all reachable sections.
 pub fn gc_collect_sections_elf64(
     objects: &[Elf64Object],
-) -> HashSet<(usize, usize)> {
+) -> FxHashSet<(usize, usize)> {
     // Build the set of all allocatable input sections
-    let mut all_sections: HashSet<(usize, usize)> = HashSet::new();
+    let mut all_sections: FxHashSet<(usize, usize)> = FxHashSet::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
         for (sec_idx, sec) in obj.sections.iter().enumerate() {
             if sec.flags & SHF_ALLOC == 0 { continue; }
@@ -33,7 +34,7 @@ pub fn gc_collect_sections_elf64(
     }
 
     // Build a map from symbol name -> (obj_idx, sec_idx) for defined symbols
-    let mut sym_to_section: HashMap<&str, (usize, usize)> = HashMap::new();
+    let mut sym_to_section: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
             if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON { continue; }
@@ -48,10 +49,10 @@ pub fn gc_collect_sections_elf64(
     }
 
     // Seed the worklist with entry-point sections and sections that must be kept
-    let mut live: HashSet<(usize, usize)> = HashSet::new();
+    let mut live: FxHashSet<(usize, usize)> = FxHashSet::default();
     let mut worklist: VecDeque<(usize, usize)> = VecDeque::new();
 
-    let mark_live = |key: (usize, usize), live: &mut HashSet<(usize, usize)>, wl: &mut VecDeque<(usize, usize)>| {
+    let mark_live = |key: (usize, usize), live: &mut FxHashSet<(usize, usize)>, wl: &mut VecDeque<(usize, usize)>| {
         if all_sections.contains(&key) && live.insert(key) {
             wl.push_back(key);
         }

@@ -291,7 +291,7 @@ fn estimate_line_bytes(trimmed: &str) -> u64 {
 /// Substitutes each backward reference with its byte position, then evaluates the expression.
 fn resolve_rept_label_expr(
     count_str: &str,
-    label_positions: &std::collections::FxHashMap<String, Vec<u64>>,
+    label_positions: &crate::common::fx_hash::FxHashMap<String, Vec<u64>>,
 ) -> Result<i64, String> {
     // First try direct evaluation (handles simple integer expressions)
     if let Ok(val) = asm_expr::parse_integer_expr(count_str) {
@@ -358,7 +358,7 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     // Track numeric label positions (byte offsets) for resolving backward refs
-    let mut label_positions: std::collections::FxHashMap<String, Vec<u64>> = std::collections::FxHashMap::default();
+    let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> = crate::common::fx_hash::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
@@ -738,7 +738,7 @@ fn expand_macros(lines: &[&str]) -> Result<Vec<String>, String> {
 /// `counter` is GAS's `\@` macro invocation counter.
 fn expand_macros_impl(
     lines: &[&str],
-    macros: &mut std::collections::FxHashMap<String, MacroDef>,
+    macros: &mut crate::common::fx_hash::FxHashMap<String, MacroDef>,
     depth: usize,
     counter: &mut u64,
 ) -> Result<Vec<String>, String> {
@@ -1060,7 +1060,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     // any_taken = whether any branch in this if/elseif/else chain was taken.
     let mut if_stack: Vec<(bool, bool)> = Vec::new();
     // Track defined symbols for .ifdef/.ifndef
-    let mut defined_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut defined_symbols: crate::common::fx_hash::FxHashSet<String> = crate::common::fx_hash::FxHashSet::default();
     for (line_num, line) in expanded_lines.iter().enumerate() {
         let line = line.trim();
 

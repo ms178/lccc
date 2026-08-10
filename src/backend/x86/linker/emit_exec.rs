@@ -4,7 +4,8 @@
 //! depending on whether dynamic symbols are present. Handles PLT/GOT,
 //! `.dynamic` section, TLS, IFUNC/IRELATIVE, and copy relocations.
 
-use std::collections::{HashMap, BTreeSet};
+use std::collections::BTreeSet;
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
@@ -25,9 +26,9 @@ fn dynsym_emit_name(name: &str) -> &str {
 }
 
 pub(super) fn emit_executable(
-    objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     plt_names: &[String], got_entries: &[(String, bool)],
     needed_sonames: &[String], output_path: &str,
     export_dynamic: bool, rpath_entries: &[String], use_runpath: bool,
@@ -98,7 +99,7 @@ pub(super) fn emit_executable(
     // ── Build .gnu.version (versym) and .gnu.version_r (verneed) data ──
     //
     // Collect version requirements from dynamic symbols, grouped by library.
-    let mut lib_versions: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut lib_versions: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
     for name in &dyn_sym_names {
         if let Some(gs) = globals.get(name) {
             if gs.is_dynamic {
@@ -114,7 +115,7 @@ pub(super) fn emit_executable(
     }
 
     // Build version index mapping: (library, version_string) -> version index (starting at 2)
-    let mut ver_index_map: HashMap<(String, String), u16> = HashMap::new();
+    let mut ver_index_map: FxHashMap<(String, String), u16> = FxHashMap::default();
     let mut ver_idx: u16 = 2;
     let mut lib_ver_list: Vec<(String, Vec<String>)> = Vec::new();
     let mut sorted_libs: Vec<String> = lib_versions.keys().cloned().collect();
@@ -492,7 +493,7 @@ pub(super) fn emit_executable(
 
     // Allocate BSS space for copy-relocated symbols.
     // Symbols that are aliases (same from_lib + lib_sym_value) share the same BSS slot.
-    let mut copy_reloc_addr_map: HashMap<(String, u64), u64> = HashMap::new(); // (lib, lib_value) -> bss_addr
+    let mut copy_reloc_addr_map: FxHashMap<(String, u64), u64> = FxHashMap::default(); // (lib, lib_value) -> bss_addr
     for (name, size) in &copy_reloc_syms {
         let gsym = globals.get(name).cloned();
         let key = gsym.as_ref().and_then(|g| {
@@ -619,7 +620,7 @@ pub(super) fn emit_executable(
     symtab_entries.push([0u8; 24]); // NULL symbol at index 0
 
     // Map output_sections index → section-header index, in write order.
-    let mut out_sec_to_hdr: HashMap<usize, u16> = HashMap::new();
+    let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
     {
         let mut h = 1usize; // [0] = NULL
         if !is_static {
@@ -1078,7 +1079,7 @@ pub(super) fn emit_executable(
 
     // === Apply relocations ===
     // Snapshot globals to avoid borrow issues
-    let globals_snap: HashMap<String, GlobalSymbol> = globals.clone();
+    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
 
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
@@ -1209,7 +1210,7 @@ pub(super) fn emit_executable(
     // === Append section headers ===
     // Build .shstrtab string table
     let mut shstrtab = vec![0u8]; // null byte at offset 0
-    let mut shstr_offsets: HashMap<String, u32> = HashMap::new();
+    let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
     let known_names = [
         ".interp", ".gnu.hash", ".dynsym", ".dynstr",
         ".gnu.version", ".gnu.version_r",
@@ -1443,8 +1444,8 @@ pub(super) fn emit_executable(
 }
 
 pub(super) fn resolve_sym(
-    obj_idx: usize, sym: &Symbol, globals: &HashMap<String, GlobalSymbol>,
-    section_map: &HashMap<(usize, usize), (usize, u64)>, output_sections: &[OutputSection],
+    obj_idx: usize, sym: &Symbol, globals: &FxHashMap<String, GlobalSymbol>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>, output_sections: &[OutputSection],
     plt_addr: u64,
 ) -> u64 {
     if sym.sym_type() == STT_SECTION {

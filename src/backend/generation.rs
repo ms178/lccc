@@ -16,6 +16,7 @@ use super::liveness::{
 };
 use super::traits::ArchCodegen;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use std::collections::hash_map::Entry;
 use crate::common::source::{SourceManager, Span};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
@@ -918,7 +919,7 @@ fn build_and_emit_dwarf_file_table(
                     continue;
                 }
                 let loc = sm.resolve_span(*span);
-                if let std::collections::hash_map::Entry::Vacant(e) = table.entry(loc.file) {
+                if let Entry::Vacant(e) = table.entry(loc.file) {
                     e.insert(next_id);
                     next_id += 1;
                 }

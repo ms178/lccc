@@ -12,7 +12,7 @@
 //! ARM and RISC-V use different parser types and don't have this pattern
 //! (ARM has no numeric labels; RISC-V has its own pre-pass).
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::x86::assembler::parser::{
     AsmItem, Instruction, Operand, MemoryOperand, Displacement, DataValue, ImmediateValue,
 };
@@ -51,8 +51,8 @@ pub fn parse_numeric_ref(name: &str) -> Option<(&str, bool)> {
 /// updates all references accordingly. Used by both x86 and i686 ELF writers.
 pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
     // First pass: find all numeric label definitions and assign unique names.
-    let mut defs: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    let mut unique_counter: HashMap<String, usize> = HashMap::new();
+    let mut defs: FxHashMap<String, Vec<(usize, String)>> = FxHashMap::default();
+    let mut unique_counter: FxHashMap<String, usize> = FxHashMap::default();
 
     for (i, item) in items.iter().enumerate() {
         if let AsmItem::Label(name) = item {
@@ -131,7 +131,7 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
 fn resolve_numeric_operand(
     op: &Operand,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Operand {
     match op {
         Operand::Label(name) => {
@@ -178,7 +178,7 @@ fn resolve_numeric_operand(
 fn resolve_numeric_data_values(
     vals: &[DataValue],
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Vec<DataValue> {
     vals.iter().map(|val| {
         match val {
@@ -210,7 +210,7 @@ fn resolve_numeric_data_values(
 pub fn resolve_numeric_name(
     name: &str,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Option<String> {
     let (num, is_forward) = parse_numeric_ref(name)?;
     let def_list = defs.get(num)?;
@@ -231,7 +231,7 @@ pub fn resolve_numeric_name(
 fn resolve_numeric_displacement(
     disp: &Displacement,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Option<Displacement> {
     match disp {
         Displacement::Symbol(name) => {
@@ -259,7 +259,7 @@ fn resolve_numeric_displacement(
 pub fn resolve_numeric_refs_in_expr(
     expr: &str,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> String {
     let mut result = String::with_capacity(expr.len());
     let bytes = expr.as_bytes();

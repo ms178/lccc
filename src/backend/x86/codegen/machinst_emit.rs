@@ -437,8 +437,8 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
     // Raptor Lake Optimization: Identify loop headers (labels targeted by backward branches)
     // and align them to 32-byte boundaries (.p2align 5) to maximize instruction fetch and
     // uOP cache port bandwidth!
-    let mut defined_labels = std::collections::HashSet::new();
-    let mut loop_headers = std::collections::HashSet::new();
+    let mut defined_labels = crate::common::fx_hash::FxHashSet::default();
+    let mut loop_headers = crate::common::fx_hash::FxHashSet::default();
 
     for inst in insts {
         match inst {

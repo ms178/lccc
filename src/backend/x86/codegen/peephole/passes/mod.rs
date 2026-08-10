@@ -304,7 +304,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Validation: differential fuzz (gen2, all passes ON, vs GCC -O2) and gzip 1.14
     // (30/30) and regression (7/7). expat 2.8.2 fails identically with and without
     // peephole (a base-backend codegen issue, not a peephole bug).
-    let skip_set: std::collections::HashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
+    let skip_set: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_string())

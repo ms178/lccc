@@ -4,7 +4,7 @@
 //! `.dynsym`/`.dynstr` tables, `.rela.dyn`/`.rela.plt`, and copy relocations.
 //! This is the code path used when shared library symbols are present.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
@@ -16,9 +16,9 @@ use linker_common::{DynStrTab, OutputSection};
 
 /// Emit a dynamically-linked AArch64 ELF executable with PLT/GOT/.dynamic support.
 pub(super) fn emit_dynamic_executable(
-    objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     plt_names: &[String], got_entries: &[(String, bool)],
     needed_sonames: &[String], output_path: &str,
     export_dynamic: bool,
@@ -306,7 +306,7 @@ pub(super) fn emit_dynamic_executable(
     }
 
     // BSS space for copy relocations
-    let mut copy_reloc_addr_map: HashMap<(String, u64), u64> = HashMap::new();
+    let mut copy_reloc_addr_map: FxHashMap<(String, u64), u64> = FxHashMap::default();
     for (name, size) in &copy_reloc_syms {
         let gsym = globals.get(name).cloned();
         let key = gsym.as_ref().and_then(|g| {
@@ -659,10 +659,10 @@ pub(super) fn emit_dynamic_executable(
     }
 
     // Apply relocations
-    let globals_snap: HashMap<String, GlobalSymbol> = globals.clone();
+    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
 
     // Build GotInfo for GOT-only entries (non-PLT symbols accessed via ADR_GOT_PAGE/LD64_GOT_LO12_NC)
-    let mut dyn_got_entries: HashMap<String, usize> = HashMap::new();
+    let mut dyn_got_entries: FxHashMap<String, usize> = FxHashMap::default();
     {
         let mut got_only_idx = 0usize;
         for (name, is_plt) in got_entries.iter() {
@@ -839,8 +839,8 @@ pub(super) fn emit_dynamic_executable(
 fn resolve_sym_dynamic(
     obj_idx: usize,
     sym: &Symbol,
-    globals: &HashMap<String, GlobalSymbol>,
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    globals: &FxHashMap<String, GlobalSymbol>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     output_sections: &[OutputSection],
     plt_addr: u64,
 ) -> u64 {

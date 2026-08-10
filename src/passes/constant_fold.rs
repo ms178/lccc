@@ -32,7 +32,7 @@ pub fn run(module: &mut IrModule) -> usize {
 pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
     // Narrow string literals store one C byte per Rust char, so the byte
     // length is chars().count(); String::len() over-counts bytes >= 0x80.
-    let literals: std::collections::HashMap<String, usize> = module
+    let literals: crate::common::fx_hash::FxHashMap<String, usize> = module
         .string_literals
         .iter()
         .map(|(label, value)| (label.clone(), value.chars().count()))
@@ -47,7 +47,7 @@ pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
         }
         // Map Value -> string length from GlobalAddr instructions naming a
         // string-literal global (per function; allocas/params excluded).
-        let mut addr_lens: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        let mut addr_lens: crate::common::fx_hash::FxHashMap<u32, usize> = crate::common::fx_hash::FxHashMap::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::GlobalAddr { dest, name } = inst {

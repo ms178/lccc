@@ -23,6 +23,7 @@ pub enum IntrinsicOp {
     Mfence,
     Sfence,
     Pause,
+    Vzeroupper,
     Clflush,
     /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double)
     Movnti,

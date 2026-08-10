@@ -1732,15 +1732,15 @@ struct GasMacro {
 /// This runs as a text-level expansion pass before instruction parsing.
 /// It handles the Linux kernel's extable_type_reg pattern and similar constructs.
 fn expand_gas_macros(lines: &[String]) -> Result<Vec<String>, String> {
-    let mut macros = std::collections::HashMap::new();
-    let mut symbols = std::collections::HashMap::new();
+    let mut macros = crate::common::fx_hash::FxHashMap::default();
+    let mut symbols = crate::common::fx_hash::FxHashMap::default();
     expand_gas_macros_with_state(lines, &mut macros, &mut symbols)
 }
 
 fn expand_gas_macros_with_state(
     lines: &[String],
-    macros: &mut std::collections::HashMap<String, GasMacro>,
-    symbols: &mut std::collections::HashMap<String, i64>,
+    macros: &mut crate::common::fx_hash::FxHashMap<String, GasMacro>,
+    symbols: &mut crate::common::fx_hash::FxHashMap<String, i64>,
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -2174,7 +2174,7 @@ fn parse_macro_args(args_str: &str, params: &[(String, Option<String>)]) -> Resu
     // Example: "0 asm_foo exc_foo has_error_code=0" with params (vector, asmsym, cfunc, has_error_code)
     // → positional: vector=0, asmsym=asm_foo, cfunc=exc_foo; named: has_error_code=0
     let mut positional_idx = 0;
-    let mut arg_map = std::collections::HashMap::new();
+    let mut arg_map = crate::common::fx_hash::FxHashMap::default();
     let mut positional_vals: Vec<(usize, String)> = Vec::new();
 
     for part in &arg_parts {
@@ -2303,7 +2303,7 @@ fn eval_ifc(rest: &str) -> bool {
 /// Resolve symbols in a .set expression string.
 /// Uses whole-word matching to avoid replacing substrings inside identifiers,
 /// register names, or instruction mnemonics (e.g., replacing `i` inside `rip`).
-fn resolve_set_expr(expr: &str, symbols: &std::collections::HashMap<String, i64>) -> String {
+fn resolve_set_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> String {
     let mut result = expr.to_string();
     // Sort by length (longest first) to avoid partial replacements
     let mut sym_list: Vec<_> = symbols.iter().collect();
@@ -2368,7 +2368,7 @@ fn is_if_start(trimmed: &str) -> bool {
 /// Resolves `.set` symbols and x86 register names (%rsp, %rbp, etc.) before
 /// evaluating the expression. Supports `==`, `!=`, `>=`, `<=`, `>`, `<`
 /// comparison operators and full arithmetic.
-fn eval_if_expr(expr: &str, symbols: &std::collections::HashMap<String, i64>) -> bool {
+fn eval_if_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> bool {
     let resolved = resolve_set_expr(expr, symbols);
     asm_preprocess::eval_if_condition_with_resolver(&resolved, |s| {
         asm_preprocess::resolve_x86_registers(s)

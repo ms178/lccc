@@ -8,7 +8,7 @@
 //! - `emit_exec`: executable emission (static and dynamic)
 //! - `emit_shared`: shared library (.so) emission
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::section_order;
 use super::{input, sections, symbols};
@@ -71,11 +71,11 @@ pub fn link_builtin(
     let mut inline_archive_paths: Vec<String> = Vec::new();
     input::load_input_files(&all_inputs, &mut input_objs, &mut inline_archive_paths)?;
 
-    let mut defined_syms: HashSet<String> = HashSet::new();
-    let mut undefined_syms: HashSet<String> = HashSet::new();
+    let mut defined_syms: FxHashSet<String> = FxHashSet::default();
+    let mut undefined_syms: FxHashSet<String> = FxHashSet::default();
     input::collect_initial_symbols(&input_objs, &mut defined_syms, &mut undefined_syms);
 
-    let mut shared_lib_syms: HashMap<String, DynSymbol> = HashMap::new();
+    let mut shared_lib_syms: FxHashMap<String, DynSymbol> = FxHashMap::default();
     let mut actual_needed_libs: Vec<String> = Vec::new();
     if !is_static {
         input::discover_shared_lib_symbols(
@@ -86,7 +86,7 @@ pub fn link_builtin(
     }
 
     // Treat symbols available from shared libs as "defined" for archive resolution
-    let shared_defined: HashSet<String> = shared_lib_syms.keys()
+    let shared_defined: FxHashSet<String> = shared_lib_syms.keys()
         .filter(|s| undefined_syms.contains(*s))
         .cloned()
         .collect();
@@ -112,7 +112,7 @@ pub fn link_builtin(
 
     // ── Phase 3: Build global symbol table ──────────────────────────────
 
-    let mut sec_mapping: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
+    let mut sec_mapping: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     for r in &input_sec_refs {
         sec_mapping.insert((r.obj_idx, r.sec_idx), (r.merged_sec_idx, r.offset_in_merged));
     }
@@ -137,7 +137,7 @@ pub fn link_builtin(
     if !is_static {
         symbols::check_undefined_symbols(&global_syms, &shared_lib_syms)?;
     } else {
-        symbols::check_undefined_symbols(&global_syms, &HashMap::new())?;
+        symbols::check_undefined_symbols(&global_syms, &FxHashMap::default())?;
     }
 
     let (got_symbols, tls_got_symbols, local_got_sym_info) =
@@ -223,8 +223,8 @@ pub fn link_shared(
     // ── Phase 1: Load input objects ──────────────────────────────────
 
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
-    let mut defined_syms: HashSet<String> = HashSet::new();
-    let mut undefined_syms: HashSet<String> = HashSet::new();
+    let mut defined_syms: FxHashSet<String> = FxHashSet::default();
+    let mut undefined_syms: FxHashSet<String> = FxHashSet::default();
     let mut needed_sonames: Vec<String> = Vec::new();
 
     let mut all_lib_paths: Vec<String> = extra_lib_paths;
@@ -251,7 +251,7 @@ pub fn link_shared(
 
     // ── Phase 3: Build global symbol table ───────────────────────────
 
-    let mut sec_mapping: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
+    let mut sec_mapping: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     for r in &input_sec_refs {
         sec_mapping.insert((r.obj_idx, r.sec_idx), (r.merged_sec_idx, r.offset_in_merged));
     }

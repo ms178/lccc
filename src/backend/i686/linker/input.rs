@@ -3,7 +3,7 @@
 //! Phases 1-4 of the linking pipeline: argument parsing, input file collection,
 //! library resolution, object parsing, and demand-driven archive extraction.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
 use super::types::*;
@@ -127,8 +127,8 @@ pub(super) fn load_libraries(
     extra_libs: &[String],
     extra_lib_files: &[String],
     all_lib_dirs: &[String],
-) -> (HashMap<String, (String, u8, u32, Option<String>, bool, u8)>, Vec<String>) {
-    let mut dynlib_syms: HashMap<String, (String, u8, u32, Option<String>, bool, u8)> = HashMap::new();
+) -> (FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>, Vec<String>) {
+    let mut dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> = FxHashMap::default();
     let mut static_lib_objects: Vec<String> = Vec::new();
     let all_lib_refs: Vec<&str> = all_lib_dirs.iter().map(|s| s.as_str()).collect();
 
@@ -201,7 +201,7 @@ pub(super) fn load_libraries(
 pub(super) fn scan_shared_lib(
     lib: &str,
     lib_refs: &[&str],
-    dynlib_syms: &mut HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
+    dynlib_syms: &mut FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
 ) -> bool {
     let so_base = format!("lib{}.so", lib);
     for dir in lib_refs {
@@ -240,7 +240,7 @@ pub(super) fn scan_shared_lib(
 }
 
 pub(super) fn insert_dynsym(
-    dynlib_syms: &mut HashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
+    dynlib_syms: &mut FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
     sym: DynSymInfo,
     lib_soname: &str,
 ) {
@@ -297,8 +297,8 @@ pub(super) fn load_and_parse_objects(all_objects: &[String], defsym_defs: &[(Str
 
 /// Pull in archive members that satisfy undefined symbols, iterating until stable.
 pub(super) fn resolve_archive_members(inputs: &mut Vec<InputObject>, archive_pool: &mut Vec<InputObject>, defsym_defs: &[(String, String)]) {
-    let mut defined: HashSet<String> = HashSet::new();
-    let mut undefined: HashSet<String> = HashSet::new();
+    let mut defined: FxHashSet<String> = FxHashSet::default();
+    let mut undefined: FxHashSet<String> = FxHashSet::default();
 
     for obj in inputs.iter() {
         for sym in &obj.symbols {

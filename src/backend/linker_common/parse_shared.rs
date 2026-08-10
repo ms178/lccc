@@ -66,7 +66,7 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
         }
 
         // Parse version definitions to build index -> version string mapping
-        let mut ver_names: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        let mut ver_names: crate::common::fx_hash::FxHashMap<u16, String> = crate::common::fx_hash::FxHashMap::default();
         if let Some((vd_off, vd_size, vd_link)) = verdef_shdr {
             // Get the string table for verdef (typically the dynstr)
             let vd_strtab = if vd_link < sections.len() {

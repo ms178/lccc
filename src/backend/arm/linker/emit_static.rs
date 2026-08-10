@@ -3,7 +3,7 @@
 //! Emits a statically-linked ELF64 executable with two LOAD segments (RX+RW),
 //! GOT for position-dependent code, IPLT/IRELATIVE for ifuncs, and TLS support.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE};
@@ -15,9 +15,9 @@ use linker_common::OutputSection;
 
 pub(super) fn emit_executable(
     objects: &[ElfObject],
-    globals: &mut HashMap<String, GlobalSymbol>,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     output_path: &str,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
@@ -236,7 +236,7 @@ pub(super) fn emit_executable(
     offset = (offset + 7) & !7; // 8-byte align
     let got_offset = offset;
     let got_addr = BASE_ADDR + offset;
-    let mut got_entries = HashMap::new();
+    let mut got_entries = FxHashMap::default();
     for (idx, (key, _kind)) in got_syms.iter().enumerate() {
         got_entries.insert(key.clone(), idx);
     }
@@ -465,11 +465,11 @@ pub(super) fn emit_executable(
     // rather than only looking up global symbol names.
     let globals_snap = globals.clone();
     let got_info = reloc::GotInfo { got_addr, entries: got_entries };
-    let got_kind_map: HashMap<String, reloc::GotEntryKind> = got_syms.iter()
+    let got_kind_map: FxHashMap<String, reloc::GotEntryKind> = got_syms.iter()
         .map(|(k, kind)| (k.clone(), *kind))
         .collect();
     // Build a resolved address map for GOT entries by walking relocations
-    let mut got_resolved: HashMap<String, u64> = HashMap::new();
+    let mut got_resolved: FxHashMap<String, u64> = FxHashMap::default();
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
             for rela in &objects[obj_idx].relocations[sec_idx] {

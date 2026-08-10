@@ -4,14 +4,14 @@
 //! (for function calls via BL/B) or GOT entries (for data references via ADRP),
 //! and builds the PLT/GOT entry lists.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::types::GlobalSymbol;
 
 
 pub(super) fn create_plt_got(
-    objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
 ) -> (Vec<String>, Vec<(String, bool)>) {
     let mut plt_names: Vec<String> = Vec::new();
     let mut got_only_names: Vec<String> = Vec::new();

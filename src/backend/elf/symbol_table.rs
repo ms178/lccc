@@ -8,7 +8,7 @@
 //! The only architecture-specific difference is that RISC-V needs to include
 //! referenced local labels (for pcrel_hi synthetic labels) in the symbol table.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::constants::*;
 use super::object_writer::ObjSection;
 
@@ -28,14 +28,14 @@ pub struct ObjSymbol {
 /// Collects the state needed to build the symbol table without requiring
 /// a specific ElfWriter struct type.
 pub struct SymbolTableInput<'a> {
-    pub labels: &'a HashMap<String, (String, u64)>,
-    pub global_symbols: &'a HashMap<String, bool>,
-    pub weak_symbols: &'a HashMap<String, bool>,
-    pub symbol_types: &'a HashMap<String, u8>,
-    pub symbol_sizes: &'a HashMap<String, u64>,
-    pub symbol_visibility: &'a HashMap<String, u8>,
-    pub aliases: &'a HashMap<String, String>,
-    pub sections: &'a HashMap<String, ObjSection>,
+    pub labels: &'a FxHashMap<String, (String, u64)>,
+    pub global_symbols: &'a FxHashMap<String, bool>,
+    pub weak_symbols: &'a FxHashMap<String, bool>,
+    pub symbol_types: &'a FxHashMap<String, u8>,
+    pub symbol_sizes: &'a FxHashMap<String, u64>,
+    pub symbol_visibility: &'a FxHashMap<String, u8>,
+    pub aliases: &'a FxHashMap<String, String>,
+    pub sections: &'a FxHashMap<String, ObjSection>,
     /// If true, include .L* local labels that are referenced by relocations
     /// in the symbol table (needed by RISC-V for pcrel_hi/pcrel_lo pairs).
     pub include_referenced_locals: bool,
@@ -53,7 +53,7 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
     let mut symbols: Vec<ObjSymbol> = Vec::new();
 
     // Collect referenced local labels if needed (RISC-V pcrel_hi)
-    let mut referenced_local_labels: HashSet<String> = HashSet::new();
+    let mut referenced_local_labels: FxHashSet<String> = FxHashSet::default();
     if input.include_referenced_locals {
         for sec in input.sections.values() {
             for reloc in &sec.relocs {
@@ -91,7 +91,7 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
     }
 
     // Add alias symbols from .set/.equ directives
-    let defined_names: HashMap<String, usize> = symbols.iter()
+    let defined_names: FxHashMap<String, usize> = symbols.iter()
         .enumerate()
         .map(|(i, s)| (s.name.clone(), i))
         .collect();
@@ -99,7 +99,7 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
     for (alias, target) in input.aliases {
         // Resolve through alias chains
         let mut resolved = target.as_str();
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         seen.insert(target.as_str());
         while let Some(next) = input.aliases.get(resolved) {
             if !seen.insert(next.as_str()) {
@@ -166,12 +166,12 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
     }
 
     // Add undefined symbols (referenced in relocations but not defined)
-    let mut referenced: HashSet<String> = HashSet::new();
+    let mut referenced: FxHashSet<String> = FxHashSet::default();
     // Symbols referenced by TLS relocations must be STT_TLS in the symbol
     // table; otherwise the linker rejects the object with
     // "TLS definition ... mismatches non-TLS reference" (glibc's errno.os /
     // __libc_errno via @GOTTPOFF hits this).
-    let mut tls_referenced: HashSet<String> = HashSet::new();
+    let mut tls_referenced: FxHashSet<String> = FxHashSet::default();
     for sec in input.sections.values() {
         for reloc in &sec.relocs {
             if reloc.symbol_name.is_empty() {
@@ -187,7 +187,7 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
         }
     }
 
-    let defined: HashSet<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    let defined: FxHashSet<String> = symbols.iter().map(|s| s.name.clone()).collect();
 
     for name in &referenced {
         if input.sections.contains_key(name) {

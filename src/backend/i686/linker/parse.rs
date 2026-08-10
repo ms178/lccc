@@ -4,7 +4,7 @@
 //! and thin archives. This is separate from the ELF64 parser in `linker_common`
 //! because ELF32 has different field widths (u32 vs u64 for addresses/offsets).
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::types::*;
 
@@ -101,7 +101,7 @@ pub(super) fn parse_elf32(data: &[u8], filename: &str) -> Result<InputObject, St
     }
 
     // Build relocation map: section index -> list of REL section indices
-    let mut rel_map: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut rel_map: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for (i, shdr) in shdrs.iter().enumerate() {
         if shdr.sh_type == SHT_REL {
             rel_map.entry(shdr.info as usize).or_default().push(i);

@@ -4,7 +4,7 @@
 //! orchestrate the linking pipeline: load inputs, resolve symbols, merge sections,
 //! build PLT/GOT, and dispatch to the appropriate ELF emission path.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
 use super::elf::*;
@@ -26,7 +26,7 @@ pub fn link_builtin(
 ) -> Result<(), String> {
     let is_static = user_args.iter().any(|a| a == "-static");
     let mut objects: Vec<ElfObject> = Vec::new();
-    let mut globals: HashMap<String, GlobalSymbol> = HashMap::new();
+    let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
     let mut needed_sonames: Vec<String> = Vec::new();
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
@@ -141,17 +141,17 @@ pub fn link_builtin(
     // Garbage-collect unreferenced sections when --gc-sections is active.
     // This removes sections not reachable from entry points, which may also
     // eliminate undefined symbol references from dead code.
-    let dead_sections: HashSet<(usize, usize)> = if gc_sections {
+    let dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
         linker_common::gc_collect_sections_elf64(&objects)
     } else {
-        HashSet::new()
+        FxHashSet::default()
     };
 
     // When gc-sections is active, remove globals that only exist in dead sections
     // and also remove references from dead sections
     if gc_sections {
         // Build set of symbols referenced only from dead sections
-        let mut referenced_from_live: HashSet<String> = HashSet::new();
+        let mut referenced_from_live: FxHashSet<String> = FxHashSet::default();
         for (obj_idx, obj) in objects.iter().enumerate() {
             for (sec_idx, relas) in obj.relocations.iter().enumerate() {
                 if dead_sections.contains(&(obj_idx, sec_idx)) { continue; }
@@ -179,7 +179,7 @@ pub fn link_builtin(
 
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
-    let mut section_map: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
+    let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
 
     // Allocate COMMON symbols
@@ -213,7 +213,7 @@ pub fn link_shared(
     needed_libs: &[&str],
 ) -> Result<(), String> {
     let mut objects: Vec<ElfObject> = Vec::new();
-    let mut globals: HashMap<String, GlobalSymbol> = HashMap::new();
+    let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
     let mut needed_sonames: Vec<String> = Vec::new();
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
@@ -340,7 +340,7 @@ pub fn link_shared(
         }
         // Track which whole-archive libraries have been fully loaded to avoid
         // re-adding all members on subsequent iterations of the group loop.
-        let mut whole_archive_loaded: HashSet<String> = HashSet::new();
+        let mut whole_archive_loaded: FxHashSet<String> = FxHashSet::default();
         let mut changed = true;
         while changed {
             changed = false;
@@ -389,7 +389,7 @@ pub fn link_shared(
 
     // Merge sections (no gc-sections for shared libraries)
     let mut output_sections: Vec<OutputSection> = Vec::new();
-    let mut section_map: HashMap<(usize, usize), (usize, u64)> = HashMap::new();
+    let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
 
     // Allocate COMMON symbols

@@ -3,12 +3,11 @@
 //! This replaces the default SipHash in HashMap/HashSet with a much faster
 //! hash for compiler workloads where DoS resistance is unnecessary.
 
-use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// Type aliases for HashMap/HashSet using FxHash.
-pub type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-pub type FxHashSet<V> = HashSet<V, BuildHasherDefault<FxHasher>>;
+pub type FxHashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type FxHashSet<V> = std::collections::HashSet<V, BuildHasherDefault<FxHasher>>;
 
 const SEED: u64 = 0x517cc1b727220a95;
 

@@ -3,7 +3,7 @@
 //! physical fall-through.
 use crate::ir::reexports::{BlockId, IrModule};
 use crate::pgo::ProfileData;
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     if std::env::var("LCCC_PGO_LAYOUT").as_deref() != Ok("1") {
@@ -25,17 +25,17 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         } else if fp.total_count.saturating_mul(10_000) < max {
             f.section = Some(".text.unlikely".into());
         }
-        let mut counts = HashMap::<BlockId, u64>::new();
+        let mut counts = FxHashMap::<BlockId, u64>::default();
         for b in &f.blocks {
             counts.insert(b.label, fp.block_count(b.label));
         }
-        let mut succ = HashMap::<BlockId, Vec<BlockId>>::new();
+        let mut succ = FxHashMap::<BlockId, Vec<BlockId>>::default();
         for b in &f.blocks {
             succ.insert(b.label, successors(&b.terminator));
         }
         let entry = f.blocks[0].label;
         let mut ordered = Vec::with_capacity(f.blocks.len());
-        let mut placed = HashSet::new();
+        let mut placed = FxHashSet::default();
         let mut cur = entry;
         loop {
             if !placed.insert(cur) {

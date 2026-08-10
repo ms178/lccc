@@ -1,7 +1,7 @@
 //! PGO v3 profile identity, deterministic merge, and fail-closed loading.
 use super::{FunctionProfile, ProfileData};
 use crate::ir::reexports::{IrFunction, Terminator};
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -227,7 +227,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                 name = Some(x);
                 cur = Some(FunctionProfile {
                     total_count: 0,
-                    block_counts: HashMap::new(),
+                    block_counts: FxHashMap::default(),
                     cfg_hash: hash,
                     entry_label: entry,
                 });

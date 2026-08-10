@@ -3,7 +3,7 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs
 //! for external function calls, and a `.dynamic` section for the dynamic linker.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::types::{GlobalSymbol, PAGE_SIZE};
@@ -13,9 +13,9 @@ use linker_common::{DynStrTab, OutputSection};
 
 /// Emit a shared library (.so) ELF file for AArch64.
 pub(super) fn emit_shared_library(
-    objects: &[ElfObject], globals: &mut HashMap<String, GlobalSymbol>,
+    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     needed_sonames: &[String], output_path: &str,
     soname: Option<String>,
 ) -> Result<(), String> {
@@ -213,7 +213,7 @@ pub(super) fn emit_shared_library(
     // relocations, so the dynamic linker must be able to write to them at load time.
     {
         // Build a set of output section indices that have ABS64 relocs targeting them
-        let mut needs_write: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut needs_write: crate::common::fx_hash::FxHashSet<usize> = crate::common::fx_hash::FxHashSet::default();
         for obj_idx in 0..objects.len() {
             for sec_idx in 0..objects[obj_idx].sections.len() {
                 let relas = &objects[obj_idx].relocations[sec_idx];
@@ -686,7 +686,7 @@ pub(super) fn emit_shared_library(
     }
 
     // GOT entries
-    let mut got_sym_addrs: HashMap<String, u64> = HashMap::new();
+    let mut got_sym_addrs: FxHashMap<String, u64> = FxHashMap::default();
     for (i, name) in got_needed.iter().enumerate() {
         let gea = got_addr + i as u64 * 8;
         got_sym_addrs.insert(name.clone(), gea);
@@ -706,7 +706,7 @@ pub(super) fn emit_shared_library(
     }
 
     // Apply relocations and collect dynamic relocation entries
-    let globals_snap: HashMap<String, GlobalSymbol> = globals.clone();
+    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
     // Each entry: (offset, r_info, addend)
     let mut rela_dyn_entries: Vec<(u64, u64, u64)> = Vec::new();
     const R_AARCH64_RELATIVE_DYN: u64 = 1027;

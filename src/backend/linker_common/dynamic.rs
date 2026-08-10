@@ -4,7 +4,7 @@
 //! linkers into a single generic implementation. Also provides `register_symbols_elf64()`
 //! for populating the global symbol table from object files.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use crate::backend::elf::{
@@ -33,7 +33,7 @@ use super::resolve_lib::resolve_lib;
 pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
     dyn_syms: &[DynSymbol],
     soname: &str,
-    globals: &mut HashMap<String, G>,
+    globals: &mut FxHashMap<String, G>,
 ) -> bool {
     let mut lib_needed = false;
     let mut matched_weak_objects: Vec<(u64, u64)> = Vec::new();
@@ -123,7 +123,7 @@ pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
 /// one symbol was actually resolved.
 pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
     path: &str,
-    globals: &mut HashMap<String, G>,
+    globals: &mut FxHashMap<String, G>,
     needed_sonames: &mut Vec<String>,
     lib_paths: &[String],
 ) -> Result<(), String> {
@@ -192,7 +192,7 @@ pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
 /// `lib_search_paths` provides directories to search for the default libs.
 /// `default_lib_names` lists the .so filenames to try (e.g., ["libc.so.6"]).
 pub fn resolve_dynamic_symbols_elf64<G: GlobalSymbolOps>(
-    globals: &mut HashMap<String, G>,
+    globals: &mut FxHashMap<String, G>,
     needed_sonames: &mut Vec<String>,
     lib_search_paths: &[String],
     default_lib_names: &[&str],
@@ -239,7 +239,7 @@ pub fn resolve_dynamic_symbols_elf64<G: GlobalSymbolOps>(
 pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     obj_idx: usize,
     obj: &Elf64Object,
-    globals: &mut HashMap<String, G>,
+    globals: &mut FxHashMap<String, G>,
     should_replace_extra: fn(existing: &G) -> bool,
 ) {
     for sym in &obj.symbols {

@@ -14,7 +14,7 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
-use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write};
+use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family};
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
 /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
@@ -839,6 +839,61 @@ pub(super) fn eliminate_dead_sign_extensions(
 // Requirements: REG_IDX and REG_BASE must be callee-saved or otherwise
 // guaranteed not clobbered between definition and use.
 
+/// Whole-function scan: does any line after `start` READ register family `fam`?
+///
+/// Path-insensitive and deliberately conservative: a line that references the
+/// family counts as a read unless it is a provable pure write (mov*-family
+/// store into the register, or the xor-self zeroing idiom). Implicit reads
+/// (cltq/cdq/cqo, integer div/mul, shld/shrd) are detected via
+/// [`implicit_read_reg_family`]. The scan stops at the next function's
+/// `.cfi_startproc`.
+///
+/// This is used by [`fold_base_index_addressing`] to prove that a register
+/// whose defining instruction is about to be removed is dead after the folded
+/// memory operation. The previous window-until-barrier scans missed reads in
+/// LATER basic blocks (e.g. phi copy-backs after a branch), which left a
+/// never-defined register live and miscompiled switch/loop code (regression:
+/// phi_gep_fold.c — zlib-ng zng_deflateSetParams).
+fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) -> bool {
+    if fam > 15 {
+        return true; // unknown family: be conservative
+    }
+    let mask = 1u16 << fam;
+    for n in start..store.len() {
+        if infos[n].is_nop() {
+            continue;
+        }
+        let td = infos[n].trimmed(store.get(n));
+        if td.starts_with(".cfi_startproc") {
+            break; // next function: its registers are independent
+        }
+        if implicit_read_reg_family(td) == Some(fam) {
+            return true;
+        }
+        if infos[n].reg_refs & mask == 0 {
+            continue;
+        }
+        let dest = get_dest_reg(&infos[n]);
+        if dest == fam {
+            // Pure write: mov-family store to the register (no memory operand
+            // through it) or xor-self zeroing. Anything else with dest == fam
+            // (addq %r8,%rax, ...) also READS the register.
+            let name64 = REG_NAMES[0][fam as usize];
+            let name32 = REG_NAMES[1][fam as usize];
+            let mov_store = (td.starts_with("mov") || td.starts_with("movabs"))
+                && !td.contains(&format!("({})", name64))
+                && !td.contains(&format!("({})", name32));
+            let xor_self = (td.starts_with("xorl ") || td.starts_with("xorq "))
+                && td.contains(&format!("{}, {}", name32, name32));
+            if mov_store || xor_self {
+                continue;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 pub(super) fn fold_base_index_addressing(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -889,21 +944,10 @@ pub(super) fn fold_base_index_addressing(
         if let Some(folded) = try_fold_mem_op_with_sib(tk, "(%rax)", base_reg, idx_reg) {
             // Safety: verify rax is dead after k. The NOP'd instructions
             // leave rax without the computed address. If anything reads rax
-            // after k expecting the address, the fold is unsafe.
-            let rax_mask = 1u16;
-            let mut rax_dead = true;
-            let mut n = k + 1;
-            while n < len {
-                if infos[n].is_nop() { n += 1; continue; }
-                if infos[n].is_barrier() { break; }
-                if infos[n].reg_refs & rax_mask != 0 {
-                    let dest = get_dest_reg(&infos[n]);
-                    if dest == 0 { break; } // rax overwritten → dead
-                    rax_dead = false;
-                    break;
-                }
-                n += 1;
-            }
+            // after k expecting the address, the fold is unsafe. The scan is
+            // whole-function (not window-until-barrier): a read in a LATER
+            // basic block is just as unsafe as one in the same block.
+            let rax_dead = !fam_read_after(store, infos, k + 1, 0);
             if rax_dead {
                 mark_nop(&mut infos[i]); // remove movq %REG, %rax
                 mark_nop(&mut infos[j]); // remove addq %REG_BASE, %rax
@@ -930,28 +974,12 @@ pub(super) fn fold_base_index_addressing(
                     let tm = infos[m].trimmed(store.get(m));
                     let addr_pat = format!("(%{})", &tmp_reg[1..]); // e.g. "(%rcx)"
                     if let Some(folded) = try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg) {
-                        // Safety: verify %TMP is dead after m. If anything reads
-                        // %TMP after the folded mem op, the NOP'd movq at k means
-                        // %TMP holds a stale value. Scan forward to the next
-                        // barrier and check %TMP is either overwritten or not read.
-                        let tmp_mask = 1u16 << tmp_family;
-                        let mut tmp_dead = true;
-                        let mut n = m + 1;
-                        while n < len {
-                            if infos[n].is_nop() { n += 1; continue; }
-                            if infos[n].is_barrier() { break; }
-                            if infos[n].reg_refs & tmp_mask != 0 {
-                                // TMP is referenced. Check if it's a pure write (overwrite → dead).
-                                let dest = get_dest_reg(&infos[n]);
-                                if dest == tmp_family {
-                                    break; // overwritten before read → safe
-                                }
-                                // TMP is read before being overwritten → not safe
-                                tmp_dead = false;
-                                break;
-                            }
-                            n += 1;
-                        }
+                        // Safety: verify %TMP is dead after m. If anything
+                        // reads %TMP after the folded mem op, the NOP'd movq
+                        // at k means %TMP holds a stale value. Whole-function
+                        // scan (not window-until-barrier): cross-block reads
+                        // (e.g. phi copy-backs) are just as unsafe.
+                        let tmp_dead = !fam_read_after(store, infos, m + 1, tmp_family);
 
                         if tmp_dead {
                             mark_nop(&mut infos[i]); // remove movq %REG, %rax
@@ -3620,9 +3648,9 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
 /// never consult stale liveness. Direct branches are resolved through labels;
 /// unknown indirect control flow is conservatively all-live.
 fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
-    use std::collections::HashMap;
+    use crate::common::fx_hash::FxHashMap;
     let n = store.len();
-    let mut labels = HashMap::new();
+    let mut labels = FxHashMap::default();
     for i in 0..n {
         if infos[i].kind == LineKind::Label {
             labels.insert(infos[i].trimmed(store.get(i)).trim_end_matches(':').to_string(), i);

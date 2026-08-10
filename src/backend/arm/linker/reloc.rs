@@ -3,7 +3,7 @@
 //! Applies ELF relocations to the output buffer after section layout
 //! has been determined.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 use crate::backend::linker_common::OutputSection;
@@ -44,7 +44,7 @@ pub struct TlsInfo {
 pub struct GotInfo {
     pub got_addr: u64,
     /// (symbol_key, resolved_address) -- symbol_key is "name" or "sec:obj:sec"
-    pub entries: HashMap<String, usize>,
+    pub entries: FxHashMap<String, usize>,
 }
 
 impl GotInfo {
@@ -61,8 +61,8 @@ impl GotInfo {
 pub fn resolve_sym(
     obj_idx: usize,
     sym: &Symbol,
-    globals: &HashMap<String, GlobalSymbol>,
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    globals: &FxHashMap<String, GlobalSymbol>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     output_sections: &[OutputSection],
 ) -> u64 {
     if sym.sym_type() == STT_SECTION {
@@ -142,9 +142,9 @@ pub enum GotEntryKind {
 /// Apply all relocations to the output buffer.
 pub fn apply_relocations(
     objects: &[ElfObject],
-    globals: &HashMap<String, GlobalSymbol>,
+    globals: &FxHashMap<String, GlobalSymbol>,
     output_sections: &[OutputSection],
-    section_map: &HashMap<(usize, usize), (usize, u64)>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     out: &mut [u8],
     tls_info: &TlsInfo,
     got_info: &GotInfo,

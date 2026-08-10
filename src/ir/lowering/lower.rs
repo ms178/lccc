@@ -658,8 +658,8 @@ impl Lowerer {
         // to bind unversioned refs to `foo@VER` under --whole-archive).
         // Must run BEFORE body lowering so references lower correctly.
         {
-            let mut defined: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut defined: crate::common::fx_hash::FxHashSet<String> =
+                crate::common::fx_hash::FxHashSet::default();
             // Function DEFINITIONS (a mere declaration does not count: glibc's
             // compat_symbol_reference versionizes references to declared-only
             // functions like matherr).

@@ -4,7 +4,7 @@
 //! regular and thin archive loading, and a generic file dispatch function that
 //! handles archives, linker scripts, shared libraries, and object files.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use crate::backend::elf::{
@@ -22,7 +22,7 @@ use super::resolve_lib::resolve_lib;
 
 /// Check if an archive member defines any currently-undefined, non-dynamic symbol.
 fn member_resolves_undefined_generic<G: GlobalSymbolOps>(
-    obj: &Elf64Object, globals: &HashMap<String, G>,
+    obj: &Elf64Object, globals: &FxHashMap<String, G>,
 ) -> bool {
     for sym in &obj.symbols {
         if sym.is_undefined() || sym.is_local() { continue; }
@@ -42,7 +42,7 @@ fn member_resolves_undefined_generic<G: GlobalSymbolOps>(
 fn resolve_archive_members<G: GlobalSymbolOps>(
     member_objects: &mut Vec<Elf64Object>,
     objects: &mut Vec<Elf64Object>,
-    globals: &mut HashMap<String, G>,
+    globals: &mut FxHashMap<String, G>,
     should_replace_extra: fn(&G) -> bool,
 ) {
     let mut changed = true;
@@ -71,7 +71,7 @@ fn resolve_archive_members<G: GlobalSymbolOps>(
 /// shared library creation from convenience archives (e.g., libtool).
 pub fn load_archive_elf64<G: GlobalSymbolOps>(
     data: &[u8], archive_path: &str,
-    objects: &mut Vec<Elf64Object>, globals: &mut HashMap<String, G>,
+    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
     expected_machine: u16, should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
@@ -108,7 +108,7 @@ pub fn load_archive_elf64<G: GlobalSymbolOps>(
 /// When `whole_archive` is true, all members are unconditionally included.
 pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
     data: &[u8], archive_path: &str,
-    objects: &mut Vec<Elf64Object>, globals: &mut HashMap<String, G>,
+    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
     expected_machine: u16, should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
@@ -155,7 +155,7 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
 pub fn load_file_elf64<G: GlobalSymbolOps>(
     path: &str,
     objects: &mut Vec<Elf64Object>,
-    globals: &mut HashMap<String, G>,
+    globals: &mut FxHashMap<String, G>,
     expected_machine: u16,
     lib_paths: &[String],
     prefer_static: bool,

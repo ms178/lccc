@@ -10,7 +10,7 @@
 //! - ARM adds `pending_sym_diffs` and AArch64-specific branch resolution
 //! - RISC-V adds `pcrel_hi_counter`, `numeric_labels`, and RV64C compression
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use super::constants::*;
 use super::linker_symbols::default_section_flags;
 use super::object_writer::{ElfConfig, ObjSection, ObjReloc};
@@ -30,25 +30,25 @@ pub struct ElfWriterBase {
     /// Current section we're emitting into
     pub current_section: String,
     /// All sections being built (using shared ObjSection directly)
-    pub sections: HashMap<String, ObjSection>,
+    pub sections: FxHashMap<String, ObjSection>,
     /// Section order (for deterministic output)
     pub section_order: Vec<String>,
     /// Extra symbols (e.g., COMMON symbols from .comm directives)
     pub extra_symbols: Vec<ObjSymbol>,
     /// Local labels -> (section, offset) for branch resolution
-    pub labels: HashMap<String, (String, u64)>,
+    pub labels: FxHashMap<String, (String, u64)>,
     /// Symbols that have been declared .globl
-    pub global_symbols: HashMap<String, bool>,
+    pub global_symbols: FxHashMap<String, bool>,
     /// Symbols declared .weak
-    pub weak_symbols: HashMap<String, bool>,
+    pub weak_symbols: FxHashMap<String, bool>,
     /// Symbol types from .type directives
-    pub symbol_types: HashMap<String, u8>,
+    pub symbol_types: FxHashMap<String, u8>,
     /// Symbol sizes from .size directives
-    pub symbol_sizes: HashMap<String, u64>,
+    pub symbol_sizes: FxHashMap<String, u64>,
     /// Symbol visibility from .hidden/.protected/.internal
-    pub symbol_visibility: HashMap<String, u8>,
+    pub symbol_visibility: FxHashMap<String, u8>,
     /// Symbol aliases from .set/.equ directives
-    pub aliases: HashMap<String, String>,
+    pub aliases: FxHashMap<String, String>,
     /// Section stack for .pushsection/.popsection (saves both current and previous section)
     section_stack: Vec<(String, String)>,
     /// Previous section for .section/.previous swapping
@@ -64,16 +64,16 @@ impl ElfWriterBase {
     pub fn new(nop_bytes: [u8; 4], text_align: u64) -> Self {
         Self {
             current_section: String::new(),
-            sections: HashMap::new(),
+            sections: FxHashMap::default(),
             section_order: Vec::new(),
             extra_symbols: Vec::new(),
-            labels: HashMap::new(),
-            global_symbols: HashMap::new(),
-            weak_symbols: HashMap::new(),
-            symbol_types: HashMap::new(),
-            symbol_sizes: HashMap::new(),
-            symbol_visibility: HashMap::new(),
-            aliases: HashMap::new(),
+            labels: FxHashMap::default(),
+            global_symbols: FxHashMap::default(),
+            weak_symbols: FxHashMap::default(),
+            symbol_types: FxHashMap::default(),
+            symbol_sizes: FxHashMap::default(),
+            symbol_visibility: FxHashMap::default(),
+            aliases: FxHashMap::default(),
             section_stack: Vec::new(),
             previous_section: String::new(),
             nop_bytes,
@@ -287,8 +287,8 @@ impl ElfWriterBase {
     ///
     /// Returns a mapping from subsection name to (parent_name, offset_adjustment)
     /// so callers can fix up any pending references that point to subsection names.
-    pub fn merge_subsections(&mut self) -> HashMap<String, (String, u64)> {
-        let mut remap = HashMap::new();
+    pub fn merge_subsections(&mut self) -> FxHashMap<String, (String, u64)> {
+        let mut remap = FxHashMap::default();
 
         // Collect subsection names grouped by parent
         let mut subsections: std::collections::BTreeMap<String, std::collections::BTreeMap<u64, String>> =

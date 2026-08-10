@@ -14,7 +14,7 @@
 //! - **Utility functions**: `build_gnu_hash`, `find_versioned_soname`,
 //!   `resolve_archive_members`, `output_section_name`, `section_order`.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use super::elf_read::*;
 
 // ── RISC-V relocation type constants ─────────────────────────────────────
@@ -193,10 +193,10 @@ pub fn resolve_symbol_value(
     sym_idx: usize,
     obj: &ElfObject,
     obj_idx: usize,
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
-    global_syms: &HashMap<String, GlobalSym>,
+    global_syms: &FxHashMap<String, GlobalSym>,
 ) -> u64 {
     if sym.sym_type() == STT_SECTION {
         if (sym.shndx as usize) < obj.sections.len() {
@@ -243,16 +243,16 @@ pub fn find_hi20_value(
     obj: &ElfObject,
     obj_idx: usize,
     sec_idx: usize,
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
-    global_syms: &HashMap<String, GlobalSym>,
+    global_syms: &FxHashMap<String, GlobalSym>,
     auipc_vaddr: u64,
     sec_offset: u64,
     got_vaddr: u64,
     got_symbols: &[String],
     got_plt_vaddr: u64,
-    gd_tls_relax_info: &HashMap<u64, (u64, i64)>,
+    gd_tls_relax_info: &FxHashMap<u64, (u64, i64)>,
     tls_vaddr: u64,
 ) -> i64 {
     // Check if this references a GD->LE relaxed auipc (now a lui)
@@ -276,10 +276,10 @@ pub fn find_hi20_value_shared(
     obj: &ElfObject,
     obj_idx: usize,
     sec_idx: usize,
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
-    global_syms: &HashMap<String, GlobalSym>,
+    global_syms: &FxHashMap<String, GlobalSym>,
     auipc_vaddr: u64,
     sec_offset: u64,
     got_vaddr: u64,
@@ -297,10 +297,10 @@ fn find_hi20_value_core(
     obj: &ElfObject,
     obj_idx: usize,
     sec_idx: usize,
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
-    global_syms: &HashMap<String, GlobalSym>,
+    global_syms: &FxHashMap<String, GlobalSym>,
     auipc_vaddr: u64,
     sec_offset: u64,
     got_vaddr: u64,
@@ -588,8 +588,8 @@ pub fn find_versioned_soname(dir: &str, libname: &str) -> Option<String> {
 pub fn resolve_archive_members(
     members: Vec<(String, ElfObject)>,
     input_objs: &mut Vec<(String, ElfObject)>,
-    defined_syms: &mut std::collections::HashSet<String>,
-    undefined_syms: &mut std::collections::HashSet<String>,
+    defined_syms: &mut crate::common::fx_hash::FxHashSet<String>,
+    undefined_syms: &mut crate::common::fx_hash::FxHashSet<String>,
 ) {
     let mut pool = members;
     loop {

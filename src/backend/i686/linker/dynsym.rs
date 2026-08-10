@@ -130,8 +130,8 @@ fn parse_verdef(
     verdef_shdr: Option<(usize, usize, usize)>,
     e_shoff: usize,
     e_shentsize: usize,
-) -> std::collections::HashMap<u16, String> {
-    let mut ver_names = std::collections::HashMap::new();
+) -> crate::common::fx_hash::FxHashMap<u16, String> {
+    let mut ver_names = crate::common::fx_hash::FxHashMap::default();
 
     let (vd_off, vd_size, vd_link) = match verdef_shdr {
         Some(v) => v,
@@ -178,7 +178,7 @@ fn parse_verdef(
 fn lookup_version(
     j: usize,
     versym_shdr: Option<(usize, usize)>,
-    ver_names: &std::collections::HashMap<u16, String>,
+    ver_names: &crate::common::fx_hash::FxHashMap<u16, String>,
     data: &[u8],
 ) -> (Option<String>, bool) {
     if let Some((vs_off, _vs_size)) = versym_shdr {

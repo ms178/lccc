@@ -16,7 +16,7 @@
 //! framework). These are handled as optional extensions controlled by
 //! the `supports_deferred_skips()` trait method.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use crate::backend::x86::assembler::parser::*;
 use crate::backend::elf::{self as elf_mod,
     SHT_PROGBITS,
@@ -275,26 +275,26 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
 pub struct ElfWriterCore<A: X86Arch> {
     sections: Vec<Section>,
     symbols: Vec<SymbolInfo>,
-    section_map: HashMap<String, usize>,
-    symbol_map: HashMap<String, usize>,
+    section_map: FxHashMap<String, usize>,
+    symbol_map: FxHashMap<String, usize>,
     current_section: Option<usize>,
     previous_section: Option<usize>,
-    label_positions: HashMap<String, (usize, u64)>,
-    numeric_label_positions: HashMap<String, Vec<(usize, u64)>>,
+    label_positions: FxHashMap<String, (usize, u64)>,
+    numeric_label_positions: FxHashMap<String, Vec<(usize, u64)>>,
     pending_globals: Vec<String>,
     pending_weaks: Vec<String>,
-    pending_types: HashMap<String, SymbolKind>,
-    pending_sizes: HashMap<String, SizeExpr>,
+    pending_types: FxHashMap<String, SymbolKind>,
+    pending_sizes: FxHashMap<String, SizeExpr>,
     pending_hidden: Vec<String>,
     pending_protected: Vec<String>,
     pending_internal: Vec<String>,
-    aliases: HashMap<String, String>,
+    aliases: FxHashMap<String, String>,
     /// `.symver real, name@VER` where `real` is NOT defined in this object:
     /// GNU-as semantics — every reference to `real` becomes a versioned
     /// reference `name@VER` (glibc compat_symbol_reference; needed because
     /// GNU ld 2.47 does not bind unversioned refs to foo@VER under
     /// --whole-archive). Applied to relocations after all items are parsed.
-    symver_refs: HashMap<String, String>,
+    symver_refs: FxHashMap<String, String>,
     section_stack: Vec<(Option<usize>, Option<usize>)>,
     /// Deferred `.skip` expressions: (section_index, offset, expression, fill_byte).
     deferred_skips: Vec<(usize, usize, String, u8)>,
@@ -315,21 +315,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
         ElfWriterCore {
             sections: Vec::new(),
             symbols: Vec::new(),
-            section_map: HashMap::new(),
-            symbol_map: HashMap::new(),
+            section_map: FxHashMap::default(),
+            symbol_map: FxHashMap::default(),
             current_section: None,
             previous_section: None,
-            label_positions: HashMap::new(),
-            numeric_label_positions: HashMap::new(),
+            label_positions: FxHashMap::default(),
+            numeric_label_positions: FxHashMap::default(),
             pending_globals: Vec::new(),
             pending_weaks: Vec::new(),
-            pending_types: HashMap::new(),
-            pending_sizes: HashMap::new(),
+            pending_types: FxHashMap::default(),
+            pending_sizes: FxHashMap::default(),
             pending_hidden: Vec::new(),
             pending_protected: Vec::new(),
             pending_internal: Vec::new(),
-            aliases: HashMap::new(),
-            symver_refs: HashMap::new(),
+            aliases: FxHashMap::default(),
+            symver_refs: FxHashMap::default(),
             section_stack: Vec::new(),
             deferred_skips: Vec::new(),
             deferred_byte_diffs: Vec::new(),
@@ -349,7 +349,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // rewrite relocations against it to the versioned name (foo@VER).
         // `@@` in a reference selects the default version -> single @.
         if !self.symver_refs.is_empty() {
-            let defined: std::collections::HashSet<&String> =
+            let defined: crate::common::fx_hash::FxHashSet<&String> =
                 self.label_positions.keys().collect();
             for sec in self.sections.iter_mut() {
                 for reloc in sec.relocations.iter_mut() {
@@ -1311,7 +1311,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Convert to shared ObjSection/ObjSymbol format
         let section_names: Vec<String> = self.sections.iter().map(|s| s.name.clone()).collect();
 
-        let mut shared_sections: HashMap<String, ObjSection> = HashMap::new();
+        let mut shared_sections: FxHashMap<String, ObjSection> = FxHashMap::default();
         for sec in &self.sections {
             let mut data = sec.data.clone();
             let mut relocs = Vec::new();
@@ -1370,20 +1370,20 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         // Convert label positions
-        let labels: HashMap<String, (String, u64)> = self.label_positions.iter()
+        let labels: FxHashMap<String, (String, u64)> = self.label_positions.iter()
             .map(|(name, &(sec_idx, offset))| {
                 (name.clone(), (section_names[sec_idx].clone(), offset))
             })
             .collect();
 
-        let global_symbols: HashMap<String, bool> = self.pending_globals.iter()
+        let global_symbols: FxHashMap<String, bool> = self.pending_globals.iter()
             .map(|s| (s.clone(), true))
             .collect();
-        let weak_symbols: HashMap<String, bool> = self.pending_weaks.iter()
+        let weak_symbols: FxHashMap<String, bool> = self.pending_weaks.iter()
             .map(|s| (s.clone(), true))
             .collect();
 
-        let symbol_types: HashMap<String, u8> = self.pending_types.iter()
+        let symbol_types: FxHashMap<String, u8> = self.pending_types.iter()
             .map(|(name, kind)| {
                 let stt = match kind {
                     SymbolKind::Function => STT_FUNC,
@@ -1397,7 +1397,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .collect();
 
         // Resolve pending_sizes to concrete u64 values
-        let symbol_sizes: HashMap<String, u64> = self.pending_sizes.iter()
+        let symbol_sizes: FxHashMap<String, u64> = self.pending_sizes.iter()
             .map(|(name, expr)| {
                 let size = match expr {
                     SizeExpr::Constant(v) => *v,
@@ -1430,7 +1430,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             })
             .collect();
 
-        let mut symbol_visibility: HashMap<String, u8> = HashMap::new();
+        let mut symbol_visibility: FxHashMap<String, u8> = FxHashMap::default();
         for name in &self.pending_hidden {
             symbol_visibility.insert(name.clone(), STV_HIDDEN);
         }
@@ -1531,7 +1531,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // Iterative relaxation until convergence
             loop {
                 let mut any_relaxed = false;
-                let mut local_labels: HashMap<String, usize> = HashMap::new();
+                let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
                 for (name, &(s_idx, offset)) in &self.label_positions {
                     if s_idx == sec_idx {
                         local_labels.insert(name.clone(), offset as usize);
@@ -1651,7 +1651,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.fixup_alignment_markers(sec_idx);
 
             // Resolve short jump displacements
-            let mut local_labels: HashMap<String, usize> = HashMap::new();
+            let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
             for (name, &(s_idx, offset)) in &self.label_positions {
                 if s_idx == sec_idx {
                     local_labels.insert(name.clone(), offset as usize);

@@ -3,7 +3,7 @@
 //! Handles loading of object files (.o), archives (.a), shared libraries (.so),
 //! and linker scripts. Delegates to `linker_common` for ELF parsing.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use super::elf::*;
@@ -11,7 +11,7 @@ use crate::backend::linker_common;
 use super::types::{GlobalSymbol, x86_should_replace_extra};
 
 pub(super) fn load_file(
-    path: &str, objects: &mut Vec<ElfObject>, globals: &mut HashMap<String, GlobalSymbol>,
+    path: &str, objects: &mut Vec<ElfObject>, globals: &mut FxHashMap<String, GlobalSymbol>,
     needed_sonames: &mut Vec<String>, lib_paths: &[String],
     whole_archive: bool,
 ) -> Result<(), String> {

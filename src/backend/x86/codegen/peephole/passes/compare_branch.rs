@@ -203,7 +203,7 @@ pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
     }
 
     // Count explicit branch references; labels with none are transparent joins.
-    let mut refs=std::collections::HashMap::<String,usize>::new();
+    let mut refs=crate::common::fx_hash::FxHashMap::<String,usize>::default();
     for l in &lines {let t=l.trim();if t.starts_with('j') {if let Some(x)=t.split_whitespace().last(){*refs.entry(x.to_string()).or_default()+=1;}}}
     let active:Vec<usize>=(0..lines.len()).filter(|i|{
         let t=lines[*i].trim();if t.is_empty(){return false;}

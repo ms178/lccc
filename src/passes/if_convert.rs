@@ -101,7 +101,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
     // (e.g., nested ternaries where converting one invalidates another).
     let mut converted = 0;
-    let mut modified_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut modified_blocks: crate::common::fx_hash::FxHashSet<usize> = crate::common::fx_hash::FxHashSet::default();
     for diamond in &diamonds {
         // Skip if any of the diamond's blocks were already modified
         if modified_blocks.contains(&diamond.pred_idx)
@@ -618,7 +618,7 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
     pred_block.terminator = Terminator::Branch(merge_label);
 
     // 4. Remove the converted Phi nodes from the merge block
-    let converted_dests: std::collections::HashSet<u32> = diamond.phi_selects.iter()
+    let converted_dests: crate::common::fx_hash::FxHashSet<u32> = diamond.phi_selects.iter()
         .map(|(dest, _, _, _)| dest.0)
         .collect();
     {

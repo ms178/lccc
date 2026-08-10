@@ -7,7 +7,7 @@
 //! Called from `link.rs::link_shared` after input loading, section merging,
 //! and symbol resolution.
 
-use std::collections::{HashMap, HashSet};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL_PLT,
@@ -48,12 +48,12 @@ const ELFDATA2LSB: u8 = 1;
 pub fn emit_shared_library(
     input_objs: &[(String, ElfObject)],
     merged_sections: &mut [MergedSection],
-    _merged_map: &mut HashMap<String, usize>,
-    sec_mapping: &HashMap<(usize, usize), (usize, u64)>,
-    global_syms: &mut HashMap<String, GlobalSym>,
+    _merged_map: &mut FxHashMap<String, usize>,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
+    global_syms: &mut FxHashMap<String, GlobalSym>,
     got_symbols: &[String],
-    _tls_got_symbols: &HashSet<String>,
-    _local_got_sym_info: &HashMap<String, (usize, usize, i64)>,
+    _tls_got_symbols: &FxHashSet<String>,
+    _local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
     needed_sonames: &[String],
     soname: Option<String>,
     output_path: &str,
@@ -61,7 +61,7 @@ pub fn emit_shared_library(
     // ── Phase 3c: Identify PLT entries needed for external function calls ──
     let mut plt_symbols: Vec<String> = Vec::new();
     {
-        let mut plt_set: HashSet<String> = HashSet::new();
+        let mut plt_set: FxHashSet<String> = FxHashSet::default();
         for (_, obj) in input_objs.iter() {
             for relocs in &obj.relocations {
                 for reloc in relocs {
@@ -428,7 +428,7 @@ pub fn emit_shared_library(
     );
 
     // Assign GOT offsets to symbols
-    let mut got_sym_offsets: HashMap<String, u64> = HashMap::new();
+    let mut got_sym_offsets: FxHashMap<String, u64> = FxHashMap::default();
     for (gi, name) in got_symbols.iter().enumerate() {
         let got_off = gi as u64 * 8;
         got_sym_offsets.insert(name.clone(), got_off);
@@ -543,7 +543,7 @@ pub fn emit_shared_library(
     }
 
     // Write .dynsym
-    let mut merged_to_shdr: HashMap<usize, u16> = HashMap::new();
+    let mut merged_to_shdr: FxHashMap<usize, u16> = FxHashMap::default();
     {
         let mut shdr_idx = 4u16;
         for &si in &sec_indices {
@@ -620,7 +620,7 @@ pub fn emit_shared_library(
     }
 
     // Build PLT stubs and GOT.PLT
-    let mut plt_sym_addrs: HashMap<String, u64> = HashMap::new();
+    let mut plt_sym_addrs: FxHashMap<String, u64> = FxHashMap::default();
     if !plt_symbols.is_empty() {
         let plt0_addr = plt_vaddr;
         for i in 0..plt_symbols.len() {
@@ -695,8 +695,8 @@ pub fn emit_shared_library(
     }
 
     // Apply relocations with RELATIVE collection
-    let empty_relax = HashMap::new();
-    let empty_nop = HashSet::new();
+    let empty_relax = FxHashMap::default();
+    let empty_nop = FxHashSet::default();
     let ctx = reloc::RelocContext {
         sec_mapping,
         section_vaddrs: &section_vaddrs,
