@@ -493,9 +493,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     } else {
         detect_phi_coalesce_groups(func, &liveness)
     };
-    for &(_phi_dest, backedge_src) in &phi_coalesce {
-        // Remove backedge source from eligibility — it will inherit the phi dest's register.
-        eligible.remove(&backedge_src);
+    for candidate in &phi_coalesce {
+        // Remove the backedge source from independent allocation. If the
+        // candidate survives final conflict checks it inherits the phi
+        // destination's register.
+        eligible.remove(&candidate.backedge_src);
     }
 
     // --- Linear scan allocation (replaces three-phase greedy allocator) ---
@@ -721,86 +723,59 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Propagate phi coalesce assignments: backedge source values inherit
-    // the register of their phi dest. This makes the backedge Copy a no-op
-    // when both values share the same register.
-    // Safety check: only propagate if the backedge source's interval doesn't
-    // conflict with other values already assigned to the same register.
-    for &(phi_dest, backedge_src) in &phi_coalesce {
-        if let Some(&reg) = assignments.get(&phi_dest) {
-            // Find backedge_src's interval
-            let src_interval = liveness
-                .intervals
+    // Propagate proven phi-coalesce assignments. A candidate carries its
+    // exact same-block definition/copy window from detection; revalidate that
+    // window before changing locations so future refactors fail closed.
+    for candidate in &phi_coalesce {
+        let phi_dest = candidate.phi_dest;
+        let backedge_src = candidate.backedge_src;
+        let Some(block) = func.blocks.get(candidate.block_idx) else {
+            continue;
+        };
+        if candidate.source_def_idx >= candidate.copy_idx
+            || candidate.copy_idx >= block.instructions.len()
+            || block.instructions[candidate.source_def_idx]
+                .dest()
+                .is_none_or(|dest| dest.0 != backedge_src)
+            || !matches!(
+                block.instructions[candidate.copy_idx],
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } if dest.0 == phi_dest && src.0 == backedge_src
+            )
+            || block.instructions[candidate.source_def_idx + 1..candidate.copy_idx]
                 .iter()
-                .find(|iv| iv.value_id == backedge_src);
-            if let Some(src_iv) = src_interval {
-                // Additional: check overlap with the phi dest's own interval
-                // (they share a register, so they should not overlap)
-                let dest_iv = liveness.intervals.iter().find(|iv| iv.value_id == phi_dest);
-                if let Some(_div) = dest_iv {
-                    // The coarse interval-overlap test rejects the common
-                    // loop-carried pattern (head/condition use of the phi dest
-                    // precedes the backedge source's definition, so sharing a
-                    // register is safe). Only a real "lost copy" is a hazard:
-                    // the OLD phi-dest value used AFTER the new value is
-                    // computed and BEFORE the backedge copy. That window lies
-                    // in the copy block and the source's defining block, which
-                    // the group detector already checks; re-verify here.
-                    let phi_dest_used_after_src = {
-                        let src_def_block = func.blocks.iter().enumerate().find_map(
-                            |(bi, b)| {
-                                b.instructions
-                                    .iter()
-                                    .any(|i| i.dest().is_some_and(|d| d.0 == backedge_src))
-                                    .then_some(bi)
-                            },
-                        );
-                        let copy_block = func.blocks.iter().enumerate().find_map(|(bi, b)| {
-                            b.instructions.iter().any(|i| {
-                                matches!(i, Instruction::Copy { dest, src: Operand::Value(sv) }
-                                    if dest.0 == phi_dest && sv.0 == backedge_src)
-                            })
-                            .then_some(bi)
-                        });
-                        let mut hazard = false;
-                        for bi in [src_def_block, copy_block].into_iter().flatten() {
-                            let mut src_defined = false;
-                            for inst in &func.blocks[bi].instructions {
-                                if !src_defined {
-                                    if inst.dest().is_some_and(|d| d.0 == backedge_src) {
-                                        src_defined = true;
-                                    }
-                                } else if uses_value(inst, phi_dest) {
-                                    hazard = true;
-                                }
-                            }
-                        }
-                        hazard
-                    };
-                    if phi_dest_used_after_src {
-                        // Genuine lost-copy hazard — keep them apart.
-                        continue;
-                    }
+                .any(|inst| uses_value(inst, phi_dest))
+        {
+            continue;
+        }
+
+        let Some(&reg) = assignments.get(&phi_dest) else {
+            continue;
+        };
+        let src_interval = liveness
+            .intervals
+            .iter()
+            .find(|iv| iv.value_id == backedge_src);
+        if let Some(src_iv) = src_interval {
+            // A value already allocated to this register must not overlap the
+            // source interval. The phi destination itself is intentionally
+            // excluded: the same-block window proof above establishes the
+            // legal destructive update from old phi value to new source value.
+            let has_conflict = liveness.intervals.iter().any(|iv| {
+                if iv.value_id == backedge_src || iv.value_id == phi_dest {
+                    return false;
                 }
-                // Check for conflicts with other values in the same register
-                let has_conflict = liveness.intervals.iter().any(|iv| {
-                    if iv.value_id == backedge_src || iv.value_id == phi_dest {
-                        return false;
-                    }
-                    if let Some(&other_reg) = assignments.get(&iv.value_id) {
-                        other_reg.0 == reg.0 && iv.start < src_iv.end && src_iv.start < iv.end
-                    } else {
-                        false
-                    }
-                });
-                if !has_conflict {
-                    assignments.insert(backedge_src, reg);
-                }
-            } else {
-                // No interval info — still safe to propagate (value might be dead)
-                assignments.insert(backedge_src, reg);
+                assignments.get(&iv.value_id).is_some_and(|other_reg| {
+                    other_reg.0 == reg.0 && iv.start < src_iv.end && src_iv.start < iv.end
+                })
+            });
+            if has_conflict {
+                continue;
             }
         }
+        assignments.insert(backedge_src, reg);
     }
 
     // Debug: count overlaps after phi coalesce
@@ -1771,209 +1746,174 @@ fn count_value_uses_in_loop(func: &IrFunction, block_loop_depth: &[u32]) -> FxHa
     uses
 }
 
-/// Detect phi coalesce groups for loop-carried variables.
+/// A phi/backedge pair that may share one physical register.
 ///
-/// After phi elimination, loop-header phi nodes become Copy instructions in
-/// predecessor blocks. For the backedge predecessor, this creates a Copy:
-///   `%phi_dest = copy %backedge_src`
-/// where `%phi_dest` is the multi-def phi variable and `%backedge_src` is the
-/// new value computed in the loop body.
+/// `source_def_idx..copy_idx` is a straight-line window in `block_idx`.
+/// Keeping these exact sites makes the destructive update proof explicit and
+/// lets assignment propagation revalidate it without whole-function searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhiCoalesceCandidate {
+    phi_dest: u32,
+    backedge_src: u32,
+    block_idx: usize,
+    source_def_idx: usize,
+    copy_idx: usize,
+}
+
+/// Detect safe phi coalesce candidates for loop-carried variables.
 ///
-/// By coalescing these two values (giving them the same register), the Copy
-/// becomes a no-op, eliminating a register-to-register move or stack round-trip.
-///
-/// Returns a list of (phi_dest, backedge_src) pairs that should share a register.
-fn detect_phi_coalesce_groups(func: &IrFunction, liveness: &LivenessResult) -> Vec<(u32, u32)> {
-    // Step 1: Find multi-def values (phi dests after phi elimination).
-    // A value is multi-def if it has Copy definitions in multiple blocks.
-    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+/// After phi elimination, a backedge contains `%phi = copy %next`. Sharing a
+/// register removes that copy, but it is a destructive update: `%next`'s
+/// definition overwrites `%phi`. This is safe only when definition and Copy are
+/// in the SAME basic block and `%phi` is not read between them. If the source is
+/// defined in an earlier block, an intervening successor can still read the old
+/// phi value (SQLite deleteTable); checking only the source and Copy blocks
+/// cannot prove otherwise.
+fn detect_phi_coalesce_groups(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+) -> Vec<PhiCoalesceCandidate> {
+    // Build both forms of definition metadata in one pass:
+    // - multi_def identifies post-phi destinations defined by edge Copies;
+    // - unique_def_site proves a source has exactly one definition and records
+    //   its exact straight-line location. None means multiple definitions.
+    let mut first_copy_def_block: FxHashMap<u32, usize> = FxHashMap::default();
     let mut multi_def: FxHashSet<u32> = FxHashSet::default();
+    let mut unique_def_site: FxHashMap<u32, Option<(usize, usize)>> = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        for inst in &block.instructions {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                unique_def_site
+                    .entry(dest.0)
+                    .and_modify(|site| *site = None)
+                    .or_insert(Some((block_idx, inst_idx)));
+            }
             if let Instruction::Copy { dest, .. } = inst {
-                if let Some(&prev) = def_block.get(&dest.0) {
-                    if prev != block_idx {
-                        multi_def.insert(dest.0);
-                    }
+                if first_copy_def_block
+                    .insert(dest.0, block_idx)
+                    .is_some_and(|previous| previous != block_idx)
+                {
+                    multi_def.insert(dest.0);
                 }
-                def_block.insert(dest.0, block_idx);
             }
         }
     }
-
     if multi_def.is_empty() {
         return Vec::new();
     }
 
-    // Step 1b: Build use-block map for backedge source safety check.
-    // If a backedge source is used in blocks OTHER than the Copy's block,
-    // coalescing is unsafe: the source's register would be reused by the
-    // allocator for other values in those blocks, clobbering the source
-    // before its cross-block uses.
+    // Source uses outside the Copy block make destructive coalescing unsafe.
+    // Canonical visitors cover data operands, pointer-only uses, and every
+    // terminator form without hand-maintained omissions.
     let mut src_use_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
-            // Skip Copy dests — we care about OPERAND uses, not definitions.
-            // Canonical traversal covers every instruction form (Intrinsic
-            // args, Memcpy endpoints, InlineAsm inputs included).
-            let mut uses = Vec::new();
             for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    uses.push(v.0);
+                if let Operand::Value(value) = op {
+                    src_use_blocks.entry(value.0).or_default().insert(block_idx);
                 }
             });
-            for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
-            for vid in uses {
-                src_use_blocks.entry(vid).or_default().insert(block_idx);
-            }
+            for_each_value_use_in_instruction(inst, |value| {
+                src_use_blocks.entry(value.0).or_default().insert(block_idx);
+            });
         }
-        // Also check terminator operands
-        match &block.terminator {
-            Terminator::CondBranch { cond, .. } => {
-                if let Operand::Value(v) = cond {
-                    src_use_blocks.entry(v.0).or_default().insert(block_idx);
-                }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(value) = op {
+                src_use_blocks.entry(value.0).or_default().insert(block_idx);
             }
-            Terminator::Return(Some(op)) => {
-                if let Operand::Value(v) = op {
-                    src_use_blocks.entry(v.0).or_default().insert(block_idx);
-                }
-            }
-            Terminator::Switch { val, .. } => {
-                if let Operand::Value(v) = val {
-                    src_use_blocks.entry(v.0).or_default().insert(block_idx);
-                }
-            }
-            _ => {}
-        }
+        });
     }
 
-    // Step 2: Find backedge copies in loop blocks.
-    // A backedge copy is a Copy where:
-    //   - The dest is a multi-def value (phi dest)
-    //   - The source is a Value (not a constant)
-    //   - The copy is in a block with loop_depth > 0
-    let mut groups: Vec<(u32, u32)> = Vec::new();
+    let debug = std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok();
+    let mut candidates = Vec::new();
     let mut seen_phi_dests: FxHashSet<u32> = FxHashSet::default();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        let depth = liveness
+        if liveness
             .block_loop_depth
             .get(block_idx)
             .copied()
-            .unwrap_or(0);
-        if depth == 0 {
+            .unwrap_or(0)
+            == 0
+        {
             continue;
         }
 
-        for inst in &block.instructions {
-            if let Instruction::Copy {
+        for (copy_idx, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Copy {
                 dest,
-                src: Operand::Value(src_val),
+                src: Operand::Value(src),
             } = inst
+            else {
+                continue;
+            };
+            if !multi_def.contains(&dest.0)
+                || seen_phi_dests.contains(&dest.0)
+                || multi_def.contains(&src.0)
             {
-                if multi_def.contains(&dest.0) && !seen_phi_dests.contains(&dest.0) {
-                    // Don't coalesce if src is itself a multi-def (swap cycle temporaries)
-                    if !multi_def.contains(&src_val.0) {
-                        // Safety: don't coalesce if the phi dest is used AFTER
-                        // the backedge source's definition. This detects the
-                        // "lost copy" pattern where e.g.:
-                        //   v_n = Call(malloc)       ← src defined here
-                        //   Store(v_head, v_n+8)     ← phi dest USED here
-                        //   Copy v_head = v_n        ← coalesce candidate
-                        // Coalescing v_head and v_n to the same register would
-                        // clobber v_head when storing the Call result.
-                        //
-                        // Important: the src may be defined in a DIFFERENT block
-                        // than the Copy (multi-block loop bodies). We must check
-                        // the src's defining block for phi dest uses, not just
-                        // the Copy's block.
-                        let mut phi_dest_used_after_src = false;
-
-                        // Find the block that defines the backedge source
-                        let mut src_def_block = None;
-                        for (bi, b) in func.blocks.iter().enumerate() {
-                            for i in &b.instructions {
-                                if let Some(d) = i.dest() {
-                                    if d.0 == src_val.0 {
-                                        src_def_block = Some(bi);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check the block containing the Copy
-                        {
-                            let mut src_defined = false;
-                            for inst2 in &block.instructions {
-                                if !src_defined {
-                                    if let Some(d) = inst2.dest() {
-                                        if d.0 == src_val.0 {
-                                            src_defined = true;
-                                        }
-                                    }
-                                } else {
-                                    if let Instruction::Copy { dest: d, .. } = inst2 {
-                                        if d.0 == dest.0 {
-                                            break;
-                                        }
-                                    }
-                                    if uses_value(inst2, dest.0) {
-                                        phi_dest_used_after_src = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        // If the src is defined in a DIFFERENT block, also check
-                        // that block (and any other block the src's value flows
-                        // through) for phi dest uses after the src definition.
-                        if let Some(sdb) = src_def_block {
-                            if sdb != block_idx {
-                                let mut src_defined = false;
-                                for inst2 in &func.blocks[sdb].instructions {
-                                    if !src_defined {
-                                        if let Some(d) = inst2.dest() {
-                                            if d.0 == src_val.0 {
-                                                src_defined = true;
-                                            }
-                                        }
-                                    } else {
-                                        if uses_value(inst2, dest.0) {
-                                            phi_dest_used_after_src = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Also check: the backedge source must not have uses
-                        // in OTHER blocks. If it does, coalescing gives it the
-                        // phi dest's register, but the allocator may reassign
-                        // that register to other values in those blocks,
-                        // clobbering the source before its cross-block uses.
-                        let src_has_cross_block_use = src_use_blocks
-                            .get(&src_val.0)
-                            .map(|blocks| blocks.iter().any(|&b| b != block_idx))
-                            .unwrap_or(false);
-
-                        if !phi_dest_used_after_src && !src_has_cross_block_use {
-                            if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
-                                eprintln!("[PHI_COALESCE] Coalescing phi_dest=Value({}) with backedge_src=Value({}) in block {}",
-                                    dest.0, src_val.0, block_idx);
-                            }
-                            groups.push((dest.0, src_val.0));
-                            seen_phi_dests.insert(dest.0);
-                        } else if std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok() {
-                            eprintln!("[PHI_COALESCE] BLOCKED phi_dest=Value({}) with backedge_src=Value({}) in block {} (used_after={}, cross_block={})",
-                                dest.0, src_val.0, block_idx, phi_dest_used_after_src, src_has_cross_block_use);
-                        }
-                    }
-                }
+                continue;
             }
+
+            let Some((source_block, source_def_idx)) =
+                unique_def_site.get(&src.0).copied().flatten()
+            else {
+                if debug {
+                    eprintln!(
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): source is not single-def",
+                        dest.0, src.0
+                    );
+                }
+                continue;
+            };
+
+            // Core SQLite deleteTable soundness rule. A basic block is the only
+            // region with no hidden control-flow path between definition and
+            // Copy; different blocks require full path-sensitive interference
+            // and are conservatively not coalesced.
+            if source_block != block_idx || source_def_idx >= copy_idx {
+                if debug {
+                    eprintln!(
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} != copy {}:{}",
+                        dest.0, src.0, source_block, source_def_idx, block_idx, copy_idx
+                    );
+                }
+                continue;
+            }
+
+            let phi_used_in_window = block.instructions[source_def_idx + 1..copy_idx]
+                .iter()
+                .any(|middle| uses_value(middle, dest.0));
+            let source_used_elsewhere = src_use_blocks
+                .get(&src.0)
+                .is_some_and(|blocks| blocks.iter().any(|&use_block| use_block != block_idx));
+            if phi_used_in_window || source_used_elsewhere {
+                if debug {
+                    eprintln!(
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} used_in_window={} cross_block={}",
+                        dest.0, src.0, block_idx, phi_used_in_window, source_used_elsewhere
+                    );
+                }
+                continue;
+            }
+
+            if debug {
+                eprintln!(
+                    "[PHI_COALESCE] Coalescing phi_dest=Value({}) with backedge_src=Value({}) in block {} window {}..{}",
+                    dest.0, src.0, block_idx, source_def_idx, copy_idx
+                );
+            }
+            candidates.push(PhiCoalesceCandidate {
+                phi_dest: dest.0,
+                backedge_src: src.0,
+                block_idx,
+                source_def_idx,
+                copy_idx,
+            });
+            seen_phi_dests.insert(dest.0);
         }
     }
 
-    groups
+    candidates
 }
 
 /// Check if an instruction uses a given value ID as an operand (not as dest).
@@ -2000,4 +1940,91 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
         });
     }
     found
+}
+#[cfg(test)]
+mod phi_coalesce_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_source_defined_before_intervening_phi_use_block() {
+        // Reduced sqlite deleteTable shape:
+        //   block 2 defines the proposed backedge source;
+        //   block 3 still reads the old phi value;
+        //   block 4 performs the backedge Copy.
+        // Coalescing source and phi destination clobbers the old value before
+        // block 3. Looking only in the source and Copy blocks misses the use.
+        let mut func = IrFunction::new("deleteTable_shape".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                Vec::new(),
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(5),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                vec![Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(5)),
+                    ty: IrType::I32,
+                }],
+                Terminator::Branch(BlockId(4)),
+            ),
+            block(
+                4,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                5,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 4;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            candidates.is_empty(),
+            "cross-block source must not coalesce: {candidates:?}"
+        );
+    }
 }
