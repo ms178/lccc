@@ -13,7 +13,7 @@ pub mod parser;
 pub mod encoder;
 pub mod elf_writer;
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 use parser::{parse_asm, AsmStatement, Operand, AsmDirective, DataValue};
 use elf_writer::ElfWriter;
 
@@ -152,7 +152,7 @@ fn parse_numeric_ref(name: &str) -> Option<(&str, bool)> {
 fn resolve_numeric_name(
     name: &str,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Option<String> {
     let (num, is_forward) = parse_numeric_ref(name)?;
     let def_list = defs.get(num)?;
@@ -177,8 +177,8 @@ fn resolve_numeric_name(
 /// reference `Nb` refers to the most recent definition of `N`.
 fn resolve_numeric_labels(statements: &[AsmStatement]) -> Vec<AsmStatement> {
     // First pass: find all numeric label definitions and assign unique names.
-    let mut defs: HashMap<String, Vec<(usize, String)>> = HashMap::new();
-    let mut unique_counter: HashMap<String, usize> = HashMap::new();
+    let mut defs: FxHashMap<String, Vec<(usize, String)>> = FxHashMap::default();
+    let mut unique_counter: FxHashMap<String, usize> = FxHashMap::default();
 
     for (i, stmt) in statements.iter().enumerate() {
         if let AsmStatement::Label(name) = stmt {
@@ -233,7 +233,7 @@ fn resolve_numeric_labels(statements: &[AsmStatement]) -> Vec<AsmStatement> {
 fn resolve_numeric_operand(
     op: &Operand,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Operand {
     match op {
         Operand::Symbol(name) => {
@@ -274,7 +274,7 @@ fn resolve_numeric_operand(
 fn resolve_numeric_refs_in_expr(
     expr: &str,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> String {
     let bytes = expr.as_bytes();
     let mut result = String::with_capacity(expr.len());
@@ -327,7 +327,7 @@ fn resolve_numeric_refs_in_expr(
 fn resolve_numeric_directive(
     dir: &AsmDirective,
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> AsmDirective {
     match dir {
         AsmDirective::Byte(vals) => {
@@ -347,7 +347,7 @@ fn resolve_numeric_directive(
 fn resolve_numeric_data_values(
     vals: &[DataValue],
     current_idx: usize,
-    defs: &HashMap<String, Vec<(usize, String)>>,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Vec<DataValue> {
     vals.iter().map(|v| {
         match v {
