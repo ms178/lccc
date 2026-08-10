@@ -291,7 +291,7 @@ fn estimate_line_bytes(trimmed: &str) -> u64 {
 /// Substitutes each backward reference with its byte position, then evaluates the expression.
 fn resolve_rept_label_expr(
     count_str: &str,
-    label_positions: &std::collections::HashMap<String, Vec<u64>>,
+    label_positions: &std::collections::FxHashMap<String, Vec<u64>>,
 ) -> Result<i64, String> {
     // First try direct evaluation (handles simple integer expressions)
     if let Ok(val) = asm_expr::parse_integer_expr(count_str) {
@@ -358,7 +358,7 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     // Track numeric label positions (byte offsets) for resolving backward refs
-    let mut label_positions: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut label_positions: std::collections::FxHashMap<String, Vec<u64>> = std::collections::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
@@ -727,8 +727,8 @@ fn substitute_params(body: &[String], params: &[String], defaults: &[Option<Stri
 /// Also handles .purgem to remove macro definitions (used by FFmpeg to allow
 /// each `function` invocation to redefine `endfunc`).
 fn expand_macros(lines: &[&str]) -> Result<Vec<String>, String> {
-    use std::collections::HashMap;
-    let mut macros: HashMap<String, MacroDef> = HashMap::new();
+    use crate::common::fx_hash::FxHashMap;
+    let mut macros: FxHashMap<String, MacroDef> = FxHashMap::default();
     let mut counter = 0u64;
     expand_macros_impl(lines, &mut macros, 0, &mut counter)
 }
@@ -738,7 +738,7 @@ fn expand_macros(lines: &[&str]) -> Result<Vec<String>, String> {
 /// `counter` is GAS's `\@` macro invocation counter.
 fn expand_macros_impl(
     lines: &[&str],
-    macros: &mut std::collections::HashMap<String, MacroDef>,
+    macros: &mut std::collections::FxHashMap<String, MacroDef>,
     depth: usize,
     counter: &mut u64,
 ) -> Result<Vec<String>, String> {
@@ -863,8 +863,8 @@ fn expand_macros_impl(
 /// are reassigned (e.g., `.Lasm_alt_mode` in kernel ALTERNATIVE macros).
 /// The `.set` directives themselves are preserved for the encoder to process.
 fn resolve_set_constants(lines: &[String]) -> Vec<String> {
-    use std::collections::HashMap;
-    let mut constants: HashMap<String, String> = HashMap::new();
+    use crate::common::fx_hash::FxHashMap;
+    let mut constants: FxHashMap<String, String> = FxHashMap::default();
     let mut result = Vec::with_capacity(lines.len());
 
     // Single sequential pass: update constants as .set directives are encountered,
@@ -935,8 +935,8 @@ fn is_ident_char(b: u8) -> bool {
 /// Second pass: substitute alias names with their register values in all non-directive lines.
 /// The `.req` / `.unreq` lines themselves are preserved (they'll be parsed as Empty later).
 fn resolve_register_aliases(lines: &[String]) -> Vec<String> {
-    use std::collections::HashMap;
-    let mut aliases: HashMap<String, String> = HashMap::new();
+    use crate::common::fx_hash::FxHashMap;
+    let mut aliases: FxHashMap<String, String> = FxHashMap::default();
 
     // First pass: collect alias definitions and removals in order
     for line in lines {
