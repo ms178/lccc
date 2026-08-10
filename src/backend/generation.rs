@@ -1328,6 +1328,7 @@ fn generate_function(
         !has_dyn_alloca && !func.is_variadic && !has_inline_asm_rbp && !has_vector_intrinsics;
 
     // Calculate stack space and emit prologue
+    cg.state().current_func_name = func.name.clone();
     let raw_space = cg.calculate_stack_space(func);
     let frame_size = cg.aligned_frame_size(raw_space);
     cg.state().frame_size = frame_size;
@@ -1510,7 +1511,7 @@ fn generate_function(
             // If the instruction is handled, it's accumulated in the MachInst buffer.
             // When an unhandled instruction is encountered, the buffer is flushed
             // (allocated and emitted) before falling through to the default codegen.
-            if cg.try_lower_machinst(inst) {
+            if cg.try_lower_machinst(inst, &dead_global_addrs) {
                 cg.state().current_program_point += 1;
                 continue;
             }
@@ -1612,7 +1613,7 @@ fn emit_loc_directive(
 ///
 /// Instructions that clobber the accumulator unpredictably (calls, stores, atomics,
 /// inline asm, va_arg, memcpy, etc.) invalidate the cache after execution.
-fn generate_instruction(
+pub(crate) fn generate_instruction(
     cg: &mut dyn ArchCodegen,
     inst: &Instruction,
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,

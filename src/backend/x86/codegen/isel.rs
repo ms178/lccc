@@ -341,7 +341,7 @@ pub fn lower_cmp(
     let rhs_op = lower_operand_with_regs(rhs, ra);
     out.push(MachInst::Cmp { lhs: lhs_op, rhs: rhs_op, size });
     out.push(MachInst::SetCC { cc, dst });
-    out.push(MachInst::Movzx { src: dst, dst, from_size: OpSize::S8, to_size: OpSize::S32 });
+    out.push(MachInst::Movzx { src: MachOperand::Reg(dst), dst, from_size: OpSize::S8, to_size: OpSize::S32 });
 }
 
 /// Lower a fused Cmp + CondBranch (no boolean materialization).
@@ -392,9 +392,9 @@ pub fn lower_cast(
     };
 
     if to_ty.is_unsigned() || from_ty.is_unsigned() {
-        out.push(MachInst::Movzx { src: src_reg, dst, from_size, to_size });
+        out.push(MachInst::Movzx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
     } else {
-        out.push(MachInst::Movsx { src: src_reg, dst, from_size, to_size });
+        out.push(MachInst::Movsx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
     }
 }
 

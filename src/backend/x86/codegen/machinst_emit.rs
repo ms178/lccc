@@ -129,6 +129,26 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
     }
 }
 
+
+/// If `op` is an immediate outside the signed-32-bit range, materialize it
+/// into %rax with movabsq and return a register operand (plus the emitted
+/// movabsq line). x86 `cmp/test` (like all ALU ops) only support imm32
+/// sign-extended operands; using the raw 64-bit immediate would truncate it
+/// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
+/// check compiled to `cmp $0x55667788`).
+fn materialize_large_imm(
+    op: &MachOperand,
+    out: &mut AsmOutput,
+) -> MachOperand {
+    match op {
+        MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
+            out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
+            MachOperand::Reg(MachReg::Phys(super::machinst::RAX))
+        }
+        _ => op.clone(),
+    }
+}
+
 /// ALU operation mnemonic.
 fn alu_mnemonic(op: AluOp) -> &'static str {
     match op {
@@ -318,43 +338,52 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Cmp { lhs, rhs, size } => {
             let suffix = size.suffix();
+            let mut lhs = lhs.clone();
+            let mut rhs = rhs.clone();
+            // 64-bit immediates don't fit in the imm32 of cmp; materialize.
+            lhs = materialize_large_imm(&lhs, out);
+            rhs = materialize_large_imm(&rhs, out);
             // x86 cmp can't have two memory operands — load rhs to rax
-            let both_mem = matches!((lhs, rhs),
+            let both_mem = matches!((&lhs, &rhs),
                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
                 (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
                 (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
                 (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
             if both_mem {
-                let rhs_str = fmt_operand(rhs, *size, out);
+                let rhs_str = fmt_operand(&rhs, *size, out);
                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
-                let lhs_str = fmt_operand(lhs, *size, out);
+                let lhs_str = fmt_operand(&lhs, *size, out);
                 // AT&T: cmp rhs, lhs
                 out.emit_fmt(format_args!("    cmp{} %{}, {}", suffix, rax, lhs_str));
             } else {
-                let rhs_str = fmt_operand(rhs, *size, out);
-                let lhs_str = fmt_operand(lhs, *size, out);
+                let rhs_str = fmt_operand(&rhs, *size, out);
+                let lhs_str = fmt_operand(&lhs, *size, out);
                 out.emit_fmt(format_args!("    cmp{} {}, {}", suffix, rhs_str, lhs_str));
             }
         }
 
         MachInst::Test { lhs, rhs, size } => {
             let suffix = size.suffix();
+            let mut lhs = lhs.clone();
+            let mut rhs = rhs.clone();
+            lhs = materialize_large_imm(&lhs, out);
+            rhs = materialize_large_imm(&rhs, out);
             // x86 test can't have two memory operands — load one to rax
-            let both_mem = matches!((lhs, rhs),
+            let both_mem = matches!((&lhs, &rhs),
                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
                 (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
                 (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
                 (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
             if both_mem {
-                let rhs_str = fmt_operand(rhs, *size, out);
+                let rhs_str = fmt_operand(&rhs, *size, out);
                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
-                let lhs_str = fmt_operand(lhs, *size, out);
+                let lhs_str = fmt_operand(&lhs, *size, out);
                 out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
             } else {
-                let rhs_str = fmt_operand(rhs, *size, out);
-                let lhs_str = fmt_operand(lhs, *size, out);
+                let rhs_str = fmt_operand(&rhs, *size, out);
+                let lhs_str = fmt_operand(&lhs, *size, out);
                 out.emit_fmt(format_args!("    test{} {}, {}", suffix, rhs_str, lhs_str));
             }
         }
@@ -366,20 +395,25 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
         }
 
         MachInst::Movzx { src, dst, from_size, to_size } => {
-            let src_str = fmt_reg(src, *from_size);
-            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit)
-            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
-            let dst_str = fmt_reg(dst, actual_dst_size);
+            let src_str = fmt_operand(src, *from_size, out);
+            // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit).
+            // A 32->64 zero-extension is a plain movl: writing a 32-bit
+            // register zero-extends to the full 64-bit register on x86-64.
+            // (The previous `_ => movzbl` fallback TRUNCATED 32-bit values to
+            // 8 bits — miscompiling every U32->U64 zero-extending cast, e.g.
+            // gzip's send_bits bit packing: wrong values -> corrupt output.)
             let mnem = match (from_size, to_size) {
                 (OpSize::S8, _) => "movzbl",
                 (OpSize::S16, _) => "movzwl",
-                _ => "movzbl",
+                _ => "movl",
             };
+            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
+            let dst_str = fmt_reg(dst, actual_dst_size);
             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
         }
 
         MachInst::Movsx { src, dst, from_size, to_size } => {
-            let src_str = fmt_reg(src, *from_size);
+            let src_str = fmt_operand(src, *from_size, out);
             let dst_str = fmt_reg(dst, *to_size);
             let mnem = match (from_size, to_size) {
                 (OpSize::S8, OpSize::S32) => "movsbl",

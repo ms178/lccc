@@ -96,7 +96,7 @@ fn collect_vreg_refs(
             def_reg(dst, point, defs, uses);
         }
         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
-            use_reg(src, point, uses);
+            use_operand(src, point, uses);
             def_reg(dst, point, defs, uses);
         }
         MachInst::Cmov { src, dst, .. } => {
@@ -239,7 +239,7 @@ fn visit_regs_shared(inst: &MachInst, f: &mut impl FnMut(&MachReg)) {
         }
         MachInst::SetCC { dst, .. } => { f(dst); }
         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
-            f(src); f(dst);
+            visit_op(src, f); f(dst);
         }
         MachInst::Cmov { src, dst, .. } => { visit_op(src, f); f(dst); }
         MachInst::CallIndirect { reg, .. } => { f(reg); }
@@ -571,7 +571,7 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
             }
             MachInst::Movzx { src, dst, from_size, to_size } => {
                 out.push(MachInst::Movzx {
-                    src: rewrite_reg(src, result),
+                    src: rewrite_operand(src, result),
                     dst: rewrite_reg(dst, result),
                     from_size: *from_size,
                     to_size: *to_size,
@@ -579,7 +579,7 @@ pub fn rewrite_machinsts(insts: &[MachInst], result: &MachAllocResult) -> Vec<Ma
             }
             MachInst::Movsx { src, dst, from_size, to_size } => {
                 out.push(MachInst::Movsx {
-                    src: rewrite_reg(src, result),
+                    src: rewrite_operand(src, result),
                     dst: rewrite_reg(dst, result),
                     from_size: *from_size,
                     to_size: *to_size,

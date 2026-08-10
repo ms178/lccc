@@ -174,7 +174,13 @@ pub trait ArchCodegen {
     /// internal buffer). Returns false if the instruction should use the default
     /// accumulator-based codegen path.
     /// Default: always false (no MachInst support).
-    fn try_lower_machinst(&mut self, _inst: &Instruction) -> bool {
+    /// Try to lower an IR instruction into the MachInst buffer.
+    /// `folded_global_addrs` lists GlobalAddr values whose address computation
+    /// is folded into direct symbol(%rip) load/store operands by the default
+    /// path (their GlobalAddr instruction is skipped). MachInst cannot
+    /// represent those as a register base, so such loads/stores must stay on
+    /// the default path.
+    fn try_lower_machinst(&mut self, _inst: &Instruction, _folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>) -> bool {
         false
     }
 
