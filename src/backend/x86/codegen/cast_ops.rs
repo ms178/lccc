@@ -11,6 +11,15 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        // W2 Load->Cast fold handshake: skip ONLY when the adjacent load
+        // ACTUALLY emitted the redirected load into this value's register
+        // (handshake set by emit_load_impl). Any other situation emits the
+        // cast normally — the fold is sound by construction.
+        if self.fold_skip_cast == Some(dest.0) {
+            self.fold_skip_cast = None;
+            return;
+        }
+        self.fold_skip_cast = None;
         // A cast OF an x87 bit-pattern value (LDFabs/LDCopysign result,
         // tracked in f128_direct_slots) is a no-op regardless of the source
         // type in the IR (the value is already the 16-byte x87 format).

@@ -174,16 +174,21 @@ fn run_gvn_licm_ivsr_shared(
         // Run IVSR with shared analysis.
         // LICM hoists instructions to preheaders but does not add/remove blocks,
         // so CFG analysis is still valid.
-        // IVSR and Un-IVSR disabled: IVSR creates pointer IVs that replace
-        // index-based GEP addressing with pointer arithmetic. However, when
-        // the original GEP also uses indexed offsets (e.g., in nested loops
-        // where the outer loop's row base and the inner loop's column offset
-        // interact), the pointer increment compounds with the existing offset,
-        // doubling effective addresses. This causes correctness bugs in matmul
-        // and other multi-dimensional array patterns.
-        // TODO: Fix IVSR to correctly handle GEPs in nested loop contexts
-        // where the base pointer is itself a loop-variant value.
-        let _ = run_ivsr; // suppress unused warning
+        // W4 (2026-08-10): reduce_loop gates every candidate GEP on
+        // is_loop_invariant(base) — loop-VARIANT bases (the historical matmul
+        // address-doubling bug) are skipped, so the pointer recurrence can
+        // never compound with a moving base. Full battery verified with the
+        // pass forced ON. Opt-in (CCC_IVSR=1) because gzip measured slightly
+        // negative: -6 +1.25% (faster 2/9), -9 +0.17% (faster 3/9).
+        if run_ivsr {
+            let n = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+            if n > 0 {
+                ivsr_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+            }
+        }
     }
 
     if time_passes {
@@ -642,7 +647,9 @@ macro_rules! preloop_dump {
             let gvn_enabled = true;
             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
-            let run_ivsr = iter == 0 && !disabled.contains("ivsr");
+            let run_ivsr = iter == 0
+                && std::env::var("CCC_IVSR").is_ok()
+                && !disabled.contains("ivsr");
 
             if run_gvn || run_licm || run_ivsr {
                 let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
