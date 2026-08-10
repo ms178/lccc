@@ -351,6 +351,13 @@ pub struct X86Codegen {
     /// MachInst buffer for virtual register ISel. Instructions are accumulated
     /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
     pub(super) machinst_buf: Vec<super::machinst::MachInst>,
+    /// Shadow of the IR instructions currently in `machinst_buf`, in the same
+    /// order. Used by the fallback path: if the MachInst buffer cannot be fully
+    /// resolved (a value on the stack in a register-only position), the
+    /// buffered IR instructions are re-emitted through the default codegen
+    /// path instead of being silently deleted (which miscompiled gzip:
+    /// missing loads/ALU -> segfault).
+    pub(super) machinst_buf_ir: Vec<crate::ir::reexports::Instruction>,
     /// Whether MachInst ISel is enabled (CCC_USE_MACHINST env var).
     pub(super) machinst_enabled: bool,
 }
@@ -401,6 +408,7 @@ impl X86Codegen {
             caller_save_spill_slots: FxHashMap::default(),
             caller_save_intervals: FxHashMap::default(),
             machinst_buf: Vec::new(),
+            machinst_buf_ir: Vec::new(),
             machinst_enabled: std::env::var("CCC_USE_MACHINST").is_ok(),
         }
     }
@@ -2569,7 +2577,7 @@ fn collect_vregs_in_inst(
             def_reg(dst, all, defs);
         }
         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
-            use_reg(src, all);
+            use_op(src, all);
             def_reg(dst, all, defs);
         }
         MachInst::Cmov { src, dst, .. } => {
@@ -2730,6 +2738,47 @@ fn resolve_stack_vregs(
                 size: *size,
             }
         }
+        MachInst::Movzx { src, dst, from_size, to_size } => {
+            // movzx/movsx accept a memory source: a slot-backed (spilled) src
+            // vreg can be resolved to StackSlot directly. The emitter formats
+            // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
+            // A slot-backed dst stays a vreg and is caught by
+            // has_unresolvable_vreg -> default-path fallback.
+            let src_resolved = match src {
+                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+                    if let Some(slot) = state.get_slot(*id) {
+                        MachOperand::StackSlot(slot.0)
+                    } else {
+                        src.clone()
+                    }
+                }
+                _ => src.clone(),
+            };
+            MachInst::Movzx {
+                src: src_resolved,
+                dst: *dst,
+                from_size: *from_size,
+                to_size: *to_size,
+            }
+        }
+        MachInst::Movsx { src, dst, from_size, to_size } => {
+            let src_resolved = match src {
+                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+                    if let Some(slot) = state.get_slot(*id) {
+                        MachOperand::StackSlot(slot.0)
+                    } else {
+                        src.clone()
+                    }
+                }
+                _ => src.clone(),
+            };
+            MachInst::Movsx {
+                src: src_resolved,
+                dst: *dst,
+                from_size: *from_size,
+                to_size: *to_size,
+            }
+        }
         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
             lhs: resolve_op(lhs),
             rhs: resolve_op(rhs),
@@ -2788,6 +2837,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
             MachOperand::Reg(r) => check_reg(r),
             MachOperand::Mem { base, .. } => check_reg(base),
             MachOperand::MemIndex { base, index, .. } => check_reg(base) || check_reg(index),
+            // AllocaAddr is resolved to a Raw leaq only when a slot exists;
+            // without one the emitter prints an error comment and the address
+            // computation silently vanishes. Fall back instead.
+            MachOperand::AllocaAddr(_) => true,
             _ => false,
         }
     };
@@ -2808,12 +2861,39 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, ra: &FxHashMap<u32, P
         }
         MachInst::SetCC { dst, .. } => check_reg(dst),
         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
-            check_reg(src) || check_reg(dst)
+            check_op(src) || check_reg(dst)
         }
         MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
         MachInst::CallIndirect { reg, .. } => check_reg(reg),
         _ => false,
     }
+}
+
+/// A value is MachInst-unsafe when it lives outside the GPR domain:
+/// floats/XMM, vectors, i128/wide, or long double. MachInst's
+/// lower_copy/lower_cast assume 64-bit GPR moves; touching such values
+/// there miscompiles (float bit-copies read stale slots, i128 copies drop
+/// the high half, vector slots get GPR-clobbered).
+fn is_mi_unsafe_value(
+    v: u32,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    state: &CodegenState,
+    value_types: &FxHashMap<u32, crate::common::types::IrType>,
+) -> bool {
+    if state.is_i128_value(v) || state.vector_values.contains(&v) {
+        return true;
+    }
+    if let Some(r) = reg_assignments.get(&v) {
+        if r.0 >= 20 {
+            return true; // XMM-assigned
+        }
+    }
+    if let Some(ty) = value_types.get(&v) {
+        if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
+            return true;
+        }
+    }
+    false
 }
 
 impl ArchCodegen for X86Codegen {
@@ -2843,9 +2923,20 @@ impl ArchCodegen for X86Codegen {
         true
     }
 
-    fn try_lower_machinst(&mut self, inst: &crate::ir::reexports::Instruction) -> bool {
+    fn try_lower_machinst(
+        &mut self,
+        inst: &crate::ir::reexports::Instruction,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
         if !self.machinst_enabled {
             return false;
+        }
+        // Debug knob: CCC_MI_SKIP_FUNC=name1,name2 disables the MachInst path
+        // for whole functions (diagnostic bisection aid).
+        if let Some(skip) = std::env::var("CCC_MI_SKIP_FUNC").ok() {
+            if skip.split(',').any(|n| n == self.state.current_func_name.as_str()) {
+                return false;
+            }
         }
 
         // Reject instructions involving values we can't handle.
@@ -2866,6 +2957,10 @@ impl ArchCodegen for X86Codegen {
                     reject = true;
                     return;
                 }
+                if is_mi_unsafe_value(v.0, ra, state, &self.value_types) {
+                    reject = true;
+                    return;
+                }
                 if let Some(r) = ra.get(&v.0) {
                     if r.0 >= 20 {
                         reject = true;
@@ -2882,7 +2977,25 @@ impl ArchCodegen for X86Codegen {
         match inst {
             crate::ir::reexports::Instruction::Load { ptr, .. }
             | crate::ir::reexports::Instruction::Store { ptr, .. } => {
+                // A pointer whose address is folded into a direct symbol(%rip)
+                // operand by the default path has NO materialized address: the
+                // GlobalAddr instruction was skipped. MachInst would emit a
+                // memory operand through a register that is never loaded
+                // (gzip: `movq %r15, (%r13)` with r13 never set -> SEGV).
+                if folded_global_addrs.contains(&ptr.0) {
+                    reject = true;
+                }
                 if state.folded_gep_values.contains(&ptr.0) {
+                    reject = true;
+                }
+                // Over-aligned allocas (e.g. _Alignas(32) SIMD buffers): the
+                // runtime address is (slot+align-1)&~(align-1), not the raw
+                // slot. MachInst's lower_load/lower_store use the raw slot
+                // address and would write to the WRONG location. The default
+                // path handles OverAligned via emit_alloca_aligned_addr.
+                if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
+                    state.resolve_slot_addr(ptr.0)
+                {
                     reject = true;
                 }
                 if let Some(r) = ra.get(&ptr.0) {
@@ -2899,6 +3012,15 @@ impl ArchCodegen for X86Codegen {
                 }
             }
             crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
+                // Over-aligned alloca bases need the aligned address; the
+                // default path computes it, MachInst would use the raw slot.
+                if state.is_alloca(base.0) {
+                    if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
+                        state.resolve_slot_addr(base.0)
+                    {
+                        reject = true;
+                    }
+                }
                 // Allow alloca bases (ISel handles via AllocaAddr + leaq)
                 if !state.is_alloca(base.0) {
                     if let Some(r) = ra.get(&base.0) {
@@ -2918,6 +3040,9 @@ impl ArchCodegen for X86Codegen {
         // Copy dest can be a stack slot (resolved to Mov with StackSlot).
         if let Some(dest) = inst.dest() {
             if state.is_alloca(dest.0) {
+                reject = true;
+            }
+            if is_mi_unsafe_value(dest.0, ra, state, &self.value_types) {
                 reject = true;
             }
             if let Some(r) = ra.get(&dest.0) {
@@ -2968,12 +3093,16 @@ impl ArchCodegen for X86Codegen {
             _ => {}
         }
 
-        super::isel::lower_instruction_ctx(
+        let lowered = super::isel::lower_instruction_ctx(
             inst,
             &self.reg_assignments,
             &alloca_slots,
             &mut self.machinst_buf,
-        )
+        );
+        if lowered {
+            self.machinst_buf_ir.push(inst.clone());
+        }
+        lowered
     }
 
     fn flush_machinst(&mut self) {
@@ -2993,6 +3122,36 @@ impl ArchCodegen for X86Codegen {
             .iter()
             .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
         if has_bad {
+            if std::env::var("CCC_MI_DEBUG").is_ok() {
+                eprintln!("[MI-FALLBACK] {} instructions -> default path", self.machinst_buf_ir.len());
+                for mi in &resolved {
+                    if has_unresolvable_vreg(mi, &self.reg_assignments) {
+                        eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
+                    }
+                }
+            }
+            // CORRECTNESS: never delete instructions. Re-emit the buffered IR
+            // through the default (accumulator) codegen path, which handles
+            // stack-backed values in every position. The buffer is a
+            // straight-line sequence (flushed before calls and at block ends),
+            // the register cache is still valid for the pre-buffer state, and
+            // GEP folding is a pure optimization — an empty fold map keeps the
+            // default path semantics-identical.
+            let ir = std::mem::take(&mut self.machinst_buf_ir);
+            for inst in ir {
+                crate::backend::generation::generate_instruction(
+                    self,
+                    &inst,
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                );
+                // Mirror the main loop's program-point accounting so any
+                // call-spanning save/restore decisions after the fallback
+                // stay aligned with the IR positions they were computed for.
+                self.state.current_program_point += 1;
+            }
             self.machinst_buf.clear();
             return;
         }
@@ -3000,6 +3159,7 @@ impl ArchCodegen for X86Codegen {
         super::machinst_emit::emit_machinsts(&resolved, &mut self.state.out);
 
         self.machinst_buf.clear();
+        self.machinst_buf_ir.clear();
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();

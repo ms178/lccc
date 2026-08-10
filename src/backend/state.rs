@@ -221,6 +221,8 @@ pub struct CodegenState {
     /// and skipped during codegen. These values are never emitted — their registers
     /// are uninitialized. MachInst must not use these as pointers.
     pub folded_gep_values: FxHashSet<u32>,
+    /// Name of the function currently being code-generated (diagnostics).
+    pub current_func_name: String,
     /// Total use count for each value ID across the entire function.
     /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
     pub value_use_counts: Vec<u32>,
@@ -379,6 +381,7 @@ impl CodegenState {
             reg_cache: RegCache::default(),
             gep_base_offset: FxHashMap::default(),
             folded_gep_values: FxHashSet::default(),
+            current_func_name: String::new(),
             value_use_counts: Vec::new(),
             block_use_counts: FxHashMap::default(),
             function_return_thunk: false,

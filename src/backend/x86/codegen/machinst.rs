@@ -102,10 +102,10 @@ pub enum MachInst {
     Mov { src: MachOperand, dst: MachOperand, size: OpSize },
 
     /// movzx src, dst (zero-extend: movzbl, movzwl, movzbq, movzwq)
-    Movzx { src: MachReg, dst: MachReg, from_size: OpSize, to_size: OpSize },
+    Movzx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
 
     /// movsx src, dst (sign-extend: movsbq, movswq, movslq)
-    Movsx { src: MachReg, dst: MachReg, from_size: OpSize, to_size: OpSize },
+    Movsx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
 
     // ── Arithmetic ───────────────────────────────────────────────────
     /// Two-address ALU: dst = dst OP src.
