@@ -105,6 +105,40 @@ impl X86Codegen {
                 self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
             }
             Operand::Value(v) => {
+                // XMM register direct: if RHS is in xmm3-xmm7 (register allocator
+                // assigned), operate directly — avoids GPR domain crossing. Safe
+                // because xmm3-xmm7 are never clobbered by codegen scratch.
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(reg) {
+                        let src_name = phys_reg_name(reg);
+                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0", mnemonic, suffix, src_name));
+                        // Store result to dest
+                        if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                            let sr = self.slot_ref(dest_slot.0);
+                            self.state.emit_fmt(format_args!("    {} %xmm0, {}", mov_instr, sr));
+                            self.state.reg_cache.invalidate_acc();
+                        } else if let Some(&dreg) = self.reg_assignments.get(&dest.0) {
+                            if is_xmm_reg(dreg) {
+                                let dn = phys_reg_name(dreg);
+                                if dn != "xmm0" {
+                                    self.state.emit_fmt(format_args!("    {} %xmm0, %{}", mov_instr, dn));
+                                }
+                                self.state.reg_cache.invalidate_acc();
+                            } else {
+                                if ty == IrType::F32 { self.state.emit("    movd %xmm0, %eax"); }
+                                else { self.state.emit("    movq %xmm0, %rax"); }
+                                self.state.reg_cache.invalidate_acc();
+                                self.store_rax_to(dest);
+                            }
+                        } else {
+                            if ty == IrType::F32 { self.state.emit("    movd %xmm0, %eax"); }
+                            else { self.state.emit("    movq %xmm0, %rax"); }
+                            self.state.reg_cache.invalidate_acc();
+                            self.store_rax_to(dest);
+                        }
+                        return;
+                    }
+                }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
                     self.state.emit_fmt(format_args!("    {}{} {}, %xmm0", mnemonic, suffix, sr));
