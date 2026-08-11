@@ -31,7 +31,60 @@ pub fn run_regalloc_and_merge_clobbers(
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
-    let xmm_regs = if available_regs.iter().any(|r| r.0 == 1) {
+    let has_scalar_fp = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| match inst {
+            Instruction::BinOp { ty, .. }
+            | Instruction::UnaryOp { ty, .. }
+            | Instruction::Cmp { ty, .. }
+            | Instruction::Load { ty, .. }
+            | Instruction::Store { ty, .. } => ty.is_float() && *ty != IrType::F128,
+            Instruction::Cast { from_ty, to_ty, .. } => {
+                (from_ty.is_float() || to_ty.is_float())
+                    && *from_ty != IrType::F128
+                    && *to_ty != IrType::F128
+            }
+            _ => false,
+        })
+    });
+    let has_memcpy_or_vector_intrinsic = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            if matches!(inst, Instruction::Memcpy { .. }) {
+                return true;
+            }
+            let Instruction::Intrinsic { op, .. } = inst else { return false; };
+            use crate::ir::intrinsics::IntrinsicOp;
+            matches!(op,
+                IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
+                IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+                IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
+                IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+                IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
+                IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+                IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
+                IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
+                IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
+                IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
+                IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
+                IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
+                IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
+                IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
+                IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
+                IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4)
+        })
+    });
+    // The mature accumulator backend has a complete stack path for scalar FP,
+    // while its XMM location contract is not yet unified with aggregate memcpy
+    // and intrinsic producers. For ordinary scalar-FP functions, stack-backed
+    // values avoid XMM↔GPR relays and are measurably faster. Keep XMM allocation
+    // for aggregate/vector functions until their location model is migrated as
+    // one unit; this is a function-shape decision, not a benchmark-name switch.
+    let disable_scalar_fp_xmm = has_scalar_fp
+        && !has_memcpy_or_vector_intrinsic
+        && std::env::var("CCC_ENABLE_SCALAR_FP_XMM").is_err();
+    let xmm_regs = if available_regs.iter().any(|r| r.0 == 1)
+        && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
+        && !disable_scalar_fp_xmm
+    {
         // x86-64: xmm2-xmm7 available for F64 values
         vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
     } else {

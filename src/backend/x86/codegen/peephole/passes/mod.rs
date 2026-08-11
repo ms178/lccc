@@ -349,6 +349,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
         changed = false;
         let local_changed = if sk("combined") { false } else { local_patterns::combined_local_pass(&mut store, &mut infos) };
         changed |= local_changed;
+        if !sk("lea_mem_sib") {
+            changed |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+        }
         if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
         if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
         if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
@@ -414,6 +417,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
             // interaction miscompiles (e.g. redundant `xorl %eax,%eax` removal
             // across loop boundaries). Honor the skip set.
             if !sk("combined") { changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos); }
+            if !sk("lea_mem_sib") { changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
@@ -460,6 +464,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
             changed3 = false;
             changed3 |= local_patterns::combined_local_pass(&mut store, &mut infos);
+            if !sk("lea_mem_sib") { changed3 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
             changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
@@ -582,6 +587,33 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("mulsd -40(%rbp), %xmm0"),
             "should fold movsd+mulsd: {}", result);
+    }
+
+    #[test]
+    fn test_lea_into_indexed_load() {
+        let asm = [
+            "    leaq (%r12, %r9), %rdi",
+            "    movsbq (%rdi), %rsi",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsbq (%r12,%r9), %rsi"),
+            "should fold LEA into SIB load: {}", result);
+        assert!(!result.contains("leaq (%r12, %r9), %rdi"),
+            "temporary LEA should be removed: {}", result);
+    }
+
+    #[test]
+    fn test_lea_copy_into_indexed_store() {
+        let asm = [
+            "    leaq (%r12, %r9), %rdi",
+            "    movq %rdi, %rcx",
+            "    movb $0, (%rcx)",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movb $0, (%r12,%r9)"),
+            "should fold LEA/copy into SIB store: {}", result);
+        assert!(!result.contains("movq %rdi, %rcx"),
+            "temporary address copy should be removed: {}", result);
     }
 
     #[test]

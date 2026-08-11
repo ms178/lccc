@@ -26,6 +26,7 @@
 //! folding, DCE, and CFG simplification clean up the dead code.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
 
 /// Run interprocedural constant propagation on the module.
@@ -34,6 +35,13 @@ use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
 /// or parameters specialized with constants).
 pub fn run(module: &mut IrModule) -> usize {
     let mut total_changes = 0;
+
+    // Phase 0: bounded evaluation of direct constant calls. This is a
+    // compile-time interpreter for pure integer IR, not a general symbolic
+    // executor. It handles small recursive specializations such as
+    // ackermann(3, 11) while refusing memory, inline asm, indirect calls,
+    // unbounded loops, or calls with non-constant arguments.
+    total_changes += evaluate_constant_calls(module);
 
     // Phase 1: Constant return propagation.
     // Find side-effect-free functions that always return the same constant,
@@ -114,6 +122,255 @@ pub fn run(module: &mut IrModule) -> usize {
     total_changes += propagate_constant_arguments(module);
 
     total_changes
+}
+
+/// Evaluate direct calls whose arguments are all compile-time integer constants.
+///
+/// This intentionally works on a small, strict IR subset. Refusing a function
+/// is the default: a single load, store, indirect call, volatile operation, or
+/// unsupported loop shape makes evaluation return `None` and leaves the call
+/// unchanged. The step budget and memo table bound compile-time work.
+fn evaluate_constant_calls(module: &mut IrModule) -> usize {
+    type EvalKey = (usize, Vec<crate::ir::constants::ConstHashKey>);
+    let mut function_indices: FxHashMap<String, usize> = FxHashMap::default();
+    for (idx, func) in module.functions.iter().enumerate() {
+        if !func.is_declaration && func.is_static && !func.is_weak && !func.is_variadic {
+            function_indices.insert(func.name.clone(), idx);
+        }
+    }
+    if function_indices.is_empty() {
+        return 0;
+    }
+
+    let mut replacements: Vec<(usize, usize, usize, IrConst)> = Vec::new();
+    let mut memo: FxHashMap<EvalKey, Option<IrConst>> = FxHashMap::default();
+    let mut active: FxHashSet<EvalKey> = FxHashSet::default();
+
+    for (caller_idx, caller) in module.functions.iter().enumerate() {
+        if caller.is_declaration {
+            continue;
+        }
+        for (block_idx, block) in caller.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                let Instruction::Call { func: callee, info } = inst else { continue; };
+                let Some(dest) = info.dest else { continue; };
+                let Some(&callee_idx) = function_indices.get(callee) else { continue; };
+                if info.args.iter().any(|arg| !matches!(arg, Operand::Const(_))) {
+                    continue;
+                }
+                let args: Vec<IrConst> = info
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        Operand::Const(c) => Some(*c),
+                        Operand::Value(_) => None,
+                    })
+                    .collect();
+                if args.len() != info.args.len() {
+                    continue;
+                }
+                let mut budget = 2_000_000u64;
+                if let Some(result) = eval_const_function(
+                    module,
+                    &function_indices,
+                    callee_idx,
+                    &args,
+                    &mut memo,
+                    &mut active,
+                    &mut budget,
+                ) {
+                    replacements.push((caller_idx, block_idx, inst_idx, result));
+                    if std::env::var("CCC_DEBUG_IPCP_EVAL").is_ok() {
+                        eprintln!(
+                            "[IPCP-EVAL] {} -> {} = {:?}",
+                            callee, dest.0, result
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply backwards within each block so instruction indices remain valid.
+    replacements.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    let mut changes = 0;
+    for (caller_idx, block_idx, inst_idx, result) in replacements.into_iter().rev() {
+        if let Some(Instruction::Call { info, .. }) = module
+            .functions
+            .get_mut(caller_idx)
+            .and_then(|func| func.blocks.get_mut(block_idx))
+            .and_then(|block| block.instructions.get(inst_idx))
+        {
+            if let Some(dest) = info.dest {
+                module.functions[caller_idx].blocks[block_idx].instructions[inst_idx] =
+                    Instruction::Copy { dest, src: Operand::Const(result) };
+                changes += 1;
+            }
+        }
+    }
+    changes
+}
+
+fn eval_const_function(
+    module: &IrModule,
+    function_indices: &FxHashMap<String, usize>,
+    function_idx: usize,
+    args: &[IrConst],
+    memo: &mut FxHashMap<(usize, Vec<crate::ir::constants::ConstHashKey>), Option<IrConst>>,
+    active: &mut FxHashSet<(usize, Vec<crate::ir::constants::ConstHashKey>)>,
+    budget: &mut u64,
+) -> Option<IrConst> {
+    if *budget == 0 {
+        return None;
+    }
+    let key = (function_idx, args.iter().map(|c| c.to_hash_key()).collect());
+    if let Some(result) = memo.get(&key) {
+        return *result;
+    }
+    if !active.insert(key.clone()) {
+        return None;
+    }
+    *budget -= 1;
+
+    let result = (|| {
+        let func = module.functions.get(function_idx)?;
+        if func.is_declaration || func.is_variadic || func.is_weak || func.params.len() != args.len() {
+            return None;
+        }
+        let label_to_idx: FxHashMap<u32, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(idx, block)| (block.label.0, idx))
+            .collect();
+        let mut values: FxHashMap<u32, IrConst> = FxHashMap::default();
+        let mut current_idx = 0usize;
+        let mut predecessor: Option<u32> = None;
+
+        loop {
+            let block = func.blocks.get(current_idx)?;
+            let mut first_non_phi = 0usize;
+            while first_non_phi < block.instructions.len() {
+                let Instruction::Phi { dest, incoming, .. } = &block.instructions[first_non_phi] else { break; };
+                let pred = predecessor?;
+                let op = incoming.iter().find(|(_, label)| label.0 == pred).map(|(op, _)| op)?;
+                values.insert(dest.0, eval_const_operand(op, &values)?);
+                first_non_phi += 1;
+            }
+            for inst in block.instructions.iter().skip(first_non_phi) {
+                if *budget == 0 { return None; }
+                *budget -= 1;
+                match inst {
+                    // Residual allocas are harmless when mem2reg has removed
+                    // every load/store use; keep them as no-ops in the pure
+                    // evaluator.
+                    Instruction::Alloca { .. } => {},
+                    Instruction::ParamRef { dest, param_idx, .. } => {
+                        values.insert(dest.0, *args.get(*param_idx)?);
+                    }
+                    Instruction::Copy { dest, src } => {
+                        values.insert(dest.0, eval_const_operand(src, &values)?);
+                    }
+                    Instruction::Cast { dest, src, from_ty, to_ty } => {
+                        let value = eval_const_operand(src, &values)?;
+                        values.insert(dest.0, value.coerce_to_with_src(*to_ty, Some(*from_ty)));
+                    }
+                    Instruction::UnaryOp { dest, op, src, ty } => {
+                        let value = eval_const_operand(src, &values)?.to_i64()?;
+                        let result = match op {
+                            crate::ir::reexports::IrUnaryOp::Neg => value.checked_neg()?,
+                            crate::ir::reexports::IrUnaryOp::Not => !value,
+                            crate::ir::reexports::IrUnaryOp::Clz => (value as u64).leading_zeros() as i64,
+                            crate::ir::reexports::IrUnaryOp::Ctz => (value as u64).trailing_zeros() as i64,
+                            crate::ir::reexports::IrUnaryOp::Popcount => (value as u64).count_ones() as i64,
+                            crate::ir::reexports::IrUnaryOp::Bswap => match *ty {
+                                IrType::I32 | IrType::U32 => (value as i32).swap_bytes() as i64,
+                                _ => value.swap_bytes(),
+                            },
+                            crate::ir::reexports::IrUnaryOp::IsConstant => 1,
+                        };
+                        values.insert(dest.0, IrConst::from_i64(result, *ty));
+                    }
+                    Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
+                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
+                        let result = op.eval_i64(lhs, rhs)?;
+                        values.insert(dest.0, IrConst::from_i64(result, *ty));
+                    }
+                    Instruction::Cmp { dest, op, lhs, rhs, .. } => {
+                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
+                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
+                        values.insert(dest.0, IrConst::I32(if op.eval_i64(lhs, rhs) { 1 } else { 0 }));
+                    }
+                    Instruction::Select { dest, cond, true_val, false_val, .. } => {
+                        let cond = eval_const_operand(cond, &values)?.to_i64()?;
+                        let selected = if cond != 0 { true_val } else { false_val };
+                        values.insert(dest.0, eval_const_operand(selected, &values)?);
+                    }
+                    Instruction::Call { func: callee, info } => {
+                        let callee_idx = *function_indices.get(callee)?;
+                        let mut call_args = Vec::with_capacity(info.args.len());
+                        for arg in &info.args {
+                            call_args.push(eval_const_operand(arg, &values)?);
+                        }
+                        let result = eval_const_function(
+                            module,
+                            function_indices,
+                            callee_idx,
+                            &call_args,
+                            memo,
+                            active,
+                            budget,
+                        )?;
+                        if let Some(dest) = info.dest {
+                            values.insert(dest.0, result);
+                        } else {
+                            return None;
+                        }
+                    }
+                    // Memory, address-taking, indirect calls, atomics, inline
+                    // asm, and target intrinsics are intentionally not evaluated.
+                    _ => return None,
+                }
+            }
+
+            if *budget == 0 { return None; }
+            *budget -= 1;
+            match &block.terminator {
+                Terminator::Return(Some(op)) => return eval_const_operand(op, &values),
+                Terminator::Return(None) | Terminator::Unreachable => return None,
+                Terminator::Branch(label) => {
+                    predecessor = Some(block.label.0);
+                    current_idx = *label_to_idx.get(&label.0)?;
+                }
+                Terminator::CondBranch { cond, true_label, false_label } => {
+                    let cond = eval_const_operand(cond, &values)?.to_i64()?;
+                    predecessor = Some(block.label.0);
+                    let label = if cond != 0 { true_label } else { false_label };
+                    current_idx = *label_to_idx.get(&label.0)?;
+                }
+                Terminator::Switch { val, cases, default, .. } => {
+                    let value = eval_const_operand(val, &values)?.to_i64()?;
+                    predecessor = Some(block.label.0);
+                    let label = cases.iter().find(|(case, _)| *case == value).map(|(_, label)| label).unwrap_or(default);
+                    current_idx = *label_to_idx.get(&label.0)?;
+                }
+                Terminator::IndirectBranch { .. } => return None,
+            }
+
+        }
+    })();
+
+    active.remove(&key);
+    memo.insert(key, result);
+    result
+}
+
+fn eval_const_operand(op: &Operand, values: &FxHashMap<u32, IrConst>) -> Option<IrConst> {
+    match op {
+        Operand::Const(c) => Some(*c),
+        Operand::Value(v) => values.get(&v.0).copied(),
+    }
 }
 
 /// Analyze all static (internal-linkage) functions in the module and return
