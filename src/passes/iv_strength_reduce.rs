@@ -95,15 +95,39 @@ pub(crate) fn ivsr_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
 
     // Merge loops with same header
     let loops = loop_analysis::merge_loops_by_header(loops);
+    let debug = std::env::var("CCC_IVSR_DEBUG").is_ok();
 
     let mut total_reductions = 0;
 
-    // Process each loop (innermost first)
+    // Process innermost-first.  IVSR creates a new pointer phi and recurrence.
+    // Applying it independently to overlapping/nested loops can make an outer
+    // recurrence consume a base transformed by the inner loop — the nested matmul
+    // wrong-result.  Original conservative fix skipped all overlapping loops.
+    // Improved policy: keep inner loops (smallest bodies first) and skip any
+    // outer that overlaps an already-kept inner.  This retains the more
+    // profitable inner-loop optimization while preventing address-doubling.
     let mut sorted_loops = loops;
     sorted_loops.sort_by_key(|l| l.body.len());
 
+    let mut kept_bodies: Vec<FxHashSet<usize>> = Vec::new();
+
     for natural_loop in &sorted_loops {
-        total_reductions += reduce_loop(func, natural_loop, &cfg.preds);
+        let overlaps_kept = kept_bodies.iter().any(|kept| !kept.is_disjoint(&natural_loop.body));
+        if overlaps_kept {
+            if debug {
+                eprintln!(
+                    "[IVSR] skip outer overlapping loop header={} blocks={} (overlaps kept inner)",
+                    natural_loop.header,
+                    natural_loop.body.len()
+                );
+            }
+            continue;
+        }
+        let changed = reduce_loop(func, natural_loop, &cfg.preds);
+        if changed > 0 {
+            kept_bodies.push(natural_loop.body.clone());
+        }
+        total_reductions += changed;
     }
 
     total_reductions
@@ -157,170 +181,193 @@ fn reduce_loop(
     let preheader_label = func.blocks[preheader].label;
     let back_block_label = func.blocks[back_blocks[0]].label;
 
+    // Coalesce all equivalent derived expressions, not only GEPs that
+    // literally share the same multiply instruction. C frontends commonly
+    // materialize `a[i]` twice as two independently numbered `i * stride`
+    // expressions. The key is semantic: (basic IV, byte stride, invariant base).
+    let mut pointer_groups: Vec<(usize, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
     for d in &derived {
-        let iv = &basic_ivs[d.iv_index];
-        let inc_bytes = iv.step * d.stride;
-
         for &(gep_block_idx, gep_inst_idx, gep_dest, gep_base) in &d.gep_uses {
-            // Only reduce GEPs where the base is loop-invariant (skip loop-variant bases).
-            if !is_loop_invariant(gep_base.0, &natural_loop.body, func) {
-                continue;
+            if let Some((_, _, _, uses)) = pointer_groups.iter_mut().find(|(iv_index, stride, base, _)| {
+                *iv_index == d.iv_index && *stride == d.stride && *base == gep_base
+            }) {
+                uses.push((gep_block_idx, gep_inst_idx, gep_dest));
+            } else {
+                pointer_groups.push((
+                    d.iv_index,
+                    d.stride,
+                    gep_base,
+                    vec![(gep_block_idx, gep_inst_idx, gep_dest)],
+                ));
             }
+        }
+    }
 
-            let ptr_iv_val = Value(next_id);
-            next_id += 1;
-            let ptr_next_val = Value(next_id);
-            next_id += 1;
-            let init_ptr_val = Value(next_id);
-            next_id += 1;
+    for (iv_index, stride, gep_base, gep_uses) in pointer_groups {
+        let iv = &basic_ivs[iv_index];
+        let inc_bytes = iv.step * stride;
 
-            // Try to resolve init to a constant (looking through copies)
-            let init_const = try_resolve_const(&iv.init, func);
-            let init_offset = init_const.map(|v| v * d.stride);
+        // Only reduce GEPs where the base is loop-invariant (skip loop-variant bases).
+        if !is_loop_invariant(gep_base.0, &natural_loop.body, func) {
+            continue;
+        }
 
-            // Build preheader instructions for computing the initial pointer
-            let mut preheader_insts: Vec<Instruction> = Vec::new();
+        let ptr_iv_val = Value(next_id);
+        next_id += 1;
+        let ptr_next_val = Value(next_id);
+        next_id += 1;
+        let init_ptr_val = Value(next_id);
+        next_id += 1;
 
-            if let Some(init_off) = init_offset {
-                // Constant initial offset case (most common: i = 0)
-                if init_off == 0 {
-                    preheader_insts.push(Instruction::Copy {
-                        dest: init_ptr_val,
-                        src: Operand::Value(gep_base),
+        // Try to resolve init to a constant (looking through copies)
+        let init_const = try_resolve_const(&iv.init, func);
+        let init_offset = init_const.map(|v| v * stride);
+
+        // Build preheader instructions for computing the initial pointer
+        let mut preheader_insts: Vec<Instruction> = Vec::new();
+
+        if let Some(init_off) = init_offset {
+            // Constant initial offset case (most common: i = 0)
+            if init_off == 0 {
+                preheader_insts.push(Instruction::Copy {
+                    dest: init_ptr_val,
+                    src: Operand::Value(gep_base),
+                });
+            } else {
+                preheader_insts.push(Instruction::GetElementPtr {
+                    dest: init_ptr_val,
+                    base: gep_base,
+                    offset: Operand::Const(IrConst::I64(init_off)),
+                    ty: IrType::I8,
+                });
+            }
+        } else {
+            // Non-constant init: compute init * stride at runtime in preheader
+            let init_val = match &iv.init {
+                Operand::Value(v) => *v,
+                _ => continue,
+            };
+
+            if stride == 1 {
+                let init_cast_val = Value(next_id);
+                next_id += 1;
+                if iv.ty != IrType::I64 && iv.ty != IrType::Ptr {
+                    preheader_insts.push(Instruction::Cast {
+                        dest: init_cast_val,
+                        src: Operand::Value(init_val),
+                        from_ty: iv.ty,
+                        to_ty: IrType::I64,
                     });
-                } else {
                     preheader_insts.push(Instruction::GetElementPtr {
                         dest: init_ptr_val,
                         base: gep_base,
-                        offset: Operand::Const(IrConst::I64(init_off)),
+                        offset: Operand::Value(init_cast_val),
+                        ty: IrType::I8,
+                    });
+                } else {
+                    next_id -= 1; // Undo unused init_cast_val allocation
+                    preheader_insts.push(Instruction::GetElementPtr {
+                        dest: init_ptr_val,
+                        base: gep_base,
+                        offset: Operand::Value(init_val),
                         ty: IrType::I8,
                     });
                 }
             } else {
-                // Non-constant init: compute init * stride at runtime in preheader
-                let init_val = match &iv.init {
-                    Operand::Value(v) => *v,
-                    _ => continue,
-                };
-
-                if d.stride == 1 {
+                // Compute init * stride at runtime.
+                // Only allocate a cast value if the IV type needs widening to I64.
+                let needs_cast = iv.ty != IrType::I64 && iv.ty != IrType::Ptr;
+                let mul_operand = if needs_cast {
                     let init_cast_val = Value(next_id);
                     next_id += 1;
-                    if iv.ty != IrType::I64 && iv.ty != IrType::Ptr {
-                        preheader_insts.push(Instruction::Cast {
-                            dest: init_cast_val,
-                            src: Operand::Value(init_val),
-                            from_ty: iv.ty,
-                            to_ty: IrType::I64,
-                        });
-                        preheader_insts.push(Instruction::GetElementPtr {
-                            dest: init_ptr_val,
-                            base: gep_base,
-                            offset: Operand::Value(init_cast_val),
-                            ty: IrType::I8,
-                        });
-                    } else {
-                        next_id -= 1; // Undo unused init_cast_val allocation
-                        preheader_insts.push(Instruction::GetElementPtr {
-                            dest: init_ptr_val,
-                            base: gep_base,
-                            offset: Operand::Value(init_val),
-                            ty: IrType::I8,
-                        });
-                    }
+                    preheader_insts.push(Instruction::Cast {
+                        dest: init_cast_val,
+                        src: Operand::Value(init_val),
+                        from_ty: iv.ty,
+                        to_ty: IrType::I64,
+                    });
+                    Operand::Value(init_cast_val)
                 } else {
-                    // Compute init * stride at runtime.
-                    // Only allocate a cast value if the IV type needs widening to I64.
-                    let needs_cast = iv.ty != IrType::I64 && iv.ty != IrType::Ptr;
-                    let mul_operand = if needs_cast {
-                        let init_cast_val = Value(next_id);
-                        next_id += 1;
-                        preheader_insts.push(Instruction::Cast {
-                            dest: init_cast_val,
-                            src: Operand::Value(init_val),
-                            from_ty: iv.ty,
-                            to_ty: IrType::I64,
-                        });
-                        Operand::Value(init_cast_val)
-                    } else {
-                        Operand::Value(init_val)
-                    };
+                    Operand::Value(init_val)
+                };
 
-                    let init_mul_val = Value(next_id);
-                    next_id += 1;
-                    preheader_insts.push(Instruction::BinOp {
-                        dest: init_mul_val,
-                        op: IrBinOp::Mul,
-                        lhs: mul_operand,
-                        rhs: Operand::Const(IrConst::I64(d.stride)),
-                        ty: IrType::I64,
-                    });
-                    preheader_insts.push(Instruction::GetElementPtr {
-                        dest: init_ptr_val,
-                        base: gep_base,
-                        offset: Operand::Value(init_mul_val),
-                        ty: IrType::I8,
-                    });
-                }
+                let init_mul_val = Value(next_id);
+                next_id += 1;
+                preheader_insts.push(Instruction::BinOp {
+                    dest: init_mul_val,
+                    op: IrBinOp::Mul,
+                    lhs: mul_operand,
+                    rhs: Operand::Const(IrConst::I64(stride)),
+                    ty: IrType::I64,
+                });
+                preheader_insts.push(Instruction::GetElementPtr {
+                    dest: init_ptr_val,
+                    base: gep_base,
+                    offset: Operand::Value(init_mul_val),
+                    ty: IrType::I8,
+                });
             }
+        }
 
-            // Header: ptr_iv = phi(init_ptr from preheader, ptr_next from back_block)
-            let phi_inst = Instruction::Phi {
-                dest: ptr_iv_val,
-                ty: IrType::Ptr,
-                incoming: vec![
-                    (Operand::Value(init_ptr_val), preheader_label),
-                    (Operand::Value(ptr_next_val), back_block_label),
-                ],
-            };
+        // Header: ptr_iv = phi(init_ptr from preheader, ptr_next from back_block)
+        let phi_inst = Instruction::Phi {
+            dest: ptr_iv_val,
+            ty: IrType::Ptr,
+            incoming: vec![
+                (Operand::Value(init_ptr_val), preheader_label),
+                (Operand::Value(ptr_next_val), back_block_label),
+            ],
+        };
 
-            // Back-edge block: ptr_next = GEP(ptr_iv, inc_bytes)
-            let inc_inst = Instruction::GetElementPtr {
-                dest: ptr_next_val,
-                base: ptr_iv_val,
-                offset: Operand::Const(IrConst::I64(inc_bytes)),
-                ty: IrType::I8,
-            };
+        // Back-edge block: ptr_next = GEP(ptr_iv, inc_bytes)
+        let inc_inst = Instruction::GetElementPtr {
+            dest: ptr_next_val,
+            base: ptr_iv_val,
+            offset: Operand::Const(IrConst::I64(inc_bytes)),
+            ty: IrType::I8,
+        };
 
-            // Apply the transformation:
-            let ph_has_spans = !func.blocks[preheader].source_spans.is_empty();
-            let hdr_has_spans = !func.blocks[header].source_spans.is_empty();
-            let bb_has_spans = !func.blocks[back_blocks[0]].source_spans.is_empty();
+        // Apply the transformation:
+        let ph_has_spans = !func.blocks[preheader].source_spans.is_empty();
+        let hdr_has_spans = !func.blocks[header].source_spans.is_empty();
+        let bb_has_spans = !func.blocks[back_blocks[0]].source_spans.is_empty();
 
-            // 1. Add init_ptr computation to end of preheader
-            for inst in preheader_insts {
-                func.blocks[preheader].instructions.push(inst);
-                if ph_has_spans {
-                    func.blocks[preheader].source_spans.push(
-                        crate::common::source::Span::dummy(),
-                    );
-                }
+        // 1. Add init_ptr computation to end of preheader
+        for inst in preheader_insts {
+            func.blocks[preheader].instructions.push(inst);
+            if ph_has_spans {
+                func.blocks[preheader].source_spans.push(
+                    crate::common::source::Span::dummy(),
+                );
             }
+        }
 
-            // 2. Add phi at beginning of header (after existing phis)
-            let insert_pos = func.blocks[header]
-                .instructions
-                .iter()
-                .position(|inst| !matches!(inst, Instruction::Phi { .. }))
-                .unwrap_or(func.blocks[header].instructions.len());
-            func.blocks[header].instructions.insert(insert_pos, phi_inst);
-            if hdr_has_spans {
-                func.blocks[header]
-                    .source_spans
-                    .insert(insert_pos, crate::common::source::Span::dummy());
-            }
-            header_phi_insertions += 1;
+        // 2. Add phi at beginning of header (after existing phis)
+        let insert_pos = func.blocks[header]
+            .instructions
+            .iter()
+            .position(|inst| !matches!(inst, Instruction::Phi { .. }))
+            .unwrap_or(func.blocks[header].instructions.len());
+        func.blocks[header].instructions.insert(insert_pos, phi_inst);
+        if hdr_has_spans {
+            func.blocks[header]
+                .source_spans
+                .insert(insert_pos, crate::common::source::Span::dummy());
+        }
+        header_phi_insertions += 1;
 
-            // 3. Add increment to end of back-edge block
-            func.blocks[back_blocks[0]].instructions.push(inc_inst);
-            if bb_has_spans {
-                func.blocks[back_blocks[0]]
-                    .source_spans
-                    .push(crate::common::source::Span::dummy());
-            }
+        // 3. Add increment to end of back-edge block
+        func.blocks[back_blocks[0]].instructions.push(inc_inst);
+        if bb_has_spans {
+            func.blocks[back_blocks[0]]
+                .source_spans
+                .push(crate::common::source::Span::dummy());
+        }
 
-            // 4. Replace the original GEP instruction with a Copy from ptr_iv.
-            // Adjust index for all phis we've inserted at the header so far.
+        // 4. Replace every original GEP in this semantic group with a Copy
+        // from the one shared pointer IV. Adjust header indices for the
+        // inserted phis, but do not add another recurrence per use.
+        for (gep_block_idx, gep_inst_idx, gep_dest) in gep_uses {
             let adjusted_idx = if gep_block_idx == header {
                 gep_inst_idx + header_phi_insertions
             } else {
@@ -659,8 +706,37 @@ fn is_loop_invariant(val_id: u32, loop_body: &FxHashSet<usize>, func: &IrFunctio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::fx_hash::FxHashSet;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
+
+    #[test]
+    fn nested_or_overlapping_loops_inner_kept_outer_skipped() {
+        // Inner loop bodies are subsets of outer.  New policy keeps inner and
+        // skips outer that overlaps an already-kept inner, rather than skipping
+        // both.  This test validates the disjoint checks used by that policy.
+        let outer = NaturalLoop {
+            header: 1,
+            body: [1usize, 2, 3, 4].into_iter().collect::<FxHashSet<_>>(),
+        };
+        let inner = NaturalLoop {
+            header: 2,
+            body: [2usize, 3].into_iter().collect::<FxHashSet<_>>(),
+        };
+        let separate = NaturalLoop {
+            header: 7,
+            body: [7usize, 8].into_iter().collect::<FxHashSet<_>>(),
+        };
+        // Simulate sorted asc processing: inner first, then outer, then separate
+        let mut kept: Vec<FxHashSet<usize>> = Vec::new();
+        // inner does not overlap kept (empty) -> keep
+        assert!(!kept.iter().any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body)));
+        kept.push(inner.body.clone());
+        // outer overlaps kept inner -> should be skipped
+        assert!(kept.iter().any(|b| !b.is_disjoint(&outer.body)));
+        // separate does not overlap kept -> keep
+        assert!(!kept.iter().any(|b| !b.is_disjoint(&separate.body)));
+    }
 
     /// Test basic IV detection on a simple counting loop.
     #[test]
@@ -819,6 +895,28 @@ mod tests {
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
                 },
+                // A second independently-numbered `i * 4` and address
+                // materialization models `if (a[i] > 0) sum += a[i]`.
+                // It must share the pointer IV despite a distinct Mul value.
+                Instruction::BinOp {
+                    dest: Value(11),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(12),
+                    base: Value(0),
+                    offset: Operand::Value(Value(11)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(13),
+                    ptr: Value(12),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::BinOp {
                     dest: Value(9),
                     op: IrBinOp::Add,
@@ -846,10 +944,10 @@ mod tests {
             source_spans: Vec::new(),
         });
 
-        func.next_value_id = 11;
+        func.next_value_id = 14;
 
         let changes = ivsr_function(&mut func);
-        assert!(changes > 0, "Expected IVSR to make changes");
+        assert_eq!(changes, 2, "Expected both same-base GEPs to be reduced");
 
         // Check that a phi for the pointer IV was added to the header
         let header_phis: Vec<_> = func.blocks[1]
@@ -857,17 +955,23 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, Instruction::Phi { .. }))
             .collect();
-        assert!(
-            header_phis.len() >= 2,
-            "Expected at least 2 phis in header"
+        assert_eq!(
+            header_phis.len(),
+            2,
+            "Expected one original IV plus one shared pointer IV"
         );
 
-        // Check that the original GEP was replaced with a Copy
+        // Both original GEPs must become Copies from the same pointer IV.
         let body_copies: Vec<_> = func.blocks[2]
             .instructions
             .iter()
-            .filter(|i| matches!(i, Instruction::Copy { dest: Value(7), .. }))
+            .filter_map(|i| match i {
+                Instruction::Copy { dest, src: Operand::Value(src) }
+                    if *dest == Value(7) || *dest == Value(12) => Some((*dest, *src)),
+                _ => None,
+            })
             .collect();
-        assert_eq!(body_copies.len(), 1, "Expected GEP to be replaced with Copy");
+        assert_eq!(body_copies.len(), 2, "Expected both GEPs to become Copies");
+        assert_eq!(body_copies[0].1, body_copies[1].1, "Expected one shared pointer IV");
     }
 }

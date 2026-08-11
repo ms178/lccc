@@ -617,6 +617,34 @@ mod tests {
     }
 
     #[test]
+    fn test_lea_fold_keeps_sib_index_producer_live() {
+        // This is the exact shape from Expat's corpus tail fill.  Once the
+        // load/store uses r8 as a folded SIB index, dead-register elimination
+        // must still observe r8 as a read and preserve its defining move.
+        let asm = [
+            "    movq %rax, %r8",
+            "    leaq (%rdx, %r8), %r9",
+            "    movb $0x20, (%r9)",
+        ].join("\n") + "\n";
+        assert_ne!(scan_register_refs(b"movb $0x20, (%rdx,%r8)") & (1u16 << 8), 0,
+            "SIB index must be represented in the cached register-reference mask");
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        assert!(local_patterns::fold_lea_into_memory_op(&mut store, &mut infos));
+        assert_ne!(infos[2].reg_refs & (1u16 << 8), 0,
+            "rewritten SIB store must retain r8 in LineInfo: {}", store.get(2));
+        assert_eq!(helpers::get_dest_reg(&infos[2]), REG_NONE,
+            "SIB memory operands do not write their base/index registers");
+        assert!(!dead_code::eliminate_dead_reg_moves(&store, &mut infos),
+            "index producer must not become dead after SIB fold");
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movb $0x20, (%rdx,%r8)"),
+            "should fold to indexed store: {}", result);
+        assert!(result.contains("movq %rax, %r8"),
+            "SIB index producer must remain live after folding: {}", result);
+    }
+
+    #[test]
     fn test_redundant_store_load() {
         let asm = "    movq %rax, -8(%rbp)\n    movq -8(%rbp), %rax\n".to_string();
         let result = peephole_optimize(asm);
@@ -1777,7 +1805,13 @@ mod regression_tests {
             "    pushq %rax",
         ].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("xorl %eax, %eax").count(), 2, "{}", result);
+        // The first zeroing is dead because the volatile load overwrites eax.
+        // The important invariant is that the *second* zeroing survives after
+        // the opaque load; otherwise pushq would consume the volatile value.
+        assert_eq!(result.matches("xorl %eax, %eax").count(), 1, "{}", result);
+        let load = result.find("movl 8(%rsp), %eax").expect("volatile load kept");
+        let zero = result.rfind("xorl %eax, %eax").expect("post-load zero kept");
+        assert!(load < zero, "post-load zero must follow volatile load: {}", result);
     }
 
     #[test]

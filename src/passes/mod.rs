@@ -178,8 +178,10 @@ fn run_gvn_licm_ivsr_shared(
         // is_loop_invariant(base) — loop-VARIANT bases (the historical matmul
         // address-doubling bug) are skipped, so the pointer recurrence can
         // never compound with a moving base. Full battery verified with the
-        // pass forced ON. Opt-in (CCC_IVSR=1) because gzip measured slightly
-        // negative: -6 +1.25% (faster 2/9), -9 +0.17% (faster 3/9).
+        // pass forced ON. The overlap guard now excludes nested-loop cases
+        // that previously miscompiled matrix-style code, and the safe pass
+        // reduces redundant induction casts in disjoint array loops. Keep
+        // CCC_NO_IVSR=1 as a targeted diagnostic escape hatch.
         if run_ivsr {
             let n = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
             if n > 0 {
@@ -673,7 +675,7 @@ macro_rules! preloop_dump {
             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
             let run_ivsr = iter == 0
-                && std::env::var("CCC_IVSR").is_ok()
+                && std::env::var("CCC_NO_IVSR").is_err()
                 && !disabled.contains("ivsr");
 
             if run_gvn || run_licm || run_ivsr {

@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: Benchmarks
-description: LCCC vs CCC vs GCC — methodology, results, and interpretation.
+description: LCCC generated-code benchmark methodology, artifacts, and results.
 prev_page:
   title: Optimization Passes
   url: /docs/optimization-passes
@@ -12,9 +12,97 @@ next_page:
 
 # Benchmarks
 {:.doc-subtitle}
-Six micro-benchmarks targeting different bottlenecks. All measured with best-of-5 wall-clock time.
+A generated-code laboratory: deterministic synthetic tests, workload-derived
+kernels, assembly capture, and controlled comparison against reference
+compilers.
 
-## Test Environment
+## Current benchmark policy
+
+The canonical runner is
+[`tests/benchmark/run_benchmarks.py`](../tests/benchmark/run_benchmarks.py).
+It is intentionally stricter than the former best-of-*N* wall-clock script:
+
+- it checks deterministic output equivalence before interpreting a speed result;
+- it pins children to one allowed CPU where `taskset` permits it;
+- it uses excluded warm-ups, then runs **randomized compiler order in every
+  paired round** to reduce drift/thermal/order bias;
+- it reports medians, raw samples, coefficient of variation, MAD outliers
+  (without silently deleting them), and paired bootstrap intervals;
+- it captures compiler commands, source digests, OS/CPU/governor/swap metadata,
+  and optionally binaries, disassembly, section sizes, and JSON evidence;
+- it emits an LCCC/GCC/Clang/ICX competition matrix when those reference
+  compilers are present, including LCCC versus the fastest available reference;
+  and
+- it probes PMU availability once.  A VM with no usable PMU is explicitly
+  labelled *screening evidence*, never a microarchitectural performance claim.
+
+The runner compares LCCC and GCC by default and includes Clang/ICX when they
+are installed.  It uses the same explicit code-generation flag for every
+compiler (`-O2` by default); `-march=native` is opt-in rather than silently
+mixed into a baseline.
+
+Build the compiler itself under the research build policy (Rust opt-level 1,
+exactly two Cargo jobs) with:
+
+```bash
+./scripts/build_lccc_o1_j2.sh
+```
+
+The script reports active swap.  The runner automatically chooses the writable
+filesystem with the most free space among the repository, `/var/tmp`, and
+`/tmp`; override it with `--work-dir` when needed.
+
+## Workload-derived kernels
+
+The suite now includes six small, self-contained extracts selected from the
+package recipes in [`ms178/archpkgbuilds`](https://github.com/ms178/archpkgbuilds).
+They deliberately bridge algorithm microbenchmarks and whole-package runs;
+they are not substitutes for full gzip, zlib-ng, Expat, SQLite, kernel, or
+glibc workload measurements.
+
+| ID | Upstream-derived hot path | Principal codegen questions |
+|---|---|---|
+| `gzip_crc32` | GNU gzip 1.14 scalar CRC-32 lookup loop | indexed loads, recurrence latency, shifts |
+| `zlib_ng_adler32` | zlib-ng 2.3.3 generic Adler-32 | unrolling, modulo lowering, register pressure |
+| `expat_xml_scan` | Expat 2.8.2 UTF-8 name tokenizer specialization | inlining, branches, pointer induction |
+| `sqlite_varint` | SQLite 3.53.4 1–9 byte varint decoder | branch layout, shifts, common-subexpression reuse |
+| `linux_find_bit` | Linux 6.18.42 sparse `find_next_andnot_bit` | bit-scan selection, load scheduling, loop layout |
+| `glibc_memcmp` | glibc pinned aligned-word `memcmp` path | word loads, early exits, byte ordering |
+
+Each file names its source license and links to
+[`WORKLOAD_PROVENANCE.md`](../tests/benchmark/WORKLOAD_PROVENANCE.md), which
+records the package selector, exact source-file digest, adaptation boundary,
+and archive-integrity observations.  The first evidence-backed candidate is
+recorded in [`hotspots/`](../hotspots/README.md), rather than being mistaken
+for a proven optimization.
+
+### Reproducible screening run
+
+```bash
+# All available reference compilers; default 15 paired timed rounds.
+python3 tests/benchmark/run_benchmarks.py
+
+# A targeted, inspectable experiment.
+python3 tests/benchmark/run_benchmarks.py \
+  --only gzip_crc32,sqlite_varint,expat_xml_scan \
+  --compilers lccc,gcc --reps 21 --warmup 2 --cpu auto \
+  --artifact-dir results/workload-screen/artifacts \
+  --json results/workload-screen/results.json \
+  --markdown results/workload-screen/report.md
+```
+
+For bare-metal Raptor Lake decisions, retain the same JSON/assembly artifacts
+and add PMU evidence (`cycles`, `instructions`, IPC, branches, cache/TLB and
+Top-Down metrics) in a controlled affinity/governor/thermal environment.
+
+## Historical snapshot (not current evidence)
+
+The material below documents an earlier six-microbenchmark report.  Its
+best-of-five figures and claims must not be compared to the current expanded
+suite or used as current performance evidence without rerunning the source and
+recording the new artifact bundle.
+
+### Test Environment
 
 | Item | Value |
 |------|-------|
@@ -26,7 +114,7 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 | **Timing** | `time.perf_counter()` wall clock, 7 reps, best taken |
 | **Date** | 2026-04-05 |
 
-## Results
+### Results
 
 | Benchmark | LCCC | GCC -O2 | LCCC/GCC |
 |-----------|-----:|--------:|:--------:|
@@ -40,13 +128,13 @@ Six micro-benchmarks targeting different bottlenecks. All measured with best-of-
 
 All outputs are byte-identical to GCC's.
 
-## Real-World: SQLite 3.45
+### Real-World: SQLite 3.45
 
 LCCC compiles and fully runs the SQLite amalgamation (260K lines) with **all optimization passes active** — no disabled passes or flags needed. All core SQL operations work correctly. 36+ correctness bugs were fixed across the peephole optimizer, GVN, vectorizer, register allocator, stack layout, and codegen. 18/18 compatibility tests pass.
 
-## Benchmark Descriptions
+### Benchmark Descriptions
 
-### `01_arith_loop` — Register Pressure + Phi Register Coalescing + Multiply ILP
+#### `01_arith_loop` — Register Pressure + Phi Register Coalescing + Multiply ILP
 
 ```c
 // 32 local int variables, all updated every loop iteration, 10M iterations
@@ -69,7 +157,7 @@ int arith_loop(int n) {
 
 **LCCC vs GCC: 1.0× (parity).** LCCC generates 109 loop body instructions vs GCC's 125, but GCC keeps ~14 of 32 variables in registers (vs LCCC's ~11) due to its unified rax/rcx/rdx usage. The 3-channel multiply ILP compensates by fully saturating the multiply port.
 
-### `02_fib` — Recursive Calls
+#### `02_fib` — Recursive Calls
 
 ```c
 long fib(int n) {
@@ -85,7 +173,7 @@ long fib(int n) {
 
 **Note:** This is a synthetic benchmark. No production code uses naive recursive Fibonacci. The optimization demonstrates LCCC's pattern-matching capabilities but should not be interpreted as "LCCC is faster than GCC" in general — GCC wins on all other benchmarks.
 
-### `03_matmul` — Floating Point + Cache + AVX2 Vectorization
+#### `03_matmul` — Floating Point + Cache + AVX2 Vectorization
 
 ```c
 void matmul(void) {
@@ -110,7 +198,7 @@ void matmul(void) {
 
 Remaining gap (10 vs 7 instructions): 2 `leaq` instructions (GCC uses inline SIB addressing), 2 redundant sign-extensions (needs I64 IV widening), 1 loop counter instruction.
 
-### `04_qsort` — Library Calls
+#### `04_qsort` — Library Calls
 
 ```c
 qsort(arr, N, sizeof(int), cmp);
@@ -122,7 +210,7 @@ qsort(arr, N, sizeof(int), cmp);
 
 **LCCC vs GCC:** 1.13× slower. Close to parity because libc does the work.
 
-### `05_sieve` — Memory Writes + Inner Loop
+#### `05_sieve` — Memory Writes + Inner Loop
 
 ```c
 for (int i = 2; i*i <= N; i++)
@@ -141,7 +229,7 @@ for (int i = 2; i*i <= N; i++)
 
 Remaining timing gap (0.07s vs 0.06s) is from outer loop overhead and the prime-counting loop.
 
-### `06_reduction` — Reduction Vectorization (NEW)
+#### `06_reduction` — Reduction Vectorization (NEW)
 
 ```c
 double sum_array(double *arr, int n) {
@@ -174,7 +262,7 @@ vaddsd (%rdi), %xmm0, %xmm0         # Scalar add
 vaddsd -8(%rdi), %xmm0, %xmm0       # Scalar add (unrolled)
 ```
 
-### `07_tce_sum` — Tail-Call Elimination
+#### `07_tce_sum` — Tail-Call Elimination
 
 ```c
 static long sum(int n, long acc) {
@@ -190,20 +278,17 @@ static long sum(int n, long acc) {
 
 **LCCC vs GCC:** ≈ equal. Both emit a 3-instruction counted loop — LCCC's TCE matches GCC's output here.
 
-## Running the Benchmarks
+### Historical commands
+
+The former `lccc-improvements/benchmarks/bench.py` script is retained as an
+archive, but it is not the canonical measurement path.  Use the current runner
+and keep its JSON plus assembly artifact directory with every performance
+claim.  To manually inspect a single generated binary:
 
 ```bash
-# Build LCCC
-cargo build --release
-
-# Run full suite (requires upstream CCC at ../ccc-upstream or adjust paths)
-python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md
-
-# Run a single benchmark, more reps
-python3 lccc-improvements/benchmarks/bench.py --bench 01_arith_loop --reps 20
-
-# Compile a benchmark manually for disassembly comparison
-GCC_INC="-I/usr/lib/gcc/x86_64-linux-gnu/$(gcc -dumpversion)/include"
-./target/release/ccc $GCC_INC -O2 -o /tmp/arith_lccc lccc-improvements/benchmarks/bench/01_arith_loop.c
-objdump -d /tmp/arith_lccc | grep -A 100 "arith_loop"
+./scripts/build_lccc_o1_j2.sh
+GCC_INC="$(gcc -print-file-name=include)"
+./target/release/lccc -I"$GCC_INC" -O2 \
+  -o /tmp/sqlite_varint_lccc tests/benchmark/programs/sqlite_varint.c
+objdump -drwC /tmp/sqlite_varint_lccc | less
 ```

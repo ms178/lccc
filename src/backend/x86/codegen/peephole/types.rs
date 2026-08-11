@@ -599,11 +599,18 @@ pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
         && (s.starts_with("div") || s.starts_with("idiv") || s.starts_with("mul")) {
             return 0; // rax family (also rdx, but we track rax as primary)
         }
-    // Two-operand instructions: last operand is destination
-    if let Some(comma_pos) = memrchr(b',', b) {
+    // For AT&T syntax the final *top-level* operand is the destination.  A
+    // raw last-comma search is unsound for SIB memory operands such as
+    // `movb $0, (%rdx,%r8)`: it mistakes `%r8)` for a destination register.
+    // That corrupts dead-register analysis after a LEA→SIB rewrite and can
+    // remove the live index producer.  Ignore commas nested in parentheses.
+    if let Some(comma_pos) = last_top_level_comma(b) {
         let after_comma = &s[comma_pos + 1..];
         let trimmed = after_comma.trim();
-        return register_family(trimmed).unwrap_or(REG_NONE);
+        if !trimmed.starts_with('%') {
+            return REG_NONE;
+        }
+        return register_family_fast(trimmed);
     }
     // Single-operand instructions that modify their operand in-place:
     //   inc, dec, not, neg    (arithmetic/logic)
@@ -638,6 +645,25 @@ pub(super) fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Find the last comma that separates operands rather than SIB address fields.
+/// x86 AT&T memory operands contain commas inside balanced parentheses, so a
+/// conventional `memrchr(',')` cannot be used to determine an instruction's
+/// destination operand.
+#[inline]
+fn last_top_level_comma(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0u32;
+    let mut last = None;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => last = Some(idx),
+            _ => {}
+        }
+    }
+    last
 }
 
 /// Fast i32 parse for stack offsets like "-8", "-24", "0", etc.
