@@ -1,6 +1,6 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
+use crate::ir::reexports::{IrBinOp, IrCmpOp, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -401,6 +401,96 @@ impl X86Codegen {
                     }
                 }
             }
+            // ── Compare-replay set ───────────────────────────────────────────
+            // Cmps whose single use is a Select (or the block-terminator
+            // CondBranch) but NOT adjacent to the Cmp cannot use the pending-
+            // flag handshake (an intervening ALU instruction — e.g. the
+            // `m - WSIZE` sub in fill_window's prev[] loop — clobbers the
+            // flags). For those, the Cmp skips setcc/movzbl entirely and the
+            // consumer re-emits `cmp` from the recorded operands, then uses
+            // cmovcc/jcc directly. This removes the
+            // setcc/movzbl + testq (3 instructions) per select in hot loops.
+            //
+            // Soundness: the Cmp dest has exactly one use (the consumer), the
+            // operands are pure SSA values (side-effect-free re-materialization
+            // at the consumer; the accumulator cache is invalidated first so a
+            // value that only lived in %rax is reloaded from its slot), and the
+            // replayed cmp is emitted immediately before the cmov/jcc with no
+            // intervening flag mutation.
+            let mut cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
+                FxHashMap::default();
+            for block in &func.blocks {
+                let insts = &block.instructions;
+                for (ii, inst) in insts.iter().enumerate() {
+                    let (cdest, cop, clhs, crhs, cty) = match inst {
+                        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+                            (dest.0, *op, lhs.clone(), rhs.clone(), *ty)
+                        }
+                        _ => continue,
+                    };
+                    if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    // Integer comparisons only: float comparisons use ucomiss/
+                    // ucomisd with a different flag contract (PF for NaN, the
+                    // setnp/sete dance) — replaying them as integer cmps
+                    // produces wrong selects (simd_sse2_arith regression).
+                    if !cty.is_integer() {
+                        continue;
+                    }
+                    // Replay soundness: the operands are re-materialized at the
+                    // consumer via operand_to_rax, which requires a STABLE
+                    // location (register assignment or stack slot). Values with
+                    // neither (immediately-consumed / slot-eliminated) reload
+                    // as zero — a wrong compare (simd_sse2_arith saturating-add
+                    // check: want = s > 255 ? 255 : s got 0x7f). Constants are
+                    // always re-materializable.
+                    let op_has_location = |op: &Operand| -> bool {
+                        match op {
+                            Operand::Const(_) => true,
+                            Operand::Value(v) => {
+                                self.reg_assignments.contains_key(&v.0)
+                                    || self.state.get_slot(v.0).is_some()
+                            }
+                        }
+                    };
+                    if !op_has_location(&clhs) || !op_has_location(&crhs) {
+                        continue;
+                    }
+                    // Already handled by the (better) adjacent fusion.
+                    if fused.contains_key(&cdest) {
+                        continue;
+                    }
+                    // The single use must be a Select in this block or the
+                    // block-terminator CondBranch.
+                    let mut used_by_select = false;
+                    for (jj, other) in insts.iter().enumerate() {
+                        if jj == ii {
+                            continue;
+                        }
+                        if let Instruction::Select { cond: Operand::Value(v), .. } = other {
+                            if v.0 == cdest {
+                                used_by_select = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !used_by_select {
+                        if let Terminator::CondBranch { cond: Operand::Value(v), .. } =
+                            &block.terminator
+                        {
+                            if v.0 == cdest {
+                                used_by_select = true;
+                            }
+                        }
+                    }
+                    if used_by_select {
+                        cmp_replay.insert(cdest, (cop, clhs, crhs, cty));
+                    }
+                }
+            }
+            self.cmp_replay = cmp_replay;
+
             self.fused_cmp_dests = fused;
             self.value_use_counts = use_counts;
 

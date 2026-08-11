@@ -325,6 +325,12 @@ pub struct X86Codegen {
     /// materialization (setcc/movzbl/store) and the consumer uses the live
     /// flags directly (jcc/cmovcc).
     pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
+    /// Cmp destinations eligible for compare-replay: the Cmp's single use is
+    /// a Select or CondBranch that is NOT adjacent to the Cmp (flags would be
+    /// clobbered in between), so the consumer re-emits `cmp` from the
+    /// recorded operands and uses cmovcc/jcc directly instead of testing the
+    /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
+    pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
     /// Number of uses of each SSA value (instructions + terminators).
     pub(super) value_use_counts: FxHashMap<u32, u32>,
     /// W2 Load->Cast fold (2026-08-10): load dest value id -> the register of
@@ -478,6 +484,7 @@ impl X86Codegen {
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
+            cmp_replay: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
             load_cast_fold: FxHashMap::default(),
             folded_cast_dests: FxHashSet::default(),
@@ -3071,8 +3078,15 @@ impl ArchCodegen for X86Codegen {
         match inst {
             crate::ir::reexports::Instruction::Select { .. } => return false,
             crate::ir::reexports::Instruction::Cmp { dest, .. }
-                if self.fused_cmp_dests.contains_key(&dest.0) =>
+                if self.fused_cmp_dests.contains_key(&dest.0)
+                    || self.cmp_replay.contains_key(&dest.0) =>
             {
+                // Fused candidates keep their flags for the adjacent consumer;
+                // REPLAY candidates are emitted by the mature path's Cmp
+                // emitter, which skips the boolean materialization entirely
+                // (the consumer re-emits the compare). Sending either through
+                // MachInst would materialize setcc/movzbl AND leave the
+                // consumer to replay — a doubled compare per select.
                 return false;
             }
             _ => {}

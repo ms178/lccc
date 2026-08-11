@@ -437,7 +437,11 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         if let Some(name) = direct_name {
             if self.state.needs_plt(name) {
-                self.state.emit_fmt(format_args!("    call {}@PLT", name));
+                // Versioned symbols (`printf@GLIBC_2.2.5`, bound by .symver)
+                // must use the base name in @PLT references — GAS 2.47 rejects
+                // `sym@ver@PLT` (GAS-oracle). The linker resolves the version.
+                let n = name.split('@').next().unwrap_or(name);
+                self.state.emit_fmt(format_args!("    call {}@PLT", n));
             } else {
                 self.state.out.emit_call(name);
             }

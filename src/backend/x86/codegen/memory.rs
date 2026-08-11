@@ -916,8 +916,16 @@ impl X86Codegen {
                             if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
                                 if !is_xmm_reg(d_reg) {
                                     // movslq/movsbq/movswq need 64-bit dest.
-                                    // movl/movzbl/movzwl use 32-bit dest (implicit zero-extend).
-                                    let d_name = if matches!(ty, IrType::U32 | IrType::F32) {
+                                    // movl/movzbl/movzwl use 32-bit dest (implicit
+                                    // zero-extend). Keyed on the OPCODE, not the
+                                    // IR type: a U8 load is `movzbl` → 32-bit dest
+                                    // (`%r11d`), and emitting `%r11` is rejected by
+                                    // GNU as (GAS oracle: "incorrect register %r11
+                                    // used with l suffix").
+                                    let load_instr = Self::mov_load_for_type(ty);
+                                    let use_32bit_dest =
+                                        matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                                    let d_name = if use_32bit_dest {
                                         phys_reg_name_32(d_reg)
                                     } else {
                                         phys_reg_name(d_reg)
@@ -970,7 +978,14 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_typed_load_from_slot_impl(&mut self, instr: &'static str, slot: StackSlot) {
-        let dest_reg = if instr == "movl" { "%eax" } else { "%rax" };
+        // movl/movzbl/movzwl write a 32-bit register (implicit zero-extend);
+        // emitting %rax is rejected by GAS for movzbl (GAS-oracle:
+        // "incorrect register %rax used with l suffix").
+        let dest_reg = if matches!(instr, "movl" | "movzbl" | "movzwl") {
+            "%eax"
+        } else {
+            "%rax"
+        };
         let out = &mut self.state.out;
         out.write_str("    ");
         out.write_str(instr);
@@ -1015,7 +1030,13 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_typed_load_indirect_impl(&mut self, instr: &'static str) {
-        let dest_reg = if instr == "movl" { "%eax" } else { "%rax" };
+        // movl/movzbl/movzwl write a 32-bit register (implicit zero-extend);
+        // %rax for movzbl/movzwl is rejected by GAS (GAS-oracle).
+        let dest_reg = if matches!(instr, "movl" | "movzbl" | "movzwl") {
+            "%eax"
+        } else {
+            "%rax"
+        };
         self.state.emit_fmt(format_args!("    {} (%rcx), {}", instr, dest_reg));
     }
 

@@ -58,6 +58,18 @@ impl super::InstructionEncoder {
 
     /// Emit REX prefix for a memory operand where 'reg' is the reg field.
     pub(crate) fn emit_rex_rm(&mut self, size: u8, reg: &str, mem: &MemoryOperand) {
+        // 32-bit address-size override (0x67): required whenever the memory
+        // operand's base or index is a 32-bit register (e.g.
+        // `leal (%edi,%edi,2),%edi`). Emitted BEFORE the REX byte (prefix
+        // order: segment, 66/67, REX, opcode). The old code silently dropped
+        // it — the address was encoded as 64-bit, which GAS-oracle caught as
+        // a one-byte divergence from GNU as (and is semantically wrong for
+        // addresses >= 4 GiB).
+        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
+        if addr32 {
+            self.bytes.push(0x67);
+        }
         let w = size == 8;
         let r = needs_rex_ext(reg);
         let b = mem.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name));
