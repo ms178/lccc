@@ -260,8 +260,44 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
                 }
             }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                // Stack slot path: load directly from memory to XMM (no GPR intermediate).
+                // This is always safe because stack slots are stable locations.
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let mov = if ty == IrType::F32 { "movss" } else { "movsd" };
+                    let sr = self.slot_ref(slot.0);
+                    self.state.emit_fmt(format_args!("    {} {}, %{}", mov, sr, xmm));
+                    return;
+                }
+                // Reg cache check for accumulator (value already in %rax)
+                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                    let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
+                    let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
+                    if ty == IrType::F32 {
+                        self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+                    }
+                    return;
+                }
+                // Fallback: GPR → XMM path (handles GPR register-allocated values
+                // and any other case not covered above)
+                let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
+                let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
+                if gpr == "rax" {
+                    self.operand_to_rax(op);
+                } else {
+                    self.operand_to_rcx(op);
+                }
+                if ty == IrType::F32 {
+                    self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
+                } else {
+                    self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+                }
+            }
             _ => {
-                // Fall back to GPR → XMM path
+                // Other operand kinds (e.g. Const::I64 for bitcast): GPR → XMM
                 let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
                 let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
                 if gpr == "rax" {
