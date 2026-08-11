@@ -26,7 +26,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::instruction::Instruction;
-use crate::ir::reexports::{IrFunction, IrModule, Value};
+use crate::ir::reexports::{IrFunction, IrModule, Operand, Value};
 
 /// Run the vector-temp promotion across all functions.
 pub(crate) fn promote_vector_temps(module: &mut IrModule) -> usize {
@@ -87,6 +87,12 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
                         if uses.get(&tmp) == Some(&2)
                             && alloca_sizes.get(&tmp) == Some(size)
                             && alloca_sizes.contains_key(&dest.0)
+                            && no_var_access_between(
+                                &block.instructions,
+                                intr_idx + 1,
+                                ii,
+                                dest.0,
+                            )
                         {
                             rewrites.push(Rewrite {
                                 block: bi,
@@ -150,6 +156,64 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
     }
 
     promoted
+}
+
+/// Soundness window check for temp promotion.
+///
+/// The rewrite redirects the Intrinsic's store from `%tmp` to `%var` and drops
+/// the trailing `Memcpy(dest=%var, src=%tmp)`. This moves the store to `%var`
+/// EARLIER (from the Memcpy position to the Intrinsic position), so it is only
+/// valid when nothing reads or writes `%var` in between: a read would observe
+/// the new value too early, and a write would clobber the promoted value
+/// before the copy point, changing what later code sees.
+///
+/// Real bug fixed: zlib-ng-style dual-loop adler32 code has
+/// `vs1 = sad+vs1; ...; vs1_0 = vs1` — the memcpy for `vs1_0 = vs1` was
+/// promoted, redirecting the `vs1` update into `vs1_0`'s slot. In the wide
+/// loop the interleaved `vs3 = vs1_0 + vs3` happens to read the slot before
+/// the update (safe by accident); in the narrow loop it reads AFTER the
+/// redirected store (wrong value → vector_defer_multidef_slot regression).
+fn no_var_access_between(
+    insts: &[Instruction],
+    from: usize,
+    to: usize,
+    var: u32,
+) -> bool {
+    for inst in &insts[from.min(insts.len())..to.min(insts.len())] {
+        // Any operand/value-ref use of the slot (args, Load/Store ptr, GEP
+        // base, Intrinsic dest_ptr, Memcpy src, terminator operands are after
+        // `to` so not included here).
+        if inst.used_values().contains(&var) {
+            return false;
+        }
+        // Any SSA write of the variable.
+        if inst.dest().map(|d| d.0) == Some(var) {
+            return false;
+        }
+        // Any memory write through the slot (Intrinsic dest_ptr is already
+        // covered by used_values, but be explicit for Store/Memcpy/atomics).
+        match inst {
+            Instruction::Store { ptr, .. } => {
+                if ptr.0 == var {
+                    return false;
+                }
+            }
+            Instruction::AtomicStore { ptr, .. } => {
+                if let Operand::Value(v) = ptr {
+                    if v.0 == var {
+                        return false;
+                    }
+                }
+            }
+            Instruction::Memcpy { dest, .. } => {
+                if dest.0 == var {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Fuse vector load intrinsics into their single consumer.

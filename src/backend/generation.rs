@@ -820,6 +820,29 @@ pub fn generate_module(
         }
     }
 
+    // Numeric `.set sym, <number>` directives in top-level asm define ABSOLUTE
+    // symbols (glibc localeinfo.h _NL_CURRENT_DEFINE). Their addresses are
+    // link-time constants and must never go through the GOT.
+    for asm_str in &module.toplevel_asm {
+        for line in asm_str.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix(".set ") {
+                let mut it = rest.splitn(2, ',');
+                if let (Some(sym), Some(val)) = (it.next(), it.next()) {
+                    let sym = sym.trim();
+                    let val = val.trim();
+                    if !sym.is_empty()
+                        && val.chars().next().map(|c| c.is_ascii_digit() || c == '-' || c == '+')
+                            .unwrap_or(false)
+                        && val.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == 'x' || c.is_ascii_hexdigit())
+                    {
+                        cg.state().absolute_symbols.insert(sym.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let referenced_symbols = collect_referenced_symbols(module);
     emit_extern_visibility_directives(cg, module, &referenced_symbols);
     emit_functions_and_sections(cg, module, source_mgr, &file_table);
@@ -1728,12 +1751,19 @@ pub(super) fn generate_instruction(
             // not symbol(%rip).
             let is_dead = dead_global_addrs.contains(&dest.0)
                 && !cg.state_ref().needs_got_for_addr(name)
-                && !cg.state_ref().tls_symbols.contains(name.as_str());
+                && !cg.state_ref().tls_symbols.contains(name.as_str())
+                && !cg.state_ref().absolute_symbols.contains(name.as_str());
             if !is_dead {
                 if cg.state_ref().tls_symbols.contains(name.as_str()) {
                     cg.emit_tls_global_addr(dest, name);
-                } else if cg.state_ref().code_model_kernel && !global_addr_ptr_set.contains(&dest.0)
+                } else if cg.state_ref().absolute_symbols.contains(name.as_str())
+                    || (cg.state_ref().code_model_kernel && !global_addr_ptr_set.contains(&dest.0))
                 {
+                    // Absolute symbols (`.set sym, <number>` markers such as
+                    // glibc's _NL_CURRENT_DEFINE) are link-time constants: emit
+                    // `movq $sym` directly. A GOTPCREL reference would need a
+                    // GOT entry the absolute symbol cannot provide
+                    // (glibc_abs_symbol regression under the PIC default).
                     cg.emit_global_addr_absolute(dest, name);
                 } else {
                     cg.emit_global_addr(dest, name);

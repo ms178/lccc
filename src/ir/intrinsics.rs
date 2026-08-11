@@ -460,6 +460,70 @@ pub enum IntrinsicOp {
 }
 
 impl IntrinsicOp {
+    /// Width in bytes of the vector/XMM result produced by this intrinsic:
+    /// 128-bit SSE results → Some(16), 256-bit AVX/AVX2 results → Some(32).
+    /// Returns None for ops whose `dest` is scalar (GPR/x87), that produce no
+    /// value (fences, stores, control), or that are handled by the F128 path.
+    ///
+    /// NOTE: ops whose result is a SCALAR must never be listed here even if
+    /// their name sounds vector-ish (HorizontalAdd*/VecHorizontalAdd* return
+    /// I32/F64 scalars; Pmovmskb*/Cvtsi128Si*/Pextr*/Crc32* are scalar too).
+    /// Misclassifying them as vectors corrupts scalar values (volatile_access
+    /// regression: sum reloaded via leaq instead of movq).
+    ///
+    /// This is the single authority for "does this intrinsic write a vector
+    /// home slot" — used by the stack-layout pre-scan to protect user-level
+    /// SSE/AVX intrinsic results from block-local slot reuse. Previously only
+    /// the auto-vectorizer's internal Vec* ops were recognized, so real code
+    /// (zlib-ng adler32_ssse3, _mm256_mul_ps chains, ...) got 8-byte slots
+    /// with 16/32-byte stores overflowing into neighbours and reusable slots
+    /// being read back after corruption (vector_defer_multidef_slot and
+    /// simd_avx2_256 regressions).
+    pub fn vector_result_width(&self) -> Option<u32> {
+        use IntrinsicOp::*;
+        match self {
+            // ---- 256-bit AVX/AVX2 results ----
+            Loadu256 | Load256
+            | Paddb256 | Paddw256 | Paddd256 | Psubb256 | Psubw256 | Psubusw256
+            | Psadbw256 | Pmaddubsw256 | Pmaddwd256 | Pcmpeqb256 | Pcmpgtb256
+            | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
+            | Pminub256 | Pxor256 | Por256 | Pand256 | Psllidi256 | Psrlidi256
+            | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
+            | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256
+            | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
+            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
+            | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
+            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
+            | VecAddI32x8 | VecZeroF64x4 | VecZeroI32x8 => Some(32),
+            // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
+            Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
+            | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
+            | MulPs128 | AddPd128 | SubPd128 | MulPd128 | Pmuludq128
+            | Pmuldq128 | Pmulld128 | CastReinterpret128 | SetEpi8 | SetEpi16
+            | SetEpi32 | Pslldqi128 | Psrldqi128 | Psllqi128 | Psrlqi128
+            | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
+            | Psubusw128 | Psadbw128 | Pmullw128 | Pmaddubsw128 | Phaddw128
+            | Phaddd128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
+            | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pmovzxbw128
+            | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
+            | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
+            | Psradi128 | Pslldi128 | Psrldi128 | Paddd128 | Psubd128
+            | Packssdw128 | Packsswb128 | Packuswb128 | Punpcklbw128
+            | Punpckhbw128 | Punpcklwd128 | Punpckhwd128 | Pinsrw128
+            | Cvtsi32Si128 | Pshuflw128 | Pshufhw128 | Pinsrd128 | Pinsrb128
+            | Pinsrq128 | Cast256to128 | Dpbusd128 | Dpbssd128 | Dpwuud128
+            | Gf2p8mulb128 | Aesenc128 | Aesenclast128 | Aesdec128
+            | Aesdeclast128 | Aesimc128 | Aeskeygenassist128 | Pclmulqdq128
+            | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
+            | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
+            | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
+            => Some(16),
+            // Everything else produces a scalar GPR/x87 result, no result, or
+            // is an F128 helper handled by the dedicated f128 slot path.
+            _ => None,
+        }
+    }
+
     /// Returns true if this intrinsic is a pure function (no side effects, result depends
     /// only on inputs). Pure intrinsics can be dead-code eliminated if their result is unused.
     pub fn is_pure(&self) -> bool {

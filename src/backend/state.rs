@@ -140,6 +140,12 @@ pub struct CodegenState {
     /// These should be addressed via leaq (to get stack slot address) instead of movq
     /// (which would load scalar bytes), because they hold 128/256-bit vector data.
     pub vector_values: FxHashSet<u32>,
+    /// 128-bit (SSE-class) vector values. Same addressing rules as
+    /// `vector_values`, but their home slots are 16 bytes wide rather than 32.
+    /// Populated together with `vector_values` by the stack-layout pre-scan for
+    /// every user-level SSE/AVX intrinsic result (see
+    /// `IntrinsicOp::vector_result_width`).
+    pub vector128_values: FxHashSet<u32>,
     /// Vector-register peephole: the stack slot offset that the last
     /// `avx_store_dest`/`sse_store_dest` wrote from %ymm0/%xmm0, and whether
     /// that register still provably holds the value. When the very next vector
@@ -196,6 +202,10 @@ pub struct CodegenState {
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
+    /// Symbols defined by numeric `.set sym, <number>` directives in top-level
+    /// asm (glibc-style absolute markers). Their address is a link-time
+    /// constant: emitted as `movq $sym`, never via GOT.
+    pub absolute_symbols: FxHashSet<String>,
     /// Set of symbol names that are thread-local (_Thread_local / __thread).
     /// These require TLS-specific access patterns (e.g., %fs:x@TPOFF on x86-64).
     pub tls_symbols: FxHashSet<String>,
@@ -360,6 +370,7 @@ impl CodegenState {
             i128_values: FxHashSet::default(),
             wide_values: FxHashSet::default(),
             vector_values: FxHashSet::default(),
+            vector128_values: FxHashSet::default(),
             vec_last_store_slot: None,
             vec_last_store_val: None,
             vec_last_store_reg: false,
@@ -374,6 +385,7 @@ impl CodegenState {
             label_counter: 0,
             pic_mode: false,
             local_symbols: FxHashSet::default(),
+            absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
             has_dyn_alloca: false,
             omit_frame_pointer: false,
@@ -521,6 +533,19 @@ impl CodegenState {
         self.sse_last_store_val = None;
         self.sse_last_store_reg = false;
         self.sse_last_store_reg_name = None;
+        // Per-function vector classification sets MUST be cleared here. Value
+        // IDs are function-local; leaving these populated leaks classifications
+        // from previously compiled functions into the next one (a scalar value
+        // in function B colliding with a vector intrinsic result ID from
+        // function A is then copied via the vector path, emitting LEA instead
+        // of LOAD — adler32-style miscompile: vs2 initialized with the address
+        // of its slot).
+        self.vector_values.clear();
+        self.vector128_values.clear();
+        self.protected_slot_values.clear();
+        self.vector_defer_values.clear();
+        self.pending_vec_store = None;
+        self.vec_live_regs.clear();
         self.uses_sret = false;
         self.next_block_label = None;
     }

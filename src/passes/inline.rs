@@ -2416,6 +2416,14 @@ fn inline_call_site(
     // The merge block has the highest ID we assigned.
     *global_max_block_id = merge_block_id.0;
 
+    // The caller's label namespace must be advanced past every block we just
+    // cloned. Without this, a later pass that allocates fresh block labels
+    // from func.next_label (vectorizer, unroller, ...) reuses the inlined
+    // blocks' labels, corrupting CFG edges — observed as an infinite
+    // self-loop / out-of-bounds read in the lea_sib_fold -O2 regression
+    // (exit CondBranch retargeted onto the loop header).
+    caller.next_label = std::cmp::max(caller.next_label, merge_block_id.0 + 1);
+
     true
 }
 

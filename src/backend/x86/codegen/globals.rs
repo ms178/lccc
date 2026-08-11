@@ -30,7 +30,13 @@ impl X86Codegen {
     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
         // TLS requires %rax for the fs:0 base — can't fully avoid accumulator.
         // But when dest has a register, we can skip the final store_rax_to relay.
-        if self.state.pic_mode {
+        // TLS model selection: LOCAL symbols (static/visibility-hidden TLS, the
+        // common `static __thread` case) use the Local-Exec model — a direct
+        // %fs:offset with NO GOT entry — even under -fPIC, exactly like GCC.
+        // Only external TLS symbols need the GOT-based General-Dynamic sequence
+        // in PIC mode (globals_tls regression: static __thread read garbage
+        // when GOTTPOFF was forced for a local symbol).
+        if self.state.pic_mode && !self.state.local_symbols.contains(name) {
             self.state.emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
             self.state.emit("    addq %fs:0, %rax");
         } else {

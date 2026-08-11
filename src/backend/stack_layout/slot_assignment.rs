@@ -354,18 +354,36 @@ fn classify_alloca(
 
     // Skip dead param allocas (still registered so backend recognizes them).
     if ctx.dead_param_allocas.contains(&dest.0) {
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead param", dest.0);
+        }
         return;
     }
 
     // Skip dead non-param allocas (never referenced by any instruction).
     if ctx.coalescable_allocas.dead.contains(&dest.0) {
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead (no recorded uses)", dest.0);
+        }
         return;
     }
 
     // Single-block allocas: use block-local coalescing (Tier 3).
     // Over-aligned allocas (> 16) are excluded because their alignment
     // padding complicates coalescing.
-    if effective_align <= 16 {
+    // Allocas whose single use-block is inside a LOOP are excluded too: the
+    // block-local region shares offsets across blocks assuming exclusive
+    // execution, but loop bodies re-enter, so a loop-carried alloca (written
+    // in iteration N, read in N+1) is clobbered by other values at the same
+    // offset (simd_avx2_256 / vector_defer_multidef_slot regressions). Loop
+    // allocas get permanent Tier-1 slots instead.
+    let use_block_in_loop = ctx
+        .coalescable_allocas
+        .single_block
+        .get(&dest.0)
+        .map(|&ub| ctx.block_loop_depth.get(ub).copied().unwrap_or(1) != 0)
+        .unwrap_or(false);
+    if effective_align <= 16 && !use_block_in_loop {
         if let Some(&use_block) = ctx.coalescable_allocas.single_block.get(&dest.0) {
             let alloca_size = raw_size + extra as i64;
             let alloca_align = align as i64;
@@ -430,13 +448,23 @@ fn classify_value(
         Some(IrType::F32)
     );
     let is_vector = state.vector_values.contains(&dest.0);
-    let slot_size: i64 = if is_vector {
+    let is_vector128 = state.vector128_values.contains(&dest.0);
+    let memcpy_width = ctx.memcpy_value_sizes.get(&dest.0).copied().unwrap_or(0) as i64;
+    let mut slot_size: i64 = if is_vector && !is_vector128 {
         32 // AVX2 256-bit vectors need 32 bytes
+    } else if is_vector128 {
+        16 // SSE 128-bit vectors need 16 bytes
     } else if is_i128 || is_f128 {
         16
     } else {
         8
     };
+    // A value that is a Memcpy dest/src must be at least as wide as the copy:
+    // struct-by-value temps otherwise get 8-byte slots that a 32-byte copy
+    // overflows (simd_avx2_256 mul_ps check corruption).
+    if memcpy_width > slot_size {
+        slot_size = memcpy_width;
+    }
 
     if is_i128 {
         state.i128_values.insert(dest.0);
@@ -451,11 +479,11 @@ fn classify_value(
         }
     }
 
-    // Vector values from Vec* intrinsics need protected stack slots to prevent
-    // slot reuse from corrupting vector data during reduction vectorization.
-    // The vector_values set is populated by the backend's intrinsic emitters
-    // when they encounter VecZero*, VecLoad*, VecAdd*, etc. operations.
-    if state.vector_values.contains(&dest.0) {
+    // Vector values (both the auto-vectorizer's Vec* ops and user-level
+    // SSE/AVX intrinsic results, see IntrinsicOp::vector_result_width) need
+    // protected stack slots to prevent slot reuse from corrupting vector data
+    // during reduction vectorization and real intrinsic chains.
+    if is_vector || is_vector128 {
         state.protected_slot_values.insert(dest.0);
     }
 
@@ -912,8 +940,14 @@ pub(super) fn finalize_deferred_slots(
         } else {
             non_local_space
         };
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!("[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}", aligned_nls, max_block_local_space, deferred_slots.len());
+        }
         for ds in deferred_slots {
             let (slot, _) = assign_slot(aligned_nls + ds.block_offset, ds.size, ds.align);
+            if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+                eprintln!("[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}", ds.dest_id, ds.block_offset, ds.size, ds.align, slot);
+            }
             state.value_locations.insert(ds.dest_id, StackSlot(slot));
         }
         aligned_nls + max_block_local_space
