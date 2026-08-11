@@ -712,6 +712,14 @@ impl Driver {
                         self.target = Target::I686;
                     }
                 }
+                "-m64" => {
+                    // 64-bit x86-64 target — the default, but GCC accepts it
+                    // explicitly and real build systems pass it (zlib-ng's
+                    // configure does). Accept as a no-op when already x86-64.
+                    if self.target != Target::X86_64 {
+                        self.target = Target::X86_64;
+                    }
+                }
                 "-mno-sse" | "-mno-sse2" => self.no_sse = true,
                 "-mno-mmx" | "-mno-3dnow" => {}
                 "-mno-avx2" => { self.enable_avx2=false; self.enable_avxvnni=false; self.enable_avxvnniint8=false; self.enable_avxvnniint16=false; }

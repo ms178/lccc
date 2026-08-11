@@ -37,6 +37,29 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
     let mut total = 0;
     for func in &mut module.functions {
         if func.is_declaration { continue; }
+
+        // Function-wide use counts. The intermediate `tmp` of a chain
+        //   memcpy tmp, src
+        //   memcpy dst, tmp
+        // must be referenced by NOTHING except those two memcpys (dest of the
+        // first, src of the second). In particular, uses of `tmp` in OTHER
+        // blocks (loop bodies reading the variable whose slot `tmp` holds)
+        // make the rewrite unsound: dropping the first memcpy would leave
+        // `tmp`'s slot stale for those readers (adler32 dual-loop
+        // miscompile: vs1's slot was never initialized/updated while the
+        // wide/narrow loops kept reading it).
+        let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                for v in inst.used_values() {
+                    *uses.entry(v).or_insert(0) += 1;
+                }
+            }
+            for v in block.terminator.used_values() {
+                *uses.entry(v).or_insert(0) += 1;
+            }
+        }
+
         for block in &mut func.blocks {
             let mut i = 0;
             while i < block.instructions.len() {
@@ -44,6 +67,12 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
                     _ => { i += 1; continue; }
                 };
+                // Soundness: `tmp` may be referenced only by this memcpy's
+                // dest and the chain consumer's src (2 uses total).
+                if uses.get(&tmp.0).copied().unwrap_or(0) != 2 {
+                    i += 1;
+                    continue;
+                }
                 let mut consumer = None;
                 let mut safe = true;
                 for j in (i + 1)..block.instructions.len() {

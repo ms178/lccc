@@ -327,7 +327,10 @@ impl Driver {
             shared_lib: false,
             nostdlib: false,
             relocatable: false,
-            pic: false,
+            pic: true, // x86-64 Linux default: PIE/PIC-safe codegen, matching
+                       // GCC's default (zlib-ng etc. compile shared objects
+                       // with -DPIC only and rely on the compiler default).
+                       // -fno-pic/-fno-PIE disables.
             force_includes: Vec::new(),
             function_return_thunk: false,
             indirect_branch_thunk: false,

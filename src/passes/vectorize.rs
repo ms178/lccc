@@ -1686,6 +1686,12 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
+    // Defensive: never trust func.next_label alone — some IR producers can
+    // leave it stale relative to the blocks actually present. Allocating
+    // below an existing label duplicates it and corrupts the CFG
+    // (lea_sib_fold -O2 self-loop regression).
+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
     let innermost_blocks: FxHashSet<usize> = [
@@ -2167,6 +2173,12 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
+    // Defensive: never trust func.next_label alone — some IR producers can
+    // leave it stale relative to the blocks actually present. Allocating
+    // below an existing label duplicates it and corrupts the CFG
+    // (lea_sib_fold -O2 self-loop regression).
+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
     // This prevents accidentally modifying comparisons or GEPs in outer loops.
@@ -2854,20 +2866,22 @@ fn insert_reduction_remainder_loop(
     func.blocks.push(remainder_latch_block);
 
     // Step 7: Replace uses of original scalar accumulator with remainder accumulator
-    // After vectorization, pattern.accumulator_phi in the header now holds a VECTOR value.
-    // The exit block and any blocks only reachable after the remainder loop should use
-    // sum_rem_phi (the scalar accumulator from the remainder loop) instead.
-    //
-    // We update the exit block since it's now only reachable from remainder_header.
+    // After vectorization, pattern.accumulator_phi in the header now holds a VECTOR
+    // value. EVERY use outside this loop must read the scalar remainder result
+    // sum_rem_phi instead. The former code only rewired the exit block: with
+    // several inlined reductions in one function the consumer (e.g. a printf
+    // argument) lives in a later block and kept reading the vector accumulator —
+    // emitted as LEA (vectors are addressed, not loaded), printing a stack
+    // address (lea_sib_fold -O2 wrong sum; --compare-gcc output mismatch).
     {
-        let exit_block = &mut func.blocks[pattern.exit_idx];
+        let acc_id = pattern.accumulator_phi.0;
         let mut updates = 0;
         if debug {
-            eprintln!("[VEC-RED]   Checking exit block for uses of SSA {} (vector accumulator)", pattern.accumulator_phi.0);
+            eprintln!("[VEC-RED]   Rewiring uses of SSA {} (vector accumulator) outside the loop", acc_id);
         }
 
         // Helper to replace SSA values in operands
-        let replace_in_operand = |op: &mut Operand, from: u32, to: Value| -> bool {
+        let mut replace_in_operand = |op: &mut Operand, from: u32, to: Value| -> bool {
             if let Operand::Value(v) = op {
                 if v.0 == from {
                     *v = to;
@@ -2877,55 +2891,69 @@ fn insert_reduction_remainder_loop(
             false
         };
 
-        // Update all uses of the accumulator phi in the exit block's instructions.
-        // The accumulator may be used in Copy, Store, BinOp, Call args, etc.
-        let acc_id = pattern.accumulator_phi.0;
-        for inst in &mut exit_block.instructions {
-            match inst {
-                Instruction::Copy { src, .. } => {
-                    if let Operand::Value(v) = src { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-                }
-                Instruction::Store { val, .. } => {
-                    if let Operand::Value(v) = val { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-                }
-                Instruction::BinOp { lhs, rhs, .. } => {
-                    if let Operand::Value(v) = lhs { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-                    if let Operand::Value(v) = rhs { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-                }
-                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-                    if let Operand::Value(v) = src { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
-                }
-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                    for a in &mut info.args {
-                        if let Operand::Value(v) = a { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+        for (bi, block) in func.blocks.iter_mut().enumerate() {
+            if pattern.loop_blocks.contains(&bi) {
+                continue; // the vector accumulator lives and is consumed here
+            }
+            for inst in &mut block.instructions {
+                match inst {
+                    Instruction::Copy { src, .. } => {
+                        if replace_in_operand(src, acc_id, sum_rem_phi) { updates += 1; }
                     }
-                }
-                Instruction::Phi { incoming, .. } => {
-                    for (op, _) in incoming {
-                        if let Operand::Value(v) = op { if v.0 == acc_id { *v = sum_rem_phi; updates += 1; } }
+                    Instruction::Store { val, .. } => {
+                        if replace_in_operand(val, acc_id, sum_rem_phi) { updates += 1; }
                     }
+                    Instruction::BinOp { lhs, rhs, .. } => {
+                        if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
+                    }
+                    Instruction::Cmp { lhs, rhs, .. } => {
+                        // Comparisons consuming the accumulator (e.g.
+                        // `if (s != 45)`) were missed by the exit-block-only
+                        // rewiring: a surviving Cmp operand kept the vector
+                        // accumulator, emitted as leaq (vectors are
+                        // addressed) — comparing a stack address instead of
+                        // the sum (regr_v2_reduction_two_sums regression).
+                        if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
+                    }
+                    Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+                        if replace_in_operand(src, acc_id, sum_rem_phi) { updates += 1; }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        for a in &mut info.args {
+                            if replace_in_operand(a, acc_id, sum_rem_phi) { updates += 1; }
+                        }
+                    }
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, _) in incoming {
+                            if replace_in_operand(op, acc_id, sum_rem_phi) { updates += 1; }
+                        }
+                    }
+                    Instruction::Select { cond, true_val, false_val, .. } => {
+                        if replace_in_operand(cond, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(true_val, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(false_val, acc_id, sum_rem_phi) { updates += 1; }
+                    }
+                    _ => {}
+                }
+            }
+            match &mut block.terminator {
+                Terminator::Return(Some(op)) => {
+                    if replace_in_operand(op, acc_id, sum_rem_phi) { updates += 1; }
+                }
+                Terminator::CondBranch { cond, .. } => {
+                    if replace_in_operand(cond, acc_id, sum_rem_phi) { updates += 1; }
+                }
+                Terminator::Switch { val, .. } => {
+                    if replace_in_operand(val, acc_id, sum_rem_phi) { updates += 1; }
                 }
                 _ => {}
             }
         }
 
-        // Also update terminator
-        match &mut exit_block.terminator {
-            Terminator::Return(Some(op)) => {
-                if replace_in_operand(op, pattern.accumulator_phi.0, sum_rem_phi) {
-                    updates += 1;
-                }
-            }
-            Terminator::CondBranch { cond, .. } => {
-                if replace_in_operand(cond, pattern.accumulator_phi.0, sum_rem_phi) {
-                    updates += 1;
-                }
-            }
-            _ => {}
-        }
-
         if debug {
-            eprintln!("[VEC-RED]   Updated {} uses of accumulator in exit block", updates);
+            eprintln!("[VEC-RED]   Rewired {} uses of accumulator outside the loop", updates);
         }
     }
 
@@ -2944,6 +2972,12 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
+    // Defensive: never trust func.next_label alone — some IR producers can
+    // leave it stale relative to the blocks actually present. Allocating
+    // below an existing label duplicates it and corrupts the CFG
+    // (lea_sib_fold -O2 self-loop regression).
+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Determine vector width and intrinsics based on element type
     // NOTE: These are only used for pattern matching - the actual transform uses Vec* variants
@@ -3454,6 +3488,12 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
+    // Defensive: never trust func.next_label alone — some IR producers can
+    // leave it stale relative to the blocks actually present. Allocating
+    // below an existing label duplicates it and corrupts the CFG
+    // (lea_sib_fold -O2 self-loop regression).
+    let max_present_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Determine vector width and intrinsics based on element type (SSE2 = half of AVX2)
     let (vec_width, load_intrinsic, add_intrinsic, mul_intrinsic, horizontal_intrinsic) = match pattern.element_type {
@@ -3962,6 +4002,114 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
         return 0;
     }
 
+    // Volatile memory accesses are observable side effects: vectorizing a
+    // loop that reads or writes volatile objects changes the number, width,
+    // and order of memory accesses (C11 6.7.3p7: "Any attempt to refer to a
+    // volatile object through a non-volatile lvalue is undefined behaviour"
+    // — a vector load is exactly such an access). Bail out for any function
+    // whose loop loads/stores chain to a volatile alloca.
+    // (Reproducer: tests/correctness volatile_access — volatile int array
+    // sum produced garbage at -O2 when vectorized.)
+    if func_has_volatile_loop_access(func) {
+        return 0;
+    }
+
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis(func, &cfg)
+}
+
+/// True if any Load/Store in `func` chains (through GEP/Cast/Copy) to an
+/// alloca declared `volatile` or `semantic_volatile`. Such loops must never be
+/// vectorized: vector loads/stores would observe or mutate volatile objects
+/// with different width/count/order than the source program.
+fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
+    use crate::ir::instruction::Instruction;
+
+    let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                volatile,
+                semantic_volatile,
+                ..
+            } = inst
+            {
+                if *volatile || *semantic_volatile {
+                    volatile_allocas.insert(dest.0);
+                }
+            }
+        }
+    }
+    if volatile_allocas.is_empty() {
+        return false;
+    }
+
+    // Union-find style root map: pointer value -> alloca root it derives from.
+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    fn find(parent: &mut FxHashMap<u32, u32>, v: u32) -> u32 {
+        let mut root = v;
+        while let Some(&p) = parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        // Path compression.
+        let mut cur = v;
+        while let Some(&p) = parent.get(&cur) {
+            if p == root {
+                break;
+            }
+            parent.insert(cur, root);
+            cur = p;
+        }
+        root
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let (dest, base): (Option<u32>, Option<u32>) = match inst {
+                Instruction::GetElementPtr { dest, base, .. } => (Some(dest.0), Some(base.0)),
+                Instruction::Cast { dest, src, .. } => {
+                    if let Operand::Value(v) = src {
+                        (Some(dest.0), Some(v.0))
+                    } else {
+                        (None, None)
+                    }
+                }
+                Instruction::Copy { dest, src } => {
+                    if let Operand::Value(v) = src {
+                        (Some(dest.0), Some(v.0))
+                    } else {
+                        (None, None)
+                    }
+                }
+                _ => (None, None),
+            };
+            if let (Some(d), Some(b)) = (dest, base) {
+                let rb = find(&mut parent, b);
+                parent.insert(d, rb);
+                // The alloca itself is its own root.
+                parent.entry(rb).or_insert(rb);
+            }
+        }
+    }
+
+    // Any Load/Store whose pointer chains to a volatile alloca disqualifies
+    // the whole function from vectorization.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let ptr: Option<u32> = match inst {
+                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => Some(ptr.0),
+                _ => None,
+            };
+            if let Some(p) = ptr {
+                let root = find(&mut parent, p);
+                if volatile_allocas.contains(&root) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

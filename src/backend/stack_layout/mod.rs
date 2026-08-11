@@ -119,10 +119,26 @@ struct StackLayoutContext {
     /// elimination places Copies at predecessor block ends. If the source
     /// value's Tier 3 slot was reused by another block, the Copy reads garbage.
     phi_incoming_values: FxHashSet<u32>,
+    /// Values that appear as the dest or src of a Memcpy, mapped to the
+    /// copy width. A struct-by-value temp copied by a 32-byte Memcpy needs a
+    /// 32-byte slot; the generic 8-byte fallback for Copy/Memcpy temps lets
+    /// the copy read/write past its slot, corrupting neighbours
+    /// (simd_avx2_256 mul_ps check: vfb copy read the add-loop residue).
+    memcpy_value_sizes: FxHashMap<u32, usize>,
     /// Block indices where the block has more instructions than the Tier 3
     /// greedy coloring threshold. Values defined in these blocks are directed
     /// to Tier 2 (liveness-packed) instead of Tier 3 (greedy reuse).
     large_blocks: FxHashSet<usize>,
+    /// Loop nesting depth per block index (0 = not inside any loop).
+    ///
+    /// Allocas whose single use-block is inside a loop MUST NOT be placed in
+    /// the shared block-local slot region: that region reuses offsets across
+    /// blocks under the assumption that blocks execute exclusively, but a
+    /// loop body re-enters — so a loop-carried alloca (written in iteration N,
+    /// read in iteration N+1, e.g. adler32's vs1/vs1_0 or a sum accumulator)
+    /// is clobbered by another value allocated at the same offset
+    /// (simd_avx2_256 mul check and vector_defer_multidef_slot regressions).
+    block_loop_depth: Vec<u32>,
 }
 
 // ── Main stack space calculation ──────────────────────────────────────────
@@ -163,27 +179,35 @@ pub fn calculate_stack_space_common(
         eprintln!("[PROTECT] Scanning function {} for vector intrinsics", func.name);
     }
 
-    // Pass 1: Mark all vector intrinsic destinations as vector values
+    // Pass 1: Mark all vector intrinsic destinations as vector values.
+    // Uses the single authority `IntrinsicOp::vector_result_width()` so that
+    // USER-level SSE/AVX intrinsics (sad_epu8, maddubs, add_epi32, mul_ps,
+    // loadu_si256, ...) are protected exactly like the auto-vectorizer's
+    // internal Vec* ops. Previously only the Vec* ops were recognized, so
+    // real SIMD code (zlib-ng adler32_ssse3, AVX2 intrinsic chains) got
+    // 8-byte slots that 16/32-byte stores overflowed and that block-local
+    // reuse reassigned while still live (vector_defer_multidef_slot,
+    // simd_avx2_256 regressions).
     for block in &func.blocks {
         for inst in &block.instructions {
             if let crate::ir::instruction::Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
-                // Mark destinations of all vector intrinsics as vector values
-                let is_vector = matches!(op,
-                    IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
-                    IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
-                    IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
-                    IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-                    IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
-                    IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-                    IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2
-                );
-                if is_vector {
-                    state.vector_values.insert(d.0);
-                    // Also mark as protected so slot reuse doesn't corrupt vector data
-                    state.protected_slot_values.insert(d.0);
-                    if debug_protect {
-                        eprintln!("[PROTECT] Marked SSA value {} as protected ({:?})", d.0, op);
+                match op.vector_result_width() {
+                    Some(32) => {
+                        state.vector_values.insert(d.0);
+                        state.protected_slot_values.insert(d.0);
+                        if debug_protect {
+                            eprintln!("[PROTECT] Marked SSA value {} as protected 256-bit ({:?})", d.0, op);
+                        }
                     }
+                    Some(16) => {
+                        state.vector128_values.insert(d.0);
+                        state.vector_values.insert(d.0);
+                        state.protected_slot_values.insert(d.0);
+                        if debug_protect {
+                            eprintln!("[PROTECT] Marked SSA value {} as protected 128-bit ({:?})", d.0, op);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -215,6 +239,19 @@ pub fn calculate_stack_space_common(
                 });
                 if has_vector_incoming {
                     state.vector_values.insert(dest.0);
+                    // A 128-bit class propagates only when every vector incoming
+                    // is 128-bit; any 256-bit incoming makes the PHI 256-bit.
+                    let all_incoming_128 = incoming.iter().all(|(val, _)| {
+                        if let crate::ir::instruction::Operand::Value(v) = val {
+                            !state.vector_values.contains(&v.0)
+                                || state.vector128_values.contains(&v.0)
+                        } else {
+                            true
+                        }
+                    });
+                    if all_incoming_128 {
+                        state.vector128_values.insert(dest.0);
+                    }
                     state.protected_slot_values.insert(dest.0);
                     if debug_protect {
                         eprintln!("[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)", dest.0);
@@ -234,11 +271,18 @@ pub fn calculate_stack_space_common(
             for inst in &block.instructions {
                 if let crate::ir::instruction::Instruction::Copy { dest, src } = inst {
                     if let crate::ir::instruction::Operand::Value(src_val) = src {
-                        if state.protected_slot_values.contains(&src_val.0) {
+                        // Propagate only from genuinely VECTOR sources. Protected
+                        // values also include scalar holders (DynAlloca results,
+                        // addresses); marking those as vectors would switch their
+                        // codegen from value-load to leaq addressing.
+                        if state.vector_values.contains(&src_val.0) {
                             let was_new = state.protected_slot_values.insert(dest.0);
-                            state.vector_values.insert(dest.0);
-                            if debug_protect && was_new {
-                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from protected SSA {})", dest.0, src_val.0);
+                            let was_vec = state.vector_values.insert(dest.0);
+                            if state.vector128_values.contains(&src_val.0) {
+                                state.vector128_values.insert(dest.0);
+                            }
+                            if debug_protect {
+                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from vector SSA {})", dest.0, src_val.0);
                             }
                         }
                     }
@@ -293,7 +337,9 @@ pub fn calculate_stack_space_common(
 
     // Raptor Lake Optimization: Protect cross-block vector slots
     for mbv in &multi_block_values {
-        if state.vector_values.contains(&mbv.dest_id) {
+        if state.vector_values.contains(&mbv.dest_id)
+            || state.vector128_values.contains(&mbv.dest_id)
+        {
             state.protected_slot_values.insert(mbv.dest_id);
         }
     }
@@ -316,6 +362,35 @@ pub fn calculate_stack_space_common(
 
     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
+
+    // Diagnostic: dump the full value→slot map (and the vector/defer sets) so
+    // slot aliasing miscompiles can be root-caused from the layout alone.
+    // Usage: CCC_DEBUG_SLOTS=1 lccc -O2 -c file.c
+    if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+        eprintln!("[SLOTS] fn={} total_space={}", func.name, total_space);
+        let mut ids: Vec<u32> = state.value_locations.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let slot = state.value_locations[&id].0;
+            let tags: Vec<&str> = {
+                let mut t = Vec::new();
+                if state.vector_values.contains(&id) {
+                    t.push(if state.vector128_values.contains(&id) { "v128" } else { "v256" });
+                }
+                if state.protected_slot_values.contains(&id) {
+                    t.push("prot");
+                }
+                if state.vector_defer_values.contains(&id) {
+                    t.push("defer");
+                }
+                if state.alloca_values.contains(&id) {
+                    t.push("alloca");
+                }
+                t
+            };
+            eprintln!("[SLOTS]   v{:<5} slot={:<5} {}", id, slot, tags.join(","));
+        }
+    }
 
     total_space
 }
@@ -467,6 +542,25 @@ fn build_layout_context(
         }
     }
 
+    // Collect Memcpy dest/src value widths: struct copies must get slots at
+    // least as wide as the copy, otherwise the 16/32-byte copy overflows the
+    // 8-byte fallback slot into neighbours.
+    let mut memcpy_value_sizes: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Memcpy { dest, src, size } = inst {
+                let e = memcpy_value_sizes.entry(dest.0).or_insert(0);
+                if *size > *e {
+                    *e = *size;
+                }
+                let e2 = memcpy_value_sizes.entry(src.0).or_insert(0);
+                if *size > *e2 {
+                    *e2 = *size;
+                }
+            }
+        }
+    }
+
     // Collect phi incoming values: values used as operands in Phi instructions.
     let mut phi_incoming_values = FxHashSet::default();
     for block in &func.blocks {
@@ -480,6 +574,15 @@ fn build_layout_context(
             }
         }
     }
+
+    // Loop depth per block: allocas used only inside a loop must stay out of
+    // the shared block-local region (loop-carried lifetimes alias across
+    // iterations). If liveness was not computed, conservatively treat every
+    // block as looped (disables block-local allocas entirely).
+    let block_loop_depth = cached_liveness
+        .as_ref()
+        .map(|l| l.block_loop_depth.clone())
+        .unwrap_or_else(|| vec![1u32; func.blocks.len()]);
 
     // Identify blocks too large for Tier 3 greedy coloring.
     // The accumulator-based codegen processes instructions sequentially, but
@@ -505,6 +608,8 @@ fn build_layout_context(
         immediately_consumed,
         vector_defer_values,
         phi_incoming_values,
+        memcpy_value_sizes,
         large_blocks,
+        block_loop_depth,
     }
 }
