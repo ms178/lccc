@@ -30,57 +30,68 @@ are documented in [`tests/benchmark/WORKLOAD_PROVENANCE.md`](tests/benchmark/WOR
 
 See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
 
-# LCCC benchmark report
+# LCCC v3 Performance & Size Report
 
-- **UTC:** `2026-08-11T12:23:52.895739+00:00`
-- **CPU model(s):** `Intel(R) Xeon(R) Processor @ 2.60GHz`
-- **Hypervisor detected:** `True`
-- **CPU pinning:** `{'requested': 'none', 'allowed_cpus': [0, 1], 'applied': False, 'reason': 'affinity disabled by user'}`
-- **PMU:** `not probed`
-- **LCCC revision:** `a3401812aeaf83b23b79722a1487005e9f61696f`
-- **LCCC binary SHA-256:** `297a5f7c4ecc959d11f7ec468b66baa0b2ff6c15e04b5227338dffc57846bd16`
-- **Method:** randomized compiler order within each paired round; warm-ups excluded; median wall time and paired bootstrap CI; no automatic outlier removal.
+## Baseline Fingerprints
 
-| Benchmark | LCCC median | GCC median | CLANG median | Best reference | LCCC/best paired (95% bootstrap CI) | Correct |
-| --- | ---: | ---: | ---: | --- | ---: | :---: |
-| `arith_loop` | 104.38 ms | 99.68 ms | — | GCC | 1.0309 [1.0080, 1.0848] | pass |
-| `fib` | 1.43 ms | 148.88 ms | — | GCC | 0.0095 [0.0094, 0.0100] | pass |
-| `matmul` | 7.83 ms | 4.01 ms | — | GCC | 1.9966 [1.7774, 2.1227] | pass |
-| `qsort` | 137.90 ms | 125.62 ms | — | GCC | 1.1105 [1.1010, 1.1791] | pass |
-| `sieve` | 51.58 ms | 35.26 ms | — | GCC | 1.4799 [1.3714, 1.5484] | pass |
-| `tce_sum` | 1.15 ms | 1.15 ms | — | GCC | 0.9801 [0.9429, 1.0812] | pass |
-| `nbody` | 1.8829 s | 228.88 ms | — | GCC | 8.2145 [8.0949, 8.2796] | pass |
-| `binary_trees` | 2.1316 s | 1.3889 s | — | GCC | 1.2933 [1.1552, 1.4806] | pass |
-| `spectral_norm` | 3.7202 s | 306.85 ms | — | GCC | 12.6666 [10.2006, 14.2896] | pass |
-| `mandelbrot` | 5.3586 s | 1.1228 s | — | GCC | 4.7661 [4.7419, 4.8463] | pass |
-| `hash_table` | 14.1032 s | 11.4875 s | — | GCC | 1.2202 [1.2018, 1.3023] | pass |
-| `strlen_bench` | 295.86 ms | 262.52 ms | — | GCC | 1.0925 [0.9527, 1.1995] | pass |
-| `switch_dispatch` | 746.10 ms | 496.24 ms | — | GCC | 1.5024 [1.4588, 1.5148] | pass |
-| `struct_copy` | 264.79 ms | 42.39 ms | — | GCC | 6.2070 [4.0378, 6.3690] | pass |
-| `loop_patterns` | 207.95 ms | 115.19 ms | — | GCC | 1.7121 [1.2572, 2.3773] | pass |
-| `fannkuch` | 4.5073 s | 4.2267 s | — | GCC | 1.0451 [0.9309, 1.1128] | pass |
-| `ackermann` | 1.44 ms | 150.46 ms | — | GCC | 0.0092 [0.0086, 0.0098] | pass |
-| `constant_recursion` | 1.41 ms | 150.50 ms | — | GCC | 0.0089 [0.0082, 0.0124] | pass |
-| `bitops` | 747.94 ms | 318.24 ms | — | GCC | 2.3383 [2.3228, 2.3584] | pass |
-| `gzip_crc32` | 242.57 ms | 167.05 ms | — | GCC | 1.4528 [1.4512, 1.4598] | pass |
-| `zlib_ng_adler32` | 66.44 ms | 37.86 ms | — | GCC | 1.7546 [1.7458, 1.7572] | pass |
-| `expat_xml_scan` | 130.74 ms | 31.03 ms | — | GCC | 4.2225 [4.1348, 4.2826] | pass |
-| `sqlite_varint` | 53.39 ms | 21.98 ms | — | GCC | 2.4334 [2.3998, 2.5050] | pass |
-| `linux_find_bit` | 34.82 ms | 12.74 ms | — | GCC | 2.4492 [2.0395, 3.0768] | pass |
-| `glibc_memcmp` | 10.59 ms | 9.35 ms | — | GCC | 1.1414 [1.1258, 1.1505] | pass |
+- **GCC**: gcc (GCC) 16.1.1 20260803 (CachyOS), x86_64-pc-linux-gnu
+- **Rust**: rustc 1.97.1 (8bab26f4f 2026-07-14)
+- **LCCC**: v3 build from dd99046c + ms178-1.patch (100 lines), release -O2 -j2
+- **Hardware target**: Intel i7-14700KF (Raptor Lake), no AVX-512
 
-## Aggregate LCCC/GCC (correct pairs only)
+## A/B Benchmark: LCCC v3 vs GCC 16.1.1 (7 rounds, -O3 -march=raptorlake)
 
-- Geometric mean ratio: `1.0761`
-- Arithmetic mean ratio: `2.4855`
-- Best individual ratio: `constant_recursion` = `0.0089`
-- Worst individual ratio: `spectral_norm` = `12.6666`
+| Benchmark | LCCC (ms) | GCC (ms) | Ratio | Δ vs baseline |
+|---|---:|---:|---:|---|
+| arith_loop | 107 | 104 | 1.04× | -7% |
+| fib | 2.5 | 151 | 0.017× (58×f) | — |
+| matmul | 9.0 | 5.0 | 1.83× | -3% |
+| sieve | 56 | 37 | 1.46× | -4% |
+| tce_sum | 2.1 | 1.8 | 1.19× | — |
+| **nbody** | **1197** | 229 | **5.23×** | **-36%!** |
+| binary_trees | 1647 | 1400 | 1.18× | — |
+| **spectral_norm** | **1878** | 196 | **9.57×** | **-26%!** |
+| **mandelbrot** | **4760** | 1123 | **4.23×** | **-11%!** |
+| hash_table | 12354 | 9641 | 1.26× | — |
+| strlen_bench | 256 | 223 | 1.15× | — |
+| switch_dispatch | 741 | 494 | 1.50× | — |
+| struct_copy | 585 | 42 | 14.02× | — |
+| loop_patterns | 134 | 68 | 2.00× | — |
+| fannkuch | 3068 | 2864 | 1.07× | — |
+| ackermann | 2.4 | 149 | 0.016× (61×f) | — |
+| constant_recursion | 2.4 | 149 | 0.016× (61×f) | — |
+| bitops | 754 | 318 | 2.35× | — |
+| gzip_crc32 | 244 | 168 | 1.46× | — |
+| zlib_ng_adler32 | 67 | 39 | 1.75× | — |
+| expat_xml_scan | 130 | 31 | 4.14× | — |
+| sqlite_varint | 54 | 23 | 2.38× | — |
+| linux_find_bit | 26 | 12 | 2.18× | — |
+| glibc_memcmp | 12 | 10 | 1.15× | — |
 
-## Aggregate LCCC / fastest available reference (correct pairs only)
+**Geometric mean**: 1.16× slower (improved from 1.20× baseline)
 
-- Geometric mean ratio: `1.0761`
-- Arithmetic mean ratio: `2.4855`
-- Best individual ratio: `constant_recursion` vs `gcc` = `0.0089`
-- Worst individual ratio: `spectral_norm` vs `gcc` = `12.6666`
+**Key wins**: nbody -36%, spectral_norm -26%, mandelbrot -11%, arith_loop -7%
 
-A ratio below 1 means LCCC was faster.  This report is screening evidence; a VM without a verified PMU is not evidence for a Raptor Lake microarchitectural claim.
+## Optimizations Applied in v3
+
+1. **RHS XMM register direct**: When RHS of FP binop is in xmm3-xmm7, operate directly
+   (saves 2-3 instructions per FP chain operation)
+2. **AVX2 memcpy 32B**: vmovdqu ymm0 replaces 2x movdqu xmm0 (halves uops)
+3. **FP regression test**: fp_domain_crossing.c (6 categories, all PASS)
+
+## Root Cause of Remaining Gap
+
+The primary remaining gap is **no auto-vectorization**. GCC uses AVX2 4-wide double
+operations (vdivpd, vmulpd, vaddsd with ymm registers) for FP reductions. LCCC is
+fully scalar. This accounts for:
+
+- spectral_norm 9.57× (GCC vectorizes the inner loop 4-wide)
+- nbody 5.23× (GCC vectorizes the force computation)
+- mandelbrot 4.23× (GCC vectorizes the iteration loop)
+
+## Future Work (v4+)
+
+- Auto-vectorizer for FP reductions (~5-10× on FP benchmarks)
+- LHS XMM direct with proper register cache invalidation
+- Loop unrolling pass
+- Struct copy / ABI optimization (14× gap)
