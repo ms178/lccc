@@ -1232,16 +1232,14 @@ impl X86Codegen {
             let mut remaining = size;
             while remaining > 0 {
                 if remaining >= 32 {
+                    // Use AVX2 256-bit vmovdqu for 32-byte chunks (1 instruction
+                    // instead of 2x movdqu). ymm scratch: ymm0 = xmm0's extension.
                     if offset == 0 {
-                        self.state.emit("    movdqu (%rsi), %xmm0");
-                        self.state.emit("    movdqu %xmm0, (%rdi)");
-                        self.state.emit("    movdqu 16(%rsi), %xmm0");
-                        self.state.emit("    movdqu %xmm0, 16(%rdi)");
+                        self.state.emit("    vmovdqu (%rsi), %ymm0");
+                        self.state.emit("    vmovdqu %ymm0, (%rdi)");
                     } else {
-                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
-                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
-                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset+16));
-                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset+16));
+                        self.state.emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
+                        self.state.emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
                     }
                     offset += 32;
                     remaining -= 32;
@@ -1298,8 +1296,64 @@ impl X86Codegen {
                 }
             }
         } else {
-            self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
-            self.state.emit("    rep movsb");
+            // For copies > 64 bytes, use an unrolled AVX2 loop instead of rep movsb.
+            // This is faster for medium copies (65-512 bytes) because vmovdqu ymm
+            // has higher throughput than rep movsb on modern Intel CPUs without ERMS.
+            // Each iteration copies 64 bytes (2x vmovdqu 32-byte).
+            let full_chunks = size / 64;
+            let remainder = size % 64;
+
+            // Unrolled loop: copy 64 bytes per iteration
+            if full_chunks > 0 {
+                self.state.out.emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
+                let loop_label = format!(".Lmcpy_loop_{}", self.state.next_label_id());
+                self.state.emit_fmt(format_args!("{}:", loop_label));
+                self.state.emit("    vmovdqu (%rsi), %ymm0");
+                self.state.emit("    vmovdqu %ymm0, (%rdi)");
+                self.state.emit("    vmovdqu 32(%rsi), %ymm1");
+                self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
+                self.state.emit("    addq $64, %rsi");
+                self.state.emit("    addq $64, %rdi");
+                self.state.emit("    decq %rcx");
+                self.state.emit_fmt(format_args!("    jne {}", loop_label));
+            }
+
+            // Handle remainder (0-63 bytes) with scalar/128-bit moves
+            let mut offset = 0usize;
+            let mut remaining = remainder;
+            while remaining > 0 {
+                if remaining >= 32 {
+                    self.state.emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
+                    self.state.emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
+                    offset += 32;
+                    remaining -= 32;
+                } else if remaining >= 16 {
+                    self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
+                    self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
+                    offset += 16;
+                    remaining -= 16;
+                } else if remaining >= 8 {
+                    self.state.emit_fmt(format_args!("    movq {}(%rsi), %rax", offset));
+                    self.state.emit_fmt(format_args!("    movq %rax, {}(%rdi)", offset));
+                    offset += 8;
+                    remaining -= 8;
+                } else if remaining >= 4 {
+                    self.state.emit_fmt(format_args!("    movl {}(%rsi), %eax", offset));
+                    self.state.emit_fmt(format_args!("    movl %eax, {}(%rdi)", offset));
+                    offset += 4;
+                    remaining -= 4;
+                } else if remaining >= 2 {
+                    self.state.emit_fmt(format_args!("    movw {}(%rsi), %ax", offset));
+                    self.state.emit_fmt(format_args!("    movw %ax, {}(%rdi)", offset));
+                    offset += 2;
+                    remaining -= 2;
+                } else {
+                    self.state.emit_fmt(format_args!("    movb {}(%rsi), %al", offset));
+                    self.state.emit_fmt(format_args!("    movb %al, {}(%rdi)", offset));
+                    offset += 1;
+                    remaining -= 1;
+                }
+            }
         }
     }
 
