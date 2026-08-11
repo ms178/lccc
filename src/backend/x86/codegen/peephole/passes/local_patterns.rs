@@ -835,6 +835,167 @@ pub(super) fn eliminate_dead_sign_extensions(
     changed
 }
 
+// ── LEA-to-memory SIB folding ───────────────────────────────────────────────
+//
+// Fold the already-emitted form:
+//   leaq (%base,%index,scale), %tmp
+//   movX (%tmp), %dst
+// into:
+//   movX (%base,%index,scale), %dst
+//
+// This is deliberately a late textual peephole. It handles GEPs whose IR
+// lifetime proof is unavailable by the time the mature accumulator backend
+// emits them, while the whole-function dead-register check keeps the rewrite
+// sound across CFG edges.
+
+pub(super) fn fold_lea_into_memory_op(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let lea = infos[i].trimmed(store.get(i));
+        if !lea.starts_with("leaq ") {
+            i += 1;
+            continue;
+        }
+        let Some((addr_text, dst_text)) = lea[5..].rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let addr_text = addr_text.trim();
+        let dst_text = dst_text.trim();
+        if !dst_text.starts_with('%') {
+            i += 1;
+            continue;
+        }
+        let dst_family = register_family_fast(dst_text);
+        if dst_family == REG_NONE || dst_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        let Some(open) = addr_text.find('(') else {
+            i += 1;
+            continue;
+        };
+        let Some(close) = addr_text.rfind(')') else {
+            i += 1;
+            continue;
+        };
+        if close <= open || close + 1 != addr_text.len() {
+            i += 1;
+            continue;
+        }
+        let displacement = addr_text[..open].trim();
+        let fields: Vec<&str> = addr_text[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .collect();
+        if fields.len() < 2 || fields.len() > 3
+            || fields.iter().any(|field| !field.starts_with('%'))
+        {
+            i += 1;
+            continue;
+        }
+        let base = fields[0];
+        let index = fields[1];
+        let base_family = register_family_fast(base);
+        let index_family = register_family_fast(index);
+        if base_family == REG_NONE
+            || index_family == REG_NONE
+            || base_family > REG_GP_MAX
+            || index_family > REG_GP_MAX
+            || dst_family == base_family
+            || dst_family == index_family
+        {
+            i += 1;
+            continue;
+        }
+        if fields.len() == 3 && !matches!(fields[2], "1" | "2" | "4" | "8") {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let next = infos[j].trimmed(store.get(j));
+        let addr_pat = format!("({})", dst_text);
+        let sib = if fields.len() == 3 {
+            format!("{}({},{},{})", displacement, base, index, fields[2])
+        } else {
+            format!("{}({},{})", displacement, base, index)
+        };
+        if !next.contains(&addr_pat) {
+            // A common store shape uses one extra address-register copy:
+            //   leaq (...), %rdi
+            //   movq %rdi, %rcx
+            //   movb $0, (%rcx)
+            // Fold that form as well, provided the copied temporary is dead.
+            if let Some((src, tmp)) = next.strip_prefix("movq ").and_then(|rest| rest.split_once(',')) {
+                let src = src.trim();
+                let tmp = tmp.trim();
+                let tmp_family = register_family_fast(tmp);
+                if src == dst_text
+                    && tmp.starts_with('%')
+                    && tmp_family <= REG_GP_MAX
+                    && tmp_family != base_family
+                    && tmp_family != index_family
+                {
+                    let mut k = j + 1;
+                    while k < len && infos[k].is_nop() { k += 1; }
+                    if k < len && !infos[k].is_barrier() {
+                        let mem_next = infos[k].trimmed(store.get(k));
+                        let tmp_pat = format!("({})", tmp);
+                        if mem_next.contains(&tmp_pat)
+                            && !fam_read_after(store, infos, k + 1, tmp_family)
+                        {
+                            let replacement = mem_next.replacen(&tmp_pat, &sib, 1);
+                            if replacement != mem_next {
+                                mark_nop(&mut infos[i]);
+                                mark_nop(&mut infos[j]);
+                                replace_line(store, &mut infos[k], k, format!("    {}", replacement));
+                                changed = true;
+                                i = k + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // The address fields were already evaluated by LEA. Removing it is
+        // valid only if the temporary is dead after the memory operation.
+        if fam_read_after(store, infos, j + 1, dst_family) {
+            i += 1;
+            continue;
+        }
+        let replacement = next.replacen(&addr_pat, &sib, 1);
+        if replacement == next {
+            i += 1;
+            continue;
+        }
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, format!("    {}", replacement));
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
 // ── SIB indexed addressing folding ──────────────────────────────────────────
 //
 // The accumulator-based codegen computes `base + index` manually:
@@ -891,12 +1052,17 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
             // (addq %r8,%rax, ...) also READS the register.
             let name64 = REG_NAMES[0][fam as usize];
             let name32 = REG_NAMES[1][fam as usize];
-            let mov_store = (td.starts_with("mov") || td.starts_with("movabs"))
+            let mov_store = (td.starts_with("mov")
+                || td.starts_with("movabs")
+                || td.starts_with("lea"))
                 && !td.contains(&format!("({})", name64))
                 && !td.contains(&format!("({})", name32));
+            let explicit_lea_write = td.starts_with("lea")
+                && td.ends_with(&format!(", %{}", name64))
+                && !td[..td.rfind(',').unwrap_or(0)].contains(name64);
             let xor_self = (td.starts_with("xorl ") || td.starts_with("xorq "))
                 && td.contains(&format!("{}, {}", name32, name32));
-            if mov_store || xor_self {
+            if mov_store || explicit_lea_write || xor_self {
                 continue;
             }
         }
@@ -1198,6 +1364,45 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
 
     while i < len {
         if infos[i].is_nop() { i += 1; continue; }
+
+        // Pattern X: XMM -> GPR -> XMM relay. The mature emitter uses the
+        // integer accumulator as a compatibility bridge for values that are
+        // already in XMM registers. Replace the two bit-moves with one scalar
+        // FP move when the bridge register is dead afterwards.
+        let line_i = infos[i].trimmed(store.get(i));
+        if line_i.starts_with("movq %xmm") {
+            let Some((src, dst_gpr)) = line_i[5..].rsplit_once(',') else {
+                i += 1;
+                continue;
+            };
+            let src = src.trim();
+            let dst_gpr = dst_gpr.trim();
+            let gpr_family = register_family_fast(dst_gpr);
+            if (dst_gpr == "%rax" || dst_gpr == "%rcx")
+                && gpr_family <= REG_GP_MAX
+                && src.starts_with('%')
+            {
+                let mut j = i + 1;
+                while j < len && infos[j].is_nop() { j += 1; }
+                if j < len {
+                    let relay = infos[j].trimmed(store.get(j));
+                    let expected = format!("movq {}, %xmm", dst_gpr);
+                    if relay.starts_with(&expected) {
+                        let dst_xmm = relay.rsplit_once(',').map(|(_, dst)| dst.trim()).unwrap_or("");
+                        if !dst_xmm.is_empty()
+                            && !fam_read_after(store, infos, j + 1, gpr_family)
+                        {
+                            let replacement = format!("    movsd {}, {}", src, dst_xmm);
+                            replace_line(store, &mut infos[i], i, replacement);
+                            mark_nop(&mut infos[j]);
+                            changed = true;
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         // Pattern A: LoadRbp{rax(0) or rcx(1), Q} then "movq %gpr, %xmmN"
         if let LineKind::LoadRbp { reg: load_reg, offset, size: MoveSize::Q } = infos[i].kind {

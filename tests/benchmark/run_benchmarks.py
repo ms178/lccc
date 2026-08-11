@@ -56,6 +56,7 @@ BENCHMARKS = [
     ("loop_patterns", "Loop patterns (reduce, transform, prefix)", [], 30),
     ("fannkuch", "Fannkuch-Redux (permutations, integer)", [], 120),
     ("ackermann", "Ackermann(3,11) (deep recursion)", [], 60),
+    ("constant_recursion", "Constant recursive specialization", [], 30),
     ("bitops", "Bit manipulation (popcount, clz, reverse)", [], 30),
 ]
 
@@ -105,7 +106,12 @@ def get_text_size(binary_path):
 
 def compile_one(compiler_name, src, out, extra_flags):
     exe, flags = COMPILERS[compiler_name]
-    cmd = [exe] + flags + extra_flags + ["-o", str(out), str(src)]
+    # Keep source files before library flags. GCC's --as-needed link handling
+    # can discard libraries that appear before the object/source providing the
+    # references (notably -lm for spectral_norm and nbody). LCCC accepts both
+    # orders, but the baseline compiler must receive a conventional driver
+    # command so a benchmark is not silently skipped for infrastructure reasons.
+    cmd = [exe] + flags + [str(src)] + extra_flags + ["-o", str(out)]
     t0 = time.perf_counter()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     t1 = time.perf_counter()

@@ -16,12 +16,232 @@
 //! FxHashMap, since Value IDs are dense sequential u32s. This eliminates hashing
 //! overhead and gives O(1) lookups with better cache locality.
 
-use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Terminator, Value};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
 
 /// Run copy propagation on the entire module.
 /// Returns the number of operand replacements made.
 pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(propagate_copies)
+}
+
+/// Forward a purely intermediate memcpy source:
+///
+///     memcpy tmp, src
+///     memcpy dst, tmp
+///
+/// becomes `memcpy dst, src` when `tmp` has no other use. This is a local
+/// copy-chain rewrite; unlike general aggregate forwarding it does not remove
+/// the final copy or change any load/store aliasing.
+pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
+    let mut total = 0;
+    for func in &mut module.functions {
+        if func.is_declaration { continue; }
+        for block in &mut func.blocks {
+            let mut i = 0;
+            while i < block.instructions.len() {
+                let (tmp, src) = match block.instructions[i] {
+                    Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
+                    _ => { i += 1; continue; }
+                };
+                let mut consumer = None;
+                let mut safe = true;
+                for j in (i + 1)..block.instructions.len() {
+                    let inst = &block.instructions[j];
+                    match inst {
+                        Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
+                            if consumer.is_some() { safe = false; break; }
+                            consumer = Some(j);
+                        }
+                        _ if inst.used_values().into_iter().any(|value| value == tmp.0) => {
+                            safe = false;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(consumer) = consumer else { i += 1; continue; };
+                if !safe { i += 1; continue; }
+                if let Instruction::Memcpy { src: copy_src, .. } = &mut block.instructions[consumer] {
+                    *copy_src = src;
+                }
+                block.instructions.remove(i);
+                if block.source_spans.len() > i {
+                    block.source_spans.remove(i);
+                }
+                total += 1;
+            }
+        }
+    }
+    total
+}
+
+/// Remove a large local aggregate copy when every observation is a scalar load
+/// from the destination after the copy. Each load gets a new source-rooted GEP,
+/// so no pointer is rewritten before its source alloca dominates it.
+pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
+    let mut total = 0;
+    for func in &mut module.functions {
+        if func.is_declaration { continue; }
+        'restart: loop {
+            for block_idx in 0..func.blocks.len() {
+                for copy_idx in 0..func.blocks[block_idx].instructions.len() {
+                    let (dest, src, size) = match func.blocks[block_idx].instructions[copy_idx] {
+                        Instruction::Memcpy { dest, src, size } => (dest, src, size),
+                        _ => continue,
+                    };
+                    if size < 128 || dest == src
+                        || !is_local_alloca(func, dest)
+                        || !is_local_alloca(func, src)
+                    { continue; }
+
+                    let dest_derived = collect_derived_pointers(func, dest);
+                    let mut loads = Vec::new();
+                    let mut safe = true;
+                    for (bi, block) in func.blocks.iter().enumerate() {
+                        for (ii, inst) in block.instructions.iter().enumerate() {
+                            if bi == block_idx && ii == copy_idx { continue; }
+                            let uses = inst.used_values().into_iter().any(|v| dest_derived.contains(&v));
+                            if !uses { continue; }
+                            match inst {
+                                Instruction::GetElementPtr { base, .. }
+                                    if dest_derived.contains(&base.0) => {}
+                                Instruction::Load { ptr, .. }
+                                    if dest_derived.contains(&ptr.0)
+                                        && bi == block_idx && ii > copy_idx => {
+                                    loads.push((bi, ii, *ptr));
+                                }
+                                _ => { safe = false; break; }
+                            }
+                        }
+                        if !safe { break; }
+                        if block.terminator.used_values().into_iter().any(|v| dest_derived.contains(&v)) {
+                            safe = false;
+                            break;
+                        }
+                    }
+                    if !safe || loads.is_empty() { continue; }
+
+                    // No source write, call, or opaque operation may occur
+                    // between the copy and any forwarded load on this path.
+                    for &(_, load_idx, _) in &loads {
+                        for inst in &func.blocks[block_idx].instructions[copy_idx + 1..load_idx] {
+                            if matches!(inst,
+                                Instruction::Store { .. }
+                                | Instruction::Memcpy { .. }
+                                | Instruction::Call { .. }
+                                | Instruction::CallIndirect { .. }
+                                | Instruction::InlineAsm { .. }
+                                | Instruction::Intrinsic { .. }
+                            ) {
+                                safe = false;
+                                break;
+                            }
+                        }
+                        if !safe { break; }
+                    }
+                    if !safe { continue; }
+
+                    // Resolve each destination-rooted pointer to a constant
+                    // byte offset. Dynamic GEPs are rejected rather than
+                    // guessing an alias relation.
+                    let mut gep_defs: FxHashMap<u32, (u32, i64, crate::common::types::IrType)> = FxHashMap::default();
+                    for block in &func.blocks {
+                        for inst in &block.instructions {
+                            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), ty } = inst {
+                                if let Some(offset) = c.to_i64() {
+                                    gep_defs.insert(dest.0, (base.0, offset, *ty));
+                                }
+                            }
+                        }
+                    }
+                    let resolve = |ptr: Value| -> Option<(i64, crate::common::types::IrType)> {
+                        let mut current = ptr.0;
+                        let mut offset = 0i64;
+                        let mut ty = crate::common::types::IrType::Ptr;
+                        let mut seen = FxHashSet::default();
+                        loop {
+                            if !seen.insert(current) { return None; }
+                            if current == dest.0 { return Some((offset, ty)); }
+                            let &(base, delta, gep_ty) = gep_defs.get(&current)?;
+                            offset = offset.checked_add(delta)?;
+                            ty = gep_ty;
+                            current = base;
+                        }
+                    };
+                    let mut resolved = Vec::with_capacity(loads.len());
+                    for &(bi, ii, ptr) in &loads {
+                        let Some((offset, ty)) = resolve(ptr) else { safe = false; break; };
+                        resolved.push((bi, ii, offset, ty));
+                    }
+                    if !safe { continue; }
+
+                    // Insert source-rooted GEPs immediately before loads, in
+                    // reverse order to keep indices stable.
+                    for &(_, load_idx, offset, ty) in resolved.iter().rev() {
+                        let new_ptr = Value(func.next_value_id);
+                        func.next_value_id += 1;
+                        let gep = Instruction::GetElementPtr {
+                            dest: new_ptr,
+                            base: src,
+                            offset: Operand::Const(IrConst::I64(offset)),
+                            ty,
+                        };
+                        func.blocks[block_idx].instructions.insert(load_idx, gep);
+                        if func.blocks[block_idx].source_spans.len() >= load_idx {
+                            func.blocks[block_idx].source_spans.insert(
+                                load_idx,
+                                crate::common::source::Span::dummy(),
+                            );
+                        }
+                        // The load shifted by one; locate the first load at or
+                        // after the insertion point with the old destination-rooted ptr.
+                        for inst in &mut func.blocks[block_idx].instructions[load_idx + 1..] {
+                            if let Instruction::Load { ptr, .. } = inst {
+                                if dest_derived.contains(&ptr.0) {
+                                    *ptr = new_ptr;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    func.blocks[block_idx].instructions.remove(copy_idx);
+                    if func.blocks[block_idx].source_spans.len() > copy_idx {
+                        func.blocks[block_idx].source_spans.remove(copy_idx);
+                    }
+                    total += 1;
+                    continue 'restart;
+                }
+            }
+            break;
+        }
+    }
+    total
+}
+
+fn is_local_alloca(func: &IrFunction, value: Value) -> bool {
+    func.blocks.iter().any(|block| block.instructions.iter().any(|inst| {
+        matches!(inst, Instruction::Alloca { dest, volatile: false, .. } if *dest == value)
+    }))
+}
+
+fn collect_derived_pointers(func: &IrFunction, root: Value) -> FxHashSet<u32> {
+    let mut derived = FxHashSet::default();
+    derived.insert(root.0);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                    if derived.contains(&base.0) && derived.insert(dest.0) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    derived
 }
 
 /// Propagate copies within a single function.

@@ -687,6 +687,107 @@ impl Instruction {
         }
     }
 
+    /// Mutably visit every Operand stored in this instruction.
+    ///
+    /// This is the mutation counterpart to `for_each_used_value`. Keeping the
+    /// traversal canonical prevents optimization passes from forgetting less
+    /// common operand-bearing forms such as atomics, inline asm inputs, or
+    /// intrinsic argument lists.
+    #[inline]
+    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
+        match self {
+            Instruction::DynAlloca { size, .. }
+            | Instruction::UnaryOp { src: size, .. }
+            | Instruction::Cast { src: size, .. }
+            | Instruction::Copy { src: size, .. }
+            | Instruction::AtomicLoad { ptr: size, .. }
+            | Instruction::AtomicInc { ptr: size, .. } => f(size),
+            Instruction::Store { val, .. } => f(val),
+            Instruction::BinOp { lhs, rhs, .. }
+            | Instruction::Cmp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Instruction::Call { info, .. } => {
+                for arg in &mut info.args {
+                    f(arg);
+                }
+            }
+            Instruction::CallIndirect { func_ptr, info } => {
+                f(func_ptr);
+                for arg in &mut info.args {
+                    f(arg);
+                }
+            }
+            Instruction::GetElementPtr { offset, .. } => f(offset),
+            Instruction::AtomicRmw { ptr, val, .. } => {
+                f(ptr);
+                f(val);
+            }
+            Instruction::AtomicCmpxchg {
+                ptr,
+                expected,
+                desired,
+                ..
+            } => {
+                f(ptr);
+                f(expected);
+                f(desired);
+            }
+            Instruction::AtomicStore { ptr, val, .. } => {
+                f(ptr);
+                f(val);
+            }
+            Instruction::Phi { incoming, .. } => {
+                for (op, _) in incoming {
+                    f(op);
+                }
+            }
+            Instruction::SetReturnF64Second { src }
+            | Instruction::SetReturnF32Second { src }
+            | Instruction::SetReturnF128Second { src } => f(src),
+            Instruction::InlineAsm { inputs, .. } => {
+                for (_, op, _) in inputs {
+                    f(op);
+                }
+            }
+            Instruction::Intrinsic { args, .. } => {
+                for arg in args {
+                    f(arg);
+                }
+            }
+            Instruction::Select {
+                cond,
+                true_val,
+                false_val,
+                ..
+            } => {
+                f(cond);
+                f(true_val);
+                f(false_val);
+            }
+            // These variants contain Value fields, not Operand fields, or no
+            // source operands at all. Their values require a distinct remap.
+            Instruction::Alloca { .. }
+            | Instruction::Load { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaArgStruct { .. }
+            | Instruction::VaStart { .. }
+            | Instruction::VaEnd { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::Fence { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::StackRestore { .. }
+            | Instruction::ParamRef { .. } => {}
+        }
+    }
+
     /// Collect all Value IDs used (as operands, not defined) by this instruction.
     pub fn used_values(&self) -> Vec<u32> {
         let mut used = Vec::new();
@@ -696,6 +797,22 @@ impl Instruction {
 }
 
 impl Terminator {
+    /// Mutably visit every Operand stored in this terminator.
+    #[inline]
+    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
+        match self {
+            Terminator::Return(value) => {
+                if let Some(op) = value {
+                    f(op);
+                }
+            }
+            Terminator::CondBranch { cond, .. }
+            | Terminator::IndirectBranch { target: cond, .. }
+            | Terminator::Switch { val: cond, .. } => f(cond),
+            Terminator::Branch(_) | Terminator::Unreachable => {}
+        }
+    }
+
     /// Call `f(value_id)` for every Value ID used as an operand in this terminator.
     #[inline]
     pub fn for_each_used_value(&self, mut f: impl FnMut(u32)) {

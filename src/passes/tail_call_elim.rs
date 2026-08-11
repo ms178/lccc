@@ -48,6 +48,199 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
 };
 
+/// Replace the canonical tail-recursive integer sum with a closed form.
+///
+/// The source pattern is:
+///
+///     if (n <= 0) return acc;
+///     return sum(n - 1, acc + n);
+///
+/// After TCE this is a two-phi loop. For the lowered `int`/`long` ABI,
+/// `n*(n+1)` is bounded by roughly 2^62, so the product is representable in
+/// signed i64 for every defined int input. Replacing the loop with
+/// `acc + (n * (n + 1) / 2)` removes O(n) work while preserving the original
+/// branch for n <= 0. The matcher is deliberately strict and rejects any
+/// extra side effects or non-canonical recurrence.
+///
+/// Returns 1 when transformed, 0 otherwise.
+pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
+    if func.is_declaration
+        || func.is_variadic
+        || func.uses_sret
+        || func.return_type != crate::common::types::IrType::I64
+        || func.params.len() != 2
+        || func.params[0].ty != crate::common::types::IrType::I32
+        || func.params[1].ty != crate::common::types::IrType::I64
+        || func.blocks.len() < 3
+    {
+        return 0;
+    }
+
+    let Some(entry) = func.blocks.first() else { return 0; };
+    let mut n_param = None;
+    let mut acc_param = None;
+    for inst in &entry.instructions {
+        if let Instruction::ParamRef { dest, param_idx, ty } = inst {
+            match (*param_idx, *ty) {
+                (0, crate::common::types::IrType::I32) => n_param = Some(*dest),
+                (1, crate::common::types::IrType::I64) => acc_param = Some(*dest),
+                _ => {}
+            }
+        }
+    }
+    let (Some(n_param), Some(acc_param)) = (n_param, acc_param) else { return 0; };
+
+    // Find the loop header with the two recurrence phis and its n <= 0 test.
+    let mut header_idx = None;
+    let mut n_phi = None;
+    let mut acc_phi = None;
+    let mut base_label = None;
+    let mut rec_label = None;
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let mut found_n = None;
+        let mut found_acc = None;
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, ty, .. } = inst {
+                match *ty {
+                    crate::common::types::IrType::I32 if found_n.is_none() => found_n = Some(*dest),
+                    crate::common::types::IrType::I64 if found_acc.is_none() => found_acc = Some(*dest),
+                    _ => {}
+                }
+            }
+        }
+        let Some((n_phi_here, acc_phi_here)) = found_n.zip(found_acc) else { continue; };
+        let Terminator::CondBranch { cond, true_label, false_label } = &block.terminator else { continue; };
+        let Operand::Value(cond_value) = cond else { continue; };
+        let mut is_base_true = false;
+        for inst in &block.instructions {
+            if let Instruction::Cmp { dest, op: crate::ir::reexports::IrCmpOp::Sle, lhs, rhs, ty } = inst {
+                if *dest == *cond_value
+                    && *ty == crate::common::types::IrType::I32
+                    && matches!(lhs, Operand::Value(v) if *v == n_phi_here)
+                    && matches!(rhs, Operand::Const(crate::ir::reexports::IrConst::I32(0)))
+                {
+                    is_base_true = true;
+                }
+            }
+        }
+        if !is_base_true { continue; }
+        header_idx = Some(idx);
+        n_phi = Some(n_phi_here);
+        acc_phi = Some(acc_phi_here);
+        base_label = Some(*true_label);
+        rec_label = Some(*false_label);
+        break;
+    }
+    let (Some(header_idx), Some(n_phi), Some(acc_phi), Some(base_label), Some(rec_label)) =
+        (header_idx, n_phi, acc_phi, base_label, rec_label)
+    else { return 0; };
+    let header_label = func.blocks[header_idx].label;
+
+    let find_block = |label: crate::ir::reexports::BlockId| {
+        func.blocks.iter().find(|block| block.label == label)
+    };
+    let Some(base_block) = find_block(base_label) else { return 0; };
+    let Some(rec_block) = find_block(rec_label) else { return 0; };
+    if !matches!(base_block.terminator, Terminator::Return(Some(_)))
+        || !matches!(rec_block.terminator, Terminator::Branch(label) if label == header_label)
+    {
+        return 0;
+    }
+
+    // The base arm must return the accumulator phi (possibly through one Copy).
+    let base_returns_acc = match base_block.terminator {
+        Terminator::Return(Some(Operand::Value(v))) => {
+            v == acc_phi
+                || base_block.instructions.iter().any(|inst| {
+                    matches!(inst, Instruction::Copy { dest, src: Operand::Value(src) } if *dest == v && *src == acc_phi)
+                })
+        }
+        _ => false,
+    };
+    if !base_returns_acc { return 0; }
+
+    let mut has_n_step = false;
+    let mut has_acc_step = false;
+    for inst in &rec_block.instructions {
+        match inst {
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Sub, lhs, rhs, ty, .. }
+                if *ty == crate::common::types::IrType::I32
+                    && matches!(lhs, Operand::Value(v) if *v == n_phi)
+                    && matches!(rhs, Operand::Const(crate::ir::reexports::IrConst::I32(1))) =>
+            {
+                has_n_step = true;
+            }
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty, .. }
+                if *ty == crate::common::types::IrType::I64
+                    && ((matches!(lhs, Operand::Value(v) if *v == acc_phi)
+                        && rec_block.instructions.iter().any(|candidate| matches!(candidate,
+                            Instruction::Cast { dest, src: Operand::Value(src), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 }
+                                if matches!(rhs, Operand::Value(v) if *v == *dest) && *src == n_phi)))
+                        || (matches!(rhs, Operand::Value(v) if *v == acc_phi)
+                        && rec_block.instructions.iter().any(|candidate| matches!(candidate,
+                            Instruction::Cast { dest, src: Operand::Value(src), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 }
+                                if matches!(lhs, Operand::Value(v) if *v == *dest) && *src == n_phi)))) =>
+            {
+                has_acc_step = true;
+            }
+            _ => {}
+        }
+    }
+    if !has_n_step || !has_acc_step { return 0; }
+
+    let formula_label = rec_label;
+    let base_label = base_label;
+    let mut next = func.next_value_id;
+    let fresh = |next: &mut u32| { let value = Value(*next); *next += 1; value };
+    let cond = fresh(&mut next);
+    let n64 = fresh(&mut next);
+    let n_plus_one = fresh(&mut next);
+    let product = fresh(&mut next);
+    let half = fresh(&mut next);
+    let result = fresh(&mut next);
+
+    let spans = |count: usize| vec![crate::common::source::Span::dummy(); count];
+    let entry_block = BasicBlock {
+        label: func.blocks[0].label,
+        instructions: vec![
+            Instruction::ParamRef { dest: n_param, param_idx: 0, ty: crate::common::types::IrType::I32 },
+            Instruction::ParamRef { dest: acc_param, param_idx: 1, ty: crate::common::types::IrType::I64 },
+            Instruction::Cmp {
+                dest: cond,
+                op: crate::ir::reexports::IrCmpOp::Sle,
+                lhs: Operand::Value(n_param),
+                rhs: Operand::Const(crate::ir::reexports::IrConst::I32(0)),
+                ty: crate::common::types::IrType::I32,
+            },
+        ],
+        terminator: Terminator::CondBranch { cond: Operand::Value(cond), true_label: base_label, false_label: formula_label },
+        source_spans: spans(3),
+    };
+    let base_block = BasicBlock {
+        label: base_label,
+        instructions: Vec::new(),
+        terminator: Terminator::Return(Some(Operand::Value(acc_param))),
+        source_spans: Vec::new(),
+    };
+    let formula_block = BasicBlock {
+        label: formula_label,
+        instructions: vec![
+            Instruction::Cast { dest: n64, src: Operand::Value(n_param), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 },
+            Instruction::BinOp { dest: n_plus_one, op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(n64), rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)), ty: crate::common::types::IrType::I64 },
+            Instruction::BinOp { dest: product, op: crate::ir::reexports::IrBinOp::Mul, lhs: Operand::Value(n64), rhs: Operand::Value(n_plus_one), ty: crate::common::types::IrType::I64 },
+            Instruction::BinOp { dest: half, op: crate::ir::reexports::IrBinOp::SDiv, lhs: Operand::Value(product), rhs: Operand::Const(crate::ir::reexports::IrConst::I64(2)), ty: crate::common::types::IrType::I64 },
+            Instruction::BinOp { dest: result, op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(acc_param), rhs: Operand::Value(half), ty: crate::common::types::IrType::I64 },
+        ],
+        terminator: Terminator::Return(Some(Operand::Value(result))),
+        source_spans: spans(5),
+    };
+    func.blocks = vec![entry_block, base_block, formula_block];
+    func.next_value_id = next;
+    func.next_label = formula_label.0.saturating_add(1);
+    func.param_alloca_values.clear();
+    1
+}
+
 /// Run tail-call-to-loop on a single function.
 /// Returns the number of tail calls eliminated (0 = no change).
 pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
@@ -821,5 +1014,21 @@ mod tests {
         let n = tail_calls_to_loops(&mut func);
         assert_eq!(n, 0, "non-tail call should not be eliminated");
         assert_eq!(func.blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_closed_form_tail_sum_after_tce() {
+        let mut func = make_sum_func();
+        if let Instruction::Cmp { op, .. } = &mut func.blocks[0].instructions[2] {
+            *op = IrCmpOp::Sle;
+        }
+        assert_eq!(tail_calls_to_loops(&mut func), 1);
+        assert_eq!(closed_form_tail_sum(&mut func), 1);
+        assert_eq!(func.blocks.len(), 3);
+        assert!(func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(inst, Instruction::BinOp { op: IrBinOp::SDiv, ty: IrType::I64, .. })
+            })
+        }));
     }
 }

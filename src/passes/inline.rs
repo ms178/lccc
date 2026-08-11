@@ -31,7 +31,13 @@ use crate::common::fx_hash::FxHashMap;
 const MAX_INLINE_INSTRUCTIONS: usize = 32;
 
 /// Separate cap for medium static helpers; caller budgets bound growth.
-const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 96;
+const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 160;
+/// Medium static helpers may contain a small loop nest. Keep this separate from
+/// the ordinary six-block limit: aggregate-producing helpers such as
+/// `make_group` need their loop CFG inlined before scalar cleanup can expose
+/// their hot arithmetic. The caller budget and caller-size caps remain the
+/// primary growth controls.
+const MAX_MEDIUM_STATIC_INLINE_BLOCKS: usize = 16;
 
 /// Cap for `static inline` functions whose bodies are dominated by SIMD vector
 /// intrinsics. Such functions (e.g. zlib-ng's compare256_avx2_static, ~70 IR
@@ -261,6 +267,13 @@ fn select_inline_site(
     let budget_exhausted = always_inline_budget_remaining == 0;
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
+        // Never use ordinary inlining for a recursive callee. A clone still
+        // contains the recursive call, so fixed-point cloning only inflates
+        // the caller and does not remove call overhead. Dedicated recursion
+        // transforms run before this post-structural phase.
+        if callee_data.is_recursive && !callee_data.is_always_inline {
+            continue;
+        }
         let callee_inst_count: usize = callee_data
             .blocks
             .iter()
@@ -317,6 +330,9 @@ fn select_inline_site(
     }
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
+        if callee_data.is_recursive && !callee_data.is_always_inline {
+            continue;
+        }
         let callee_inst_count: usize = callee_data
             .blocks
             .iter()
@@ -1284,6 +1300,11 @@ struct CalleeData {
     /// Whether this callee contains any back-edges (loops).
     /// Functions without loops can use a higher block limit for inlining.
     has_loops: bool,
+    /// Direct self-recursion. Normal inlining rejects these callees: after one
+    /// clone the recursive call remains in the caller and a fixed-point inliner
+    /// would keep cloning the body until the caller size cap. Recursive
+    /// specialization is a separate bounded transform.
+    is_recursive: bool,
     /// Whether this callee contains SIMD vector intrinsics (SSE/AVX/AVX2).
     /// Functions dominated by vector intrinsics are allowed a much larger
     /// static-inline budget: their standalone codegen is memory-bound, and
@@ -1424,6 +1445,15 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     .any(|succ| label_to_order.get(succ).map_or(false, |&j| j <= i))
             })
         };
+        let is_recursive = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Call { func: callee_name, .. }
+                        if callee_name == &func.name
+                )
+            })
+        });
         let is_small_static = func.is_static
             && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
@@ -1437,18 +1467,17 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // modpost flags a .text -> .init.text section mismatch.
         // These are treated as normal inline candidates (not exceeds_normal_limits)
         // since they fit within MAX_INLINE_INSTRUCTIONS/MAX_INLINE_BLOCKS.
-        let medium_block_limit = if has_loops {
+        let medium_block_limit = if func.is_static && !func.is_inline {
+            MAX_MEDIUM_STATIC_INLINE_BLOCKS
+        } else if has_loops {
             MAX_INLINE_BLOCKS
         } else {
             MAX_INLINE_BLOCKS_NO_LOOPS
         };
-        // ms178: allow medium-sized `static` (non-inline) callees up to 96 IR
-        // instructions. Hot leaf helpers like expat's sip_round (~85 instr, one
-        // loop) are 2-3x slower as calls because the from-scratch backend spills
-        // their state; inlining lets the caller keep SipHash state in registers.
-        // The per-caller budget (MAX_INLINE_BUDGET_PER_CALLER) and caller-size
-        // cap bound the code growth. (The 32-instr cap dates from a v2 tune that
-        // favored gzip .text; verified: gzip .text impact < 4% with this change.)
+        // Medium static callees up to MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
+        // instructions are admitted, including small loop CFGs. This exposes
+        // aggregate-return helpers such as make_group to scalar cleanup. The
+        // per-caller budget and caller-size cap remain the code-growth bounds.
         let is_medium_static = func.is_static
             && !func.is_inline
             && !is_small_static
@@ -1494,7 +1523,9 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // Non-loop callees get a higher block limit since their control flow
         // (if/else chains, switch, early returns) doesn't create nested loops
         // when inlined into a loop caller.
-        let effective_block_limit = if has_loops {
+        let effective_block_limit = if func.is_static && !func.is_inline {
+            MAX_MEDIUM_STATIC_INLINE_BLOCKS
+        } else if has_loops {
             MAX_INLINE_BLOCKS
         } else {
             MAX_INLINE_BLOCKS_NO_LOOPS
@@ -1593,6 +1624,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 exceeds_normal_limits: exceeds_normal,
                 is_static_inline: func.is_static && func.is_inline,
                 has_loops,
+                is_recursive,
                 has_vector_intrinsics: func_has_vector_intrinsics(func),
             },
         );
@@ -1913,8 +1945,63 @@ fn inline_call_site(
         }
     }
 
+    // The entry-block borrow is no longer used below; non-lexical lifetimes
+    // release it before the whole-block rewrite.
+    // Constant arguments can also flow directly through ParamRef values after
+    // structural transforms such as TCE. The older home-substitution path only
+    // rewrote loads from parameter allocas, leaving a ParamRef value undefined
+    // in phi incoming edges (tce_sum became zero after post-TCE inlining).
+    // Build a remapped ParamRef -> constant map and apply it to every operand
+    // and terminator before ParamRef instructions are removed below.
+    let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
+    for block in &inlined_blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef {
+                dest,
+                param_idx,
+                ty,
+            } = inst
+            {
+                // ParamRef is the immutable incoming parameter value. Its
+                // substitution is sound even when the callee also retains an
+                // address-taken parameter alloca; later stores affect the home,
+                // not this SSA incoming value. This also covers transformed
+                // callees (TCE/loop lowering) whose ParamRef has already been
+                // detached from its original alloca.
+                if *param_idx < site.args.len() {
+                    if let Operand::Const(arg_const) = site.args[*param_idx] {
+                        if const_ir_type(&arg_const) == Some(*ty) {
+                            paramref_subst.insert(dest.0, site.args[*param_idx]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !paramref_subst.is_empty() {
+        for block in &mut inlined_blocks {
+            for inst in &mut block.instructions {
+                inst.for_each_operand_mut(|op| {
+                    if let Operand::Value(v) = op {
+                        if let Some(&replacement) = paramref_subst.get(&v.0) {
+                            *op = replacement;
+                        }
+                    }
+                });
+            }
+            block.terminator.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if let Some(&replacement) = paramref_subst.get(&v.0) {
+                        *op = replacement;
+                    }
+                }
+            });
+        }
+    }
+
     // Insert stores/memcpys of arguments into param allocas at the beginning of the
     // entry block (after the allocas themselves)
+    let entry_block = &mut inlined_blocks[0];
     let mut insert_pos = 0;
     // Find position after all allocas in the entry block
     for (i, inst) in entry_block.instructions.iter().enumerate() {

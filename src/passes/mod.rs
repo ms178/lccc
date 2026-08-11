@@ -443,6 +443,12 @@ macro_rules! preloop_dump {
     if !disabled.contains("tce") {
         module.for_each_function(tail_call_elim::tail_calls_to_loops);
     }
+    // Collapse the canonical accumulator-sum loop after TCE. This is a
+    // semantics-preserving closed form for the strict int/long recurrence and
+    // removes O(n) work without touching arbitrary loops.
+    if !disabled.contains("tail_sum_formula") {
+        module.for_each_function(tail_call_elim::closed_form_tail_sum);
+    }
     preloop_dump!("tce");
 
     // Binary recursion → iterative accumulator (e.g., Fibonacci).
@@ -451,6 +457,25 @@ macro_rules! preloop_dump {
         module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
     preloop_dump!("rec2iter");
+
+    // Post-structural inlining: TCE and recursion-to-iteration can turn a
+    // previously recursive static helper into a small, ordinary loop. A second
+    // bounded inlining pass exposes constant call arguments and lets the scalar
+    // cleanup pipeline fold the caller (e.g. tce_sum's sum(10_000_000, 0)).
+    // This is intentionally after the recursion transforms: doing it before
+    // them would either reject the recursive callee or clone the call tree.
+    if !disabled.contains("postinline") {
+        inline::run(module);
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        simplify::run(module);
+        module.for_each_function(cfg_simplify::run_function);
+        module.for_each_function(dce::eliminate_dead_code);
+        copy_prop::forward_memcpy_chains(module);
+        copy_prop::forward_large_memcpy_loads(module);
+    }
+    preloop_dump!("post-structural-inline");
 
     let iterations = 3;
     let num_funcs = module.functions.len();
