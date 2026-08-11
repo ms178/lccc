@@ -321,6 +321,8 @@ pub enum IntrinsicOp {
     Pminub128,
     /// Packed variable blend bytes (PBLENDVB, SSE4.1)
     Pblendvb128,
+    /// Packed blend 16-bit words with immediate (PBLENDW, SSE4.1)
+    Pblendw128,
     /// Packed zero-extend 8-bit to 16-bit (PMOVZXBW, SSE4.1)
     Pmovzxbw128,
     /// Packed zero-extend 16-bit to 32-bit (PMOVZXWD, SSE4.1)
@@ -504,7 +506,7 @@ impl IntrinsicOp {
             | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
             | Psubusw128 | Psadbw128 | Pmullw128 | Pmaddubsw128 | Phaddw128
             | Phaddd128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
-            | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pmovzxbw128
+            | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pblendw128 | Pmovzxbw128
             | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
             | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
             | Psradi128 | Pslldi128 | Psrldi128 | Paddd128 | Psubd128

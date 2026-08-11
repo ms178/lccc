@@ -434,6 +434,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pabsw128 | BuiltinIntrinsic::X86Pabsd128
             | BuiltinIntrinsic::X86Palignr128 | BuiltinIntrinsic::X86Pmaxub128
             | BuiltinIntrinsic::X86Pminub128 | BuiltinIntrinsic::X86Pblendvb128
+            | BuiltinIntrinsic::X86Pblendw128
             | BuiltinIntrinsic::X86Pmovzxbw128 | BuiltinIntrinsic::X86Pmovzxwd128
             | BuiltinIntrinsic::X86Psllw128 | BuiltinIntrinsic::X86Psrlw128
             | BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Storeu256
@@ -997,6 +998,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmaxub128 => IntrinsicOp::Pmaxub128,
         BuiltinIntrinsic::X86Pminub128 => IntrinsicOp::Pminub128,
         BuiltinIntrinsic::X86Pblendvb128 => IntrinsicOp::Pblendvb128,
+        BuiltinIntrinsic::X86Pblendw128 => IntrinsicOp::Pblendw128,
         BuiltinIntrinsic::X86Pmovzxbw128 => IntrinsicOp::Pmovzxbw128,
         BuiltinIntrinsic::X86Pmovzxwd128 => IntrinsicOp::Pmovzxwd128,
         BuiltinIntrinsic::X86Psllw128 => IntrinsicOp::Psllw128,
