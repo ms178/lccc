@@ -140,11 +140,15 @@ fn reduce_loop(
     preds: &analysis::FlatAdj,
 ) -> usize {
     let header = natural_loop.header;
+    let dbg = std::env::var("CCC_IVSR_DEBUG").is_ok();
 
     // Find the preheader (single predecessor outside the loop)
     let preheader = match loop_analysis::find_preheader(header, &natural_loop.body, preds) {
         Some(ph) => ph,
-        None => return 0,
+        None => {
+            if dbg { eprintln!("[IVSR] header={} no preheader", header); }
+            return 0;
+        }
     };
 
     // Find back-edge blocks (predecessors of header that are inside the loop)
@@ -156,20 +160,25 @@ fn reduce_loop(
 
     // Only handle simple single-latch loops
     if back_blocks.len() != 1 {
+        if dbg { eprintln!("[IVSR] header={} back_blocks={}", header, back_blocks.len()); }
         return 0;
     }
 
     // Step 1: Identify basic induction variables from phi nodes in the header.
     let basic_ivs = find_basic_ivs(func, header, &natural_loop.body, preheader, &back_blocks);
     if basic_ivs.is_empty() {
+        if dbg { eprintln!("[IVSR] header={} no basic ivs", header); }
         return 0;
     }
+    if dbg { eprintln!("[IVSR] header={} ivs={}", header, basic_ivs.len()); }
 
     // Step 2: Find derived expressions (iv * const) used in GEPs.
     let derived = find_derived_exprs(func, &basic_ivs, &natural_loop.body);
     if derived.is_empty() {
+        if dbg { eprintln!("[IVSR] header={} no derived exprs", header); }
         return 0;
     }
+    if dbg { eprintln!("[IVSR] header={} derived={}", header, derived.len()); }
 
     // Step 3: Apply strength reduction transformations.
     let mut reductions = 0;
@@ -565,6 +574,11 @@ fn find_derived_exprs(
     let find_iv = |val_id: u32| -> Option<usize> {
         iv_values.get(&val_id).or_else(|| iv_derived.get(&val_id)).copied()
     };
+    if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+        let mut d: Vec<u32> = iv_derived.keys().copied().collect();
+        d.sort_unstable();
+        eprintln!("[IVSR-DERIV] iv_values={:?} iv_derived={:?}", iv_values.keys().collect::<Vec<_>>(), d);
+    }
 
     // Find multiplications/shifts of IV values by constants
     for &bi in loop_body {
@@ -572,6 +586,12 @@ fn find_derived_exprs(
             continue;
         }
         for inst in func.blocks[bi].instructions.iter() {
+            if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+                eprintln!("[IVSR-DERIV] b{} label={} inst={:?}", bi, func.blocks[bi].label.0, std::mem::discriminant(inst));
+                if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
+                    eprintln!("[IVSR-DERIV] b{} label={} BinOp v{} op={:?} lhs={:?} rhs={:?}", bi, func.blocks[bi].label.0, dest.0, op, lhs, rhs);
+                }
+            }
             let (mul_dest, iv_idx, stride) = match inst {
                 // Multiply by constant
                 Instruction::BinOp {
@@ -596,6 +616,29 @@ fn find_derived_exprs(
                     if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
                         if (0..64).contains(&shift) {
                             (*dest, idx, 1i64 << shift)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                // Add of a value with itself: %x = add %v, %v  ==  %v * 2.
+                // The frontend/GVN pipeline canonically folds `i * 2` into
+                // `i + i` BEFORE IVSR runs, so the Mul/Shl arms above never
+                // see the common stride-2 case (fill_window's prev[]/head[]
+                // loops were not strength-reduced at all — measured 13
+                // instructions per element vs GCC's 7).
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(l),
+                    rhs: Operand::Value(r),
+                    ..
+                } => {
+                    if l.0 == r.0 {
+                        if let Some(idx) = find_iv(l.0) {
+                            (*dest, idx, 2)
                         } else {
                             continue;
                         }
@@ -640,6 +683,8 @@ fn find_derived_exprs(
                     iv_index: iv_idx,
                     gep_uses,
                 });
+            } else if std::env::var("CCC_IVSR_DEBUG").is_ok() {
+                eprintln!("[IVSR-DERIV] mul v{} stride {} has no GEP uses", mul_dest.0, stride);
             }
         }
     }

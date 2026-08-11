@@ -96,27 +96,32 @@ impl super::InstructionEncoder {
                         self.bytes.extend_from_slice(&val.to_le_bytes());
                     }
                 } else if size == 4 {
-                    if needs_rex_ext(&dst.name) {
+                    // Prefer the B8+rd id form (no modrm byte) — matches GAS
+                    // and is 1 byte shorter than C7 /0 for r8-r15.
+                    let b = needs_rex_ext(&dst.name);
+                    if b {
                         self.bytes.push(self.rex(false, false, false, true));
                     }
-                    self.bytes.push(0xC7);
-                    self.bytes.push(self.modrm(3, 0, dst_num));
+                    self.bytes.push(0xB8 + (dst_num & 7));
                     self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
                 } else if size == 2 {
+                    // 66 B8+rd iw (matches GAS; avoids the modrm byte).
                     self.bytes.push(0x66); // operand size prefix
-                    if needs_rex_ext(&dst.name) {
+                    let b = needs_rex_ext(&dst.name);
+                    if b {
                         self.bytes.push(self.rex(false, false, false, true));
                     }
-                    self.bytes.push(0xC7);
-                    self.bytes.push(self.modrm(3, 0, dst_num));
+                    self.bytes.push(0xB8 + (dst_num & 7));
                     self.bytes.extend_from_slice(&(val as i16).to_le_bytes());
                 } else {
-                    // 8-bit
-                    if needs_rex_ext(&dst.name) || is_rex_required_8bit(&dst.name) {
-                        self.bytes.push(self.rex(false, false, false, needs_rex_ext(&dst.name)));
+                    // 8-bit: B0+r8 ib is 2 bytes (vs 3 for C6 /0) for
+                    // AL/CL/DL/BL; with REX it matches C6 length. Matches GAS.
+                    if needs_rex_ext(&dst.name) {
+                        self.bytes.push(self.rex(false, false, false, true));
+                        self.bytes.push(0xB0 + (dst_num & 7));
+                    } else {
+                        self.bytes.push(0xB0 + (dst_num & 7));
                     }
-                    self.bytes.push(0xC6);
-                    self.bytes.push(self.modrm(3, 0, dst_num));
                     self.bytes.push(val as u8);
                 }
             }
@@ -458,12 +463,25 @@ impl super::InstructionEncoder {
                 self.emit_rex_unary(size, &dst.name);
 
                 if size == 1 {
-                    // 8-bit ALU with imm8
-                    self.bytes.push(0x80);
-                    self.bytes.push(self.modrm(3, alu_op, dst_num));
-                    self.bytes.push(val as u8);
-                } else if (-128..=127).contains(&val) {
-                    // Sign-extended imm8
+                    // 8-bit ALU with imm8. Prefer the AL short form
+                    // (04+op*8 ib, 2 bytes) when the destination is AL —
+                    // matches GAS (e.g. `and $0x80,%al` → `24 80`, not
+                    // `80 e0 80`).
+                    if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                        self.bytes.push(0x04 + alu_op * 8);
+                        self.bytes.push(val as u8);
+                    } else {
+                        self.bytes.push(0x80);
+                        self.bytes.push(self.modrm(3, alu_op, dst_num));
+                        self.bytes.push(val as u8);
+                    }
+                } else if (-128..=127).contains(&val)
+                    || (size <= 4 && (-128..=127).contains(&(val as i32 as i64)))
+                {
+                    // Sign-extended imm8. For 32-bit operands, values whose
+                    // low 32 bits fit in a signed imm8 (e.g. 0xffffffff == -1)
+                    // use the 3-byte 83 form — matches GAS (cmp $0xffffffff,
+                    // %r10d → 41 83 fa ff, not the 7-byte 81 form).
                     self.bytes.push(0x83);
                     self.bytes.push(self.modrm(3, alu_op, dst_num));
                     self.bytes.push(val as u8);

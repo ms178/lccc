@@ -5,13 +5,23 @@ use crate::common::types::IrType;
 use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, is_xmm_reg};
 
 impl X86Codegen {
+    /// GOTPCREL references must use the BASE symbol name: for a versioned
+    /// symbol (`printf@GLIBC_2.2.5`, bound by a `.symver` directive) GAS 2.47
+    /// rejects `sym@ver@GOTPCREL` ("junk after expression") — GCC emits
+    /// `sym@GOTPCREL` and the linker resolves the version. Splitting at the
+    /// first '@' yields the base name; ELF symbol names cannot contain '@'.
+    fn got_name<'a>(&self, name: &'a str) -> &'a str {
+        name.split('@').next().unwrap_or(name)
+    }
+
     pub(super) fn emit_global_addr_impl(&mut self, dest: &Value, name: &str) {
         // Register-direct: emit directly to dest register, skip %rax relay.
         if let Some(d_reg) = self.dest_reg(dest) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name(d_reg);
                 if self.state.needs_got_for_addr(name) {
-                    self.state.emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", name, d_name));
+                    let n = self.got_name(name);
+                    self.state.emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, d_name));
                 } else {
                     self.state.out.emit_instr_sym_base_reg("    leaq", name, "rip", d_name);
                 }
@@ -20,7 +30,8 @@ impl X86Codegen {
             }
         }
         if self.state.needs_got_for_addr(name) {
-            self.state.emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %rax", name));
+            let n = self.got_name(name);
+            self.state.emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %rax", n));
         } else {
             self.state.out.emit_instr_sym_base_reg("    leaq", name, "rip", "rax");
         }

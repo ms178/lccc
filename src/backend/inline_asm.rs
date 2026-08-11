@@ -475,7 +475,28 @@ pub fn emit_inline_asm_common_impl(
             continue;
         }
         let resolved = emitter.substitute_template_line(line, &operands, &gcc_to_internal, operand_types, goto_labels);
-        emitter.asm_state().emit_fmt(format_args!("    {}", resolved));
+        // Strip GNU-as mnemonic hint prefixes (glibc math uses `%vstmxcsr` /
+        // `%vldmxcsr` and `%xbegin`): GCC removes the `%v`/`%x` when emitting
+        // the assembly; GAS 2.47 rejects them in the final .s (GAS-oracle:
+        // "junk after expression"). `%x` is kept when it starts a register
+        // (%xmm0..); no register name starts with `%v`.
+        let stripped = if resolved.starts_with("%v") {
+            resolved.replacen("%v", "", 1)
+        } else if resolved.starts_with("%x") && !resolved.starts_with("%xmm") && !resolved.starts_with("%ymm") {
+            resolved.replacen("%x", "", 1)
+        } else {
+            resolved
+        };
+        // setcc instructions require an 8-bit destination register. GCC
+        // substitutes the low-8 name for "=r" outputs (glibc's x87 compare
+        // idioms: `fnstsw %ax; ...; sete %0` with "=r"); GAS 2.47 rejects a
+        // 64-bit name (or, worse, EVEX-encodes it as APX `setzue`).
+        let final_line = if is_setcc_line(&stripped) {
+            to_8bit_setcc_dest(&stripped)
+        } else {
+            stripped
+        };
+        emitter.asm_state().emit_fmt(format_args!("    {}", final_line));
     }
 
     // Phase 4: Store output register values back to their stack slots
@@ -1186,4 +1207,55 @@ fn x86_normalize_reg_to_64bit(name: &str) -> Option<Cow<'static, str>> {
             }
         }
     }
+}
+
+/// True if the (already-substituted) inline-asm line is a setcc instruction.
+fn is_setcc_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("sete ") || t.starts_with("setne ") || t.starts_with("setl ")
+        || t.starts_with("setle ") || t.starts_with("setg ") || t.starts_with("setge ")
+        || t.starts_with("seta ") || t.starts_with("setae ") || t.starts_with("setb ")
+        || t.starts_with("setbe ") || t.starts_with("sets ") || t.starts_with("setns ")
+        || t.starts_with("seto ") || t.starts_with("setno ") || t.starts_with("setp ")
+        || t.starts_with("setnp ")
+}
+
+/// Rewrite a setcc line's destination register to its 8-bit name
+/// (rax→al, rcx→cl, ..., r8→r8b, ...), matching GCC's output for "=r"
+/// constraints. setcc has exactly one register operand.
+fn to_8bit_setcc_dest(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find('%') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let reg = &after[..name_len];
+        let low8 = match reg {
+            "rax" | "eax" | "ax" | "al" => "al",
+            "rcx" | "ecx" | "cx" | "cl" => "cl",
+            "rdx" | "edx" | "dx" | "dl" => "dl",
+            "rbx" | "ebx" | "bx" | "bl" => "bl",
+            "rsi" | "esi" | "si" | "sil" => "sil",
+            "rdi" | "edi" | "di" | "dil" => "dil",
+            "rbp" | "ebp" | "bp" | "bpl" => "bpl",
+            "rsp" | "esp" | "sp" | "spl" => "spl",
+            "r8" | "r8d" | "r8w" | "r8b" => "r8b",
+            "r9" | "r9d" | "r9w" | "r9b" => "r9b",
+            "r10" | "r10d" | "r10w" | "r10b" => "r10b",
+            "r11" | "r11d" | "r11w" | "r11b" => "r11b",
+            "r12" | "r12d" | "r12w" | "r12b" => "r12b",
+            "r13" | "r13d" | "r13w" | "r13b" => "r13b",
+            "r14" | "r14d" | "r14w" | "r14b" => "r14b",
+            "r15" | "r15d" | "r15w" | "r15b" => "r15b",
+            _ => reg,
+        };
+        out.push('%');
+        out.push_str(low8);
+        rest = &after[name_len..];
+    }
+    out.push_str(rest);
+    out
 }

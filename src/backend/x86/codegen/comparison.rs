@@ -104,6 +104,14 @@ impl X86Codegen {
         rhs: &Operand,
         ty: IrType,
     ) {
+        // COMPARE-REPLAY: the Cmp's single use is a non-adjacent Select or
+        // CondBranch (recorded in cmp_replay). Skip the ENTIRE instruction —
+        // including the cmp itself — because the consumer re-emits the
+        // comparison from the recorded operands right before its cmov/jcc.
+        // Emitting the cmp here too would double the compare in the hot loop.
+        if self.cmp_replay.contains_key(&dest.0) {
+            return;
+        }
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
 
@@ -289,6 +297,18 @@ impl X86Codegen {
         None
     }
 
+    /// If `cond` is the destination of a Cmp eligible for compare-replay,
+    /// consume the replay record (op + operands) so the consumer can re-emit
+    /// the comparison and use cmovcc/jcc directly.
+    fn take_replay_cmp(&mut self, cond: &Operand) -> Option<(IrCmpOp, Operand, Operand, IrType)> {
+        if let Operand::Value(v) = cond {
+            if let Some(rec) = self.cmp_replay.remove(&v.0) {
+                return Some(rec);
+            }
+        }
+        None
+    }
+
     #[inline]
     fn invert_jcc(cc: &str) -> &'static str {
         match cc {
@@ -323,6 +343,28 @@ impl X86Codegen {
         // preceding Cmp; its flags are live — branch on them directly,
         // skipping the testq of the materialized boolean.
         if let Some(op) = self.take_pending_cmp(cond) {
+            let jcc = Self::cmp_jcc(op);
+            if true_fallthrough {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc, true_block.0);
+                if !false_fallthrough {
+                    self.state.out.emit_jmp_block(false_block.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // COMPARE-REPLAY: non-adjacent Cmp consumed by this branch. Re-emit
+        // the comparison (fresh flags) and branch on the condition code
+        // directly — kills the setcc/movzbl + testq chain per branch.
+        if let Some((op, lhs, rhs, ty)) = self.take_replay_cmp(cond) {
+            self.state.reg_cache.invalidate_acc();
+            let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+            self.emit_int_cmp_insn_typed(&lhs, &rhs, use_32bit);
             let jcc = Self::cmp_jcc(op);
             if true_fallthrough {
                 self.state
@@ -573,19 +615,32 @@ impl X86Codegen {
         // preceding Cmp whose flags are live — use the comparison's condition
         // code directly for the cmov, no test needed.
         let fused_op = self.take_pending_cmp(cond);
+        // COMPARE-REPLAY: the condition is a Cmp result consumed only by this
+        // select but not adjacent to the Cmp (flags clobbered in between).
+        // Re-emit the comparison from the recorded operands right before the
+        // cmov; the flags are then fresh. The accumulator cache is invalidated
+        // first so re-materialized operands are always reloaded from their
+        // canonical locations.
+        let replay_op = self.take_replay_cmp(cond);
+        if let Some((op, lhs, rhs, ty)) = &replay_op {
+            self.state.reg_cache.invalidate_acc();
+            let use_32bit = *ty == IrType::I32 || *ty == IrType::U32;
+            self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
+        }
         // Test the condition in place (no pushfq). Only when the condition is
         // not directly testable (rare) do we fall back to the legacy
         // materialize + pushfq/popfq path.
         let tested_in_place = if std::env::var("CCC_NO_INPLACE_SELECT").is_ok() {
             false
-        } else if fused_op.is_some() {
+        } else if fused_op.is_some() || replay_op.is_some() {
             true
         } else {
             self.test_select_cond_in_place(cond)
         };
-        let cmov_cc = match fused_op {
-            Some(op) => Self::cmp_cmov(op),
-            None => "ne",
+        let cmov_cc = match (fused_op, replay_op.as_ref()) {
+            (Some(op), _) => Self::cmp_cmov(op),
+            (None, Some((op, _, _, _))) => Self::cmp_cmov(*op),
+            (None, None) => "ne",
         };
 
         // Register-direct: when dest has a register, operate directly on it.
@@ -605,14 +660,43 @@ impl X86Codegen {
                     // All materialization is flag-neutral (select_operand_to_reg
                     // avoids `xorl` for zero constants, which would clobber the
                     // flags between the test and the cmov).
-                    self.select_operand_to_reg(true_val, "rcx", "ecx");
-                    self.select_operand_to_reg(
-                        false_val,
-                        phys_reg_name(d_reg),
-                        phys_reg_name_32(d_reg),
-                    );
-                    self.state
-                        .emit_fmt(format_args!("    cmov{}q %rcx, %{}", cmov_cc, d_name));
+                    //
+                    // Direct-cmov: when the true value already lives in a
+                    // (non-XMM, non-dest) register, emit `cmovcc %src, %dest`
+                    // straight from it — skipping the dead `movq %src, %rcx`
+                    // staging copy (fill_window's prev[] loop had one per
+                    // element). The rcx staging is only needed when true_val
+                    // aliases dest or isn't register-resident.
+                    let true_src_reg = match true_val {
+                        Operand::Value(v) => self
+                            .reg_assignments
+                            .get(&v.0)
+                            .copied()
+                            .filter(|r| !is_xmm_reg(*r) && *r != d_reg),
+                        _ => None,
+                    };
+                    if let Some(src_reg) = true_src_reg {
+                        self.select_operand_to_reg(
+                            false_val,
+                            phys_reg_name(d_reg),
+                            phys_reg_name_32(d_reg),
+                        );
+                        self.state.emit_fmt(format_args!(
+                            "    cmov{}q %{}, %{}",
+                            cmov_cc,
+                            phys_reg_name(src_reg),
+                            d_name
+                        ));
+                    } else {
+                        self.select_operand_to_reg(true_val, "rcx", "ecx");
+                        self.select_operand_to_reg(
+                            false_val,
+                            phys_reg_name(d_reg),
+                            phys_reg_name_32(d_reg),
+                        );
+                        self.state
+                            .emit_fmt(format_args!("    cmov{}q %rcx, %{}", cmov_cc, d_name));
+                    }
                     self.state.reg_cache.invalidate_acc();
                     return;
                 }

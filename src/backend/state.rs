@@ -12,7 +12,7 @@
 use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::BlockId;
+use crate::ir::reexports::{BlockId, IrCmpOp, Operand};
 
 /// Stack slot location for a value. Interpretation varies by arch:
 /// - x86: negative offset from %rbp
@@ -202,6 +202,13 @@ pub struct CodegenState {
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
+    /// Compare-replay records: Cmp instructions whose boolean result is
+    /// consumed by exactly one Select or CondBranch that is NOT adjacent to
+    /// the Cmp (so pending-flag fusion cannot fire — an intervening ALU op
+    /// like `sub` clobbers the flags). The Cmp emitter skips setcc/movzbl;
+    /// the consumer re-emits `cmp` from the recorded operands and uses
+    /// `cmovcc`/`jcc` directly. Recorded per-function, keyed by Cmp dest.
+    pub cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
     /// Symbols defined by numeric `.set sym, <number>` directives in top-level
     /// asm (glibc-style absolute markers). Their address is a link-time
     /// constant: emitted as `movq $sym`, never via GOT.
@@ -385,6 +392,7 @@ impl CodegenState {
             label_counter: 0,
             pic_mode: false,
             local_symbols: FxHashSet::default(),
+            cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
             has_dyn_alloca: false,
