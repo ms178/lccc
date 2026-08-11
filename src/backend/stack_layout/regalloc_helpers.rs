@@ -75,11 +75,16 @@ pub fn run_regalloc_and_merge_clobbers(
     // The mature accumulator backend has a complete stack path for scalar FP,
     // while its XMM location contract is not yet unified with aggregate memcpy
     // and intrinsic producers. For ordinary scalar-FP functions, stack-backed
-    // values avoid XMM↔GPR relays and are measurably faster. Keep XMM allocation
-    // for aggregate/vector functions until their location model is migrated as
-    // one unit; this is a function-shape decision, not a benchmark-name switch.
+    // values were observed to avoid XMM↔GPR relays and be faster in some
+    // microbenchmarks, but the stack path has a correctness bug (nbody O2
+    // miscompile: LCCC O2 outputs -0.321 vs GCC -0.169, while O0 and XMM O2 are
+    // correct).  The XMM path is correct and must be the default until the
+    // stack bug is root-caused.  Keep the environment escape hatch for
+    // experiments: CCC_DISABLE_SCALAR_FP_XMM=1 forces stack path, and
+    // CCC_ENABLE_SCALAR_FP_XMM=1 (legacy) also enables XMM.
     let disable_scalar_fp_xmm = has_scalar_fp
         && !has_memcpy_or_vector_intrinsic
+        && std::env::var("CCC_DISABLE_SCALAR_FP_XMM").is_ok()
         && std::env::var("CCC_ENABLE_SCALAR_FP_XMM").is_err();
     let xmm_regs = if available_regs.iter().any(|r| r.0 == 1)
         && std::env::var("CCC_NO_XMM_REGALLOC").is_err()

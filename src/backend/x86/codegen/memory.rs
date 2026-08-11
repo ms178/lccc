@@ -1227,42 +1227,79 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
-        // ms178: small fixed-size copies use direct register moves instead of
-        // rep movsb (which costs a 3-cycle rep prefix + rcx setup + rdi/rsi
-        // clobbers). rdi/rsi already point at dest/src (set by the caller's
-        // emit_memcpy_load_dest_addr / emit_memcpy_load_src_addr), so a
-        // single movdqu/movq/movl round-trip is both smaller and faster, and
-        // only clobbers xmm0 (never rdi/rsi/rcx, which some surrounding
-        // codegen still needs).
-        match size {
-            32 => {
-                self.state.emit("    vmovdqu (%rsi), %ymm0");
-                self.state.emit("    vmovdqu %ymm0, (%rdi)");
+        if size <= 64 {
+            let mut offset = 0usize;
+            let mut remaining = size;
+            while remaining > 0 {
+                if remaining >= 32 {
+                    if offset == 0 {
+                        self.state.emit("    movdqu (%rsi), %xmm0");
+                        self.state.emit("    movdqu %xmm0, (%rdi)");
+                        self.state.emit("    movdqu 16(%rsi), %xmm0");
+                        self.state.emit("    movdqu %xmm0, 16(%rdi)");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
+                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
+                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset+16));
+                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset+16));
+                    }
+                    offset += 32;
+                    remaining -= 32;
+                } else if remaining >= 16 {
+                    if offset == 0 {
+                        self.state.emit("    movdqu (%rsi), %xmm0");
+                        self.state.emit("    movdqu %xmm0, (%rdi)");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
+                        self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
+                    }
+                    offset += 16;
+                    remaining -= 16;
+                } else if remaining >= 8 {
+                    if offset == 0 {
+                        self.state.emit("    movq (%rsi), %rax");
+                        self.state.emit("    movq %rax, (%rdi)");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq {}(%rsi), %rax", offset));
+                        self.state.emit_fmt(format_args!("    movq %rax, {}(%rdi)", offset));
+                    }
+                    offset += 8;
+                    remaining -= 8;
+                } else if remaining >= 4 {
+                    if offset == 0 {
+                        self.state.emit("    movl (%rsi), %eax");
+                        self.state.emit("    movl %eax, (%rdi)");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movl {}(%rsi), %eax", offset));
+                        self.state.emit_fmt(format_args!("    movl %eax, {}(%rdi)", offset));
+                    }
+                    offset += 4;
+                    remaining -= 4;
+                } else if remaining >= 2 {
+                    if offset == 0 {
+                        self.state.emit("    movw (%rsi), %ax");
+                        self.state.emit("    movw %ax, (%rdi)");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movw {}(%rsi), %ax", offset));
+                        self.state.emit_fmt(format_args!("    movw %ax, {}(%rdi)", offset));
+                    }
+                    offset += 2;
+                    remaining -= 2;
+                } else {
+                    if offset == 0 {
+                        self.state.emit("    movb (%rsi), %al");
+                        self.state.emit("    movb %al, (%rdi)");
+                    } else {
+                        self.state.emit_fmt(format_args!("    movb {}(%rsi), %al", offset));
+                        self.state.emit_fmt(format_args!("    movb %al, {}(%rdi)", offset));
+                    }
+                    offset += 1;
+                    remaining -= 1;
+                }
             }
-            16 => {
-                self.state.emit("    movdqu (%rsi), %xmm0");
-                self.state.emit("    movdqu %xmm0, (%rdi)");
-            }
-            8 => {
-                self.state.emit("    movq (%rsi), %rax");
-                self.state.emit("    movq %rax, (%rdi)");
-            }
-            4 => {
-                self.state.emit("    movl (%rsi), %eax");
-                self.state.emit("    movl %eax, (%rdi)");
-            }
-            2 => {
-                self.state.emit("    movw (%rsi), %ax");
-                self.state.emit("    movw %ax, (%rdi)");
-            }
-            1 => {
-                self.state.emit("    movb (%rsi), %al");
-                self.state.emit("    movb %al, (%rdi)");
-            }
-            _ => {
-                self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
-                self.state.emit("    rep movsb");
-            }
+        } else {
+            self.state.out.emit_instr_imm_reg("    movq", size as i64, "rcx");
+            self.state.emit("    rep movsb");
         }
     }
 
