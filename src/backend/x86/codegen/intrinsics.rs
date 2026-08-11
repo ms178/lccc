@@ -1053,6 +1053,18 @@ impl X86Codegen {
                     self.sse_store_dest(dptr, "xmm2");
                 }
             }
+            // PBLENDW: packed 16-bit blend with immediate mask.
+            // _mm_blend_epi16(a, b, imm8) → pblendw $imm8, b, a
+            IntrinsicOp::Pblendw128 => {
+                if let Some(dptr) = dest_ptr {
+                    // args = [a, b, imm8]; result = blend words per imm8 bits
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.sse_load_arg(&args[1], "xmm1");
+                    let imm = self.operand_to_imm_i64(&args[2]);
+                    self.state.emit_fmt(format_args!("    pblendw ${}, %xmm1, %xmm0", imm));
+                    self.sse_store_dest(dptr, "xmm0");
+                }
+            }
             // SSE2 binary 128-bit operations
             IntrinsicOp::Paddw128 | IntrinsicOp::Psubw128 | IntrinsicOp::Pmulhw128
             | IntrinsicOp::Pmullw128

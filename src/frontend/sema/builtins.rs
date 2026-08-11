@@ -533,6 +533,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("_mm_max_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxub128));
     m.insert("_mm_min_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminub128));
     m.insert("_mm_blendv_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pblendvb128));
+    m.insert("_mm_blend_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pblendw128));
     m.insert("_mm_cvtepu8_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxbw128));
     m.insert("_mm_cvtepu16_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxwd128));
     m.insert("_mm_sll_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllw128));
@@ -960,6 +961,7 @@ pub enum BuiltinIntrinsic {
     X86Pmaxub128,      // _mm_max_epu8 (PMAXUB)
     X86Pminub128,      // _mm_min_epu8 (PMINUB)
     X86Pblendvb128,    // _mm_blendv_epi8 (PBLENDVB, SSE4.1)
+    X86Pblendw128,     // _mm_blend_epi16 (PBLENDW, SSE4.1)
     X86Pmovzxbw128,    // _mm_cvtepu8_epi16 (PMOVZXBW, SSE4.1)
     X86Pmovzxwd128,    // _mm_cvtepu16_epi32 (PMOVZXWD, SSE4.1)
     X86Psllw128,       // _mm_sll_epi16 (PSLLW variable)

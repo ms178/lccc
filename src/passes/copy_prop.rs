@@ -88,6 +88,19 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                         }
                         _ => {}
                     }
+                    // SOUNDNESS: if the source location `src` is modified between
+                    // the two memcpys, forwarding would read stale data.  Check
+                    // for stores/memcpys/intrinsics that write to `src`.
+                    // Without this, zlib-ng's fold_1 pattern
+                    //   x_tmp3 = *c3; *c3 = *c0; ... *c2 = x_tmp3;
+                    // was miscompiled: x_tmp3 was forwarded to re-read *c3,
+                    // but *c3 had already been overwritten by *c0.
+                    match inst {
+                        Instruction::Store { ptr, .. } if *ptr == src => { safe = false; break; }
+                        Instruction::Memcpy { dest, .. } if *dest == src => { safe = false; break; }
+                        Instruction::Intrinsic { dest_ptr: Some(dp), .. } if *dp == src => { safe = false; break; }
+                        _ => {}
+                    }
                 }
                 let Some(consumer) = consumer else { i += 1; continue; };
                 if !safe { i += 1; continue; }

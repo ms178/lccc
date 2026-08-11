@@ -1182,7 +1182,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::Pblendvb128
+        O::Pblendvb128 | O::Pblendw128
             | O::Loadldi128
             | O::Storeldi128
             | O::FmaF64x2
@@ -1507,7 +1507,7 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                 .position(|a| matches!(a, Operand::Value(v) if v.0 == slot))
                 .unwrap_or(usize::MAX);
             let cache_aware = if pos == 0 {
-                !is_raw_reader_intrinsic(cop) && !matches!(cop, IntrinsicOp::Pblendvb128)
+                !is_raw_reader_intrinsic(cop) && !matches!(cop, IntrinsicOp::Pblendvb128 | IntrinsicOp::Pblendw128)
             } else {
                 is_two_operand_binary(cop)
             };
