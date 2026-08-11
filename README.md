@@ -24,6 +24,10 @@ MIT OR Apache-2.0 OR BSD-2-Clause (your choice). See `LICENSE-MIT`, `LICENSE-APA
 **CCC-derived code** (frontend, SSA IR, optimizer, backends, assembler, linker) —
 CC0 1.0 Universal (public domain). CCC was released as CC0 by Anthropic.
 
+**Workload-derived benchmark kernels** — retain the per-file upstream license
+and provenance (for example GPL/LGPL/MIT/Zlib/public-domain material); they
+are documented in [`tests/benchmark/WORKLOAD_PROVENANCE.md`](tests/benchmark/WORKLOAD_PROVENANCE.md).
+
 See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
 
 # LCCC Performance Report

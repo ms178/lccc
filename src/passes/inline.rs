@@ -39,6 +39,22 @@ const MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS: usize = 160;
 /// primary growth controls.
 const MAX_MEDIUM_STATIC_INLINE_BLOCKS: usize = 16;
 
+/// A static helper containing a loop can still be a profitable inline candidate
+/// when it is small enough to fit the caller cap.  Keeping this separate from
+/// the generic 6-block loop cap avoids admitting arbitrary externally-visible
+/// loop bodies, while allowing internal checksum/parser kernels to expose
+/// constant arguments and post-inline simplification.
+///
+/// There are two tiers. Tiny loop helpers are cheap enough to clone freely.
+/// Larger loop helpers may be cloned at no more than two direct call sites;
+/// this retains constant-argument specialization for checksum kernels while
+/// preventing medium-sized search loops from duplicating into every caller.
+const MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 40;
+const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
+const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
+const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
+const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
+
 /// Cap for `static inline` functions whose bodies are dominated by SIMD vector
 /// intrinsics. Such functions (e.g. zlib-ng's compare256_avx2_static, ~70 IR
 /// instructions, 10 blocks) are pathological when NOT inlined: the from-scratch
@@ -58,7 +74,12 @@ const MAX_INLINE_BLOCKS: usize = 6;
 /// Functions with if/else chains, switch statements, or early returns can
 /// have many blocks without loops. These are safe to inline more aggressively
 /// since they don't create nested loop structures that overwhelm codegen.
-const MAX_INLINE_BLOCKS_NO_LOOPS: usize = 12;
+///
+/// 16 is an experimental threshold: Expat's tiny `xml_name_start` predicate
+/// lowers to 13 acyclic blocks despite being a single source expression.  The
+/// benchmark/hotspot suite validates whether admitting this class improves
+/// generated code without unacceptable broad code-growth.
+const MAX_INLINE_BLOCKS_NO_LOOPS: usize = 16;
 
 /// Maximum total inlining budget per caller function (total inlined instructions).
 /// Prevents exponential blowup from recursive inlining chains.
@@ -1375,7 +1396,35 @@ fn fits_normal_inline_limits(
     inst_ok && block_ok
 }
 
+fn fits_static_loop_inline_limits(
+    inst_count: usize,
+    block_count: usize,
+    direct_call_count: usize,
+) -> bool {
+    let small = inst_count <= MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+        && block_count <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS;
+    let bounded_clone = direct_call_count <= MAX_STATIC_LOOP_INLINE_CALLS
+        && inst_count <= MAX_STATIC_LOOP_INLINE_INSTRUCTIONS
+        && block_count <= MAX_STATIC_LOOP_INLINE_BLOCKS;
+    small || bounded_clone
+}
+
+fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
+    let mut counts = FxHashMap::default();
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                if let Instruction::Call { func, .. } = instruction {
+                    *counts.entry(func.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
 fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+    let call_counts = direct_call_counts(module);
     let mut map = FxHashMap::default();
 
     let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
@@ -1454,6 +1503,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 )
             })
         });
+        let direct_call_count = call_counts.get(&func.name).copied().unwrap_or(0);
         let is_small_static = func.is_static
             && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
@@ -1481,8 +1531,15 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         let is_medium_static = func.is_static
             && !func.is_inline
             && !is_small_static
-            && inst_count_for_static <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
-            && func.blocks.len() <= medium_block_limit;
+            && ((!has_loops
+                && inst_count_for_static <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
+                && func.blocks.len() <= medium_block_limit)
+                || (has_loops
+                    && fits_static_loop_inline_limits(
+                        inst_count_for_static,
+                        func.blocks.len(),
+                        direct_call_count,
+                    )));
         if !is_always_inline
             && !is_trivially_empty
             && !is_small_static
@@ -1491,8 +1548,16 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         {
             if debug_callee {
                 eprintln!(
-                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, is_declaration={}",
-                    func.name, func.is_static, func.is_inline, func.is_declaration
+                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, blocks={}, inst_count={}, has_loops={}, direct_calls={}, medium_block_limit={}, is_declaration={}",
+                    func.name,
+                    func.is_static,
+                    func.is_inline,
+                    func.blocks.len(),
+                    inst_count_for_static,
+                    has_loops,
+                    direct_call_count,
+                    medium_block_limit,
+                    func.is_declaration,
                 );
             }
             continue;
@@ -1500,10 +1565,11 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         if debug_callee {
             let ic: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
             eprintln!(
-                "[INLINE_DEBUG] {} candidate: blocks={}, inst_count={}, is_variadic={}, params={}",
+                "[INLINE_DEBUG] {} candidate: blocks={}, inst_count={}, direct_calls={}, is_variadic={}, params={}",
                 func.name,
                 func.blocks.len(),
                 ic,
+                direct_call_count,
                 func.is_variadic,
                 func.params.len()
             );
@@ -1542,7 +1608,10 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             func.is_inline,
             func_has_vector_intrinsics(func),
             effective_block_limit,
-        );
+        ) || (func.is_static
+            && !func.is_inline
+            && has_loops
+            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count));
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         let exceeds_normal = !is_always_inline && !fits_normal;
@@ -1618,7 +1687,14 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 param_struct_sizes,
                 return_type: func.return_type,
                 num_params: func.params.len(),
-                next_value_id: func.next_value_id,
+                // Post-structural inlining can clone values into a function
+                // whose cached next_value_id predates the clone. Preserve the
+                // stronger of the cached cursor and the real IR maximum so a
+                // later inline cannot collide with an existing definition.
+                next_value_id: std::cmp::max(
+                    func.next_value_id,
+                    func.max_value_id().saturating_add(1),
+                ),
                 max_block_id,
                 is_always_inline,
                 exceeds_normal_limits: exceeds_normal,
@@ -1811,12 +1887,14 @@ fn inline_call_site(
         return false;
     }
 
-    // Compute ID offsets for remapping callee values and blocks into caller's namespace
-    let caller_next_value = if caller.next_value_id > 0 {
-        caller.next_value_id
-    } else {
-        caller.max_value_id() + 1
-    };
+    // Compute ID offsets for remapping callee values and blocks into caller's
+    // namespace. Structural transforms may have introduced values without
+    // advancing next_value_id, so it is an optimization hint rather than an
+    // authority: always reserve past the actual maximum present in the IR.
+    let caller_next_value = std::cmp::max(
+        caller.next_value_id,
+        caller.max_value_id().saturating_add(1),
+    );
 
     // Use the global max block ID to avoid collisions with ANY function's blocks
     let value_offset = caller_next_value;
@@ -1907,6 +1985,23 @@ fn inline_call_site(
         }
         v
     };
+    // Record remapped ParamRef values before removing them.  Unlike ordinary
+    // home loads, ParamRef is an SSA incoming parameter value; it can survive
+    // prior structural transforms and be consumed directly by intrinsics.
+    // Every such value must receive a caller-defined replacement before its
+    // instruction is removed.
+    let mut paramref_records: Vec<(Value, usize, IrType)> = Vec::new();
+    let mut paramref_params: crate::common::fx_hash::FxHashSet<usize> =
+        crate::common::fx_hash::FxHashSet::default();
+    for block in &inlined_blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef { dest, param_idx, ty } = inst {
+                paramref_records.push((*dest, *param_idx, *ty));
+                paramref_params.insert(*param_idx);
+            }
+        }
+    }
+
     // CCC_NO_SSA_PARAM=1 disables parameter substitution (diagnostic toggle).
     let ssa_param_enabled = std::env::var("CCC_NO_SSA_PARAM").is_err();
     // CCC_SSA_PARAM_SKIP=callee1,callee2 disables substitution for named
@@ -1919,6 +2014,10 @@ fn inline_call_site(
             let ok = ssa_param_enabled
                 && !ssa_skip.contains(&site.callee_name)
                 && i < site.args.len()
+                // ParamRef users are materialized below from their caller
+                // store. Do not remove their home alloca through the older
+                // load-only optimization.
+                && !paramref_params.contains(&i)
                 && orig_homes.get(i).is_some_and(|h| param_substitutable(callee, i, *h));
             if ok && ssa_log {
                 eprintln!("[SSA_PARAM] {} arg{} substituted", site.callee_name, i);
@@ -1945,91 +2044,68 @@ fn inline_call_site(
         }
     }
 
-    // The entry-block borrow is no longer used below; non-lexical lifetimes
-    // release it before the whole-block rewrite.
-    // Constant arguments can also flow directly through ParamRef values after
-    // structural transforms such as TCE. The older home-substitution path only
-    // rewrote loads from parameter allocas, leaving a ParamRef value undefined
-    // in phi incoming edges (tce_sum became zero after post-TCE inlining).
-    // Build a remapped ParamRef -> constant map and apply it to every operand
-    // and terminator before ParamRef instructions are removed below.
-    let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
-    for block in &inlined_blocks {
-        for inst in &block.instructions {
-            if let Instruction::ParamRef {
-                dest,
-                param_idx,
-                ty,
-            } = inst
-            {
-                // ParamRef is the immutable incoming parameter value. Its
-                // substitution is sound even when the callee also retains an
-                // address-taken parameter alloca; later stores affect the home,
-                // not this SSA incoming value. This also covers transformed
-                // callees (TCE/loop lowering) whose ParamRef has already been
-                // detached from its original alloca.
-                if *param_idx < site.args.len() {
-                    if let Operand::Const(arg_const) = site.args[*param_idx] {
-                        if const_ir_type(&arg_const) == Some(*ty) {
-                            paramref_subst.insert(dest.0, site.args[*param_idx]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if !paramref_subst.is_empty() {
-        for block in &mut inlined_blocks {
-            for inst in &mut block.instructions {
-                inst.for_each_operand_mut(|op| {
-                    if let Operand::Value(v) = op {
-                        if let Some(&replacement) = paramref_subst.get(&v.0) {
-                            *op = replacement;
-                        }
-                    }
-                });
-            }
-            block.terminator.for_each_operand_mut(|op| {
-                if let Operand::Value(v) = op {
-                    if let Some(&replacement) = paramref_subst.get(&v.0) {
-                        *op = replacement;
-                    }
-                }
-            });
-        }
-    }
-
     // Insert stores/memcpys of arguments into param allocas at the beginning of the
-    // entry block (after the allocas themselves)
-    let entry_block = &mut inlined_blocks[0];
-    let mut insert_pos = 0;
-    // Find position after all allocas in the entry block
-    for (i, inst) in entry_block.instructions.iter().enumerate() {
-        if matches!(inst, Instruction::Alloca { .. }) {
-            insert_pos = i + 1;
-        } else {
-            break;
+    // entry block (after the allocas themselves). ParamRef materializations are
+    // inserted immediately after this argument bridge so they are defined on
+    // every inlined path before any cloned block can consume them.
+    let mut paramref_next_value = value_offset + callee.next_value_id;
+    let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
+    let paramref_debug = std::env::var("CCC_INLINE_PARAMREF_DEBUG").is_ok();
+    {
+        let entry_block = &mut inlined_blocks[0];
+        let mut insert_pos = 0;
+        // Find position after all allocas in the entry block.
+        for (i, inst) in entry_block.instructions.iter().enumerate() {
+            if matches!(inst, Instruction::Alloca { .. }) {
+                insert_pos = i + 1;
+            } else {
+                break;
+            }
         }
-    }
 
-    // Insert stores in reverse order so indices stay valid
-    let has_spans = !entry_block.source_spans.is_empty();
-    let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
-    for i in (0..num_args_to_store).rev() {
-        if home_subst.contains_key(&param_alloca_info[i].0 .0) {
-            continue; // value flows via SSA substitution, no home store needed
-        }
-        let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
-        if let Some(struct_size) = param_struct_size {
-            // Struct-by-value parameter: the caller passes a pointer to the struct data.
-            // We must copy the struct data from that pointer into the callee's param alloca.
-            if let Operand::Value(src_ptr) = site.args[i] {
+        // Insert stores in reverse order so indices stay valid. Every parameter
+        // with a live ParamRef retains this bridge even for a constant argument:
+        // constants may replace the ParamRef directly, while the home remains a
+        // valid ABI object for address-taken or later memory uses.
+        let has_spans = !entry_block.source_spans.is_empty();
+        let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
+        let mut inserted_arg_count = 0usize;
+        for i in (0..num_args_to_store).rev() {
+            if home_subst.contains_key(&param_alloca_info[i].0 .0) {
+                continue; // value flows via the older pure-home substitution
+            }
+            let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
+            if let Some(struct_size) = param_struct_size {
+                // Struct-by-value parameter: the caller passes a pointer to the struct data.
+                // We must copy the struct data from that pointer into the callee's param alloca.
+                if let Operand::Value(src_ptr) = site.args[i] {
+                    entry_block.instructions.insert(
+                        insert_pos,
+                        Instruction::Memcpy {
+                            dest: param_alloca_info[i].0,
+                            src: src_ptr,
+                            size: struct_size,
+                        },
+                    );
+                    if has_spans {
+                        entry_block
+                            .source_spans
+                            .insert(insert_pos, crate::common::source::Span::dummy());
+                    }
+                    inserted_arg_count += 1;
+                } else {
+                    // Struct arg should always be a Value (pointer), not a Const.
+                    return false;
+                }
+            } else {
+                let store_ty = param_alloca_info[i].1;
                 entry_block.instructions.insert(
                     insert_pos,
-                    Instruction::Memcpy {
-                        dest: param_alloca_info[i].0,
-                        src: src_ptr,
-                        size: struct_size,
+                    Instruction::Store {
+                        val: site.args[i],
+                        ptr: param_alloca_info[i].0,
+                        ty: store_ty,
+                        seg_override: AddressSpace::Default,
                     },
                 );
                 if has_spans {
@@ -2037,28 +2113,89 @@ fn inline_call_site(
                         .source_spans
                         .insert(insert_pos, crate::common::source::Span::dummy());
                 }
-            } else {
-                // Struct arg should always be a Value (pointer), not a Const.
-                // If somehow it's a Const, bail out of inlining.
+                inserted_arg_count += 1;
+            }
+        }
+
+        let mut materialize_pos = insert_pos + inserted_arg_count;
+        // Deduplicate loads: one Load per distinct param_idx, and one Cast per
+        // distinct (param_idx, param_ty) when types differ.  This reduces IR
+        // bloat when a callee has multiple ParamRef for same parameter (common
+        // after TCE / loop lowering) and keeps compile-time low.
+        use crate::common::fx_hash::FxHashMap as ParamMap;
+        let mut loaded_per_param: ParamMap<usize, Value> = ParamMap::default();
+        let mut cast_per_param_ty: ParamMap<(usize, IrType), Value> = ParamMap::default();
+
+        for (paramref_dest, param_idx, param_ty) in &paramref_records {
+            if *param_idx >= num_args_to_store || *param_idx >= param_alloca_info.len() {
                 return false;
             }
-        } else {
-            // Scalar parameter: store the value directly into the param alloca.
-            let store_ty = param_alloca_info[i].1;
-            entry_block.instructions.insert(
-                insert_pos,
-                Instruction::Store {
-                    val: site.args[i],
-                    ptr: param_alloca_info[i].0,
-                    ty: store_ty,
-                    seg_override: AddressSpace::Default,
-                },
-            );
-            if has_spans {
-                entry_block
-                    .source_spans
-                    .insert(insert_pos, crate::common::source::Span::dummy());
+
+            let (home, home_ty, _) = param_alloca_info[*param_idx];
+
+            // Reuse existing load for this param_idx if present
+            let loaded = if let Some(&v) = loaded_per_param.get(param_idx) {
+                v
+            } else {
+                let v = Value(paramref_next_value);
+                paramref_next_value += 1;
+                entry_block.instructions.insert(
+                    materialize_pos,
+                    Instruction::Load {
+                        dest: v,
+                        ptr: home,
+                        ty: home_ty,
+                        seg_override: AddressSpace::Default,
+                    },
+                );
+                if has_spans {
+                    entry_block
+                        .source_spans
+                        .insert(materialize_pos, crate::common::source::Span::dummy());
+                }
+                materialize_pos += 1;
+                loaded_per_param.insert(*param_idx, v);
+                v
+            };
+
+            let replacement = if home_ty == *param_ty {
+                Operand::Value(loaded)
+            } else {
+                let key = (*param_idx, *param_ty);
+                if let Some(&casted) = cast_per_param_ty.get(&key) {
+                    Operand::Value(casted)
+                } else {
+                    let cast = Value(paramref_next_value);
+                    paramref_next_value += 1;
+                    entry_block.instructions.insert(
+                        materialize_pos,
+                        Instruction::Cast {
+                            dest: cast,
+                            src: Operand::Value(loaded),
+                            from_ty: home_ty,
+                            to_ty: *param_ty,
+                        },
+                    );
+                    if has_spans {
+                        entry_block
+                            .source_spans
+                            .insert(materialize_pos, crate::common::source::Span::dummy());
+                    }
+                    materialize_pos += 1;
+                    cast_per_param_ty.insert(key, cast);
+                    Operand::Value(cast)
+                }
+            };
+            if paramref_debug {
+                eprintln!(
+                    "[INLINE_PARAMREF] {} param{} remapped v{} -> {:?}",
+                    site.callee_name,
+                    param_idx,
+                    paramref_dest.0,
+                    replacement
+                );
             }
+            paramref_subst.insert(paramref_dest.0, replacement);
         }
     }
 
@@ -2131,6 +2268,44 @@ fn inline_call_site(
             block.source_spans = new_spans;
         }
     }
+    // Replace every direct ParamRef use after removing ParamRef instructions.
+    // This includes intrinsic arguments, phi incoming values, and terminators;
+    // leaving even one remapped ParamRef unbound produces an invalid backend
+    // value with no register or stack home.
+    if !paramref_subst.is_empty() {
+        for block in &mut inlined_blocks {
+            for inst in &mut block.instructions {
+                inst.for_each_operand_mut(|op| {
+                    if let Operand::Value(v) = op {
+                        if let Some(&replacement) = paramref_subst.get(&v.0) {
+                            *op = replacement;
+                        }
+                    }
+                });
+                inst.for_each_value_use_mut(|value| {
+                    if let Some(Operand::Value(replacement)) = paramref_subst.get(&value.0) {
+                        if paramref_debug {
+                            eprintln!(
+                                "[INLINE_PARAMREF] {} direct v{} -> v{}",
+                                site.callee_name,
+                                value.0,
+                                replacement.0
+                            );
+                        }
+                        *value = *replacement;
+                    }
+                });
+            }
+            block.terminator.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if let Some(&replacement) = paramref_subst.get(&v.0) {
+                        *op = replacement;
+                    }
+                }
+            });
+        }
+    }
+
     // Now split the caller's block at the call site:
     // Block before call -> instructions before the call + branch to callee entry
     // Block after call (merge block) -> instructions after the call + original terminator
@@ -2225,10 +2400,11 @@ fn inline_call_site(
     }
 
     // Update caller's next_value_id to account for the new values
-    let new_next_value_id = value_offset + callee.next_value_id;
-    if caller.next_value_id > 0 || new_next_value_id > caller.next_value_id {
-        caller.next_value_id = std::cmp::max(new_next_value_id, caller.next_value_id);
-    }
+    let new_next_value_id = std::cmp::max(
+        value_offset + callee.next_value_id,
+        paramref_next_value,
+    );
+    caller.next_value_id = std::cmp::max(new_next_value_id, caller.next_value_id);
     if debug_inline_detail {
         eprintln!(
             "[INLINE_DETAIL]   after inline: caller.next_value_id={}",
@@ -2850,6 +3026,39 @@ mod inline_limit_tests {
         assert!(fits_normal_inline_limits(80, 5, true, false, false, 6));
         assert!(!fits_normal_inline_limits(80, 5, false, false, false, 6));
         assert!(!fits_normal_inline_limits(80, 7, true, false, false, 6));
+    }
+    #[test]
+    fn acyclic_static_leaf_with_thirteen_blocks_is_inlineable() {
+        // A short source-level predicate with chained `||` conditions can lower
+        // to 13 acyclic blocks (the Expat XML-name classification reproducer).
+        // It fits the static instruction budget and should not pay a hot call
+        // solely because the generic no-loop cap was one block too small.
+        assert!(fits_normal_inline_limits(
+            32,
+            13,
+            true,
+            false,
+            false,
+            MAX_INLINE_BLOCKS_NO_LOOPS,
+        ));
+        assert!(!fits_normal_inline_limits(
+            32,
+            MAX_INLINE_BLOCKS_NO_LOOPS + 1,
+            true,
+            false,
+            false,
+            MAX_INLINE_BLOCKS_NO_LOOPS,
+        ));
+    }
+    #[test]
+    fn static_loop_helper_has_own_bounded_inline_limit() {
+        // Small loop helpers remain cheap enough to clone at many sites.
+        assert!(fits_static_loop_inline_limits(40, 8, 7));
+        // Larger loop bodies are admitted only when cloning is bounded.
+        assert!(fits_static_loop_inline_limits(128, 16, 2));
+        assert!(!fits_static_loop_inline_limits(128, 16, 3));
+        assert!(!fits_static_loop_inline_limits(129, 16, 1));
+        assert!(!fits_static_loop_inline_limits(128, 17, 1));
     }
     #[test]
     fn vector_static_inline_limit() {

@@ -687,6 +687,83 @@ impl Instruction {
         }
     }
 
+    /// Mutably visit every direct `Value` use that is not wrapped in an
+    /// [`Operand`]. Together with [`Instruction::for_each_operand_mut`], this
+    /// is the complete mutable counterpart of `for_each_used_value`.
+    ///
+    /// Keeping pointer/base/destination uses here prevents transformation
+    /// passes from rewriting only scalar operands while leaving an intrinsic
+    /// `dest_ptr` or memcpy endpoint bound to a removed SSA definition.
+    #[inline]
+    pub fn for_each_value_use_mut(&mut self, mut f: impl FnMut(&mut Value)) {
+        match self {
+            Instruction::Store { ptr, .. }
+            | Instruction::Load { ptr, .. }
+            | Instruction::StackRestore { ptr } => f(ptr),
+            Instruction::GetElementPtr { base, .. } => f(base),
+            Instruction::Memcpy { dest, src, .. } => {
+                f(dest);
+                f(src);
+            }
+            Instruction::VaArg { va_list_ptr, .. }
+            | Instruction::VaStart { va_list_ptr }
+            | Instruction::VaEnd { va_list_ptr } => f(va_list_ptr),
+            Instruction::VaCopy { dest_ptr, src_ptr } => {
+                f(dest_ptr);
+                f(src_ptr);
+            }
+            Instruction::VaArgStruct {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            } => {
+                f(dest_ptr);
+                f(va_list_ptr);
+            }
+            Instruction::InlineAsm { outputs, .. } => {
+                for (_, value, _) in outputs {
+                    f(value);
+                }
+            }
+            Instruction::Intrinsic { dest_ptr, .. } => {
+                if let Some(ptr) = dest_ptr {
+                    f(ptr);
+                }
+            }
+            // Exhaustive list of remaining variants without direct Value uses.
+            // No wildcard is used intentionally so that adding a new IR variant
+            // with a direct Value field triggers a compile error.
+            Instruction::Alloca { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::BinOp { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::Cmp { .. }
+            | Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Fence { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicLoad { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::Phi { .. }
+            | Instruction::Select { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::ParamRef { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::SetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::SetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::SetReturnF128Second { .. } => {}
+        }
+    }
+
+    
     /// Mutably visit every Operand stored in this instruction.
     ///
     /// This is the mutation counterpart to `for_each_used_value`. Keeping the
@@ -839,5 +916,32 @@ impl Terminator {
         let mut used = Vec::new();
         self.for_each_used_value(|id| used.push(id));
         used
+    }
+}
+
+#[cfg(test)]
+mod direct_value_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn mutates_intrinsic_destination_pointer_without_touching_operand_args() {
+        let mut inst = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::Storedqu,
+            dest_ptr: Some(Value(7)),
+            args: vec![Operand::Value(Value(8))],
+        };
+        inst.for_each_value_use_mut(|value| {
+            if value.0 == 7 {
+                *value = Value(70);
+            }
+        });
+        match inst {
+            Instruction::Intrinsic { dest_ptr, args, .. } => {
+                assert_eq!(dest_ptr, Some(Value(70)));
+                assert!(matches!(args[0], Operand::Value(Value(8))));
+            }
+            _ => unreachable!(),
+        }
     }
 }

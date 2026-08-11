@@ -237,24 +237,33 @@ containing `VaStart`/`VaEnd`/`VaArg`, `DynAlloca`, `StackSave`/`StackRestore`,
 `IndirectBranch`, or static locals with label references are excluded.
 `__attribute__((noinline))` functions and recursive calls are also excluded.
 
-**Heuristics.** The inliner uses a tiered size-based heuristic:
+**Heuristics.** The inliner uses a tiered size- and CFG-based heuristic.  The
+limits below are IR instructions/blocks, not source lines:
 
 | Category | Instruction limit | Block limit | Notes |
-|---|---|---|---|
-| Tiny | 5 | 1 | Always inlined, ignores caller size |
-| Small / static inline | 20 | 3 | Always inlined if budget not exhausted, or if `always_inline` |
-| Normal static | 30 | 4 | Inlined if under caller budget |
-| Normal eligible | 60 | 6 | Inlined if under caller budget |
-| `always_inline` | 500 | 500 | Separate 200-instruction budget (main) + 400 (second pass) |
+|---|---:|---:|---|
+| Tiny | 5 | 1 | Always inlined; negligible growth |
+| Small | 20 | 3 | Treated aggressively, including small `always_inline` helpers |
+| Ordinary eligible / static inline | 32 | 6 with loops; 16 acyclic | Acyclic predicates may lower to many blocks despite small source form |
+| Static non-inline base | 30 | 4 | Preserves GCC-like small-static behavior |
+| Medium static non-inline | 96 | 6 with loops; 16 acyclic | Bounded by normal caller budgets |
+| Static loop helper | 40 at any call count; 128 at ≤2 direct call sites | 8 / 16 | Avoids cloning medium search loops widely while allowing bounded checksum-style specialization |
+| Vector static inline | 200 | 24 | SIMD intrinsic bodies otherwise suffer call/materialization overhead |
+| `always_inline` | 500 | 500 | Separate 200-instruction main budget + 400 second-pass budget |
+
+The 16-block acyclic limit is deliberately higher than the looped limit: a
+short chained predicate can form 13 branch/merge blocks without creating a
+nested-loop/codegen hazard.  The `expat_xml_scan` workload benchmark and
+inliner unit test protect this boundary.
 
 Inlining respects per-caller budgets: normal inlining stops when the caller
-exceeds 200 instructions or 800 total inlined instructions, with a hard cap at
-500 instructions (1000 absolute cap). The `always_inline` attribute has its own
-200-instruction budget in the main loop, kept low to prevent stack frame bloat
-(CCC allocates ~8 bytes per SSA value on the stack). When the caller has a
-section attribute (e.g., `.init.text` in the Linux kernel), `always_inline`
-callees bypass the budget entirely, ensuring kernel initialization code is always
-fully inlined.
+exceeds 200 instructions or consumes 350 normal inline instructions, with a
+hard cap at 500 instructions (1000 absolute cap). The `always_inline` attribute
+has its own 200-instruction budget in the main loop, kept low to prevent stack
+frame bloat (CCC allocates roughly 8 bytes per SSA value on the stack). When
+the caller has a section attribute (e.g., `.init.text` in the Linux kernel),
+`always_inline` callees bypass the budget entirely, ensuring kernel
+initialization code is fully inlined.
 
 Each caller function is processed for up to 200 inlining rounds to handle chains
 of inlined calls (e.g., A calls B calls C, where B is inlined into A, exposing
@@ -649,11 +658,13 @@ basic IV (following Cast and Copy chains for up to 3 propagation passes). These
 derived expressions that feed into GEP instructions become candidates for
 strength reduction.
 
-**Applying the transformation.** For each eligible GEP, the pass creates a new
-pointer induction variable (a phi in the loop header) that starts at the initial
-pointer and increments by `iv.step * stride` bytes each iteration. The original
-GEP is replaced with a copy of the new pointer IV. The dead original
-computations are removed by subsequent DCE.
+**Applying the transformation.** For each semantic `(basic IV, stride, base)`
+group, the pass creates one pointer induction variable (a phi in the loop
+header) that starts at the initial pointer and increments by `iv.step * stride`
+bytes each iteration. Equivalent independently-numbered expressions such as two
+occurrences of `a[i]` share that one recurrence; every original GEP is replaced
+with a copy of the shared pointer IV. The dead original computations are
+removed by subsequent DCE.
 
 **Limits:**
 
@@ -662,9 +673,13 @@ computations are removed by subsequent DCE.
 | Max stride | 1024 bytes | Avoids unusual access patterns |
 | Max cast chain depth | 10 | Prevents pathological chain following |
 | Shift amount range | 0..64 | Validates shift amounts before computing stride |
+| Nested/overlapping natural loops | skipped | Prevents a pointer recurrence from consuming a base transformed by another loop |
 
-Runs only during the first iteration of the main loop. Uses shared CFG analysis
-with GVN and LICM.
+Runs by default only during the first iteration of the main loop and uses shared
+CFG analysis with GVN and LICM. Set `CCC_NO_IVSR=1` or add `ivsr` to
+`CCC_DISABLE_PASSES` for diagnosis. The nested-loop guard is deliberately
+conservative: IVSR is only applied to disjoint simple loops until
+dependence-aware nested-loop reasoning is available.
 
 ### if_convert -- If-Conversion
 

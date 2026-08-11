@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Build the LCCC compiler itself reproducibly under the project research policy:
+# Rust optimization level 1 and exactly two Cargo jobs.  This affects the
+# compiler executable, not the C code-generation optimization flag passed to
+# LCCC by the benchmark runner.
+set -euo pipefail
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_root"
+
+# Cargo has no direct `-O1` CLI spelling.  This profile override is the Cargo/
+# rustc equivalent and is intentionally scoped to this invocation.
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=1
+export CARGO_BUILD_JOBS=2
+export CARGO_INCREMENTAL=0
+
+printf '%s\n' "Building LCCC with Rust opt-level=1 and Cargo jobs=2"
+printf '%s\n' "Active swap (if any):"
+if [[ -r /proc/swaps ]]; then
+  cat /proc/swaps
+fi
+
+exec cargo build --release --locked -j 2

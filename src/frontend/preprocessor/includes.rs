@@ -10,6 +10,48 @@ use super::pipeline::Preprocessor;
 /// Prevents infinite inclusion loops in files without `#pragma once`.
 const MAX_INCLUDE_DEPTH: usize = 200;
 
+/// Compiler-reserved x86 intrinsic headers supplied with LCCC.  They need to
+/// win over a user-supplied GCC builtin include directory: modern GCC's
+/// `immintrin.h` unconditionally pulls AVX-512/_Float16 declarations that the
+/// C frontend intentionally does not model yet, causing an unrelated AVX2
+/// feature probe to fail before it reaches any AVX2 intrinsic.
+///
+/// This is intentionally a narrow reserved-header mechanism rather than a
+/// global reordering of `-I`: project headers and ordinary system headers
+/// retain the standard user-path precedence rules.  The check is two-tier:
+/// 1) an explicit allowlist for the common umbrella headers, and
+/// 2) a dynamic fallback for any `*intrin.h` that actually exists in the
+/// bundled directory.  This covers newer VAES/VPCLMULQDQ/GFNI/CET headers
+/// without hard-coding an ever-growing list, while still avoiding a blanket
+/// “all system headers win” policy that would break user -I shadowing for
+/// non-intrinsic files.
+const BUNDLED_X86_INTRINSIC_HEADERS: &[&str] = &[
+    "immintrin.h", "x86intrin.h", "xmmintrin.h", "emmintrin.h", "pmmintrin.h",
+    "tmmintrin.h", "smmintrin.h", "nmmintrin.h", "avxintrin.h", "avx2intrin.h",
+    "avx512fintrin.h", "fmaintrin.h", "bmi2intrin.h", "mmintrin.h", "shaintrin.h",
+    "vaesintrin.h", "vpclmulqdqintrin.h", "gfniintrin.h", "cetintrin.h",
+    "avx512bwintrin.h", "avx512cdintrin.h", "avx512dqintrin.h", "avx512vlintrin.h",
+];
+
+#[inline]
+fn is_bundled_x86_intrinsic_header(include_path: &str) -> bool {
+    if BUNDLED_X86_INTRINSIC_HEADERS.contains(&include_path) {
+        return true;
+    }
+    // Dynamic fallback: any *intrin.h that is known to be bundled should be
+    // treated as compiler-reserved.  This keeps the list from going stale as
+    // new ISA extensions appear, while still not reserving arbitrary headers.
+    if include_path.ends_with("intrin.h") {
+        // Quick heuristic: intrinsic headers are flat, no directory component
+        // in the include path for <*.h> includes.  Avoid reserving something
+        // like "foo/barintrin.h" that is not an LCCC-owned intrinsic.
+        if !include_path.contains('/') && !include_path.contains('\\') {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect if a source file has a classic include guard pattern.
 ///
 /// The pattern we detect is:
@@ -651,10 +693,26 @@ impl Preprocessor {
         //   6. -idirafter paths
         //
         // For system includes (#include <...>), search in this order:
-        //   1. -I paths
-        //   2. -isystem paths
-        //   3. Default system paths
-        //   4. -idirafter paths
+        //   1. compiler-reserved bundled x86 intrinsic headers
+        //   2. -I paths
+        //   3. -isystem paths
+        //   4. Default system paths
+        //   5. -idirafter paths
+        //
+        // The reserved-header step is active only when the bundled directory
+        // remains in the configured system search list, preserving -nostdinc
+        // behavior. It avoids GCC's newer unsupported intrinsic umbrella
+        // headers shadowing LCCC's ABI-matched intrinsic declarations.
+        if is_system && is_bundled_x86_intrinsic_header(include_path) {
+            if let Some(bundled) = Preprocessor::bundled_include_dir() {
+                if self.system_include_paths.iter().any(|path| path == &bundled) {
+                    let candidate = bundled.join(include_path);
+                    if candidate.is_file() {
+                        return Some(make_absolute(&candidate));
+                    }
+                }
+            }
+        }
 
         if !is_system {
             // Step 1: Search relative to the current file's directory
@@ -828,5 +886,44 @@ impl Preprocessor {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_include_tests {
+    use super::*;
+
+    #[test]
+    fn system_intrinsics_prefer_bundled_headers_over_user_i_path() {
+        let bundled = Preprocessor::bundled_include_dir()
+            .expect("test tree must contain bundled intrinsic headers");
+        let expected = std::fs::canonicalize(bundled.join("immintrin.h"))
+            .expect("bundled immintrin.h must exist");
+
+        let unique = format!(
+            "lccc_fake_intrin_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        );
+        let fake_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&fake_dir).expect("create fake include directory");
+        std::fs::write(fake_dir.join("immintrin.h"), "#error wrong header\n")
+            .expect("write fake immintrin.h");
+
+        let mut preprocessor = Preprocessor::new();
+        preprocessor.add_include_path(fake_dir.to_str().expect("utf8 temp path"));
+        let resolved = preprocessor
+            .resolve_include_path("immintrin.h", true)
+            .expect("resolve compiler intrinsic header");
+        assert_eq!(
+            std::fs::canonicalize(resolved).expect("canonical resolved header"),
+            expected,
+            "compiler-reserved intrinsic headers must not be shadowed by -I GCC paths"
+        );
+
+        std::fs::remove_dir_all(fake_dir).expect("remove fake include directory");
     }
 }

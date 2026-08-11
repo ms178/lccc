@@ -9,6 +9,7 @@ This document explains the dual licensing structure used in LCCC (Lev's Claude's
 | **Original CCC Code** | CC0 1.0 (Public Domain) | No copyright restrictions, attribution not required |
 | **LCCC Improvements** | MIT OR Apache-2.0 OR BSD-2-Clause | Your choice, per contribution |
 | **Mixed Files** | Both CC0 + your choice | Original sections CC0, new sections your license |
+| **Third-party-derived benchmark kernels** | Per-file upstream license | Must retain upstream provenance and may not be relabelled as project-default-only |
 
 ## Licensing Structure
 
@@ -46,6 +47,35 @@ All code authored as part of LCCC optimization efforts:
 - Standard open source protections
 - Users can use your code under their chosen license
 - Each license file available: [`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE), [`LICENSE-BSD`](./LICENSE-BSD)
+
+### Third-Party-Derived Benchmark Sources
+**Licensed under**: the upstream license named in each file, plus any clearly
+separable original harness material where applicable.
+
+The benchmark suite intentionally contains narrow source-derived workload
+kernels.  They are not CCC code and must **not** be treated as automatically
+`MIT OR Apache-2.0 OR BSD-2-Clause` merely because their harness lives in this
+repository.  Every such source has a license/provenance header and is listed in
+[`tests/benchmark/WORKLOAD_PROVENANCE.md`](./tests/benchmark/WORKLOAD_PROVENANCE.md).
+The corresponding upstream license texts are retained under
+[`third_party_licenses/`](./third_party_licenses/README.md).
+
+Current derived benchmark files are:
+
+| File | Upstream-derived material | Applicable upstream license |
+|---|---|---|
+| `tests/benchmark/programs/gzip_crc32.c` | GNU gzip 1.14 `lib/crc.c` scalar table path | LGPL-3.0-or-later |
+| `tests/benchmark/programs/zlib_ng_adler32.c` | zlib-ng 2.3.3 generic Adler-32 | Zlib |
+| `tests/benchmark/programs/expat_xml_scan.c` | Expat 2.8.2 tokenizer specialization | MIT |
+| `tests/benchmark/programs/sqlite_varint.c` | SQLite 3.53.4 varint encoder/decoder | Public domain |
+| `tests/benchmark/programs/linux_find_bit.c` | Linux 6.18.42 bit-search kernel | GPL-2.0-or-later |
+| `tests/benchmark/programs/glibc_memcmp.c` | glibc `memcmp` aligned-word strategy | LGPL-2.1-or-later |
+
+The original benchmark runner, build script, provenance documentation, and
+hotspot documentation remain LCCC contributions under the project default
+unless their own header states otherwise.  Keep third-party benchmark sources
+as test/measurement material; do not link them into the compiler/runtime or
+claim the project-default license covers their upstream-derived portions.
 
 ### Hybrid Files (CCC Base + LCCC Improvements)
 **Licensed under**: Both CC0 + your chosen license
@@ -88,7 +118,16 @@ For any code in LCCC, ask these questions in order:
 
 **NO** → Go to Question 3
 
-### Question 3: Is this a hybrid (CCC base + LCCC improvements)?
+### Question 3: Is this derived from a third-party upstream source?
+**YES** → Preserve and apply that upstream license
+- Add a per-file source/provenance header
+- Record exact release/commit and source digest in `WORKLOAD_PROVENANCE.md`
+- Do not describe the complete file as project-default-only
+- Keep it out of compiler/runtime distribution paths unless license review approves it
+
+**NO** → Go to Question 4
+
+### Question 4: Is this a hybrid (CCC base + LCCC improvements)?
 **YES** → Both licenses apply
 - Identify which sections are CCC (CC0)
 - Identify which sections are new (your choice)
