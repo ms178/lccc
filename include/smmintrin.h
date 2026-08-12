@@ -347,4 +347,18 @@ _mm_packus_epi32(__m128i __a, __m128i __b)
     return __r;
 }
 
+
+/* _mm_blend_epi16: blend 16-bit elements by immediate mask (PBLENDW) */
+static __inline__ __m128i __attribute__((__always_inline__))
+_mm_blend_epi16(__m128i __a, __m128i __b, const int __imm)
+{
+    short *__pa = (short *)&__a;
+    short *__pb = (short *)&__b;
+    __m128i __r;
+    short *__pr = (short *)&__r;
+    for (int __i = 0; __i < 8; __i++)
+        __pr[__i] = ((__imm >> __i) & 1) ? __pb[__i] : __pa[__i];
+    return __r;
+}
+
 #endif /* _SMMINTRIN_H_INCLUDED */

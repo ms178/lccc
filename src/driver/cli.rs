@@ -804,6 +804,8 @@ impl Driver {
                 "-mno-avx10.2" => self.enable_avx10_2 = false,
                 "-mno-gfni" => self.enable_gfni = false,
                 "-mno-vaes" => self.enable_vaes = false,
+                "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt" | "-mno-xsavec" => {},
+                "-mavx512fp16" => self.enable_avx512fp16 = true,
                 "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
                 "-mavx2" => self.enable_x86_avx2_profile(),
                 "-mavx" => {
@@ -883,9 +885,12 @@ impl Driver {
                 arg if arg.starts_with("-mtune=") => {
                     let tune = &arg["-mtune=".len()..];
                     match self.target {
-                        Target::X86_64 | Target::I686 => match tune {
-                            "generic" | "raptorlake" | "raptor-lake" | "alderlake" | "haswell" | "broadwell" | "skylake" => self.x86_tune = Some(tune.to_string()),
-                            _ => return Err(format!("unsupported x86 -mtune={}; supported tune names are generic, haswell, broadwell, skylake, alderlake, and raptorlake", tune)),
+                        Target::X86_64 | Target::I686 => {
+                            // Accept all GCC-compatible tune names (zlib-ng probes
+                            // skylake-avx512/cascadelake etc.). Unknown tunes are
+                            // stored but otherwise ignored – matching GCC's permissive
+                            // handling and ensuring configure scripts never abort.
+                            self.x86_tune = Some(tune.to_string());
                         },
                         _ => return Err(format!("-mtune={} is not implemented for target {}", tune, self.target.triple())),
                     }
