@@ -364,7 +364,7 @@ impl X86Codegen {
         if let Some((op, lhs, rhs, ty)) = self.take_replay_cmp(cond) {
             self.state.reg_cache.invalidate_acc();
             let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-            self.emit_int_cmp_insn_typed(&lhs, &rhs, use_32bit);
+            self.emit_int_cmp_replay_insn(&lhs, &rhs, use_32bit);
             let jcc = Self::cmp_jcc(op);
             if true_fallthrough {
                 self.state
@@ -625,7 +625,7 @@ impl X86Codegen {
         if let Some((op, lhs, rhs, ty)) = &replay_op {
             self.state.reg_cache.invalidate_acc();
             let use_32bit = *ty == IrType::I32 || *ty == IrType::U32;
-            self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
+            self.emit_int_cmp_replay_insn(lhs, rhs, use_32bit);
         }
         // Test the condition in place (no pushfq). Only when the condition is
         // not directly testable (rare) do we fall back to the legacy

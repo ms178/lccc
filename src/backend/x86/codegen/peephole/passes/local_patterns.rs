@@ -960,6 +960,18 @@ pub(super) fn fold_lea_into_memory_op(
                         let tmp_pat = format!("({})", tmp);
                         if mem_next.contains(&tmp_pat)
                             && !fam_read_after(store, infos, k + 1, tmp_family)
+                            // SOUNDNESS (sqlite3): removing the leaq leaves the
+                            // LEA destination register undefined. The
+                            // temporary-copy check alone is not enough: the
+                            // leaq dest (e.g. %r13 = GEP result) is commonly
+                            // read by SUBSEQUENT stores through
+                            // displacement-form operands like `movw $0, 2(%r13)`
+                            // (field stores of a promoted struct). The fold
+                            // must also prove the leaq dest is dead after the
+                            // folded memory operation. Without this, sqlite3's
+                            // opcode/schema-init store sequence wrote struct
+                            // fields through an undefined base register.
+                            && !fam_read_after(store, infos, k + 1, dst_family)
                         {
                             let replacement = mem_next.replacen(&tmp_pat, &sib, 1);
                             if replacement != mem_next {
@@ -1052,11 +1064,19 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
             // (addq %r8,%rax, ...) also READS the register.
             let name64 = REG_NAMES[0][fam as usize];
             let name32 = REG_NAMES[1][fam as usize];
+            // SOUNDNESS: a mov to the family is a pure write only if the
+            // SOURCE part does not reference the family — including through
+            // displacement-form memory operands like `movq 8(%r13), %r13`
+            // (or `movl 4(%r13), %r13d`), which the old `(%r13)`-substring
+            // checks missed (`8(%r13)` does not contain `(r13)`). Such a
+            // line READS the family, so it must block the fold.
+            let src_part = td[..td.rfind(',').unwrap_or(td.len())].to_string();
+            let fam_in_src = src_part.contains(&format!("%{}", name64))
+                || src_part.contains(&format!("%{}", name32));
             let mov_store = (td.starts_with("mov")
                 || td.starts_with("movabs")
                 || td.starts_with("lea"))
-                && !td.contains(&format!("({})", name64))
-                && !td.contains(&format!("({})", name32));
+                && !fam_in_src;
             let explicit_lea_write = td.starts_with("lea")
                 && td.ends_with(&format!(", %{}", name64))
                 && !td[..td.rfind(',').unwrap_or(0)].contains(name64);
@@ -1157,8 +1177,14 @@ pub(super) fn fold_base_index_addressing(
                         // scan (not window-until-barrier): cross-block reads
                         // (e.g. phi copy-backs) are just as unsafe.
                         let tmp_dead = !fam_read_after(store, infos, m + 1, tmp_family);
+                        // SOUNDNESS: the fold removes the `movq %idx, %rax`
+                        // AND `addq %base, %rax`, leaving %rax undefined. The
+                        // tmp-copy deadness alone is not sufficient: a later
+                        // instruction may read %rax expecting the computed
+                        // address (the accumulator is reused constantly).
+                        let rax_dead = !fam_read_after(store, infos, m + 1, 0);
 
-                        if tmp_dead {
+                        if tmp_dead && rax_dead {
                             mark_nop(&mut infos[i]); // remove movq %REG, %rax
                             mark_nop(&mut infos[j]); // remove addq
                             mark_nop(&mut infos[k]); // remove movq %rax, %TMP
