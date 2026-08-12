@@ -805,7 +805,6 @@ impl Driver {
                 "-mno-gfni" => self.enable_gfni = false,
                 "-mno-vaes" => self.enable_vaes = false,
                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt" | "-mno-xsavec" => {},
-                "-mavx512fp16" => self.enable_avx512fp16 = true,
                 "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
                 "-mavx2" => self.enable_x86_avx2_profile(),
                 "-mavx" => {

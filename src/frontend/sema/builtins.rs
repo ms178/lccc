@@ -534,6 +534,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("_mm_min_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminub128));
     m.insert("_mm_blendv_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pblendvb128));
     m.insert("_mm_blend_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pblendw128));
+    m.insert("__builtin_ia32_pblendw128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pblendw128));
     m.insert("_mm_cvtepu8_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxbw128));
     m.insert("_mm_cvtepu16_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxwd128));
     m.insert("_mm_sll_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllw128));
