@@ -39,6 +39,48 @@ use crate::ir::analysis::CfgAnalysis;
 use crate::common::fx_hash::FxHashSet;
 use crate::ir::reexports::{Instruction, IrFunction, IrModule};
 
+/// Debug hook: dump only functions whose name contains one of the comma-
+/// separated substrings in `CCC_DUMP_FUNC` (empty = dump all), in the same
+/// compact per-block format as the backend's CCC_DUMP_IR.
+/// Environment-gated; never changes codegen.
+fn dump_ir_filtered(module: &IrModule, tag: &str) {
+    use std::fmt::Write as _;
+    let filters: Vec<String> = std::env::var("CCC_DUMP_FUNC")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out = String::new();
+    let _ = writeln!(out, "==== IR {} ====", tag);
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let matched = filters.is_empty()
+            || filters.iter().any(|f| func.name.contains(f.as_str()));
+        if matched {
+            let _ = writeln!(
+                out,
+                "--- function {} ({} blocks, {} instrs) ---",
+                func.name,
+                func.blocks.len(),
+                func.blocks.iter().map(|b| b.instructions.len()).sum::<usize>()
+            );
+            for (bi, block) in func.blocks.iter().enumerate() {
+                let _ = writeln!(out, "block {} ({}):", bi, block.label);
+                for inst in &block.instructions {
+                    let _ = writeln!(out, "  {:?}", inst);
+                }
+                let _ = writeln!(out, "  term: {:?}", block.terminator);
+            }
+        }
+    }
+    let _ = writeln!(out, "==== END IR {} ====", tag);
+    eprintln!("{}", out);
+}
+
+
 /// Run a per-function pass only on functions in the visit set.
 ///
 /// `visit` indicates which functions to process in this iteration.
@@ -412,9 +454,7 @@ pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::b
 macro_rules! preloop_dump {
     ($name:expr) => {
         if dump_each_pass {
-            eprintln!("==== IR after pre-loop {} ====", $name);
-            eprintln!("{:#?}", module);
-            eprintln!("==== END IR after pre-loop {} ====", $name);
+            dump_ir_filtered(module, &format!("pre-loop {}", $name));
         }
     };
 }

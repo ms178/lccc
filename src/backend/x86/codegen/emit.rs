@@ -769,32 +769,39 @@ impl X86Codegen {
     /// correct, stable source here.
     pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, use_32bit: bool) {
         let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
-        let load_slot = |cg: &mut Self, op: &Operand, reg: &str| -> bool {
-            if let Operand::Value(v) = op {
-                if let Some(slot) = cg.state.get_slot(v.0) {
-                    let sr = cg.slot_ref(slot.0);
-                    cg.state.emit_fmt(format_args!("    movq {}, %{}", sr, reg));
-                    return true;
-                }
+        // Load lhs from its slot with the TYPE-AWARE width. A raw `movq` slot
+        // load is unsound for narrow values: the slot stores are 8-byte
+        // (movq) but only the low N bytes hold the value; the upper bytes are
+        // stale (slot reuse / sign-extension residue). value_to_reg emits
+        // movzbl/movzwl/movsbq/movswq/movslq/movl/movq matched to the value
+        // type, exactly like every other load path — comparing a U16 stateno
+        // (sqlite3 yy_shift `state > 599 ? state+415 : state`) with 64-bit
+        // garbage would branch wrongly and corrupt the parser stack.
+        match lhs {
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                self.value_to_reg(v, "rax");
             }
-            false
-        };
-        if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
-            let lreg = if use_32bit { "eax" } else { "rax" };
-            if !load_slot(self, lhs, lreg) {
+            _ => {
                 self.operand_to_rax(lhs);
             }
+        }
+        // Prefer the immediate form whenever rhs is an encodable constant,
+        // matching emit_int_cmp_insn_typed (cmp $imm, %rax / %eax).
+        if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+            let lreg = if use_32bit { "eax" } else { "rax" };
             self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lreg));
             return;
         }
+        match rhs {
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                self.value_to_reg(v, "rcx");
+            }
+            _ => {
+                self.operand_to_rcx(rhs);
+            }
+        }
         let lreg = if use_32bit { "eax" } else { "rax" };
         let rreg = if use_32bit { "ecx" } else { "rcx" };
-        if !load_slot(self, lhs, lreg) {
-            self.operand_to_rax(lhs);
-        }
-        if !load_slot(self, rhs, rreg) {
-            self.operand_to_rcx(rhs);
-        }
         self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, lreg));
     }
 

@@ -1539,6 +1539,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
 
                 let mut to_relax: Vec<usize> = Vec::new();
+                let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
                     if jump.relaxed { continue; }
                     let target_off_opt = local_labels.get(&jump.target).copied()
@@ -1546,9 +1547,33 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
                                 .map(|(_, off)| off as usize)
                         });
+                    if dbg {
+                        eprintln!("[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?}",
+                            sec_idx, j_idx, jump.offset, jump.len, jump.is_conditional,
+                            jump.target, target_off_opt);
+                    }
                     if let Some(target_off) = target_off_opt {
-                        let short_end = jump.offset as i64 + 2;
-                        let disp = target_off as i64 - short_end;
+                        // SOUNDNESS (GAS oracle): the short-form displacement
+                        // must account for the jump's OWN shrink when the
+                        // target lies after the jump. Relaxing a forward jump
+                        // moves the target left by (old_len - new_len), so the
+                        // short displacement equals the 32-bit displacement
+                        // target - (offset + old_len). The previous code used
+                        // target - (offset + 2) for every jump, overestimating
+                        // forward displacements by 4 (jcc) / 3 (jmp) — jumps
+                        // with true short displacement 124/127 were computed
+                        // as 128/131 and never relaxed, diverging from GAS
+                        // (sqlite3 pblendvb_implicit_mask corpus t58).
+                        // Backward jumps are unaffected by the own-shrink
+                        // (the target precedes the jump), so their short
+                        // displacement is target - (offset + 2).
+                        let old_len = jump.len as i64;
+                        let disp = if (target_off as i64) > jump.offset as i64 {
+                            target_off as i64 - (jump.offset as i64 + old_len)
+                        } else {
+                            target_off as i64 - (jump.offset as i64 + 2)
+                        };
+                        if dbg { eprintln!("[RELAX]   disp={} relaxable={}", disp, (-128..=127).contains(&disp)); }
                         if (-128..=127).contains(&disp) {
                             to_relax.push(j_idx);
                         }

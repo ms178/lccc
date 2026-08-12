@@ -296,6 +296,32 @@ impl X86Codegen {
             }
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
+                // REGISTER ASSIGNMENT first: a value assigned to an XMM reg
+                // lives there (store_rax_to honors the assignment), so move it
+                // directly — never through the GPR shuttle. A value assigned
+                // to a GPR is moved to the target XMM from that GPR. Without
+                // this, an FP compare's second operand read GARBAGE %rcx
+                // (frexp_volatile_global: inf != inf was true at -O0).
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(reg) {
+                        let name = phys_reg_name(reg);
+                        if name != xmm {
+                            self.state
+                                .emit_fmt(format_args!("    movaps %{}, %{}", name, xmm));
+                        }
+                    } else {
+                        let gpr = phys_reg_name(reg);
+                        let gpr32 = phys_reg_name_32(reg);
+                        if ty == IrType::F32 {
+                            self.state
+                                .emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+                        }
+                    }
+                    return;
+                }
                 // Stack slot path: load directly from memory to XMM (no GPR intermediate).
                 // This is always safe because stack slots are stable locations.
                 if let Some(slot) = self.state.get_slot(v.0) {
@@ -304,19 +330,20 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("    {} {}, %{}", mov, sr, xmm));
                     return;
                 }
-                // Reg cache check for accumulator (value already in %rax)
+                // Reg cache check for accumulator. The acc cache means the value
+                // is in %rax (NOT %rcx regardless of the target xmm): reading
+                // %rcx for an xmm1 target would load garbage. Fix: always
+                // source the accumulator.
                 if self.state.reg_cache.acc_has(v.0, is_alloca) {
-                    let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
-                    let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
                     if ty == IrType::F32 {
-                        self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
+                        self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
                     } else {
-                        self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+                        self.state.emit_fmt(format_args!("    movq %rax, %{}", xmm));
                     }
                     return;
                 }
-                // Fallback: GPR → XMM path (handles GPR register-allocated values
-                // and any other case not covered above)
+                // Fallback: GPR → XMM path (handles any other case not covered
+                // above — loads through the target's staging register).
                 let gpr = if xmm == "xmm0" { "rax" } else { "rcx" };
                 let gpr32 = if xmm == "xmm0" { "eax" } else { "ecx" };
                 if gpr == "rax" {
