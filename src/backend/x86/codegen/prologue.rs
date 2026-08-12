@@ -439,19 +439,21 @@ impl X86Codegen {
                         continue;
                     }
                     // Replay soundness: the operands are re-materialized at the
-                    // consumer via operand_to_rax, which requires a STABLE
-                    // location (register assignment or stack slot). Values with
-                    // neither (immediately-consumed / slot-eliminated) reload
-                    // as zero — a wrong compare (simd_sse2_arith saturating-add
-                    // check: want = s > 255 ? 255 : s got 0x7f). Constants are
-                    // always re-materializable.
+                    // consumer via a STACK-SLOT load. A register assignment is
+                    // NOT a stable location here: the allocator sized the
+                    // operand's live range against the ORIGINAL Cmp position,
+                    // but the replay executes LATER (after intervening
+                    // instructions), and a later-defined value may share the
+                    // register — the replay would compare the wrong value
+                    // (sqlite3 yy_shift: `state > 599 ? state+415 : state`
+                    // compared state+415 instead of state because the Cmp lhs
+                    // register had been reused by the +415 add). Slot-only
+                    // operands are always safe: store_rax_to writes the slot
+                    // for every non-register-allocated value.
                     let op_has_location = |op: &Operand| -> bool {
                         match op {
                             Operand::Const(_) => true,
-                            Operand::Value(v) => {
-                                self.reg_assignments.contains_key(&v.0)
-                                    || self.state.get_slot(v.0).is_some()
-                            }
+                            Operand::Value(v) => self.state.get_slot(v.0).is_some(),
                         }
                     };
                     if !op_has_location(&clhs) || !op_has_location(&crhs) {

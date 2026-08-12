@@ -757,6 +757,47 @@ impl X86Codegen {
 
     /// Emit a comparison instruction, optionally using 32-bit form for I32/U32 types.
     /// When `use_32bit` is true, emits `cmpl` with 32-bit register names instead of `cmpq`.
+    /// COMPARE-REPLAY re-emission: like emit_int_cmp_insn_typed, but loads
+    /// both operands from their CANONICAL STACK SLOTS instead of trusting
+    /// register assignments. The replay runs at the consumer (Select /
+    /// CondBranch) position, after intervening instructions: a register that
+    /// held the operand at the original Cmp may since have been reassigned to
+    /// a later-defined value (the register allocator sized live ranges
+    /// against the original Cmp position). Slots are written for every
+    /// non-register-allocated value, and the replay candidates are filtered
+    /// to slot-resident operands at build time — so the slot is always the
+    /// correct, stable source here.
+    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, use_32bit: bool) {
+        let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
+        let load_slot = |cg: &mut Self, op: &Operand, reg: &str| -> bool {
+            if let Operand::Value(v) = op {
+                if let Some(slot) = cg.state.get_slot(v.0) {
+                    let sr = cg.slot_ref(slot.0);
+                    cg.state.emit_fmt(format_args!("    movq {}, %{}", sr, reg));
+                    return true;
+                }
+            }
+            false
+        };
+        if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+            let lreg = if use_32bit { "eax" } else { "rax" };
+            if !load_slot(self, lhs, lreg) {
+                self.operand_to_rax(lhs);
+            }
+            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lreg));
+            return;
+        }
+        let lreg = if use_32bit { "eax" } else { "rax" };
+        let rreg = if use_32bit { "ecx" } else { "rcx" };
+        if !load_slot(self, lhs, lreg) {
+            self.operand_to_rax(lhs);
+        }
+        if !load_slot(self, rhs, rreg) {
+            self.operand_to_rcx(rhs);
+        }
+        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, lreg));
+    }
+
     pub(super) fn emit_int_cmp_insn_typed(
         &mut self,
         lhs: &Operand,
@@ -3280,6 +3321,10 @@ impl ArchCodegen for X86Codegen {
 
         use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 
+        if std::env::var("CCC_MI_STREAM").is_ok() {
+            eprintln!("### MI-STREAM fn={} n={}", self.state.current_func_name, self.machinst_buf.len());
+            for mi in &self.machinst_buf { eprintln!("  {mi:?}"); }
+        }
         let resolved: Vec<MachInst> = self
             .machinst_buf
             .iter()
