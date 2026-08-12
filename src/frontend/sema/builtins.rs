@@ -762,6 +762,105 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_ia32_pinsrq128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pinsrq128));
     m.insert("__builtin_ia32_pextrq128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pextrq128));
 
+    // Hardware emission for ops that previously compiled as scalar C loops.
+    m.insert("_mm_adds_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddusb128));
+    m.insert("_mm_adds_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddsb128));
+    m.insert("_mm_adds_epu16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddusw128));
+    m.insert("_mm_adds_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddsw128));
+    m.insert("_mm_subs_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubsw128));
+    m.insert("_mm_andnot_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128));
+    m.insert("_mm_andnot_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128));
+    m.insert("_mm_andnot_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128));
+    m.insert("_mm_cmpeq_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqw128));
+    m.insert("_mm_cmpgt_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpgtd128));
+    m.insert("_mm_avg_epu8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pavgb128));
+    m.insert("_mm_avg_epu16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pavgw128));
+    m.insert("_mm_min_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsw128));
+    m.insert("_mm_max_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsw128));
+    m.insert("_mm_mulhi_epu16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulhuw128));
+    m.insert("_mm_add_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddq128));
+    m.insert("_mm_sub_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubq128));
+    m.insert("_mm_unpacklo_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckldq128));
+    m.insert("_mm_unpackhi_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhdq128));
+    m.insert("_mm_unpacklo_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklqdq128));
+    m.insert("_mm_unpackhi_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhqdq128));
+    m.insert("_mm_setzero_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128));
+    m.insert("_mm_setzero_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128));
+    m.insert("_mm_setzero_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128));
+    m.insert("_mm_testz_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Testz128));
+
+    m.insert("_mm256_mullo_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulld256));
+    m.insert("_mm256_sub_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubd256));
+    m.insert("_mm256_add_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddq256));
+    m.insert("_mm256_sub_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubq256));
+    m.insert("_mm256_andnot_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256));
+    m.insert("_mm256_andnot_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256));
+    m.insert("_mm256_andnot_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn256));
+    m.insert("_mm256_cmpeq_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqd256));
+    m.insert("_mm256_cmpeq_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpeqq256));
+    m.insert("_mm256_cmpgt_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpgtd256));
+    m.insert("_mm256_cmpgt_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pcmpgtq256));
+    m.insert("_mm256_extracti128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128));
+    m.insert("_mm256_extractf128_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128));
+    m.insert("_mm256_extractf128_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Extracti128));
+    m.insert("_mm256_setzero_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero256));
+    m.insert("_mm256_setzero_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero256));
+    m.insert("_mm256_setzero_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero256));
+    m.insert("_mm256_add_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AddPs256));
+    m.insert("_mm256_sub_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SubPs256));
+    m.insert("_mm256_mul_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulPs256));
+    m.insert("_mm256_add_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AddPd256));
+    m.insert("_mm256_sub_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SubPd256));
+    m.insert("_mm256_mul_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulPd256));
+    m.insert("_mm256_loadu_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86LoaduPs256));
+    m.insert("_mm256_storeu_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StoreuPs256));
+    m.insert("_mm256_loadu_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86LoaduPd256));
+    m.insert("_mm256_storeu_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StoreuPd256));
+    m.insert("_mm256_permute2x128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
+    m.insert("_mm256_permute2f128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
+    m.insert("_mm256_permute2f128_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
+    m.insert("_mm256_permute2f128_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute2x128));
+    m.insert("_mm256_permute4x64_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permute4x64));
+    m.insert("_mm256_shuffle_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pshufd256));
+    m.insert("_mm256_unpacklo_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklbw256));
+    m.insert("_mm256_unpackhi_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhbw256));
+    m.insert("_mm256_unpacklo_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklwd256));
+    m.insert("_mm256_unpackhi_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhwd256));
+    m.insert("_mm256_unpacklo_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckldq256));
+    m.insert("_mm256_unpackhi_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhdq256));
+    m.insert("_mm256_unpacklo_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpcklqdq256));
+    m.insert("_mm256_unpackhi_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Punpckhqdq256));
+    m.insert("_mm256_slli_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslldqi256));
+    m.insert("_mm256_srli_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrldqi256));
+    m.insert("_mm256_bslli_epi128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pslldqi256));
+    m.insert("_mm256_bsrli_epi128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrldqi256));
+    m.insert("_mm256_slli_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllqi256));
+    m.insert("_mm256_srli_epi64", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlqi256));
+    m.insert("_mm256_mullo_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmullw256));
+    m.insert("_mm256_mulhi_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulhw256));
+    m.insert("_mm256_min_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pminsd256));
+    m.insert("_mm256_max_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmaxsd256));
+    m.insert("_mm256_cvtepu8_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxbw256));
+    m.insert("_mm256_cvtepu8_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxbd256));
+    m.insert("_mm256_cvtepu16_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovzxwd256));
+    m.insert("_mm256_cvtepi8_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovsxbw256));
+    m.insert("_mm256_cvtepi8_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovsxbd256));
+    m.insert("_mm256_cvtepi16_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovsxwd256));
+    m.insert("_mm256_srai_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrawi256));
+    m.insert("_mm256_srai_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psradi256));
+    m.insert("_mm256_packs_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packssdw256));
+    m.insert("_mm256_packus_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Packuswb256));
+    m.insert("_mm256_hadd_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddw256));
+    m.insert("_mm256_hadd_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddd256));
+    m.insert("_mm256_abs_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pabsd256));
+    m.insert("_mm256_mul_epu32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmuludq256));
+    m.insert("_mm256_castsi128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
+    m.insert("_mm256_castps128_ps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
+    m.insert("_mm256_castpd128_pd256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
+    m.insert("_mm256_castps256_ps128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128));
+    m.insert("_mm256_castpd256_pd128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128));
+    m.insert("_mm256_lddqu_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loadu256));
+
     m
 });
 
@@ -999,6 +1098,27 @@ pub enum BuiltinIntrinsic {
     // VAES 256 + VPCLMULQDQ 256
     X86Aesenc256, X86Aesenclast256, X86Aesdec256, X86Aesdeclast256,
     X86Vpclmulqdq256,
+    // SSE2/SSE4.1 previously scalar
+    X86Paddusb128, X86Paddsb128, X86Paddusw128, X86Paddsw128, X86Psubsw128,
+    X86Pandn128, X86Pcmpeqw128, X86Pcmpgtd128, X86Pavgb128, X86Pavgw128,
+    X86Pminsw128, X86Pmaxsw128, X86Pmulhuw128, X86Paddq128, X86Psubq128,
+    X86Punpckldq128, X86Punpckhdq128, X86Punpcklqdq128, X86Punpckhqdq128,
+    X86Setzero128, X86Testz128,
+    // AVX/AVX2 previously scalar
+    X86Pmulld256, X86Psubd256, X86Paddq256, X86Psubq256, X86Pandn256,
+    X86Pcmpeqd256, X86Pcmpeqq256, X86Pcmpgtd256, X86Pcmpgtq256,
+    X86Extracti128, X86Setzero256,
+    X86AddPs256, X86SubPs256, X86MulPs256, X86AddPd256, X86SubPd256, X86MulPd256,
+    X86LoaduPs256, X86StoreuPs256, X86LoaduPd256, X86StoreuPd256,
+    X86Permute2x128, X86Permute4x64, X86Pshufd256,
+    X86Punpcklbw256, X86Punpckhbw256, X86Punpcklwd256, X86Punpckhwd256,
+    X86Punpckldq256, X86Punpckhdq256, X86Punpcklqdq256, X86Punpckhqdq256,
+    X86Pslldqi256, X86Psrldqi256, X86Psllqi256, X86Psrlqi256,
+    X86Pmullw256, X86Pmulhw256, X86Pminsd256, X86Pmaxsd256,
+    X86Pmovzxbw256, X86Pmovzxbd256, X86Pmovzxwd256,
+    X86Pmovsxbw256, X86Pmovsxbd256, X86Pmovsxwd256,
+    X86Psrawi256, X86Psradi256, X86Packssdw256, X86Packuswb256,
+    X86Phaddw256, X86Phaddd256, X86Pabsd256, X86Pmuludq256,
     /// __builtin___*_chk: fortification builtins that forward to unchecked libc equivalents
     FortifyChk,
     /// __builtin_va_arg_pack(): used in always_inline fortification wrappers, returns 0
