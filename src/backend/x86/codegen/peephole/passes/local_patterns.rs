@@ -1332,6 +1332,18 @@ pub(super) fn fold_accumulator_alu_store(
         }
         if !src_safe { i += 1; continue; }
 
+        // SOUNDNESS (v9 / BUG-003): after the fold, %eax no longer holds the
+        // ALU result — `OP mem, %REGd` writes %REG, and the store is rewritten
+        // to `movl %REGd, slot`. Later uses that still read %eax expecting the
+        // add result (inlined adler32_copy_tail: `sum2 += new_adler` after
+        // `adler += byte`) would observe the *pre-add* copy, typically the
+        // just-loaded byte. Require %eax to be dead or overwritten after the
+        // store before folding.
+        if !rax_elidable_after(store, infos, m + 1, len) {
+            i += 1;
+            continue;
+        }
+
         // Transform! Replace 3 instructions with 2 (no cltq, 32-bit store).
         mark_nop(&mut infos[i]);
         let new_alu = format!("    {} {}, {}", alu_op_s, mem_src_s, src_reg32);

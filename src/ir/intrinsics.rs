@@ -444,6 +444,9 @@ pub enum IntrinsicOp {
     SetEpi16_256,
     SetEpi32_256,
     SetEpi64x256,
+    SetEpi8_256,
+    /// VPERMD: permute 8 x i32 by variable index (chunkset_avx2)
+    Permutevar8x32,
 
     // --- AVX-VNNI (VEX, Raptor Lake+) ---
     Dpbusd128, Dpbusds128, Dpwusd128, Dpwusds128,
@@ -570,7 +573,7 @@ impl IntrinsicOp {
             | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
             | Pminub256 | Pxor256 | Por256 | Pand256 | Psllidi256 | Psrlidi256
             | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
-            | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256
+            | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
@@ -581,7 +584,7 @@ impl IntrinsicOp {
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
             | Setzero256 | AddPs256 | SubPs256 | MulPs256 | AddPd256
             | SubPd256 | MulPd256 | LoaduPs256 | StoreuPs256 | LoaduPd256
-            | StoreuPd256 | Permute2x128 | Permute4x64 | Pshufd256
+            | StoreuPd256 | Permute2x128 | Permute4x64 | Permutevar8x32 | Pshufd256
             | Punpcklbw256 | Punpckhbw256 | Punpcklwd256 | Punpckhwd256
             | Punpckldq256 | Punpckhdq256 | Punpcklqdq256 | Punpckhqdq256
             | Pslldqi256 | Psrldqi256 | Psllqi256 | Psrlqi256

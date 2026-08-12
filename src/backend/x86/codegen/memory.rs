@@ -1224,6 +1224,8 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_inline_memmove_call_impl(&mut self, dest: &Operand, src: &Operand, size: usize) {
+        // Source slot may still be a deferred vector result.
+        self.flush_pending_vec_store_impl();
         self.operand_to_reg(dest, "rdi");
         self.operand_to_reg(src, "rsi");
         // memmove must handle overlapping ranges. With dst > src, a forward
@@ -1248,6 +1250,15 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+        // SOUNDNESS (v9 / BUG-004): 16/32-byte copies go through %xmm0/%ymm0/%ymm1.
+        // The vector last-store peephole and deferred-store cache assume those
+        // registers still hold the last SIMD intrinsic result. Clobbering them
+        // here without invalidation made inlined fold_state_1
+        //   *xmm_crc3 = _mm_xor_si128(x_low, x_high)
+        // reuse a stale %xmm0 (the just-copied *crc3 = 0) instead of reloading
+        // x_high from its slot. zlib-ng CRC32 then failed iff (n % 64) ∈ [16,31].
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
         if size <= 64 {
             let mut offset = 0usize;
             let mut remaining = size;
