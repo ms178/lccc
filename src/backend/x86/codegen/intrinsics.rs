@@ -1303,14 +1303,15 @@ impl X86Codegen {
                     self.avx_store_dest(dptr);
                 }
             }
-            IntrinsicOp::SetEpi16_256 | IntrinsicOp::SetEpi32_256 | IntrinsicOp::SetEpi64x256 => {
+            IntrinsicOp::SetEpi8_256 | IntrinsicOp::SetEpi16_256 | IntrinsicOp::SetEpi32_256 | IntrinsicOp::SetEpi64x256 => {
                 if let Some(dptr) = dest_ptr {
                     // Constant splats lower to a single memory-source broadcast:
-                    //   vpbroadcast{w,d,q} .LvcN(%rip), %ymm0
+                    //   vpbroadcast{b,w,d,q} .LvcN(%rip), %ymm0
                     // which is 1 uop handled by the load port (the modern best
                     // choice — no movd, no port-5 shuffle). Runtime values use
                     // vmovd+vbroadcast (matches GCC/LLVM on AVX2).
                     let (inst, bits) = match op {
+                        IntrinsicOp::SetEpi8_256 => ("vpbroadcastb", 1u8),
                         IntrinsicOp::SetEpi16_256 => ("vpbroadcastw", 2u8),
                         IntrinsicOp::SetEpi32_256 => ("vpbroadcastd", 4u8),
                         IntrinsicOp::SetEpi64x256 => ("vpbroadcastq", 8u8),
@@ -1614,6 +1615,16 @@ impl X86Codegen {
                     self.avx_load_arg(&args[0]);
                     let imm = self.operand_to_imm_i64(&args[1]);
                     self.state.emit_fmt(format_args!("    vpermq ${}, %ymm0, %ymm0", imm));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            // VPERMD: dest[i] = src[idx[i] & 7]. AT&T: vpermd %src, %idx, %dest
+            // (Intel VPERMD dest, idx, src).
+            IntrinsicOp::Permutevar8x32 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    self.state.emit("    vpermd %ymm0, %ymm1, %ymm0");
                     self.avx_store_dest(dptr);
                 }
             }

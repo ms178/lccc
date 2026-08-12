@@ -591,9 +591,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("_mm256_zextsi128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Zext128to256));
     m.insert("_mm256_castsi256_si128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cast256to128));
     m.insert("_mm256_inserti128_si256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Insert128to256));
+    m.insert("_mm256_set1_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi8_256));
     m.insert("_mm256_set1_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi16_256));
     m.insert("_mm256_set1_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi32_256));
     m.insert("_mm256_set1_epi64x", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi64x256));
+    m.insert("_mm256_permutevar8x32_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permutevar8x32));
     // __builtin_ia32_* names for AVX2
     m.insert("__builtin_ia32_loaddqu256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loadu256));
     m.insert("__builtin_ia32_storedqu256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storeu256));
@@ -620,9 +622,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_ia32_psrldi256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlidi256));
     m.insert("__builtin_ia32_psllwi256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllwi256));
     m.insert("__builtin_ia32_psrlwi256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlwi256));
+    m.insert("__builtin_ia32_vpbroadcastb256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi8_256));
     m.insert("__builtin_ia32_vpbroadcastw256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi16_256));
     m.insert("__builtin_ia32_vpbroadcastd256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi32_256));
     m.insert("__builtin_ia32_vpbroadcastq256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetEpi64x256));
+    m.insert("__builtin_ia32_permvarsi256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Permutevar8x32));
     m.insert("_mm_dpbusd_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Dpbusd128));
     m.insert("_mm_dpbusds_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Dpbusds128));
     m.insert("_mm_dpwusd_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Dpwusd128));
@@ -1076,7 +1080,8 @@ pub enum BuiltinIntrinsic {
     X86Pxor256, X86Por256, X86Pand256,
     X86Psllidi256, X86Psrlidi256, X86Psllwi256, X86Psrlwi256,
     X86Broadcast128to256, X86Zext128to256, X86Cast256to128, X86Insert128to256,
-    X86SetEpi16_256, X86SetEpi32_256, X86SetEpi64x256,
+    X86SetEpi8_256, X86SetEpi16_256, X86SetEpi32_256, X86SetEpi64x256,
+    X86Permutevar8x32,
     /// Float SSE ops. The bundled headers implement these via scalar
     /// __builtin_memcpy fallbacks (catastrophic); map the common ones to the
     /// native instructions. xorps/andps/orps are bitwise — pxor/pand/por is
