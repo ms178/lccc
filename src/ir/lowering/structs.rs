@@ -466,7 +466,28 @@ impl Lowerer {
                         // Indirect call through variable: use struct size to determine ABI
                         struct_size > 8
                     } else {
-                        self.func_meta.sigs.get(name.as_str()).is_some_and(|s| s.sret_size.is_some() || s.two_reg_ret_size.is_some())
+                        match self.func_meta.sigs.get(name.as_str()) {
+                            Some(s) => s.sret_size.is_some() || s.two_reg_ret_size.is_some(),
+                            None => {
+                                // No seeded signature (e.g. an SSE/AVX builtin
+                                // whose system-header declaration is ISA-gated
+                                // out of the build). Classify by the return
+                                // type: a struct/vector return > 8 bytes comes
+                                // back by address (sret or an intrinsic result
+                                // alloca); <= 8 bytes is packed register data.
+                                // Without this, _mm256_clmulepi64_epi128 was
+                                // misclassified as a small packed return: its
+                                // result ADDRESS was spilled as 8 bytes and
+                                // the 32-byte init memcpy read through it
+                                // (clmul256 regression).
+                                let ret_size = self.types.func_return_ctypes
+                                    .get(name.as_str())
+                                    .filter(|c| c.is_struct_or_union() || c.is_vector())
+                                    .map(|c| self.ctype_size(c))
+                                    .unwrap_or(struct_size);
+                                ret_size > 8
+                            }
+                        }
                     }
                 } else {
                     // Indirect call through expression: determine from return type
