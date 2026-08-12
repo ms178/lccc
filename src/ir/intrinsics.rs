@@ -459,6 +459,85 @@ pub enum IntrinsicOp {
     // --- VAES 256-bit + VPCLMULQDQ 256-bit ---
     Aesenc256, Aesenclast256, Aesdec256, Aesdeclast256,
     Vpclmulqdq256,
+
+    // --- SSE2 ops previously left as scalar header loops ---
+    Paddusb128,
+    Paddsb128,
+    Paddusw128,
+    Paddsw128,
+    Psubsw128,
+    Pandn128,
+    Pcmpeqw128,
+    Pcmpgtd128,
+    Pavgb128,
+    Pavgw128,
+    Pminsw128,
+    Pmaxsw128,
+    Pmulhuw128,
+    Paddq128,
+    Psubq128,
+    Punpckldq128,
+    Punpckhdq128,
+    Punpcklqdq128,
+    Punpckhqdq128,
+    Setzero128,
+    Testz128,
+
+    // --- AVX / AVX2 ops previously left as scalar header loops ---
+    Pmulld256,
+    Psubd256,
+    Paddq256,
+    Psubq256,
+    Pandn256,
+    Pcmpeqd256,
+    Pcmpeqq256,
+    Pcmpgtd256,
+    Pcmpgtq256,
+    Extracti128,
+    Setzero256,
+    AddPs256,
+    SubPs256,
+    MulPs256,
+    AddPd256,
+    SubPd256,
+    MulPd256,
+    LoaduPs256,
+    StoreuPs256,
+    LoaduPd256,
+    StoreuPd256,
+    Permute2x128,
+    Permute4x64,
+    Pshufd256,
+    Punpcklbw256,
+    Punpckhbw256,
+    Punpcklwd256,
+    Punpckhwd256,
+    Punpckldq256,
+    Punpckhdq256,
+    Punpcklqdq256,
+    Punpckhqdq256,
+    Pslldqi256,
+    Psrldqi256,
+    Psllqi256,
+    Psrlqi256,
+    Pmullw256,
+    Pmulhw256,
+    Pminsd256,
+    Pmaxsd256,
+    Pmovzxbw256,
+    Pmovzxbd256,
+    Pmovzxwd256,
+    Pmovsxbw256,
+    Pmovsxbd256,
+    Pmovsxwd256,
+    Psrawi256,
+    Psradi256,
+    Packssdw256,
+    Packuswb256,
+    Phaddw256,
+    Phaddd256,
+    Pabsd256,
+    Pmuludq256,
 }
 
 impl IntrinsicOp {
@@ -496,7 +575,21 @@ impl IntrinsicOp {
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
-            | VecAddI32x8 | VecZeroF64x4 | VecZeroI32x8 => Some(32),
+            | VecAddI32x8 | VecZeroF64x4 | VecZeroI32x8
+            // Newly wired AVX/AVX2 ops (previously scalar header loops)
+            | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
+            | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
+            | Setzero256 | AddPs256 | SubPs256 | MulPs256 | AddPd256
+            | SubPd256 | MulPd256 | LoaduPs256 | StoreuPs256 | LoaduPd256
+            | StoreuPd256 | Permute2x128 | Permute4x64 | Pshufd256
+            | Punpcklbw256 | Punpckhbw256 | Punpcklwd256 | Punpckhwd256
+            | Punpckldq256 | Punpckhdq256 | Punpcklqdq256 | Punpckhqdq256
+            | Pslldqi256 | Psrldqi256 | Psllqi256 | Psrlqi256
+            | Pmullw256 | Pmulhw256 | Pminsd256 | Pmaxsd256
+            | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
+            | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
+            | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
+            | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256 => Some(32),
             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
             Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
@@ -519,6 +612,11 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
+            | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
+            | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
+            | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
+            | Punpckldq128 | Punpckhdq128 | Punpcklqdq128 | Punpckhqdq128
+            | Setzero128 | Extracti128
             => Some(16),
             // Everything else produces a scalar GPR/x87 result, no result, or
             // is an F128 helper handled by the dedicated f128 slot path.

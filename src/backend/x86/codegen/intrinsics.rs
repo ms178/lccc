@@ -1274,10 +1274,12 @@ impl X86Codegen {
             }
             IntrinsicOp::Zext128to256 => {
                 if let Some(dptr) = dest_ptr {
+                    // Zero-extend 128→256: VEX insert of the 128-bit value into
+                    // a zeroed ymm. A lone vinserti128 $1 of the same xmm would
+                    // DUPLICATE the low lane into the high lane (miscompile).
                     self.sse_load_arg(&args[0], "xmm0");
-                    self.state.emit("    vinserti128 $1, %xmm0, %ymm0, %ymm0");
-                    self.state.emit("    vxorps %xmm1, %xmm1, %xmm1");
-                    self.state.emit("    vinserti128 $1, %xmm1, %ymm0, %ymm0");
+                    self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
+                    self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
                     self.avx_store_dest(dptr);
                 }
             }
@@ -1464,6 +1466,212 @@ impl X86Codegen {
                 self.state.emit("    vpmovmskb %ymm0, %eax");
                 if let Some(d) = dest {
                     self.store_rax_to(d);
+                }
+            }
+
+            // --- Newly wired SSE2 ops (were scalar header loops) ---
+            IntrinsicOp::Paddusb128 | IntrinsicOp::Paddsb128 | IntrinsicOp::Paddusw128
+            | IntrinsicOp::Paddsw128 | IntrinsicOp::Psubsw128 | IntrinsicOp::Pandn128
+            | IntrinsicOp::Pcmpeqw128 | IntrinsicOp::Pcmpgtd128 | IntrinsicOp::Pavgb128
+            | IntrinsicOp::Pavgw128 | IntrinsicOp::Pminsw128 | IntrinsicOp::Pmaxsw128
+            | IntrinsicOp::Pmulhuw128 | IntrinsicOp::Paddq128 | IntrinsicOp::Psubq128
+            | IntrinsicOp::Punpckldq128 | IntrinsicOp::Punpckhdq128
+            | IntrinsicOp::Punpcklqdq128 | IntrinsicOp::Punpckhqdq128 => {
+                if let Some(dptr) = dest_ptr {
+                    let inst = match op {
+                        IntrinsicOp::Paddusb128 => "paddusb",
+                        IntrinsicOp::Paddsb128 => "paddsb",
+                        IntrinsicOp::Paddusw128 => "paddusw",
+                        IntrinsicOp::Paddsw128 => "paddsw",
+                        IntrinsicOp::Psubsw128 => "psubsw",
+                        IntrinsicOp::Pandn128 => "pandn",
+                        IntrinsicOp::Pcmpeqw128 => "pcmpeqw",
+                        IntrinsicOp::Pcmpgtd128 => "pcmpgtd",
+                        IntrinsicOp::Pavgb128 => "pavgb",
+                        IntrinsicOp::Pavgw128 => "pavgw",
+                        IntrinsicOp::Pminsw128 => "pminsw",
+                        IntrinsicOp::Pmaxsw128 => "pmaxsw",
+                        IntrinsicOp::Pmulhuw128 => "pmulhuw",
+                        IntrinsicOp::Paddq128 => "paddq",
+                        IntrinsicOp::Psubq128 => "psubq",
+                        IntrinsicOp::Punpckldq128 => "punpckldq",
+                        IntrinsicOp::Punpckhdq128 => "punpckhdq",
+                        IntrinsicOp::Punpcklqdq128 => "punpcklqdq",
+                        IntrinsicOp::Punpckhqdq128 => "punpckhqdq",
+                        _ => unreachable!(),
+                    };
+                    self.emit_sse_binary_128(dptr, args, inst);
+                }
+            }
+            IntrinsicOp::Setzero128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.state.emit("    pxor %xmm0, %xmm0");
+                    self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            IntrinsicOp::Testz128 => {
+                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[1], "xmm1");
+                self.state.emit("    ptest %xmm1, %xmm0");
+                self.state.emit("    sete %al");
+                self.state.emit("    movzbl %al, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+
+            // --- Newly wired AVX/AVX2 ops ---
+            IntrinsicOp::Pmulld256 | IntrinsicOp::Psubd256 | IntrinsicOp::Paddq256
+            | IntrinsicOp::Psubq256 | IntrinsicOp::Pandn256 | IntrinsicOp::Pcmpeqd256
+            | IntrinsicOp::Pcmpeqq256 | IntrinsicOp::Pcmpgtd256 | IntrinsicOp::Pcmpgtq256
+            | IntrinsicOp::AddPs256 | IntrinsicOp::SubPs256 | IntrinsicOp::MulPs256
+            | IntrinsicOp::AddPd256 | IntrinsicOp::SubPd256 | IntrinsicOp::MulPd256
+            | IntrinsicOp::Punpcklbw256 | IntrinsicOp::Punpckhbw256
+            | IntrinsicOp::Punpcklwd256 | IntrinsicOp::Punpckhwd256
+            | IntrinsicOp::Punpckldq256 | IntrinsicOp::Punpckhdq256
+            | IntrinsicOp::Punpcklqdq256 | IntrinsicOp::Punpckhqdq256
+            | IntrinsicOp::Pmullw256 | IntrinsicOp::Pmulhw256
+            | IntrinsicOp::Pminsd256 | IntrinsicOp::Pmaxsd256
+            | IntrinsicOp::Packssdw256 | IntrinsicOp::Packuswb256
+            | IntrinsicOp::Phaddw256 | IntrinsicOp::Phaddd256
+            | IntrinsicOp::Pmuludq256 => {
+                if let Some(dptr) = dest_ptr {
+                    let (inst, comm) = match op {
+                        IntrinsicOp::Pmulld256 => ("vpmulld", true),
+                        IntrinsicOp::Psubd256 => ("vpsubd", false),
+                        IntrinsicOp::Paddq256 => ("vpaddq", true),
+                        IntrinsicOp::Psubq256 => ("vpsubq", false),
+                        IntrinsicOp::Pandn256 => ("vpandn", false),
+                        IntrinsicOp::Pcmpeqd256 => ("vpcmpeqd", true),
+                        IntrinsicOp::Pcmpeqq256 => ("vpcmpeqq", true),
+                        IntrinsicOp::Pcmpgtd256 => ("vpcmpgtd", false),
+                        IntrinsicOp::Pcmpgtq256 => ("vpcmpgtq", false),
+                        IntrinsicOp::AddPs256 => ("vaddps", true),
+                        IntrinsicOp::SubPs256 => ("vsubps", false),
+                        IntrinsicOp::MulPs256 => ("vmulps", true),
+                        IntrinsicOp::AddPd256 => ("vaddpd", true),
+                        IntrinsicOp::SubPd256 => ("vsubpd", false),
+                        IntrinsicOp::MulPd256 => ("vmulpd", true),
+                        IntrinsicOp::Punpcklbw256 => ("vpunpcklbw", false),
+                        IntrinsicOp::Punpckhbw256 => ("vpunpckhbw", false),
+                        IntrinsicOp::Punpcklwd256 => ("vpunpcklwd", false),
+                        IntrinsicOp::Punpckhwd256 => ("vpunpckhwd", false),
+                        IntrinsicOp::Punpckldq256 => ("vpunpckldq", false),
+                        IntrinsicOp::Punpckhdq256 => ("vpunpckhdq", false),
+                        IntrinsicOp::Punpcklqdq256 => ("vpunpcklqdq", false),
+                        IntrinsicOp::Punpckhqdq256 => ("vpunpckhqdq", false),
+                        IntrinsicOp::Pmullw256 => ("vpmullw", true),
+                        IntrinsicOp::Pmulhw256 => ("vpmulhw", true),
+                        IntrinsicOp::Pminsd256 => ("vpminsd", true),
+                        IntrinsicOp::Pmaxsd256 => ("vpmaxsd", true),
+                        IntrinsicOp::Packssdw256 => ("vpackssdw", false),
+                        IntrinsicOp::Packuswb256 => ("vpackuswb", false),
+                        IntrinsicOp::Phaddw256 => ("vphaddw", false),
+                        IntrinsicOp::Phaddd256 => ("vphaddd", false),
+                        IntrinsicOp::Pmuludq256 => ("vpmuludq", true),
+                        _ => unreachable!(),
+                    };
+                    self.emit_avx_binary_256(dptr, args, inst, comm);
+                }
+            }
+            IntrinsicOp::Setzero256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Extracti128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    let lane = self.operand_to_imm_i64(&args[1]) & 1;
+                    self.state.emit_fmt(format_args!("    vextracti128 ${}, %ymm0, %xmm0", lane));
+                    self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            IntrinsicOp::LoaduPs256 | IntrinsicOp::LoaduPd256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::StoreuPs256 | IntrinsicOp::StoreuPd256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Permute2x128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    let imm = self.operand_to_imm_i64(&args[2]);
+                    self.state.emit_fmt(format_args!("    vperm2i128 ${}, %ymm1, %ymm0, %ymm0", imm));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Permute4x64 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    let imm = self.operand_to_imm_i64(&args[1]);
+                    self.state.emit_fmt(format_args!("    vpermq ${}, %ymm0, %ymm0", imm));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Pshufd256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    let imm = self.operand_to_imm_i64(&args[1]);
+                    self.state.emit_fmt(format_args!("    vpshufd ${}, %ymm0, %ymm0", imm));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Pslldqi256 | IntrinsicOp::Psrldqi256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    let imm = self.operand_to_imm_i64(&args[1]) & 0xff;
+                    let inst = if matches!(op, IntrinsicOp::Pslldqi256) { "vpslldq" } else { "vpsrldq" };
+                    self.state.emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Psllqi256 | IntrinsicOp::Psrlqi256
+            | IntrinsicOp::Psrawi256 | IntrinsicOp::Psradi256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    let imm = self.operand_to_imm_i64(&args[1]);
+                    let inst = match op {
+                        IntrinsicOp::Psllqi256 => "vpsllq",
+                        IntrinsicOp::Psrlqi256 => "vpsrlq",
+                        IntrinsicOp::Psrawi256 => "vpsraw",
+                        IntrinsicOp::Psradi256 => "vpsrad",
+                        _ => unreachable!(),
+                    };
+                    self.state.emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Pmovzxbw256 | IntrinsicOp::Pmovzxbd256 | IntrinsicOp::Pmovzxwd256
+            | IntrinsicOp::Pmovsxbw256 | IntrinsicOp::Pmovsxbd256 | IntrinsicOp::Pmovsxwd256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    let inst = match op {
+                        IntrinsicOp::Pmovzxbw256 => "vpmovzxbw",
+                        IntrinsicOp::Pmovzxbd256 => "vpmovzxbd",
+                        IntrinsicOp::Pmovzxwd256 => "vpmovzxwd",
+                        IntrinsicOp::Pmovsxbw256 => "vpmovsxbw",
+                        IntrinsicOp::Pmovsxbd256 => "vpmovsxbd",
+                        IntrinsicOp::Pmovsxwd256 => "vpmovsxwd",
+                        _ => unreachable!(),
+                    };
+                    self.state.emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
+                    self.avx_store_dest(dptr);
+                }
+            }
+            IntrinsicOp::Pabsd256 => {
+                if let Some(dptr) = dest_ptr {
+                    self.avx_load_arg(&args[0]);
+                    self.state.emit("    vpabsd %ymm0, %ymm0");
+                    self.avx_store_dest(dptr);
                 }
             }
 
