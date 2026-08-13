@@ -924,6 +924,16 @@ impl Driver {
                 }
                 "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
                 "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
+                arg if arg.starts_with("-fprofile-update=") => {
+                    // GCC 7+/LLVM 17+ semantics: single (default, non-atomic),
+                    // atomic (lock-prefixed), prefer-atomic (atomic when the
+                    // target supports it — x86-64 always does).
+                    let m = arg["-fprofile-update=".len()..].to_string();
+                    self.pgo_update = Some(match m.as_str() {
+                        "atomic" | "prefer-atomic" => "atomic".to_string(),
+                        _ => "single".to_string(),
+                    });
+                }
                 "-fbranch-probabilities" => self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string())),
                 arg if arg.starts_with("-fprofile-dir=") => {
                     let path = arg["-fprofile-dir=".len()..].to_string();

@@ -5,6 +5,7 @@ pub(crate) mod instrument;
 pub(crate) mod layout;
 pub(crate) mod profile;
 pub(crate) mod promote;
+pub(crate) mod summary;
 pub(crate) mod unroll_pgo;
 use crate::ir::reexports::{BlockId, IrFunction, IrModule};
 use std::cell::{Cell, RefCell};
@@ -146,8 +147,10 @@ static PRE_HASHES: std::sync::LazyLock<std::sync::Mutex<FxHashMap<String, u64>>>
 static POST_HASHES: std::sync::LazyLock<std::sync::Mutex<FxHashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
 /// Promoted-hot block labels (unit, function) -> labels, from
-/// promote::promote_indirect_calls; layout uses them to keep the
-/// devirtualized hot path hot.
+/// promote::promote_indirect_calls. Labels are recorded BEFORE the label
+/// renumber pass; `remap_promoted_hot` (called by the driver right after
+/// renumbering, which knows the exact old->new map) translates them, so
+/// layout sees post-renumber labels.
 static PROMOTED_HOT: std::sync::LazyLock<
     std::sync::Mutex<FxHashMap<(String, String), FxHashSet<u32>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
@@ -184,6 +187,22 @@ pub fn promoted_hot_labels(u: &str, fname: &str) -> FxHashSet<u32> {
         .cloned()
         .unwrap_or_default()
 }
+
+/// Translate recorded promoted-block labels through the label-renumber map
+/// (old label -> new label; labels are TU-unique). Called by the driver right
+/// after the renumber pass; labels whose block vanished keep their value (the
+/// relocation then simply fails to find them and leaves the block in place —
+/// harmless).
+pub fn remap_promoted_hot(remap: &FxHashMap<u32, u32>) {
+    let mut m = PROMOTED_HOT.lock().unwrap();
+    for labels in m.values_mut() {
+        let old: Vec<u32> = labels.iter().copied().collect();
+        labels.clear();
+        for l in old {
+            labels.insert(remap.get(&l).copied().unwrap_or(l));
+        }
+    }
+}
 /// Activate the profile for PRE-PASS consumers (PGO-guided inlining, loop
 /// unrolling). Called before `run_passes`; name+unit-keyed entry counts are
 /// stable across gen/use even when the optimizer changes the CFG.
@@ -197,6 +216,24 @@ pub fn prepass_activate(unit: &str) {
 
 pub fn prepass_is_active() -> bool {
     PREPASS_ACTIVE.with(Cell::get)
+}
+
+/// The unit currently being compiled (pre-pass unit preferred, post-pass
+/// fallback) — used by summary-aware consumers.
+pub fn active_unit() -> Option<String> {
+    ACTIVE_UNIT2
+        .with(|s| s.borrow().clone())
+        .or_else(|| ACTIVE_UNIT.with(|s| s.borrow().clone()))
+}
+
+/// Raw (instrumented-edge) profile for a function in the PRE-pass unit.
+/// Block/tree-edge counts are NOT yet derived; callers that need them must
+/// run `profile::derive_block_counts` on the CURRENT IrFunction (the v8
+/// inliner does exactly that for per-call-site hotness).
+pub fn prepass_profile(name: &str) -> Option<FunctionProfile> {
+    let p = get_pgo_profile()?;
+    let u = ACTIVE_UNIT2.with(|slot| slot.borrow().clone())?;
+    profile::get_for_unit(p, &u, name).cloned()
 }
 
 /// Name-keyed, unit-scoped total count for pre-pass consumers.

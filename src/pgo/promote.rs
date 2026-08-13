@@ -384,10 +384,12 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                         }
                     }
                 }
-                hot_labels
-                    .entry(f.name.clone())
-                    .or_default()
-                    .insert(lhot.0);
+                // Record the promoted blocks by label (lhot, lcold, ljoin).
+                // The label-renumber pass remaps these via
+                // crate::pgo::remap_promoted_hot before layout runs.
+                hot_labels.entry(f.name.clone()).or_default().insert(lhot.0);
+                hot_labels.entry(f.name.clone()).or_default().insert(lcold.0);
+                hot_labels.entry(f.name.clone()).or_default().insert(ljoin.0);
                 promoted += 1;
             }
         }

@@ -12,6 +12,10 @@ $CCC -O2 -fprofile-generate="$PGD" "$SRC" -o /tmp/r7_pg || { echo "GEN-FAIL"; ex
 /tmp/r7_pg > /tmp/r7_pg.out || { echo "GEN-RUN-FAIL"; exit 1; }
 grep -q "^ok " /tmp/r7_pg.out || { echo "GEN-OUT-FAIL: $(cat /tmp/r7_pg.out)"; exit 1; }
 [ -n "$(ls "$PGD"/*.profraw 2>/dev/null)" ] || { echo "NO-PROFILE"; exit 1; }
+echo "== env override =="
+rm -f /tmp/r7_custom.profraw
+LCCC_PROFILE_FILE=/tmp/r7_custom.profraw /tmp/r7_pg > /dev/null || { echo "ENV-RUN-FAIL"; exit 1; }
+[ -s /tmp/r7_custom.profraw ] || { echo "ENV-NO-FILE"; exit 1; }
 echo "== use =="
 $CCC -O2 -fprofile-use="$PGD" "$SRC" -o /tmp/r7_pu 2>/tmp/r7_pu.log || { echo "USE-FAIL"; exit 1; }
 /tmp/r7_pu > /tmp/r7_pu.out || { echo "USE-RUN-FAIL"; exit 1; }

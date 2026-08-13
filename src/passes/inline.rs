@@ -535,14 +535,31 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             // PGO: filter/adjust call sites based on profile
             if let Some(profile) = crate::pgo::get_pgo_profile() {
                 let caller_name = module.functions[func_idx].name.clone();
+                // v8: per-call-site hotness. Derive block counts for the
+                // CURRENT caller CFG from the h0-keyed profile (the CFG may
+                // have changed since training; derive handles drift
+                // gracefully) so the decision sees the count of the block
+                // containing each call (LLVM isHotCallSite/BFI).
+                let caller_fn = &module.functions[func_idx];
+                let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
+                if let Some(fp) = caller_fp.as_mut() {
+                    crate::pgo::profile::derive_block_counts(caller_fn, fp);
+                }
                 // For each call site, check if PGO says to force inline or deny
                 let mut filtered = Vec::new();
                 for site in call_sites {
                     if let Some(callee) = callee_map.get(&site.callee_name) {
                         // Get callee name
                         let callee_name = &site.callee_name;
+                        let site_cnt = caller_fp
+                            .as_ref()
+                            .map(|fp| {
+                                let lbl = module.functions[func_idx].blocks[site.block_idx].label;
+                                fp.block_count(lbl)
+                            })
+                            .unwrap_or(0);
                         // Check PGO inline decision
-                        if let Some(force) = crate::pgo::inline_pgo::should_inline_normal(
+                        if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
                             &module.functions[func_idx],
                             &{
                                 // Reconstruct IrFunction for callee from callee_map data
@@ -576,6 +593,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                                 };
                                 dummy
                             },
+                            site_cnt,
                             Some(profile),
                         ) {
                             if force {
@@ -729,14 +747,31 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             // PGO: filter/adjust call sites based on profile
             if let Some(profile) = crate::pgo::get_pgo_profile() {
                 let caller_name = module.functions[func_idx].name.clone();
+                // v8: per-call-site hotness. Derive block counts for the
+                // CURRENT caller CFG from the h0-keyed profile (the CFG may
+                // have changed since training; derive handles drift
+                // gracefully) so the decision sees the count of the block
+                // containing each call (LLVM isHotCallSite/BFI).
+                let caller_fn = &module.functions[func_idx];
+                let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
+                if let Some(fp) = caller_fp.as_mut() {
+                    crate::pgo::profile::derive_block_counts(caller_fn, fp);
+                }
                 // For each call site, check if PGO says to force inline or deny
                 let mut filtered = Vec::new();
                 for site in call_sites {
                     if let Some(callee) = callee_map.get(&site.callee_name) {
                         // Get callee name
                         let callee_name = &site.callee_name;
+                        let site_cnt = caller_fp
+                            .as_ref()
+                            .map(|fp| {
+                                let lbl = module.functions[func_idx].blocks[site.block_idx].label;
+                                fp.block_count(lbl)
+                            })
+                            .unwrap_or(0);
                         // Check PGO inline decision
-                        if let Some(force) = crate::pgo::inline_pgo::should_inline_normal(
+                        if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
                             &module.functions[func_idx],
                             &{
                                 // Reconstruct IrFunction for callee from callee_map data
@@ -770,6 +805,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                                 };
                                 dummy
                             },
+                            site_cnt,
                             Some(profile),
                         ) {
                             if force {
