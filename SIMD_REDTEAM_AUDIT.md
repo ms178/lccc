@@ -306,3 +306,52 @@ F32 sum/dot match GCC bit-exactly for N ∈ {1..257, 1024} in both AVX2 and SSE2
 3. Memory-operand folding for the first (last-use) reference of a vector slot.
 4. matmul `BroadcastLoadF64` hoisting (documented TODO, blocked on register
    allocation).
+
+---
+
+# v3 (2026-08-13) — novel-ideas execution: diagnostics + reduction-loop codegen
+
+## Delivered (all validated: regression 126/126, correctness 50/50, intrinsics 3/3)
+
+1. **"Why not vectorized" diagnostics (goal §57).** The auto-vectorizer records the
+   most specific rejection reason at every bail-out site; `LCCC_WHY_NOT_VECTORIZE=1`
+   prints a one-line-per-loop summary. Purely diagnostic.
+
+2. **Defer-aware folding of auto-vectorizer Vec* ops.** The Vec{Load,Add,Mul}
+   emitters previously bypassed the register-cache / deferred-store machinery and
+   round-tripped every vector op through the stack (~17 instrs per F64 dot
+   iteration). They now route through `emit_avx_binary_256`/`emit_sse_binary_128`
+   (memory-operand folding + deferred single-use loads + register cache), and
+   `compute_vector_defer_values` recognizes Vec* SSA `dest` producers.
+
+3. **Commutative rename elimination** in `emit_avx_binary_256`: `op m0, %ymm0, %ymm0`
+   instead of `vmovdqa` rename + fold.
+
+4. **Constant-zero offset materialization removed** from VecLoad* (the vectorizer
+   passes `(array_gep, 0)`): `vmovupd (%rax), %ymm0` instead of
+   `xorl %ecx,%ecx; vmovupd (%rax,%rcx), %ymm0`.
+
+5. **resolve_slot_addr** now treats `vector_values`/`vector128_values` as Direct
+   slots (slot holds vector data, not a pointer) — removes leaq+indirect-load
+   round-trips.
+
+## Measured (min-of-5, pinned core, warm cache)
+
+| kernel | lccc (before v3) | lccc (v3) | gcc | clang |
+|---|---|---|---|---|
+| F64 sum 1M | 0.658 s | **0.624 s** | 0.616 s | — |
+| F64 dot 1M | 0.262 s | **0.250 s** | 0.247 s | — |
+| F32 dot 1M | 0.124 s | **0.124 s** | 0.246 s | 0.247 s |
+
+F64 reductions went from ~6% slower to within measurement noise of GCC; F32 dot
+remains ~2× faster than GCC/Clang.
+
+## Remaining top-priority work (v4)
+1. **Loop-carried accumulator in a YMM register** — the last 4-5 instr/iter on
+   reduction loops (sum copy + acc load/store) need 256-bit vector register
+   allocation (YMM PhysReg class + Phase 3c + Vec* copy coalescing). This is the
+   adler32 5.3× gap too (hand-written intrinsic chains).
+2. **Reduction-loop address strength reduction** (element-index IV + per-iter
+   shl/leaq vs the byte-offset IV the matmul path already uses).
+3. Store-loop / general loop vectorization (dataflow-driven).
+4. matmul `BroadcastLoadF64` hoisting (still blocked on register allocation).

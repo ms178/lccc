@@ -85,6 +85,28 @@ use crate::ir::ops::{IrBinOp, IrCmpOp};
 use crate::ir::reexports::{IrConst, IrFunction};
 use crate::passes::loop_analysis;
 
+/// Per-loop rejection reason for the "why was this not vectorized" diagnostic
+/// (project goal §57). The analysis functions record the most specific reason
+/// they bail out with; `vectorize_with_analysis` prints it when either
+/// `LCCC_DEBUG_VECTORIZE=1` (full trace) or `LCCC_WHY_NOT_VECTORIZE=1`
+/// (one-line-per-loop summary) is set. Purely diagnostic — never changes
+/// codegen.
+thread_local! {
+    static REJECT_REASON: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_reject(reason: &'static str) {
+    REJECT_REASON.with(|r| {
+        if r.borrow().is_none() {
+            *r.borrow_mut() = Some(reason);
+        }
+    });
+}
+
+fn take_reject() -> Option<&'static str> {
+    REJECT_REASON.with(|r| r.borrow_mut().take())
+}
+
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
     let num_blocks = func.blocks.len();
@@ -125,6 +147,7 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
         }
 
         // Try to vectorize this loop - first try matmul, then try reduction patterns.
+        take_reject();
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
             let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
@@ -168,8 +191,14 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern);
             }
-        } else if debug {
-            eprintln!("[VEC] No vectorizable pattern found for loop {}", idx);
+        } else {
+            let why = take_reject().unwrap_or("pattern shape not recognized");
+            if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
+                eprintln!(
+                    "[VEC] Loop {} (header block {}) not vectorized: {}",
+                    idx, loop_info.header, why
+                );
+            }
         }
     }
 
@@ -523,6 +552,7 @@ fn analyze_loop_pattern(
             if debug {
                 eprintln!("[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)", ty);
             }
+            set_reject("matmul element type is not double (only F64 FMA is supported)");
             return None;
         }
     }
@@ -1077,6 +1107,7 @@ fn analyze_reduction_pattern(
         if debug {
             eprintln!("[VEC-RED]   No accumulator phi found (initialized to zero)");
         }
+        set_reject("no zero-initialized accumulator variable found");
         return None;
     }
     let accumulator_phi = accumulator_phi?;
@@ -1195,6 +1226,7 @@ fn analyze_reduction_pattern(
         if debug {
             eprintln!("[VEC-RED]   Unsupported element type: {:?}", element_type);
         }
+        set_reject("accumulator element type is not F64/F32/I32/I64");
         return None;
     }
 
@@ -1236,6 +1268,7 @@ fn analyze_reduction_pattern(
                 if debug {
                     eprintln!("[VEC-RED]   Array GEP doesn't use IV");
                 }
+                set_reject("array index is not based on the loop induction variable");
                 return None;
             }
 
@@ -1258,6 +1291,7 @@ fn analyze_reduction_pattern(
                 if debug {
                     eprintln!("[VEC-RED]   Rejecting unsound reduction (Sum)");
                 }
+                set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
                 return None;
             }
 
@@ -1327,6 +1361,7 @@ fn analyze_reduction_pattern(
                     if debug {
                         eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
                     }
+                    set_reject("widening/narrowing reduction cast not vectorizable");
                     return None;
                 }
 
@@ -1345,6 +1380,7 @@ fn analyze_reduction_pattern(
                     if debug {
                         eprintln!("[VEC-RED]   Rejecting unsound reduction (Cast-Sum)");
                     }
+                    set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
                     return None;
                 }
 
@@ -1406,6 +1442,7 @@ fn analyze_reduction_pattern(
                 if debug {
                     eprintln!("[VEC-RED]   Array GEPs don't use IV");
                 }
+                set_reject("array index is not based on the loop induction variable");
                 return None;
             }
 
@@ -1428,6 +1465,7 @@ fn analyze_reduction_pattern(
                 if debug {
                     eprintln!("[VEC-RED]   Rejecting unsound reduction (DotProduct)");
                 }
+                set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
                 return None;
             }
 
@@ -1455,6 +1493,7 @@ fn analyze_reduction_pattern(
             if debug {
                 eprintln!("[VEC-RED]   Unsupported accumulator update pattern");
             }
+            set_reject("accumulator update is not sum += x[i] or sum += x[i]*y[i]");
             None
         }
     }
