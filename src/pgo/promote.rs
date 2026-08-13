@@ -64,6 +64,21 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
         .unwrap_or(51)
         .max(1)
         .min(100);
+    // v11 (red-team fix): a site whose top target accounts for >= STABLE_PERCENT
+    // (default 95%) of calls is effectively SINGLE-TARGET and is already
+    // predicted perfectly by the indirect branch predictor (BTB) — the guarded
+    // `cmp fp, target; jne cold; call target; cold: call *fp` transform then
+    // adds a compare + branch to EVERY call with no accuracy benefit, a net
+    // REGRESSION (measured: op_dispatch indirect dispatch 38.9ms -> 49.9ms,
+    // +28% from devirtualizing a loop-invariant single target). Devirtualization
+    // is only beneficial when the site is genuinely MULTI-VALUED (top share
+    // below STABLE_PERCENT) — there the guard makes the common case a direct
+    // call and reduces real indirect-call mispredictions.
+    let stable_percent: u64 = std::env::var("LCCC_PGO_PROMOTE_STABLE")
+        .ok()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(95)
+        .clamp(51, 100);
     let mut promoted = 0;
 
     // Module-global label + value counters (labels are TU-global).
@@ -133,6 +148,12 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     continue;
                 };
                 if tcount.saturating_mul(100) < site.total.saturating_mul(threshold) {
+                    continue;
+                }
+                // v11: skip the effectively single-target (stable, perfectly
+                // predicted) sites — promoting them only adds per-call overhead
+                // (see the stable_percent rationale above).
+                if tcount.saturating_mul(100) >= site.total.saturating_mul(stable_percent) {
                     continue;
                 }
                 // A static target's emitted symbol is LOCAL: cross-TU direct

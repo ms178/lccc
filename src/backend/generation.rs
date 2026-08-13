@@ -2264,7 +2264,13 @@ fn generate_terminator(
             true_label,
             false_label,
         } => {
+            // v11: hand the profile-driven preferred-fallthrough successor
+            // (the hot edge target, computed by the layout pass) to the
+            // backend so the hot path falls through without reordering
+            // blocks. Cleared immediately after emission.
+            crate::pgo::set_cond_fallthrough(crate::pgo::cond_fallthrough(block_label));
             cg.emit_cond_branch_blocks(cond, *true_label, *false_label);
+            crate::pgo::set_cond_fallthrough(None);
         }
         Terminator::IndirectBranch { target, .. } => {
             cg.emit_indirect_branch(target);

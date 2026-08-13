@@ -40,8 +40,13 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
         let dh = s.is_hot(to_count(df));
         let dc = s.is_cold(to_count(df));
         let cc = s.is_cold(to_count(cf));
+        // v10: the hot-caller/hot-callee bonus is only meaningful when the
+        // profile has genuine hot/cold separation. On a flat profile
+        // (`has_spread()` == false) "both hot" is vacuous, and returning 1.75
+        // makes the base inliner over-inline helpers into hot functions —
+        // restructuring them and regressing the hot path (see summary.rs).
         if ch && dh {
-            1.75
+            if s.has_spread() { 1.75 } else { 1.0 }
         } else if ch && dc {
             0.60
         } else if cc {
@@ -49,14 +54,48 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
         } else {
             1.0
         }
-    } else if cf >= 0.10 && df >= 0.05 {
-        1.75
-    } else if cf >= 0.10 && df < 0.005 {
-        0.60
-    } else if cf < 0.005 {
-        0.80
     } else {
-        1.0
+        // v7 relative-frequency fallback (no summary): same rule — the 1.75
+        // bonus needs a real hot/cold spread, else it over-inlines.
+        let m = p
+            .functions
+            .values()
+            .map(|x| x.total_count)
+            .max()
+            .unwrap_or(0);
+        // A genuine hot/cold spread exists if some function is at least 10x
+        // rarer than the hottest — hotness classification is then meaningful.
+        let has_cold = m > 0
+            && p.functions
+                .values()
+                .any(|f| f.total_count.saturating_mul(10) < m.max(1));
+        if cf >= 0.10 && df >= 0.05 && has_cold {
+            1.75
+        } else if cf >= 0.10 && df < 0.005 {
+            0.60
+        } else if cf < 0.005 {
+            0.80
+        } else {
+            1.0
+        }
+    }
+}
+
+/// v10: whether profile-driven inlining decisions are meaningfully active.
+///
+/// On a FLAT profile (no hot/cold spread) every call site and function looks
+/// "hot" to the percentile thresholds, so the PGO inliner has no informative
+/// signal. Merely reading the profile in that state can perturb the inliner's
+/// pass iterations and change the final code, regressing hot paths (v10
+/// finding: zlib-ng adler32 and expat kernels regressed ~20-26% under
+/// `-fprofile-use` on flat profiles, and the regression survived disabling
+/// layout and the identifiable consumers). Gate the entire PGO inline filter on
+/// this: a flat profile compiles exactly like plain `-O2` for inlining, and PGO
+/// inlining only engages where the profile is genuinely skewed.
+pub fn inline_decisions_active() -> bool {
+    match crate::pgo::summary::get_summary() {
+        Some(s) => s.has_spread(),
+        None => true, // no summary: use the v7 relative-frequency heuristics
     }
 }
 
@@ -97,9 +136,9 @@ fn should_inline_impl(
         match crate::pgo::summary::get_summary() {
             Some(s) => (
                 s.is_hot(cf),
-                s.is_hot(df),
-                s.is_cold(cf),
-                s.is_cold(df),
+                df > 0 && s.is_hot(df),
+                cf > 0 && s.is_cold(cf),
+                df > 0 && s.is_cold(df),
                 site_count > 0 && s.is_hot(site_count),
                 site_count > 0 && s.is_cold(site_count),
             ),
@@ -114,9 +153,9 @@ fn should_inline_impl(
                 let r = |c: u64| if m == 0 { 0.0 } else { c as f64 / m as f64 };
                 (
                     r(cf) >= 0.10,
-                    r(df) >= 0.05,
-                    r(cf) < 0.005,
-                    r(df) < 0.001,
+                    df > 0 && r(df) >= 0.05,
+                    cf > 0 && r(cf) < 0.005,
+                    df > 0 && r(df) < 0.001,
                     false,
                     false,
                 )
@@ -132,9 +171,39 @@ fn should_inline_impl(
         return None;
     }
     // Strongest signal: a HOT CALL SITE (the block containing the call is
-    // hot — LLVM HotCallSiteThreshold). Medium hot callees inline.
+    // hot — LLVM HotCallSiteThreshold). Medium hot callees inline. This is
+    // only reached when inline_decisions_active() (a non-flat profile), so the
+    // percentile hotness is informative.
     if (caller_hot || site_hot) && callee_hot && size <= 48 {
         return Some(true);
+    }
+    // v11: a LOOPED hot call site — the site executes substantially more often
+    // than its caller's entry (site_count >> caller entry), i.e. it is inside a
+    // hot loop. Inlining it removes call overhead from every iteration and
+    // exposes the callee to the caller's optimizations, which a plain build
+    // cannot do when the base inliner skips the (larger) callee. This is the
+    // PGO advantage LLVM/ICC rely on; allow larger callees here, still bounded.
+    if site_count > 0 && site_count.saturating_mul(2) >= cf.max(1) && size <= 200 {
+        return Some(true);
+    }
+    // v11 (novel): ENTRY-COUNT-RATIO force-inline. Per-block site counts are
+    // unavailable at pre-pass time — the pre-pass CFG's block labels differ
+    // from the post-pass labels the instrumentation recorded, so
+    // `derive_block_counts` yields zero and the block-level hot-site signal is
+    // destroyed (this is exactly why v10's force-inline never fired). The
+    // function ENTRY counts, however, are LABEL-INDEPENDENT and survive across
+    // pre/post pass. The ratio `df / cf` is the average number of times the
+    // callee runs per caller invocation: when it is large, the callee is called
+    // from a loop inside the caller, i.e. a hot call site — even if the base
+    // inliner would skip the (larger) callee. Use it as a robust, block-free
+    // proxy for looped-hotness. Only on a non-flat (informative) profile.
+    if crate::pgo::inline_pgo::inline_decisions_active() {
+        let ce = cf.max(1);
+        if df >= 8 * ce && size <= 200 && df > 0 {
+            // Callee runs >=8x per caller invocation: clearly looped. Only when
+            // the callee is hot (measured, not absent) and not recursive.
+            return Some(true);
+        }
     }
     // Hot caller with a warm call site: inline small callees.
     if caller_hot && site_count > 0 && !site_cold && size <= 32 {
@@ -149,4 +218,37 @@ fn should_inline_impl(
         return Some(false);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pgo::summary::ProfileSummary;
+
+    #[test]
+    fn flat_profile_disables_inline_decisions() {
+        // No summary set -> fallback heuristics active.
+        crate::pgo::summary::set_summary(ProfileSummary {
+            total: 146,
+            max: 48,
+            second_max: 48, // tied at max -> flat
+            hot_threshold: 48,
+            cold_threshold: 48,
+        });
+        assert!(
+            !inline_decisions_active(),
+            "a flat (tied-max) profile must not drive PGO inlining decisions"
+        );
+        crate::pgo::summary::set_summary(ProfileSummary {
+            total: 2_014_792,
+            max: 2_014_727,
+            second_max: 64, // dominant hot -> informative
+            hot_threshold: 2_014_727,
+            cold_threshold: 2_014_727,
+        });
+        assert!(
+            inline_decisions_active(),
+            "a dominant-hot profile must drive PGO inlining decisions"
+        );
+    }
 }

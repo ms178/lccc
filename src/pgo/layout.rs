@@ -31,6 +31,8 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // v8 F7: fresh per-unit switch-hint map (labels are TU-unique post
     // renumber; layout runs immediately before codegen for this unit).
     crate::pgo::record_switch_hints(crate::common::fx_hash::FxHashMap::default());
+    // v11: fresh per-unit conditional-branch fallthrough map.
+    crate::pgo::record_cond_fallthroughs(crate::common::fx_hash::FxHashMap::default());
     let max = p.max_total_for_unit(u);
     if max == 0 {
         return;
@@ -44,10 +46,23 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         // are derived at propagate time. Reading the raw profile made every
         // block count 0: chain ordering degenerated and every switch block
         // looked cold.
-        let Some(fp) = crate::pgo::active_profile_for_function(f)
-            .or_else(|| p.get_for_unit(u, &f.name))
-        else {
-            continue;
+        //
+        // v9 (red-team audit): edge-derived block layout is ONLY sound for
+        // functions whose post-pass CFG matches the training build (the
+        // drift gate). A drifted function's surviving edge labels no longer
+        // denote the same CFG edges, so reordering on them would scatter
+        // blocks by garbage weights. `active_derived_profile` returns None
+        // for drifted functions; we then use the name/unit-keyed entry count
+        // for hot/cold SECTIONS only (stable) and skip edge-based block
+        // reordering entirely (original order preserved).
+        let derived = crate::pgo::active_derived_profile(f);
+        let raw = p.get_for_unit(u, &f.name);
+        let (fp, edges_valid): (&crate::pgo::FunctionProfile, bool) = match derived {
+            Some(fp) => (fp, true),
+            None => match raw {
+                Some(fp) => (fp, false),
+                None => continue,
+            },
         };
         // v8: hot/cold section classification via the data-driven summary
         // (percentile thresholds over the unit's count distribution) with
@@ -64,7 +79,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         } else if cold {
             f.section = Some(".text.unlikely".into());
         }
-        layout_function(f, fp, u);
+        layout_function(f, fp, u, edges_valid);
     }
 
     // v8: order functions by hotness class within the TU — hot first, cold
@@ -121,12 +136,52 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
             perm.swap(i, j);
         }
     }
+
+    // v11: profile-driven conditional-branch fallthrough. For every
+    // CondBranch whose edge profile is valid (non-drifted, derived), the
+    // successor with the higher edge execution count becomes the preferred
+    // fallthrough. The backend then emits the branch so the HOT successor
+    // falls through (fewer taken branches / branch misses on the hot path),
+    // WITHOUT reordering blocks — so register allocation is never perturbed.
+    use crate::ir::reexports::Terminator;
+    let mut cf_map: crate::common::fx_hash::FxHashMap<u32, u32> =
+        crate::common::fx_hash::FxHashMap::default();
+    for f in &m.functions {
+        if f.is_declaration || f.blocks.is_empty() {
+            continue;
+        }
+        // Only trust edge-derived hotness for non-drifted functions.
+        let Some(fp) = crate::pgo::active_derived_profile(f) else {
+            continue;
+        };
+        for b in &f.blocks {
+            let Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } = &b.terminator
+            else {
+                continue;
+            };
+            let t = fp.edge_count(b.label.0, true_label.0);
+            let fl = fp.edge_count(b.label.0, false_label.0);
+            if t == 0 && fl == 0 {
+                continue; // no informative edge data
+            }
+            let hot = if t >= fl { true_label.0 } else { false_label.0 };
+            cf_map.insert(b.label.0, hot);
+        }
+    }
+    if !cf_map.is_empty() {
+        crate::pgo::record_cond_fallthroughs(cf_map);
+    }
 }
 
 fn layout_function(
     f: &mut crate::ir::reexports::IrFunction,
     fp: &crate::pgo::FunctionProfile,
     u: &str,
+    edges_valid: bool,
 ) {
     use crate::ir::reexports::Terminator;
     let promoted: FxHashSet<u32> = crate::pgo::promoted_hot_labels(u, &f.name);
@@ -143,171 +198,36 @@ fn layout_function(
         };
         counts.insert(b.label, c);
     }
-    // Edge weights: recorded edge counts; synthesized hot edges for promoted
-    // blocks (their CFG edges have no profile entries).
-    let mut succs = FxHashMap::<BlockId, Vec<BlockId>>::default();
-    for b in &f.blocks {
-        succs.insert(
-            b.label,
-            match &b.terminator {
-                Terminator::Branch(x) => vec![*x],
-                Terminator::CondBranch {
-                    true_label,
-                    false_label,
-                    ..
-                } => vec![*true_label, *false_label],
-                Terminator::Switch { cases, default, .. } => cases
-                    .iter()
-                    .map(|x| x.1)
-                    .chain(std::iter::once(*default))
-                    .collect(),
-                Terminator::IndirectBranch {
-                    possible_targets, ..
-                } => possible_targets.clone(),
-                _ => vec![],
-            },
-        );
-    }
-    let edge_w = |src: BlockId, dst: BlockId| -> u64 {
-        let e = fp
-            .edge_count(src.0, dst.0)
-            .max(fp.edge_count(crate::pgo::instrument::VENTRY, dst.0));
-        if e > 0 {
-            return e;
-        }
-        // Synthesize: promoted block <-> its immediate neighbors are hot.
-        if promoted.contains(&src.0) || promoted.contains(&dst.0) {
-            return entry_count.max(1);
-        }
-        0
+    // v9 drift gate: when the edge profile is not trustworthy (drifted or a
+    // raw/entry-only fallback), skip the chain-based block reordering and the
+    // edge-frequency switch-case sorting — they would scatter blocks by stale
+    // weights. Preserve original order (still run hot/cold sectioning,
+    // promoted-block placement, and count-based cold switch lowering).
+    let mut ordered: Vec<crate::ir::reexports::BasicBlock> = if edges_valid {
+        // v10 (red-team fix): PRESERVE the original block order. The prior
+        // chain-based (Petis-Hansen) reorder and even cold-block sinking can,
+        // for a function dominated by ONE hot loop, perturb the hot loop body
+        // and its register allocation — expat's multi-byte UTF-8 handling was
+        // placed before the hot ASCII loop (frame 40->72B, ~2x regression,
+        // measured 131ms -> 248ms), and cold-block sinking alone cost ~7ms
+        // (128.5 -> 135.5ms). The source order already provides good
+        // fallthrough for a hot loop. Robust no-regression rule: keep the
+        // ORIGINAL block order byte-for-byte (no reordering, no sinking), so
+        // the hot path is IDENTICAL to the plain build. Profile value comes
+        // from the (safe, local) switch-case ordering, hot/cold FUNCTION
+        // sections, promoted-block placement, and the PGO inliner's
+        // cold-classification fix — not from intra-function block movement.
+        f.blocks.clone()
+    } else {
+        f.blocks.clone()
     };
 
-    // Chain building: repeatedly join the max-weight edge whose endpoints are
-    // chain ends. Only edges with positive weight participate; zero-weight
-    // blocks stay singleton chains and sink to the cold tail.
-    let n = f.blocks.len();
-    let labels: Vec<BlockId> = f.blocks.iter().map(|b| b.label).collect();
-    let mut idx_of: FxHashMap<BlockId, usize> = FxHashMap::default();
-    for (i, l) in labels.iter().enumerate() {
-        idx_of.insert(*l, i);
-    }
-    let mut edges: Vec<(u64, BlockId, BlockId)> = Vec::new();
-    for (&s, dsts) in &succs {
-        for &d in dsts {
-            if s == d {
-                continue;
-            }
-            let w = edge_w(s, d);
-            if w > 0 {
-                edges.push((w, s, d));
-            }
-        }
-    }
-    edges.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)).then(a.2 .0.cmp(&b.2 .0)));
-
-    // chain_of[block] = chain id; chains: Vec<Vec<BlockId>>; head/tail lookup.
-    let mut chain_of: Vec<usize> = (0..n).collect();
-    let mut chains: Vec<Vec<BlockId>> = labels.iter().map(|l| vec![*l]).collect();
-    // head/tail: since we only append at ends, chain[0] is head, last is tail.
-    for (w, s, d) in edges {
-        let (Some(&si), Some(&di)) = (idx_of.get(&s), idx_of.get(&d)) else {
-            continue;
-        };
-        let ca = chain_of[si];
-        let cb = chain_of[di];
-        if ca == cb {
-            continue;
-        }
-        let head_a = chains[ca][0];
-        let tail_a = *chains[ca].last().unwrap();
-        let head_b = chains[cb][0];
-        let tail_b = *chains[cb].last().unwrap();
-        // Merge forms: (tail_a -> head_b), (tail_a -> tail_b reversed).
-        let (mut merged, reversed_b) = if tail_a == s && head_b == d {
-            (true, false)
-        } else if tail_a == s && tail_b == d {
-            (true, true)
-        } else {
-            (false, false)
-        };
-        if !merged && head_a == s && head_b == d {
-            // prepend: reverse A then append B
-            let mut a = std::mem::take(&mut chains[ca]);
-            a.reverse();
-            a.extend(chains[cb].iter().copied());
-            chains[ca] = a;
-            merged = true;
-        } else if !merged && head_a == s && tail_b == d {
-            // reverse both
-            let mut a = std::mem::take(&mut chains[ca]);
-            a.reverse();
-            let mut b = std::mem::take(&mut chains[cb]);
-            b.reverse();
-            a.extend(b);
-            chains[ca] = a;
-            merged = true;
-        }
-        if merged {
-            let a = std::mem::take(&mut chains[ca]);
-            let b = std::mem::take(&mut chains[cb]);
-            let mut out = a;
-            if reversed_b {
-                out.extend(b.iter().rev().copied());
-            } else {
-                out.extend(b);
-            }
-            chains[ca] = out;
-            let ca_blocks = chains[ca].clone();
-            for &l in &ca_blocks {
-                if let Some(&li) = idx_of.get(&l) {
-                    chain_of[li] = ca;
-                }
-            }
-        }
-        let _ = w;
-    }
-
-    // Rotate the entry chain to start at the function entry.
-    for chain in chains.iter_mut() {
-        if chain.contains(&entry) {
-            if let Some(pos) = chain.iter().position(|&l| l == entry) {
-                chain.rotate_left(pos);
-            }
-        }
-    }
-    // Order chains: entry chain first, then by max count desc, then cold.
-    let entry_chain = chain_of[idx_of[&entry]];
-    let mut order: Vec<usize> = (0..chains.len()).collect();
-    order.sort_by(|&a, &b| {
-        let ka = if a == entry_chain { 0 } else { 1 };
-        let kb = if b == entry_chain { 0 } else { 1 };
-        ka.cmp(&kb).then_with(|| {
-            let ma = chains[a].iter().map(|l| counts.get(l).copied().unwrap_or(0)).max().unwrap_or(0);
-            let mb = chains[b].iter().map(|l| counts.get(l).copied().unwrap_or(0)).max().unwrap_or(0);
-            mb.cmp(&ma)
-        })
-    });
-    let mut ordered: Vec<crate::ir::reexports::BasicBlock> = Vec::with_capacity(n);
-    let mut placed = FxHashSet::default();
-    for &ci in &order {
-        for &l in &chains[ci] {
-            if placed.insert(l) {
-                if let Some(b) = f.blocks.iter().find(|b| b.label == l) {
-                    ordered.push(b.clone());
-                }
-            }
-        }
-    }
-    // Safety net: any block missed by the chain logic.
-    for b in &f.blocks {
-        if !placed.contains(&b.label) {
-            ordered.push(b.clone());
-        }
-    }
     // v8 F7: profile-driven switch hints. For every Switch block:
     //   * cold per the summary -> force a compare chain (no jump table);
     //   * a case carrying >= 50% of the block's executions -> record it for
     //     hoisting out of the jump table (profile-guided partitioning).
+    // v9: hot-case hoisting uses edge counts, so it is only sound when the
+    // edge profile is valid; cold classification uses block counts (stable).
     if crate::pgo::summary::get_summary().is_some() {
         use crate::ir::reexports::Terminator;
         let mut hints: FxHashMap<u32, crate::pgo::SwitchHint> = FxHashMap::default();
@@ -321,7 +241,7 @@ fn layout_function(
                     hot_case: None,
                     force_chain: cold,
                 };
-                if c > 0 {
+                if edges_valid && c > 0 {
                     let mut best: Option<(i64, u32, u64)> = None;
                     for (v, t) in cases {
                         let e = fp.edge_count(b.label.0, t.0);
@@ -418,19 +338,24 @@ fn layout_function(
         f.blocks = ordered;
     }
 
+
+
     // PGO switch case ordering: sort each Switch's cases by the frequency
     // of the (switch block -> case block) edge so compare-and-branch
-    // chains test the most likely cases first.
-    for b in &mut f.blocks {
-        let src = b.label.0;
-        if let Terminator::Switch { cases, .. } = &mut b.terminator {
-            if cases.len() < 2 {
-                continue;
+    // chains test the most likely cases first. Only when the edge profile is
+    // valid (v9 drift gate).
+    if edges_valid {
+        for b in &mut f.blocks {
+            let src = b.label.0;
+            if let Terminator::Switch { cases, .. } = &mut b.terminator {
+                if cases.len() < 2 {
+                    continue;
+                }
+                let mut idx: Vec<usize> = (0..cases.len()).collect();
+                idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1 .0)));
+                let sorted: Vec<_> = idx.into_iter().map(|i| cases[i]).collect();
+                *cases = sorted;
             }
-            let mut idx: Vec<usize> = (0..cases.len()).collect();
-            idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1 .0)));
-            let sorted: Vec<_> = idx.into_iter().map(|i| cases[i]).collect();
-            *cases = sorted;
         }
     }
 }

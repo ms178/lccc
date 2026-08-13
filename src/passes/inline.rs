@@ -183,6 +183,10 @@ const MAX_STATIC_NONINLINE_BLOCKS: usize = 4;
 /// aren't fully inlined remain correct because __attribute__((error)) calls
 /// are lowered as no-ops (not traps).
 const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
+/// v11: dedicated budget for profile-guided FORCE-inlined call sites (hot loop
+/// sites inlined even into large callers). Bounded to keep PGO-driven growth
+/// safe for stack-frame and I-cache size.
+const MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER: usize = 600;
 
 /// Additional always_inline budget for the second (correctness) pass.
 /// After the main inlining loop exhausts max_rounds, any remaining
@@ -267,6 +271,7 @@ fn select_inline_site(
     caller_is_recursive: bool,
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
+    pgo_force_budget_remaining: usize,
     small_only: bool,
 ) -> Option<(InlineCallSite, usize, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
@@ -364,29 +369,38 @@ fn select_inline_site(
         if caller_is_recursive && !callee_data.is_always_inline {
             continue;
         }
-        // When the caller has a section attribute (e.g., .init.text),
-        // allow inlining small callees even into large callers to
-        // prevent section mismatch errors.
-        if caller_too_large
-            && !callee_data.is_always_inline
-            && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS)
-        {
-            continue;
-        }
-        // Absolute cap: stop normal inlining for extremely large callers.
-        // always_inline callees MUST still be inlined (C semantic requirement).
-        if caller_at_absolute_cap && !callee_data.is_always_inline {
-            continue;
-        }
-        // Hard cap: stop normal inlining to prevent kernel stack overflow.
-        // always_inline callees are still inlined (C semantic requirement),
-        // but are limited by the always_inline budget.
-        if caller_at_hard_cap && !callee_data.is_always_inline {
-            continue;
+        // v11: a profile-guided FORCE-INLINE site is hot (in a hot loop /
+        // high frequency); it should be inlined even when the caller is large
+        // or the normal budget is tight — the PGO advantage. We bypass the
+        // caller-size / cap gates for it, but still bound total PGO-driven
+        // growth with a dedicated budget so we never unboundedly bloat a
+        // caller (stack-frame and I-cache safety).
+        if !site.pgo_force {
+            // When the caller has a section attribute (e.g., .init.text),
+            // allow inlining small callees even into large callers to
+            // prevent section mismatch errors.
+            if caller_too_large
+                && !callee_data.is_always_inline
+                && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS)
+            {
+                continue;
+            }
+            // Absolute cap: stop normal inlining for extremely large callers.
+            // always_inline callees MUST still be inlined (C semantic requirement).
+            if caller_at_absolute_cap && !callee_data.is_always_inline {
+                continue;
+            }
+            // Hard cap: stop normal inlining to prevent kernel stack overflow.
+            // always_inline callees are still inlined (C semantic requirement),
+            // but are limited by the always_inline budget.
+            if caller_at_hard_cap && !callee_data.is_always_inline {
+                continue;
+            }
         }
         let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
         // Budget enforcement: always_inline callees use a separate budget;
-        // non-always_inline callees use the normal budget.
+        // non-always_inline callees use the normal budget. PGO-forced sites
+        // use the dedicated (larger) PGO budget.
         if callee_data.is_always_inline {
             // When the caller has a section attribute, always_inline callees
             // bypass the budget entirely (critical for kernel init functions
@@ -397,6 +411,10 @@ fn select_inline_site(
                 if !is_tiny && callee_inst_count > always_inline_budget_remaining {
                     continue;
                 }
+            }
+        } else if site.pgo_force {
+            if callee_inst_count > pgo_force_budget_remaining {
+                continue;
             }
         } else if callee_inst_count > budget_remaining {
             continue;
@@ -505,6 +523,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
         };
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
+        let mut pgo_force_budget_remaining = MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER;
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -532,8 +551,13 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 &skip_list,
                 caller_has_section,
             );
-            // PGO: filter/adjust call sites based on profile
+            // PGO: filter/adjust call sites based on profile. v10: on a FLAT
+            // profile (no hot/cold spread) PGO inlining has no informative
+            // signal; skip reading the profile entirely so inlining is
+            // byte-identical to plain -O2 (prevents pass perturbation that can
+            // regress hot paths — see inline_pgo::inline_decisions_active).
             if let Some(profile) = crate::pgo::get_pgo_profile() {
+                if crate::pgo::inline_pgo::inline_decisions_active() {
                 let caller_name = module.functions[func_idx].name.clone();
                 // v8: per-call-site hotness. Derive block counts for the
                 // CURRENT caller CFG from the h0-keyed profile (the CFG may
@@ -597,7 +621,9 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                             Some(profile),
                         ) {
                             if force {
-                                filtered.push(site);
+                                let mut s2 = site;
+                                s2.pgo_force = true;
+                                filtered.push(s2);
                                 continue;
                             } else {
                                 continue;
@@ -621,6 +647,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                     filtered.push(site);
                 }
                 call_sites = filtered;
+                } // end inline_decisions_active
             }
             if call_sites.is_empty() {
                 break;
@@ -637,6 +664,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 caller_is_recursive,
                 budget_remaining,
                 always_inline_budget_remaining,
+                pgo_force_budget_remaining,
                 small_only,
             );
             let (site, callee_inst_count, _use_relaxed) = match found_site {
@@ -707,6 +735,10 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                         always_inline_budget_remaining =
                             always_inline_budget_remaining.saturating_sub(callee_inst_count);
                     }
+                } else if site.pgo_force {
+                    // v11: PGO-forced sites consume the dedicated PGO budget.
+                    pgo_force_budget_remaining =
+                        pgo_force_budget_remaining.saturating_sub(callee_inst_count);
                 } else {
                     budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
                 }
@@ -744,8 +776,13 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 &skip_list,
                 caller_has_section,
             );
-            // PGO: filter/adjust call sites based on profile
+            // PGO: filter/adjust call sites based on profile. v10: on a FLAT
+            // profile (no hot/cold spread) PGO inlining has no informative
+            // signal; skip reading the profile entirely so inlining is
+            // byte-identical to plain -O2 (prevents pass perturbation that can
+            // regress hot paths — see inline_pgo::inline_decisions_active).
             if let Some(profile) = crate::pgo::get_pgo_profile() {
+                if crate::pgo::inline_pgo::inline_decisions_active() {
                 let caller_name = module.functions[func_idx].name.clone();
                 // v8: per-call-site hotness. Derive block counts for the
                 // CURRENT caller CFG from the h0-keyed profile (the CFG may
@@ -809,7 +846,9 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                             Some(profile),
                         ) {
                             if force {
-                                filtered.push(site);
+                                let mut s2 = site;
+                                s2.pgo_force = true;
+                                filtered.push(s2);
                                 continue;
                             } else {
                                 continue;
@@ -833,6 +872,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                     filtered.push(site);
                 }
                 call_sites = filtered;
+                } // end inline_decisions_active
             }
             if call_sites.is_empty() {
                 break;
@@ -1382,6 +1422,12 @@ struct InlineCallSite {
     dest: Option<Value>,
     /// Arguments passed to the call
     args: Vec<Operand>,
+    /// v11: profile-guided force-inline. Set by the PGO filter when the call
+    /// site is genuinely HOT (in a hot loop / high frequency) and should be
+    /// inlined even if the base inliner's caller-size or budget limits would
+    /// normally skip it — the PGO advantage LLVM/ICC have over a plain build.
+    /// Still bounded by a dedicated budget to prevent unbounded bloat.
+    pgo_force: bool,
 }
 
 /// Check if a GlobalInit contains references to local labels (`.LBBxx`).
@@ -1809,6 +1855,7 @@ fn find_inline_call_sites(
                             callee_name: callee_name.clone(),
                             dest: info.dest,
                             args: info.args.clone(),
+                            pgo_force: false,
                         });
                     }
                 }
