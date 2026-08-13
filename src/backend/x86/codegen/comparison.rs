@@ -333,25 +333,40 @@ impl X86Codegen {
         false_block: BlockId,
     ) {
         let next = self.state.next_block_label;
-        // If the false edge is the next emitted block, branch only on true.
-        // If the true edge is next, invert the condition and branch only on
-        // false. This removes the unconditional jump from the hot path.
-        let false_fallthrough = next == Some(false_block);
-        let true_fallthrough = next == Some(true_block);
+        // v11: profile-driven fallthrough. The layout pass recorded which
+        // successor carries more profile executions (the hot edge); the
+        // codegen driver sets it before this call. We make that successor the
+        // physical fallthrough (emit a conditional jump to the COLD successor
+        // instead), so the hot path takes no branch — Intel branch-prediction
+        // guidance — without reordering blocks and thus without perturbing
+        // register allocation. When no hint is present (or it is ambiguous),
+        // we default to preferring the TRUE successor, preserving the original
+        // behavior.
+        let pref_true = crate::pgo::take_cond_fallthrough()
+            .map(|h| h == true_block.0)
+            .unwrap_or(true);
+        let (hot, cold) = if pref_true {
+            (true_block, false_block)
+        } else {
+            (false_block, true_block)
+        };
+        let hot_next = next == Some(hot);
+        let cold_next = next == Some(cold);
 
         // FLAG FUSION: the condition is the direct result of the immediately
         // preceding Cmp; its flags are live — branch on them directly,
         // skipping the testq of the materialized boolean.
         if let Some(op) = self.take_pending_cmp(cond) {
             let jcc = Self::cmp_jcc(op);
-            if true_fallthrough {
+            let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
+            if hot_next {
                 self.state
                     .out
-                    .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
             } else {
-                self.state.out.emit_jcc_block(jcc, true_block.0);
-                if !false_fallthrough {
-                    self.state.out.emit_jmp_block(false_block.0);
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
                 }
             }
             self.state.reg_cache.invalidate_all();
@@ -366,14 +381,15 @@ impl X86Codegen {
             let use_32bit = ty == IrType::I32 || ty == IrType::U32;
             self.emit_int_cmp_replay_insn(&lhs, &rhs, use_32bit);
             let jcc = Self::cmp_jcc(op);
-            if true_fallthrough {
+            let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
+            if hot_next {
                 self.state
                     .out
-                    .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
             } else {
-                self.state.out.emit_jcc_block(jcc, true_block.0);
-                if !false_fallthrough {
-                    self.state.out.emit_jmp_block(false_block.0);
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
                 }
             }
             self.state.reg_cache.invalidate_all();
@@ -387,12 +403,14 @@ impl X86Codegen {
                     let name = phys_reg_name(reg);
                     self.state
                         .emit_fmt(format_args!("    testq %{}, %{}", name, name));
-                    if true_fallthrough {
-                        self.state.out.emit_jcc_block("je", false_block.0);
+                    let jcc_hot = if pref_true { "jne" } else { "je" };
+                    if hot_next {
+                        self.state.out.emit_jcc_block(
+                            Self::invert_jcc(jcc_hot), cold.0);
                     } else {
-                        self.state.out.emit_jcc_block("jne", true_block.0);
-                        if !false_fallthrough {
-                            self.state.out.emit_jmp_block(false_block.0);
+                        self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                        if !cold_next {
+                            self.state.out.emit_jmp_block(cold.0);
                         }
                     }
                     return;
@@ -401,12 +419,15 @@ impl X86Codegen {
         }
         self.operand_to_rax(cond);
         self.state.emit("    testq %rax, %rax");
-        if true_fallthrough {
-            self.state.out.emit_jcc_block("je", false_block.0);
+        let jcc_hot = if pref_true { "jne" } else { "je" };
+        if hot_next {
+            self.state
+                .out
+                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
         } else {
-            self.state.out.emit_jcc_block("jne", true_block.0);
-            if !false_fallthrough {
-                self.state.out.emit_jmp_block(false_block.0);
+            self.state.out.emit_jcc_block(jcc_hot, hot.0);
+            if !cold_next {
+                self.state.out.emit_jmp_block(cold.0);
             }
         }
     }

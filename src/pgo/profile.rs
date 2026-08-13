@@ -433,22 +433,58 @@ pub fn get_for_unit_cfg<'a>(
         .map(|(_, f)| f)
         .next()
 }
+/// Serialize a loaded `ProfileData` as human-readable text.
+///
+/// Used for debugging and profile inspection (`LCCC_PGO_DUMP_TEXT=<file>`),
+/// complementing the binary `.profraw` dump the instrumented runtime writes.
+/// The on-disk format mirrors `parse_file`'s `lccc-pgo-v3/v4/v5` text layout so
+/// the text dump can be re-loaded with `load_profile` for round-tripping.
 pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
     if let Some(q) = p.parent() {
         fs::create_dir_all(q)?
     }
     let mut f = fs::File::create(p)?;
     for (n, x) in &d.functions {
-        writeln!(
-            f,
-            "lccc-pgo-v3 {} {} {}",
-            x.cfg_hash,
-            x.entry_label,
-            n.split("::").next().unwrap_or("0")
-        )?;
+        // The function key is `{unit_hash:016x}::name`; the parser reads the
+        // unit field as a DECIMAL u64 (`unit_hash`), so convert the hex prefix
+        // back to a decimal u64 to keep the text output re-loadable.
+        let unit_hex = n.split("::").next().unwrap_or("0");
+        let unit_dec = u64::from_str_radix(unit_hex, 16).unwrap_or(0);
+        // v5 header carries both fingerprints and the entry label / unit id;
+        // fall back to v3 for legacy (post_hash == cfg_hash) so text output is
+        // re-loadable by the version-tolerant parser.
+        if x.post_hash != 0 && x.post_hash != x.cfg_hash {
+            writeln!(
+                f,
+                "lccc-pgo-v5 {} {} {} {}",
+                x.cfg_hash, x.post_hash, x.entry_label, unit_dec
+            )?;
+        } else {
+            writeln!(
+                f,
+                "lccc-pgo-v3 {} {} {}",
+                x.cfg_hash, x.entry_label, unit_dec
+            )?;
+        }
         writeln!(f, "func {}", n)?;
+        for (s, d2) in &x.edge_counts {
+            if s.0 == crate::pgo::instrument::VENTRY {
+                writeln!(f, "f {}", d2)?;
+            } else {
+                writeln!(f, "e {} {} {}", s.0, s.1, d2)?;
+            }
+        }
         for (b, c) in &x.block_counts {
             writeln!(f, "{} {}", b, c)?;
+        }
+        for vs in &x.value_sites {
+            for (tname, tcnt, tflags) in &vs.targets {
+                writeln!(
+                    f,
+                    "v {} {} {}\n{} {} {}",
+                    vs.ordinal, vs.total, vs.sig, tname, tcnt, tflags
+                )?;
+            }
         }
     }
     Ok(())
@@ -616,4 +652,62 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
         }
     }
     fp.total_count = entry_count;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Operand, Terminator, IrParam, Instruction};
+    use crate::common::types::IrType;
+    use crate::ir::constants::IrConst;
+
+    /// Build a minimal loop CFG:
+    ///   b0 (entry) -> Branch b1
+    ///   b1 (header) CondBranch b2 (latch) / b3 (exit)
+    ///   b2 (latch) Branch b1 (backedge)
+    ///   b3 (exit) Return
+    fn loop_cfg() -> IrFunction {
+        let mk = |label: u32, is: Vec<Instruction>, term: Terminator| BasicBlock {
+            label: BlockId(label), instructions: is, terminator: term, source_spans: vec![],
+        };
+        IrFunction {
+            name: "loop_fn".into(),
+            return_type: IrType::I32,
+            params: vec![IrParam{ty:IrType::I32,struct_size:None,struct_align:None,struct_eightbyte_classes:vec![],is_f128_sse:false,riscv_float_class:None}],
+            blocks: vec![
+                mk(0, vec![], Terminator::Branch(BlockId(1))),
+                mk(1, vec![], Terminator::CondBranch{
+                    cond: Operand::Const(IrConst::I32(1)), true_label: BlockId(2), false_label: BlockId(3),
+                }),
+                mk(2, vec![], Terminator::Branch(BlockId(1))),
+                mk(3, vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+            ],
+            is_variadic:false,is_declaration:false,is_static:false,is_inline:false,is_always_inline:false,
+            is_noinline:false,next_value_id:0,next_label:0,section:None,visibility:None,is_weak:false,is_used:false,
+            has_inlined_calls:false,param_alloca_values:vec![],uses_sret:false,is_fastcall:false,is_naked:false,
+            global_init_label_blocks:vec![],ret_eightbyte_classes:vec![],ret_is_f128_sse:false,is_gnu_inline_def:false,
+        }
+    }
+
+    #[test]
+    fn solver_derives_latch_count() {
+        // A proper arborescence roots the tree at entry(0) with tree edges
+        // 0->1, 1->2, 1->3, 3->VEXIT; the loop backedge 2->1 is therefore the
+        // instrumented (non-tree) edge. entry count = 10, backedge = 80.
+        let f = loop_cfg();
+        let mut fp = FunctionProfile {
+            total_count: 0,
+            block_counts: FxHashMap::default(),
+            edge_counts: FxHashMap::default(),
+            cfg_hash: 0, post_hash: 0, entry_label: 0, value_sites: vec![],
+        };
+        fp.edge_counts.insert((crate::pgo::instrument::VENTRY, 0), 10); // entry count
+        fp.edge_counts.insert((2, 1), 80); // instrumented backedge (latch -> header)
+        derive_block_counts(&f, &mut fp);
+        // The latch (b2) executes 80 times; the header executes entry + backedge.
+        assert_eq!(fp.block_count(BlockId(2)), 80,
+            "latch block must derive its count from flow conservation");
+        assert_eq!(fp.block_count(BlockId(1)), 90,
+            "header block must be entry + backedge executions");
+    }
 }

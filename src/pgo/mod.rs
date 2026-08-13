@@ -232,6 +232,41 @@ pub fn switch_hints_snapshot() -> FxHashMap<u32, SwitchHint> {
     SWITCH_HINTS.lock().unwrap().clone()
 }
 
+/// v11: per-unit preferred-fallthrough successor for conditional branches,
+/// keyed by the branch block's label (TU-unique after the renumber pass). The
+/// layout pass computes these from the profile edge weights — the successor
+/// carrying more executions becomes the preferred fallthrough — and codegen
+/// consumes them so the HOT path falls through (Intel branch-prediction
+/// guidance: minimize taken branches on the hot path, without reordering
+/// blocks and thus without perturbing register allocation).
+static COND_FALLTHROUGHS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<u32, u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+/// Pending preferred-fallthrough for the conditional branch being emitted
+/// (block label is set right before codegen of the terminator and taken by the
+/// backend's emit_cond_branch_blocks_impl). Codegen is single-threaded and
+/// per-TU sequential, so a process-wide scratch is safe.
+static PENDING_COND_FALLTHROUGH: std::sync::LazyLock<std::sync::Mutex<Option<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Replace the per-unit cond-branch fallthrough map (called once per unit by
+/// layout_module).
+pub fn record_cond_fallthroughs(map: FxHashMap<u32, u32>) {
+    *COND_FALLTHROUGHS.lock().unwrap() = map;
+}
+/// The preferred fallthrough successor (block label) for a conditional branch
+/// whose source block is `label`, if the profile was informative for it.
+pub fn cond_fallthrough(label: u32) -> Option<u32> {
+    COND_FALLTHROUGHS.lock().unwrap().get(&label).copied()
+}
+/// Set the pending preferred-fallthrough before codegen of a CondBranch.
+pub fn set_cond_fallthrough(h: Option<u32>) {
+    *PENDING_COND_FALLTHROUGH.lock().unwrap() = h;
+}
+/// Take (and clear) the pending preferred-fallthrough in the backend.
+pub fn take_cond_fallthrough() -> Option<u32> {
+    PENDING_COND_FALLTHROUGH.lock().unwrap().take()
+}
+
 /// Translate recorded promoted-block labels through the label-renumber map
 /// (old label -> new label; labels are TU-unique). Called by the driver right
 /// after the renumber pass; labels whose block vanished keep their value (the
@@ -300,6 +335,14 @@ pub fn init_pgo_profile(path: Option<&str>) {
                     x.functions.len(),
                     p
                 );
+                // Debug/inspection hook: dump the loaded profile as text for
+                // a human-readable view (LCCC_PGO_DUMP_TEXT=<file>).
+                if let Ok(txt) = std::env::var("LCCC_PGO_DUMP_TEXT") {
+                    match profile::write_text_profile(std::path::Path::new(&txt), &x) {
+                        Ok(()) => eprintln!("lccc: PGO: wrote text profile to {}", txt),
+                        Err(e) => eprintln!("lccc: PGO warning: text dump failed: {}", e),
+                    }
+                }
                 x
             }
             Err(e) => {
@@ -354,7 +397,22 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
     // Derive block counts and tree-edge counts from the instrumented edge
     // counts (flow conservation) into a leaked per-unit map that
     // active_profile_for_function prefers.
+    //
+    // DRIFT GATE (red-team audit): a function whose POST-pass CFG no longer
+    // matches the training build has been structurally changed by
+    // profile-guided transforms (inlining/unrolling fired differently than in
+    // the training build). Its edge counts are keyed by the TRAINING labels;
+    // after block insertion/removal the surviving labels no longer denote the
+    // same edges, so every derived block/backedge count is unreliable. We
+    // therefore only publish edge-DERIVED data for functions whose post_hash
+    // matches (or legacy profiles with post_hash == 0). Drifted functions
+    // keep their name/unit-keyed `total_count` (stable, used for hot/cold
+    // section classification) but get NO edge-derived block counts — edge
+    // consumers (block layout, branch probability, derived trip counts)
+    // degrade to entry-count-only, exactly LLVM's fail-closed contract.
     let mut derived: FxHashMap<String, FunctionProfile> = FxHashMap::default();
+    let mut edge_ok = 0usize;
+    let mut drifted_edges = 0usize;
     for f in &m.functions {
         if f.is_declaration || f.blocks.is_empty() {
             continue;
@@ -363,14 +421,27 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
         let Some(fp) = profile::get_for_unit_cfg(p, u, &f.name, h0) else {
             continue;
         };
+        if fp.post_hash != 0 && fp.post_hash != post_hash_for(&f.name) {
+            drifted_edges += 1;
+            continue;
+        }
+        edge_ok += 1;
         let mut copy = fp.clone();
         profile::derive_block_counts(f, &mut copy);
         derived.insert(profile::function_key(u, &f.name), copy);
+    }
+    if drifted_edges > 0 {
+        eprintln!(
+            "lccc: PGO v9: {} function(s) drifted from the training CFG: \
+             edge-derived branch/layout/unroll data disabled for them (hot/cold sections kept)",
+            drifted_edges
+        );
     }
     if !derived.is_empty() {
         let leaked: &'static FxHashMap<String, FunctionProfile> = Box::leak(Box::new(derived));
         DERIVED_PTR.with(|d| d.set(leaked as *const _));
     }
+    let _ = edge_ok;
 }
 
 /// Return the exact, CFG-validated profile for a function in the translation
@@ -395,7 +466,39 @@ pub fn active_profile_for_function(f: &IrFunction) -> Option<&'static FunctionPr
             return Some(fp);
         }
         let p = get_pgo_profile()?;
-        profile_for_function(p, unit, f)
+        let fp = profile_for_function(p, unit, f)?;
+        // Drift gate: never hand a drifted function's stale edge counts to an
+        // edge consumer. `total_count` (entry count) is still usable by
+        // callers that look it up directly via summary::entry_count_for /
+        // get_for_unit; block/edge consumers must degrade to entry-only.
+        if fp.post_hash != 0 && fp.post_hash != post_hash_for(&f.name) {
+            return None;
+        }
+        Some(fp)
+    })
+}
+
+/// The non-drifted, flow-conservation-DERIVED profile for `f`, if one was
+/// published by `propagate_profile`. `None` for drifted functions and for
+/// functions without an edge-complete profile. Edge consumers (block layout,
+/// branch probability, derived trip counts) MUST use this rather than
+/// `active_profile_for_function`, so a drifted function is never reordered or
+/// given branch/layout decisions from stale edge counts.
+pub fn active_derived_profile(f: &IrFunction) -> Option<&'static FunctionProfile> {
+    ACTIVE_UNIT.with(|slot| {
+        let unit = slot.borrow();
+        let unit = unit.as_deref()?;
+        let key = profile::function_key(unit, &f.name);
+        DERIVED_PTR.with(|d| {
+            let p = d.get();
+            if p.is_null() {
+                None
+            } else {
+                // SAFETY: leaked once per unit before codegen; only replaced
+                // at the next propagate_profile call, never concurrently.
+                unsafe { (*p).get(&key) }
+            }
+        })
     })
 }
 

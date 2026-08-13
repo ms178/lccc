@@ -225,39 +225,13 @@ fn scc_ids(nodes: &[u32], edges: &[Edge]) -> FxHashMap<u32, u32> {
         .collect()
 }
 
-struct Dsu {
-    parent: Vec<usize>,
-}
-impl Dsu {
-    fn new(n: usize) -> Self {
-        Dsu {
-            parent: (0..n).collect(),
-        }
-    }
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x {
-            self.parent[x] = self.parent[self.parent[x]];
-            x = self.parent[x];
-        }
-        x
-    }
-    fn union(&mut self, a: usize, b: usize) -> bool {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra == rb {
-            return false;
-        }
-        self.parent[ra] = rb;
-        true
-    }
-}
-
-/// Choose the instrumented (non-tree) edges: maximum spanning tree over the
-/// CFG (Kruskal), with the virtual entry edge forced instrumented.
+/// Choose the instrumented (non-tree) edges: maximum-weight directed spanning
+/// ARBORESCENCE over the CFG (rooted at entry), with the virtual entry edge
+/// forced instrumented.
 fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<Edge> {
     let comp = scc_ids(nodes, edges);
     let dom = dominators(nodes, edges, entry);
-    let weight = |e: &Edge| -> (i64, u32, u32) {
+    let weight = |e: &Edge| -> i64 {
         let backed = dom
             .get(&e.src)
             .map(|d| d.contains(&e.dst))
@@ -268,30 +242,29 @@ fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<E
                 .zip(comp.get(&e.dst))
                 .map(|(a, b)| a == b)
                 .unwrap_or(false);
-        let w = if backed {
+        if backed {
             2000
         } else if loopish {
             1000
         } else {
             1
-        };
-        (w, e.src, e.dst)
-    };
-    let node_index: FxHashMap<u32, usize> =
-        nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
-    let mut ordered: Vec<usize> = (0..edges.len()).collect();
-    ordered.sort_by(|&a, &b| weight(&edges[a]).cmp(&weight(&edges[b])).reverse());
-    let mut dsu = Dsu::new(nodes.len());
-    let mut tree = FxHashSet::default();
-    for &ei in &ordered {
-        let e = edges[ei];
-        let (Some(&a), Some(&b)) = (node_index.get(&e.src), node_index.get(&e.dst)) else {
-            continue;
-        };
-        if dsu.union(a, b) {
-            tree.insert(e);
         }
-    }
+    };
+    // v9 red-team fix: build a MAX-WEIGHT DIRECTED SPANNING ARBORESCENCE
+    // rooted at `entry` (Chu–Liu/Edmonds via BFS + greedy improvement),
+    // over ALL nodes including the virtual EXIT. The old code used an
+    // UNDIRECTED max spanning tree (Kruskal/DSU), which can orient a loop
+    // backedge BACKWARDS: for a simple loop the backedge (latch->header,
+    // weight 2000) was chosen as the tree edge, so the latch's only incoming
+    // edge (header->latch) became non-tree/instrumented and the latch had NO
+    // incoming tree edge. The flow-conservation solver (`derive_block_counts`)
+    // then derived the latch's count from its outgoing edges = 0, silently
+    // zeroing every loop-latch block count and the derived backedge count —
+    // corrupting block layout, branch probability and profile-accurate loop
+    // unrolling for every loop. A proper arborescence guarantees every
+    // non-entry node (latch included) has exactly one incoming tree edge, so
+    // the solver reconstructs exact counts.
+    let tree = max_arborescence(nodes, edges, entry, &weight);
     let entry_edge = Edge {
         src: VENTRY,
         dst: entry,
@@ -304,6 +277,122 @@ fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<E
     instr.push(entry_edge);
     instr.sort();
     instr
+}
+
+/// Chu–Liu/Edmonds maximum-weight directed spanning arborescence rooted at
+/// `root` (which must be in `nodes`). Returns the set of TREE edges (edges NOT
+/// instrumented). Weight is higher = more desirable to keep off the counter
+/// path (hot backedges/cycle edges). The result is a valid directed tree: every
+/// node except `root` has exactly one incoming tree edge and is reachable from
+/// `root` via tree edges — exactly the invariant the flow-conservation solver
+/// needs (see `choose_instrumented_edges`).
+///
+/// Implementation: start from a BFS arborescence (guaranteed correct), then
+/// greedily replace each node's tree in-edge with a heavier in-edge whenever
+/// that cannot create a cycle (v is not an ancestor of the new parent u).
+/// Iterate to a fixed point. For the hierarchical backedge/loop/normal weight
+/// scheme this yields the same tree as full Edmonds and is far simpler to keep
+/// correct.
+fn max_arborescence(
+    nodes: &[u32],
+    edges: &[Edge],
+    root: u32,
+    weight: &dyn Fn(&Edge) -> i64,
+) -> FxHashSet<Edge> {
+    use std::collections::VecDeque;
+    let node_idx: FxHashMap<u32, usize> = nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let n = nodes.len();
+    let root_i = node_idx[&root];
+    // Allowed edges: within the node set, not into root.
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_edges: Vec<Vec<(usize, usize, i64)>> = vec![Vec::new(); n]; // dst -> (src,dst,w)
+    for e in edges {
+        let (Some(&a), Some(&b)) = (node_idx.get(&e.src), node_idx.get(&e.dst)) else {
+            continue;
+        };
+        if b == root_i {
+            continue; // no tree edge into the root
+        }
+        let w = weight(e);
+        succs[a].push(b);
+        in_edges[b].push((a, b, w));
+    }
+    // 1. BFS arborescence from root: guarantee a valid tree.
+    let mut parent: Vec<usize> = vec![usize::MAX; n]; // parent[v] = u (edge u->v)
+    {
+        let mut q = VecDeque::new();
+        q.push_back(root_i);
+        while let Some(u) = q.pop_front() {
+            for &b in &succs[u] {
+                if parent[b] == usize::MAX {
+                    parent[b] = u;
+                    q.push_back(b);
+                }
+            }
+        }
+    }
+    // Helper: is `anc` an ancestor of `node` in the current tree (walking up)?
+    // Used to reject a swap that would create a cycle.
+    fn is_ancestor(node: usize, anc: usize, parent: &[usize], n: usize) -> bool {
+        let mut x = node;
+        let mut steps = 0;
+        while x != usize::MAX && steps <= n {
+            if x == anc {
+                return true;
+            }
+            x = parent[x];
+            steps += 1;
+        }
+        false
+    }
+    // 2. Greedy improvement to fixed point.
+    loop {
+        let mut changed = false;
+        for v in 0..n {
+            if v == root_i {
+                continue;
+            }
+            let cur = parent[v];
+            if cur == usize::MAX {
+                continue; // unreachable — leave as is (won't happen from BFS)
+            }
+            let mut cur_w = in_edges[v]
+                .iter()
+                .find(|(u, _, _)| *u == cur)
+                .map(|(_, _, w)| *w)
+                .unwrap_or(i64::MIN);
+            for &(u, _, w) in &in_edges[v] {
+                if u == cur || w <= cur_w {
+                    continue;
+                }
+                // Replacing parent[v]=cur with parent[v]=u forms a cycle iff
+                // u is already a DESCENDANT of v in the tree (a path v -> u
+                // exists downward), because the new edge u->v would close it.
+                // `is_ancestor(u, v)` returns true iff v is an ancestor of u.
+                if is_ancestor(u, v, &parent, n) {
+                    continue;
+                }
+                parent[v] = u;
+                cur_w = w;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Convert parent array to tree-edge set (for reachable nodes only).
+    let mut tree = FxHashSet::default();
+    for v in 0..n {
+        if v == root_i || parent[v] == usize::MAX {
+            continue;
+        }
+        tree.insert(Edge {
+            src: nodes[parent[v]],
+            dst: nodes[v],
+        });
+    }
+    tree
 }
 
 pub fn instrument_module(
@@ -390,7 +479,13 @@ pub fn instrument_module(
         }
         let edges: Vec<Edge> = edge_set.into_iter().collect();
         let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
-        let instr_edges = choose_instrumented_edges(&nodes, &edges, entry);
+        // v9: the arborescence spans ALL nodes including the virtual EXIT so
+        // it too gets a single incoming tree edge (instead of every
+        // return->exit edge being instrumented) and the flow solver's
+        // reconstruction stays exact.
+        let mut tree_nodes = nodes.clone();
+        tree_nodes.push(VEXIT);
+        let instr_edges = choose_instrumented_edges(&tree_nodes, &edges, entry);
         let n_counters = instr_edges.len();
         let slot: FxHashMap<Edge, usize> = instr_edges
             .iter()
@@ -2330,5 +2425,58 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             x.next,
             label_base,
         );
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_backedge_is_instrumented_not_forward_edge() {
+        // Simple loop: 0(entry)->1(header)->2(latch), 2->1 backedge,
+        // 1->3(exit) return, 3->VEXIT. Build the CFG edge list.
+        let nodes = vec![0u32, 1, 2, 3];
+        let edges = vec![
+            Edge { src: 0, dst: 1 },
+            Edge { src: 1, dst: 2 },
+            Edge { src: 2, dst: 1 }, // backedge
+            Edge { src: 1, dst: 3 },
+            Edge { src: 3, dst: VEXIT },
+        ];
+        // Include VEXIT in the node set (as the pipeline does).
+        let mut tree_nodes = nodes.clone();
+        tree_nodes.push(VEXIT);
+        let instr = choose_instrumented_edges(&tree_nodes, &edges, 0);
+        let has = |s: u32, d: u32| instr.iter().any(|e| e.src == s && e.dst == d);
+        // The forward edge into the latch (1->2) is a TREE edge: it must NOT
+        // be instrumented. The backedge (2->1) must be instrumented.
+        assert!(!has(1, 2), "forward edge 1->2 must be a tree edge, not instrumented");
+        assert!(has(2, 1), "backedge 2->1 must be instrumented (off the arborescence)");
+        // Every node except entry must have exactly one incoming TREE edge.
+        let tree: FxHashSet<Edge> = edges
+            .iter()
+            .copied()
+            .filter(|e| !instr.iter().any(|i| i.src == e.src && i.dst == e.dst))
+            .collect();
+        for &v in &[1u32, 2, 3, VEXIT] {
+            let n = tree.iter().filter(|e| e.dst == v).count();
+            assert_eq!(n, 1, "node {} must have exactly one incoming tree edge", v);
+        }
+        // Reachability from entry via tree edges must cover all nodes.
+        let mut reachable = FxHashSet::default();
+        let mut stack = vec![0u32];
+        while let Some(u) = stack.pop() {
+            if !reachable.insert(u) {
+                continue;
+            }
+            for e in &tree {
+                if e.src == u {
+                    stack.push(e.dst);
+                }
+            }
+        }
+        for &v in &[1u32, 2, 3, VEXIT] {
+            assert!(reachable.contains(&v), "node {} must be tree-reachable from entry", v);
+        }
     }
 }

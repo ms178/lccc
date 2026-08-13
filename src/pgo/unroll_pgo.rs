@@ -37,11 +37,25 @@ fn successors(t: &crate::ir::reexports::Terminator) -> Vec<crate::ir::reexports:
     }
 }
 
-/// Estimated average trip count of the loop whose header is `f.blocks[idx]`.
-/// Uses the derived edge counts: trip = backedge / entry.
+/// Estimated average trip count of the loop whose header is `f.blocks[idx]`,
+/// derived from the profile via flow conservation: trip = backedge / entry.
+///
+/// The unroller runs DURING the pre-pass (inside `run_passes`), at which point
+/// `active_derived_profile` is not yet published (`propagate_profile` runs
+/// after the pass pipeline). The raw profile only carries instrumented
+/// NON-tree edges; a loop's backedge is the maximum-spanning-tree edge (weight
+/// 2000) and is therefore NOT instrumented, so `edge_count(backedge)` is 0 on
+/// the raw profile — the v8 "derived trip count" path was dead during
+/// unrolling and always fell back to the entry-count heuristic. Fix: derive
+/// the tree/backedge counts on the current (pre-pass) CFG right here, exactly
+/// as the PGO inliner already does for per-call-site hotness.
 fn trip_count(f: &IrFunction, idx: usize) -> Option<u64> {
     let header = f.blocks.get(idx)?.label.0;
-    let fp = crate::pgo::active_profile_for_function(f)?;
+    // Pre-pass: clone the raw (name-keyed) profile and derive the tree edges
+    // on the CURRENT pre-pass CFG. The pre-pass CFG is stable across
+    // generate/use, so the derived backedge count is correct.
+    let mut fp = crate::pgo::prepass_profile(&f.name)?;
+    crate::pgo::profile::derive_block_counts(f, &mut fp);
     let entry = fp.total_count.max(1);
     let mut back = 0u64;
     for b in &f.blocks {
@@ -71,6 +85,9 @@ pub fn should_unroll_loop(
         return Some(false);
     }
     if let Some(t) = trip_count(f, idx) {
+        // Profile-accurate unrolling (GCC/LLVM scale unrolling by the
+        // estimated trip count): high-trip loops unroll, low-trip loops do
+        // not — no code bloat on cold/once-only paths.
         if t >= 16 && size <= 24 {
             return Some(true);
         }
@@ -82,7 +99,8 @@ pub fn should_unroll_loop(
         }
         return None;
     }
-    // Pre-pass fallback: entry-count heuristic (v7 behavior).
+    // Pre-pass fallback: entry-count heuristic (v7 behavior) for functions
+    // without a usable derived backedge (e.g. no profile for this function).
     let n = if crate::pgo::prepass_is_active() {
         crate::pgo::total_count_for(&f.name)
     } else {
