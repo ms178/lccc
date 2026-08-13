@@ -743,12 +743,19 @@ impl CodegenState {
                 }
             } else if self.i128_values.contains(&val_id)
                 || self.f128_direct_slots.contains(&val_id)
+                || self.vector_values.contains(&val_id)
+                || self.vector128_values.contains(&val_id)
             {
-                // 16-byte payload values (i128/U128/F128 bit patterns, x87
-                // bit-op results) live DIRECTLY in their slot — the slot is
-                // the data, not a pointer to it. Treat as Direct so memcpy
-                // and friends take the slot address instead of loading the
-                // first 8 payload bytes as a pointer (SEGV).
+                // 16/32-byte payload values (i128/U128/F128 bit patterns, x87
+                // bit-op results, and the auto-vectorizer's Vec* values) live
+                // DIRECTLY in their slot — the slot is the data, not a pointer
+                // to it. Treat as Direct so memcpy, value_ptr_mem_operand, and
+                // friends take the slot address instead of loading the first 8
+                // payload bytes as a pointer (SEGV). Vec* values are stored
+                // with vmovupd/movups straight into the slot by the Vec*
+                // emitters; without this they resolved to Indirect and the
+                // defer-aware binary emitters fell back to a leaq+indirect
+                // load round-trip (v3 reduction-loop codegen).
                 Some(SlotAddr::Direct(slot))
             } else {
                 Some(SlotAddr::Indirect(slot))

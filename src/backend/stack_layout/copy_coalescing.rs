@@ -1204,16 +1204,12 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI32x8
             | O::VecLoadF32x4
             | O::VecLoadF32x8
-            | O::VecAddF64x2
-            | O::VecAddF64x4
-            | O::VecAddI32x4
-            | O::VecAddI32x8
-            | O::VecAddF32x4
-            | O::VecAddF32x8
-            | O::VecMulF64x2
-            | O::VecMulF64x4
-            | O::VecMulF32x4
-            | O::VecMulF32x8
+            // VecAdd*/VecMul* are NOT raw readers: they are cache-aware
+            // two-operand binaries whose codegen goes through
+            // emit_avx_binary_256 / emit_sse_binary_128 (v3), so they can
+            // consume a deferred single-use load from the register cache and
+            // fold the other operand as a memory operand. VecLoad*/VecZero*/
+            // VecHorizontalAdd* stay raw (pointer/scalar operands).
             | O::VecHorizontalAddF64x2
             | O::VecHorizontalAddF64x4
             | O::VecHorizontalAddI32x4
@@ -1261,6 +1257,10 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
         | O::Pmaxub256 | O::Pminub256
         | O::Pxor256 | O::Por256 | O::Pand256
         | O::AddF64x4 | O::MulF64x4 | O::AddI32x8
+        | O::VecAddF64x4 | O::VecMulF64x4 | O::VecAddI32x8
+        | O::VecAddF32x8 | O::VecMulF32x8
+        | O::VecAddF64x2 | O::VecMulF64x2 | O::VecAddI32x4
+        | O::VecAddF32x4 | O::VecMulF32x4
     )
 }
 
@@ -1414,6 +1414,35 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                     continue;
                 }
                 if allocas.contains(&d.0) {
+                    defs.entry(d.0).or_default().push((bi, ii));
+                    def_blocks.entry(d.0).or_default().insert(bi);
+                }
+            }
+            // v3: the auto-vectorizer's Vec* intrinsics produce their result as
+            // an SSA `dest` (not a `dest_ptr` alloca). Register those defs too,
+            // so a single-use VecLoad result can have its slot store deferred
+            // and its consumer (VecAdd/VecMul) can fold it. VecZero*/VecLoad*/
+            // VecAdd*/VecMul* all write a home slot for `dest`.
+            if let Instruction::Intrinsic {
+                dest: Some(d), op, ..
+            } = inst
+            {
+                use crate::ir::intrinsics::IntrinsicOp as O;
+                let is_vec_producer = matches!(
+                    op,
+                    O::VecLoadF64x2 | O::VecLoadF64x4
+                        | O::VecLoadI32x4 | O::VecLoadI32x8
+                        | O::VecLoadF32x4 | O::VecLoadF32x8
+                        | O::VecAddF64x2 | O::VecAddF64x4
+                        | O::VecAddI32x4 | O::VecAddI32x8
+                        | O::VecAddF32x4 | O::VecAddF32x8
+                        | O::VecMulF64x2 | O::VecMulF64x4
+                        | O::VecMulF32x4 | O::VecMulF32x8
+                        | O::VecZeroF64x2 | O::VecZeroF64x4
+                        | O::VecZeroI32x4 | O::VecZeroI32x8
+                        | O::VecZeroF32x4 | O::VecZeroF32x8
+                );
+                if is_vec_producer {
                     defs.entry(d.0).or_default().push((bi, ii));
                     def_blocks.entry(d.0).or_default().insert(bi);
                 }
