@@ -535,8 +535,8 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
    During development, an iterated linear-scan-hint approach was tried and
    reverted: it miscompiled `energy()` via a subtle adjacent-interval liveness
    interaction with the `reg_free_until` bookkeeping (end+1 off-by-one vs
-   `overlaps_with`'s inclusive-end semantics). The post-pass avoids the
-   allocator internals entirely.
+   `overlaps_with`'s inclusive-end semantics). That interaction is now fixed
+   and the hint approach supersedes this pass — see the v8 section below.
 
 2. **F32 scalars now XMM-allocated** (was F64-only). Also fixed a latent panic
    the widening exposed: the register-direct int→float cast read an
@@ -558,14 +558,83 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
 Correctness: 14 benchmarks bit-exact vs gcc; F32/F64 difftests 0..300 exact;
 zlib-ng adler32 correct.
 
-## v8 roadmap (diagnosed this session)
+## v8 — in-allocator producer→consumer register hints (die-at-birth coalescing)
 
-1. **Branch/boolean domain** (expat 3.2x, sqlite_varint 2.1x): range-check
-   folding `(x>=lo && x<=hi) -> (unsigned)(x-lo) <= hi-lo`, fused
-   compare-to-branch for short-circuit booleans, and GPR boolean coalescing
-   (redundant `movl %esi,%ebp; movl %ebp,%r15d` copies). GCC's approach for
-   expat is direct `cmpb $X,%dl; ja/jle` range branches with zero boolean
-   materialization.
+Resurrected the linear-scan hint approach, with the liveness interaction fixed
+properly (the earlier attempt miscompiled `energy()` and was reverted).
+
+**Root cause of the old miscompile.** The reverted design changed register
+OCCUPANCY to half-open (`occupy_until(end)`) while the overlap predicate stayed
+inclusive-end, so `is_register_free` reported "free" at a producer's final use
+point and an unrelated interval clobbered the still-live value.
+
+**The fix changes the CONFLICT predicate, not the occupancy:**
+- `LiveRange::conflicts_with` encodes use-before-def at a shared point: two
+  ranges touching only at a boundary (producer.end == consumer.start) may share
+  a register iff the producer is genuinely USED at that point
+  (`uses.last() == end`). Liveness-extended ends (live-through-block,
+  phi-incoming, GEP-base, F128-pointer) are not recorded uses, so those stay
+  conservative.
+- `find_free_register` resolves a producer-follow hint (FP BinOp LHS edge) at
+  allocation time; the producer is always allocated first (earlier def).
+- **The adjacency rule is scoped to the hint path.** Applied globally to the
+  GPR scan it was UNSOUND: GPR BinOps round-trip through the accumulator and do
+  not compute into the destination register, so sharing produced
+  `or %r9,%r9` in sqlite_get_varint (self-op, silently drops a term).
+  GPR coalescing stays with the proven paths (phi coalescing, copy coalescing).
+- Fixed the pre-existing hint bug: the hint check compared the incoming range
+  against ALL active intervals instead of only those in the hint register, so
+  hints essentially never fired.
+
+**Also fixed** the use-collection divergence this exposed: `record_operand_uses`
+hand-rolled a match that missed Intrinsic args, InlineAsm inputs, atomic
+pointer operands and `SetReturnF*Second` sources. It now uses the canonical
+operand/value traversal, making `uses` (priority, spill weight, next-use
+eviction, die-at-birth guard) complete.
+
+**Post-pass removed.** `coalesce_f64_producers` (post-allocation, single-use
+only) is superseded: the hints are equivalent-or-better (any-use producers via
+last-use adjacency, and they influence register choice). Measured identical on
+the FP corpus (nbody 3.466x, spectral_norm 2.911x, mandelbrot 1.891x,
+zlib_ng_adler32 1.746x).
+
+**Validation:** regression 127/127, correctness 50/50, intrinsics 3/3, corpus
+25/25 correct, geomean 0.953 vs gcc (v7: 0.951); sqlite_varint + zlib_ng_adler32
+bit-exact. New unit test `test_conflicts_with_die_at_birth`.
+
+## v8 — range-check folding (branch/boolean domain, part 1)
+
+`a && b` / `a || b` lower to short-circuit control flow; if-conversion turns
+that into `Select` chains. A new pass (`src/passes/range_check.rs`, runs right
+after if-conversion) folds the shared-value constant-bound form:
+
+    x >= lo && x <= hi  =>  (unsigned)(x - lo) <= (hi - lo)      (lo <= hi)
+    x <  lo || x >  hi  =>  (unsigned)(x - lo) >  (hi - lo)
+
+Wraparound subtraction sends out-of-range values huge, so one unsigned compare
+classifies the range; valid for signed/unsigned comparisons in any width when
+hi-lo is representable. The two arms are matched through their cast chains (the
+lowering casts the operand once per comparison), and the boolean result keeps
+the Select's type so downstream uses are unchanged.
+
+Supporting change in `simplify`: `Cast(Cast(x, A->B), B->C)` with B strictly
+widest collapses to `Cast(x, A->C)` (complements the existing double-widen /
+double-narrow folds; covers the C-promotion idiom the range fold emits).
+
+Measured: expat 3.28x -> 3.13x, hash_table 1.38x -> 1.31x,
+loop_patterns 1.85x -> 1.80x; no regressions; corpus 25/25 correct.
+Differential test (all byte values + INT_MIN/MAX + LLONG edges) bit-exact vs gcc.
+
+## v8 roadmap (remaining)
+
+1. **Branch/boolean domain, part 2** (expat still ~3.1x): the range check now
+   collapses to one `sub`+`cmp`, but the boolean is still MATERIALIZED
+   (`setcc; movzbl; test; cmov`) because the `||` chain routes each result
+   through a Select. GCC fuses the compare straight into the branch
+   (`cmpb $-17,%dl; ja`) with zero materialization. Remaining work:
+   fused compare-to-branch for short-circuit chains (extend the existing
+   `take_pending_cmp` flag fusion past Cast/Select), and GPR boolean copy
+   coalescing (redundant `movl %esi,%ebp; movl %ebp,%r15d`).
 2. **Parameter register allocation** (nbody's `movq %xmm0,216(%rsp)` at entry).
 3. Loop-carried scalar accumulator in an XMM register (the last 2 movsd/iter in
    reduction loops).

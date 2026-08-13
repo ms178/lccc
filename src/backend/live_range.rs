@@ -15,7 +15,8 @@ use super::liveness::{
 };
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator};
 
 /// Enhanced live interval with priority, uses, and spill weight.
 ///
@@ -34,6 +35,13 @@ pub struct LiveRange {
     pub loop_depth: u32,           // Loop nesting depth (0 = no loop, 1 = in loop, etc.)
     pub priority: u64,             // uses.len() * 10^loop_depth (higher priority = allocate first)
     pub reg_hint: Option<PhysReg>, // Preferred register (from Copy sources)
+    /// Dynamic coalescing hint: prefer the register this producer value was
+    /// assigned. Set by `build_live_ranges` from FP BinOp LHS edges and
+    /// resolved at allocation time in `find_free_register` (the producer is
+    /// always allocated first because it is defined earlier). The allocator's
+    /// `conflicts_with` keeps the share sound: it is honoured only when the
+    /// producer's final use *is* this consumer's definition.
+    pub follow_value: Option<u32>,
     pub spill_weight: f64,         // Cost of spilling: priority / range_length
     /// Cascade number for eviction-chain suppression (LLVM RegAllocGreedy
     /// lineage): an interval that took a register by eviction carries
@@ -71,6 +79,7 @@ impl LiveRange {
             loop_depth,
             priority: uses,
             reg_hint: None,
+            follow_value: None,
             spill_weight,
             cascade: 0,
         }
@@ -87,9 +96,47 @@ impl LiveRange {
         self.start < end && start < self.end
     }
 
-    /// Check if this interval overlaps with another LiveRange.
-    pub fn overlaps_with(&self, other: &LiveRange) -> bool {
-        self.overlaps(other.start, other.end + 1)
+    /// True if `self` has a recorded use at exactly `point`.
+    ///
+    /// `uses` is ascending (collected in program order), so this is an O(1)
+    /// tail check. Interval ends extended by the liveness analysis (live
+    /// through a block, phi incoming edges, GEP-fold bases, F128 source
+    /// pointers) are NOT recorded uses, which is exactly what makes this the
+    /// guard for die-at-birth sharing below.
+    #[inline]
+    fn last_use_is_at(&self, point: u32) -> bool {
+        self.uses.last() == Some(&point)
+    }
+
+    /// Whether `self` and `other` may NOT share one physical register.
+    ///
+    /// Two ranges conflict when their live-point sets intersect. Under LCCC's
+    /// per-instruction program-point model every operand USE at a point
+    /// precedes the single DEFINITION at that point (SSA: a fresh value's def
+    /// is the result of the very instruction that reads its operands). So
+    /// when `self` dies exactly where `other` is born (`self.end ==
+    /// other.start`) — and `self` is genuinely *used* at that point — the read
+    /// precedes the write and the ranges may legally share a register. This is
+    /// what lets a producer and its consumer coalesce onto one register during
+    /// allocation instead of paying a copy.
+    ///
+    /// An end that was artificially extended (not a real use) fails
+    /// `last_use_is_at`, so those ranges stay conservative and never share a
+    /// register at their extended endpoint.
+    pub fn conflicts_with(&self, other: &LiveRange) -> bool {
+        // Strictly disjoint: no shared point at all.
+        if self.start > other.end || other.start > self.end {
+            return false;
+        }
+        // Shared single point, use-before-def: the dying value's final use
+        // reads the register before the newborn's definition writes it.
+        if self.end == other.start && self.last_use_is_at(self.end) {
+            return false;
+        }
+        if other.end == self.start && other.last_use_is_at(other.end) {
+            return false;
+        }
+        true
     }
 }
 
@@ -180,13 +227,6 @@ impl LinearScanAllocator {
         }
     }
 
-    /// Check if a register is free at the given position.
-    pub fn is_register_free(&self, reg: PhysReg, position: u32) -> bool {
-        self.reg_free_until
-            .get(&reg)
-            .map_or(true, |&free_until| free_until <= position)
-    }
-
     /// Find the earliest position at which a register becomes free.
     pub fn earliest_free_position(&self) -> u32 {
         self.reg_free_until.values().copied().min().unwrap_or(0)
@@ -224,21 +264,43 @@ impl LinearScanAllocator {
     /// Find a free register for the given range.
     ///
     /// Uses the following strategy:
-    /// 1. If there's a register hint from Copy sources, try that first
-    /// 2. Find a register that's free for the entire duration of the range
-    /// 3. If none, return None (caller will spill)
+    /// 1. If there's a register hint (explicit, or a producer this value
+    ///    follows), try that register first — the only place the
+    ///    use-before-def adjacency rule applies.
+    /// 2. Otherwise pick a register that is strictly free at the range's
+    ///    start point, rotating the start index to distribute consecutive
+    ///    allocations across different registers for ILP.
     pub fn find_free_register(&mut self, range: &LiveRange) -> Option<PhysReg> {
-        // Try register hint first (for coalescing with Copy sources)
+        // Try a coalescing hint first. The producer is always allocated before
+        // its consumer (it is defined earlier), so its assignment is already
+        // known here.
         if let Some(hint) = range.reg_hint {
-            if self.is_register_free(hint, range.start)
-                && self.active.iter().all(|a| !a.range.overlaps_with(range))
-            {
+            if self.register_compatible(hint, range) {
                 return Some(hint);
+            }
+        } else if let Some(producer) = range.follow_value {
+            if let Some(&hint) = self.assignments.get(&producer) {
+                if self.register_compatible(hint, range) {
+                    return Some(hint);
+                }
             }
         }
 
-        // Find any free register, rotating the start index to distribute
-        // consecutive allocations across different registers for ILP.
+        // Find a STRICTLY free register, rotating the start index to
+        // distribute consecutive allocations across different registers for
+        // ILP. A register is usable only when its last occupant's final use is
+        // strictly before range.start.
+        //
+        // The use-before-def adjacency rule from `register_compatible` is
+        // deliberately NOT applied here: it is only sound for values whose
+        // defining instruction computes into the destination register with the
+        // operand pre-loaded (the FP emitter `emit_float_binop_into_reg`).
+        // General GPR BinOps round-trip through the accumulator and do not
+        // tolerate die-at-birth sharing — applying it globally produced
+        // `or %r9,%r9` in sqlite_get_varint, silently dropping a term
+        // (measured miscompile). Coalescing in the GPR class therefore stays
+        // with the dedicated, proven paths (phi coalescing, copy coalescing),
+        // while the FP class uses the hint path above.
         let n = self.available_regs.len();
         if n == 0 {
             return None;
@@ -247,29 +309,40 @@ impl LinearScanAllocator {
         for offset in 0..n {
             let idx = (start + offset) % n;
             let reg = self.available_regs[idx];
-            // Check if this register is free at the start of the range
-            if self.is_register_free(reg, range.start) {
-                // Also check that no active interval uses this register
-                let reg_free_throughout = self
-                    .active
-                    .iter()
-                    .filter(|a| {
-                        if let Some(assigned_reg) = self.assignments.get(&a.range.value_id) {
-                            *assigned_reg == reg
-                        } else {
-                            false
-                        }
-                    })
-                    .all(|a| !a.range.overlaps_with(range));
-
-                if reg_free_throughout {
-                    self.next_reg_idx = idx + 1;
-                    return Some(reg);
-                }
+            let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
+            if free_until <= range.start {
+                self.next_reg_idx = idx + 1;
+                return Some(reg);
             }
         }
 
         None
+    }
+
+    /// Whether `reg` may hold `range` for its whole live range.
+    ///
+    /// Two checks, both against the allocator's current state:
+    ///
+    /// 1. **Occupancy.** `reg_free_until[reg]` is one past the final use of
+    ///    the last interval assigned to `reg`. `free_until - 1` is therefore
+    ///    that occupant's end point. If it lies strictly past `range.start`
+    ///    the occupant is still needed after `range`'s definition and the
+    ///    register is taken. Equality (`occupant_end == range.start`) is the
+    ///    die-at-birth case: legal only when the occupant's final use *is*
+    ///    `range.start` (use-before-def), which the interference check below
+    ///    verifies precisely.
+    /// 2. **Interference.** No active interval in `reg` may conflict with
+    ///    `range` under `LiveRange::conflicts_with`.
+    fn register_compatible(&self, reg: PhysReg, range: &LiveRange) -> bool {
+        let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
+        let occupant_end = free_until.saturating_sub(1);
+        if occupant_end > range.start {
+            return false;
+        }
+        self.active
+            .iter()
+            .filter(|a| self.assignments.get(&a.range.value_id) == Some(&reg))
+            .all(|a| !a.range.conflicts_with(range))
     }
 
     /// Remaining (future) weighted use count of a range at scan position `pos`:
@@ -397,7 +470,7 @@ impl LinearScanAllocator {
             if trace {
                 for active in &self.active {
                     if let Some(&areg) = self.assignments.get(&active.range.value_id) {
-                        if areg == reg && active.range.overlaps_with(&range) {
+                        if areg == reg && active.range.conflicts_with(&range) {
                             eprintln!("[ALLOC-BUG] Assigning val{}[{}-{}] to reg={} but val{}[{}-{}] already in reg={}!",
                                 range.value_id, range.start, range.end, reg.0,
                                 active.range.value_id, active.range.start, active.range.end, areg.0);
@@ -640,7 +713,7 @@ pub fn build_live_ranges(
     // Collect actual use points for each value
     let uses_map = collect_uses_for_values(func);
 
-    // Register hints from Copy sources (currently none are emitted).
+    // Producer→consumer follow hints (FP BinOp LHS edges).
     let hints_map = find_register_hints(func);
 
     // PGO-aware use weighting: exact block-entry counts bias allocation toward
@@ -668,8 +741,9 @@ pub fn build_live_ranges(
             .sum();
         range.priority = weighted_uses.max(1).saturating_mul(loop_weight);
 
-        // Add register hint if available
-        range.reg_hint = hints_map.get(&range.value_id).copied();
+        // Add producer-follow hint if available (the consumer prefers the
+        // producer's register; resolved at allocation time).
+        range.follow_value = hints_map.get(&range.value_id).copied();
 
         // Recalculate spill weight with actual use count
         range.calculate_spill_weight();
@@ -745,117 +819,18 @@ fn collect_uses_for_values(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
 }
 
 /// Record uses of operands in an instruction.
+///
+/// Uses the canonical operand/value traversal (the same visitors the liveness
+/// analysis runs) so every instruction form is covered — a hand-maintained
+/// match previously missed Intrinsic args, InlineAsm inputs, atomic pointer
+/// operands, and the SetReturnF*Second sources, under-counting uses and
+/// skewing allocation priority and the die-at-birth guard in `conflicts_with`.
 fn record_operand_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32, Vec<u32>>) {
-    // Helper to record a use of a value
-    let mut record = |vid: u32| {
-        uses.entry(vid).or_insert_with(Vec::new).push(point);
-    };
-
-    // Match on instruction type to find all operand uses
-    match inst {
-        Instruction::BinOp { lhs, rhs, .. } => {
-            if let Operand::Value(v) = lhs {
-                record(v.0);
-            }
-            if let Operand::Value(v) = rhs {
-                record(v.0);
-            }
+    for_each_operand_in_instruction(inst, |op| {
+        if let Operand::Value(v) = op {
+            uses.entry(v.0).or_insert_with(Vec::new).push(point);
         }
-        Instruction::UnaryOp { src, .. } => {
-            if let Operand::Value(v) = src {
-                record(v.0);
-            }
-        }
-        Instruction::Cmp { lhs, rhs, .. } => {
-            if let Operand::Value(v) = lhs {
-                record(v.0);
-            }
-            if let Operand::Value(v) = rhs {
-                record(v.0);
-            }
-        }
-        Instruction::Store { val, .. } => {
-            if let Operand::Value(v) = val {
-                record(v.0);
-            }
-        }
-        Instruction::Cast { src, .. } => {
-            if let Operand::Value(v) = src {
-                record(v.0);
-            }
-        }
-        Instruction::Copy { src, .. } => {
-            if let Operand::Value(v) = src {
-                record(v.0);
-            }
-        }
-        Instruction::Call { info, .. } => {
-            for arg in &info.args {
-                if let Operand::Value(v) = arg {
-                    record(v.0);
-                }
-            }
-        }
-        Instruction::CallIndirect { func_ptr, info, .. } => {
-            if let Operand::Value(v) = func_ptr {
-                record(v.0);
-            }
-            for arg in &info.args {
-                if let Operand::Value(v) = arg {
-                    record(v.0);
-                }
-            }
-        }
-        Instruction::GetElementPtr { offset, .. } => {
-            if let Operand::Value(v) = offset {
-                record(v.0);
-            }
-        }
-        Instruction::Select {
-            cond,
-            true_val,
-            false_val,
-            ..
-        } => {
-            if let Operand::Value(v) = cond {
-                record(v.0);
-            }
-            if let Operand::Value(v) = true_val {
-                record(v.0);
-            }
-            if let Operand::Value(v) = false_val {
-                record(v.0);
-            }
-        }
-        Instruction::AtomicRmw { val, .. } => {
-            if let Operand::Value(v) = val {
-                record(v.0);
-            }
-        }
-        Instruction::AtomicInc { ptr, .. } => {
-            if let Operand::Value(v) = ptr {
-                record(v.0);
-            }
-        }
-        Instruction::AtomicCmpxchg {
-            expected, desired, ..
-        } => {
-            if let Operand::Value(v) = expected {
-                record(v.0);
-            }
-            if let Operand::Value(v) = desired {
-                record(v.0);
-            }
-        }
-        Instruction::Phi { incoming, .. } => {
-            for (op, _) in incoming {
-                if let Operand::Value(v) = op {
-                    record(v.0);
-                }
-            }
-        }
-        _ => {}
-    }
+    });
 
     // Record direct Value uses (pointers, bases, etc.)
     record_value_uses(inst, point, uses);
@@ -863,20 +838,9 @@ fn record_operand_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32,
 
 /// Record direct Value uses (not wrapped in Operand).
 fn record_value_uses(inst: &Instruction, point: u32, uses: &mut FxHashMap<u32, Vec<u32>>) {
-    let mut record = |v: &Value| {
+    for_each_value_use_in_instruction(inst, |v| {
         uses.entry(v.0).or_insert_with(Vec::new).push(point);
-    };
-
-    match inst {
-        Instruction::Load { ptr, .. } => record(ptr),
-        Instruction::Store { ptr, .. } => record(ptr),
-        Instruction::GetElementPtr { base, .. } => record(base),
-        Instruction::Memcpy { dest, src, .. } => {
-            record(dest);
-            record(src);
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Record uses in a terminator.
@@ -910,17 +874,47 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
     }
 }
 
-/// Find register hints from Copy instructions.
+/// Compute producer→consumer register-following hints.
 ///
-/// For Copy instructions where the source is allocated to a register,
-/// the destination can be hinted to use the same register, enabling coalescing.
+/// For an FP BinOp `d = lhs op rhs`, the x86 FP emitter computes the result
+/// into `d`'s allocated register and first loads the LHS there
+/// (`emit_float_binop_into_reg`). When `d` is allocated to the same register
+/// as `lhs`, that load is a no-op — a whole register copy disappears per
+/// chain link. We therefore record `d → lhs` as a FOLLOW hint: at allocation
+/// time the consumer resolves the producer's already-assigned register and
+/// prefers it (see `LinearScanAllocator::find_free_register`).
 ///
-/// Returns a map: dest_value_id → source_register_hint
-fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, PhysReg> {
-    let _ = func;
-    // Register hints are currently not emitted (post-allocation coalescing
-    // handles producer->consumer sharing instead).
-    FxHashMap::default()
+/// Only the LHS is hinted. The emitter loads the LHS into the destination
+/// register; hinting the RHS would place it in that same register, where the
+/// LHS load would clobber it before it is read (observed miscompile:
+/// `subsd %xmm4, %xmm4` ≡ 0). RHS sharing is therefore never requested.
+///
+/// The allocator's `conflicts_with` performs the soundness check: a follow
+/// hint is honoured only when producer and consumer are die-at-birth
+/// compatible (the producer's final use IS the consumer's definition, so the
+/// read precedes the write). A long-lived or multi-use producer simply leaves
+/// the hint unhonoured and the consumer falls back to a free register —
+/// over-hinting never removes an allocation option.
+///
+/// Returns a map: consumer value id → producer value id to follow.
+fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
+    let mut hints: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::BinOp {
+                dest,
+                lhs: Operand::Value(lhs),
+                ty,
+                ..
+            } = inst
+            {
+                if *ty == IrType::F64 || *ty == IrType::F32 {
+                    hints.insert(dest.0, lhs.0);
+                }
+            }
+        }
+    }
+    hints
 }
 
 #[cfg(test)]
@@ -954,6 +948,7 @@ mod tests {
             loop_depth: 0,
             priority: 1,
             reg_hint: None,
+            follow_value: None,
             spill_weight: 0.1,
             cascade: 0,
         };
@@ -972,6 +967,84 @@ mod tests {
 
         // No overlap: starts after range
         assert!(!range.overlaps(0, 9));
+    }
+
+    #[test]
+    fn test_conflicts_with_die_at_birth() {
+        // Producer used exactly at its end (a genuine use) and a consumer born
+        // at that same point: use-before-def, so they may share a register.
+        let producer = LiveRange {
+            value_id: 1,
+            start: 0,
+            end: 5,
+            uses: vec![0, 5],
+            loop_depth: 0,
+            priority: 2,
+            reg_hint: None,
+            follow_value: None,
+            spill_weight: 0.1,
+            cascade: 0,
+        };
+        let consumer = LiveRange {
+            value_id: 2,
+            start: 5,
+            end: 10,
+            uses: vec![5, 10],
+            loop_depth: 0,
+            priority: 2,
+            reg_hint: None,
+            follow_value: None,
+            spill_weight: 0.1,
+            cascade: 0,
+        };
+        assert!(!producer.conflicts_with(&consumer));
+        assert!(!consumer.conflicts_with(&producer));
+
+        // Same shape but with an artificially extended end (no recorded use at
+        // the shared point) must conflict: the extension is not a real use.
+        let extended = LiveRange {
+            value_id: 3,
+            start: 0,
+            end: 5,
+            uses: vec![0], // last recorded use is NOT at end=5
+            loop_depth: 0,
+            priority: 2,
+            reg_hint: None,
+            follow_value: None,
+            spill_weight: 0.1,
+            cascade: 0,
+        };
+        assert!(extended.conflicts_with(&consumer));
+
+        // Genuine overlap (more than a single shared point) always conflicts.
+        let overlapping = LiveRange {
+            value_id: 4,
+            start: 3,
+            end: 7,
+            uses: vec![3, 7],
+            loop_depth: 0,
+            priority: 2,
+            reg_hint: None,
+            follow_value: None,
+            spill_weight: 0.1,
+            cascade: 0,
+        };
+        assert!(producer.conflicts_with(&overlapping));
+
+        // Disjoint intervals never conflict.
+        let disjoint = LiveRange {
+            value_id: 5,
+            start: 20,
+            end: 30,
+            uses: vec![20, 30],
+            loop_depth: 0,
+            priority: 2,
+            reg_hint: None,
+            follow_value: None,
+            spill_weight: 0.1,
+            cascade: 0,
+        };
+        assert!(!producer.conflicts_with(&disjoint));
     }
 
     #[test]
@@ -1001,6 +1074,7 @@ mod tests {
             loop_depth: 0,
             priority: 100,
             reg_hint: None,
+            follow_value: None,
             spill_weight: 100.0 / 11.0, // 100 / range_length
             cascade: 0,
         };
@@ -1013,6 +1087,7 @@ mod tests {
             loop_depth: 0,
             priority: 100,
             reg_hint: None,
+            follow_value: None,
             spill_weight: 100.0 / 101.0, // 100 / range_length
             cascade: 0,
         };
@@ -1033,6 +1108,7 @@ mod tests {
                 loop_depth: 0,
                 priority: 3,
                 reg_hint: None,
+                follow_value: None,
                 spill_weight: 0.3,
                 cascade: 0,
             },
@@ -1044,6 +1120,7 @@ mod tests {
                 loop_depth: 0,
                 priority: 3,
                 reg_hint: None,
+                follow_value: None,
                 spill_weight: 0.3,
                 cascade: 0,
             },
@@ -1055,6 +1132,7 @@ mod tests {
                 loop_depth: 0,
                 priority: 3,
                 reg_hint: None,
+                follow_value: None,
                 spill_weight: 0.3,
                 cascade: 0,
             },
@@ -1083,6 +1161,7 @@ mod tests {
                 loop_depth: 0,
                 priority: 3, // High priority
                 reg_hint: None,
+                follow_value: None,
                 spill_weight: 0.03,
                 cascade: 0,
             },
@@ -1094,6 +1173,7 @@ mod tests {
                 loop_depth: 0,
                 priority: 2, // Lower priority - should spill
                 reg_hint: None,
+                follow_value: None,
                 spill_weight: 0.02,
                 cascade: 0,
             },
@@ -1121,6 +1201,7 @@ mod tests {
             loop_depth: 0,
             priority: 1,
             reg_hint: None,
+            follow_value: None,
             spill_weight: 0.1,
             cascade: 0,
         }];

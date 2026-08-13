@@ -27,6 +27,7 @@ pub(crate) mod loop_analysis;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
+pub(crate) mod range_check;
 pub(crate) mod recursion_to_iter;
 mod resolve_asm;
 pub(crate) mod simplify;
@@ -756,6 +757,22 @@ macro_rules! preloop_dump {
                 )
             );
             cur_pass_changes[7] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 7b: Range-check folding.
+        // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
+        // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).
+        // Runs right after if-conversion, which produces the Select form from
+        // short-circuit branches. Idempotent and O(instructions), so it also
+        // folds Selects produced earlier (mem2reg in the pre-loop phase).
+        // Pass name for CCC_DISABLE_PASSES: "range_fold".
+        if !disabled.contains("range_fold") {
+            let n = timed_pass!(
+                "range_fold",
+                run_on_visited(module, &dirty, &mut changed, range_check::run_function)
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }

@@ -368,6 +368,23 @@ fn simplify_cast(
                             to_ty,
                         });
                     }
+
+                    // Widen then narrow, B strictly widest: Cast(Cast(x, A->B), B->C)
+                    // with B > A and B > C (all ints) => Cast(x, A->C).
+                    // The widening A->B preserves every A bit (zero- or
+                    // sign-extended), and narrowing B->C discards only high bits,
+                    // so the result is exactly extend-then-truncate(x) which
+                    // equals Cast(x, A->C) for any signedness and any C.
+                    // (Covers the C-promotion idiom the range-check fold emits:
+                    // bool I8 -> I64 -> I32 collapses to bool I8 -> I32.)
+                    if b > a && b > c {
+                        return Some(Instruction::Cast {
+                            dest,
+                            src: inner_src,
+                            from_ty: inner_from,
+                            to_ty,
+                        });
+                    }
                 }
             }
         }
