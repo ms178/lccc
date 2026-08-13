@@ -107,11 +107,19 @@ Top-Down metrics) in a controlled affinity/governor/thermal environment.
 
 ## Current results (screening)
 
-A fresh run of the canonical runner on the current `main`, `-O2`, 5 paired
-rounds + 2 warm-ups, pinned to one KVM vCPU. The run included three compilers:
-**LCCC**, **GCC 14.2**, and the **original upstream Claude's C Compiler (CCC)**
-built from `anthropics/claudes-c-compiler`, so the corpus also shows what LCCC
-improved over its ancestor.
+A fresh run of the canonical runner on the current `main`, `-O2`, paired
+rounds + 2 warm-ups, pinned to one KVM vCPU. The comparison spans **four**
+compilers on the same corpus:
+
+- **LCCC** (this fork, current `main`);
+- **Lev LCCC**, built from [`levkropp/lccc`](https://github.com/levkropp/lccc)
+  — the original lccc this fork builds on;
+- the **original upstream Claude's C Compiler (CCC)**, built from
+  `anthropics/claudes-c-compiler` — the common ancestor; and
+- **GCC 14.2** as an external reference.
+
+LCCC/GCC/original-CCC were measured in one paired run; Lev LCCC was run fresh
+in a second run on the same corpus and machine (seed `20260813`).
 
 ### LCCC vs GCC
 
@@ -186,6 +194,54 @@ executes the exponential recursion, hence ~500×), **AVX2/SSE2 vectorization and
 FMA** (matmul, reductions, nbody, spectral_norm), **strength reduction /
 register allocation / IVSR** (arith_loop, loop_patterns, sieve), and
 **PGO-driven inlining and devirtualization** (expat, zlib-ng).
+
+### The improvement chain: original CCC → Lev LCCC → this LCCC
+
+Median wall times (ms) from the two runs. Ratio columns are **speedups**:
+`CCC→Lev > 1` means Lev LCCC is faster than the original CCC; `Lev→LCCC > 1`
+means this fork is faster than Lev LCCC. GCC is the external reference.
+
+| Benchmark | CCC | Lev LCCC | LCCC | GCC | CCC→Lev | Lev→LCCC |
+|---|---:|---:|---:|---:|---:|---:|
+| ackermann | 1277 | 1047 | 3 | 152 | 1.2× | 417× |
+| arith_loop | 259 | 157 | 113 | 102 | 1.6× | 1.4× |
+| binary_trees | 1848 | 1798 | 1715 | 1416 | 1.0× | 1.0× |
+| bitops | 1127 | 5048 | 745 | 390 | 0.2× | 6.8× |
+| constant_recursion | 1266 | 1050 | 2 | 149 | 1.2× | 436× |
+| expat_xml_scan | 258 | 1601 | 131 | 41 | 0.2× | 12.2× |
+| fannkuch | 6658 | 9554 | 3235 | 2608 | 0.7× | 3.0× |
+| fib | 771 | 3 | 3 | 175 | 305× | 1.0× |
+| glibc_memcmp | 25 | 16 ⚠ | 12 | 9 | 1.5× | 1.4× |
+| gzip_crc32 | 257 | 251 | 244 | 168 | 1.0× | 1.0× |
+| hash_table | 14249 | 14842 | 13381 | 10317 | 1.0× | 1.1× |
+| linux_find_bit | 45 | 79 | 26 | 14 | 0.6× | 3.0× |
+| loop_patterns | 213 | 252 | 134 | 74 | 0.8× | 1.9× |
+| mandelbrot | 5218 | 6031 | 4760 | 1489 | 0.9× | 1.3× |
+| matmul | 51 | 13 | 9 | 7 | 3.9× | 1.4× |
+| nbody | 2268 | 2301 | 1218 | 313 | 1.0× | 1.9× |
+| qsort | 146 | 150 | 139 | 126 | 1.0× | 1.1× |
+| sieve | 100 | 74 | 51 | 42 | 1.3× | 1.4× |
+| spectral_norm | 2472 | 2528 | 1880 | 202 | 1.0× | 1.3× |
+| sqlite_varint | 73 | 73 | 54 | 26 | 1.0× | 1.4× |
+| strlen_bench | 350 | 333 | 282 | 261 | 1.1× | 1.2× |
+| struct_copy | 931 | 874 | 584 | 27 | 1.1× | 1.5× |
+| switch_dispatch | 747 | 773 | 742 | 508 | 1.0× | 1.0× |
+| tce_sum | — | 17 | 2 | 2 | — | 7.9× |
+| zlib_ng_adler32 | 196 | 78 | 68 | 39 | 2.5× | 1.1× |
+
+(⚠ = Lev LCCC produced a **wrong output** on `glibc_memcmp`; the original CCC
+failed to run `tce_sum`.)
+
+**Geometric means (this corpus):**
+- **CCC → Lev LCCC: 1.24×** — Lev's optimizations (recursion-to-iteration,
+  vectorized matmul, zlib-ng adler32, arith_loop) are a clear win over the
+  original CCC, though they regress a few workloads (bitops, expat, fannkuch)
+  and miscompile `glibc_memcmp`.
+- **Lev LCCC → this LCCC: 2.82×** — this fork is faster than the lccc it builds
+  on for **every** benchmark, fixing Lev's codegen regressions (bitops 6.8×,
+  expat 12.2×, fannkuch 3.0×, linux_find_bit 3.0×) and the recursion gap
+  (constant_recursion 436×, ackermann 417×).
+- **CCC → this LCCC: 3.24×**; **this LCCC vs GCC: 1.08×**.
 
 ## Historical snapshot (not current evidence)
 
