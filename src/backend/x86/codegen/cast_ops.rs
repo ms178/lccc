@@ -197,7 +197,10 @@ impl X86Codegen {
             if let Some(dest_phys) = self.dest_reg(dest) {
                 if super::emit::is_xmm_reg(dest_phys) {
                     let dname = super::emit::phys_reg_name(dest_phys);
-                    self.operand_to_reg(src, "rax");
+                    // operand_to_rax handles the accumulator cache
+                    // (immediately-consumed sources have no slot and no
+                    // register — value_to_reg/operand_to_reg would panic).
+                    self.operand_to_rax(src);
                     if from_ty.is_unsigned() {
                         self.emit_zero_extend_to_rax(from_ty);
                     } else {

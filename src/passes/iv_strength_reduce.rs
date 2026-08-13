@@ -62,6 +62,10 @@ struct DerivedExpr {
     stride: i64,
     /// Which basic IV this derives from (index into basic_ivs)
     iv_index: usize,
+    /// Constant added to the IV BEFORE the stride multiply, for the affine
+    /// pattern `(iv + k) * stride` (e.g. nbody's `(i + 1) * 56`). Zero for the
+    /// plain `iv * stride` pattern.
+    add_offset: i64,
     /// GEPs that use this multiply/shift result as their offset.
     /// (block_idx, inst_idx, GEP dest, GEP base)
     gep_uses: Vec<(usize, usize, Value, Value)>,
@@ -194,17 +198,18 @@ fn reduce_loop(
     // literally share the same multiply instruction. C frontends commonly
     // materialize `a[i]` twice as two independently numbered `i * stride`
     // expressions. The key is semantic: (basic IV, byte stride, invariant base).
-    let mut pointer_groups: Vec<(usize, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
+    let mut pointer_groups: Vec<(usize, i64, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
     for d in &derived {
         for &(gep_block_idx, gep_inst_idx, gep_dest, gep_base) in &d.gep_uses {
-            if let Some((_, _, _, uses)) = pointer_groups.iter_mut().find(|(iv_index, stride, base, _)| {
-                *iv_index == d.iv_index && *stride == d.stride && *base == gep_base
+            if let Some((_, _, _, _, uses)) = pointer_groups.iter_mut().find(|(iv_index, stride, off, base, _)| {
+                *iv_index == d.iv_index && *stride == d.stride && *off == d.add_offset && *base == gep_base
             }) {
                 uses.push((gep_block_idx, gep_inst_idx, gep_dest));
             } else {
                 pointer_groups.push((
                     d.iv_index,
                     d.stride,
+                    d.add_offset,
                     gep_base,
                     vec![(gep_block_idx, gep_inst_idx, gep_dest)],
                 ));
@@ -212,7 +217,7 @@ fn reduce_loop(
         }
     }
 
-    for (iv_index, stride, gep_base, gep_uses) in pointer_groups {
+    for (iv_index, stride, add_offset, gep_base, gep_uses) in pointer_groups {
         let iv = &basic_ivs[iv_index];
         let inc_bytes = iv.step * stride;
 
@@ -228,9 +233,12 @@ fn reduce_loop(
         let init_ptr_val = Value(next_id);
         next_id += 1;
 
-        // Try to resolve init to a constant (looking through copies)
+        // Try to resolve init to a constant (looking through copies). The
+        // initial byte offset is (init + add_offset) * stride: the affine
+        // `(iv + k) * stride` pattern starts at `k * stride` bytes past the
+        // base even when the IV starts at zero.
         let init_const = try_resolve_const(&iv.init, func);
-        let init_offset = init_const.map(|v| v * stride);
+        let init_offset = init_const.map(|v| (v + add_offset) * stride);
 
         // Build preheader instructions for computing the initial pointer
         let mut preheader_insts: Vec<Instruction> = Vec::new();
@@ -251,7 +259,14 @@ fn reduce_loop(
                 });
             }
         } else {
-            // Non-constant init: compute init * stride at runtime in preheader
+            // Non-constant init: compute init * stride at runtime in preheader.
+            // The affine `(iv + k) * stride` form with a non-constant init would
+            // need `(init + k) * stride` here; that composition is not yet
+            // handled, so skip it conservatively (falls back to scalar code,
+            // which is always correct).
+            if add_offset != 0 {
+                continue;
+            }
             let init_val = match &iv.init {
                 Operand::Value(v) => *v,
                 _ => continue,
@@ -574,6 +589,33 @@ fn find_derived_exprs(
     let find_iv = |val_id: u32| -> Option<usize> {
         iv_values.get(&val_id).or_else(|| iv_derived.get(&val_id)).copied()
     };
+    // Affine form: `add(iv, k)` (or `add(k, iv)`) — recognized so that
+    // `(iv + k) * stride` strength-reduces with an initial offset of k*stride.
+    let find_affine = |val_id: u32| -> Option<(usize, i64)> {
+        for &bi in loop_body {
+            if bi >= func.blocks.len() {
+                continue;
+            }
+            for inst in &func.blocks[bi].instructions {
+                if inst.dest() != Some(Value(val_id)) {
+                    continue;
+                }
+                if let Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } = inst {
+                    if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
+                        if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
+                            return Some((idx, k));
+                        }
+                    }
+                    if let (Operand::Const(c), Operand::Value(v)) = (lhs, rhs) {
+                        if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
+                            return Some((idx, k));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    };
     if std::env::var("CCC_IVSR_DEBUG").is_ok() {
         let mut d: Vec<u32> = iv_derived.keys().copied().collect();
         d.sort_unstable();
@@ -592,16 +634,20 @@ fn find_derived_exprs(
                     eprintln!("[IVSR-DERIV] b{} label={} BinOp v{} op={:?} lhs={:?} rhs={:?}", bi, func.blocks[bi].label.0, dest.0, op, lhs, rhs);
                 }
             }
-            let (mul_dest, iv_idx, stride) = match inst {
-                // Multiply by constant
+            let (mul_dest, iv_idx, stride, add_offset) = match inst {
+                // Multiply by constant (plain `iv * s`, or affine
+                // `(iv + k) * s` via find_affine).
                 Instruction::BinOp {
                     dest, op: IrBinOp::Mul, lhs, rhs, ..
                 } => {
                     match (lhs, rhs) {
                         (Operand::Value(v), Operand::Const(c))
                         | (Operand::Const(c), Operand::Value(v)) => {
-                            if let (Some(idx), Some(s)) = (find_iv(v.0), c.to_i64()) {
-                                (*dest, idx, s)
+                            let s = c.to_i64();
+                            if let (Some(idx), Some(s)) = (find_iv(v.0), s) {
+                                (*dest, idx, s, 0)
+                            } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0), s) {
+                                (*dest, idx, s, k)
                             } else {
                                 continue;
                             }
@@ -615,7 +661,7 @@ fn find_derived_exprs(
                 } => {
                     if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
                         if (0..64).contains(&shift) {
-                            (*dest, idx, 1i64 << shift)
+                            (*dest, idx, 1i64 << shift, 0)
                         } else {
                             continue;
                         }
@@ -638,7 +684,7 @@ fn find_derived_exprs(
                 } => {
                     if l.0 == r.0 {
                         if let Some(idx) = find_iv(l.0) {
-                            (*dest, idx, 2)
+                            (*dest, idx, 2, 0)
                         } else {
                             continue;
                         }
@@ -681,6 +727,7 @@ fn find_derived_exprs(
                 derived.push(DerivedExpr {
                     stride,
                     iv_index: iv_idx,
+                    add_offset,
                     gep_uses,
                 });
             } else if std::env::var("CCC_IVSR_DEBUG").is_ok() {

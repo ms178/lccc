@@ -810,11 +810,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Phase 3: XMM register allocation for F64 values that don't span calls.
-    // These values were excluded from GPR allocation but can use XMM registers.
+    // Phase 3: XMM register allocation for scalar FP (F64/F32) values that
+    // don't span calls. These values were excluded from GPR allocation but can
+    // use XMM registers.
     if !config.xmm_regs.is_empty() {
-        // Collect F64 values: values in non_gpr_values that are F64 typed,
-        // haven't been assigned a GPR, and don't span calls.
+        // Collect scalar-FP values: values in non_gpr_values that are F64/F32
+        // typed, haven't been assigned a GPR, and don't span calls.
         let f64_intervals: Vec<LiveInterval> = liveness
             .intervals
             .iter()
@@ -822,30 +823,36 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !spans_any_call(iv, call_points))
-            // Only include values that are actually F64 (not i128, not f32, etc.)
+            // Only include values that are actually scalar F64/F32 (not i128,
+            // not long double, etc.)
             .filter(|iv| {
-                // Check if this value is produced by a F64-typed instruction
-                // (or a scalar F64 intrinsic such as sqrt/fabs — those were
-                // previously excluded, so their result spilled to the stack in
-                // the middle of every FP chain: nbody's sqrt(d2)).
+                // Check if this value is produced by an F64/F32-typed
+                // instruction (or a scalar FP intrinsic such as sqrt/fabs).
                 func.blocks.iter().any(|block| {
                     block.instructions.iter().any(|inst| match inst {
                         Instruction::BinOp { dest, ty, .. }
                         | Instruction::UnaryOp { dest, ty, .. }
-                            if *ty == IrType::F64 =>
+                            if *ty == IrType::F64 || *ty == IrType::F32 =>
                         {
                             dest.0 == iv.value_id
                         }
-                        Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
+                        Instruction::Load { dest, ty, .. }
+                            if *ty == IrType::F64 || *ty == IrType::F32 =>
+                        {
                             dest.0 == iv.value_id
                         }
-                        Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
+                        Instruction::Cast { dest, to_ty, .. }
+                            if *to_ty == IrType::F64 || *to_ty == IrType::F32 =>
+                        {
                             dest.0 == iv.value_id
                         }
                         Instruction::Intrinsic { dest: Some(d), op, .. } => {
                             use crate::ir::intrinsics::IntrinsicOp as O;
                             d.0 == iv.value_id
-                                && matches!(op, O::SqrtF64 | O::FabsF64)
+                                && matches!(
+                                    op,
+                                    O::SqrtF64 | O::FabsF64 | O::SqrtF32 | O::FabsF32
+                                )
                         }
                         _ => false,
                     })
@@ -883,6 +890,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 assignments.insert(vid, reg);
                 // XMM regs (20+) are caller-saved, no prologue save needed
             }
+
+            // v7: post-allocation producer->consumer coalescing. Reassign
+            // single-use F64 producers (loads feeding an FP op, chain links)
+            // onto their sole consumer's register when the producer's interval
+            // does not conflict with anything already in that register. This
+            // removes the reg-to-reg copy that otherwise precedes every FP
+            // operation in a dependency chain. Explicit conflict checks make
+            // it sound; the linear scan is untouched.
+            coalesce_f64_producers(func, &f64_intervals, &mut assignments);
         }
 
         // Phase 3b (W6): XMM allocation for 128-bit VECTOR values. Runs AFTER
@@ -1358,6 +1374,122 @@ fn synthetic_vec_intervals(
         }
     }
     result
+}
+
+/// Post-allocation producer→consumer coalescing for the F64 XMM class.
+///
+/// A single-use F64 value (a load feeding an FP op, or an intermediate chain
+/// link) is reassigned to its sole consumer's register when that causes no
+/// register conflict. This removes the reg-to-reg copy that otherwise precedes
+/// every FP operation in a dependency chain (the load lands directly in the
+/// op's destination register). Candidates are processed in REVERSE program
+/// order so an entire dependency chain folds onto the tail register in one
+/// pass (each link follows the register its consumer just moved to).
+///
+/// Soundness: a value is moved only when its interval does not strictly
+/// overlap any value currently holding the target register (adjacent
+/// intervals — producer's last use == consumer's def — are shareable, since
+/// the read precedes the write within one instruction). Only the final
+/// assignment map changes; the linear scan is untouched.
+fn coalesce_f64_producers(
+    func: &IrFunction,
+    f64_intervals: &[LiveInterval],
+    assignments: &mut FxHashMap<u32, PhysReg>,
+) {
+    let iv_of: FxHashMap<u32, (u32, u32)> = f64_intervals
+        .iter()
+        .map(|iv| (iv.value_id, (iv.start, iv.end)))
+        .collect();
+    if iv_of.is_empty() {
+        return;
+    }
+    let raw_uses = raw_value_use_counts(func);
+
+    // Collect (producer, consumer) pairs. Only the FIRST operand (LHS) of a
+    // BinOp is eligible: the FP emitter loads the LHS into the destination
+    // register, so a coalesced LHS needs no copy. Coalescing the RHS would put
+    // it in the destination register too, where the LHS load would clobber it
+    // before it is read (observed miscompile: `subsd %xmm4, %xmm4` = 0).
+    let mut cands: Vec<(u32, u32)> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Some(dest) = inst.dest() else { continue };
+            if !iv_of.contains_key(&dest.0) {
+                continue;
+            }
+            if !assignments.contains_key(&dest.0) {
+                continue;
+            }
+            let lhs: Option<u32> = match inst {
+                Instruction::BinOp { lhs: Operand::Value(v), .. } => Some(v.0),
+                _ => None,
+            };
+            if let Some(v) = lhs {
+                if iv_of.contains_key(&v) && raw_uses.get(&v).copied().unwrap_or(0) == 1 {
+                    cands.push((v, dest.0));
+                }
+            }
+        }
+    }
+    // Reverse program order: the chain tail moves first, so earlier links
+    // follow it onto one shared register.
+    cands.reverse();
+
+    for (v, d) in cands {
+        let Some(&creg) = assignments.get(&d) else { continue };
+        if assignments.get(&v) == Some(&creg) {
+            continue; // already coalesced
+        }
+        let (s, e) = iv_of[&v];
+        let mut ok = true;
+        for (&w, &wr) in assignments.iter() {
+            if w == v || wr != creg {
+                continue;
+            }
+            if let Some(&(ws, we)) = iv_of.get(&w) {
+                if s < we && ws < e {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            assignments.insert(v, creg);
+        }
+    }
+
+    if std::env::var("CCC_DEBUG_XMM").is_ok() {
+        let mut pairs: Vec<(u32, u32)> = assignments
+            .iter()
+            .filter(|(v, _)| iv_of.contains_key(v))
+            .map(|(&v, &r)| (v, r.0 as u32))
+            .collect();
+        pairs.sort_unstable();
+        eprintln!("[XMM-COALESCE] fn={} {:?}", func.name, pairs);
+    }
+}
+
+/// Raw operand-use count per value (one per Operand::Value occurrence in any
+/// instruction or terminator). Used for single-use detection in coalescing:
+/// only a value with exactly one use can share its consumer's register, because
+/// only then do producer and consumer live ranges not overlap.
+fn raw_value_use_counts(func: &IrFunction) -> FxHashMap<u32, u32> {
+    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *uses.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *uses.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+    uses
 }
 
 /// Collect values whose types don't fit in a single GPR (floats, i128, and

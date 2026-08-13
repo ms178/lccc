@@ -516,3 +516,58 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
    is a one-line filter widening plus validation).
 5. Branch-heavy workloads (expat 3.2x, sqlite_varint 2.1x): boolean
    `setcc+movzbl+test` chains instead of fused compare-to-branch.
+
+---
+
+# v7 (2026-08-13) — FP register coalescing, F32 XMM class, affine IVSR
+
+## Delivered (validated; regression 127/127, correctness 50/50, intrinsics 3/3)
+
+1. **Post-allocation F64/F32 producer→consumer register coalescing.** A
+   single-use scalar-FP value feeding a binary op is reassigned to its
+   consumer's destination register, so loads land directly in the op's register
+   and the reg-to-reg copy that preceded every FP operation disappears.
+   LHS-only (the emitter loads the LHS into the destination; coalescing the RHS
+   there would let the LHS load clobber it — caught in development as
+   `subsd %xmm4,%xmm4` = 0), processed in reverse program order so a chain
+   folds onto the tail register, with explicit interval-conflict checks. The
+   linear scan is untouched.
+   During development, an iterated linear-scan-hint approach was tried and
+   reverted: it miscompiled `energy()` via a subtle adjacent-interval liveness
+   interaction with the `reg_free_until` bookkeeping (end+1 off-by-one vs
+   `overlaps_with`'s inclusive-end semantics). The post-pass avoids the
+   allocator internals entirely.
+
+2. **F32 scalars now XMM-allocated** (was F64-only). Also fixed a latent panic
+   the widening exposed: the register-direct int→float cast read an
+   immediately-consumed source via `value_to_reg`, which panics when there is
+   no slot/register (accumulator-cached); switched to `operand_to_rax`.
+
+3. **Affine IVSR** — `(iv + k) * stride` now strength-reduces with initial
+   offset `(init + k) * stride` (non-constant init + non-zero offset falls
+   back conservatively). Synthetic `(i+1)*2` kernel: zero `imulq` remain.
+
+## Measured (min-of-5, pinned, vs gcc -O2)
+
+| benchmark | v6 | v7 |
+|---|---|---|
+| nbody | 4.25x | **3.48x** (advance copies 34→11) |
+| mandelbrot | 2.12x | **1.89x** |
+| struct_copy | 6.65x | **6.27x** |
+
+Correctness: 14 benchmarks bit-exact vs gcc; F32/F64 difftests 0..300 exact;
+zlib-ng adler32 correct.
+
+## v8 roadmap (diagnosed this session)
+
+1. **Branch/boolean domain** (expat 3.2x, sqlite_varint 2.1x): range-check
+   folding `(x>=lo && x<=hi) -> (unsigned)(x-lo) <= hi-lo`, fused
+   compare-to-branch for short-circuit booleans, and GPR boolean coalescing
+   (redundant `movl %esi,%ebp; movl %ebp,%r15d` copies). GCC's approach for
+   expat is direct `cmpb $X,%dl; ja/jle` range branches with zero boolean
+   materialization.
+2. **Parameter register allocation** (nbody's `movq %xmm0,216(%rsp)` at entry).
+3. Loop-carried scalar accumulator in an XMM register (the last 2 movsd/iter in
+   reduction loops).
+4. nbody's remaining `imulq` are preheader pointer-inits for non-constant IV
+   inits (reuse `&bodies[i]+56` for `&bodies[i+1]`).
