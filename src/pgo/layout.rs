@@ -28,6 +28,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     if std::env::var("LCCC_PGO_NO_LAYOUT").is_ok() {
         return;
     }
+    // v8 F7: fresh per-unit switch-hint map (labels are TU-unique post
+    // renumber; layout runs immediately before codegen for this unit).
+    crate::pgo::record_switch_hints(crate::common::fx_hash::FxHashMap::default());
     let max = p.max_total_for_unit(u);
     if max == 0 {
         return;
@@ -36,7 +39,14 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         if f.is_declaration || f.blocks.len() < 2 {
             continue;
         }
-        let Some(fp) = p.get_for_unit(u, &f.name) else {
+        // F9: use the DERIVED profile (flow-conservation solver output) —
+        // raw v5 profiles carry only instrumented EDGE counts; block counts
+        // are derived at propagate time. Reading the raw profile made every
+        // block count 0: chain ordering degenerated and every switch block
+        // looked cold.
+        let Some(fp) = crate::pgo::active_profile_for_function(f)
+            .or_else(|| p.get_for_unit(u, &f.name))
+        else {
             continue;
         };
         // v8: hot/cold section classification via the data-driven summary
@@ -67,7 +77,11 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
             if f.is_declaration || f.blocks.is_empty() {
                 continue;
             }
-            let Some(fp) = p.get_for_unit(u, &f.name) else { continue };
+            let Some(fp) = crate::pgo::active_profile_for_function(f)
+                .or_else(|| p.get_for_unit(u, &f.name))
+            else {
+                continue;
+            };
             let s = crate::pgo::summary::get_summary().unwrap();
             if s.is_hot(fp.total_count) {
                 cls[i] = 0;
@@ -290,6 +304,55 @@ fn layout_function(
             ordered.push(b.clone());
         }
     }
+    // v8 F7: profile-driven switch hints. For every Switch block:
+    //   * cold per the summary -> force a compare chain (no jump table);
+    //   * a case carrying >= 50% of the block's executions -> record it for
+    //     hoisting out of the jump table (profile-guided partitioning).
+    if crate::pgo::summary::get_summary().is_some() {
+        use crate::ir::reexports::Terminator;
+        let mut hints: FxHashMap<u32, crate::pgo::SwitchHint> = FxHashMap::default();
+        for b in &f.blocks {
+            if let Terminator::Switch { cases, .. } = &b.terminator {
+                let c = counts.get(&b.label).copied().unwrap_or(0);
+                let cold = crate::pgo::summary::get_summary()
+                    .map(|s| s.is_cold(c))
+                    .unwrap_or(false);
+                let mut hint = crate::pgo::SwitchHint {
+                    hot_case: None,
+                    force_chain: cold,
+                };
+                if c > 0 {
+                    let mut best: Option<(i64, u32, u64)> = None;
+                    for (v, t) in cases {
+                        let e = fp.edge_count(b.label.0, t.0);
+                        if best.map_or(true, |(_, _, be)| e > be) {
+                            best = Some((*v, t.0, e));
+                        }
+                    }
+                    if let Some((v, t, e)) = best {
+                        if (e as f64) / (c as f64) >= 0.50 {
+                            hint.hot_case = Some((v, t));
+                        }
+                    }
+                }
+                if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
+                    eprintln!(
+                        "[LAYOUT-SW] {} switch block {} count={} cold={} hint={:?}",
+                        f.name, b.label.0, c, cold, hint
+                    );
+                }
+                hints.insert(b.label.0, hint);
+            }
+        }
+        if !hints.is_empty() {
+            let mut all = crate::pgo::switch_hints_snapshot();
+            for (k, v) in hints {
+                all.insert(k, v);
+            }
+            crate::pgo::record_switch_hints(all);
+        }
+    }
+
     // v8: keep promoted (devirtualized) hot blocks adjacent to their
     // predecessor. The chain heuristic can strand them at the function
     // tail (their edges to a mid-chain block never merge), hurting the hot

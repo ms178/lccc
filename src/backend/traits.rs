@@ -1547,8 +1547,13 @@ pub trait ArchCodegen {
         default: &BlockId,
         ty: IrType,
     ) {
-        // Check density for jump table eligibility (disabled by -fno-jump-tables)
-        let use_jump_table = if self.state_ref().no_jump_tables {
+        // Check density for jump table eligibility (disabled by -fno-jump-tables).
+        // v8 F7: a COLD switch block (per the profile summary) forces the
+        // compare chain even when dense — a table's rodata + I-cache cost is
+        // not worth a path that barely runs.
+        let hint = crate::pgo::take_switch_hint();
+        let force_chain = hint.map(|h| h.force_chain).unwrap_or(false);
+        let use_jump_table = if self.state_ref().no_jump_tables || force_chain {
             false
         } else if cases.len() >= MIN_JUMP_TABLE_CASES {
             let min_val = cases
@@ -1571,9 +1576,26 @@ pub trait ArchCodegen {
         };
 
         if use_jump_table {
-            self.emit_switch_jump_table(val, cases, default, ty);
+            // Profile-guided partitioning: hoist the dominant case (>= 50% of
+            // executions) OUT of the table into a single compare — the common
+            // path skips the bounds check and the indirect jump entirely.
+            let mut cases2: Vec<(i64, BlockId)> = cases.to_vec();
+            let mut hoist: Option<(i64, BlockId)> = None;
+            if let Some(h) = hint {
+                if let Some((hv, ht)) = h.hot_case {
+                    if let Some(pos) = cases2.iter().position(|&(v, t)| v == hv && t.0 == ht) {
+                        hoist = Some(cases2.remove(pos));
+                    }
+                }
+            }
+            if let Some((hv, ht)) = hoist {
+                self.emit_load_operand(val);
+                self.emit_switch_case_branch(hv, &ht.as_label(), ty);
+            }
+            self.emit_switch_jump_table(val, &cases2, default, ty);
         } else {
-            // Sparse: linear compare-and-branch chain
+            // Sparse: linear compare-and-branch chain (PGO-sorted by layout,
+            // so the most likely case is already tested first).
             self.emit_load_operand(val);
             for &(case_val, target) in cases {
                 let label = target.as_label();
