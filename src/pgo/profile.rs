@@ -1,5 +1,5 @@
 //! PGO v4 profile identity, deterministic merge, and fail-closed loading.
-use super::{FunctionProfile, ProfileData};
+use super::{FunctionProfile, ProfileData, ValueSite};
 use crate::ir::reexports::{IrFunction, Terminator};
 use crate::common::fx_hash::FxHashMap;
 use std::fs;
@@ -157,8 +157,17 @@ pub fn load_profile(path: &str) -> std::io::Result<ProfileData> {
     } else {
         files.push(p.into());
     }
-    for q in files {
-        parse_file(&q, &mut d)?;
+    let mut warned = 0;
+    for q in &files {
+        if let Err(e) = parse_file(q, &mut d) {
+            // A single corrupt/partial profraw (e.g. a crashed training run)
+            // must not invalidate the whole profile: warn and continue.
+            warned += 1;
+            eprintln!("lccc: PGO warning: {} -- skipped", e);
+        }
+    }
+    if warned > 0 {
+        eprintln!("lccc: PGO warning: skipped {} of {} profile file(s)", warned, files.len());
     }
     if d.is_empty() {
         return Err(std::io::Error::new(
@@ -178,11 +187,21 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
     let mut name = None;
     let mut cur = None;
     let mut hash: u64 = 0;
+    let mut cur_post: u64 = 0;
     let mut entry: u32 = 0;
     let mut unit: u64 = 0;
+    // v-line continuation: the writer emits `v <ord> <total> <sig>` and
+    // `<name> <count>` on the FOLLOWING line (two <=3-vararg fprintf calls,
+    // because the backend's variadic codegen drops register args 3+).
+    let mut pending_vp: Option<(usize, u64, String)> = None;
     let mut flush =
         |name: &mut Option<String>, cur: &mut Option<FunctionProfile>| -> std::io::Result<()> {
             if let (Some(n), Some(mut f)) = (name.take(), cur.take()) {
+                for s in f.value_sites.iter_mut() {
+                    s.targets.sort_by(|x, y| y.1.cmp(&x.1));
+                    let mut seen = crate::common::fx_hash::FxHashSet::default();
+                    s.targets.retain(|t| seen.insert(t.0.clone()));
+                }
                 f.total_count = f
                     .edge_counts
                     .get(&(crate::pgo::instrument::VENTRY, f.entry_label))
@@ -202,13 +221,51 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
             continue;
         }
         let mut a = l.split_whitespace();
+        if let Some((pord, ptot, psig)) = pending_vp.take() {
+            let nm = a.next().ok_or_else(|| bad(p, n, "missing vp name"))?;
+            let cnt: u64 = a
+                .next()
+                .ok_or_else(|| bad(p, n, "missing vp count"))?
+                .parse()
+                .map_err(|_| bad(p, n, "bad vp count"))?;
+            let flags: u64 = a
+                .next()
+                .ok_or_else(|| bad(p, n, "missing vp flags"))?
+                .parse()
+                .map_err(|_| bad(p, n, "bad vp flags"))?;
+            let f: &mut FunctionProfile = cur
+                .as_mut()
+                .ok_or_else(|| bad(p, n, "value profile before func"))?;
+            if cnt > 0 && nm != "?" {
+                if !f.value_sites.iter().any(|s| s.ordinal == pord) {
+                    f.value_sites.push(ValueSite {
+                        ordinal: pord,
+                        total: ptot,
+                        sig: psig.clone(),
+                        targets: Vec::new(),
+                    });
+                }
+                if let Some(site) = f.value_sites.iter_mut().find(|s| s.ordinal == pord) {
+                    site.targets.push((nm.to_string(), cnt, flags));
+                }
+            }
+            continue;
+        }
         match a.next().unwrap_or("") {
-            "lccc-pgo-v3" | "lccc-pgo-v4" => {
+            "lccc-pgo-v3" | "lccc-pgo-v4" | "lccc-pgo-v5" => {
                 hash = a
                     .next()
                     .ok_or_else(|| bad(p, n, "missing hash"))?
                     .parse()
                     .map_err(|_| bad(p, n, "bad hash"))?;
+                let mut post_hash = hash;
+                if l.starts_with("lccc-pgo-v5") {
+                    post_hash = a
+                        .next()
+                        .ok_or_else(|| bad(p, n, "missing post hash"))?
+                        .parse()
+                        .map_err(|_| bad(p, n, "bad post hash"))?;
+                }
                 entry = a
                     .next()
                     .ok_or_else(|| bad(p, n, "missing entry"))?
@@ -219,6 +276,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                     .ok_or_else(|| bad(p, n, "missing unit"))?
                     .parse()
                     .map_err(|_| bad(p, n, "bad unit"))?;
+                cur_post = post_hash;
             }
             "func" => {
                 flush(&mut name, &mut cur)?;
@@ -232,7 +290,9 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                     block_counts: FxHashMap::default(),
                     edge_counts: FxHashMap::default(),
                     cfg_hash: hash,
+                    post_hash: cur_post,
                     entry_label: entry,
+                    value_sites: Vec::new(),
                 });
             }
             "f" => {
@@ -267,6 +327,29 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(c);
+            }
+            "v" => {
+                // v7 indirect-call value profile, two-line form:
+                //   v <ordinal> <total> <sig>
+                //   <name> <count>
+                let _ = cur
+                    .as_mut()
+                    .ok_or_else(|| bad(p, n, "value profile before func"))?;
+                let ordinal: usize = a
+                    .next()
+                    .ok_or_else(|| bad(p, n, "missing vp ordinal"))?
+                    .parse()
+                    .map_err(|_| bad(p, n, "bad vp ordinal"))?;
+                let total: u64 = a
+                    .next()
+                    .ok_or_else(|| bad(p, n, "missing vp total"))?
+                    .parse()
+                    .map_err(|_| bad(p, n, "bad vp total"))?;
+                let sig = a
+                    .next()
+                    .ok_or_else(|| bad(p, n, "missing vp sig"))?
+                    .to_string();
+                pending_vp = Some((ordinal, total, sig));
             }
             x => {
                 // v3 block-count lines accepted for compatibility.
@@ -373,8 +456,21 @@ pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
 
 /// Derive every block count and every tree-edge count from the instrumented
 /// edge counts by flow conservation (Knuth–Stevenson / GCC gcov / LLVM).
+///
+/// v7 rewrite: the previous solver only visited nodes reachable from the
+/// entry through UNKNOWN (tree) edges, so blocks reached through instrumented
+/// edges (the common case for loop bodies!) never got counts, and tree-edge
+/// derivation was incomplete. The correct algorithm:
+///   1. reconstruct the spanning tree: each non-entry node's tree parent is
+///      its single unknown (un-instrumented) in-edge;
+///   2. process nodes in TREE POSTORDER (children before parents) so every
+///      tree out-edge of a node is known when the node is visited;
+///   3. count(b) = known_out(b) + sum of derived tree out-edges;
+///      tree_in(b) = count(b) - known_in(b);
+///   4. blocks never visited (unreachable / drifted) get count 0; missing
+///      edges in drifted CFGs are tolerated (their counts stay 0).
 pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
-    use crate::common::fx_hash::FxHashMap;
+    use crate::common::fx_hash::{FxHashMap, FxHashSet};
     use crate::ir::reexports::Terminator;
     use crate::pgo::instrument::VENTRY;
     if fp.edge_counts.is_empty() {
@@ -399,72 +495,101 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
             _ => vec![],
         }
     }
-    let mut known_in: FxHashMap<u32, u64> = FxHashMap::default();
-    let mut known_out: FxHashMap<u32, u64> = FxHashMap::default();
-    let mut unknown_in: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-    let mut unknown_out: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    // Deduplicated CFG edges.
+    let mut edge_set: FxHashSet<(u32, u32)> = FxHashSet::default();
     for b in &f.blocks {
         for d in succs(&b.terminator) {
-            let e = (b.label.0, d);
-            match fp.edge_counts.get(&e) {
-                Some(&c) => {
-                    *known_in.entry(d).or_insert(0) += c;
-                    *known_out.entry(b.label.0).or_insert(0) += c;
-                }
-                None => {
-                    unknown_in.entry(d).or_default().push(e);
-                    unknown_out.entry(b.label.0).or_default().push(e);
-                }
-            }
+            edge_set.insert((b.label.0, d));
         }
     }
+    let edges: Vec<(u32, u32)> = edge_set.into_iter().collect();
     let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
     let entry_count = fp.edge_counts.get(&(VENTRY, entry)).copied().unwrap_or(0);
 
-    // Children-before-parents order (reverse BFS over unknown edges).
-    let mut order = Vec::new();
+    let mut known_in: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut known_out: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut unknown_in: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for (s, d) in &edges {
+        if let Some(&c) = fp.edge_counts.get(&(*s, *d)) {
+            *known_in.entry(*d).or_insert(0) += c;
+            *known_out.entry(*s).or_insert(0) += c;
+        } else {
+            unknown_in.entry(*d).or_default().push((*s, *d));
+        }
+    }
+    // Reconstruct the tree: parent(b) = first unknown in-edge source.
+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    for (d, ins) in &unknown_in {
+        if let Some(&(p, _)) = ins.first() {
+            parent.insert(*d, p);
+        }
+    }
+    // Children map for the tree.
+    let mut children: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (d, p) in &parent {
+        children.entry(*p).or_default().push(*d);
+    }
+    // Postorder (children before parents) over the tree, from all roots.
+    let mut postorder: Vec<u32> = Vec::new();
     {
-        let mut seen = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(entry);
-        seen.insert(entry);
-        while let Some(b) = queue.pop_front() {
-            order.push(b);
-            if let Some(outs) = unknown_out.get(&b) {
-                for &(_, d) in outs {
-                    if seen.insert(d) {
-                        queue.push_back(d);
-                    }
+        let mut visited: FxHashSet<u32> = FxHashSet::default();
+        fn dfs(
+            n: u32,
+            children: &FxHashMap<u32, Vec<u32>>,
+            visited: &mut FxHashSet<u32>,
+            out: &mut Vec<u32>,
+        ) {
+            if !visited.insert(n) {
+                return;
+            }
+            if let Some(cs) = children.get(&n) {
+                let mut cs = cs.clone();
+                cs.sort_unstable();
+                for c in cs {
+                    dfs(c, children, visited, out);
                 }
+            }
+            out.push(n);
+        }
+        // Roots: entry first, then any node without a tree parent.
+        dfs(entry, &children, &mut visited, &mut postorder);
+        for b in &f.blocks {
+            if !parent.contains_key(&b.label.0) && !visited.contains(&b.label.0) {
+                dfs(b.label.0, &children, &mut visited, &mut postorder);
+            }
+        }
+        // Any remaining nodes (tree parents unreachable from roots): append.
+        for b in &f.blocks {
+            if !visited.contains(&b.label.0) {
+                dfs(b.label.0, &children, &mut visited, &mut postorder);
             }
         }
     }
-    let mut out_sum: FxHashMap<u32, u64> = known_out.clone();
-    let mut in_sum: FxHashMap<u32, u64> = known_in.clone();
+    // Process children-before-parents: counts + derived tree edges.
+    let mut out_acc: FxHashMap<u32, u64> = known_out.clone();
     let mut counts: FxHashMap<u32, u64> = FxHashMap::default();
     let mut derived_edges: Vec<((u32, u32), u64)> = Vec::new();
-    for &b in order.iter().rev() {
-        if b == entry {
-            counts.insert(b, entry_count);
-            continue;
-        }
-        let c = out_sum.get(&b).copied().unwrap_or(0);
+    for &b in postorder.iter() {
+        let c = if b == entry {
+            entry_count
+        } else {
+            out_acc.get(&b).copied().unwrap_or(0)
+        };
         counts.insert(b, c);
-        if let Some(ins) = unknown_in.get(&b) {
-            if let Some(&pe) = ins.first() {
-                let pc = c.saturating_sub(in_sum.get(&b).copied().unwrap_or(0));
-                derived_edges.push((pe, pc));
-                *out_sum.entry(pe.0).or_insert(0) =
-                    out_sum.get(&pe.0).copied().unwrap_or(0).saturating_add(pc);
-            }
+        if let Some(&p) = parent.get(&b) {
+            let pc = c.saturating_sub(known_in.get(&b).copied().unwrap_or(0));
+            derived_edges.push(((p, b), pc));
+            *out_acc.entry(p).or_insert(0) =
+                out_acc.get(&p).copied().unwrap_or(0).saturating_add(pc);
         }
     }
     for (b, c) in counts {
         fp.block_counts.insert(b, c);
     }
     for (e, c) in derived_edges {
-        let v = fp.edge_counts.entry(e).or_insert(0);
-        *v = v.saturating_add(c);
+        if !fp.edge_counts.contains_key(&e) && c > 0 {
+            fp.edge_counts.insert(e, c);
+        }
     }
     fp.total_count = entry_count;
 }

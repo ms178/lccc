@@ -1347,11 +1347,73 @@ impl Driver {
             eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64());
         }
 
+        // v7: profile identity. The PRE-pass fingerprint (right after mem2reg,
+        // deterministic and profile-independent in both generate and use
+        // builds) is the profile key; the POST-pass fingerprint (right after
+        // run_passes) detects CFG drift from profile-guided transforms.
+        let pgo_active = self.pgo_use.is_some()
+            || std::env::var("LCCC_PGO_USE").is_ok()
+            || self.pgo_generate.is_some()
+            || std::env::var("LCCC_PGO_GENERATE").is_ok();
+        if pgo_active {
+            let pgo_unit = crate::pgo::profile::unit_identity(input_file);
+            let mut pre = crate::common::fx_hash::FxHashMap::default();
+            for f in &module.functions {
+                if !f.is_declaration && !f.blocks.is_empty() {
+                    pre.insert(
+                        f.name.clone(),
+                        crate::pgo::profile::cfg_fingerprint(&f.name, &pgo_unit, f),
+                    );
+                }
+            }
+            crate::pgo::stash_pre_hashes(pre);
+            let mut post = crate::common::fx_hash::FxHashMap::default();
+            for f in &module.functions {
+                if !f.is_declaration && !f.blocks.is_empty() {
+                    post.insert(
+                        f.name.clone(),
+                        crate::pgo::profile::cfg_fingerprint(&f.name, &pgo_unit, f),
+                    );
+                }
+            }
+            crate::pgo::stash_post_hashes(post);
+        }
+
         let t6 = std::time::Instant::now();
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(&mut module, self.opt_level, self.target);
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
+        }
+
+        // v7: post-pass fingerprint snapshot (the CFG drift detector). The
+        // pre-pass snapshot above was taken BEFORE optimization; this one is
+        // taken after, at the same pipeline point in generate and use builds
+        // (before promotion/instrumentation touch the CFG).
+        if pgo_active {
+            let pgo_unit = crate::pgo::profile::unit_identity(input_file);
+            let mut post = crate::common::fx_hash::FxHashMap::default();
+            for f in &module.functions {
+                if !f.is_declaration && !f.blocks.is_empty() {
+                    post.insert(
+                        f.name.clone(),
+                        crate::pgo::profile::cfg_fingerprint(&f.name, &pgo_unit, f),
+                    );
+                }
+            }
+            crate::pgo::stash_post_hashes(post);
+        }
+
+        // v7: indirect-call value-profile promotion (use mode). Runs after
+        // the main pass loop but BEFORE phi elimination, so SSA phis are
+        // still valid; the re-inlined hot targets then go through the
+        // regular pipeline (split ranges, phi elimination, codegen).
+        let pgo_unit = crate::pgo::profile::unit_identity(input_file);
+        if self.pgo_use.is_some() || std::env::var("LCCC_PGO_USE").is_ok() {
+            let nprom = crate::pgo::promote::promote_indirect_calls(&mut module, &pgo_unit);
+            if nprom > 0 {
+                let _ = crate::passes::inline::run(&mut module);
+            }
         }
 
         // Live range splitting: split call-spanning values, then clean up
@@ -1500,10 +1562,8 @@ impl Driver {
             }
         }
 
-        // PGO v3 is post-optimization and post-label-renumber.  Generation and
-        // use therefore fingerprint the same module, while stale profiles fail
-        // closed before optional layout.
-        let pgo_unit = crate::pgo::profile::unit_identity(input_file);
+        // PGO is post-optimization and post-label-renumber; profiles are
+        // keyed by the PRE-pass fingerprint (stable across gen/use).
         if self.pgo_use.is_some() || std::env::var("LCCC_PGO_USE").is_ok() {
             crate::pgo::propagate_profile(&mut module, &pgo_unit);
         }
@@ -1514,9 +1574,19 @@ impl Driver {
                 &pgo_unit,
                 self.pgo_update.as_deref(),
                 self.target,
+                &crate::pgo::pre_hashes(),
+                &crate::pgo::post_hashes(),
             );
         } else if let Ok(dir) = std::env::var("LCCC_PGO_GENERATE") {
-            crate::pgo::instrument::instrument_module(&mut module, &dir, &pgo_unit, None, self.target);
+            crate::pgo::instrument::instrument_module(
+                &mut module,
+                &dir,
+                &pgo_unit,
+                None,
+                self.target,
+                &crate::pgo::pre_hashes(),
+                &crate::pgo::post_hashes(),
+            );
         }
         if let Some(profile) = crate::pgo::get_pgo_profile() {
             crate::pgo::layout::layout_module(&mut module, profile, &pgo_unit);

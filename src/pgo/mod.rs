@@ -4,10 +4,11 @@ pub(crate) mod inline_pgo;
 pub(crate) mod instrument;
 pub(crate) mod layout;
 pub(crate) mod profile;
+pub(crate) mod promote;
 pub(crate) mod unroll_pgo;
 use crate::ir::reexports::{BlockId, IrFunction, IrModule};
 use std::cell::{Cell, RefCell};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default)]
@@ -19,8 +20,28 @@ pub struct FunctionProfile {
     /// are absent; their counts are derived by flow conservation at profile
     /// use (see `profile::derive_block_counts`).
     pub edge_counts: FxHashMap<(u32, u32), u64>,
+    /// PRE-pass structural fingerprint: the profile identity. Stable across
+    /// generate/use builds even when profile-guided transforms (inlining,
+    /// unrolling, devirtualization) change the post-pass CFG.
     pub cfg_hash: u64,
+    /// POST-pass structural fingerprint: detects CFG drift from
+    /// profile-guided transforms; edge/layout consumers degrade gracefully
+    /// instead of dropping the whole function.
+    pub post_hash: u64,
     pub entry_label: u32,
+    /// Indirect-call value profiles: site ordinal -> top callees.
+    pub value_sites: Vec<ValueSite>,
+}
+
+/// One indirect-call site's recorded callee distribution.
+#[derive(Debug, Clone, Default)]
+pub struct ValueSite {
+    pub ordinal: usize,
+    pub total: u64,
+    pub sig: String,
+    /// (callee name, count, linkage flags), sorted by count descending.
+    /// flags bit0 = static (cross-TU direct calls to statics cannot link).
+    pub targets: Vec<(String, u64, u64)>,
 }
 impl FunctionProfile {
     pub fn block_count(&self, l: BlockId) -> u64 {
@@ -114,6 +135,55 @@ thread_local! {
     static PREPASS_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Pre-pass (mem2reg-time) fingerprints: the profile identity, stable across
+/// gen/use. Filled by the driver right after mem2reg. Mutex-backed because
+/// `FxHashMap::default()` is not const (thread_local! requires const inits);
+/// compilation is single-threaded per TU so the lock is uncontended.
+static PRE_HASHES: std::sync::LazyLock<std::sync::Mutex<FxHashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+/// Post-pass fingerprints: CFG-drift detection. Filled by the driver right
+/// after run_passes (before promotion/instrumentation).
+static POST_HASHES: std::sync::LazyLock<std::sync::Mutex<FxHashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+/// Promoted-hot block labels (unit, function) -> labels, from
+/// promote::promote_indirect_calls; layout uses them to keep the
+/// devirtualized hot path hot.
+static PROMOTED_HOT: std::sync::LazyLock<
+    std::sync::Mutex<FxHashMap<(String, String), FxHashSet<u32>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+
+pub fn stash_pre_hashes(map: FxHashMap<String, u64>) {
+    *PRE_HASHES.lock().unwrap() = map;
+}
+pub fn stash_post_hashes(map: FxHashMap<String, u64>) {
+    *POST_HASHES.lock().unwrap() = map;
+}
+pub fn pre_hash_for(name: &str) -> u64 {
+    PRE_HASHES.lock().unwrap().get(name).copied().unwrap_or(0)
+}
+pub fn post_hash_for(name: &str) -> u64 {
+    POST_HASHES.lock().unwrap().get(name).copied().unwrap_or(0)
+}
+pub fn pre_hashes() -> FxHashMap<String, u64> {
+    PRE_HASHES.lock().unwrap().clone()
+}
+pub fn post_hashes() -> FxHashMap<String, u64> {
+    POST_HASHES.lock().unwrap().clone()
+}
+pub fn record_promoted_hot(u: &str, map: FxHashMap<String, FxHashSet<u32>>) {
+    let mut m = PROMOTED_HOT.lock().unwrap();
+    for (fname, labels) in map {
+        m.insert((u.to_string(), fname), labels);
+    }
+}
+pub fn promoted_hot_labels(u: &str, fname: &str) -> FxHashSet<u32> {
+    PROMOTED_HOT
+        .lock()
+        .unwrap()
+        .get(&(u.to_string(), fname.to_string()))
+        .cloned()
+        .unwrap_or_default()
+}
 /// Activate the profile for PRE-PASS consumers (PGO-guided inlining, loop
 /// unrolling). Called before `run_passes`; name+unit-keyed entry counts are
 /// stable across gen/use even when the optimizer changes the CFG.
@@ -170,22 +240,34 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
     ACTIVE_PROFILE_VALID.with(|valid| valid.set(false));
     let mut bad = 0;
     let mut good = 0;
+    let mut drifted = 0;
     for f in &m.functions {
         if f.is_declaration || f.blocks.is_empty() {
             continue;
         }
-        let h = profile::cfg_fingerprint(&f.name, u, f);
-        if profile::get_for_unit_cfg(p, u, &f.name, h).is_none() {
-            bad += 1
-        } else {
-            good += 1
+        // v7: identity is the PRE-pass fingerprint (stable across gen/use);
+        // the post-pass fingerprint detects CFG drift from PGO transforms.
+        let h0 = pre_hash_for(&f.name);
+        let Some(fp) = profile::get_for_unit_cfg(p, u, &f.name, h0) else {
+            bad += 1;
+            continue;
+        };
+        good += 1;
+        if fp.post_hash != 0 && fp.post_hash != post_hash_for(&f.name) {
+            drifted += 1;
         }
     }
     ACTIVE_PROFILE_VALID.with(|valid| valid.set(good > 0));
     if bad > 0 {
         eprintln!(
-            "lccc: PGO v4: ignored {} stale/mismatched function profiles",
+            "lccc: PGO v7: no profile for {} function(s) in this unit (new/changed code?)",
             bad
+        )
+    }
+    if drifted > 0 {
+        eprintln!(
+            "lccc: PGO v7: {} function(s) drifted from the training CFG (PGO-guided transforms); edge profiles degrade gracefully",
+            drifted
         )
     }
     // Derive block counts and tree-edge counts from the instrumented edge
@@ -196,8 +278,8 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
         if f.is_declaration || f.blocks.is_empty() {
             continue;
         }
-        let h = profile::cfg_fingerprint(&f.name, u, f);
-        let Some(fp) = profile::get_for_unit_cfg(p, u, &f.name, h) else {
+        let h0 = pre_hash_for(&f.name);
+        let Some(fp) = profile::get_for_unit_cfg(p, u, &f.name, h0) else {
             continue;
         };
         let mut copy = fp.clone();
@@ -244,8 +326,8 @@ pub fn profile_for_function<'a>(
     u: &str,
     f: &IrFunction,
 ) -> Option<&'a FunctionProfile> {
-    let h = profile::cfg_fingerprint(&f.name, u, f);
-    profile::get_for_unit_cfg(p, u, &f.name, h)
+    let h0 = pre_hash_for(&f.name);
+    profile::get_for_unit_cfg(p, u, &f.name, h0)
 }
 #[cfg(test)]
 mod tests {
@@ -260,7 +342,9 @@ mod tests {
                 block_counts: FxHashMap::default(),
                 edge_counts: FxHashMap::default(),
                 cfg_hash: 1,
+                post_hash: 1,
                 entry_label: 0,
+                value_sites: Vec::new(),
             },
         );
         p.functions.insert(
@@ -270,7 +354,9 @@ mod tests {
                 block_counts: FxHashMap::default(),
                 edge_counts: FxHashMap::default(),
                 cfg_hash: 2,
+                post_hash: 2,
                 entry_label: 0,
+                value_sites: Vec::new(),
             },
         );
         assert!(p.is_function_hot("x"));
