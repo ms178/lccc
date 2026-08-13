@@ -472,7 +472,7 @@ pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
 pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
     use crate::common::fx_hash::{FxHashMap, FxHashSet};
     use crate::ir::reexports::Terminator;
-    use crate::pgo::instrument::VENTRY;
+    use crate::pgo::instrument::{VENTRY, VEXIT};
     if fp.edge_counts.is_empty() {
         return; // v3 block-count profile: nothing to derive
     }
@@ -495,11 +495,16 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
             _ => vec![],
         }
     }
-    // Deduplicated CFG edges.
+    // Deduplicated CFG edges + the virtual exit edges (mirroring the
+    // instrumentation side: every RETURN-terminated block has an edge to the
+    // virtual EXIT node, closing the flow equations at the leaves).
     let mut edge_set: FxHashSet<(u32, u32)> = FxHashSet::default();
     for b in &f.blocks {
         for d in succs(&b.terminator) {
             edge_set.insert((b.label.0, d));
+        }
+        if matches!(b.terminator, Terminator::Return(_)) {
+            edge_set.insert((b.label.0, VEXIT));
         }
     }
     let edges: Vec<(u32, u32)> = edge_set.into_iter().collect();
@@ -569,7 +574,24 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
     let mut out_acc: FxHashMap<u32, u64> = known_out.clone();
     let mut counts: FxHashMap<u32, u64> = FxHashMap::default();
     let mut derived_edges: Vec<((u32, u32), u64)> = Vec::new();
+    // The virtual EXIT node FIRST: its count is the entry count (every
+    // execution eventually returns), and its single tree in-edge derives as
+    // entry_count - known_in(exit) — added to the exit edge's source (the
+    // return block) BEFORE that block is processed, so RETURN-terminated
+    // blocks (case targets, exits) get their real counts instead of 0.
+    if let Some(&p) = parent.get(&VEXIT) {
+        let pc = entry_count.saturating_sub(known_in.get(&VEXIT).copied().unwrap_or(0));
+        if pc > 0 {
+            derived_edges.push(((p, VEXIT), pc));
+            *out_acc.entry(p).or_insert(0) =
+                out_acc.get(&p).copied().unwrap_or(0).saturating_add(pc);
+        }
+    }
+    counts.insert(VEXIT, entry_count);
     for &b in postorder.iter() {
+        if b == VEXIT {
+            continue;
+        }
         let c = if b == entry {
             entry_count
         } else {
@@ -578,7 +600,9 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
         counts.insert(b, c);
         if let Some(&p) = parent.get(&b) {
             let pc = c.saturating_sub(known_in.get(&b).copied().unwrap_or(0));
-            derived_edges.push(((p, b), pc));
+            if pc > 0 {
+                derived_edges.push(((p, b), pc));
+            }
             *out_acc.entry(p).or_insert(0) =
                 out_acc.get(&p).copied().unwrap_or(0).saturating_add(pc);
         }

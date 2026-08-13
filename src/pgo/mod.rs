@@ -188,6 +188,50 @@ pub fn promoted_hot_labels(u: &str, fname: &str) -> FxHashSet<u32> {
         .unwrap_or_default()
 }
 
+/// v8 F7: profile-driven switch lowering hint for one switch block.
+/// `hot_case` = the case value/target that accounts for >= 50% of the
+/// block's executions (hoist it out of the jump table — LLVM's
+/// profile-guided switch partitioning); `force_chain` = the switch block is
+/// COLD per the profile summary (a jump table would waste rodata + I-cache
+/// on a path that barely runs — lower as a compare chain instead, even when
+/// the case set is dense).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchHint {
+    pub hot_case: Option<(i64, u32)>,
+    pub force_chain: bool,
+}
+
+/// Pending hint consumed by the backend's `emit_switch`. Set by generation.rs
+/// (which knows the current block label) immediately before the terminator is
+/// emitted and taken by the backend default `emit_switch`. Codegen is
+/// single-threaded and per-TU sequential, so a process-wide scratch is safe.
+static PENDING_SWITCH_HINT: std::sync::LazyLock<std::sync::Mutex<Option<SwitchHint>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+pub fn set_switch_hint(h: Option<SwitchHint>) {
+    *PENDING_SWITCH_HINT.lock().unwrap() = h;
+}
+pub fn take_switch_hint() -> Option<SwitchHint> {
+    PENDING_SWITCH_HINT.lock().unwrap().take()
+}
+
+/// Per-unit switch hints keyed by block label (labels are TU-unique after
+/// the renumber pass; layout runs immediately before codegen for the same
+/// unit, so a fresh map per unit is correct even for multi-TU invocations).
+static SWITCH_HINTS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<u32, SwitchHint>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+
+/// Replace the hint map (called once per unit by layout_module).
+pub fn record_switch_hints(map: FxHashMap<u32, SwitchHint>) {
+    *SWITCH_HINTS.lock().unwrap() = map;
+}
+pub fn switch_hint(label: u32) -> Option<SwitchHint> {
+    SWITCH_HINTS.lock().unwrap().get(&label).copied()
+}
+pub fn switch_hints_snapshot() -> FxHashMap<u32, SwitchHint> {
+    SWITCH_HINTS.lock().unwrap().clone()
+}
+
 /// Translate recorded promoted-block labels through the label-renumber map
 /// (old label -> new label; labels are TU-unique). Called by the driver right
 /// after the renumber pass; labels whose block vanished keep their value (the

@@ -1600,7 +1600,7 @@ fn generate_function(
                 }
             }
         } else {
-            generate_terminator(cg, &block.terminator, frame_size);
+            generate_terminator(cg, &block.terminator, frame_size, block.label.0);
         }
         // Count terminator as a program point (matches liveness analysis)
         cg.state().current_program_point += 1;
@@ -2246,7 +2246,12 @@ fn generate_store(
 }
 
 /// Dispatch a terminator to the appropriate arch method.
-fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size: i64) {
+fn generate_terminator(
+    cg: &mut dyn ArchCodegen,
+    term: &Terminator,
+    frame_size: i64,
+    block_label: u32,
+) {
     match term {
         Terminator::Return(val) => {
             cg.emit_return(val.as_ref(), frame_size);
@@ -2270,7 +2275,11 @@ fn generate_terminator(cg: &mut dyn ArchCodegen, term: &Terminator, frame_size: 
             default,
             ty,
         } => {
+            // v8 F7: hand the profile-driven switch hint (cold -> chain,
+            // dominant case -> hoist) to the backend for this block.
+            crate::pgo::set_switch_hint(crate::pgo::switch_hint(block_label));
             cg.emit_switch(val, cases, default, *ty);
+            crate::pgo::set_switch_hint(None);
         }
         Terminator::Unreachable => {
             cg.emit_unreachable();

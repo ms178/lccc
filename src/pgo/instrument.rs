@@ -52,6 +52,12 @@ type Rec = (
 /// Sentinel source label for the virtual entry edge (V -> entry). Cannot
 /// collide with a real block label.
 pub(crate) const VENTRY: u32 = u32::MAX - 1;
+/// Sentinel destination label for the virtual EXIT node (ret block -> exit).
+/// Modeling the exit closes the flow equations for RETURN-terminated blocks:
+/// without it, leaf blocks (case targets, exits) derive count 0 and every
+/// edge into them derives 0 (observed: switch-case edges all zero, so
+/// profile-driven switch partitioning never fired).
+pub(crate) const VEXIT: u32 = u32::MAX - 2;
 
 /// One instrumented indirect-call site.
 struct SiteRec {
@@ -371,6 +377,14 @@ pub fn instrument_module(
                 edge_set.insert(Edge {
                     src: b.label.0,
                     dst: s,
+                });
+            }
+            // v8: virtual exit edge for RETURN-terminated blocks — closes
+            // the flow equations at the exit so leaf counts derive correctly.
+            if matches!(b.terminator, Terminator::Return(_)) {
+                edge_set.insert(Edge {
+                    src: b.label.0,
+                    dst: VEXIT,
                 });
             }
         }
