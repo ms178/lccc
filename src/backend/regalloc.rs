@@ -825,6 +825,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // Only include values that are actually F64 (not i128, not f32, etc.)
             .filter(|iv| {
                 // Check if this value is produced by a F64-typed instruction
+                // (or a scalar F64 intrinsic such as sqrt/fabs — those were
+                // previously excluded, so their result spilled to the stack in
+                // the middle of every FP chain: nbody's sqrt(d2)).
                 func.blocks.iter().any(|block| {
                     block.instructions.iter().any(|inst| match inst {
                         Instruction::BinOp { dest, ty, .. }
@@ -838,6 +841,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         }
                         Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
                             dest.0 == iv.value_id
+                        }
+                        Instruction::Intrinsic { dest: Some(d), op, .. } => {
+                            use crate::ir::intrinsics::IntrinsicOp as O;
+                            d.0 == iv.value_id
+                                && matches!(op, O::SqrtF64 | O::FabsF64)
                         }
                         _ => false,
                     })
@@ -1411,9 +1419,18 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                 Instruction::Intrinsic {
                     dest: Some(d), op, ..
                 } => {
-                    // Vector intrinsics produce 128/256-bit values that cannot be
-                    // stored in scalar GPRs. Exclude them from register allocation.
+                    // Scalar FP intrinsics (sqrt/fabs) produce F64/F32 values
+                    // that must live in XMM, never GPRs. Vector intrinsics
+                    // produce 128/256-bit values that also cannot be stored in
+                    // scalar GPRs — exclude both from GPR allocation.
                     use crate::ir::intrinsics::IntrinsicOp;
+                    if matches!(
+                        op,
+                        IntrinsicOp::SqrtF64 | IntrinsicOp::SqrtF32
+                            | IntrinsicOp::FabsF64 | IntrinsicOp::FabsF32
+                    ) {
+                        non_gpr_values.insert(d.0);
+                    }
                     let is_vector = matches!(
                         op,
                         IntrinsicOp::VecZeroF64x4

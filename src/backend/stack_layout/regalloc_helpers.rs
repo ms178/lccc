@@ -123,9 +123,11 @@ pub fn run_regalloc_and_merge_clobbers(
             })
         });
         if clobbers_xmm2 {
-            vec![PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+            // xmm2 clobbered: use xmm3-xmm15 (13 regs).
+            (21..=33).map(PhysReg).collect::<Vec<_>>()
         } else {
-            vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+            // xmm2-xmm15 (14 regs).
+            (20..=33).map(PhysReg).collect::<Vec<_>>()
         }
     } else {
         Vec::new()
