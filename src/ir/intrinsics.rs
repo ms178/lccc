@@ -793,6 +793,10 @@ pub enum IntrinsicOp {
     CvttPd2Ep32_256,
     VpermilPs128,
     VpermilPs256,
+    /// 256-bit variable-index permute: `vpermilps %idx, %src, %dst`.
+    VpermilvarPs256,
+    /// 256-bit variable-index permute (double): `vpermilpd %idx, %src, %dst`.
+    VpermilvarPd256,
     Vperm2f128,
     Vinsertf128,
     Vextractf128,

@@ -124,13 +124,13 @@ impl InstructionEncoder {
             "vpmuludq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xF4)),
             "vpmulld" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x40)),
             "vpmullq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x40)),
-            "vpcmpeqd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x76)),
-            "vpcmpeqw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x75)),
-            "vpcmpeqq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x29)),
-            "vpcmpgtb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x64)),
-            "vpcmpgtw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x65)),
-            "vpcmpgtd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x66)),
-            "vpcmpgtq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x37)),
+            // vpcmpeq*/vpcmpgt* are NOT encoded here: their mask-dest forms are
+            // dispatched by the dedicated alias arm further down (which also
+            // rejects zmm vector-dest compares like GAS), and their xmm/ymm
+            // vector-dest forms never reach this table (no k/zmm operand) and
+            // are handled by the VEX table instead. The old arms here shadowed
+            // that alias arm, so `vpcmpeqw %k1, %zmm2, %zmm3` was mis-encoded
+            // as a vector-dest compare.
             "vpmaxub" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDE)),
             "vpminub" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDA)),
             "vpmaxuw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3E)),
@@ -1250,8 +1250,8 @@ impl InstructionEncoder {
             "extractps" => self.encode_sse_extract_gpr_imm8(ops, &[0x66, 0x0F, 0x3A, 0x17]),
             "cvtsi2ss" => self.encode_cvtsi2x(ops, 0x2A, 2),
             "cvtsi2sd" => self.encode_cvtsi2x(ops, 0x2A, 3),
-            "cvtss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2D]),
-            "cvtsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2D]),
+            // Plain cvtss2si/cvtsd2si are handled by the q-suffixed arms above
+            // (which select the REX.W width); these duplicates were dead.
             "cvttss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2C]),
             "cvttsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2C]),
             "packusdw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2B]),
@@ -1329,8 +1329,6 @@ impl InstructionEncoder {
             "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
             "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
             "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
-            "vfmadd213ps" => self.encode_avx_3op_38(ops, 0xA8, true),
-            "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
             "vsqrtps" => self.encode_avx_2op_0f(ops, 0x51, 0),
             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
@@ -1524,11 +1522,14 @@ impl InstructionEncoder {
             "vmaxps" => self.encode_avx_3op_np(ops, 0x5F),
             "vminpd" => self.encode_avx_3op(ops, 0x5D, true),
             "vmaxpd" => self.encode_avx_3op(ops, 0x5F, true),
-            "vhaddps" => self.encode_avx_3op_pp(ops, 0x7C, 2),
+            // vhaddps/vhsubps/vaddsubps use the F2 prefix (VEX pp=3); the old
+            // code passed pp=2 (F3), encoding an illegal instruction that
+            // SIGILLs on hardware (reproduced by _mm256_hadd_ps).
+            "vhaddps" => self.encode_avx_3op_pp(ops, 0x7C, 3),
             "vhaddpd" => self.encode_avx_3op_pp(ops, 0x7C, 1),
-            "vhsubps" => self.encode_avx_3op_pp(ops, 0x7D, 2),
+            "vhsubps" => self.encode_avx_3op_pp(ops, 0x7D, 3),
             "vhsubpd" => self.encode_avx_3op_pp(ops, 0x7D, 1),
-            "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 2),
+            "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 3),
             "vaddsubpd" => self.encode_avx_3op_pp(ops, 0xD0, 1),
             "vcvtps2pd" => self.encode_avx_2op_0f(ops, 0x5A, 0),
             "vcvtpd2ps" => self.encode_avx_2op_0f(ops, 0x5A, 1),
@@ -1548,14 +1549,15 @@ impl InstructionEncoder {
             "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
             "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
             // FMA3 remaining forms (0F38 map; W=1 for pd/sd)
-            "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
-            "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
-            "vfmadd132ss" => self.encode_avx_3op_38(ops, 0x99, true),
-            "vfmadd213ss" => self.encode_avx_3op_38(ops, 0xA9, true),
-            "vfmadd231ss" => self.encode_avx_3op_38(ops, 0xB9, true),
-            "vfmadd132sd" => self.encode_avx_3op_38_w1(ops, 0x99, true),
-            "vfmadd213sd" => self.encode_avx_3op_38_w1(ops, 0xA9, true),
-            "vfmadd231sd" => self.encode_avx_3op_38_w1(ops, 0xB9, true),
+            // FMA3 scalar forms: ss uses F3 (pp=2), sd uses F2 (pp=3). The old
+            // code routed them through the 66-prefix path (pp=1), encoding
+            // illegal instructions.
+            "vfmadd132ss" => self.encode_avx_3op_38_pp(ops, 0x99, 2),
+            "vfmadd213ss" => self.encode_avx_3op_38_pp(ops, 0xA9, 2),
+            "vfmadd231ss" => self.encode_avx_3op_38_pp(ops, 0xB9, 2),
+            "vfmadd132sd" => self.encode_avx_3op_38_pp_w1(ops, 0x99, 3),
+            "vfmadd213sd" => self.encode_avx_3op_38_pp_w1(ops, 0xA9, 3),
+            "vfmadd231sd" => self.encode_avx_3op_38_pp_w1(ops, 0xB9, 3),
             "vfmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAA, true),
             "vfmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBA, true),
             "vfnmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xAC, true),
@@ -1580,19 +1582,28 @@ impl InstructionEncoder {
             "vsubsd" => self.encode_avx_scalar_3op(ops, 0x5C, 3),   // VEX.NDS.LIG.F2.0F 5C
             "vmulsd" => self.encode_avx_scalar_3op(ops, 0x59, 3),   // VEX.NDS.LIG.F2.0F 59
             "vdivsd" => self.encode_avx_scalar_3op(ops, 0x5E, 3),   // VEX.NDS.LIG.F2.0F 5E
-            "vmaxps" => self.encode_avx_3op_np(ops, 0x5F),
-            "vminps" => self.encode_avx_3op_np(ops, 0x5D),
-            "vmaxpd" => self.encode_avx_3op(ops, 0x5F, true),
-            "vminpd" => self.encode_avx_3op(ops, 0x5D, true),
             "vmaxss" => self.encode_avx_scalar_3op(ops, 0x5F, 2),
             "vminss" => self.encode_avx_scalar_3op(ops, 0x5D, 2),
             "vmaxsd" => self.encode_avx_scalar_3op(ops, 0x5F, 3),
             "vminsd" => self.encode_avx_scalar_3op(ops, 0x5D, 3),
 
             // AVX extract/permute
-            "vextractf128" => self.encode_avx_extract_imm8(ops, 0x19, true), // VEX.256.66.0F3A 19 /r ib
-            "vpermilps" => self.encode_avx_shuffle_3a(ops, 0x04, true),      // VEX.256.66.0F3A 04 /r ib (imm form)
-            "vpermilpd" => self.encode_avx_shuffle_3a(ops, 0x05, true),      // VEX.256.66.0F3A 05 /r ib (imm form)
+            // vpermilps/vpermilpd have two forms: immediate (0F3A 04/05) and
+            // variable-index (0F38 0C/0D, first operand = index register/mem).
+            "vpermilps" => {
+                if matches!(ops.first(), Some(Operand::Immediate(_))) {
+                    self.encode_avx_shuffle_3a(ops, 0x04, true) // VEX.256.66.0F3A 04 /r ib (imm form)
+                } else {
+                    self.encode_avx_3op_38(ops, 0x0C, true) // VEX.256.66.0F38 0C /r (var form)
+                }
+            }
+            "vpermilpd" => {
+                if matches!(ops.first(), Some(Operand::Immediate(_))) {
+                    self.encode_avx_shuffle_3a(ops, 0x05, true) // VEX.256.66.0F3A 05 /r ib (imm form)
+                } else {
+                    self.encode_avx_3op_38(ops, 0x0D, true) // VEX.256.66.0F38 0D /r (var form)
+                }
+            }
 
             // AVX conversions
             "vcvtps2dq" => self.encode_avx_2op_0f(ops, 0x5B, 1),        // VEX.128/256.66.0F 5B /r

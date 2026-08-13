@@ -16,6 +16,15 @@ for src in "$dir"/*.c; do
   if [ -f "$dir/$name.flags" ]; then
     extra_flags=$(cat "$dir/$name.flags")
   fi
+  # Per-test environment: a sibling <name>.env file is sourced so tests can
+  # select non-default compiler modes (e.g. LCCC_FORCE_SSE2=1 for the legacy
+  # SSE2 vectorization path). GCC ignores these variables.
+  if [ -f "$dir/$name.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$dir/$name.env"
+    set +a
+  fi
   # Flags AFTER the source: GCC's driver drops library flags (-lm) that
   # appear before the object under --as-needed, so extra_flags must follow
   # the input file (LCCC accepts both orders; GCC does not).
