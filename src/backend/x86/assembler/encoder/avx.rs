@@ -34,9 +34,8 @@ impl super::InstructionEncoder {
     /// Emit EVEX 4-byte prefix.
     /// Parameters match VEX but with additional EVEX-specific fields.
     /// ll: 00=128, 01=256, 10=512
-    /// TODO: z (merge-masking) and aaa (opmask register k1-k7) are not yet used.
-    /// TODO: r_prime and v_prime are passed as false; zmm16-zmm31 won't encode correctly.
-    pub(crate) fn emit_evex(&mut self, r: bool, x: bool, b: bool, r_prime: bool, mm: u8, w: u8, vvvv: u8, v_prime: bool, pp: u8, ll: u8, _z: bool, _aaa: u8) {
+    /// aaa: opmask register number (0 = no masking), z: zeroing mask semantics.
+    pub(crate) fn emit_evex(&mut self, r: bool, x: bool, b: bool, r_prime: bool, mm: u8, w: u8, vvvv: u8, v_prime: bool, pp: u8, ll: u8, z: bool, aaa: u8) {
         let r_bit = if r { 0u8 } else { 1 };
         let x_bit = if x { 0u8 } else { 1 };
         let b_bit = if b { 0u8 } else { 1 };
@@ -55,8 +54,502 @@ impl super::InstructionEncoder {
         self.bytes.push(byte2);
 
         // Byte 3: z L'L b V' aaa
-        let byte3 = (ll << 5) | (v_prime_bit << 3);
+        let byte3 = ((z as u8) << 7) | (ll << 5) | (v_prime_bit << 3) | (aaa & 0x7);
         self.bytes.push(byte3);
+    }
+
+    /// Extract EVEX masking info from an operand (register or memory):
+    /// returns (aaa, zeroing). Mask-less operands yield (0, false).
+    fn evex_mask_info(op: &Operand) -> (u8, bool) {
+        match op {
+            Operand::Register(r) => {
+                let aaa = r.mask.as_ref().and_then(|m| reg_num(m)).unwrap_or(0);
+                (aaa, r.zeroing)
+            }
+            Operand::Memory(m) => {
+                let aaa = m.mask.as_ref().and_then(|m| reg_num(m)).unwrap_or(0);
+                (aaa, m.zeroing)
+            }
+            _ => (0, false),
+        }
+    }
+
+    /// Encode an EVEX memory operand with scale-aware disp8 (EVEX disp8 is
+    /// multiplied by N = element-size × vector-length; using it for
+    /// displacements not divisible by N silently computes the WRONG address).
+    /// The R/X/B extension bits must already be set in the emitted P1 byte.
+    fn encode_evex_rm(&mut self, reg_field: u8, mem: &MemoryOperand, ll: u8) -> Result<(), String> {
+        let scale_n = [16u32, 32, 64][ll as usize];
+        self.encode_evex_mem(reg_field, mem, scale_n)
+    }
+
+    /// EVEX vector length from operands: 00=128(xmm), 01=256(ymm), 10=512(zmm).
+    fn evex_ll(ops: &[Operand]) -> u8 {
+        for op in ops {
+            if let Operand::Register(r) = op {
+                let name = r.name.to_lowercase();
+                if name.starts_with("zmm") { return 0b10; }
+                if name.starts_with("ymm") { return 0b01; }
+            }
+        }
+        0b00
+    }
+
+    /// EVEX 2-source binary op, AT&T (src, vvvv, dst) with optional mask on dst.
+    /// Encodings verified byte-for-byte against GNU as 2.42 (see LCCC_ENGINEERING
+    /// PLAN_PART3 WP-A; reference bytes captured from `as` on 2026-08-12).
+    /// Example: vpaddd %zmm2, %zmm1, %zmm0  ->  62 f1 75 48 fe c2
+    ///          vpmaddubsw %zmm2,%zmm1,%zmm0{%k1}{z} -> 62 f2 75 c9 04 c2
+    pub(crate) fn encode_evex_binary(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX binary op requires 3 operands".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_evex(r, false, b, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_evex(r, x, b_ext, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.encode_evex_rm(dst_num, mem, ll)
+            }
+            _ => Err("unsupported EVEX binary operands".to_string()),
+        }
+    }
+
+    /// EVEX unary op, AT&T (src, dst) with optional mask on dst; vvvv = 1 (GAS).
+    /// Used for vpabs*, vpopcnt*, vsqrt*, vpmovzx*/vpmovsx* (src may be narrower).
+    pub(crate) fn encode_evex_unary(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("EVEX unary op requires 2 operands".to_string());
+        }
+        // Vector length comes from the DESTINATION: pmovzx*/pmovsx* widen
+        // (ymm src -> zmm dst) and the EVEX.LL field must be 10.
+        let ll = match ops.last() {
+            Some(Operand::Register(r)) if r.name.to_lowercase().starts_with("zmm") => 0b10,
+            Some(Operand::Register(r)) if r.name.to_lowercase().starts_with("ymm") => 0b01,
+            _ => 0b00,
+        };
+        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_evex(r, false, b, false, map, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_evex(r, x, b_ext, false, map, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.encode_evex_rm(dst_num, mem, ll)
+            }
+            _ => Err("unsupported EVEX unary operands".to_string()),
+        }
+    }
+
+    /// EVEX 2-operand + imm8 shuffle, AT&T ($imm, src, dst); vvvv = 1 (GAS).
+    /// vpshufd/vpshuflw/vpshufhw: 66/F3/F2.0F.0F3A..70 /r ib.
+    pub(crate) fn encode_evex_imm2(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX imm2 op requires 3 operands (imm, src, dst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_evex(r, false, b, false, map, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, 0, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_evex(r, x, b_ext, false, map, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.encode_evex_rm(0, mem, ll)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX imm2 operands".to_string()),
+        }
+    }
+
+    /// EVEX 2-operand + imm8 with vvvv = dest (NDD), AT&T ($imm, src, dst).
+    /// vpermq/vpermpd: 66.0F3A.W1 00 /r ib.
+    pub(crate) fn encode_evex_imm2_ndd(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX imm2-ndd op requires 3 operands (imm, src, dst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                let vvvv_enc = dst_num | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
+                self.emit_evex(r, false, b, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, 0, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX imm2-ndd operands".to_string()),
+        }
+    }
+
+    /// EVEX shift-by-immediate, AT&T ($imm, src, dst); vvvv = dest (NDD).
+    /// vpsllw/d/q, vpsrlw/d/q, vpsraw/d/q: 66.0F.71/72/73 /2|/4|/6 ib.
+    pub(crate) fn encode_evex_shift_imm(
+        &mut self,
+        ops: &[Operand],
+        w: u8,
+        opcode: u8,
+        ext: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX shift requires 3 operands (imm, src, dst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let b = needs_vex_ext(&src.name);
+                let vvvv_enc = dst_num | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
+                self.emit_evex(false, false, b, false, 1, w, vvvv_enc, false, 1, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, ext, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let vvvv_enc = dst_num | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_evex(false, x, b_ext, false, 1, w, vvvv_enc, false, 1, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.encode_evex_rm(ext, mem, ll)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX shift operands".to_string()),
+        }
+    }
+
+    /// EVEX 3-source + imm8, AT&T ($imm, src2, src1, dst) with optional mask on dst.
+    /// vpternlogd/q (0F3A 25), vpalignr (0F3A 0F), vpclmulqdq (0F3A 44),
+    /// vinserti32x4/i64x2 (0F3A 38), vpshld*/vpshrd* (0F3A 70-73).
+    /// GAS convention: ModRM.reg = 0, imm8 trailing, vvvv = src1.
+    pub(crate) fn encode_evex_3src_imm(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 4 {
+            return Err("EVEX 3src-imm op requires 4 operands (imm, src2, src1, dst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[3]);
+        match (&ops[0], &ops[1], &ops[2], &ops[3]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)),
+             Operand::Register(src2), Operand::Register(src1), Operand::Register(dst)) => {
+                let src2_num = reg_num(&src2.name).ok_or("bad src2 register")?;
+                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src2.name);
+                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_evex(r, false, b, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, 0, src2_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (Operand::Immediate(ImmediateValue::Integer(imm)),
+             Operand::Memory(mem), Operand::Register(src1), Operand::Register(dst)) => {
+                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_evex(r, x, b_ext, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.encode_evex_rm(0, mem, ll)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX 3src-imm operands".to_string()),
+        }
+    }
+
+    /// EVEX compare-to-mask, AT&T ($imm, src2, src1, kdst).
+    /// vpcmpb/ub (0F3A 3F/3E), vpcmpw/uw (3F/3E W1), vpcmpd/ud (1F/1E),
+    /// vpcmpq/uq (1F/1E W1). ModRM.reg = k-dest, r/m = src2, vvvv = src1.
+    pub(crate) fn encode_evex_cmp_mask(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 4 {
+            return Err("EVEX cmp-mask op requires 4 operands (imm, src2, src1, kdst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        match (&ops[0], &ops[1], &ops[2], &ops[3]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)),
+             Operand::Register(src2), Operand::Register(src1), Operand::Register(kdst)) => {
+                let src2_num = reg_num(&src2.name).ok_or("bad src2 register")?;
+                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
+                let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
+                let b = needs_vex_ext(&src2.name);
+                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_evex(false, false, b, false, map, w, vvvv_enc, false, pp, ll, false, 0);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, k_num, src2_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX cmp-mask operands".to_string()),
+        }
+    }
+
+    /// EVEX compare-to-mask without imm8, AT&T (src2, src1, kdst).
+    /// vpshufbitqmb: F3.0F38.W0 8F /r (ModRM.reg = k-dest).
+    pub(crate) fn encode_evex_cmp_mask_nimm(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX cmp-mask-nimm op requires 3 operands (src2, src1, kdst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Register(src2), Operand::Register(src1), Operand::Register(kdst)) => {
+                let src2_num = reg_num(&src2.name).ok_or("bad src2 register")?;
+                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
+                let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
+                let b = needs_vex_ext(&src2.name);
+                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_evex(false, false, b, false, map, w, vvvv_enc, false, pp, ll, false, 0);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, k_num, src2_num));
+                Ok(())
+            }
+            _ => Err("unsupported EVEX cmp-mask-nimm operands".to_string()),
+        }
+    }
+
+    /// EVEX extract with imm8, AT&T ($imm, src, dst); GAS encodes ModRM.reg = src,
+    /// r/m = dst (verified on CPU: lane extraction semantics correct). vvvv = 1.
+    /// vextracti32x4/i64x2 (0F3A 39), vextracti64x4 (0F3A 3B).
+    pub(crate) fn encode_evex_extract_imm(
+        &mut self,
+        ops: &[Operand],
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("EVEX extract requires 3 operands (imm, src, dst)".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[2]);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)),
+             Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_evex(r, false, b, false, map, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported EVEX extract operands".to_string()),
+        }
+    }
+
+    /// EVEX masked/unmasked vector move, AT&T (src, dst) with mask on dst.
+    /// vmovdqu8 (F3.0F.W0 6F/7F), vmovdqu16 (F3 W1), vmovdqu32 (F2 W0), vmovdqu64 (F2 W1).
+    pub(crate) fn encode_evex_vmov(
+        &mut self,
+        ops: &[Operand],
+        pp: u8,
+        w: u8,
+        load_op: u8,
+        store_op: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("EVEX vmov requires 2 operands".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_evex(r, false, b, false, 1, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(load_op);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_evex(r, x, b_ext, false, 1, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(load_op);
+                self.encode_evex_rm(dst_num, mem, ll)
+            }
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let (aaa, z) = Self::evex_mask_info(&ops[1]);
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let r = needs_vex_ext(&src.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_evex(r, x, b_ext, false, 1, w, 0, false, pp, ll, z, aaa);
+                self.bytes.push(store_op);
+                self.encode_evex_rm(src_num, mem, ll)
+            }
+            _ => Err("unsupported EVEX vmov operands".to_string()),
+        }
+    }
+
+    /// EVEX broadcast from GPR, AT&T (gpr, dst): vpbroadcastb/w/d/q.
+    /// 66.0F38 7A/7B/7C (W0/W0/W0/W1). vvvv = 1 (GAS).
+    pub(crate) fn encode_evex_broadcast_gpr(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        w: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("EVEX gpr-broadcast requires 2 operands".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad gpr register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_evex(r, false, b, false, 2, w, 0, false, 1, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, 0, src_num));
+                Ok(())
+            }
+            _ => Err("unsupported EVEX gpr-broadcast operands".to_string()),
+        }
+    }
+
+    /// EVEX broadcast from 128/256-bit memory, AT&T (mem, dst):
+    /// vbroadcasti32x4/i64x2 (0F38 5A), vbroadcasti32x8/i64x4 (0F38 5B).
+    pub(crate) fn encode_evex_broadcast_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        w: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("EVEX mem-broadcast requires 2 operands".to_string());
+        }
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[1]);
+        match (&ops[0], &ops[1]) {
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_evex(r, x, b_ext, false, 2, w, 0, false, 1, ll, z, aaa);
+                self.bytes.push(opcode);
+                self.encode_evex_rm(0, mem, ll)
+            }
+            _ => Err("unsupported EVEX mem-broadcast operands".to_string()),
+        }
     }
 
     /// Determine EVEX L'L from operands: 00=128(xmm), 01=256(ymm), 10=512(zmm)
@@ -392,6 +885,17 @@ impl super::InstructionEncoder {
                 self.emit_vex(r, false, b, 3, 0, dst_num, l, pp);
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 3, 0, dst_num, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)?;
                 self.bytes.push(imm);
                 Ok(())
             }
@@ -1649,6 +2153,76 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             _ => Err("rorx: unsupported operand combination".to_string()),
+        }
+    }
+
+    /// AVX 3-op in the 0F map with an explicit pp (0=none,1=66,2=F3,3=F2).
+    /// Used by vhaddps (F2), vhaddpd (66), vaddsubps (F2), vaddsubpd (66).
+    pub(crate) fn encode_avx_3op_pp(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("AVX 3-op requires 3 operands".to_string());
+        }
+        let l = self.vex_l_from_ops(ops);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_vex(r, false, b, 1, 0, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported AVX 3-op operands".to_string()),
+        }
+    }
+
+    /// AVX extract-to-GPR with imm8, AT&T ($imm, src, dst); GAS encodes
+    /// ModRM.reg = src (xmm), r/m = dst (r32/m32). vextractps: 66.0F3A 17 /r ib.
+    pub(crate) fn encode_avx_extract_gpr_imm8(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("AVX extract-gpr requires 3 operands (imm, src, dst)".to_string());
+        }
+        let pp = if has_66 { 1 } else { 0 };
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), dst) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let r = needs_vex_ext(&src.name);
+                match dst {
+                    Operand::Register(d) => {
+                        let dst_num = reg_num(&d.name).ok_or("bad dst register")?;
+                        let b = needs_vex_ext(&d.name);
+                        self.emit_vex(r, false, b, 3, 0, 0, 0, pp);
+                        self.bytes.push(opcode);
+                        self.bytes.push(self.modrm(3, src_num, dst_num));
+                    }
+                    Operand::Memory(mem) => {
+                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        self.emit_vex(r, x, b_ext, 3, 0, 0, 0, pp);
+                        self.bytes.push(opcode);
+                        self.encode_modrm_mem(src_num, mem)?;
+                    }
+                    _ => return Err("unsupported extract-gpr destination".to_string()),
+                }
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported AVX extract-gpr operands".to_string()),
         }
     }
 }

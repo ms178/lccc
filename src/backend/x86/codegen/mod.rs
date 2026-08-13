@@ -3,6 +3,7 @@ mod asm_emitter;
 mod f128;
 mod inline_asm;
 mod intrinsics;
+mod intrinsics_simd;
 pub(crate) mod peephole;
 mod prologue;
 mod memory;

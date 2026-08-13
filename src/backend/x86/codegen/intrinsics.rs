@@ -134,7 +134,7 @@ impl X86Codegen {
     /// computed pointers, constants, and over-aligned allocas. The slot
     /// remains the value's home, so this is purely an addressing
     /// optimization — no semantic change.
-    fn sse_load_arg(&mut self, arg: &Operand, xmm: &'static str) {
+    pub(super) fn sse_load_arg(&mut self, arg: &Operand, xmm: &'static str) {
         if let Operand::Value(v) = arg {
             // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
@@ -187,7 +187,7 @@ impl X86Codegen {
     }
 
     /// Store an XMM register to a vector operand's home slot.
-    fn sse_store_dest(&mut self, dest_ptr: &Value, xmm: &'static str) {
+    pub(super) fn sse_store_dest(&mut self, dest_ptr: &Value, xmm: &'static str) {
         // CCC_ENABLE_VECREG redirect: keep the result in its allocated register.
         if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
             if is_xmm_reg(reg) {
@@ -320,7 +320,7 @@ impl X86Codegen {
         }
     }
 
-    fn emit_sse_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], sse_inst: &str) {
+    pub(super) fn emit_sse_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], sse_inst: &str) {
         // Load operands into separate registers (direct slot addressing when
         // possible), perform the op, store the result to the destination slot.
         //
@@ -359,7 +359,7 @@ impl X86Codegen {
     /// Emit SSE shuffle with immediate: load xmm0, apply `inst $imm, %xmm0, %xmm0`,
     /// store result. Used for pshufd/pshuflw/pshufhw which read and write same register.
 
-    fn avx_load_arg_to(&mut self, arg: &Operand, ymm: &'static str) {
+    pub(super) fn avx_load_arg_to(&mut self, arg: &Operand, ymm: &'static str) {
         if let Operand::Value(v) = arg {
             // CCC_ENABLE_VECREG (reserved for 256-bit values; 128-bit-only pool
             // in v5, so this is currently inert for ymm targets).
@@ -414,10 +414,10 @@ impl X86Codegen {
         self.state.emit_fmt(format_args!("    vmovdqu (%rax), %{}", ymm));
         self.state.vec_last_store_reg = false;
     }
-    fn avx_load_arg(&mut self, arg: &Operand) { self.avx_load_arg_to(arg, "ymm0"); }
+    pub(super) fn avx_load_arg(&mut self, arg: &Operand) { self.avx_load_arg_to(arg, "ymm0"); }
 
     /// Store %ymm0 to a 256-bit operand's home slot.
-    fn avx_store_dest(&mut self, dest_ptr: &Value) {
+    pub(super) fn avx_store_dest(&mut self, dest_ptr: &Value) {
         let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
             eprintln!("[VDEFER-EMIT] deferring result store for dest_ptr={}", dest_ptr.0);
@@ -2431,6 +2431,17 @@ impl X86Codegen {
                     }
                 }
             }
+            // Generic SIMD family (512-bit + FP): emitted by intrinsics_simd.rs.
+            _ => {
+                if !self.emit_simd_op(dest, op, dest_ptr, args) {
+                    eprintln!(
+                        "ccc: internal: unhandled intrinsic op {:?} (dest_ptr={}, args={})",
+                        op,
+                        dest_ptr.is_some(),
+                        args.len()
+                    );
+                }
+            }
         }
     }
 
@@ -2444,7 +2455,7 @@ impl X86Codegen {
 
     /// Emit AVX binary 256-bit op: load ymm0 from arg0 ptr, ymm1 from arg1 ptr,
     /// apply the given AVX instruction, store result ymm0 to dest_ptr.
-    fn emit_avx_binary_256(&mut self, dest_ptr: &Value, args: &[Operand], avx_inst: &str, commutative: bool) {
+    pub(super) fn emit_avx_binary_256(&mut self, dest_ptr: &Value, args: &[Operand], avx_inst: &str, commutative: bool) {
         // In AT&T VEX syntax only the first textual source may be memory.
         // Preserve operand order for non-commutative operations.
         //

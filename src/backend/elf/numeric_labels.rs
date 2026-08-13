@@ -149,6 +149,8 @@ fn resolve_numeric_operand(
                     base: mem.base.clone(),
                     index: mem.index.clone(),
                     scale: mem.scale,
+                    mask: mem.mask.clone(),
+                    zeroing: mem.zeroing,
                 })
             } else {
                 op.clone()

@@ -91,6 +91,346 @@ impl InstructionEncoder {
         result
     }
 
+    /// AVX-512 (EVEX) mnemonic dispatch. Returns None for mnemonics that are
+    /// not handled here so the caller can fall through to the VEX/legacy table.
+    /// All encodings verified byte-for-byte against GNU as 2.42 (2026-08-12).
+    fn try_encode_evex(&mut self, mnemonic: &str, ops: &[Operand]) -> Option<Result<(), String>> {
+        let r = |res: Result<(), String>| Some(res);
+        match mnemonic {
+            // ---- EVEX.NDS.512.66.0F: packed integer binary (W0=32-bit, W1=64-bit) ----
+            "vpaddd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xFE)),
+            "vpaddq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xD4)),
+            "vpaddb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xFC)),
+            "vpaddw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xFD)),
+            "vpaddsb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xEC)),
+            "vpaddsw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xED)),
+            "vpaddusb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDC)),
+            "vpaddusw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDD)),
+            "vpsubb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xF8)),
+            "vpsubw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xF9)),
+            "vpsubd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xFA)),
+            "vpsubq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xFB)),
+            "vpsubsb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xE8)),
+            "vpsubsw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xE9)),
+            "vpsubusb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xD8)),
+            "vpsubusw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xD9)),
+            "vpavgb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xE0)),
+            "vpavgw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xE3)),
+            "vpsadbw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xF6)),
+            "vpmaddwd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xF5)),
+            "vpmullw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xD5)),
+            "vpmulhw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xE5)),
+            "vpmulhuw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xE4)),
+            "vpmuludq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xF4)),
+            "vpmulld" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x40)),
+            "vpmullq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x40)),
+            "vpcmpeqd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x76)),
+            "vpcmpeqw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x75)),
+            "vpcmpeqq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x29)),
+            "vpcmpgtb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x64)),
+            "vpcmpgtw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x65)),
+            "vpcmpgtd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x66)),
+            "vpcmpgtq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x37)),
+            "vpmaxub" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDE)),
+            "vpminub" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDA)),
+            "vpmaxuw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3E)),
+            "vpminuw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3A)),
+            "vpmaxsb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3C)),
+            "vpminsb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x38)),
+            "vpmaxsw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xEE)),
+            "vpminsw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xEA)),
+            "vpmaxsd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3D)),
+            "vpminsd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x39)),
+            "vpmaxud" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3F)),
+            "vpminud" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x3B)),
+            "vpmaxsq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x3D)),
+            "vpminsq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x39)),
+            "vpmaxuq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x3F)),
+            "vpminuq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x3B)),
+            "vpxord" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xEF)),
+            "vpxorq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xEF)),
+            "vpandd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDB)),
+            "vpandq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xDB)),
+            "vpandnd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xDF)),
+            "vpandnq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xDF)),
+            "vpord" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xEB)),
+            "vporq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0xEB)),
+            "vpunpcklbw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x60)),
+            "vpunpcklwd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x61)),
+            "vpunpckldq" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x62)),
+            "vpunpcklqdq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x6C)),
+            "vpunpckhbw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x68)),
+            "vpunpckhwd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x69)),
+            "vpunpckhdq" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x6A)),
+            "vpunpckhqdq" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x6D)),
+            "vpacksswb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x63)),
+            "vpackuswb" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x67)),
+            "vpackssdw" => r(self.encode_evex_binary(ops, 1, 1, 0, 0x6B)),
+            "vpackusdw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2B)),
+            "vpmaddubsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x04)),
+            "vpshufb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x00)),
+            "vpsignb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x08)),
+            "vpsignw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x09)),
+            "vpsignd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0A)),
+            "vpmulhrsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0B)),
+            "vphaddw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x01)),
+            "vphaddd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x02)),
+            "vphsubw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x05)),
+            "vphsubd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x06)),
+            // AVX-VNNI / AVX-VNNI-INT8 (EVEX.NDS.512.66.0F38)
+            "vpdpbusd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x50)),
+            "vpdpbusds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x51)),
+            "vpdpwusd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xD2)),
+            "vpdpwusds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xD3)),
+            "vpdpbssd" => r(self.encode_evex_binary(ops, 2, 3, 0, 0x50)),
+            "vpdpbssds" => r(self.encode_evex_binary(ops, 2, 3, 0, 0x51)),
+            "vpdpbsud" => r(self.encode_evex_binary(ops, 2, 2, 0, 0x50)),
+            "vpdpbsuds" => r(self.encode_evex_binary(ops, 2, 2, 0, 0x51)),
+            "vpdpbuud" => r(self.encode_evex_binary(ops, 2, 0, 0, 0x50)),
+            "vpdpbuuds" => r(self.encode_evex_binary(ops, 2, 0, 0, 0x51)),
+            "vpdpwuud" => r(self.encode_evex_binary(ops, 2, 0, 0, 0xD2)),
+            "vpdpwuuds" => r(self.encode_evex_binary(ops, 2, 0, 0, 0xD3)),
+            "vpdpwssd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x52)),
+            "vpdpwssds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x53)),
+            // permutes (EVEX.NDS.66.0F38)
+            "vpermd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x36)),
+            "vpermps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x16)),
+            "vpermi2d" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x76)),
+            "vpermt2d" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x7E)),
+            "vpermi2q" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x76)),
+            "vpermt2q" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x7E)),
+            "vpermi2ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x77)),
+            "vpermt2ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x7F)),
+            "vpermi2pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x77)),
+            "vpermt2pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x7F)),
+            "vpermi2b" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x75)),
+            "vpermt2b" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x7D)),
+            "vpermi2w" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x75)),
+            "vpermt2w" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x7D)),
+            "vpermb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x8D)),
+            "vpermw" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x8D)),
+            // EVEX.NDS.512.F3.0F38 (AVX-512BITALG/VPOPCNTDQ, unary)
+            "vpopcntb" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x54)),
+            "vpopcntw" => r(self.encode_evex_unary(ops, 2, 1, 1, 0x54)),
+            "vpopcntd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x55)),
+            "vpopcntq" => r(self.encode_evex_unary(ops, 2, 1, 1, 0x55)),
+            // FMA (EVEX.NDS.66.0F38, W1 for pd)
+            "vfmadd132ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x98)),
+            "vfmadd132pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x98)),
+            "vfmadd213ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xA8)),
+            "vfmadd213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xA8)),
+            "vfmadd231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xB8)),
+            "vfmadd231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xB8)),
+            "vfmsub132ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x9A)),
+            "vfmsub132pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x9A)),
+            "vfmsub213ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xAA)),
+            "vfmsub213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xAA)),
+            "vfmsub231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xBA)),
+            "vfmsub231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xBA)),
+            "vfnmadd132ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x9C)),
+            "vfnmadd132pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x9C)),
+            "vfnmadd213ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xAC)),
+            "vfnmadd213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xAC)),
+            "vfnmadd231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xBC)),
+            "vfnmadd231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xBC)),
+            "vfnmsub132ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x9E)),
+            "vfnmsub132pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x9E)),
+            "vfnmsub213ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xAE)),
+            "vfnmsub213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xAE)),
+            "vfnmsub231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xBE)),
+            "vfnmsub231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xBE)),
+            // FP binary (EVEX.NDS.66.0F, W1 for pd)
+            "vaddpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x58)),
+            "vaddps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x58)),
+            "vsubpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x5C)),
+            "vsubps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5C)),
+            "vmulpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x59)),
+            "vmulps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x59)),
+            "vdivpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x5E)),
+            "vdivps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5E)),
+            "vminpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x5D)),
+            "vminps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5D)),
+            "vmaxpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x5F)),
+            "vmaxps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5F)),
+            // unary
+            "vpabsb" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1C)),
+            "vpabsw" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1D)),
+            "vpabsd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1E)),
+            "vpabsq" => r(self.encode_evex_unary(ops, 2, 1, 1, 0x1F)),
+            "vsqrtpd" => r(self.encode_evex_unary(ops, 1, 1, 1, 0x51)),
+            "vsqrtps" => r(self.encode_evex_unary(ops, 1, 0, 0, 0x51)),
+            "vpmovzxbw" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x30)),
+            "vpmovzxbd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x31)),
+            "vpmovzxbq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x32)),
+            "vpmovzxwd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x33)),
+            "vpmovzxwq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x34)),
+            "vpmovzxdq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x35)),
+            "vpmovsxbw" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x20)),
+            "vpmovsxbd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x21)),
+            "vpmovsxbq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x22)),
+            "vpmovsxwd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x23)),
+            "vpmovsxwq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x24)),
+            "vpmovsxdq" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x25)),
+            // imm8 shuffles (vvvv=1 fixed, GAS convention)
+            "vpshufd" => r(self.encode_evex_imm2(ops, 1, 1, 0, 0x70)),
+            "vpshuflw" => r(self.encode_evex_imm2(ops, 1, 3, 0, 0x70)),
+            "vpshufhw" => r(self.encode_evex_imm2(ops, 1, 2, 0, 0x70)),
+            "vpermq" => r(self.encode_evex_imm2_ndd(ops, 3, 1, 1, 0x00)),
+            "vpermpd" => r(self.encode_evex_imm2_ndd(ops, 3, 1, 1, 0x01)),
+            // shifts by imm8 (vvvv=dest, ModRM.reg = /2 /4 /6)
+            "vpsllw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 6)),
+            "vpslld" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 6)),
+            "vpsllq" => r(self.encode_evex_shift_imm(ops, 1, 0x73, 6)),
+            "vpsrlw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 2)),
+            "vpsrld" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 2)),
+            "vpsrlq" => r(self.encode_evex_shift_imm(ops, 1, 0x73, 2)),
+            "vpsraw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 4)),
+            "vpsrad" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 4)),
+            "vpsraq" => r(self.encode_evex_shift_imm(ops, 1, 0x72, 4)),
+            // 3-source + imm8 (AT&T: $imm, src2, src1, dst)
+            "vpternlogd" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x25)),
+            "vpternlogq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x25)),
+            "vpalignr" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x0F)),
+            "vpclmulqdq" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x44)),
+            "vinserti32x4" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x38)),
+            "vinserti64x2" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x38)),
+            "vinserti32x8" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x3A)),
+            "vinserti64x4" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x3A)),
+            "vpshldw" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x70)),
+            "vpshrdw" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x72)),
+            "vpshldd" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x71)),
+            "vpshrdd" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x73)),
+            "vpshldq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x71)),
+            "vpshrdq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x73)),
+            // extract with imm8 (GAS: ModRM.reg=src, r/m=dst)
+            "vextracti32x4" => r(self.encode_evex_extract_imm(ops, 3, 1, 0, 0x39)),
+            "vextracti64x2" => r(self.encode_evex_extract_imm(ops, 3, 1, 1, 0x39)),
+            "vextracti32x8" => r(self.encode_evex_extract_imm(ops, 3, 1, 0, 0x3B)),
+            "vextracti64x4" => r(self.encode_evex_extract_imm(ops, 3, 1, 1, 0x3B)),
+            // compare-to-mask (ModRM.reg = k-dest)
+            "vpcmpb" => r(self.encode_evex_cmp_mask(ops, 3, 1, 0, 0x3F)),
+            "vpcmpub" => r(self.encode_evex_cmp_mask(ops, 3, 1, 0, 0x3E)),
+            "vpcmpw" => r(self.encode_evex_cmp_mask(ops, 3, 1, 1, 0x3F)),
+            "vpcmpuw" => r(self.encode_evex_cmp_mask(ops, 3, 1, 1, 0x3E)),
+            "vpcmpd" => r(self.encode_evex_cmp_mask(ops, 3, 1, 0, 0x1F)),
+            "vpcmpud" => r(self.encode_evex_cmp_mask(ops, 3, 1, 0, 0x1E)),
+            "vpcmpq" => r(self.encode_evex_cmp_mask(ops, 3, 1, 1, 0x1F)),
+            "vpcmpuq" => r(self.encode_evex_cmp_mask(ops, 3, 1, 1, 0x1E)),
+            "vpshufbitqmb" => r(self.encode_evex_cmp_mask_nimm(ops, 2, 1, 0, 0x8F)),
+            // vpcmpeq*/vpcmpgt* aliases: mask-dest forms use the original opcodes;
+            // vector-dest forms are VEX-only (512-bit vector-dest compares do not
+            // exist — reject like GAS).
+            "vpcmpeqb" | "vpcmpeqw" | "vpcmpeqd" | "vpcmpeqq"
+            | "vpcmpgtb" | "vpcmpgtw" | "vpcmpgtd" | "vpcmpgtq" => {
+                let dst_is_k = matches!(ops.last(), Some(Operand::Register(r)) if is_kreg(&r.name));
+                let dst_masked_vec = matches!(ops.last(), Some(Operand::Register(r))
+                    if !is_kreg(&r.name) && (r.mask.is_some() || r.zeroing));
+                if dst_is_k {
+                    let (map, w, opcode) = match mnemonic {
+                        "vpcmpeqb" => (1u8, 0u8, 0x74u8),
+                        "vpcmpeqw" => (1, 0, 0x75),
+                        "vpcmpeqd" => (1, 0, 0x76),
+                        "vpcmpeqq" => (2, 1, 0x29),
+                        "vpcmpgtb" => (1, 0, 0x64),
+                        "vpcmpgtw" => (1, 0, 0x65),
+                        "vpcmpgtd" => (1, 0, 0x66),
+                        "vpcmpgtq" => (2, 1, 0x37),
+                        _ => unreachable!(),
+                    };
+                    r(self.encode_evex_cmp_mask_nimm(ops, map, 1, w, opcode))
+                } else if dst_masked_vec {
+                    r(Err(format!("{}: unsupported masking (masked vector compare)", mnemonic)))
+                } else if ops.iter().any(|op| matches!(op, Operand::Register(r) if is_zmm(&r.name))) {
+                    r(Err(format!("{}: 512-bit compares require a mask destination", mnemonic)))
+                } else {
+                    None // VEX vector-dest form (128/256-bit)
+                }
+            }
+            // vector moves (F3=8/16, F2=32/64; W distinguishes within pair)
+            "vmovdqu8" => r(self.encode_evex_vmov(ops, 3, 0, 0x6F, 0x7F)),
+            "vmovdqu16" => r(self.encode_evex_vmov(ops, 3, 1, 0x6F, 0x7F)),
+            "vmovdqu32" => r(self.encode_evex_vmov(ops, 2, 0, 0x6F, 0x7F)),
+            "vmovdqu64" => r(self.encode_evex_vmov(ops, 2, 1, 0x6F, 0x7F)),
+            "vmovdqa64" => r(self.encode_evex_vmov(ops, 1, 1, 0x6F, 0x7F)),
+            "vmovdqa32" => r(self.encode_evex_vmov(ops, 1, 0, 0x6F, 0x7F)),
+            // broadcast
+            "vpbroadcastb" => {
+                let from_gpr = matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
+                if from_gpr { r(self.encode_evex_broadcast_gpr(ops, 0x7A, 0)) }
+                else { r(self.encode_evex_broadcast_gpr(ops, 0x78, 0)) }
+            }
+            "vpbroadcastw" => {
+                let from_gpr = matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
+                if from_gpr { r(self.encode_evex_broadcast_gpr(ops, 0x7B, 0)) }
+                else { r(self.encode_evex_broadcast_gpr(ops, 0x79, 0)) }
+            }
+            "vpbroadcastd" => {
+                let from_gpr = matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
+                if from_gpr { r(self.encode_evex_broadcast_gpr(ops, 0x7C, 0)) }
+                else { r(self.encode_evex_broadcast_gpr(ops, 0x58, 0)) }
+            }
+            "vpbroadcastq" => {
+                let from_gpr = matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
+                if from_gpr { r(self.encode_evex_broadcast_gpr(ops, 0x7C, 1)) }
+                else { r(self.encode_evex_broadcast_gpr(ops, 0x59, 1)) }
+            }
+            "vbroadcasti32x4" => r(self.encode_evex_broadcast_mem(ops, 0x5A, 0)),
+            "vbroadcasti64x2" => r(self.encode_evex_broadcast_mem(ops, 0x5A, 1)),
+            "vbroadcasti32x8" => r(self.encode_evex_broadcast_mem(ops, 0x5B, 0)),
+            "vbroadcasti64x4" => r(self.encode_evex_broadcast_mem(ops, 0x5B, 1)),
+            // opmask moves (VEX-encoded, dispatched here because of k operands)
+            "kmovq" => r(self.encode_kmov(ops, 8)),
+            "kmovd" => r(self.encode_kmov(ops, 4)),
+            "kmovw" => r(self.encode_kmov(ops, 2)),
+            "kmovb" => r(self.encode_kmov(ops, 1)),
+            // EVEX rotates (existing encoder, mask support via emit_evex)
+            "vprold" => r(self.encode_evex_rotate_imm(ops, 0x72, 1, 0)),
+            "vprolq" => r(self.encode_evex_rotate_imm(ops, 0x72, 1, 1)),
+            "vprord" => r(self.encode_evex_rotate_imm(ops, 0x72, 0, 0)),
+            "vprorq" => r(self.encode_evex_rotate_imm(ops, 0x72, 0, 1)),
+            _ => None,
+        }
+    }
+
+    /// Encode opmask register moves: kmovb/w/d/q (VEX-encoded, no EVEX).
+    /// kmovq k<->r64: VEX.L0.F2.0F.W1 92/93 /r  (92: r64->k, 93: k->r64)
+    /// kmovd k<->r32: VEX.L0.F2.0F.W0 92/93 /r
+    /// kmovw k<->r32: VEX.L0.0F.W0   92/93 /r
+    /// kmovb k<->r32: VEX.L0.66.0F.W0 92/93 /r
+    fn encode_kmov(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("kmov requires 2 operands".to_string());
+        }
+        let (pp, w) = match size {
+            8 => (3u8, 1u8), // F2, W1
+            4 => (3u8, 0u8), // F2, W0
+            2 => (0u8, 0u8), // none, W0
+            1 => (1u8, 0u8), // 66, W0
+            _ => return Err("bad kmov size".to_string()),
+        };
+        match (&ops[0], &ops[1]) {
+            // k -> GPR (93): ModRM.reg = GPR (dest), r/m = k (src)
+            (Operand::Register(src), Operand::Register(dst)) if is_kreg(&src.name) && !is_kreg(&dst.name) => {
+                let k_num = reg_num(&src.name).ok_or("bad k register")?;
+                let gpr_num = reg_num(&dst.name).ok_or("bad gpr register")?;
+                self.emit_vex(false, false, false, 1, w, 0, 0, pp);
+                self.bytes.push(0x93);
+                self.bytes.push(self.modrm(3, gpr_num, k_num));
+                Ok(())
+            }
+            // GPR -> k (92): ModRM.reg = k (dest), r/m = GPR (src)
+            (Operand::Register(src), Operand::Register(dst)) if !is_kreg(&src.name) && is_kreg(&dst.name) => {
+                let gpr_num = reg_num(&src.name).ok_or("bad gpr register")?;
+                let k_num = reg_num(&dst.name).ok_or("bad k register")?;
+                self.emit_vex(false, false, false, 1, w, 0, 0, pp);
+                self.bytes.push(0x92);
+                self.bytes.push(self.modrm(3, k_num, gpr_num));
+                Ok(())
+            }
+            _ => Err("kmov requires k<->GPR operands".to_string()),
+        }
+    }
+
     /// Main mnemonic dispatch.
     fn encode_mnemonic(&mut self, instr: &Instruction) -> Result<(), String> {
         // GNU as treats mnemonics case-insensitively (glibc .S files use
@@ -101,6 +441,51 @@ impl InstructionEncoder {
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
+
+        // AVX-512: instructions touching zmm or k (opmask) registers, plus the
+        // AVX-512 byte/word vector moves, route through the EVEX dispatcher.
+        // Without this guard, zmm operands would silently encode as 128-bit VEX.
+        let has_zmm_or_k = ops.iter().any(|op| match op {
+            Operand::Register(r) => is_zmm(&r.name) || is_kreg(&r.name) || r.mask.is_some() || r.zeroing,
+            Operand::Memory(m) => m.mask.is_some() || m.zeroing,
+            _ => false,
+        });
+        // Mnemonics with NO VEX encoding (EVEX is the only form): must be
+        // routed to the EVEX table even for 128/256-bit (xmm/ymm) operands.
+        let evex_only = matches!(
+            mnemonic,
+            "vpternlogd" | "vpternlogq"
+                | "vpcmpb" | "vpcmpub" | "vpcmpw" | "vpcmpuw" | "vpcmpd" | "vpcmpud"
+                | "vpcmpq" | "vpcmpuq" | "vpshufbitqmb"
+                | "vpopcntb" | "vpopcntw" | "vpopcntd" | "vpopcntq"
+                | "vpcompressd" | "vpexpandd"
+                | "vpshldw" | "vpshrdw" | "vpshldd" | "vpshrdd" | "vpshldq" | "vpshrdq"
+                | "vpermi2d" | "vpermt2d" | "vpermi2q" | "vpermt2q"
+                | "vpermi2ps" | "vpermt2ps" | "vpermi2pd" | "vpermt2pd"
+                | "vpermi2b" | "vpermt2b" | "vpermi2w" | "vpermt2w"
+                | "vpermb" | "vpermw"
+                | "vprold" | "vprord" | "vprolq" | "vprorq"
+                | "vpmovusdb" | "vpmovdb" | "vpmovdw" | "vpmovwb"
+                | "vpmovusdw" | "vpmovusqb" | "vpmovusqw" | "vpmovsqb" | "vpmovsqw"
+                | "vpmovqb" | "vpmovqw"
+                | "vinserti32x4" | "vinserti64x2" | "vinserti32x8" | "vinserti64x4"
+                | "vextracti32x4" | "vextracti64x2" | "vextracti32x8" | "vextracti64x4"
+                | "vbroadcasti32x4" | "vbroadcasti64x2" | "vbroadcasti32x8" | "vbroadcasti64x4"
+                | "vmovdqu8" | "vmovdqu16" | "vmovdqu32" | "vmovdqu64"
+                | "vmovdqa64" | "vmovdqa32"
+        );
+        if has_zmm_or_k || evex_only {
+            if let Some(result) = self.try_encode_evex(mnemonic, ops) {
+                return result;
+            }
+            // No EVEX form: instructions without a 512-bit/masked encoding
+            // (vphaddw, vpsignb, vpslldq, vperm2i128, ...) must be REJECTED,
+            // never silently encoded as 128-bit VEX.
+            return Err(format!(
+                "{}: no AVX-512/EVEX form for these operands (zmm/k/masked)",
+                mnemonic
+            ));
+        }
 
         match mnemonic {
             // Data movement
@@ -856,6 +1241,19 @@ impl InstructionEncoder {
             "pminsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xEA]),
             "pmaxsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xEE]),
             "phminposuw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x41]),
+            // SSE FP min/max
+            "minps" => self.encode_sse_op(ops, &[0x0F, 0x5D]),
+            "maxps" => self.encode_sse_op(ops, &[0x0F, 0x5F]),
+            "minpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5D]),
+            "maxpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5F]),
+            "insertps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x21]),
+            "extractps" => self.encode_sse_extract_gpr_imm8(ops, &[0x66, 0x0F, 0x3A, 0x17]),
+            "cvtsi2ss" => self.encode_cvtsi2x(ops, 0x2A, 2),
+            "cvtsi2sd" => self.encode_cvtsi2x(ops, 0x2A, 3),
+            "cvtss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2D]),
+            "cvtsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2D]),
+            "cvttss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2C]),
+            "cvttsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2C]),
             "packusdw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2B]),
             "packsswb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x63]),
             "movhlps" => self.encode_sse_op(ops, &[0x0F, 0x12]),
@@ -925,9 +1323,16 @@ impl InstructionEncoder {
             "vmulpd" => self.encode_avx_3op(ops, 0x59, true),
             "vdivpd" => self.encode_avx_3op(ops, 0x5E, true),
             // FMA3 (0F38 map, W=1 for F64, pp=66)
+            "vfmadd132ps" => self.encode_avx_3op_38(ops, 0x98, true),
             "vfmadd132pd" => self.encode_avx_3op_38_w1(ops, 0x98, true),
+            "vfmadd213ps" => self.encode_avx_3op_38(ops, 0xA8, true),
             "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
+            "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
             "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
+            "vfmadd213ps" => self.encode_avx_3op_38(ops, 0xA8, true),
+            "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
+            "vsqrtps" => self.encode_avx_2op_0f(ops, 0x51, 0),
+            "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
             "vmulps" => self.encode_avx_3op_np(ops, 0x59),
@@ -947,6 +1352,8 @@ impl InstructionEncoder {
             "vblendpd" => self.encode_avx_3op_3a_imm8(ops, 0x0D, true),
             "vinserti128" => self.encode_avx_3op_3a_imm8(ops, 0x38, true),
             "vextracti128" => self.encode_avx_extract_imm8(ops, 0x39, true),
+            "vinsertf128" => self.encode_avx_3op_3a_imm8(ops, 0x18, true),
+            "vextractf128" => self.encode_avx_extract_imm8(ops, 0x19, true),
             "vpsignb" => self.encode_avx_3op_38(ops, 0x08, true),
             "vpsignw" => self.encode_avx_3op_38(ops, 0x09, true),
             "vpsignd" => self.encode_avx_3op_38(ops, 0x0A, true),
@@ -1112,6 +1519,49 @@ impl InstructionEncoder {
             "vmovddup" => self.encode_avx_2op_0f(ops, 0x12, 3),  // VEX.F2.0F 12 /r
             "vmovshdup" => self.encode_avx_2op_0f(ops, 0x16, 2), // VEX.F3.0F 16 /r
             "vmovsldup" => self.encode_avx_2op_0f(ops, 0x12, 2), // VEX.F3.0F 12 /r
+            // AVX FP min/max + horizontal + converts (pp: 0=none,1=66,2=F3,3=F2)
+            "vminps" => self.encode_avx_3op_np(ops, 0x5D),
+            "vmaxps" => self.encode_avx_3op_np(ops, 0x5F),
+            "vminpd" => self.encode_avx_3op(ops, 0x5D, true),
+            "vmaxpd" => self.encode_avx_3op(ops, 0x5F, true),
+            "vhaddps" => self.encode_avx_3op_pp(ops, 0x7C, 2),
+            "vhaddpd" => self.encode_avx_3op_pp(ops, 0x7C, 1),
+            "vhsubps" => self.encode_avx_3op_pp(ops, 0x7D, 2),
+            "vhsubpd" => self.encode_avx_3op_pp(ops, 0x7D, 1),
+            "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 2),
+            "vaddsubpd" => self.encode_avx_3op_pp(ops, 0xD0, 1),
+            "vcvtps2pd" => self.encode_avx_2op_0f(ops, 0x5A, 0),
+            "vcvtpd2ps" => self.encode_avx_2op_0f(ops, 0x5A, 1),
+            "vcvtdq2pd" => self.encode_avx_2op_0f(ops, 0xE6, 2),
+            "vcvtpd2dq" => self.encode_avx_2op_0f(ops, 0xE6, 3),
+            "vcvttpd2dq" => self.encode_avx_2op_0f(ops, 0xE6, 1),
+            "vtestps" => self.encode_avx_2op_38(ops, 0x0E, true),
+            "vtestpd" => self.encode_avx_2op_38(ops, 0x0F, true),
+            "vmovmskps" => self.encode_avx_extract_gp(ops, 0x50, false),
+            "vmovmskpd" => self.encode_avx_extract_gp(ops, 0x50, true),
+            "vroundps" => self.encode_avx_2op_3a_pp_imm8(ops, 0x08, 1),
+            "vroundpd" => self.encode_avx_2op_3a_pp_imm8(ops, 0x09, 1),
+            "vroundss" => self.encode_avx_3op_3a_imm8(ops, 0x0A, true),
+            "vroundsd" => self.encode_avx_3op_3a_imm8(ops, 0x0B, true),
+            "vinsertps" => self.encode_avx_3op_3a_imm8(ops, 0x21, true),
+            "vextractps" => self.encode_avx_extract_gpr_imm8(ops, 0x17, true),
+            "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
+            "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
+            // FMA3 remaining forms (0F38 map; W=1 for pd/sd)
+            "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
+            "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
+            "vfmadd132ss" => self.encode_avx_3op_38(ops, 0x99, true),
+            "vfmadd213ss" => self.encode_avx_3op_38(ops, 0xA9, true),
+            "vfmadd231ss" => self.encode_avx_3op_38(ops, 0xB9, true),
+            "vfmadd132sd" => self.encode_avx_3op_38_w1(ops, 0x99, true),
+            "vfmadd213sd" => self.encode_avx_3op_38_w1(ops, 0xA9, true),
+            "vfmadd231sd" => self.encode_avx_3op_38_w1(ops, 0xB9, true),
+            "vfmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAA, true),
+            "vfmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBA, true),
+            "vfnmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xAC, true),
+            "vfnmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xBC, true),
+            "vfnmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAE, true),
+            "vfnmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBE, true),
 
             // AVX comparison with immediate (vcmpps/vcmppd/vcmpss/vcmpsd)
             "vcmpps" => self.encode_avx_3op_0f_imm8(ops, 0xC2, false),

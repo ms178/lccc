@@ -3,22 +3,22 @@ use super::super::parser::*;
 /// Register encoding (3-bit register number in ModR/M and SIB).
 pub(crate) fn reg_num(name: &str) -> Option<u8> {
     match name {
-        "al" | "ax" | "eax" | "rax" | "xmm0" | "st" | "st(0)" | "mm0" | "es" | "ymm0" => Some(0),
-        "cl" | "cx" | "ecx" | "rcx" | "xmm1" | "st(1)" | "mm1" | "cs" | "ymm1" => Some(1),
-        "dl" | "dx" | "edx" | "rdx" | "xmm2" | "st(2)" | "mm2" | "ss" | "ymm2" => Some(2),
-        "bl" | "bx" | "ebx" | "rbx" | "xmm3" | "st(3)" | "mm3" | "ds" | "ymm3" => Some(3),
-        "ah" | "spl" | "sp" | "esp" | "rsp" | "xmm4" | "st(4)" | "mm4" | "fs" | "ymm4" => Some(4),
-        "ch" | "bpl" | "bp" | "ebp" | "rbp" | "xmm5" | "st(5)" | "mm5" | "gs" | "ymm5" => Some(5),
-        "dh" | "sil" | "si" | "esi" | "rsi" | "xmm6" | "st(6)" | "mm6" | "ymm6" => Some(6),
-        "bh" | "dil" | "di" | "edi" | "rdi" | "xmm7" | "st(7)" | "mm7" | "ymm7" => Some(7),
-        "r8b" | "r8w" | "r8d" | "r8" | "xmm8" | "ymm8" => Some(0),
-        "r9b" | "r9w" | "r9d" | "r9" | "xmm9" | "ymm9" => Some(1),
-        "r10b" | "r10w" | "r10d" | "r10" | "xmm10" | "ymm10" => Some(2),
-        "r11b" | "r11w" | "r11d" | "r11" | "xmm11" | "ymm11" => Some(3),
-        "r12b" | "r12w" | "r12d" | "r12" | "xmm12" | "ymm12" => Some(4),
-        "r13b" | "r13w" | "r13d" | "r13" | "xmm13" | "ymm13" => Some(5),
-        "r14b" | "r14w" | "r14d" | "r14" | "xmm14" | "ymm14" => Some(6),
-        "r15b" | "r15w" | "r15d" | "r15" | "xmm15" | "ymm15" => Some(7),
+        "al" | "ax" | "eax" | "rax" | "xmm0" | "st" | "st(0)" | "mm0" | "es" | "ymm0" | "zmm0" | "k0" => Some(0),
+        "cl" | "cx" | "ecx" | "rcx" | "xmm1" | "st(1)" | "mm1" | "cs" | "ymm1" | "zmm1" | "k1" => Some(1),
+        "dl" | "dx" | "edx" | "rdx" | "xmm2" | "st(2)" | "mm2" | "ss" | "ymm2" | "zmm2" | "k2" => Some(2),
+        "bl" | "bx" | "ebx" | "rbx" | "xmm3" | "st(3)" | "mm3" | "ds" | "ymm3" | "zmm3" | "k3" => Some(3),
+        "ah" | "spl" | "sp" | "esp" | "rsp" | "xmm4" | "st(4)" | "mm4" | "fs" | "ymm4" | "zmm4" | "k4" => Some(4),
+        "ch" | "bpl" | "bp" | "ebp" | "rbp" | "xmm5" | "st(5)" | "mm5" | "gs" | "ymm5" | "zmm5" | "k5" => Some(5),
+        "dh" | "sil" | "si" | "esi" | "rsi" | "xmm6" | "st(6)" | "mm6" | "ymm6" | "zmm6" | "k6" => Some(6),
+        "bh" | "dil" | "di" | "edi" | "rdi" | "xmm7" | "st(7)" | "mm7" | "ymm7" | "zmm7" | "k7" => Some(7),
+        "r8b" | "r8w" | "r8d" | "r8" | "xmm8" | "ymm8" | "zmm8" => Some(0),
+        "r9b" | "r9w" | "r9d" | "r9" | "xmm9" | "ymm9" | "zmm9" => Some(1),
+        "r10b" | "r10w" | "r10d" | "r10" | "xmm10" | "ymm10" | "zmm10" => Some(2),
+        "r11b" | "r11w" | "r11d" | "r11" | "xmm11" | "ymm11" | "zmm11" => Some(3),
+        "r12b" | "r12w" | "r12d" | "r12" | "xmm12" | "ymm12" | "zmm12" => Some(4),
+        "r13b" | "r13w" | "r13d" | "r13" | "xmm13" | "ymm13" | "zmm13" => Some(5),
+        "r14b" | "r14w" | "r14d" | "r14" | "xmm14" | "ymm14" | "zmm14" => Some(6),
+        "r15b" | "r15w" | "r15d" | "r15" | "xmm15" | "ymm15" | "zmm15" => Some(7),
         _ => None,
     }
 }
@@ -87,6 +87,31 @@ pub(crate) fn needs_rex_ext(name: &str) -> bool {
         || name.starts_with("ymm10") || name.starts_with("ymm11")
         || name.starts_with("ymm12") || name.starts_with("ymm13")
         || name.starts_with("ymm14") || name.starts_with("ymm15")
+        || name.starts_with("zmm8") || name.starts_with("zmm9")
+        || name.starts_with("zmm10") || name.starts_with("zmm11")
+        || name.starts_with("zmm12") || name.starts_with("zmm13")
+        || name.starts_with("zmm14") || name.starts_with("zmm15")
+}
+
+/// Is this a ZMM (512-bit AVX-512) register?
+pub(crate) fn is_zmm(name: &str) -> bool {
+    name.starts_with("zmm")
+}
+
+/// Is this an AVX-512 mask (opmask) register?
+pub(crate) fn is_kreg(name: &str) -> bool {
+    name.len() == 2 && name.starts_with('k')
+        && name.as_bytes().get(1).is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Does a ZMM register need the EVEX R' extension bit (zmm16-31)?
+pub(crate) fn needs_evex_rprime(name: &str) -> bool {
+    if let Some(num) = name.strip_prefix("zmm") {
+        if let Ok(n) = num.parse::<u8>() {
+            return n >= 16;
+        }
+    }
+    false
 }
 
 /// Does this register need the VEX.B extension bit? Same as REX ext but for VEX-encoded instructions.

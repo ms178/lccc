@@ -185,11 +185,15 @@ pub enum Operand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
     pub name: String,
+    /// EVEX opmask applied to this operand: `%zmm0{%k1}`.
+    pub mask: Option<String>,
+    /// EVEX zeroing semantics on the destination: `%zmm0{%k1}{z}`.
+    pub zeroing: bool,
 }
 
 impl Register {
     pub fn new(name: &str) -> Self {
-        Register { name: name.to_string() }
+        Register { name: name.to_string(), mask: None, zeroing: false }
     }
 }
 
@@ -221,6 +225,10 @@ pub struct MemoryOperand {
     pub base: Option<Register>,
     pub index: Option<Register>,
     pub scale: Option<u8>,
+    /// EVEX opmask applied to this operand: `16(%rsp){%k1}`.
+    pub mask: Option<String>,
+    /// EVEX zeroing semantics on the destination.
+    pub zeroing: bool,
 }
 
 /// Memory displacement.
@@ -1035,6 +1043,8 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
                 base: None,
                 index: None,
                 scale: None,
+                mask: None,
+                zeroing: false,
             }));
         }
     }
@@ -1044,10 +1054,40 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     Ok(Operand::Label(s.to_string()))
 }
 
+/// Split an EVEX mask/zeroing suffix: `%zmm0{%k1}{z}` -> ("%zmm0", Some("k1"), true).
+/// Accepts both `{%k1}` and `{k1}` (GNU as tolerates the bare form), and `{z}`.
+fn parse_evex_mask_suffix(s: &str) -> (String, Option<String>, bool) {
+    let mut name = s.to_string();
+    let mut mask = None;
+    let mut zeroing = false;
+    loop {
+        if let Some(pos) = name.find('{') {
+            let close = name[pos..].find('}');
+            let Some(close) = close else { break };
+            let inner = name[pos + 1..pos + close].trim().to_string();
+            let before = name[..pos].to_string();
+            let after = name[pos + close + 1..].to_string();
+            name = before + &after;
+            if inner == "z" {
+                zeroing = true;
+            } else if let Some(rest) = inner.strip_prefix('%') {
+                mask = Some(rest.trim().to_string());
+            } else if !inner.is_empty() {
+                mask = Some(inner.to_string());
+            }
+        } else {
+            break;
+        }
+    }
+    (name, mask, zeroing)
+}
+
 /// Parse a register operand like %rax, %st(0).
 fn parse_register_operand(s: &str) -> Result<Operand, String> {
     // GNU as tolerates whitespace between '%' and the register name
     // (glibc emits `mov % r13, ...` from `% " R13_LP "` macro splicing).
+    let (clean, mask, zeroing) = parse_evex_mask_suffix(s);
+    let s = clean.as_str();
     let name = s[1..].trim_start(); // strip % and any following spaces
 
     // Handle %st(N)
@@ -1062,11 +1102,16 @@ fn parse_register_operand(s: &str) -> Result<Operand, String> {
         if seg == "fs" || seg == "gs" {
             let mut mem = parse_memory_inner(rest)?;
             mem.segment = Some(seg.to_string());
+            mem.mask = mask;
+            mem.zeroing = zeroing;
             return Ok(Operand::Memory(mem));
         }
     }
 
-    Ok(Operand::Register(Register::new(name)))
+    let mut reg = Register::new(name);
+    reg.mask = mask;
+    reg.zeroing = zeroing;
+    Ok(Operand::Register(reg))
 }
 
 /// Parse an immediate operand (after the '$').
@@ -1193,6 +1238,15 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
 fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
     let s = s.trim();
 
+    // EVEX mask/zeroing suffix on a memory operand: `(%rax){%k1}`.
+    if s.contains('{') {
+        let (clean, mask, zeroing) = parse_evex_mask_suffix(s);
+        let mut mem = parse_memory_inner(&clean)?;
+        mem.mask = mask;
+        mem.zeroing = zeroing;
+        return Ok(mem);
+    }
+
     // Find the register-enclosing parentheses: the LAST balanced (...) group.
     // This handles nested parens in the displacement like ((6*8) + 8*16)(%rsp).
     // We scan backwards from the end to find the matching '(' for the final ')'.
@@ -1232,6 +1286,8 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
                     base: None,
                     index: None,
                     scale: None,
+                    mask: None,
+                    zeroing: false,
                 });
             }
         }
@@ -1296,6 +1352,8 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
             base,
             index,
             scale,
+            mask: None,
+            zeroing: false,
         })
     } else {
         // No parens - could be just a displacement/symbol
@@ -1306,6 +1364,8 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
             base: None,
             index: None,
             scale: None,
+            mask: None,
+            zeroing: false,
         })
     }
 }
