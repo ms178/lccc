@@ -18,6 +18,7 @@ use crate::ir::reexports::{
     Value,
 };
 use crate::backend::state::StackSlot;
+use crate::backend::regalloc::PhysReg;
 use super::emit::{is_xmm_reg, phys_reg_name, X86Codegen};
 
 impl X86Codegen {
@@ -578,6 +579,49 @@ impl X86Codegen {
         let imm = self.operand_to_imm_i64(&args[1]);
         self.state.emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", sse_inst, imm));
         self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
+    /// Resolve the (base, index) GPR pair for a VecLoad memory operand, reusing
+    /// register-allocated GPRs when the values already live in them (the
+    /// vectorizer's loop-carried base pointers and byte-offset IV are
+    /// register-allocated), instead of copying them into rax/rcx first — a
+    /// 2–3 instruction-per-load win in reduction hot loops. Returns
+    /// (base_reg, index_reg_or_none); index is None when the offset is the
+    /// constant zero. Both returned names are valid x86 SIB components.
+    fn vec_load_addr_regs(&mut self, base_arg: &Operand, off_arg: &Operand) -> (String, Option<String>) {
+        // The allocator only hands out rbx/r12-r15/r11/r10/r8/r9 (never
+        // rsp/rbp/rdi/rsi/rdx), all of which are legal base AND index regs.
+        let is_gpr = |r: PhysReg| (1..=16).contains(&r.0);
+        let base = if let Some(r) = self.operand_reg(base_arg) {
+            if is_gpr(r) {
+                phys_reg_name(r).to_string()
+            } else {
+                self.operand_to_reg(base_arg, "rax");
+                "rax".to_string()
+            }
+        } else {
+            self.operand_to_reg(base_arg, "rax");
+            "rax".to_string()
+        };
+        let index = if let Operand::Const(c) = off_arg {
+            if c.to_i64() == Some(0) {
+                None
+            } else {
+                self.operand_to_reg(off_arg, "rcx");
+                Some("rcx".to_string())
+            }
+        } else if let Some(r) = self.operand_reg(off_arg) {
+            if is_gpr(r) {
+                Some(phys_reg_name(r).to_string())
+            } else {
+                self.operand_to_reg(off_arg, "rcx");
+                Some("rcx".to_string())
+            }
+        } else {
+            self.operand_to_reg(off_arg, "rcx");
+            Some("rcx".to_string())
+        };
+        (base, index)
     }
 
     pub(super) fn emit_intrinsic_impl(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
@@ -2123,21 +2167,12 @@ impl X86Codegen {
             IntrinsicOp::VecLoadF64x4 => {
                 // %dest_vec = load_vector(base_ptr, offset) - AVX2 4×F64.
                 // Store through avx_store_dest so a single-use result can be
-                // deferred (kept in %ymm0) and folded by the next VecAdd/VecMul
-                // (v3: reduction-loop codegen improvement). The offset is
-                // almost always a constant 0 (the vectorizer passes
-                // (array_gep, 0)); skip materializing it into %rcx then.
-                self.operand_to_reg(&args[0], "rax");  // base pointer
-                if let Operand::Const(c) = &args[1] {
-                    if c.to_i64() == Some(0) {
-                        self.state.emit("    vmovupd (%rax), %ymm0");
-                    } else {
-                        self.operand_to_reg(&args[1], "rcx");
-                        self.state.emit("    vmovupd (%rax,%rcx), %ymm0");
-                    }
-                } else {
-                    self.operand_to_reg(&args[1], "rcx");
-                    self.state.emit("    vmovupd (%rax,%rcx), %ymm0");
+                // deferred and folded by the next VecAdd/VecMul. Reuse
+                // register-allocated base/offset GPRs (reduction hot loops).
+                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
+                match &index {
+                    Some(ix) => self.state.emit_fmt(format_args!("    vmovupd (%{},%{}), %ymm0", base, ix)),
+                    None => self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", base)),
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -2146,17 +2181,10 @@ impl X86Codegen {
             }
             IntrinsicOp::VecLoadF64x2 => {
                 // %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64.
-                self.operand_to_reg(&args[0], "rax");
-                if let Operand::Const(c) = &args[1] {
-                    if c.to_i64() == Some(0) {
-                        self.state.emit("    movupd (%rax), %xmm0");
-                    } else {
-                        self.operand_to_reg(&args[1], "rcx");
-                        self.state.emit("    movupd (%rax,%rcx), %xmm0");
-                    }
-                } else {
-                    self.operand_to_reg(&args[1], "rcx");
-                    self.state.emit("    movupd (%rax,%rcx), %xmm0");
+                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
+                match &index {
+                    Some(ix) => self.state.emit_fmt(format_args!("    movupd (%{},%{}), %xmm0", base, ix)),
+                    None => self.state.emit_fmt(format_args!("    movupd (%{}), %xmm0", base)),
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -2164,18 +2192,11 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecLoadI32x8 => {
-                // Defer-aware store; skip materializing a constant-0 offset.
-                self.operand_to_reg(&args[0], "rax");
-                if let Operand::Const(c) = &args[1] {
-                    if c.to_i64() == Some(0) {
-                        self.state.emit("    vmovdqu (%rax), %ymm0");
-                    } else {
-                        self.operand_to_reg(&args[1], "rcx");
-                        self.state.emit("    vmovdqu (%rax,%rcx), %ymm0");
-                    }
-                } else {
-                    self.operand_to_reg(&args[1], "rcx");
-                    self.state.emit("    vmovdqu (%rax,%rcx), %ymm0");
+                // Defer-aware store; reuse register-allocated base/offset.
+                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
+                match &index {
+                    Some(ix) => self.state.emit_fmt(format_args!("    vmovdqu (%{},%{}), %ymm0", base, ix)),
+                    None => self.state.emit_fmt(format_args!("    vmovdqu (%{}), %ymm0", base)),
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -2183,17 +2204,10 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecLoadI32x4 => {
-                self.operand_to_reg(&args[0], "rax");
-                if let Operand::Const(c) = &args[1] {
-                    if c.to_i64() == Some(0) {
-                        self.state.emit("    movdqu (%rax), %xmm0");
-                    } else {
-                        self.operand_to_reg(&args[1], "rcx");
-                        self.state.emit("    movdqu (%rax,%rcx), %xmm0");
-                    }
-                } else {
-                    self.operand_to_reg(&args[1], "rcx");
-                    self.state.emit("    movdqu (%rax,%rcx), %xmm0");
+                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
+                match &index {
+                    Some(ix) => self.state.emit_fmt(format_args!("    movdqu (%{},%{}), %xmm0", base, ix)),
+                    None => self.state.emit_fmt(format_args!("    movdqu (%{}), %xmm0", base)),
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -2326,22 +2340,24 @@ impl X86Codegen {
 
             // ---- F32 reduction vector ops (8-wide AVX2 / 4-wide SSE2) ----
             IntrinsicOp::VecLoadF32x8 | IntrinsicOp::VecLoadF32x4 => {
-                // Defer-aware store (single-use result folds into next op).
+                // Defer-aware store (single-use result folds into next op);
+                // reuse register-allocated base/offset GPRs.
                 let is8 = matches!(op, IntrinsicOp::VecLoadF32x8);
-                self.operand_to_reg(&args[0], "rax");
-                let zero_off = matches!(&args[1], Operand::Const(c) if c.to_i64() == Some(0));
-                if zero_off {
-                    if is8 {
-                        self.state.emit("    vmovups (%rax), %ymm0");
-                    } else {
-                        self.state.emit("    movups (%rax), %xmm0");
+                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
+                match &index {
+                    Some(ix) => {
+                        if is8 {
+                            self.state.emit_fmt(format_args!("    vmovups (%{},%{}), %ymm0", base, ix));
+                        } else {
+                            self.state.emit_fmt(format_args!("    movups (%{},%{}), %xmm0", base, ix));
+                        }
                     }
-                } else {
-                    self.operand_to_reg(&args[1], "rcx");
-                    if is8 {
-                        self.state.emit("    vmovups (%rax,%rcx), %ymm0");
-                    } else {
-                        self.state.emit("    movups (%rax,%rcx), %xmm0");
+                    None => {
+                        if is8 {
+                            self.state.emit_fmt(format_args!("    vmovups (%{}), %ymm0", base));
+                        } else {
+                            self.state.emit_fmt(format_args!("    movups (%{}), %xmm0", base));
+                        }
                     }
                 }
                 if let Some(d) = dest {

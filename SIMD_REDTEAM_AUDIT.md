@@ -407,3 +407,60 @@ remains ~2× faster than GCC/Clang.
    byte-offset SIB addressing (1 instr/iter).
 3. Store-loop / general dataflow-driven loop vectorization.
 4. matmul `BroadcastLoadF64` hoisting (unblocks once registers land).
+
+---
+
+# v5 (2026-08-13) — DCE gap, reduction-loop codegen, systemic scalar-FP fix
+
+## Root causes found and fixed
+
+1. **The v4 DCE gap (user-reported).** The vectorizer orphaned the scalar
+   load/mul/GEP chains and relied on the global DCE pass — which runs AFTER
+   IVSR. IVSR strength-reduced the already-dead GEPs into loop-carried pointer
+   increments (`leaq 256(%rdi),%rdi`) that DCE cannot remove (the increment and
+   its phi only reference each other). The vectorizer now runs DCE on the
+   function immediately after its transforms, before IVSR sees the orphaned
+   chains. DOT loop 17 -> 11, SUM 11 -> 8 instructions.
+
+2. **Reduction-loop register reuse.** VecLoad now reuses register-allocated
+   base/offset GPRs (`vmovupd (%rdi,%rsi),%ymm0`) instead of copying them into
+   rax/rcx; and the accumulator phi group {acc, init_zero, vec_sum} coalesces
+   to a single home slot (CFG copy-coalescing was blanket-excluding vector
+   values). SUM 6, DOT 9 instructions/iteration.
+
+3. **Systemic scalar-FP fix.** Scalar F64 values were register-allocated to
+   XMM, but every producer/consumer round-tripped through GPRs
+   (`movq %xmm0,%rax; movq %rax,%xmmN`) because only the binop RHS honored the
+   assignment. Now: FP binops honor XMM homes for LHS and dest AND compute
+   directly into the destination register; int->float casts emit
+   `cvtsi2sd/cvtsi2ss` straight into the dest register; F64/F32 loads emit
+   `movsd/movss (%ptr),%xmmN`. The F64 pool keeps xmm2 unless the function
+   contains an intrinsic that clobbers it (pblendvb/128-bit VNNI/F128).
+
+## Measured (min-of-N, pinned core, vs gcc -O2)
+
+| benchmark | before (v4) | v5 |
+|---|---|---|
+| spectral_norm | 9.3x | **2.9x** |
+| struct_copy | 20.9x | **6.7x** |
+| nbody | 3.8x | **4.8x** (11.9x under an earlier broken measurement) |
+| mandelbrot | 3.2x | 2.9x (compare/branch bound) |
+
+Correctness: nbody / spectral_norm / mandelbrot bit-exact vs gcc; regression
+127/127, correctness 50/50, intrinsics 3/3; reduction difftests 0..300 x
+{AVX2,SSE2} bit-exact; zlib-ng adler32 correct.
+
+## Remaining top-priority work (v6)
+
+1. **Parameter/struct-ABI register allocation**: functions spill all GPR/F64
+   parameters to stack at entry (the nbody/struct_copy/linux_find_bit prologue
+   bloat) and struct-by-value copies use vmovdqu+shuffle. Dominates the
+   remaining 4-7x gaps.
+2. **Loop-carried scalar accumulator in an XMM register** (allocator reuse
+   across the chain + phi-value F64 allocation) — the last 2 movsd/iter.
+3. **Dataflow-driven vectorization** of reductions with computed operands
+   (spectral_norm's `1.0/f(i,j) * v[j]`), multi-reduction loops, and
+   store-loops.
+4. Branch/switch codegen (expat 3.2x, sqlite_varint 2.0x, switch_dispatch 1.5x)
+   and bit-op selection (bitops 1.9x, linux_find_bit 1.8x).
+5. matmul `BroadcastLoadF64` hoisting.

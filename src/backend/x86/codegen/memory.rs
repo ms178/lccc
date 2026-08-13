@@ -711,6 +711,36 @@ impl X86Codegen {
             }
         }
 
+        // v5: register-direct F64/F32 load. When the destination is
+        // XMM-allocated, load straight into it (movsd/movss (%ptr), %xmmN)
+        // instead of the GPR round-trip (movq (%ptr),%rax; movq %rax,%xmmN).
+        // Over-aligned allocas fall through (their data lives at a runtime-
+        // aligned address, not the slot base).
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                if is_xmm_reg(d_reg) {
+                    let d_name = phys_reg_name(d_reg);
+                    let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                    if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                        if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                            let p_name = phys_reg_name(p_reg);
+                            self.state.emit_fmt(format_args!("    {} (%{}), %{}", mov, p_name, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                    if self.state.is_alloca(ptr.0) && self.state.alloca_over_align(ptr.0).is_none() {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            let sr = self.slot_ref(slot.0);
+                            self.state.emit_fmt(format_args!("    {} {}, %{}", mov, sr, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Fall back to default load logic
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
