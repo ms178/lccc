@@ -233,3 +233,76 @@ Self-checking, return 0 on success, and **verified to fail on the pre-fix binary
 
 All fixes are committed on branch `simd-redteam-audit`; correctness is backed by the
 reproducers, assembly, and the regression/correctness/intrinsics suites above.
+
+---
+
+# v2 (2026-08-13) — follow-up: MISMATCH resolution, project test-compiles, C23, F32 vectorization
+
+## 1. MISMATCH failures resolved (123→124 regression passes, 0 failures)
+
+All five `--compare-gcc` "MISMATCH" entries were **lccc-conformance tests whose
+GCC reference is a defective oracle**, not lccc bugs (verified per test):
+
+| Test | lccc | GCC oracle |
+|---|---|---|
+| glibc_f128_builtins | PASS | cannot compile (no-arg `__builtin_nanf128()`) |
+| glibc_gottpoff | PASS | wrong TLS value (stale `@gottpoff` read) |
+| glibc_x87_forms | PASS | SIGILL (GAS emits invalid x87 encoding) |
+| regr_v2_abs_symbol_value | PASS | wrong value (GNU ld rebases absolute symbols) |
+| regr_v5_clmul256 | PASS | cannot compile (256-bit VPCLMULQDQ gated behind AVX-512) |
+
+Added a `LCCC_NO_COMPARE=1` per-test opt-out via `<name>.env`: the test still
+runs and must pass under lccc, only the invalid GCC diff is skipped.
+
+## 2. Test-compile results (with ms178/archpkgbuilds custom patches)
+
+| Project | Result |
+|---|---|
+| zlib-ng (git) | **109/109** translation units compile with lccc |
+| gzip 1.14 | **17/17** real build TUs; 130/140 incl. gnulib (the other 10 fail identically under gcc) |
+| expat 2.8.2 | **5/5** real lib TUs (xcsinc.c is an #include file, not a TU) |
+| glibc 2.44 + ms178-glibc.patch | **5/5 patched files** (e_atan2f, e_powf, s_sincosf, s_tanf, malloc) + 13/15 core sample (2 need generated headers, not lccc) |
+
+**Runtime**: lccc-compiled zlib-ng `adler32_avx2`/`crc32_braid` return bit-exact
+values matching Python's zlib (adler=209396577, crc=573088776).
+
+## 3. binutils 2.47 oracle
+Built minimal binutils 2.47.20260726 (`as`, `ld`, `objdump`, `readelf`, `nm`, …)
+at `/home/user/binutils-oracle/bin` as an assembler/linker oracle.
+
+## 4. C23 `alignas`/`alignof`
+gzip 1.14 builds with `-std=gnu23` and uses `alignas (4096)` as a declaration
+specifier (via `DECLARE`); lccc only knew `_Alignas`/`_Alignof`. Added the C23
+keyword spellings (mapped to the existing token kinds) + `c23_alignas.c`
+regression test.
+
+## 5. F32 reduction auto-vectorization (validated 2× win)
+lccc detected F32 sum/dot-product reductions and then **rejected** them
+("Unsupported type for AVX2: F32"). Added `Vec{Load,Add,Mul,Zero,HorizontalAdd}F32x{8,4}`
+intrinsics + lowering, plus three correctness fixes uncovered while wiring it:
+- accumulator phi-entry rewiring only matched F64/I32 zero constants (F32 vector
+  zero was DCE'd → 8-byte zero vs 32-byte load);
+- AVX2 horizontal add dropped 2 lanes; SSE2 horizontal add shuffled a stale register;
+- F32 vector values weren't excluded from GPR register allocation (missing
+  `non_gpr_values` entries) → pointer-mediated accumulator access, lost stores.
+
+**Benchmark** (F32 dot, 1M floats, min of 5 runs, pinned):
+| compiler | time |
+|---|---|
+| **lccc** | **0.124 s** |
+| GCC 14.2 | 0.246 s |
+| Clang 19.1 | 0.247 s |
+
+F32 sum/dot match GCC bit-exactly for N ∈ {1..257, 1024} in both AVX2 and SSE2 modes.
+
+## 6. Remaining top-priority work (v3)
+1. **Vector register allocation** across the loop backedge (the adler32 5.3× gap
+   root cause: loop-carried accumulators are live across iterations, so the v5
+   store-defer analysis correctly cannot elide them; a real XMM/YMM interval
+   allocator is required). Data: adler32_avx2 = 963 instrs (lccc) vs 674 (gcc) /
+   504 (clang).
+2. **F32/F64 store-loop vectorization** (the pattern matcher still only handles
+   reductions and the double matmul).
+3. Memory-operand folding for the first (last-use) reference of a vector slot.
+4. matmul `BroadcastLoadF64` hoisting (documented TODO, blocked on register
+   allocation).

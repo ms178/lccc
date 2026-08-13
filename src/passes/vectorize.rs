@@ -3356,6 +3356,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 IntrinsicOp::HorizontalAddI32x8,
             )
         },
+        IrType::F32 => (
+            8u64,
+            IntrinsicOp::VecLoadF32x8,
+            IntrinsicOp::VecAddF32x8,
+            Some(IntrinsicOp::VecMulF32x8),
+            IntrinsicOp::VecHorizontalAddF32x8,  // pass-through (no legacy F32 form)
+        ),
         _ => {
             if debug {
                 eprintln!("[VEC-RED] Unsupported type for AVX2: {:?}", pattern.element_type);
@@ -3559,6 +3566,11 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                     IntrinsicOp::VecAddI32x8,
                     IntrinsicOp::VecZeroI32x8,
                 ),
+                IrType::F32 => (
+                    IntrinsicOp::VecLoadF32x8,
+                    IntrinsicOp::VecAddF32x8,
+                    IntrinsicOp::VecZeroF32x8,
+                ),
                 _ => panic!("Unsupported AVX2 element type: {:?}", pattern.element_type),
             };
 
@@ -3594,7 +3606,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -3682,13 +3694,19 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
             next_val_id += 1;
 
             // Map to register-based intrinsics based on element type
-            // Note: Only F64 dot products supported (no I32 multiply intrinsic yet)
+            // Note: I32 dot products unsupported (no I32 multiply intrinsic yet)
             let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op) = match pattern.element_type {
                 IrType::F64 => (
                     IntrinsicOp::VecLoadF64x4,
                     IntrinsicOp::VecMulF64x4,
                     IntrinsicOp::VecAddF64x4,
                     IntrinsicOp::VecZeroF64x4,
+                ),
+                IrType::F32 => (
+                    IntrinsicOp::VecLoadF32x8,
+                    IntrinsicOp::VecMulF32x8,
+                    IntrinsicOp::VecAddF32x8,
+                    IntrinsicOp::VecZeroF32x8,
                 ),
                 _ => {
                     if debug {
@@ -3721,7 +3739,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -3872,6 +3890,13 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 IntrinsicOp::HorizontalAddI32x4,
             )
         },
+        IrType::F32 => (
+            4u64,
+            IntrinsicOp::VecLoadF32x4,
+            IntrinsicOp::VecAddF32x4,
+            Some(IntrinsicOp::VecMulF32x4),
+            IntrinsicOp::VecHorizontalAddF32x4,  // pass-through (no legacy F32 form)
+        ),
         _ => {
             if debug {
                 eprintln!("[VEC-RED] Unsupported type for SSE2: {:?}", pattern.element_type);
@@ -4056,6 +4081,11 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                     IntrinsicOp::VecAddI32x4,
                     IntrinsicOp::VecZeroI32x4,
                 ),
+                IntrinsicOp::VecLoadF32x4 => (
+                    IntrinsicOp::VecLoadF32x4,
+                    IntrinsicOp::VecAddF32x4,
+                    IntrinsicOp::VecZeroF32x4,
+                ),
                 _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
             };
 
@@ -4089,7 +4119,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -4172,13 +4202,19 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
             vec_sum_value = Value(next_val_id);
             next_val_id += 1;
 
-            // Map old intrinsics to new register-based intrinsics (only F64 supported)
+            // Map old intrinsics to new register-based intrinsics (F64 and F32)
             let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op) = match load_intrinsic {
                 IntrinsicOp::LoadF64x2 => (
                     IntrinsicOp::VecLoadF64x2,
                     IntrinsicOp::VecMulF64x2,
                     IntrinsicOp::VecAddF64x2,
                     IntrinsicOp::VecZeroF64x2,
+                ),
+                IntrinsicOp::VecLoadF32x4 => (
+                    IntrinsicOp::VecLoadF32x4,
+                    IntrinsicOp::VecMulF32x4,
+                    IntrinsicOp::VecAddF32x4,
+                    IntrinsicOp::VecZeroF32x4,
                 ),
                 _ => {
                     if debug {
@@ -4212,7 +4248,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }

@@ -1362,6 +1362,8 @@ fn generate_function(
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
                 | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
                 | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x2
+                | crate::ir::intrinsics::IntrinsicOp::VecZeroF32x8
+                | crate::ir::intrinsics::IntrinsicOp::VecZeroF32x4
                 | crate::ir::intrinsics::IntrinsicOp::LoadF64x4
                 | crate::ir::intrinsics::IntrinsicOp::LoadF64x2
             ))

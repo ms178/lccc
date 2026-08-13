@@ -1197,10 +1197,14 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::HorizontalAddF64x2 | O::HorizontalAddF64x4
             | O::HorizontalAddI32x4 | O::HorizontalAddI32x8
             | O::VecLoadF64x2 | O::VecLoadF64x4 | O::VecLoadI32x4 | O::VecLoadI32x8
+            | O::VecLoadF32x4 | O::VecLoadF32x8
             | O::VecAddF64x2 | O::VecAddF64x4 | O::VecAddI32x4 | O::VecAddI32x8
-            | O::VecMulF64x2 | O::VecMulF64x4
+            | O::VecAddF32x4 | O::VecAddF32x8
+            | O::VecMulF64x2 | O::VecMulF64x4 | O::VecMulF32x4 | O::VecMulF32x8
             | O::VecHorizontalAddF64x2 | O::VecHorizontalAddF64x4
             | O::VecHorizontalAddI32x4 | O::VecHorizontalAddI32x8
+            | O::VecHorizontalAddF32x4 | O::VecHorizontalAddF32x8
+            | O::VecZeroF32x4 | O::VecZeroF32x8
         )
     };
 
@@ -1397,16 +1401,24 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             | IntrinsicOp::VecZeroF64x2
                             | IntrinsicOp::VecZeroI32x8
                             | IntrinsicOp::VecZeroI32x4
+                            | IntrinsicOp::VecZeroF32x8
+                            | IntrinsicOp::VecZeroF32x4
                             | IntrinsicOp::VecLoadF64x4
                             | IntrinsicOp::VecLoadF64x2
                             | IntrinsicOp::VecLoadI32x8
                             | IntrinsicOp::VecLoadI32x4
+                            | IntrinsicOp::VecLoadF32x8
+                            | IntrinsicOp::VecLoadF32x4
                             | IntrinsicOp::VecAddF64x4
                             | IntrinsicOp::VecAddF64x2
                             | IntrinsicOp::VecAddI32x8
                             | IntrinsicOp::VecAddI32x4
+                            | IntrinsicOp::VecAddF32x8
+                            | IntrinsicOp::VecAddF32x4
                             | IntrinsicOp::VecMulF64x4
                             | IntrinsicOp::VecMulF64x2
+                            | IntrinsicOp::VecMulF32x8
+                            | IntrinsicOp::VecMulF32x4
                     );
                     if is_vector {
                         non_gpr_values.insert(d.0);

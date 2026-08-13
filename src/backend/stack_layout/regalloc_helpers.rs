@@ -56,13 +56,18 @@ pub fn run_regalloc_and_merge_clobbers(
             matches!(op,
                 IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
                 IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
+                IntrinsicOp::VecZeroF32x8 | IntrinsicOp::VecZeroF32x4 |
                 IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
                 IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
+                IntrinsicOp::VecLoadF32x8 | IntrinsicOp::VecLoadF32x4 |
                 IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
                 IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
+                IntrinsicOp::VecAddF32x8 | IntrinsicOp::VecAddF32x4 |
                 IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
+                IntrinsicOp::VecMulF32x8 | IntrinsicOp::VecMulF32x4 |
                 IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
                 IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
+                IntrinsicOp::VecHorizontalAddF32x8 | IntrinsicOp::VecHorizontalAddF32x4 |
                 IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
                 IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
                 IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
