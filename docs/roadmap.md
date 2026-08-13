@@ -25,6 +25,7 @@ LCCC improves CCC in twenty phases. Phases 1–20 are complete.
 | 4 | Loop unrolling + FP intrinsic lowering | ✅ Complete | **+45% matmul vs CCC; sieve counting loop 8×** |
 | 5 | FP peephole optimization | ✅ Complete | **-41% matmul time (6.0× → 4.0× vs GCC)** |
 | 6 | SSE2 auto-vectorization (2-wide) | ✅ Complete | **~2× on matmul-style FP loops** |
+| 6s | SIMD refactor to codegen-backed intrinsic model | ✅ Complete | **cleaner AVX2/SSE2 lowering, `c1963642`** |
 | 7a | AVX2 vectorization (4-wide) | ✅ Complete | **~2× additional on matmul vs SSE2** |
 | 7b | Remainder loop handling | ✅ Complete | **Production-ready vectorization for any N** |
 | 8 | Reduction vectorization (sum, dot) | ✅ Complete | **~2.7× faster than GCC -O3** |
@@ -41,9 +42,12 @@ LCCC improves CCC in twenty phases. Phases 1–20 are complete.
 | 18 | Vectorizer fixes | ✅ Complete | **32-byte AVX2 slots, 18/18 compat tests** |
 | 19 | Live range splitting | ✅ Complete | **IR-level with mem2reg SSA reconstruction** |
 | 20 | MachInst ISel expansion + encoding fixes | ✅ Complete | **-41.7KB: Cmp/Cast/Load/Store/GEP ISel, movzbl/movzwl, sext elim** |
+| PGO8 | Profile-guided optimization: instrumentation + edge profiling | ✅ Complete | **fail-closed `-fprofile-generate/-fprofile-use`, flow-conservation solver** |
+| PGO9 | PGO: drift gate + directed-arborescence instrumentation | ✅ Complete | **exact loop-latch counts; no stale edge data on drifted CFGs** |
+| PGO10 | PGO: flat-profile gate + dominance `has_spread` + conservative layout | ✅ Complete | **adler32 -17% → neutral; expat -28% → faster (1.01×)** |
+| PGO11 | PGO: cost-aware devirtualization + branch inversion + force-inline | ✅ Complete | **single-target -28% → neutral; multi-target 1.07×; no regressions** |
 | — | Better function inlining | 🔲 Planned | ~1.5× on call-heavy code |
 | — | Full block-level MachInst codegen | 🔲 Planned | Replace accumulator model (~270KB potential) |
-| — | Profile-guided optimization (PGO) | 🔲 Planned | ~1.2–1.5× general |
 
 ---
 
@@ -175,34 +179,63 @@ See the [Phase 4 write-up](/lccc/updates/phase4-loop-unrolling) for full details
 
 ---
 
-## Phase 5 — SIMD / Auto-Vectorization (Planned)
+## Phase 5 — SIMD / Auto-Vectorization (Complete)
 
-**Goal:** Emit AVX2/SSE4 instructions for vectorizable inner loops.
+**Status:** The original gap (matmul 4.86× slower because GCC emitted
+`vfmadd231pd` while LCCC emitted scalar `mulsd`/`addsd`) is closed. LCCC now:
 
-**Current gap:** `matmul` is 4.86× slower than GCC because GCC emits `vfmadd231pd` (AVX2 FMA, 4 doubles/cycle) while LCCC emits scalar `mulsd`/`addsd` (1 double/cycle). Phase 4 FP intrinsics closed the easy part; true vectorization remains.
+- lowers FP intrinsics to native SSE2/AVX2 ops (Phases 4, 6, 7a);
+- **auto-vectorizes reduction loops** (sum, dot) to 4-wide AVX2 / 2-wide SSE2
+  (Phase 8), beating GCC `-O3` on simple reductions by ~2.7×;
+- handles arbitrary trip counts via remainder loops (Phase 7b);
+- uses indexed (SIB) addressing (Phase 9) to collapse `base+index*scale` array
+  accesses; and
+- was **refactored to a codegen-backed intrinsic model** (`c1963642`) shared by
+  the x86/ARM/RISC-V backends, eliminating a parallel intrinsic-lowering layer.
 
-**Techniques:**
-- **SLP vectorization** — pack scalar ops in a basic block into SIMD ops
-- **Loop vectorization** — vectorize simple counted loops with compatible access patterns
-- **NEON/RVV/SSE backends** — architecture-specific vector lowering
+`matmul` now runs at ~parity with GCC on x86-64. The remaining vectorization
+work is breadth (NEON/RVV, more loop patterns, prefetch), not the core x86 FP
+vectorizer.
 
-**Implementation target:** new `passes/vectorize.rs`, extended x86/ARM/RISC-V backends
+## Phase 6 — Profile-Guided Optimization (Complete)
 
-**Estimated gain:** 2–4× on FP-heavy code; closes the matmul gap from 4.86× to ~1.5–2×
+**Status:** PGO is fully integrated as the `src/pgo/` module (v8–v11), with a
+GCC-compatible flag surface:
 
----
+```bash
+# generate + train
+ccc -O2 -fprofile-generate=/tmp/pgd main.c -o train   # instrumented build
+./train                                                 # run with real data
+# use
+ccc -O2 -fprofile-use=/tmp/pgd main.c -o main          # profile-guided build
+```
 
-## Phase 6 — Profile-Guided Optimization (Planned)
+What PGO currently drives:
 
-**Goal:** Use runtime profiles to guide inlining, block layout, and register allocation priorities.
+- **Edge-based profiling** — Knuth–Stevenson minimal edge counting with a
+  maximum-weight directed arborescence (exact loop-latch counts via flow
+  conservation), indirect-call value profiling, and fail-closed loading.
+- **Profile summary** — an LLVM `ProfileSummaryInfo` analogue with a *dominance*
+  hot/cold test (`has_spread`): the profile is only treated as informative when
+  one function uniquely dominates the runner-up, so flat profiles never perturb
+  the hot path.
+- **Inlining** — percentile-threshold hot/cold classification, a
+  label-independent entry-count-ratio force-inline for hot loop sites, and a
+  bounded force-inline budget.
+- **Block/function layout** — hot/cold sections, profile-driven switch lowering
+  and case ordering, and conservative (preserve-source-order) layout that never
+  perturbs register allocation.
+- **Cost-aware devirtualization** — indirect calls whose top target is ≥95%
+  (already BTB-predicted) are left indirect; only genuinely multi-valued sites
+  are promoted to guarded direct calls.
+- **Backend branch inversion** — the hot successor of a `CondBranch` falls
+  through (fewer taken branches) without reordering blocks.
 
-**Techniques:**
-- **Instrumented build** → collect branch frequencies, call counts, loop trip counts
-- **Cold code separation** — move unlikely blocks out of hot paths
-- **PGO-weighted inlining** — inline hot callees aggressively, skip cold ones
-- **PGO register hints** — weight allocator priorities by actual execution frequency
-
-**Expected gain:** ~1.2–1.5× general improvement across diverse workloads
+Measured effect: both former PGO *regressions* were eliminated — adler32 went
+from -17% to neutral, expat from -28% to ~1.01× (faster than plain) — and the
+multi-valued devirtualization path is a genuine 1.07× win. The full evidence
+lives in `hotspots/` and the PGO A/B harness
+(`tests/benchmark/run_pgo_ab.py`).
 
 ---
 
@@ -299,14 +332,23 @@ See the [Phase 4 write-up](/lccc/updates/phase4-loop-unrolling) for full details
 
 ## Remaining Gap to GCC
 
-After all phases, LCCC is within 1.3–1.8× of GCC -O2 on most workloads:
+On the canonical benchmark suite and workload-derived kernels, LCCC is within
+~1.0–1.5× of GCC -O2 on most workloads, and **ahead** of GCC on several
+(fib/tail-recursion via TCE, reduction vectorization, several vectorized
+kernels). The A/B methodology, raw numbers, and per-kernel ratios live in
+`tests/benchmark/` and `BENCHMARK_ANALYSIS.md`; the PGO-specific A/B is
+`tests/benchmark/run_pgo_ab.py`.
 
 | Source | Gap | Addressable? |
 |--------|-----|-------------|
-| Accumulator-based codegen | 1.2–1.5× on ALU-heavy code | Fundamental architecture limit |
-| Graph-coloring register allocation | ~1.1× on register-pressure code | Future (would require regalloc rewrite) |
-| Better function inlining | ~1.5× on call-heavy code | Planned |
+| Accumulator-based codegen | ~1.2–1.5× on ALU-heavy code | Partial — MachInst ISel expansion narrowed it; full block-level MachInst remains |
+| Graph-coloring register allocation | ~1.1× on register-pressure code | Future (regalloc rewrite) |
+| Call-heavy / outlined-code overhead | ~1.2× where the base inliner is conservative | In progress — PGO force-inline + inlining cost-model refinements |
 | Link-time optimization (LTO) | ~1.1× general | Future |
 | Instruction scheduling | ~1.1× on latency-bound code | Future |
+| Auto-vectorizer breadth (NEON/RVV) | variable | Future — core x86 FP vectorizer is at parity |
 
-The goal is not to beat GCC — it's to make CCC-compiled programs fast enough for real systems software, which means within ~1.5× of GCC on typical workloads.
+The goal is to make LCCC-compiled programs fast enough for real systems
+software — within ~1.5× of GCC on typical workloads, with targeted wins ahead of
+GCC where LCCC's pattern-based passes (TCE, reduction vectorization, PGO)
+excel.

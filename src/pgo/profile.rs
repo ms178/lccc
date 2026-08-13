@@ -1,4 +1,4 @@
-//! PGO v4 profile identity, deterministic merge, and fail-closed loading.
+//! Profile identity, deterministic merge, and fail-closed loading.
 use super::{FunctionProfile, ProfileData, ValueSite};
 use crate::ir::reexports::{IrFunction, Terminator};
 use crate::common::fx_hash::FxHashMap;
@@ -252,14 +252,17 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
             continue;
         }
         match a.next().unwrap_or("") {
-            "lccc-pgo-v3" | "lccc-pgo-v4" | "lccc-pgo-v5" => {
+            "lccc-pgo-v1" | "lccc-pgo-v3" | "lccc-pgo-v4" | "lccc-pgo-v5" => {
                 hash = a
                     .next()
                     .ok_or_else(|| bad(p, n, "missing hash"))?
                     .parse()
                     .map_err(|_| bad(p, n, "bad hash"))?;
                 let mut post_hash = hash;
-                if l.starts_with("lccc-pgo-v5") {
+                // v1 and v5 carry the full header (hash, post_hash, entry,
+                // unit); legacy v3/v4 carry only (hash, entry, unit) with
+                // post_hash == hash.
+                if l.starts_with("lccc-pgo-v1") || l.starts_with("lccc-pgo-v5") {
                     post_hash = a
                         .next()
                         .ok_or_else(|| bad(p, n, "missing post hash"))?
@@ -329,7 +332,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                     .saturating_add(c);
             }
             "v" => {
-                // v7 indirect-call value profile, two-line form:
+                // Indirect-call value profile, two-line form:
                 //   v <ordinal> <total> <sig>
                 //   <name> <count>
                 let _ = cur
@@ -352,7 +355,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                 pending_vp = Some((ordinal, total, sig));
             }
             x => {
-                // v3 block-count lines accepted for compatibility.
+                // legacy block-count lines accepted for compatibility.
                 let f = cur
                     .as_mut()
                     .ok_or_else(|| bad(p, n, "counter before func"))?;
@@ -437,8 +440,9 @@ pub fn get_for_unit_cfg<'a>(
 ///
 /// Used for debugging and profile inspection (`LCCC_PGO_DUMP_TEXT=<file>`),
 /// complementing the binary `.profraw` dump the instrumented runtime writes.
-/// The on-disk format mirrors `parse_file`'s `lccc-pgo-v3/v4/v5` text layout so
-/// the text dump can be re-loaded with `load_profile` for round-tripping.
+/// The on-disk format is the canonical `lccc-pgo-v1` text layout (see
+/// `parse_file`), so the text dump can be re-loaded with `load_profile` for
+/// round-tripping. The loader also tolerates legacy v3/v4/v5 tags.
 pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
     if let Some(q) = p.parent() {
         fs::create_dir_all(q)?
@@ -450,22 +454,15 @@ pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
         // back to a decimal u64 to keep the text output re-loadable.
         let unit_hex = n.split("::").next().unwrap_or("0");
         let unit_dec = u64::from_str_radix(unit_hex, 16).unwrap_or(0);
-        // v5 header carries both fingerprints and the entry label / unit id;
-        // fall back to v3 for legacy (post_hash == cfg_hash) so text output is
-        // re-loadable by the version-tolerant parser.
-        if x.post_hash != 0 && x.post_hash != x.cfg_hash {
-            writeln!(
-                f,
-                "lccc-pgo-v5 {} {} {} {}",
-                x.cfg_hash, x.post_hash, x.entry_label, unit_dec
-            )?;
-        } else {
-            writeln!(
-                f,
-                "lccc-pgo-v3 {} {} {}",
-                x.cfg_hash, x.entry_label, unit_dec
-            )?;
-        }
+        // The current profile format is a single canonical "lccc-pgo-v1"
+        // header carrying both structural fingerprints, the entry label, and
+        // the unit id. The loader is backward-tolerant of the legacy v3/v4/v5
+        // tags so profiles written by older compilers still load.
+        writeln!(
+            f,
+            "lccc-pgo-v1 {} {} {} {}",
+            x.cfg_hash, x.post_hash, x.entry_label, unit_dec
+        )?;
         writeln!(f, "func {}", n)?;
         for (s, d2) in &x.edge_counts {
             if s.0 == crate::pgo::instrument::VENTRY {
@@ -493,7 +490,7 @@ pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
 /// Derive every block count and every tree-edge count from the instrumented
 /// edge counts by flow conservation (Knuth–Stevenson / GCC gcov / LLVM).
 ///
-/// v7 rewrite: the previous solver only visited nodes reachable from the
+/// The solver previously only visited nodes reachable from the
 /// entry through UNKNOWN (tree) edges, so blocks reached through instrumented
 /// edges (the common case for loop bodies!) never got counts, and tree-edge
 /// derivation was incomplete. The correct algorithm:
@@ -510,7 +507,7 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
     use crate::ir::reexports::Terminator;
     use crate::pgo::instrument::{VENTRY, VEXIT};
     if fp.edge_counts.is_empty() {
-        return; // v3 block-count profile: nothing to derive
+        return; // legacy block-count profile: nothing to derive
     }
     fn succs(t: &Terminator) -> Vec<u32> {
         match t {

@@ -1,0 +1,45 @@
+Broaden FP Vectorization Beyond the Reduction Idiom
+====================================================
+Priority: HIGH
+
+Problem
+-------
+The reduction vectorizer (sum/dot, AVX2/SSE2) is in place and beats GCC on the
+simple reduction kernel, but three FP-heavy benchmarks still lag badly:
+spectral_norm 9.3×, nbody 3.9×, mandelbrot 3.2×. GCC vectorizes these general
+FP inner loops (and fuses FMA); LCCC emits scalar `mulsd`/`addsd`.
+
+What GCC does that LCCC doesn't
+-------------------------------
+1. **Loop vectorization of non-reduction loops** — elementwise `a[i] op b[i]`
+   bodies with independent outputs (not just reductions), using packed ops and
+   a remainder loop.
+2. **FMA fusion** — `a*b+c` chains fused to `vfmadd`, halving the FP-op count.
+3. **SLP vectorization** — packing the independent scalar ops inside one basic
+   block (e.g. the two or four `x`,`y`,`z` component computations in nbody).
+
+Plan
+----
+1. **Extend the loop vectorizer** from reductions to elementwise/independent
+   loops (detect no loop-carried dependency on the output, rewrite body to
+   packed intrinsics, add remainder).
+2. **Add FMA fusion** to the FP peephole / instruction selection: recognize
+   `mul` feeding an `add` and emit `vfmadd231pd`.
+3. **SLP-lite**: pack 2–4 independent scalar FP ops in one block into one SIMD
+   op when their addresses/offsets are affine and contiguous (targets nbody).
+
+Risks
+-----
+- Correctness: alignment, aliasing of the arrays, and exact FP semantics. Start
+  with the same conservative no-aliasing/alignment checks the reduction
+  vectorizer already uses; never reassociate FP without an explicit fast-math
+  flag.
+
+Measurable success
+------------------
+- spectral_norm / nbody / mandelbrot ratios drop toward ~1.5× or better.
+- No correctness or suite regression; bounded code growth.
+
+Key files
+- src/passes/vectorize.rs, src/backend/x86/codegen/intrinsics.rs
+- reference: LLVM LoopVectorizer + SLP, GCC tree-vectorize, Intel FMA guidance.

@@ -1324,10 +1324,10 @@ impl Driver {
             eprintln!("Lowered to {} IR functions", module.functions.len());
         }
 
-        // PGO v6 use side: load the profile directory (once per process —
+        // PGO use side: load the profile directory (once per process —
         // per-TU lookups are unit-keyed) and activate it for THIS unit before
         // any optimization pass runs, so PGO-guided inlining, loop unrolling
-        // and branch profiling see real counts. (Before v6 this path was
+        // and branch profiling see real counts. (Before this change, this path was
         // never connected: `-fprofile-use` compiled plain code, byte-identical
         // to `-O3` — verified on zlib-ng minigzip.)
         let pgo_use_dir = self
@@ -1338,7 +1338,7 @@ impl Driver {
             crate::pgo::init_pgo_profile(pgo_use_dir.as_deref());
             let u0 = crate::pgo::profile::unit_identity(input_file);
             crate::pgo::prepass_activate(&u0);
-            // v8: build the data-driven profile summary (percentile hot/cold
+            // Build the data-driven profile summary (percentile hot/cold
             // thresholds over the unit's count distribution — LLVM
             // ProfileSummaryInfo analogue) once per unit; inliner, unroller
             // and layout all consume it.
@@ -1354,7 +1354,7 @@ impl Driver {
             eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64());
         }
 
-        // v7: profile identity. The PRE-pass fingerprint (right after mem2reg,
+        // Profile identity. The PRE-pass fingerprint (right after mem2reg,
         // deterministic and profile-independent in both generate and use
         // builds) is the profile key; the POST-pass fingerprint (right after
         // run_passes) detects CFG drift from profile-guided transforms.
@@ -1393,7 +1393,7 @@ impl Driver {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
         }
 
-        // v7: post-pass fingerprint snapshot (the CFG drift detector). The
+        // Post-pass fingerprint snapshot (the CFG drift detector). The
         // pre-pass snapshot above was taken BEFORE optimization; this one is
         // taken after, at the same pipeline point in generate and use builds
         // (before promotion/instrumentation touch the CFG).
@@ -1411,7 +1411,7 @@ impl Driver {
             crate::pgo::stash_post_hashes(post);
         }
 
-        // v7: indirect-call value-profile promotion (use mode). Runs after
+        // Indirect-call value-profile promotion (use mode). Runs after
         // the main pass loop but BEFORE phi elimination, so SSA phis are
         // still valid; the re-inlined hot targets then go through the
         // regular pipeline (split ranges, phi elimination, codegen).
@@ -1503,7 +1503,7 @@ impl Driver {
             use crate::ir::instruction::BlockId;
             use crate::common::fx_hash::FxHashMap;
             let mut next_global_label = 0u32;
-            // v8: the renumber map also translates the promoted-hot block
+            // The renumber map also translates the promoted-hot block
             // labels recorded by the value-profiling promotion pass (which
             // runs before this pass); layout reads them AFTER renumbering.
             let mut renumber_map: FxHashMap<u32, u32> = FxHashMap::default();

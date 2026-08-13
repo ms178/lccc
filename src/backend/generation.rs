@@ -1453,7 +1453,7 @@ fn generate_function(
         let mi_enabled = cg.is_machinst_enabled();
 
         // Compute per-block use counts for liveness-aware MachInst store-back
-        // and for the v5 CCC_ENABLE_VECREG live-out flush (which compares
+        // and for the CCC_ENABLE_VECREG live-out flush (which compares
         // block-local uses against the function-wide total).
         cg.state().block_use_counts.clear();
         for inst in &block.instructions {
@@ -1577,7 +1577,7 @@ fn generate_function(
         // Flush MachInst buffer at end of block (before terminator)
         cg.flush_machinst();
 
-        // v5 CCC_ENABLE_VECREG: flush live-out register-held vector values to
+        // CCC_ENABLE_VECREG: flush live-out register-held vector values to
         // their slots so cross-block memory readers see the data.
         cg.flush_vecreg_liveout();
 
@@ -1811,7 +1811,7 @@ pub(super) fn generate_instruction(
                 global_addr_map,
             );
             cg.state().reg_cache.invalidate_all();
-            // v5 hardening: a scalar store through a pointer may alias a vector
+            // Hardening: a scalar store through a pointer may alias a vector
             // value's slot; the vector last-store peephole must not skip a
             // reload past a store that could have rewritten the slot.
             cg.flush_pending_vec_store();
@@ -2266,7 +2266,7 @@ fn generate_terminator(
             true_label,
             false_label,
         } => {
-            // v11: hand the profile-driven preferred-fallthrough successor
+            // Hand the profile-driven preferred-fallthrough successor
             // (the hot edge target, computed by the layout pass) to the
             // backend so the hot path falls through without reordering
             // blocks. Cleared immediately after emission.
@@ -2283,7 +2283,7 @@ fn generate_terminator(
             default,
             ty,
         } => {
-            // v8 F7: hand the profile-driven switch hint (cold -> chain,
+            // Hand the profile-driven switch hint (cold -> chain,
             // dominant case -> hoist) to the backend for this block.
             crate::pgo::set_switch_hint(crate::pgo::switch_hint(block_label));
             cg.emit_switch(val, cases, default, *ty);

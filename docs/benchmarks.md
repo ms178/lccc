@@ -41,6 +41,15 @@ are installed.  It uses the same explicit code-generation flag for every
 compiler (`-O2` by default); `-march=native` is opt-in rather than silently
 mixed into a baseline.
 
+**PGO A/B.** For profile-guided work there is a dedicated harness,
+[`tests/benchmark/run_pgo_ab.py`](../tests/benchmark/run_pgo_ab.py).  For each
+kernel and compiler it builds both a plain binary and a
+`-fprofile-generate → train → -fprofile-use` binary, verifies the outputs are
+identical (differential correctness), and reports paired bootstrap-CI
+PGO-vs-plain and lccc-vs-gcc speedups.  It was used to validate the PGO v10/v11
+changes (flat-profile gate, cost-aware devirtualization, conservative layout)
+and to confirm those builds no longer regress relative to plain.
+
 Build the compiler itself under the research build policy (Rust opt-level 1,
 exactly two Cargo jobs) with:
 
@@ -94,6 +103,43 @@ python3 tests/benchmark/run_benchmarks.py \
 For bare-metal Raptor Lake decisions, retain the same JSON/assembly artifacts
 and add PMU evidence (`cycles`, `instructions`, IPC, branches, cache/TLB and
 Top-Down metrics) in a controlled affinity/governor/thermal environment.
+
+## Current results (screening)
+
+A fresh run of the canonical runner (see the reproducible command above) on
+revision `77b4a18c` with `-O2`, 9 paired rounds, pinned to one KVM vCPU:
+
+| Benchmark | LCCC (ms) | GCC (ms) | LCCC/GCC |
+|---|---:|---:|---:|
+| fib | 2.4 | 170.3 | **0.014×** |
+| ackermann | 2.5 | 152.6 | **0.016×** |
+| constant_recursion | 2.4 | 150.1 | **0.016×** |
+| tce_sum | 2.1 | 2.1 | **0.98×** |
+| qsort | 138.5 | 125.7 | 1.09× |
+| strlen_bench | 241.4 | 222.0 | 1.09× |
+| arith_loop | 109.5 | 99.9 | 1.10× |
+| matmul | 8.5 | 7.1 | 1.21× |
+| fannkuch | 3073 | 2549 | 1.20× |
+| hash_table | 13164 | 10407 | 1.23× |
+| binary_trees | 1536 | 1243 | 1.23× |
+| glibc_memcmp | 12.3 | 9.4 | 1.35× |
+| sieve | 48.6 | 35.4 | 1.36× |
+| gzip_crc32 | 244.3 | 168.3 | 1.45× |
+| switch_dispatch | 739.7 | 502.4 | 1.47× |
+| zlib_ng_adler32 | 68.9 | 39.3 | 1.73× |
+| loop_patterns | 134.9 | 77.3 | 1.74× |
+| linux_find_bit | 27.7 | 15.2 | 1.83× |
+| bitops | 747.5 | 392.0 | 1.90× |
+| sqlite_varint | 54.7 | 26.4 | 2.06× |
+| mandelbrot | 4747 | 1490 | 3.19× |
+| expat_xml_scan | 134.1 | 40.7 | 3.29× |
+| nbody | 1187 | 308 | 3.88× |
+| spectral_norm | 1878 | 201 | 9.34× |
+| struct_copy | 585.5 | 27.9 | 21.06× |
+
+All 25 outputs matched GCC byte-for-byte. **Geometric mean 1.08×.** These are
+*screening* numbers (KVM vCPU, no PMU); a bare-metal Raptor Lake rerun with PMU
+evidence is required before hardware claims.
 
 ## Historical snapshot (not current evidence)
 

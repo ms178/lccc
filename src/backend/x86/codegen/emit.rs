@@ -672,7 +672,7 @@ impl X86Codegen {
         }
     }
 
-    /// v5 CCC_ENABLE_VECREG: at the end of a block, flush every register-held
+    /// CCC_ENABLE_VECREG: at the end of a block, flush every register-held
     /// vector value that is LIVE OUT (used outside this block) to its home
     /// slot, so any consumer that reads it through memory (memcpy src, call
     /// arg, alias store, sret copy) sees the data. The register still holds
@@ -3690,7 +3690,7 @@ impl ArchCodegen for X86Codegen {
         goto_labels: &[(String, BlockId)],
         input_symbols: &[Option<String>],
     ) {
-        // v5 lazy flush: inline asm may clobber XMM registers or read slots.
+        // Lazy flush: inline asm may clobber XMM registers or read slots.
         self.flush_pending_vec_store_impl();
         emit_inline_asm_common(
             self,
@@ -3719,7 +3719,7 @@ impl ArchCodegen for X86Codegen {
         input_symbols: &[Option<String>],
         seg_overrides: &[AddressSpace],
     ) {
-        // v5 lazy flush: inline asm may clobber XMM registers or read slots.
+        // Lazy flush: inline asm may clobber XMM registers or read slots.
         self.flush_pending_vec_store_impl();
         crate::backend::inline_asm::emit_inline_asm_common_impl(
             self,
@@ -3760,7 +3760,7 @@ impl ArchCodegen for X86Codegen {
 
     // All remaining methods delegate to self.method_name_impl(args...)
     delegate_to_impl! {
-        // v5 CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
+        // CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
         fn flush_vecreg_liveout(&mut self) => flush_vecreg_liveout_impl;
         // prologue
         fn calculate_stack_space(&mut self, func: &IrFunction) -> i64 => calculate_stack_space_impl;

@@ -30,68 +30,94 @@ are documented in [`tests/benchmark/WORKLOAD_PROVENANCE.md`](tests/benchmark/WOR
 
 See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
 
-# LCCC v3 Performance & Size Report
+# LCCC Performance Report
 
-## Baseline Fingerprints
+> **Screening evidence.** The numbers below were produced by the canonical
+> runner [`tests/benchmark/run_benchmarks.py`](tests/benchmark/run_benchmarks.py)
+> in a KVM-exposed VM (`hypervisor_detected: true`) with **no PMU**; they rank
+> code-generation work and are *not* microarchitectural claims. Reproduce on a
+> bare-metal Intel i7-14700KF with PMU evidence before treating any number as a
+> hardware result.
 
-- **GCC**: gcc (GCC) 16.1.1 20260803 (CachyOS), x86_64-pc-linux-gnu
-- **Rust**: rustc 1.97.1 (8bab26f4f 2026-07-14)
-- **LCCC**: v3 build from dd99046c + ms178-1.patch (100 lines), release -O2 -j2
-- **Hardware target**: Intel i7-14700KF (Raptor Lake), no AVX-512
+## Baseline fingerprints
 
-## A/B Benchmark: LCCC v3 vs GCC 16.1.1 (7 rounds, -O3 -march=raptorlake)
+- **LCCC**: revision `77b4a18c` (+ current working tree, `lccc-pgo-v1` profile
+  format), built `cargo build --release` (Rust opt-level 1, two jobs), swap on.
+- **GCC**: gcc (Debian 14.2.0-19) 14.2.0.
+- **Flags**: `-O2` for both compilers (uniform).
+- **Environment**: Linux 6.1, Intel Xeon 2.60 GHz vCPU, `taskset` pinned to one
+  CPU, 9 paired timed rounds + 2 excluded warm-ups, randomized compiler order
+  per round, seed `20260813`.
+- **Correctness**: all 25 reported benchmarks produced **byte-identical output**
+  between LCCC and GCC; outliers are counted and reported, never discarded.
 
-| Benchmark | LCCC (ms) | GCC (ms) | Ratio | Δ vs baseline |
-|---|---:|---:|---:|---|
-| arith_loop | 107 | 104 | 1.04× | -7% |
-| fib | 2.5 | 151 | 0.017× (58×f) | — |
-| matmul | 9.0 | 5.0 | 1.83× | -3% |
-| sieve | 56 | 37 | 1.46× | -4% |
-| tce_sum | 2.1 | 1.8 | 1.19× | — |
-| **nbody** | **1197** | 229 | **5.23×** | **-36%!** |
-| binary_trees | 1647 | 1400 | 1.18× | — |
-| **spectral_norm** | **1878** | 196 | **9.57×** | **-26%!** |
-| **mandelbrot** | **4760** | 1123 | **4.23×** | **-11%!** |
-| hash_table | 12354 | 9641 | 1.26× | — |
-| strlen_bench | 256 | 223 | 1.15× | — |
-| switch_dispatch | 741 | 494 | 1.50× | — |
-| struct_copy | 585 | 42 | 14.02× | — |
-| loop_patterns | 134 | 68 | 2.00× | — |
-| fannkuch | 3068 | 2864 | 1.07× | — |
-| ackermann | 2.4 | 149 | 0.016× (61×f) | — |
-| constant_recursion | 2.4 | 149 | 0.016× (61×f) | — |
-| bitops | 754 | 318 | 2.35× | — |
-| gzip_crc32 | 244 | 168 | 1.46× | — |
-| zlib_ng_adler32 | 67 | 39 | 1.75× | — |
-| expat_xml_scan | 130 | 31 | 4.14× | — |
-| sqlite_varint | 54 | 23 | 2.38× | — |
-| linux_find_bit | 26 | 12 | 2.18× | — |
-| glibc_memcmp | 12 | 10 | 1.15× | — |
+## A/B benchmark: LCCC vs GCC -O2
 
-**Geometric mean**: 1.16× slower (improved from 1.20× baseline)
+| Benchmark | LCCC (ms) | GCC (ms) | LCCC/GCC |
+|---|---:|---:|---:|
+| fib | 2.4 | 170.3 | **0.014× (70× faster)** |
+| ackermann | 2.5 | 152.6 | **0.016× (63× faster)** |
+| constant_recursion | 2.4 | 150.1 | **0.016× (62× faster)** |
+| tce_sum | 2.1 | 2.1 | **0.98×** |
+| qsort | 138.5 | 125.7 | 1.09× |
+| strlen_bench | 241.4 | 222.0 | 1.09× |
+| arith_loop | 109.5 | 99.9 | 1.10× |
+| matmul | 8.5 | 7.1 | 1.21× |
+| fannkuch | 3073 | 2549 | 1.20× |
+| hash_table | 13164 | 10407 | 1.23× |
+| binary_trees | 1536 | 1243 | 1.23× |
+| glibc_memcmp | 12.3 | 9.4 | 1.35× |
+| sieve | 48.6 | 35.4 | 1.36× |
+| gzip_crc32 | 244.3 | 168.3 | 1.45× |
+| switch_dispatch | 739.7 | 502.4 | 1.47× |
+| zlib_ng_adler32 | 68.9 | 39.3 | 1.73× |
+| loop_patterns | 134.9 | 77.3 | 1.74× |
+| linux_find_bit | 27.7 | 15.2 | 1.83× |
+| bitops | 747.5 | 392.0 | 1.90× |
+| sqlite_varint | 54.7 | 26.4 | 2.06× |
+| mandelbrot | 4747 | 1490 | 3.19× |
+| expat_xml_scan | 134.1 | 40.7 | 3.29× |
+| nbody | 1187 | 308 | 3.88× |
+| spectral_norm | 1878 | 201 | 9.34× |
+| struct_copy | 585.5 | 27.9 | 21.06× |
 
-**Key wins**: nbody -36%, spectral_norm -26%, mandelbrot -11%, arith_loop -7%
+**Aggregate (n = 25 correct pairs):** geometric mean **1.08×**, arithmetic mean
+2.59× (pulled up by the struct_copy outlier). LCCC is **faster than GCC on
+tail-recursion and constant-recursion** workloads (fib/ackermann ~60–70× via
+TCE + recursion-to-iteration), at parity on `tce_sum`, and within ~1.1–1.5× of
+GCC on most integer/ALU/loop kernels.
 
-## Optimizations Applied in v3
+## Where LCCC wins
 
-1. **RHS XMM register direct**: When RHS of FP binop is in xmm3-xmm7, operate directly
-   (saves 2-3 instructions per FP chain operation)
-2. **AVX2 memcpy 32B**: vmovdqu ymm0 replaces 2x movdqu xmm0 (halves uops)
-3. **FP regression test**: fp_domain_crossing.c (6 categories, all PASS)
+- **Tail-call elimination (TCE)** and **binary recursion-to-iteration**: fib,
+  ackermann, constant_recursion — 60–70× faster than GCC (GCC keeps the
+  exponential recursion).
+- **Reduction vectorization**: LCCC vectorizes simple `sum`/`dot` reductions to
+  4-wide AVX2 where GCC `-O3` leaves them scalar (~2.7× faster on the reduction
+  kernel).
+- **Profile-guided optimization**: `-fprofile-generate`/`-fprofile-use` is fully
+  integrated (inlining, unrolling, layout, switch lowering, cost-aware
+  devirtualization) with **no PGO-induced regressions** on the workload kernels.
 
-## Root Cause of Remaining Gap
+## Root cause of the remaining gap
 
-The primary remaining gap is **no auto-vectorization**. GCC uses AVX2 4-wide double
-operations (vdivpd, vmulpd, vaddsd with ymm registers) for FP reductions. LCCC is
-fully scalar. This accounts for:
+The largest remaining gaps are FP/struct-by-value and branch-heavy byte scanning:
 
-- spectral_norm 9.57× (GCC vectorizes the inner loop 4-wide)
-- nbody 5.23× (GCC vectorizes the force computation)
-- mandelbrot 4.23× (GCC vectorizes the iteration loop)
+- **struct_copy (21×)** — struct by-value passing/copying is the single biggest
+  gap; GCC lowers multi-field copies to a few wide moves while LCCC routes each
+  field through the accumulator.
+- **spectral_norm (9.3×) / nbody (3.9×) / mandelbrot (3.2×)** — GCC vectorizes
+  these FP inner loops (and uses FMA); LCCC's reduction vectorizer covers only
+  the simple reduction idiom, not the general FP loops here.
+- **expat_xml_scan (3.3×)** — byte scanning with many small branches; GCC folds
+  the character classification into compare/range/bit-test instructions.
+- **bitops / find_bit / varint (1.8–2.1×)** — bit-scan selection and branch
+  layout.
 
-## Future Work (v4+)
+## Planned work (see `hotspots/` and `ideas/`)
 
-- Auto-vectorizer for FP reductions (~5-10× on FP benchmarks)
-- LHS XMM direct with proper register cache invalidation
-- Loop unrolling pass
-- Struct copy / ABI optimization (14× gap)
+- Struct-by-value ABI and wide (vectorized) aggregate copies.
+- Broadening the auto-vectorizer (non-reduction FP loops, FMA fusion).
+- Instruction scheduling for the Raptor Lake port/resource model.
+- Sample-based PGO and PGO value specialization.
+- Use-def-chain shared optimizer context.

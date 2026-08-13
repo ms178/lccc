@@ -28,7 +28,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     if std::env::var("LCCC_PGO_NO_LAYOUT").is_ok() {
         return;
     }
-    // v8 F7: fresh per-unit switch-hint map (labels are TU-unique post
+    // Fresh per-unit switch-hint map (labels are TU-unique post
     // renumber; layout runs immediately before codegen for this unit).
     crate::pgo::record_switch_hints(crate::common::fx_hash::FxHashMap::default());
     // v11: fresh per-unit conditional-branch fallthrough map.
@@ -47,7 +47,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         // block count 0: chain ordering degenerated and every switch block
         // looked cold.
         //
-        // v9 (red-team audit): edge-derived block layout is ONLY sound for
+        // Edge-derived block layout is ONLY sound for
         // functions whose post-pass CFG matches the training build (the
         // drift gate). A drifted function's surviving edge labels no longer
         // denote the same CFG edges, so reordering on them would scatter
@@ -64,7 +64,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
                 None => continue,
             },
         };
-        // v8: hot/cold section classification via the data-driven summary
+        // Hot/cold section classification via the data-driven summary
         // (percentile thresholds over the unit's count distribution) with
         // the v7 ratio as fallback when no summary is available.
         let (hot, cold) = match crate::pgo::summary::get_summary() {
@@ -82,7 +82,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         layout_function(f, fp, u, edges_valid);
     }
 
-    // v8: order functions by hotness class within the TU — hot first, cold
+    // Order functions by hotness class within the TU — hot first, cold
     // last — for I-cache-friendly object layout (GCC -freorder-functions).
     // Declarations and helper functions keep their relative order (class 3).
     if crate::pgo::summary::get_summary().is_some() {
@@ -198,7 +198,7 @@ fn layout_function(
         };
         counts.insert(b.label, c);
     }
-    // v9 drift gate: when the edge profile is not trustworthy (drifted or a
+    // Drift gate: when the edge profile is not trustworthy (drifted or a
     // raw/entry-only fallback), skip the chain-based block reordering and the
     // edge-frequency switch-case sorting — they would scatter blocks by stale
     // weights. Preserve original order (still run hot/cold sectioning,
@@ -222,11 +222,11 @@ fn layout_function(
         f.blocks.clone()
     };
 
-    // v8 F7: profile-driven switch hints. For every Switch block:
+    // Profile-driven switch hints. For every Switch block:
     //   * cold per the summary -> force a compare chain (no jump table);
     //   * a case carrying >= 50% of the block's executions -> record it for
     //     hoisting out of the jump table (profile-guided partitioning).
-    // v9: hot-case hoisting uses edge counts, so it is only sound when the
+    // Hot-case hoisting uses edge counts, so it is only sound when the
     // edge profile is valid; cold classification uses block counts (stable).
     if crate::pgo::summary::get_summary().is_some() {
         use crate::ir::reexports::Terminator;
@@ -273,7 +273,7 @@ fn layout_function(
         }
     }
 
-    // v8: keep promoted (devirtualized) hot blocks adjacent to their
+    // Keep promoted (devirtualized) hot blocks adjacent to their
     // predecessor. The chain heuristic can strand them at the function
     // tail (their edges to a mid-chain block never merge), hurting the hot
     // path — observed in zlib-ng deflate_quick.

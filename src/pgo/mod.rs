@@ -1,4 +1,6 @@
-//! PGO v4: fail-closed post-optimization profiling with safe profile merging.
+//! Profile-guided optimization: fail-closed, post-optimization profiling with safe
+//! profile merging, and the consumers (inlining, unrolling, layout,
+//! devirtualization) that a loaded profile drives.
 pub(crate) mod branch_prob;
 pub(crate) mod inline_pgo;
 pub(crate) mod instrument;
@@ -188,7 +190,7 @@ pub fn promoted_hot_labels(u: &str, fname: &str) -> FxHashSet<u32> {
         .unwrap_or_default()
 }
 
-/// v8 F7: profile-driven switch lowering hint for one switch block.
+/// Profile-driven switch lowering hint for one switch block.
 /// `hot_case` = the case value/target that accounts for >= 50% of the
 /// block's executions (hoist it out of the jump table — LLVM's
 /// profile-guided switch partitioning); `force_chain` = the switch block is
@@ -331,7 +333,7 @@ pub fn init_pgo_profile(path: Option<&str>) {
         Some(p) => match profile::load_profile(p) {
             Ok(x) => {
                 eprintln!(
-                    "lccc: PGO v3: loaded {} functions from {}",
+                    "lccc: PGO: loaded {} functions from {}",
                     x.functions.len(),
                     p
                 );
@@ -369,7 +371,7 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
         if f.is_declaration || f.blocks.is_empty() {
             continue;
         }
-        // v7: identity is the PRE-pass fingerprint (stable across gen/use);
+        // Identity is the PRE-pass fingerprint (stable across gen/use);
         // the post-pass fingerprint detects CFG drift from PGO transforms.
         let h0 = pre_hash_for(&f.name);
         let Some(fp) = profile::get_for_unit_cfg(p, u, &f.name, h0) else {
@@ -384,13 +386,13 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
     ACTIVE_PROFILE_VALID.with(|valid| valid.set(good > 0));
     if bad > 0 {
         eprintln!(
-            "lccc: PGO v7: no profile for {} function(s) in this unit (new/changed code?)",
+            "lccc: PGO: no profile for {} function(s) in this unit (new/changed code?)",
             bad
         )
     }
     if drifted > 0 {
         eprintln!(
-            "lccc: PGO v7: {} function(s) drifted from the training CFG (PGO-guided transforms); edge profiles degrade gracefully",
+            "lccc: PGO: {} function(s) drifted from the training CFG (PGO-guided transforms); edge profiles degrade gracefully",
             drifted
         )
     }
@@ -432,7 +434,7 @@ pub fn propagate_profile(m: &mut IrModule, u: &str) {
     }
     if drifted_edges > 0 {
         eprintln!(
-            "lccc: PGO v9: {} function(s) drifted from the training CFG: \
+            "lccc: PGO: {} function(s) drifted from the training CFG: \
              edge-derived branch/layout/unroll data disabled for them (hot/cold sections kept)",
             drifted_edges
         );

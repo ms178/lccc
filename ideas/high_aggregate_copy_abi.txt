@@ -1,0 +1,57 @@
+Aggregate By-Value ABI and Wide Copy Lowering
+==============================================
+Priority: HIGH (largest measured gap: struct_copy 21×)
+
+Problem
+-------
+`tests/benchmark/programs/struct_copy.c` is 21× slower than GCC. The by-value
+copy path lowers every aggregate copy field-by-field through the accumulator:
+`movq %xmm0,%rax; movq %rax,%xmmN` for each double field, plus a separate
+`movslq`/store per scalar field. The benchmark function uses 137 `mov`-class
+instructions vs GCC's 29. This is the single largest measured LCCC-vs-GCC gap.
+
+Root causes
+-----------
+1. **No aggregate-copy recognition.** A multi-field struct copy is emitted as N
+   independent scalar moves instead of a wide (packed/block) copy.
+2. **By-value ABI not exploited.** The SysV AMD64 ABI passes/returns aggregates
+   up to 16 bytes in two registers (rax/rdx or xmm0/xmm1) and uses SSE registers
+   for small structs; LCCC routes everything through the stack + accumulator.
+3. **No hidden-result (sret) copy elision.** Large returns are copied twice.
+
+What to build (in increasing value/complexity)
+----------------------------------------------
+A) **Wide aggregate copy** — detect a run of adjacent scalar store/load
+   instructions that together copy one aggregate and replace it with packed
+   moves (`movups xmm` / `vmovdqu ymm`) + a short scalar tail. This alone should
+   close most of the 21× on struct_copy.
+
+B) **In-register aggregate ABI** — for aggregates ≤ 16 bytes, keep the value in
+   rax/rdx (or xmm0/xmm1) across calls and returns instead of spilling to the
+   stack; handle the caller's field access directly off the register.
+
+C) **sret copy elision** — when a function returns a large aggregate via a hidden
+   result pointer and the caller immediately copies it out, fuse the return store
+   with the caller's destination store.
+
+Risks
+-----
+- Must preserve the **exact C ABI** for external functions (extern calls must
+  still use the register/stack convention the caller expects) and observable
+  struct layout/padding.
+- Wide copies must not overrun trailing padding or misalign a following
+  `movsd`/`movaps`. Start conservative: only rewrite when the field offsets are
+  contiguous and known at compile time.
+
+Measurable success
+------------------
+- struct_copy ratio 21× → well under 2×.
+- No >1% regression on the broad suite; bounded `.text`.
+- A real struct-heavy package (e.g. an emulator or a vector-of-structs kernel)
+  shows the same improvement, not just the synthetic kernel.
+
+Key files
+- src/backend/x86/codegen/memory.rs, src/backend/x86/codegen/emit.rs
+- src/backend/x86/codegen/calls.rs (ABI), src/backend/call_abi.rs
+- reference: SysV AMD64 ABI; GCC's `expand_assignment` wide-copy; LLVM
+  `SelectionDAG` aggregate copy + `TargetLowering::LowerCall`.

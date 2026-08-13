@@ -1,6 +1,6 @@
 //! Profile-guided inlining with a bounded, frequency-aware budget.
 //!
-//! v8: hotness classification is DATA-DRIVEN via the profile summary
+//! Hotness classification is DATA-DRIVEN via the profile summary
 //! (`summary::ProfileSummary`, an LLVM `ProfileSummaryInfo` analogue):
 //! percentile thresholds computed from the unit's count distribution replace
 //! the v6/v7 magic ratios (`relative_frequency >= 0.10/0.05/0.005`).
@@ -29,8 +29,8 @@ fn entry_counts(caller: &IrFunction, callee: &IrFunction, p: &ProfileData) -> (u
     }
 }
 
-/// v8: summary-driven threshold multiplier. When no summary is available the
-/// v7 relative-frequency ratios are used as a fallback.
+/// Summary-driven threshold multiplier. When no summary is available the
+/// legacy relative-frequency ratios are used as a fallback.
 pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) -> f64 {
     let cf = p.relative_frequency(caller);
     let df = p.relative_frequency(callee);
@@ -55,7 +55,7 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
             1.0
         }
     } else {
-        // v7 relative-frequency fallback (no summary): same rule — the 1.75
+        // legacy relative-frequency fallback (no summary): same rule — the 1.75
         // bonus needs a real hot/cold spread, else it over-inlines.
         let m = p
             .functions
@@ -110,7 +110,7 @@ pub fn should_inline_normal(
     should_inline_impl(caller, callee, cf, df, 0, p)
 }
 
-/// v8: call-site-aware decision. `site_count` is the derived count of the
+/// Call-site-aware decision. `site_count` is the derived count of the
 /// block containing the call (0 when unknown → entry-count-only behavior).
 pub fn should_inline_site(
     caller: &IrFunction,

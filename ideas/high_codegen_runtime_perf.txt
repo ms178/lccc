@@ -4,12 +4,15 @@ Priority: HIGH
 
 Remaining bottlenecks (profiled on zlib vs GCC -O2):
 
-1. LOOP INDUCTION VARIABLE STRENGTH REDUCTION
+1. LOOP INDUCTION VARIABLE STRENGTH REDUCTION  [DONE + EXTENDED]
    Array accesses in loops compute index*stride every iteration:
      movslq i, %rax; shlq $2, %rax; addq base, %rax; movl (%rax), ...
    Should increment a pointer instead: addq $4, %rdi; movl (%rdi), ...
-   Fix: Loop strength reduction pass (iv_strength_reduce.rs exists but
-   may need extension for pointer-based induction variables).
+   STATUS: `iv_strength_reduce.rs` is implemented and enabled by default
+   (safe disjoint-loop IVSR), with equivalent-address `(IV, stride, base)`
+   coalescing. A nested/overlapping-loop safety guard was added (P0) to fix a
+   wrong-result case. Remaining: the `univsr` universal variant is still
+   gated behind a full SSA/use-def repair before reconsideration.
 
 2. REDUNDANT SIGN EXTENSIONS (partially addressed)
    The lowering emits Cast i32->i64 for array indices even when the

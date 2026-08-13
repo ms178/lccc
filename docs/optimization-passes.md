@@ -44,12 +44,28 @@ The optimizer runs up to three full iterations. Each iteration runs this pipelin
 
 **Phase 0** (before the loop):
 - Tail-call elimination (TCE) — converts self-recursive tail calls to loops
-- Function inlining
+- Function inlining (including the **post-structural** inlining round after
+  TCE/rec2iter)
+- `recursion_to_iter` (rec2iter) — non-tail binary recursion to iterative
+  accumulators
 - mem2reg
 - Initial constant-fold/copy-prop round
 - **Vectorization** (iteration 0 only) — transforms reduction loops to AVX2/SSE2 SIMD
 
-**Phase 11** (after the loop): dead static function elimination — removes `static inline` functions that became unreferenced after inlining.
+**Phase 11** (after the loop):
+- dead static function elimination — removes `static inline` functions that
+  became unreferenced after inlining
+- **Outline switch** — large cold switches lowered out of line when beneficial
+
+Additional passes in the pipeline (see `src/passes/`): `resolve_asm` (inline-asm
+symbol resolution), `vector_temp_promotion` (SIMD temp slot promotion), and the
+standalone `univsr` (universal induction-variable strength reduction) pass that
+runs under explicit control.
+
+**PGO** (`src/pgo/`) wraps the optimizer: with `-fprofile-generate` it
+instruments the post-optimization IR; with `-fprofile-use` it drives inlining,
+loop unrolling, block/function layout, switch lowering, and indirect-call
+devirtualization from a runtime profile. See the PGO section below.
 
 ## Convergence
 
@@ -232,3 +248,77 @@ LCCC_DEBUG_PROTECT=1      # Show stack slot protection decisions
 ```
 
 ---
+
+## PGO (Profile-Guided Optimization)
+
+PGO is implemented in `src/pgo/` and wraps the pass pipeline. It uses the
+GCC-compatible flag surface: `-fprofile-generate[=dir]`,
+`-fprofile-use[=dir]`, `-fbranch-probabilities`, `-fauto-profile`, and
+`-fprofile-update=atomic|single`.
+
+### Profile generation (instrumentation)
+
+`instrument.rs` instruments the *post-optimization* IR so no optimization pass
+ever sees a counter. For each function it:
+
+1. builds the CFG (with a virtual EXIT node for `return`-terminated blocks);
+2. chooses the edges to count with a **maximum-weight directed arborescence**
+   (backedges and cycle edges stay off the counter path; every non-entry node,
+   including loop latches, keeps exactly one incoming tree edge);
+3. emits a single `incq sym+off(%rip)` per counted edge (or a `lock`-prefixed
+   increment under `-fprofile-update=atomic`), splitting critical edges so a
+   counter never sits between a fused `cmp` and its branch;
+4. instruments **indirect-call value profiling** (top-4 callee slots per site).
+
+At runtime the counters are dumped to `lccc-<unit>-<pid>.profraw` files (or the
+`LCCC_PROFILE_FILE` / `LLVM_PROFILE_FILE` override) and merged deterministically.
+
+### Profile use
+
+`profile.rs` loads the `.profraw` text format (multi-file merge, version-tolerant
+parsing, per-file corruption tolerance) and `derive_block_counts` recovers every
+block count and tree-edge count from the instrumented edges by **flow
+conservation**.
+
+**Identity & drift:** profiles are keyed by a PRE-pass CFG fingerprint (stable
+across generate/use). A POST-pass fingerprint detects CFG drift from PGO-guided
+transforms; drifted functions keep their stable entry count for hot/cold
+*sections* but get **no** stale edge-derived data (fail-closed).
+
+**Profile summary** (`summary.rs`): an LLVM `ProfileSummaryInfo` analogue. The
+hot/cold thresholds come from the count distribution, and `has_spread()` tests
+whether one function uniquely dominates the runner-up — the gate that keeps a
+**flat** profile from perturbing the hot path.
+
+### Consumers
+
+- **Inlining** (`inline_pgo.rs`): percentile hot/cold classification,
+  label-independent entry-count-ratio force-inline for hot loop sites, bounded
+  force-inline budget, and a working hotness threshold multiplier.
+- **Loop unrolling** (`unroll_pgo.rs`): derived trip count (`backedge / entry`)
+  drives whether hot high-trip loops unroll and cold low-trip loops do not.
+- **Layout** (`layout.rs`): hot/cold function sections, profile-driven switch
+  lowering (dominant case hoisted out of a jump table; cold switches forced to a
+  compare chain), switch-case ordering, and conservative
+  (preserve-source-order) block layout that never perturbs register allocation.
+- **Devirtualization** (`promote.rs`): cost-aware indirect-call promotion — a
+  site whose top target is ≥95% of calls is already BTB-predicted and left
+  indirect; genuinely multi-valued sites are promoted to a guarded direct call.
+- **Backend branch inversion**: the hot successor of a `CondBranch` is made the
+  physical fall-through so the hot path takes no branch, without reordering
+  blocks.
+
+### Debug / tuning knobs
+
+```bash
+CCC_INLINE_DEBUG=1          # explain inliner decisions
+LCCC_DEBUG_LAYOUT=1         # layout decisions
+LCCC_DEBUG_PROMOTE=1        # devirtualization decisions
+LCCC_PGO_NO_LAYOUT=1        # disable PGO layout
+LCCC_PGO_PROMOTE_STABLE=95  # top-share % treated as "already predicted"
+LCCC_PGO_HOT_FRAC / LCCC_PGO_COLD_FRAC  # summary percentiles
+```
+
+The PGO A/B harness — `tests/benchmark/run_pgo_ab.py` — builds plain and
+profile-guided binaries for lccc and a reference compiler, verifies differential
+output equivalence, and reports paired bootstrap-CI speedups.

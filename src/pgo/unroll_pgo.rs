@@ -1,6 +1,6 @@
 //! Profile-guided loop unrolling.
 //!
-//! v8: decisions are based on the ESTIMATED TRIP COUNT where the
+//! Decisions are based on the ESTIMATED TRIP COUNT where the
 //! flow-conservation solver has derived edge counts (post-pass):
 //! `trip = backedge_count / entry_count` (average iterations per call).
 //! Hot high-trip-count loops unroll; cold or low-trip loops do not — no code

@@ -1,0 +1,59 @@
+Sample-Based PGO (perf/LBR) to Complement Instrumentation PGO
+===============================================================
+Priority: HIGH
+
+Problem
+-------
+The current PGO is instrumentation-based. Two real limits showed up in the
+v10/v11 audit:
+
+1. A function that is *fully inlined in the training build* has no profile
+   entry, so at use time it looks "cold/absent" and the PGO inliner cannot see
+   it is hot. This is exactly the expat `xml_name_continue` gap — the hot
+   helper was inlined during training, so its entry count is 0.
+
+2. Instrumentation changes the code it measures (every `incq` perturbs the
+   branch predictor and the counter placement can change scheduling), and a
+   training run is a separate build.
+
+Sample-based profiling (LLVM `-fprofile-sample-use` / GCC AutoFDO) measures the
+*actual* un-instrumented binary via hardware sampling (LBR/IP-based). It has:
+- zero runtime overhead in training (uses perf);
+- no counter-perturbation;
+- full-program visibility including functions inlined in the previous build.
+
+What to build
+-------------
+Phase 1: **perf record → profile parser → reuse the existing summary/layout.**
+  - `perf record -b -e cycles` on the plain `-O2` binary with a representative
+    workload; `perf report`/`perf script` gives per-address hit counts.
+  - Map addresses → function + (roughly) block, using the same label mapping as
+    instrumentation. Feed a `ProfileData` (block_counts + entry counts) into the
+    existing `summary.rs`, `inline_pgo.rs`, and `layout.rs` consumers unchanged.
+  - Cost: a new `src/pgo/sample.rs` parser + a driver hook for a `.prof` file;
+    the whole downstream PGO machinery is reused.
+
+Phase 2: **line/sample attribution for the inlined-in-training gap.**
+  - When a sampled address falls in code attributed (by debug line info) to a
+    source function whose body is now inlined, credit that function's entry
+    count via the call graph. This closes the "inlined in training" hole that
+    instrumentation cannot see.
+
+Why it is worth it
+------------------
+- Complements, not replaces, instrumentation PGO (instrumentation is precise;
+  sampling is cheap and complete).
+- Closes the single biggest correctness-of-profile gap found in the audit.
+- The downstream machinery already exists; the marginal cost is a parser.
+
+Measurement plan
+----------------
+1. Generate a `perf` profile for expat_xml_scan on a bare-metal host.
+2. Verify the sample-derived profile makes the inliner see `xml_name_continue`.
+3. A/B sample-PGO vs plain vs instrumentation-PGO (run_pgo_ab.py or a sibling).
+4. Keep instrumentation as the default; expose `-fauto-profile=<file>` to match
+   GCC/LLVM flag semantics.
+
+Key files
+- src/pgo/sample.rs (new), src/pgo/mod.rs, src/driver/pipeline.rs
+- reference: LLVM InstrProf/ProfileSampleLoader, GCC gcov->AutoFDO

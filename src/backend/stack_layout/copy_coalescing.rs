@@ -1265,7 +1265,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
 }
 
 /// Values whose vector-result store can be DEFERRED (skipped entirely) — the
-/// v5 "accumulator renaming" optimization.
+/// "Accumulator renaming" optimization.
 ///
 /// A vector intrinsic (e.g. `_mm_xor_si128`) computes its result in
 /// %xmm0/%ymm0 and normally stores it to its dest slot; the single-entry
