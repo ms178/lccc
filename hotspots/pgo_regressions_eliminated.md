@@ -1,4 +1,4 @@
-# PGO v10/v11 — measured regressions eliminated, devirtualization made cost-aware
+# Profile-guided optimization — measured regressions eliminated, devirtualization made cost-aware
 
 Status: `integrated` — correctness, differential testing, real workloads, and
 regression policy passed. Hardware (Raptor Lake PMU) follow-up remains.

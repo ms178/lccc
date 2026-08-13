@@ -51,7 +51,8 @@ to regenerate them must stay in the repository.
 ## Current entries
 
 - [`RESEARCH_BACKLOG.md`](RESEARCH_BACKLOG.md) — prioritized, evidence-linked
-  optimization queue (now including the integrated PGO v10/v11 items and new
+  optimization queue (now including the integrated profile-guided optimization
+  items and new
   research spikes such as use-def chains, PGO loop-versioned devirtualization,
   and sample-based PGO).
 - [`expat_xml_scan_static_leaf_inlining.md`](expat_xml_scan_static_leaf_inlining.md)

@@ -259,13 +259,14 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
     requested = [item.strip().lower() for item in args.compilers.split(",") if item.strip()]
     aliases = {"icc": "icx"}
     requested = [aliases.get(item, item) for item in requested]
-    known = {"lccc", "gcc", "clang", "icx"}
+    known = {"lccc", "ccc", "gcc", "clang", "icx"}
     unknown = [item for item in requested if item not in known]
     if unknown:
         raise ValueError(f"unknown compiler key(s): {', '.join(unknown)}")
 
     candidates = {
         "lccc": ("LCCC", args.lccc),
+        "ccc": ("CCC", args.ccc),
         "gcc": ("GCC", args.gcc),
         "clang": ("Clang", args.clang),
         "icx": ("ICX", args.icx),
@@ -281,9 +282,9 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
         if not executable:
             unavailable[key] = f"not found: {supplied}"
             continue
-        if key == "lccc":
+        if key in ("lccc", "ccc"):
             if not gcc_include:
-                unavailable[key] = "GCC builtin include directory unavailable (needed for LCCC headers)"
+                unavailable[key] = "GCC builtin include directory unavailable (needed for compiler headers)"
                 continue
             flags = (f"-I{gcc_include}", args.opt, *args.cflag)
         else:
@@ -1003,11 +1004,12 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="list benchmark IDs and exit")
     parser.add_argument("--only", action="append", help="comma-separated benchmark IDs; may be repeated")
     parser.add_argument("--compilers", default="lccc,gcc,clang,icx",
-                        help="ordered compiler keys from lccc,gcc,clang,icx (default: %(default)s)")
+                        help="ordered compiler keys from lccc,ccc,gcc,clang,icx (default: %(default)s)")
     parser.add_argument("--lccc", default=str(DEFAULT_LCCC), help="path to LCCC executable")
     parser.add_argument("--gcc", default="gcc", help="GCC executable")
     parser.add_argument("--clang", default="clang", help="Clang executable")
     parser.add_argument("--icx", default="icx", help="ICX executable")
+    parser.add_argument("--ccc", default="", help="path to the original Claude's C Compiler executable (Anthropic upstream)")
     parser.add_argument("--opt", default="-O2", help="optimization flag passed uniformly to every compiler")
     parser.add_argument("--cflag", action="append", default=[], help="additional common compiler flag; may be repeated")
     parser.add_argument("--reps", type=int, default=15, help="timed paired rounds per benchmark (default: %(default)s)")
