@@ -43,9 +43,9 @@ See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
 
 ## Baseline fingerprints
 
-- **LCCC** (this fork): current `main`, `lccc-pgo-v1` profile format, built
+- **LCCC (ms178)** (this fork): current `main`, `lccc-pgo-v1` profile format, built
   `cargo build --release` (Rust opt-level 1, two jobs), swap on.
-- **Lev LCCC**: built from [`levkropp/lccc`](https://github.com/levkropp/lccc)
+- **LCCC (Lev)**: built from [`levkropp/lccc`](https://github.com/levkropp/lccc)
   (`main`) — the original lccc that this fork builds on.
 - **Original CCC**: built from `anthropics/claudes-c-compiler` (`main`) — the
   compiler both lccc forks descend from.
@@ -68,7 +68,7 @@ All three compilers run the same corpus at `-O2`. **Ratio columns are speedups**
 means this fork is faster than Lev LCCC. GCC is included as an external
 reference.
 
-| Benchmark | CCC (ms) | Lev LCCC (ms) | LCCC (ms) | GCC (ms) | CCC→Lev | Lev→LCCC |
+| Benchmark | CCC (ms) | LCCC (Lev) (ms) | LCCC (ms178) (ms) | GCC (ms) | CCC→Lev | Lev→ms178 |
 |---|---:|---:|---:|---:|---:|---:|
 | ackermann | 1277 | 1047 | 3 | 152 | 1.2× | 417.0× |
 | arith_loop | 259 | 157 | 113 | 102 | 1.6× | 1.4× |
@@ -97,16 +97,16 @@ reference.
 | zlib_ng_adler32 | 196 | 78 | 68 | 39 | 2.5× | 1.1× |
 
 **Aggregates (geometric mean):**
-- **CCC → Lev LCCC: 1.24×** (n=24) — Lev's optimizations
+- **CCC → LCCC (Lev): 1.24×** (n=24) — Lev's optimizations
   (TCE, recursion-to-iteration, vectorization, register allocation) are a clear
   win over the original CCC.
-- **Lev LCCC → this LCCC: 2.82×** (n=24) — this fork is
-  roughly **2.8× faster than the lccc it builds on** across the corpus.
-- **CCC → this LCCC: 3.24×** — combined, ~3.2× over the original.
-- **This LCCC vs GCC: 1.08×** (slower on aggregate; faster on fib/ackermann/
+- **LCCC (Lev) → LCCC (ms178): 2.82×** (n=24) — my fork is
+  roughly **2.8× faster than Lev's fork it builds on** across the corpus.
+- **CCC → LCCC (ms178): 3.24×** — combined, ~3.2× over the original.
+- **LCCC (ms178) vs GCC: 1.08×** (slower on aggregate; faster on fib/ackermann/
   constant_recursion by ~60–67× via TCE + recursion-to-iteration).
 
-### What Lev LCCC already fixed (vs the original CCC)
+### What LCCC (Lev) already fixed (vs the original CCC)
 
 Lev's lccc already delivered the big win for **recursion-to-iteration**
 (`fib` 305× over the original CCC), plus **vectorized matmul** (3.9×),
@@ -116,7 +116,7 @@ fannkuch 0.7×) and produced a **wrong output** on `glibc_memcmp`. Note that
 `constant_recursion` gained only 1.2× under Lev — the ~436× jump for it (and
 `ackermann` 417×) is this fork's constant-folding/recursion work, not Lev's.
 
-### What this fork adds on top of Lev LCCC
+### What my fork adds on top of Lev's LCCC
 
 This fork is **faster than Lev LCCC on every benchmark** (geomean ~2.8×), with
 the largest gains on:
@@ -127,7 +127,7 @@ the largest gains on:
   `expat_xml_scan` **12.2×**, `linux_find_bit` **3.0×**, `fannkuch` **3.0×**,
   `nbody` **1.9×**, `loop_patterns` **1.9×** — these were *slower* than the
   original CCC under Lev, and this fork brings them below both.
-- **Correctness**: `glibc_memcmp` (Lev produced a wrong result) is correct here.
+- **Correctness**: `glibc_memcmp` (Lev produced a wrong result), mine is correct here.
 - **TCE tail**: `tce_sum` (the original CCC cannot run it) 7.9× over Lev.
 - Broad ~1.1–1.5× across integer/ALU/loop kernels (arith_loop, sieve, matmul,
   struct_copy, sqlite_varint, spectral_norm).
@@ -165,7 +165,7 @@ The largest remaining gaps are FP/struct-by-value and branch-heavy byte scanning
 - **bitops / find_bit / varint (1.8–2.1×)** — bit-scan selection and branch
   layout.
 
-## Planned work (see `hotspots/` and `ideas/`)
+## Future work (see `hotspots/` and `ideas/`)
 
 - Struct-by-value ABI and wide (vectorized) aggregate copies.
 - Broadening the auto-vectorizer (non-reduction FP loops, FMA fusion).
