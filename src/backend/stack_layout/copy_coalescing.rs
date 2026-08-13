@@ -33,6 +33,10 @@ fn cfg_copy_coalesce_enabled() -> bool {
 enum CoalesceClass {
     /// Eight-byte scalar stack representation: integer or pointer values only.
     Scalar,
+    /// Auto-vectorizer Vec* vector value (dest-based SSA, lives directly in
+    /// its 16/32-byte home slot). Safe to coalesce through copies because the
+    /// slot is the value's single home and the emitters are slot-aware.
+    Vector,
 }
 
 fn scalar_type(ty: IrType) -> bool {
@@ -90,10 +94,18 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
                 | Instruction::LabelAddr { dest, .. } => Some(dest.0),
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
                     if info.dest.is_some() && scalar_type(info.return_type) => info.dest.map(|v| v.0),
+                // v5: the auto-vectorizer's Vec* vector values participate in
+                // copy coalescing (accumulator-phi group), with their own class.
+                Instruction::Intrinsic { dest: Some(d), op, .. }
+                    if op.vector_result_width().is_some() => Some(d.0),
                 _ => None,
             };
             if let Some(id) = class {
-                classes.insert(id, CoalesceClass::Scalar);
+                let cls = match inst {
+                    Instruction::Intrinsic { .. } => CoalesceClass::Vector,
+                    _ => CoalesceClass::Scalar,
+                };
+                classes.insert(id, cls);
             }
         }
     }
@@ -109,12 +121,13 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
                     if allocas.contains(&dest.0) || classes.contains_key(&dest.0) {
                         continue;
                     }
-                    let source_is_scalar = match src {
-                        Operand::Value(v) => classes.contains_key(&v.0),
-                        Operand::Const(c) => scalar_const(*c),
+                    let src_class = match src {
+                        Operand::Value(v) => classes.get(&v.0).copied(),
+                        Operand::Const(c) if scalar_const(*c) => Some(CoalesceClass::Scalar),
+                        _ => None,
                     };
-                    if source_is_scalar {
-                        classes.insert(dest.0, CoalesceClass::Scalar);
+                    if let Some(cls) = src_class {
+                        classes.insert(dest.0, cls);
                         changed = true;
                     }
                 }
@@ -325,25 +338,18 @@ fn build_cfg_copy_alias_map(
     reg_assigned: &FxHashMap<u32, PhysReg>,
 ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
     let classes = collect_scalar_values(func);
-    // Vector results must never share slots through copy coalescing: their
-    // dest_ptr (alloca) and the phi/copy SSA values live in different value
-    // namespaces, and a loop-carried copy (e.g. zlib-ng adler32's vs1_0 =
-    // vs1) coalesced to one slot makes the next iteration read a stale half
-    // of the pair (vector_defer_multidef_slot regression: wide-loop vs1 add
-    // stored into vs1_0's slot while vs1's own reads kept using the old one).
-    let vector_values: FxHashSet<u32> = func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.instructions)
-        .filter_map(|inst| match inst {
-            Instruction::Intrinsic {
-                dest: Some(d),
-                op,
-                ..
-            } => op.vector_result_width().map(|_| d.0),
-            _ => None,
-        })
-        .collect();
+    // Auto-vectorizer Vec* values (dest-based SSA, not user-level intrinsic
+    // dest_ptr allocas) MAY coalesce through a loop-carried copy: the
+    // accumulator group {acc_phi, init_zero, vec_sum} shares one home slot,
+    // the backedge copy becomes a no-op, and each iteration updates the slot
+    // in place. Soundness: (1) the cfg_copy_interference dataflow below only
+    // coalesces proven-non-interfering values; (2) a Vec* result whose only
+    // non-vector use is the Copy is never deferred (the store is always
+    // emitted); (3) phi destinations are never register-held, so there is no
+    // stale-register half of the pair. This is the v5 reduction-loop win
+    // (removes the per-iteration accumulator slot-to-slot copy). User-level
+    // intrinsic temporaries (dest_ptr allocas) remain excluded by the
+    // alloca-specific coalescing path, not this one.
     let mut candidates: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -353,8 +359,6 @@ fn build_cfg_copy_alias_map(
                     || reg_assigned.contains_key(&source.0)
                     || !classes.contains_key(&dest.0)
                     || !classes.contains_key(&source.0)
-                    || vector_values.contains(&dest.0)
-                    || vector_values.contains(&source.0)
                 {
                     continue;
                 }

@@ -184,6 +184,36 @@ impl X86Codegen {
             }
         }
 
+        // v5: register-direct integer -> float casts. Emit cvtsi2sd/cvtsi2ss
+        // directly into the destination's allocated XMM register instead of the
+        // accumulator path's GPR round-trip (cvtsi2sd %rax,%xmm0; movq
+        // %xmm0,%rax; movq %rax,%xmmN). U64 needs the shift+round dance and is
+        // left to the default path.
+        if !from_ty.is_float()
+            && (to_ty == IrType::F64 || to_ty == IrType::F32)
+            && from_ty != IrType::U64
+            && !is_i128_type(from_ty)
+        {
+            if let Some(dest_phys) = self.dest_reg(dest) {
+                if super::emit::is_xmm_reg(dest_phys) {
+                    let dname = super::emit::phys_reg_name(dest_phys);
+                    self.operand_to_reg(src, "rax");
+                    if from_ty.is_unsigned() {
+                        self.emit_zero_extend_to_rax(from_ty);
+                    } else {
+                        self.emit_sign_extend_to_rax(from_ty);
+                    }
+                    if to_ty == IrType::F64 {
+                        self.state.emit_fmt(format_args!("    cvtsi2sdq %rax, %{}", dname));
+                    } else {
+                        self.state.emit_fmt(format_args!("    cvtsi2ssq %rax, %{}", dname));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+
         // Fall through to default implementation for all other cases
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
     }

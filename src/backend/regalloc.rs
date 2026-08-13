@@ -846,11 +846,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .copied()
             .collect();
 
+        if std::env::var("CCC_DEBUG_XMM").is_ok() {
+            eprintln!(
+                "[XMM] fn={} f64_intervals={} regs={:?}",
+                func.name,
+                f64_intervals.len(),
+                config.xmm_regs.iter().map(|r| r.0).collect::<Vec<_>>()
+            );
+            for iv in &f64_intervals {
+                eprintln!("[XMM]   val{} [{},{}]", iv.value_id, iv.start, iv.end);
+            }
+        }
+
         if !f64_intervals.is_empty() {
             let f64_ranges =
                 live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
             let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
             xmm_allocator.run();
+
+            if std::env::var("CCC_DEBUG_XMM").is_ok() {
+                eprintln!(
+                    "[XMM]   assigned={:?}",
+                    xmm_allocator.assignments.iter().map(|(v, r)| (*v, r.0)).collect::<Vec<_>>()
+                );
+            }
 
             for (vid, reg) in xmm_allocator.assignments {
                 assignments.insert(vid, reg);

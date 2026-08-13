@@ -95,8 +95,38 @@ pub fn run_regalloc_and_merge_clobbers(
         && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
         && !disable_scalar_fp_xmm
     {
-        // x86-64: xmm2-xmm7 available for F64 values
-        vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+        // x86-64: xmm2-xmm7 for F64 values. xmm2 is normally a safe stable
+        // home (plain scalar FP codegen only touches xmm0/xmm1 as scratch),
+        // but it is clobbered by a handful of intrinsic emitters
+        // (pblendvb, 128-bit VNNI, F128 bit helpers) that use it as an
+        // implicit scratch register. Exclude it from the pool only when the
+        // function actually contains such an emitter; otherwise keep all six
+        // registers (removing xmm2 unconditionally caused spills and a ~3x
+        // slowdown in FP-struct loops such as nbody).
+        let clobbers_xmm2 = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                if let Instruction::Intrinsic { op, .. } = inst {
+                    use crate::ir::intrinsics::IntrinsicOp as O;
+                    matches!(
+                        op,
+                        O::Pblendvb128
+                            | O::Dpbusd128 | O::Dpbusds128 | O::Dpwusd128
+                            | O::Dpwusds128 | O::Dpbssd128 | O::Dpbssds128
+                            | O::Dpbsud128 | O::Dpbsuds128 | O::Dpbuud128
+                            | O::Dpbuuds128 | O::Dpwuud128 | O::Dpwuuds128
+                            | O::Dpwssd128 | O::Dpwssds128
+                            | O::F128Fabs | O::F128Neg | O::F128Copysign
+                    )
+                } else {
+                    false
+                }
+            })
+        });
+        if clobbers_xmm2 {
+            vec![PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+        } else {
+            vec![PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24), PhysReg(25)]
+        }
     } else {
         Vec::new()
     };

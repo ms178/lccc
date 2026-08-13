@@ -380,7 +380,7 @@ impl X86Codegen {
         }
     }
 
-    fn emit_sign_extend_to_rax(&mut self, ty: IrType) {
+    pub(super) fn emit_sign_extend_to_rax(&mut self, ty: IrType) {
         match ty {
             IrType::I8 => self.state.emit("    movsbq %al, %rax"),
             IrType::I16 => self.state.emit("    movswq %ax, %rax"),
@@ -389,7 +389,7 @@ impl X86Codegen {
         }
     }
 
-    fn emit_zero_extend_to_rax(&mut self, ty: IrType) {
+    pub(super) fn emit_zero_extend_to_rax(&mut self, ty: IrType) {
         match ty {
             IrType::U8 => self.state.emit("    movzbl %al, %eax"),
             IrType::U16 => self.state.emit("    movzwq %ax, %rax"),

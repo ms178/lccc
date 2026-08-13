@@ -4679,7 +4679,20 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
     }
 
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis(func, &cfg)
+    let changes = vectorize_with_analysis(func, &cfg);
+
+    // The transforms replace the scalar accumulation with vector intrinsics but
+    // leave the orphaned scalar load/mul/GEP/offset chain behind for the global
+    // DCE pass — which runs AFTER IVSR in the pipeline. IVSR therefore
+    // strength-reduces those already-dead GEPs into loop-carried pointer
+    // increments (e.g. `leaq 256(%rdi), %rdi` every iteration) that the later
+    // DCE cannot remove (the increment and the phi only reference each other).
+    // Sweep the dead chain HERE, before IVSR runs, so no dead pointer
+    // increments are ever materialized.
+    if changes > 0 {
+        crate::passes::dce::eliminate_dead_code(func);
+    }
+    changes
 }
 
 /// True if any Load/Store in `func` chains (through GEP/Cast/Copy) to an
