@@ -464,3 +464,55 @@ Correctness: nbody / spectral_norm / mandelbrot bit-exact vs gcc; regression
 4. Branch/switch codegen (expat 3.2x, sqlite_varint 2.0x, switch_dispatch 1.5x)
    and bit-op selection (bitops 1.9x, linux_find_bit 1.8x).
 5. matmul `BroadcastLoadF64` hoisting.
+
+---
+
+# v6 (2026-08-13) — FP register class xmm8-15, scalar-FP XMM codegen, GEP CSE
+
+## Delivered (all validated; regression 127/127, correctness 50/50, intrinsics 3/3)
+
+1. **F64 register class widened xmm2 → xmm2-xmm15 (14 regs).** The allocator
+   was spilling FP intervals (nbody has 58) even though xmm8-15 were free and
+   codegen-scratch only touches xmm0/1/2. `phys_reg_name`/`is_xmm_reg` extended
+   to the REX-extension bank; the assembler already encodes it.
+
+2. **Scalar FP intrinsics now XMM-allocated.** sqrt/fabs results were excluded
+   from both the GPR and XMM scans, so their result spilled mid-chain
+   (nbody's `sqrtsd` + spill + reload). Now `sqrtsd %xmmN,%xmmN` in place;
+   fabs is a single `andpd/andps` against a rodata mask.
+
+3. **FP register-direct loads/stores** — for materialized pointers AND for
+   GEP-folded constant offsets (`movsd 8(%r8),%xmm5`): the fold path only had
+   an integer register-direct fast path; F64/F32 fell to the GPR round-trip.
+
+4. **GEP CSE re-enabled in GVN.** Two GEPs with the same base+offset collapse
+   to one + a coalesced Copy (was disabled for a pre-register-aware stale-
+   register defect). nbody recomputed `bodies + i*56` once per field access
+   (8 leaq + 8 scratch-slot spills); now once.
+
+## Measured (min-of-5, pinned, vs gcc -O2)
+
+| benchmark | v5 | v6 |
+|---|---|---|
+| mandelbrot | 2.87x | **2.12x** |
+| nbody | 4.79x | **4.25x** |
+| spectral_norm | 2.9x | 2.9x |
+| struct_copy | 6.7x | 6.7x |
+
+Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
+
+## Remaining top-priority work (v7) — precisely diagnosed
+
+1. **Load→FP-op register coalescing**: the allocator assigns the load and the
+   consuming binop different XMM registers, leaving `movsd %xmm2,%xmm4` before
+   every op (the reg_hint field in the linear scan is unused). This plus
+   folded-offset store coalescing is most of the remaining nbody gap.
+2. **Affine IVSR**: `mul(add(iv,k),stride)` (nbody's `(i+1)*56`) is not
+   recognized; only `mul(iv,c)` is. Two imulq per outer iteration survive.
+3. **Parameter register allocation**: F64/GPR params spill to stack at entry
+   (`movq %xmm0,216(%rsp)`); struct-by-value copies still vmovdqu+shuffle.
+4. **F32 XMM allocation**: the XMM scan filters `ty == F64` only; F32 values
+   still go through the stack (the emitters already honor XMM homes, so this
+   is a one-line filter widening plus validation).
+5. Branch-heavy workloads (expat 3.2x, sqlite_varint 2.1x): boolean
+   `setcc+movzbl+test` chains instead of fused compare-to-branch.

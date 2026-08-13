@@ -113,13 +113,25 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
         23 => "xmm5",
         24 => "xmm6",
         25 => "xmm7",
+        // v6: xmm8-xmm15 are additional caller-saved F64 homes. Codegen
+        // scratch only ever touches xmm0/xmm1 (and xmm2 for pblendvb/VNNI),
+        // so the upper bank is a safe, stable home; the assembler already
+        // encodes them (REX.R/X/B extension bits).
+        26 => "xmm8",
+        27 => "xmm9",
+        28 => "xmm10",
+        29 => "xmm11",
+        30 => "xmm12",
+        31 => "xmm13",
+        32 => "xmm14",
+        33 => "xmm15",
         _ => unreachable!("invalid x86 register index {}", reg.0),
     }
 }
 
 /// Check if a PhysReg is an XMM register (used for F64 values).
 pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
-    reg.0 >= 20 && reg.0 <= 25
+    reg.0 >= 20 && reg.0 <= 33
 }
 
 /// Map a PhysReg index to its x86-64 32-bit sub-register name.

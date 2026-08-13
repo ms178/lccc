@@ -427,11 +427,32 @@ impl GvnState {
                     *dest,
                 ))
             }
-            Instruction::GetElementPtr { .. } => {
-                // GEP CSE disabled: creates Copy chains whose base register
-                // may be stale at fold points. Both constant-offset (foldable)
-                // and variable-offset GEPs are affected.
-                None
+            Instruction::GetElementPtr {
+                dest,
+                base,
+                offset,
+                ty,
+            } => {
+                // v6: re-enable GEP CSE. Two GEPs with the same base and
+                // offset compute the same address; the duplicate becomes a
+                // Copy that the copy-coalescer folds to one home slot (the
+                // nbody inner-loop recomputes `&bodies[i]` once per field
+                // access, and each recompute paid a leaq + a scratch-slot
+                // spill). The historical "stale base register at fold points"
+                // defect was in the pre-register-aware codegen; the current
+                // Copy/slot machinery keeps GEP results in a single coalesced
+                // slot, and the store-forwarding analysis keys on value
+                // numbers, which CSE only strengthens.
+                let base_vn = self.operand_to_vn(&Operand::Value(*base));
+                let offset_vn = self.operand_to_vn(offset);
+                Some((
+                    ExprKey::Gep {
+                        base: base_vn,
+                        offset: offset_vn,
+                        ty: *ty,
+                    },
+                    *dest,
+                ))
             }
             // Pure: a symbol's address is constant for the process lifetime.
             Instruction::GlobalAddr { dest, name } => Some((
@@ -1497,7 +1518,7 @@ mod tests {
         asm_labels: crate::common::fx_hash::FxHashMap::default(),};
 
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 0); // GEP CSE disabled
+        assert_eq!(eliminated, 1); // two identical GEPs CSE'd into one + Copy
     }
 
     #[test]

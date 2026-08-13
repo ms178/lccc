@@ -13,7 +13,7 @@ impl X86Codegen {
     /// so the register IS the value's only home — a `movsd %xmmN, %xmm0` is the
     /// whole load. Falls back to a direct slot load, then to the GPR round-trip
     /// for constants and values without a home.
-    fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
+    pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
         if let Operand::Value(v) = op {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -63,7 +63,7 @@ impl X86Codegen {
 
     /// Store %xmm0 to an F32/F64 destination, honoring a register-allocated XMM
     /// home first (mirrors load_fp_to_xmm0; the result stays in the XMM domain).
-    fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
+    pub(super) fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(reg) {
@@ -94,7 +94,7 @@ impl X86Codegen {
     /// the compute-into-dest path; xmm0 for the scratch path). Honors a
     /// register-allocated XMM home, then a direct slot, then constants and the
     /// GPR fallback.
-    fn load_fp_to_reg(&mut self, op: &Operand, ty: IrType, reg: &str) {
+    pub(super) fn load_fp_to_reg(&mut self, op: &Operand, ty: IrType, reg: &str) {
         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
         if let Operand::Value(v) = op {
             if let Some(&r) = self.reg_assignments.get(&v.0) {
@@ -218,6 +218,29 @@ impl X86Codegen {
         }
         self.state.reg_cache.invalidate_acc();
         true
+    }
+
+    /// Emit a scalar unary FP op (sqrtsd/sqrtss/roundsd/...) honoring an
+    /// XMM-allocated destination: compute straight into the dest register
+    /// instead of the xmm0 scratch + GPR/store round-trip. Falls back to the
+    /// xmm0 path when dest has no XMM home.
+    pub(super) fn emit_fp_scalar_unary(&mut self, dest: &Option<Value>, arg: &Operand, ty: IrType, inst: &str) {
+        if let Some(d) = dest {
+            if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                if is_xmm_reg(reg) {
+                    let dname = phys_reg_name(reg);
+                    self.load_fp_to_reg(arg, ty, dname);
+                    self.state.emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+        self.load_fp_to_xmm0(arg, ty);
+        self.state.emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+        if let Some(d) = dest {
+            self.store_xmm0_fp_dest(d, ty);
+        }
     }
 
     pub(super) fn emit_float_binop_impl(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {

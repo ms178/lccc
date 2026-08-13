@@ -17,6 +17,7 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
+use crate::common::types::IrType;
 use crate::backend::state::StackSlot;
 use crate::backend::regalloc::PhysReg;
 use super::emit::{is_xmm_reg, phys_reg_name, X86Codegen};
@@ -775,32 +776,34 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::SqrtF64 => {
-                // sqrtsd: scalar double-precision square root
-                self.float_operand_to_xmm0(&args[0], false);
-                self.state.emit("    sqrtsd %xmm0, %xmm0");
-                self.state.emit("    movq %xmm0, %rax");
-                if let Some(d) = dest {
-                    self.store_rax_to(d);
-                }
+                // sqrtsd, honoring an XMM-allocated destination (was a GPR
+                // round-trip in the middle of every FP chain: nbody's sqrt(d2)).
+                self.emit_fp_scalar_unary(dest, &args[0], IrType::F64, "sqrtsd");
             }
             IntrinsicOp::SqrtF32 => {
-                // sqrtss: scalar single-precision square root
-                self.float_operand_to_xmm0(&args[0], true);
-                self.state.emit("    sqrtss %xmm0, %xmm0");
-                self.state.emit("    movd %xmm0, %eax");
-                if let Some(d) = dest {
-                    self.store_rax_to(d);
-                }
+                self.emit_fp_scalar_unary(dest, &args[0], IrType::F32, "sqrtss");
             }
             IntrinsicOp::FabsF64 => {
-                // Clear sign bit for double-precision absolute value
-                self.float_operand_to_xmm0(&args[0], false);
-                self.state.emit("    movabsq $0x7FFFFFFFFFFFFFFF, %rcx");
-                self.state.emit("    movq %rcx, %xmm1");
-                self.state.emit("    andpd %xmm1, %xmm0");
-                self.state.emit("    movq %xmm0, %rax");
+                // v6: single andpd against a rodata mask, honoring the
+                // XMM-allocated destination (was movabsq + movq + andpd +
+                // GPR round-trip).
                 if let Some(d) = dest {
-                    self.store_rax_to(d);
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let dname = phys_reg_name(reg);
+                            self.load_fp_to_reg(&args[0], IrType::F64, dname);
+                            let label = self.state.get_fp_const_label(0x7FFF_FFFF_FFFF_FFFFu64);
+                            self.state.emit_fmt(format_args!("    andpd {}(%rip), %{}", label, dname));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+                self.load_fp_to_xmm0(&args[0], IrType::F64);
+                let label = self.state.get_fp_const_label(0x7FFF_FFFF_FFFF_FFFFu64);
+                self.state.emit_fmt(format_args!("    andpd {}(%rip), %xmm0", label));
+                if let Some(d) = dest {
+                    self.store_xmm0_fp_dest(d, IrType::F64);
                 }
             }
             IntrinsicOp::F128Fabs => {
@@ -983,14 +986,25 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::FabsF32 => {
-                // Clear sign bit for single-precision absolute value
-                self.float_operand_to_xmm0(&args[0], true);
-                self.state.emit("    movl $0x7FFFFFFF, %ecx");
-                self.state.emit("    movd %ecx, %xmm1");
-                self.state.emit("    andps %xmm1, %xmm0");
-                self.state.emit("    movd %xmm0, %eax");
+                // v6: single andps against a rodata mask, honoring the
+                // XMM-allocated destination.
                 if let Some(d) = dest {
-                    self.store_rax_to(d);
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let dname = phys_reg_name(reg);
+                            self.load_fp_to_reg(&args[0], IrType::F32, dname);
+                            let label = self.state.get_fp_const_label(0x7FFF_FFFFu64);
+                            self.state.emit_fmt(format_args!("    andps {}(%rip), %{}", label, dname));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+                self.load_fp_to_xmm0(&args[0], IrType::F32);
+                let label = self.state.get_fp_const_label(0x7FFF_FFFFu64);
+                self.state.emit_fmt(format_args!("    andps {}(%rip), %xmm0", label));
+                if let Some(d) = dest {
+                    self.store_xmm0_fp_dest(d, IrType::F32);
                 }
             }
             // AES-NI binary ops: aesenc, aesenclast, aesdec, aesdeclast

@@ -524,6 +524,44 @@ impl X86Codegen {
             }
         }
 
+        // v6: register-direct F64/F32 store. When the value lives in an
+        // XMM-allocated register, store it straight to memory (movsd/movss
+        // %xmmN, (%ptr)) instead of the GPR round-trip (movq %xmmN,%rax;
+        // movq %rax,(%ptr)) the default path pays on every store.
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if is_xmm_reg(v_reg) {
+                        let v_name = phys_reg_name(v_reg);
+                        let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                        // ptr in a GPR-allocated register
+                        if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                            if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                                let p_name = phys_reg_name(p_reg);
+                                self.state.emit_fmt(format_args!("    {} %{}, (%{})", mov, v_name, p_name));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                        // ptr is an alloca with a direct slot
+                        if self.state.is_alloca(ptr.0) && self.state.alloca_over_align(ptr.0).is_none() {
+                            if let Some(slot) = self.state.get_slot(ptr.0) {
+                                let sr = self.slot_ref(slot.0);
+                                self.state.emit_fmt(format_args!("    {} %{}, {}", mov, v_name, sr));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                        // general pointer: materialize to %rax and store
+                        self.operand_to_reg(&Operand::Value(*ptr), "rax");
+                        self.state.emit_fmt(format_args!("    {} %{}, (%rax)", mov, v_name));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
         // Fall back to default store logic
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
@@ -721,6 +759,7 @@ impl X86Codegen {
                 if is_xmm_reg(d_reg) {
                     let d_name = phys_reg_name(d_reg);
                     let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                    // 1. Pointer already in a GPR-allocated register.
                     if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
                         if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
                             let p_name = phys_reg_name(p_reg);
@@ -729,6 +768,7 @@ impl X86Codegen {
                             return;
                         }
                     }
+                    // 2. Alloca with a direct slot (data IS at the slot).
                     if self.state.is_alloca(ptr.0) && self.state.alloca_over_align(ptr.0).is_none() {
                         if let Some(slot) = self.state.get_slot(ptr.0) {
                             let sr = self.slot_ref(slot.0);
@@ -737,6 +777,16 @@ impl X86Codegen {
                             return;
                         }
                     }
+                    // 3. General pointer (GEP into a global, IVSR phi, computed
+                    //    address): materialize into %rax (or reuse it when the
+                    //    accumulator cache already holds the pointer) and load
+                    //    directly into the XMM home. This is the nbody inner-
+                    //    loop case: the old path did movq (%ptr),%rax +
+                    //    movq %rax,%xmmN.
+                    self.operand_to_reg(&Operand::Value(*ptr), "rax");
+                    self.state.emit_fmt(format_args!("    {} (%rax), %{}", mov, d_name));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
                 }
             }
         }
@@ -833,6 +883,31 @@ impl X86Codegen {
 
         // Register-direct store: when val has a register, store directly to memory
         // without loading to %rax first. Handles Direct (alloca) and Indirect (ptr) cases.
+        // v6: FP variant — an XMM-allocated F64/F32 value stores straight to the
+        // folded-offset address (movsd/movss %xmmN, off(%base)) instead of the
+        // GPR round-trip (movq %xmmN,%rax; movq %rax,off(%base)).
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if is_xmm_reg(v_reg) {
+                        if let Some(b_reg) = self.reg_assignments.get(&base.0).copied() {
+                            if !is_xmm_reg(b_reg) && !self.state.is_alloca(base.0) {
+                                let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                                let v_name = phys_reg_name(v_reg);
+                                let b_name = phys_reg_name(b_reg);
+                                if offset != 0 {
+                                    self.state.emit_fmt(format_args!("    {} %{}, {}(%{})", mov, v_name, offset, b_name));
+                                } else {
+                                    self.state.emit_fmt(format_args!("    {} %{}, (%{})", mov, v_name, b_name));
+                                }
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if let Operand::Value(v) = val {
                 if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
@@ -923,6 +998,30 @@ impl X86Codegen {
                 self.emit_f128_load_finish(dest);
             }
             return;
+        }
+        // v6: FP register-direct load with a folded constant offset: movsd/movss
+        // off(%base), %xmmN into the XMM-allocated destination, instead of the
+        // GPR round-trip (movq off(%base),%rax; movq %rax,%xmmN) that the
+        // fold path otherwise pays for every field load in FP-struct loops.
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                if is_xmm_reg(d_reg) {
+                    if let Some(b_reg) = self.reg_assignments.get(&base.0).copied() {
+                        if !is_xmm_reg(b_reg) && !self.state.is_alloca(base.0) {
+                            let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                            let d_name = phys_reg_name(d_reg);
+                            let b_name = phys_reg_name(b_reg);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!("    {} {}(%{}), %{}", mov, offset, b_name, d_name));
+                            } else {
+                                self.state.emit_fmt(format_args!("    {} (%{}), %{}", mov, b_name, d_name));
+                            }
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+            }
         }
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
