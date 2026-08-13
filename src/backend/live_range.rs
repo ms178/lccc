@@ -640,7 +640,7 @@ pub fn build_live_ranges(
     // Collect actual use points for each value
     let uses_map = collect_uses_for_values(func);
 
-    // Find register hints from Copy sources
+    // Register hints from Copy sources (currently none are emitted).
     let hints_map = find_register_hints(func);
 
     // PGO-aware use weighting: exact block-entry counts bias allocation toward
@@ -917,13 +917,10 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
 ///
 /// Returns a map: dest_value_id → source_register_hint
 fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, PhysReg> {
-    let mut hints: FxHashMap<u32, PhysReg> = FxHashMap::default();
-
-    // TODO: In a full implementation, we would track which values have been
-    // allocated to registers and use those as hints. For now, return empty map.
-    // This will be populated when we have actual register assignments.
-
-    hints
+    let _ = func;
+    // Register hints are currently not emitted (post-allocation coalescing
+    // handles producer->consumer sharing instead).
+    FxHashMap::default()
 }
 
 #[cfg(test)]
