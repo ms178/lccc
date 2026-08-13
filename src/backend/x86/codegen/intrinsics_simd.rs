@@ -500,9 +500,10 @@ impl X86Codegen {
             | HaddPs256 | HsubPs256 | AddsubPs256
             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256
             | BlendvPs256 | BlendvPd256 | VpermilPs256 | Vperm2f128 | Vinsertf128
-            | Vextractf128 | Vbroadcastss | Vbroadcastsd | Vbroadcastsd
+            | Vextractf128 | Vbroadcastss | Vbroadcastsd
             | CvtPs2Ep32_256 | CvtEp32_2Ps_256 | CvttPs2Ep32_256
             | CvtPs2Pd_256 | CvtPd2Ps_256 | CvtPd2Ep32_256 | CvtEp32_2Pd_256 | CvttPd2Ep32_256
+            | VpermilvarPs256 | VpermilvarPd256
             | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
             | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
                 self.emit_avx_fp_256_op(dptr, op, args);
@@ -1178,6 +1179,17 @@ impl X86Codegen {
             HaddPs256 => binary(self, "vhaddps", false),
             HsubPs256 => binary(self, "vhsubps", false),
             AddsubPs256 => binary(self, "vaddsubps", false),
+            // The 256-bit unpack family previously had NO arm here: the ops
+            // were routed to this dispatcher but silently emitted nothing,
+            // leaving the result alloca uninitialized (garbage output for
+            // _mm256_unpacklo/hi_ps/_pd).
+            UnpcklPs256 => binary(self, "vunpcklps", false),
+            UnpckhPs256 => binary(self, "vunpckhps", false),
+            UnpcklPd256 => binary(self, "vunpcklpd", false),
+            UnpckhPd256 => binary(self, "vunpckhpd", false),
+            // Variable-index permute: vpermilps/vpermilpd %idx, %src, %dst.
+            VpermilvarPs256 => binary(self, "vpermilps", false),
+            VpermilvarPd256 => binary(self, "vpermilpd", false),
             CvtPs2Ep32_256 => unary(self, "vcvtps2dq"),
             CvtEp32_2Ps_256 => unary(self, "vcvtdq2ps"),
             CvttPs2Ep32_256 => unary(self, "vcvttps2dq"),
@@ -1267,11 +1279,16 @@ impl X86Codegen {
             // vblendvps/vblendvpd: operands (mask, a, b): mask, b(src2), a(src1,dst)
             BlendvPs256 | BlendvPd256 => {
                 let inst = if matches!(op, BlendvPs256) { "vblendvps" } else { "vblendvpd" };
-                self.avx_load_arg_to(&args[0], "ymm0"); // mask
-                self.avx_load_arg_to(&args[1], "ymm1"); // a (src1 = dst)
-                self.avx_load_arg_to(&args[2], "ymm2"); // b (src2)
+                // The result MUST land in %ymm0: avx_store_dest stores %ymm0,
+                // and the old code computed the blend into %ymm1 then stored
+                // %ymm0 (the mask) instead — blendv returned the mask operand
+                // rather than the blended result. AT&T operand order:
+                //   %mask (is4), %src2, %src1(dst), %dst.
+                self.avx_load_arg_to(&args[0], "ymm2"); // mask
+                self.avx_load_arg_to(&args[1], "ymm0"); // a (src1 = dst)
+                self.avx_load_arg_to(&args[2], "ymm1"); // b (src2)
                 self.state
-                    .emit_fmt(format_args!("    {} %ymm0, %ymm2, %ymm1, %ymm1", inst));
+                    .emit_fmt(format_args!("    {} %ymm2, %ymm1, %ymm0, %ymm0", inst));
                 self.avx_store_dest(dest_ptr);
             }
             // FMA 256 (a, b, c)

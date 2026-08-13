@@ -514,6 +514,18 @@ fn analyze_loop_pattern(
         return None;
     }
     let fmul_inst = fmul_inst?;
+    // The whole transform lowers to FmaF64x4 / FmaF64x2 (packed DOUBLE FMA).
+    // Only double-precision matmuls may match: lowering a float or integer
+    // matmul as double FMA reinterprets the arrays with the wrong element
+    // width and stride (reproducer: a float matmul segfaulted at runtime).
+    if let Instruction::BinOp { ty, .. } = fmul_inst {
+        if *ty != IrType::F64 {
+            if debug {
+                eprintln!("[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)", ty);
+            }
+            return None;
+        }
+    }
     let (a_val, b_val) = match fmul_inst {
         Instruction::BinOp {
             op: IrBinOp::Mul,
@@ -1304,13 +1316,16 @@ fn analyze_reduction_pattern(
                     eprintln!("[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])", element_type, from_ty);
                 }
 
-                // When the accumulator is wider than the array element (e.g., long += int),
-                // we cannot simply use packed narrow adds — the results would overflow/truncate.
-                // Reject this pattern; proper widening vectorization would require
-                // vpmovsx + vpaddq which is much more complex.
-                if element_type.size() > from_ty.size() {
+                // The cast must be a redundant no-op (from_ty == accumulator
+                // type). Anything else — widening (`long += int`), narrowing,
+                // or cross-kind (`float += int`, `int += float`) — changes the
+                // per-element add semantics in a way a single-lane-type packed
+                // add cannot reproduce. The old check only rejected widening,
+                // so `float s += (float)int_arr[i]` slipped through, vectorized
+                // as I32 adds on a F32 accumulator, and returned 0.0.
+                if *from_ty != element_type {
                     if debug {
-                        eprintln!("[VEC-RED]   Rejecting: accumulator {:?} wider than element {:?}", element_type, from_ty);
+                        eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
                     }
                     return None;
                 }
@@ -1814,20 +1829,36 @@ fn insert_remainder_loop(
         *false_label = vec_exit_label;
     }
 
-    // Step 2: Create vec_exit block
-    // Convert byte-offset IV back to element index for the scalar remainder loop:
-    // j_rem_start = byte_off_final / 8 (sizeof(double))
+    // Step 2: Create vec_exit block.
+    // Convert the loop's final IV into the element index where the scalar
+    // remainder must start. The IV representation differs by vector width:
+    //   - AVX2 (width 4): IV is a BYTE offset stepping 32 -> start = IV / 8.
+    //   - SSE2 (width 2): IV is an ELEMENT index stepping 1 (GEP stride x2)
+    //                    -> start = IV * 2.
+    // The previous code always divided by 8, which is only valid for the AVX2
+    // byte-offset scheme; for SSE2 it re-processed nearly the whole array
+    // (double-counting elements) and miscomputed the result.
+    let rem_start_inst = if vec_width == 2 {
+        Instruction::BinOp {
+            dest: j_rem_start,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(pattern.iv),   // Final element index
+            rhs: Operand::Const(IrConst::I32(2)),
+            ty: IrType::I32,
+        }
+    } else {
+        Instruction::BinOp {
+            dest: j_rem_start,
+            op: IrBinOp::SDiv,
+            lhs: Operand::Value(pattern.iv),   // Final byte offset
+            rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
+            ty: IrType::I32,
+        }
+    };
+
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
-        instructions: vec![
-            Instruction::BinOp {
-                dest: j_rem_start,
-                op: IrBinOp::SDiv,
-                lhs: Operand::Value(pattern.iv),  // Final byte offset
-                rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
-                ty: IrType::I32,
-            },
-        ],
+        instructions: vec![rem_start_inst],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
     };
@@ -2597,36 +2628,58 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     //   - IV increment: +1 → +32 (bytes per AVX2 iteration = 4 doubles × 8 bytes)
     //   - GEP offset multiply: eliminated (IV IS the byte offset)
     {
-        // First, create the byte limit value (N * 8 bytes per double)
+        // First, create the byte limit. The vector loop steps by 32 bytes
+        // (4 doubles) per iteration, so it must run exactly floor(N/4)
+        // iterations: byte_limit = (N/4)*32 = (N & ~3)*8. Using N*8 here
+        // instead runs ceil(N/4) iterations — the final iteration reads and
+        // writes up to 3 doubles past the end of the array (OOB), and the
+        // scalar remainder loop then never fires, silently skipping the tail
+        // (reproducer: N=255 matmul clobbered element 255 and skipped
+        // elements 252..254, producing a wrong sum).
         let byte_limit = match &pattern.limit {
-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n * 8)),
-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n * 8)),
+            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 4) * 32)),
+            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 4) * 32)),
             Operand::Value(limit_val) => {
-                // Dynamic limit: insert multiply by 8 (sizeof(double)) in header
-                let mul_dest = Value(next_val_id);
-                next_val_id += 1;
-
+                // Dynamic limit: byte_limit = (N/4)*32, hoisted into the header.
                 let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
 
-                let mul_inst = Instruction::BinOp {
-                    dest: mul_dest,
-                    op: IrBinOp::Mul,
+                // N / 4
+                let div_dest = Value(next_val_id);
+                next_val_id += 1;
+                let div_inst = Instruction::BinOp {
+                    dest: div_dest,
+                    op: IrBinOp::UDiv,
                     lhs: Operand::Value(*limit_val),
                     rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(8),
-                        IrType::I64 => IrConst::I64(8),
-                        _ => IrConst::I64(8),
+                        IrType::I32 => IrConst::I32(4),
+                        IrType::I64 => IrConst::I64(4),
+                        _ => IrConst::I64(4),
                     }),
                     ty: limit_ty,
                 };
+                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
 
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, mul_inst);
+                // (N/4) * 32
+                let mul_dest = Value(next_val_id);
+                next_val_id += 1;
+                let mul_inst = Instruction::BinOp {
+                    dest: mul_dest,
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(div_dest),
+                    rhs: Operand::Const(match limit_ty {
+                        IrType::I32 => IrConst::I32(32),
+                        IrType::I64 => IrConst::I64(32),
+                        _ => IrConst::I64(32),
+                    }),
+                    ty: limit_ty,
+                };
+                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
 
                 if debug {
-                    eprintln!("[VEC]   Inserted multiply for dynamic byte limit: N * 8 => Value({})", mul_dest.0);
+                    eprintln!("[VEC]   Inserted (N/4)*32 dynamic byte limit: Value({})", mul_dest.0);
                 }
 
                 Operand::Value(mul_dest)
@@ -3440,47 +3493,48 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // Step 2: Scale array indexing by vector width
-    // Find the GEP offset and multiply it by vec_width
+    // Step 2: Scale array indexing by vector width.
+    // Each GEP's byte offset (element_index * elem_size) must be multiplied by
+    // vec_width so one vector iteration covers vec_width consecutive elements.
+    // Collect ALL matching GEPs first — a dot product has two (array A and
+    // array B) in the same block, and the old `break` after the first match
+    // left array B at scalar stride, loading the wrong elements (miscompile:
+    // dot(x,y,n) returned garbage for both n=255 and n=256).
+    let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
     for &block_idx in &pattern.loop_blocks {
         let block = &func.blocks[block_idx];
-
-        // Find GEP instructions that match our arrays
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                // Check if this is one of our array GEPs
                 if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
                     if let Operand::Value(offset_val) = offset {
-                        // Insert multiply before GEP: offset' = offset * vec_width
-                        let mul_dest = Value(next_val_id);
-                        next_val_id += 1;
-
-                        let mul_inst = Instruction::BinOp {
-                            dest: mul_dest,
-                            op: IrBinOp::Mul,
-                            lhs: Operand::Value(*offset_val),
-                            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
-                            ty: IrType::I64,
-                        };
-
-                        // Insert mul before GEP
-                        let block = &mut func.blocks[block_idx];
-                        block.instructions.insert(inst_idx, mul_inst);
-                        changes += 1;
-
-                        // Update GEP offset (now at inst_idx + 1)
-                        if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
-                            *offset = Operand::Value(mul_dest);
-                        }
-
-                        if debug {
-                            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
-                        }
-
-                        break; // Only process first GEP per block
+                        geps_to_scale.push((block_idx, inst_idx, *offset_val));
                     }
                 }
             }
+        }
+    }
+    // Apply in reverse order so earlier insertions don't shift later indices.
+    for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
+        let mul_dest = Value(next_val_id);
+        next_val_id += 1;
+
+        let mul_inst = Instruction::BinOp {
+            dest: mul_dest,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(offset_val),
+            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+            ty: IrType::I64,
+        };
+
+        func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
+        changes += 1;
+
+        if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
+            *offset = Operand::Value(mul_dest);
+        }
+
+        if debug {
+            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
         }
     }
 
@@ -3939,46 +3993,47 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // Step 2: Scale array indexing by vector width
+    // Step 2: Scale array indexing by vector width.
+    // Each GEP's byte offset (element_index * elem_size) must be multiplied by
+    // vec_width so one vector iteration covers vec_width consecutive elements.
+    // Collect ALL matching GEPs first — a dot product has two (array A and
+    // array B) in the same block, and the old `break` after the first match
+    // left array B at scalar stride, loading the wrong elements.
+    let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
     for &block_idx in &pattern.loop_blocks {
         let block = &func.blocks[block_idx];
-
-        // Find GEP instructions that match our arrays
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                // Check if this is one of our array GEPs
                 if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
                     if let Operand::Value(offset_val) = offset {
-                        // Insert multiply before GEP: offset' = offset * vec_width
-                        let mul_dest = Value(next_val_id);
-                        next_val_id += 1;
-
-                        let mul_inst = Instruction::BinOp {
-                            dest: mul_dest,
-                            op: IrBinOp::Mul,
-                            lhs: Operand::Value(*offset_val),
-                            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
-                            ty: IrType::I64,
-                        };
-
-                        // Insert mul before GEP
-                        let block = &mut func.blocks[block_idx];
-                        block.instructions.insert(inst_idx, mul_inst);
-                        changes += 1;
-
-                        // Update GEP offset (now at inst_idx + 1)
-                        if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
-                            *offset = Operand::Value(mul_dest);
-                        }
-
-                        if debug {
-                            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
-                        }
-
-                        break; // Only process first GEP per block
+                        geps_to_scale.push((block_idx, inst_idx, *offset_val));
                     }
                 }
             }
+        }
+    }
+    // Apply in reverse order so earlier insertions don't shift later indices.
+    for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
+        let mul_dest = Value(next_val_id);
+        next_val_id += 1;
+
+        let mul_inst = Instruction::BinOp {
+            dest: mul_dest,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(offset_val),
+            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+            ty: IrType::I64,
+        };
+
+        func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
+        changes += 1;
+
+        if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
+            *offset = Operand::Value(mul_dest);
+        }
+
+        if debug {
+            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
         }
     }
 
@@ -4273,18 +4328,6 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
 /// Run SSE2 vectorization on a function (builds CFG analysis if needed).
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
     if func.blocks.len() < 2 {
-        return 0;
-    }
-
-    // A DynAlloca changes the live stack extent at run time. The current vector
-    // loop/remainder builder assumes fixed alloca addresses when it rewrites
-    // GEPs and carries scalar reductions, which can misaddress a VLA
-    // (reproducer: tests/regression/vla_dynamic_stack.c). This is a scoped
-    // legality check, not a global pass disable: functions without dynamic
-    // stack allocation retain full vectorization.
-    if func.blocks.iter().any(|block| {
-        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
-    }) {
         return 0;
     }
 

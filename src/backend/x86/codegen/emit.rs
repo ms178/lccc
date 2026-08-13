@@ -3591,22 +3591,40 @@ impl ArchCodegen for X86Codegen {
                         self.state.vector_values.insert(dest.0);
                         return;
                     }
-                    // Copy vector from src slot to dest slot using ymm0
-                    // TODO: check if it's SSE (128-bit) or AVX (256-bit) and use appropriate register
-                    // For now, assume AVX2 (256-bit)
+                    // Copy vector from src slot to dest slot. The width MUST
+                    // match the value: a 128-bit (SSE2) vector copied with a
+                    // 256-bit vmovupd reads 16 bytes past its slot and writes
+                    // 16 bytes past the destination, corrupting neighbouring
+                    // locals (reproduced: LCCC_FORCE_SSE2=1 dot-product
+                    // clobbered main()'s loop bound with garbage).
+                    let is_128 = self.state.vector128_values.contains(&v.0);
                     if debug {
                         eprintln!(
-                            "[COPY-VEC] Copying slot {} to slot {}",
-                            src_slot.0, dest_slot.0
+                            "[COPY-VEC] Copying {} slot {} to slot {}",
+                            if is_128 { "128-bit" } else { "256-bit" },
+                            src_slot.0,
+                            dest_slot.0
                         );
                     }
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    vmovupd", src_slot.0 as i64, "ymm0");
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    vmovupd", "ymm0", dest_slot.0 as i64);
+                    if is_128 {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movupd", src_slot.0 as i64, "xmm0");
+                        self.state
+                            .out
+                            .emit_instr_reg_rbp("    movupd", "xmm0", dest_slot.0 as i64);
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    vmovupd", src_slot.0 as i64, "ymm0");
+                        self.state
+                            .out
+                            .emit_instr_reg_rbp("    vmovupd", "ymm0", dest_slot.0 as i64);
+                    }
                     self.state.vector_values.insert(dest.0);
+                    if is_128 {
+                        self.state.vector128_values.insert(dest.0);
+                    }
                     return;
                 } else if debug {
                     eprintln!(

@@ -1,0 +1,235 @@
+# SIMD Implementation — Red-Team Audit & Fixes
+
+**Date:** 2026-08-13 · **Branch:** `main` @ `7d86fbf0` (rebased against latest `ms178/lccc`)
+**Scope:** auto-vectorizer (`src/passes/vectorize.rs`), SIMD intrinsic lowering
+(`src/backend/x86/codegen/{intrinsics,intrinsics_simd,emit}.rs`), x86 VEX/EVEX/SSE
+assembler encoders, the generic-SIMD builtin table, and zlib-ng as the real-workload
+test case.
+
+**Method:** every claim below was verified empirically — a C reproducer was compiled
+with lccc (-O2, plus `LCCC_FORCE_SSE2=1` for the legacy path) and cross-checked against
+GCC 14.2 / Clang 19.1 and, where applicable, a Python reference. Generated assembly was
+disassembled to pin each root cause before fixing.
+
+---
+
+## 1. Executive summary
+
+The SIMD implementation was **correct on its one happy path** (AVX2 4-wide double
+matmul with `N % 4 == 0`, single-array F64/I32 reductions) but contained **six
+correctness-critical defects** that produced wrong results or illegal instructions on
+every other shape it claimed to support, plus a large body of dead code. All were fixed,
+regression-tested, and re-validated against GCC. The remaining strategic gap is
+**performance, not correctness**: lccc keeps no vector values in registers across
+intrinsic boundaries, so hand-written intrinsic code (zlib-ng) is **~5.3× slower** than
+GCC despite identical, correct semantics.
+
+### Verified before → after
+
+| Reproducer (N=255 unless noted) | lccc (before) | lccc (after) | GCC/Clang |
+|---|---|---|---|
+| matmul double (AVX2) | 33959684223.750 ✗ | 33958656000.000 ✓ | 33958656000.000 |
+| matmul double (SSE2 path) | 67527162000.000 ✗ | 33958656000.000 ✓ | 33958656000.000 |
+| matmul **float** | **SIGSEGV** ✗ | 33958715392.000 ✓ | 33958715392.000 |
+| dot product (AVX2 & SSE2) | 203466.250 / 187640.000 ✗ | 699040.000 / 707264.000 ✓ | 699040.000 / 707264.000 |
+| `float s += (float)int[i]` | 0.000 ✗ | 32896.000 ✓ | 32896.000 |
+| `_mm256_hadd_ps` | **SIGILL** ✗ | 3 7 19 23 11 15 27 31 ✓ | 3 7 19 23 11 15 27 31 |
+| `_mm256_blendv_ps` | returns *mask* ✗ | 1 2 3 2 5 2 7 2 ✓ | 1 2 3 2 5 2 7 2 |
+| `_mm256_permutevar_ps` | undefined symbol ✗ | 4 3 2 1 8 7 6 5 ✓ | 4 3 2 1 8 7 6 5 |
+
+---
+
+## 2. Confirmed critical defects (fixed)
+
+### D1 — AVX2 matmul tail: OOB write + dead remainder (wrong results)
+`transform_to_fma_f64x4` converted the loop to a byte-offset IV stepping 32 with limit
+`N*8`. For `N%4 != 0` this runs `ceil(N/4)` iterations: the last one reads/writes up to
+3 doubles **past the row end**, and the scalar remainder (start = `IV/8 = ceil(N/4)*4`)
+never fires. Reproduced with N=255 (sum 33959684223.75 vs 33958656000.00; element 255
+clobbered, 252–254 skipped).
+**Fix:** byte limit = `(N/4)*32` (floor). Constant `n → (n/4)*32`; dynamic `N → (N/4)*32`
+via hoisted `UDiv` + `Mul`.
+
+### D2 — SSE2 matmul remainder computed on the wrong IV representation
+`insert_remainder_loop` always computed `j_rem_start = IV / 8` (byte-offset assumption),
+but the SSE2 path keeps an **element-index** IV → the remainder re-processed nearly the
+whole array (67527162000.00 vs 33958656000.00).
+**Fix:** remainder start is now width-aware: `IV/8` for the byte-offset AVX2 IV, `IV*2`
+for the element-index SSE2 IV.
+
+### D3 — Dot-product: second array left at scalar stride
+`transform_reduction_{avx2,sse2}` "scale array indexing" had
+`break; // Only process first GEP per block`, so a dot product's second GEP was never
+scaled and loaded one element per *vector* iteration (dot(255)=203466.25 vs 699040.0).
+**Fix:** collect *all* matching GEPs, apply the ×vec_width scaling in reverse order.
+
+### D4 — Matmul pattern had no element-type gate
+`analyze_loop_pattern` matched `C += A*B` for *any* element type but the transform
+always lowered to `FmaF64x4/FmaF64x2` (packed **double** FMA). A float matmul was
+reinterpreted with an 8-byte element stride → **SIGSEGV**.
+**Fix:** require the multiply's element type to be `IrType::F64`; float/int matmuls stay
+scalar (they already match GCC numerically).
+
+### D5 — Reduction cast-sum path accepted cross-kind casts
+The cast path rejected only *widening* (`long += int`), so `float s += (float)int_arr[i]`
+was vectorized as packed I32 adds on an F32 accumulator and returned 0.0.
+**Fix:** require the cast source type to equal the accumulator type (redundant casts
+only); everything else is rejected.
+
+### D6 — 256-bit `vblendvps/vblendvpd` returned the mask operand
+The blend arm computed its result in `%ymm1` but `avx_store_dest` stores `%ymm0`, which
+held the **mask** — the intrinsic silently returned its mask input.
+**Fix:** produce the result in `%ymm0` (mask→`ymm2`, a→`ymm0`, b→`ymm1`).
+
+### D7 — `FmaF64x2` (SSE2 matmul) aliased the B and C pointers
+The lowering materialized pointers through the transient value cache, which conflated
+two GEPs sharing an offset but not a base — C was loaded and stored through B's address.
+**Fix:** mirror the proven `FmaF64x4` discipline: use the register allocator's
+assignments (`operand_reg`/`dest_reg`) with explicit fallbacks, then
+`reg_cache.invalidate_all()`.
+
+### D8 — Legacy 2-operand SSE instructions emitted in 3-operand form
+`unpckhpd` (2×F64 horizontal add, ×2 sites), `psrldq` (4×I32 horizontal add, ×2 sites)
+and `paddd` (`VecAddI32x4`) were emitted with a 3-operand VEX-style shape
+(`unpckhpd %xmm0, %xmm0, %xmm1`, `psrldq $8, %xmm0, %xmm1`, `paddd %xmm1, %xmm0, %xmm0`).
+The assembler rejects them ("SSE op requires 2 operands"), so the entire SSE2 reduction
+path failed to assemble. The AVX (VEX) forms were correct.
+**Fix:** emit the correct 2-operand sequences (copy + in-place shift/unpack, 2-op add).
+
+### D9 — 256-bit unpack intrinsics were silently dropped
+`UnpcklPs256/UnpckhPs256/UnpcklPd256/UnpckhPd256` were routed to
+`emit_avx_fp_256_op` but had **no match arm**, falling into `_ => {}` and emitting
+nothing — the result alloca stayed uninitialized (garbage).
+**Fix:** added the four arms (`vunpcklps/vunpckhps/vunpcklpd/vunpckhpd`).
+
+### D10 — Wrong VEX prefix on `vhaddps/vhsubps/vaddsubps`
+These require the **F2** prefix (VEX pp = 3) but were encoded with pp = 2 (**F3**) → an
+illegal instruction (**SIGILL**). The `pd` forms (66) were correct.
+**Fix:** pp 2 → 3. Same class fixed for the FMA3 scalar forms: `vfmadd*{132,213,231}ss`
+need F3 (pp=2) and `…sd` need F2 (pp=3); both were wrongly given 66 (pp=1). Added
+`encode_avx_3op_38_pp_w1` for the W=1 (sd) forms.
+
+### D11 — 128-bit vector copies emitted as 256-bit moves (SSE2 reduction corruption)
+`emit_copy_value` contained a literal `TODO` and copied *every* vector with a 256-bit
+`vmovupd`, reading 16 bytes past the source slot and writing 16 bytes past the
+destination. Under `LCCC_FORCE_SSE2=1` the accumulator copies clobbered `main()`'s
+locals (the loop bound itself was corrupted).
+**Fix:** width-aware copy — 128-bit values (`vector128_values`) use `movupd`/`xmm0`,
+256-bit use `vmovupd`/`ymm0`; the 128-bit class is propagated to the copy's dest.
+
+### D12 — Dead/mis-encoding assembler arms
+- 6 exact-duplicate `match` arms (vfmadd213/231ps·pd, vmaxps/pd, vminps/pd, vextractf128)
+  removed (unreachable-pattern warnings, no behaviour change).
+- `vpcmpeq*`/`vpcmpgt*` EVEX arms shadowed the mask-dest alias arm, so `%k`-destination
+  forms were mis-encoded as vector-dest compares. Removed the shadowing arms; the alias
+  arm now correctly handles mask-dest, rejects zmm vector-dest (like GAS), and xmm/ymm
+  falls through to VEX.
+- plain `cvtss2si/cvtsd2si` duplicate arms removed (handled by the q-suffixed arms).
+- duplicate `Vbroadcastsd` arm removed.
+
+Build warnings: **34 → 15** (the remaining 14 are `upper camel case` naming on
+IntrinsicOp variants and one trailing semicolon — cosmetic, deferred deliberately to
+avoid a large mechanical rename).
+
+---
+
+## 3. Gaps closed
+
+- `__lccc_simd256_ps_vpermilvarps256` / `…vpermilvarpd256` were declared in
+  `include/lcccsimd.h` but had **no backend lowering** and the assembler only knew the
+  immediate `vpermilps` form. Added `VpermilvarPs256/VpermilvarPd256` (enum, lookup
+  table, `emit_avx_fp_256_op`) and the variable-index encodings (0F38.0C/0D, operand-kind
+  dispatch against 0F3A.04/05).
+
+---
+
+## 4. zlib-ng as test case (data)
+
+- lccc **compiles zlib-ng's SIMD hot files cleanly** (`adler32_avx2.c`,
+  `chunkset_avx2.c`, `slide_hash_avx2.c`). Other files only fail on missing *generated*
+  config headers (`zconf-ng.h`, `zbuild.h` from a real cmake/configure run) — not
+  compiler defects.
+- **Correctness:** lccc's `adler32_avx2` over 100 KB of data returns `771462159`,
+  identical to GCC and to Python's `zlib.adler32`.
+
+| `zng adler32_avx2` (X86_AVX2, -mavx2 -O2) | instructions | runtime (5000 iters × 100 KB, min of 5, pinned) |
+|---|---|---|
+| **lccc** | **963** | **0.069 s** |
+| GCC 14.2 | 674 | 0.013 s |
+| Clang 19.1 | 504 | — |
+
+**Root cause (the next big win):** lccc has no XMM/YMM/ZMM register allocation for
+intrinsic chains. Every vector op is `vmovdqu %ymm0, N(%rsp)` … `vmovdqu M(%rsp), %ymm0`
+round-trips through the stack (72 `vmovdqu` + 274 `movq` + 77 `leaq` in one function),
+while GCC keeps ~15 ymm registers live across the loop and folds memory operands
+(`vpmaddubsw (%rsi,%rdx), %ymm0, %ymm0`). The single-op `vec_live_regs` peephole is
+insufficient. This is **the** highest-leverage improvement: a proper vector register
+allocator + memory-operand folding would close most of the ~5× gap.
+
+---
+
+## 5. Remaining gaps & prioritized work items
+
+| # | Work item | Evidence | Expected impact |
+|---|---|---|---|
+| 1 | Vector register allocation (XMM/YMM/ZMM) + memory-operand folding for intrinsic chains | adler32_avx2: 963 vs 674/504 instrs, **5.3× slower** | highest — every SIMD workload |
+| 2 | Auto-vectorizer coverage: it only recognizes matmul-F64 and F64/I32 sum/dot reductions; no F32, no stores-into-loops, no if-converted, no unaligned/alias versioning, no `#pragma`/hint support | static analysis of `analyze_loop_pattern`/`analyze_reduction_pattern` | large for real scalar loops |
+| 3 | `BroadcastLoadF64` hoisting is disabled by a `TODO` (register-allocation conflict) — A[i][k] is re-broadcast every inner iteration | comment in `transform_to_fma_f64x4` | matmul inner loop |
+| 4 | `LCCC_FORCE_AVX2` env var is documented but never read; vector width selection ignores target feature detection (uses AVX2 by default on all x86-64) | `vectorize_with_analysis` | correctness on non-AVX2 hosts |
+| 5 | `cvtss2si/cvtsd2si` (plain) are encoded with REX.W=1 even for a 32-bit dest (`%eax`); harmless for lccc's own codegen (sign-extended low 32 bits) but deviates from GAS for hand-written asm | `encoder/mod.rs` q-suffixed arms | minor compat |
+| 6 | Mixed-width vector copies elsewhere should be audited for the D11 class (any other `ymm`-width copy of a 128-bit value) | D11 | correctness hardening |
+| 7 | Duplicate logic in `vectorize.rs` (`transform_reduction_avx2`/`_sse2` are near-identical; `label_to_idx` rebuilt repeatedly) | static analysis | maintainability |
+
+---
+
+## 6. Regression tests added (`tests/regression/`)
+
+Self-checking, return 0 on success, and **verified to fail on the pre-fix binary** and
+**match GCC**:
+
+- `vectorize_matmul_tail.c` — D1 (sentinel canary catches the row-end OOB write)
+- `vectorize_dot_product.c` — D3
+- `vectorize_float_matmul.c` — D4
+- `vectorize_mixed_sum.c` — D5
+- `vectorize_i32_sum.c` — I32 reduction guard
+- `vectorize_sse2_path.c` (+ `.env`) — D2/D7/D8/D11 under `LCCC_FORCE_SSE2=1`
+- `simd_vhaddps.c` (+ `.flags -mavx`) — D10
+- `simd_blendv256.c` (+ `.flags -mavx`) — D6
+- `simd_vpermilvar256.c` (+ `.flags -mavx`) — vpermilvar gap
+
+`run_regression.sh` now sources a per-test `<name>.env` so tests can select
+`LCCC_FORCE_SSE2=1`.
+
+---
+
+## 7. Validation matrix (post-fix)
+
+| Suite | Result |
+|---|---|
+| 12 SIMD reproducers × {AVX2, SSE2} vs GCC | **all match** |
+| `tests/intrinsics/run_intrin_tests.py` | **3/3** (t256_fp now compiles *and* runs) |
+| `tests/regression/run_regression.sh` | **120/120** (5 `--compare-gcc` mismatches are pre-existing on clean main and unrelated: glibc f128/x87/TLS, abs-symbol, clmul256-gcc-SIGILL) |
+| `tests/correctness/run_correctness.py` | **50/50** |
+| zlib-ng `adler32_avx2` | correct output, matches GCC + zlib reference |
+
+---
+
+## 8. What a super-genius would do next
+
+1. **Vector register allocation.** Give the backend a real XMM/YMM/ZMM allocator
+   (e.g. an interval/priority allocator over the `vector_values` live ranges, extending
+   the existing `vec_live_regs` idea from a 1-op peephole to whole-function intervals),
+   plus memory-operand folding in `emit_avx_binary_256`/`emit_simd_op` so the *first*
+   use of a slot can fold it. Target: adler32_avx2 from 963 → ≤ 550 instructions.
+2. **Alias-analysis-driven auto-vectorization** for the general store-loop and
+   mixed-type cases, with runtime versioning (`if (alias-free && aligned && N%4==0)`),
+   and a cost model that consults register pressure (per the project's own §20–§25).
+3. **Target-feature gating**: derive vector width from the driver's target features
+   (verified via CPUID on the host, per §54) instead of the `LCCC_FORCE_SSE2` env var,
+   and honor `LCCC_FORCE_AVX2` or remove it.
+4. Turn `FmaF64x4Hoisted`/`BroadcastLoadF64` back on once (1) lands, eliminating the
+   per-iteration `vbroadcastsd` from the matmul inner loop.
+5. A "why wasn't this vectorized" diagnostic (per §57) wired to `LCCC_DEBUG_VECTORIZE`.
+
+All fixes are committed on branch `simd-redteam-audit`; correctness is backed by the
+reproducers, assembly, and the regression/correctness/intrinsics suites above.

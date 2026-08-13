@@ -359,6 +359,8 @@ pub(super) fn lccc_simd_lookup(
         "vcvtdq2pd256" => u(Vec256, CvtEp32_2Pd_256),
         "vcvttpd2dq256" => u(Vec128, CvttPd2Ep32_256),
         "vpermilps256" => ui(Vec256, VpermilPs256),
+        "vpermilvarps256" => b(Vec256, VpermilvarPs256),
+        "vpermilvarpd256" => b(Vec256, VpermilvarPd256),
         "vperm2f128" => s2(Vec256, Vperm2f128),
         "vinsertf128" => s2(Vec256, Vinsertf128),
         "vextractf128" => ui(Vec128, Vextractf128),

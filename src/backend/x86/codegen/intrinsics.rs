@@ -1810,15 +1810,39 @@ impl X86Codegen {
                 // args[1] = B pointer (2×F64)
                 // dest_ptr = C pointer (read+write, 2×F64)
                 if let Some(c_ptr) = dest_ptr {
-                    self.operand_to_reg(&args[0], "rcx");      // A ptr → %rcx
-                    self.operand_to_reg(&args[1], "rdx");      // B ptr → %rdx
-                    self.value_to_reg(c_ptr, "rax");           // C ptr → %rax
+                    // Use the register allocator's assignments when available
+                    // (mirrors FmaF64x4). The old operand_to_reg/value_to_reg
+                    // path consulted the transient value cache, which conflated
+                    // B and C GEPs sharing an offset but not a base, so C was
+                    // loaded and stored through B's address (SSE2 matmul
+                    // miscompile: every FMA wrote the B array).
+                    let a_name = if let Some(r) = self.operand_reg(&args[0]) {
+                        super::emit::phys_reg_name(r)
+                    } else {
+                        self.operand_to_reg(&args[0], "rcx");
+                        "rcx"
+                    };
+                    let b_name = if let Some(r) = self.operand_reg(&args[1]) {
+                        super::emit::phys_reg_name(r)
+                    } else {
+                        self.operand_to_reg(&args[1], "rdx");
+                        "rdx"
+                    };
+                    let c_name = if let Some(r) = self.dest_reg(c_ptr) {
+                        super::emit::phys_reg_name(r)
+                    } else {
+                        self.value_to_reg(c_ptr, "rax");
+                        "rax"
+                    };
+
                     // FMA3: load C, fused multiply-add with B, store back
-                    self.state.emit("    movsd (%rcx), %xmm1");          // xmm1 = A scalar
-                    self.state.emit("    unpcklpd %xmm1, %xmm1");        // xmm1 = {A, A}
-                    self.state.emit("    movupd (%rax), %xmm0");         // xmm0 = {C[j], C[j+1]}
-                    self.state.emit("    vfmadd231pd (%rdx), %xmm1, %xmm0"); // xmm0 = xmm1*B[mem] + xmm0
-                    self.state.emit("    movupd %xmm0, (%rax)");         // store back
+                    self.state.emit_fmt(format_args!("    movsd (%{}), %xmm1", a_name));  // xmm1 = A scalar
+                    self.state.emit("    unpcklpd %xmm1, %xmm1");                         // xmm1 = {A, A}
+                    self.state.emit_fmt(format_args!("    movupd (%{}), %xmm0", c_name)); // xmm0 = {C[j], C[j+1]}
+                    self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %xmm1, %xmm0", b_name));
+                    self.state.emit_fmt(format_args!("    movupd %xmm0, (%{})", c_name)); // store back
+
+                    self.state.reg_cache.invalidate_all();
                 }
             }
             IntrinsicOp::FmaF64x4 => {
@@ -2050,10 +2074,11 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 // Reduce 2×F64 → 1×F64
                 self.operand_to_reg(&args[0], "rax");
-                self.state.emit("    movupd (%rax), %xmm0");          // Load 2 doubles
-                self.state.emit("    unpckhpd %xmm0, %xmm0, %xmm1");  // Duplicate upper to xmm1
-                self.state.emit("    addsd %xmm1, %xmm0");            // Add (2→1)
-                self.state.emit("    movq %xmm0, %rax");              // Extract to GPR
+                self.state.emit("    movupd (%rax), %xmm0");   // Load {lo, hi}
+                self.state.emit("    movapd %xmm0, %xmm1");   // copy
+                self.state.emit("    unpckhpd %xmm0, %xmm1"); // xmm1 = {hi, hi}
+                self.state.emit("    addsd %xmm1, %xmm0");    // xmm0.lo = lo + hi
+                self.state.emit("    movq %xmm0, %rax");      // Extract to GPR
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
@@ -2081,9 +2106,11 @@ impl X86Codegen {
                 // Reduce 4×I32 → 1×I32
                 self.operand_to_reg(&args[0], "rax");
                 self.state.emit("    movdqu (%rax), %xmm0");          // Load 4 ints
-                self.state.emit("    psrldq $8, %xmm0, %xmm1");       // Shift 8 bytes (4→2)
+                self.state.emit("    movdqa %xmm0, %xmm1");           // copy
+                self.state.emit("    psrldq $8, %xmm1");              // xmm1 = {0,0,a,b}
                 self.state.emit("    paddd %xmm1, %xmm0");            // Add (4→2)
-                self.state.emit("    psrldq $4, %xmm0, %xmm1");       // Shift 4 bytes (2→1)
+                self.state.emit("    movdqa %xmm0, %xmm1");           // copy
+                self.state.emit("    psrldq $4, %xmm1");              // xmm1 = {0,a,b,a+c}
                 self.state.emit("    paddd %xmm1, %xmm0");            // Add (2→1)
                 self.state.emit("    movd %xmm0, %eax");              // Extract to GPR
                 if let Some(d) = dest {
@@ -2267,10 +2294,13 @@ impl X86Codegen {
             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                // Vector integer add (similar pattern)
-                let (load_inst, add_inst, store_inst, reg) = match op {
-                    IntrinsicOp::VecAddI32x8 => ("vmovdqu", "vpaddd", "vmovdqu", "ymm"),
-                    IntrinsicOp::VecAddI32x4 => ("movdqu", "paddd", "movdqu", "xmm"),
+                // Vector integer add. paddd is a legacy 2-operand instruction;
+                // only its VEX form (vpaddd) takes three operands. The old
+                // code emitted `paddd %xmm1, %xmm0, %xmm0` for the SSE2 case,
+                // which the assembler rejects ("SSE op requires 2 operands").
+                let (load_inst, add_inst, store_inst, reg, is_avx) = match op {
+                    IntrinsicOp::VecAddI32x8 => ("vmovdqu", "vpaddd", "vmovdqu", "ymm", true),
+                    IntrinsicOp::VecAddI32x4 => ("movdqu", "paddd", "movdqu", "xmm", false),
                     _ => unreachable!(),
                 };
                 self.operand_to_reg(&args[0], "rax");
@@ -2283,7 +2313,12 @@ impl X86Codegen {
                     self.state.out.emit_instr_rbp_reg("    leaq", slot.0 as i64, "rcx");
                 }
                 self.state.emit_fmt(format_args!("    {} (%rcx), %{}1", load_inst, reg));
-                self.state.emit_fmt(format_args!("    {} %{}1, %{}0, %{}0", add_inst, reg, reg, reg));
+                if is_avx {
+                    self.state.emit_fmt(format_args!("    {} %{}1, %{}0, %{}0", add_inst, reg, reg, reg));
+                } else {
+                    // Legacy SSE2: 2-operand form, src then dst.
+                    self.state.emit_fmt(format_args!("    {} %{}1, %{}0", add_inst, reg, reg));
+                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     if let Some(slot) = self.state.get_slot(d.0) {
@@ -2327,8 +2362,9 @@ impl X86Codegen {
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movupd (%rax), %xmm0");
                 }
-                self.state.emit("    unpckhpd %xmm0, %xmm0, %xmm1");
-                self.state.emit("    addsd %xmm1, %xmm0");
+                self.state.emit("    movapd %xmm0, %xmm1");
+                self.state.emit("    unpckhpd %xmm0, %xmm1"); // xmm1 = {hi, hi}
+                self.state.emit("    addsd %xmm1, %xmm0");    // xmm0.lo = lo + hi
                 self.state.emit("    movq %xmm0, %rax");
                 if let Some(d) = dest {
                     self.store_rax_to(d);
@@ -2369,9 +2405,11 @@ impl X86Codegen {
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movdqu (%rax), %xmm0");
                 }
-                self.state.emit("    psrldq $8, %xmm0, %xmm1");
+                self.state.emit("    movdqa %xmm0, %xmm1");
+                self.state.emit("    psrldq $8, %xmm1");   // xmm1 = {0,0,a,b}
                 self.state.emit("    paddd %xmm1, %xmm0");
-                self.state.emit("    psrldq $4, %xmm0, %xmm1");
+                self.state.emit("    movdqa %xmm0, %xmm1");
+                self.state.emit("    psrldq $4, %xmm1");   // xmm1 = {0,a,b,a+c}
                 self.state.emit("    paddd %xmm1, %xmm0");
                 self.state.emit("    movd %xmm0, %eax");
                 if let Some(d) = dest {
