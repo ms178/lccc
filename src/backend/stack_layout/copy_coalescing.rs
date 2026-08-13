@@ -1202,16 +1202,26 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadF64x4
             | O::VecLoadI32x4
             | O::VecLoadI32x8
+            | O::VecLoadF32x4
+            | O::VecLoadF32x8
             | O::VecAddF64x2
             | O::VecAddF64x4
             | O::VecAddI32x4
             | O::VecAddI32x8
+            | O::VecAddF32x4
+            | O::VecAddF32x8
             | O::VecMulF64x2
             | O::VecMulF64x4
+            | O::VecMulF32x4
+            | O::VecMulF32x8
             | O::VecHorizontalAddF64x2
             | O::VecHorizontalAddF64x4
             | O::VecHorizontalAddI32x4
             | O::VecHorizontalAddI32x8
+            | O::VecHorizontalAddF32x4
+            | O::VecHorizontalAddF32x8
+            | O::VecZeroF32x4
+            | O::VecZeroF32x8
     )
 }
 

@@ -204,6 +204,12 @@ pub enum IntrinsicOp {
     /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
     /// args[0] = base pointer, args[1] = byte offset; dest = vector value
     VecLoadI32x4,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 8×F32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF32x8,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×F32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF32x4,
 
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 4×F64
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
@@ -223,6 +229,14 @@ pub enum IntrinsicOp {
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecAddI32x4,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×F32
+    VecAddF32x8,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×F32
+    VecAddF32x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - AVX2 8×F32
+    VecMulF32x8,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 4×F32
+    VecMulF32x4,
 
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
     /// args[0] = source vector value; dest = scalar F64 result
@@ -236,6 +250,10 @@ pub enum IntrinsicOp {
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x4,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×F32 → F32
+    VecHorizontalAddF32x8,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×F32 → F32
+    VecHorizontalAddF32x4,
 
     /// Vector zero: %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
     /// No args; dest = zero vector
@@ -249,6 +267,10 @@ pub enum IntrinsicOp {
     /// Vector zero: %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
     /// No args; dest = zero vector
     VecZeroI32x4,
+    /// Vector zero: AVX2 8×F32
+    VecZeroF32x8,
+    /// Vector zero: SSE2 4×F32
+    VecZeroF32x4,
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,
@@ -918,6 +940,7 @@ impl IntrinsicOp {
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
             | VecAddI32x8 | VecZeroF64x4 | VecZeroI32x8
+            | VecLoadF32x8 | VecAddF32x8 | VecMulF32x8 | VecZeroF32x8
             // Newly wired AVX/AVX2 ops (previously scalar header loops)
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
@@ -954,6 +977,7 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
+            | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecZeroF32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128

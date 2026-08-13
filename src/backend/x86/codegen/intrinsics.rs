@@ -2417,6 +2417,188 @@ impl X86Codegen {
                 }
             }
 
+            // ---- F32 reduction vector ops (8-wide AVX2 / 4-wide SSE2) ----
+            IntrinsicOp::VecLoadF32x8 | IntrinsicOp::VecLoadF32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let is8 = matches!(op, IntrinsicOp::VecLoadF32x8);
+                self.operand_to_reg(&args[0], "rax");
+                self.operand_to_reg(&args[1], "rcx");
+                if is8 {
+                    self.state.emit("    vmovups (%rax,%rcx), %ymm0");
+                } else {
+                    self.state.emit("    movups (%rax,%rcx), %xmm0");
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        if is8 {
+                            self.state.out.emit_instr_reg_rbp("    vmovups", "ymm0", slot.0 as i64);
+                        } else {
+                            self.state.out.emit_instr_reg_rbp("    movups", "xmm0", slot.0 as i64);
+                        }
+                    }
+                }
+            }
+            IntrinsicOp::VecAddF32x8 | IntrinsicOp::VecAddF32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let is8 = matches!(op, IntrinsicOp::VecAddF32x8);
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    if is8 {
+                        self.state.out.emit_instr_rbp_reg("    vmovups", slot.0 as i64, "ymm0");
+                    } else {
+                        self.state.out.emit_instr_rbp_reg("    movups", slot.0 as i64, "xmm0");
+                    }
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    if is8 {
+                        self.state.emit("    vmovups (%rax), %ymm0");
+                    } else {
+                        self.state.emit("    movups (%rax), %xmm0");
+                    }
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    if is8 {
+                        self.state.out.emit_instr_rbp_reg("    vmovups", slot.0 as i64, "ymm1");
+                    } else {
+                        self.state.out.emit_instr_rbp_reg("    movups", slot.0 as i64, "xmm1");
+                    }
+                } else {
+                    self.operand_to_reg(&args[1], "rcx");
+                    if is8 {
+                        self.state.emit("    vmovups (%rcx), %ymm1");
+                    } else {
+                        self.state.emit("    movups (%rcx), %xmm1");
+                    }
+                }
+                if is8 {
+                    self.state.emit("    vaddps %ymm1, %ymm0, %ymm0");
+                } else {
+                    // Legacy 2-operand addps.
+                    self.state.emit("    addps %xmm1, %xmm0");
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        if is8 {
+                            self.state.out.emit_instr_reg_rbp("    vmovups", "ymm0", slot.0 as i64);
+                        } else {
+                            self.state.out.emit_instr_reg_rbp("    movups", "xmm0", slot.0 as i64);
+                        }
+                    }
+                }
+            }
+            IntrinsicOp::VecMulF32x8 | IntrinsicOp::VecMulF32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let is8 = matches!(op, IntrinsicOp::VecMulF32x8);
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    if is8 {
+                        self.state.out.emit_instr_rbp_reg("    vmovups", slot.0 as i64, "ymm0");
+                    } else {
+                        self.state.out.emit_instr_rbp_reg("    movups", slot.0 as i64, "xmm0");
+                    }
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    if is8 {
+                        self.state.emit("    vmovups (%rax), %ymm0");
+                    } else {
+                        self.state.emit("    movups (%rax), %xmm0");
+                    }
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    if is8 {
+                        self.state.out.emit_instr_rbp_reg("    vmovups", slot.0 as i64, "ymm1");
+                    } else {
+                        self.state.out.emit_instr_rbp_reg("    movups", slot.0 as i64, "xmm1");
+                    }
+                } else {
+                    self.operand_to_reg(&args[1], "rcx");
+                    if is8 {
+                        self.state.emit("    vmovups (%rcx), %ymm1");
+                    } else {
+                        self.state.emit("    movups (%rcx), %xmm1");
+                    }
+                }
+                if is8 {
+                    self.state.emit("    vmulps %ymm1, %ymm0, %ymm0");
+                } else {
+                    self.state.emit("    mulps %xmm1, %xmm0");
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        if is8 {
+                            self.state.out.emit_instr_reg_rbp("    vmovups", "ymm0", slot.0 as i64);
+                        } else {
+                            self.state.out.emit_instr_reg_rbp("    movups", "xmm0", slot.0 as i64);
+                        }
+                    }
+                }
+            }
+            IntrinsicOp::VecHorizontalAddF32x8 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // 8×F32 → F32: cross-lane-safe halving reduction.
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    vmovups", slot.0 as i64, "ymm0");
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    vmovups (%rax), %ymm0");
+                }
+                self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+                self.state.emit("    vaddps %xmm1, %xmm0, %xmm0");      // [s0 s1 s2 s3]
+                self.state.emit("    vmovshdup %xmm0, %xmm1");           // [s1 s1 s3 s3]
+                self.state.emit("    vaddps %xmm1, %xmm0, %xmm0");       // [s0+s1, .., s2+s3, ..]
+                self.state.emit("    vshufps $0xAA, %xmm0, %xmm0, %xmm1"); // lanes {2,2,2,2}
+                self.state.emit("    vaddss %xmm1, %xmm0, %xmm0");       // (s0+s1)+(s2+s3)
+                self.state.emit("    vmovd %xmm0, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecHorizontalAddF32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // 4×F32 → F32 (SSE2-only instruction sequence).
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    movups", slot.0 as i64, "xmm0");
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    movups (%rax), %xmm0");
+                }
+                self.state.emit("    movaps %xmm0, %xmm1");
+                self.state.emit("    movhlps %xmm0, %xmm1"); // xmm1 = [s2 s3 s2 s3]
+                self.state.emit("    addps %xmm1, %xmm0");  // [s0+s2, s1+s3, ..]
+                self.state.emit("    movaps %xmm0, %xmm1"); // refresh shuffle source
+                self.state.emit("    shufps $0x55, %xmm0, %xmm1"); // [s1+s3 ×4]
+                self.state.emit("    addss %xmm1, %xmm0"); // (s0+s2)+(s1+s3)
+                self.state.emit("    movd %xmm0, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecZeroF32x8 | IntrinsicOp::VecZeroF32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let is8 = matches!(op, IntrinsicOp::VecZeroF32x8);
+                if is8 {
+                    self.state.emit("    vxorps %ymm0, %ymm0, %ymm0");
+                } else {
+                    self.state.emit("    xorps %xmm0, %xmm0");
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        if is8 {
+                            self.state.out.emit_instr_reg_rbp("    vmovups", "ymm0", slot.0 as i64);
+                        } else {
+                            self.state.out.emit_instr_reg_rbp("    movups", "xmm0", slot.0 as i64);
+                        }
+                    }
+                }
+            }
             IntrinsicOp::VecZeroF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
