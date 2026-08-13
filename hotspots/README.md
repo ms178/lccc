@@ -51,6 +51,30 @@ to regenerate them must stay in the repository.
 ## Current entries
 
 - [`RESEARCH_BACKLOG.md`](RESEARCH_BACKLOG.md) — prioritized, evidence-linked
-  optimization queue.
+  optimization queue (now including the integrated PGO v10/v11 items and new
+  research spikes such as use-def chains, PGO loop-versioned devirtualization,
+  and sample-based PGO).
 - [`expat_xml_scan_static_leaf_inlining.md`](expat_xml_scan_static_leaf_inlining.md)
-  — VM-screening candidate for static leaf-function inlining.
+  — acyclic static leaf-function inlining (integrated; hardware follow-up).
+- [`P0P1_CYCLE_2026_08_11.md`](P0P1_CYCLE_2026_08_11.md) — the 2026-08-11 P0/P1
+  cycle: IVSR safety, bounded static-loop inlining, and the volatile-zero fact
+  fix, each with a retained incremental patch snapshot.
+- [`struct_copy_aggregate_abi.md`](struct_copy_aggregate_abi.md) — aggregate
+  by-value ABI & wide-copy lowering; the largest measured gap (21×) on
+  `struct_copy`.
+
+## Integrated PGO findings (moved out of "screening")
+
+The PGO red-team audits produced several *measured, integrated* results that are
+now part of the baseline. They are recorded here so the institutional memory
+keeps the **why** (and the rejected alternatives):
+
+- **Flat-profile gate** — a profile with no single dominant hot function must
+  not perturb the inliner (adler32 was -17% under `-fprofile-use`; now neutral).
+- **Cost-aware devirtualization** — promoting a stable single-target indirect
+  call is a net regression on modern BTB hardware; only multi-valued sites are
+  promoted (op_dispatch +28% → neutral; multi_dispatch 1.07×).
+- **Conservative (preserve-source-order) block layout** — reordering the hot
+  loop can blow up register allocation (expat 131→248 ms); the layout pass now
+  preserves source order and gets profile value from sections, switch ordering,
+  and branch inversion instead.

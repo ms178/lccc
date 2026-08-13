@@ -182,7 +182,7 @@ pub struct CodegenState {
     /// needs. When the store is skipped the value stays in the register and
     /// the consumer's load becomes a no-op (accumulator renaming).
     pub vector_defer_values: FxHashSet<u32>,
-    /// Lazy-flush half of the v5 deferred-store mechanism: a skipped vector
+    /// Lazy-flush half of the deferred-store mechanism: a skipped vector
     /// result store is kept PENDING here (value id, holding register, 256-bit
     /// flag) instead of being dropped. If the consumer really receives the
     /// value through the last-store cache, the entry is silently discarded

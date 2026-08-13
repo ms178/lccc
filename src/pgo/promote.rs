@@ -421,7 +421,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
         crate::pgo::record_promoted_hot(u, hot_labels);
     }
     if promoted > 0 {
-        eprintln!("lccc: PGO v7: promoted {} indirect call sites", promoted);
+        eprintln!("lccc: PGO: promoted {} indirect call sites", promoted);
     }
     promoted
 }

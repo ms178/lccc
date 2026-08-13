@@ -1074,7 +1074,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 }
 
-/// v5 CCC_ENABLE_VECREG: collect the 128-bit VECTOR VALUES that are safe to
+/// CCC_ENABLE_VECREG: collect the 128-bit VECTOR VALUES that are safe to
 /// hold in an XMM register for their whole live range.
 ///
 /// A vector value here is the ALLOCA that a SIMD intrinsic writes its 16-byte

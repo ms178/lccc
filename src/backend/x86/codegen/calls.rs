@@ -432,7 +432,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_call_instruction_impl(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, _indirect: bool, _stack_arg_space: usize) {
-        // v5 lazy flush: the call clobbers all XMM registers — a pending
+        // Lazy flush: the call clobbers all XMM registers — a pending
         // deferred vector-result store must hit its slot first.
         self.flush_pending_vec_store_impl();
         if let Some(name) = direct_name {

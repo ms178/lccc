@@ -1,0 +1,43 @@
+PGO Register-Allocation Hints (frequency-weighted spill priority)
+==================================================================
+Priority: MEDIUM
+
+Idea
+----
+The linear-scan allocator already weights priorities by loop depth
+(`max(def_depth, max_use_depth)`, Phase 12). Extend that with **profile
+frequency**: a value hot on the measured profile should get register priority
+even when it sits in a cold-looking (but profile-hot) region, and values on
+cold paths should be the first spill candidates.
+
+Concretely
+----------
+- For each SSA value, multiply its allocation weight by the sum of the profile
+  block counts of its use sites (from the PGO `active_derived_profile`).
+- This is a strict refinement of loop-depth priority: a value in a loop that
+  the profile shows runs 1,000,000× beats one in a loop that runs 3×.
+- Spill choice: prefer to spill values whose total profile-weighted use cost is
+  lowest (LLVM's spill-cost heuristic), rather than purely by live-range length.
+
+Why it is worth it
+------------------
+- It is a small, low-risk change to `live_range.rs`/`regalloc.rs` that turns the
+  existing frequency data into better allocation on exactly the hot paths PGO
+  is designed to optimize.
+- Independent of the scheduler and inliner, so it can be A/B'd cleanly.
+
+Caveats
+-------
+- Must never change *correctness* of allocation, only priority. The allocator's
+  eligibility boundary stays untouched.
+- Guard with `LCCC_PGO_REGALLOC=1` and compare against the non-PGO baseline to
+  confirm no code-quality regression on cold-heavy workloads.
+
+Measurable success
+------------------
+- Hot-loop values stay in registers where the profile says the loop dominates;
+  reduced spills on the profile-hot path in the PGO A/B harness.
+
+Key files
+- src/backend/live_range.rs, src/backend/regalloc.rs
+- reference: LLVM `-fregalloc-greedy` spill-cost heuristics, ICC PGO regalloc.

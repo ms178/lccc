@@ -1,4 +1,4 @@
-//! PGO v5 generation instrumentation: Knuth–Stevenson minimal edge counting
+//! Profile-generation instrumentation: Knuth–Stevenson minimal edge counting
 //! plus indirect-call value profiling.
 //!
 //! For every function we build the CFG, find a MAXIMUM spanning tree (hot
@@ -250,7 +250,7 @@ fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<E
             1
         }
     };
-    // v9 red-team fix: build a MAX-WEIGHT DIRECTED SPANNING ARBORESCENCE
+    // Build a MAX-WEIGHT DIRECTED SPANNING ARBORESCENCE
     // rooted at `entry` (Chu–Liu/Edmonds via BFS + greedy improvement),
     // over ALL nodes including the virtual EXIT. The old code used an
     // UNDIRECTED max spanning tree (Kruskal/DSU), which can orient a loop
@@ -408,7 +408,7 @@ pub fn instrument_module(
         return 0;
     }
     if target != Target::X86_64 {
-        eprintln!("lccc: PGO v4: instrumentation is x86-64 only; skipping");
+        eprintln!("lccc: PGO: instrumentation is x86-64 only; skipping");
         return 0;
     }
     let uid = unit_hash(unit);
@@ -449,7 +449,7 @@ pub fn instrument_module(
         if skip_funcs.iter().any(|sf| f.name.contains(sf.as_str())) {
             continue;
         }
-        // v7 identity: keyed by the PRE-pass fingerprint (stable across
+        // Identity: keyed by the PRE-pass fingerprint (stable across
         // gen/use even when profile-guided transforms change the CFG).
         let h0 = pre_hashes.get(&f.name).copied().unwrap_or(0);
         let h1 = post_hashes.get(&f.name).copied().unwrap_or(0);
@@ -468,7 +468,7 @@ pub fn instrument_module(
                     dst: s,
                 });
             }
-            // v8: virtual exit edge for RETURN-terminated blocks — closes
+            // Virtual exit edge for RETURN-terminated blocks — closes
             // the flow equations at the exit so leaf counts derive correctly.
             if matches!(b.terminator, Terminator::Return(_)) {
                 edge_set.insert(Edge {
@@ -479,7 +479,7 @@ pub fn instrument_module(
         }
         let edges: Vec<Edge> = edge_set.into_iter().collect();
         let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
-        // v9: the arborescence spans ALL nodes including the virtual EXIT so
+        // The arborescence spans ALL nodes including the virtual EXIT so
         // it too gets a single incoming tree edge (instead of every
         // return->exit edge being instrumented) and the flow solver's
         // reconstruction stays exact.
@@ -853,7 +853,7 @@ pub fn instrument_module(
         dump_helper(m, &path, &rec, &helper, &func_sites, &lookup_name);
     }
     eprintln!(
-        "lccc: PGO v5: instrumented {} functions ({} value-profile sites) into {}",
+        "lccc: PGO: instrumented {} functions ({} value-profile sites) into {}",
         rec.len(),
         func_sites.values().map(|v| v.len()).sum::<usize>(),
         path.display()
@@ -882,7 +882,7 @@ fn dump_helper(
     // variadic codegen drops register args 3+ — observed: 4-vararg fprintf
     // wrote uid=0). fmt1 ends with a space so fmt2 continues the line.
     m.string_literals
-        .push((hdr.clone(), "lccc-pgo-v5 %llu %llu ".into()));
+        .push((hdr.clone(), "lccc-pgo-v1 %llu %llu ".into()));
     let hdr2 = format!("__lccc_pgo_hdr2_{}", m.functions.len());
     m.string_literals
         .push((hdr2.clone(), "%u %llu\nfunc %s\n".into()));
@@ -1226,7 +1226,7 @@ fn dump_helper(
                 ),
             })
         }
-        // v7: indirect-call value-profile lines. Four slots per site; empty
+        // Indirect-call value-profile lines. Four slots per site; empty
         // slots carry count 0 (parser skips them; lookup(0) -> "?").
         if let Some(sites) = func_sites.get(fkey) {
             for sr in sites {

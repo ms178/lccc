@@ -183,7 +183,7 @@ const MAX_STATIC_NONINLINE_BLOCKS: usize = 4;
 /// aren't fully inlined remain correct because __attribute__((error)) calls
 /// are lowered as no-ops (not traps).
 const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
-/// v11: dedicated budget for profile-guided FORCE-inlined call sites (hot loop
+/// Dedicated budget for profile-guided force-inlined call sites (hot loop
 /// sites inlined even into large callers). Bounded to keep PGO-driven growth
 /// safe for stack-frame and I-cache size.
 const MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER: usize = 600;
@@ -369,7 +369,7 @@ fn select_inline_site(
         if caller_is_recursive && !callee_data.is_always_inline {
             continue;
         }
-        // v11: a profile-guided FORCE-INLINE site is hot (in a hot loop /
+        // A profile-guided FORCE-INLINE site is hot (in a hot loop /
         // high frequency); it should be inlined even when the caller is large
         // or the normal budget is tight — the PGO advantage. We bypass the
         // caller-size / cap gates for it, but still bound total PGO-driven
@@ -551,7 +551,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 &skip_list,
                 caller_has_section,
             );
-            // PGO: filter/adjust call sites based on profile. v10: on a FLAT
+            // PGO: filter/adjust call sites based on profile. On a FLAT
             // profile (no hot/cold spread) PGO inlining has no informative
             // signal; skip reading the profile entirely so inlining is
             // byte-identical to plain -O2 (prevents pass perturbation that can
@@ -559,7 +559,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             if let Some(profile) = crate::pgo::get_pgo_profile() {
                 if crate::pgo::inline_pgo::inline_decisions_active() {
                 let caller_name = module.functions[func_idx].name.clone();
-                // v8: per-call-site hotness. Derive block counts for the
+                // Per-call-site hotness. Derive block counts for the
                 // CURRENT caller CFG from the h0-keyed profile (the CFG may
                 // have changed since training; derive handles drift
                 // gracefully) so the decision sees the count of the block
@@ -736,7 +736,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                             always_inline_budget_remaining.saturating_sub(callee_inst_count);
                     }
                 } else if site.pgo_force {
-                    // v11: PGO-forced sites consume the dedicated PGO budget.
+                    // PGO-forced sites consume the dedicated PGO budget.
                     pgo_force_budget_remaining =
                         pgo_force_budget_remaining.saturating_sub(callee_inst_count);
                 } else {
@@ -776,7 +776,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 &skip_list,
                 caller_has_section,
             );
-            // PGO: filter/adjust call sites based on profile. v10: on a FLAT
+            // PGO: filter/adjust call sites based on profile. On a FLAT
             // profile (no hot/cold spread) PGO inlining has no informative
             // signal; skip reading the profile entirely so inlining is
             // byte-identical to plain -O2 (prevents pass perturbation that can
@@ -784,7 +784,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             if let Some(profile) = crate::pgo::get_pgo_profile() {
                 if crate::pgo::inline_pgo::inline_decisions_active() {
                 let caller_name = module.functions[func_idx].name.clone();
-                // v8: per-call-site hotness. Derive block counts for the
+                // Per-call-site hotness. Derive block counts for the
                 // CURRENT caller CFG from the h0-keyed profile (the CFG may
                 // have changed since training; derive handles drift
                 // gracefully) so the decision sees the count of the block
@@ -1422,7 +1422,7 @@ struct InlineCallSite {
     dest: Option<Value>,
     /// Arguments passed to the call
     args: Vec<Operand>,
-    /// v11: profile-guided force-inline. Set by the PGO filter when the call
+    /// Profile-guided force-inline. Set by the PGO filter when the call
     /// site is genuinely HOT (in a hot loop / high frequency) and should be
     /// inlined even if the base inliner's caller-size or budget limits would
     /// normally skip it — the PGO advantage LLVM/ICC have over a plain build.

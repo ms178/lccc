@@ -11,11 +11,13 @@ Overall 22.7% instruction count reduction (26.1B -> 20.2B).
 
 Remaining bottlenecks:
 
-1. EXTERNAL ASSEMBLER
-   The compiler shells out to gcc/as for assembling text assembly into
-   object files. Process spawn overhead matters for parallel kernel builds.
-   Fix: Native assembler + ELF writer (see native_elf_writer.txt).
-   Expected improvement: eliminates fork/exec per compilation unit.
+1. EXTERNAL ASSEMBLER  [DONE]
+   The compiler previously shelled out to gcc/as for assembling text assembly
+   into object files. A native assembler + ELF writer now ships for x86, ARM,
+   and RISC-V, eliminating fork/exec per compilation unit and enabling
+   standalone linking (QEMU, FFmpeg, and kernel builds use it). Remaining
+   work is breadth (i686 vector-table `.org`, MOVW relocs, .ifnb/.ifb, etc.)
+   tracked in `current_tasks/`.
 
 2. ALLOCATION OVERHEAD (~17.5% of total)
    malloc/free/realloc/memcpy dominate the profile (5.5% _int_malloc,

@@ -194,7 +194,7 @@ pub trait ArchCodegen {
     /// Called at block boundaries and before instructions that can't be lowered to MachInst.
     /// Default: no-op.
     fn flush_machinst(&mut self) {}
-    /// v5 CCC_ENABLE_VECREG: at the end of a block, flush register-held vector
+    /// CCC_ENABLE_VECREG: at the end of a block, flush register-held vector
     /// values that are live-out to their home slots. Default no-op; only the
     /// x86-64 backend implements it.
     fn flush_vecreg_liveout(&mut self) {}
@@ -1548,7 +1548,7 @@ pub trait ArchCodegen {
         ty: IrType,
     ) {
         // Check density for jump table eligibility (disabled by -fno-jump-tables).
-        // v8 F7: a COLD switch block (per the profile summary) forces the
+        // A COLD switch block (per the profile summary) forces the
         // compare chain even when dense — a table's rodata + I-cache cost is
         // not worth a path that barely runs.
         let hint = crate::pgo::take_switch_hint();
@@ -1835,7 +1835,7 @@ pub trait ArchCodegen {
     /// as weak symbols for standalone builds without libgcc.
     fn emit_runtime_stubs(&mut self) {}
 
-    /// Flush a pending deferred vector-result store (x86 v5 lazy-flush).
+    /// Flush a pending deferred vector-result store (x86 lazy-flush).
     /// Called at block boundaries, where the straight-line last-store cache is
     /// invalidated: if a deferred store was never consumed in its own block,
     /// the slot must be written before another block can read it. No-op on

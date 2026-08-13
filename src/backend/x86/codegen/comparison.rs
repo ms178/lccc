@@ -333,7 +333,7 @@ impl X86Codegen {
         false_block: BlockId,
     ) {
         let next = self.state.next_block_label;
-        // v11: profile-driven fallthrough. The layout pass recorded which
+        // Profile-driven fallthrough. The layout pass recorded which
         // successor carries more profile executions (the hot edge); the
         // codegen driver sets it before this call. We make that successor the
         // physical fallthrough (emit a conditional jump to the COLD successor

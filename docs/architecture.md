@@ -18,23 +18,24 @@ LCCC is a fork of CCC. The core compilation pipeline is unchanged; LCCC replaces
 
 [CCC (Claude's C Compiler)](https://github.com/anthropics/claudes-c-compiler) is a C compiler written from scratch in Rust. It implements the full toolchain — frontend, SSA IR, optimizer, code generators for four architectures, assembler, and linker — with zero external dependencies.
 
-LCCC is a fork tracked as a git submodule. The `ccc/` directory contains the compiler source; `lccc-improvements/` contains analysis, benchmarks, and documentation for the improvements. Changes are made in the submodule and tested against the full upstream test suite before landing.
+LCCC is a performance fork. It has since **moved to a standalone repository**:
+the compiler source lives directly in `src/` (no `ccc/` submodule), and the
+per-project records and ideas live in `ideas/`, `hotspots/`, and `docs/`.
 
 ```
 lccc/
-├── ccc/                    ← git submodule (compiler source, CC0 licensed)
-│   ├── src/
-│   │   ├── frontend/       ← lexer, parser, type-checker
-│   │   ├── ir/             ← SSA IR, mem2reg, analysis
-│   │   ├── passes/         ← optimizer: GVN, LICM, IPCP, DCE, inliner…
-│   │   └── backend/        ← code generation, regalloc, assembler, linker
-│   └── Cargo.toml
-├── lccc-improvements/
-│   ├── register-allocation/   ← Phase 1 design docs
-│   └── benchmarks/            ← bench.py + C benchmark sources
-├── index.html              ← this site (landing page)
+├── src/
+│   ├── frontend/           ← lexer, parser, type-checker, sema
+│   ├── ir/                 ← SSA IR, mem2reg, analysis, lowering
+│   ├── passes/             ← optimizer: GVN, LICM, IPCP, DCE, inliner…
+│   ├── pgo/                ← profile-guided optimization (v8–v11)
+│   └── backend/            ← codegen, regalloc, assembler, linker
+├── tests/benchmark/        ← canonical suite + workload kernels + PGO A/B
+├── tests/regression/       ← correctness + PGO round-trip regressions
+├── ideas/                  ← ranked optimization/portability ideas
+├── hotspots/               ← evidence-backed generated-code gap database
 ├── docs/                   ← this site (documentation)
-└── Cargo.toml              ← workspace root
+└── Cargo.toml
 ```
 
 ## Compilation Pipeline
@@ -52,14 +53,27 @@ C source
    │  └── analysis/      — dominator tree, loop analysis, liveness
    │
    ▼  passes/  (optimizer — all levels run the same pipeline)
-   │  ├── inline.rs      — function inlining
+   │  ├── inline.rs      — function inlining (incl. post-structural pass)
+   │  ├── tail_call_elim — self-recursive tail calls → loops
+   │  ├── recursion_to_iter — non-tail recursion → iterative accumulators
+   │  ├── vectorize.rs   — reduction-loop SIMD (AVX2/SSE2)
    │  ├── gvn.rs         — global value numbering / CSE
    │  ├── licm.rs        — loop-invariant code motion
+   │  ├── iv_strength_reduce — induction-variable strength reduction
    │  ├── ipcp.rs        — interprocedural constant propagation
    │  ├── dce.rs         — dead code elimination
    │  ├── constant_fold  — constant folding
    │  ├── copy_prop      — copy propagation
    │  └── cfg_simplify   — branch threading, dead block removal
+   │
+   ▼  pgo/  (profile-guided optimization, wraps the optimizer)
+   │  ├── instrument.rs  — edge + indirect-call instrumentation
+   │  ├── profile.rs     — profile load/merge + flow-conservation solver
+   │  ├── summary.rs     — dominance-based hot/cold profile summary
+   │  ├── inline_pgo.rs  — hot/cold inlining decisions
+   │  ├── unroll_pgo.rs  — profile-driven trip-count unrolling
+   │  ├── layout.rs      — hot/cold sections + conservative block layout
+   │  └── promote.rs     — cost-aware indirect-call devirtualization
    │
    ▼  backend/  (per-architecture)
    │  ├── regalloc.rs    ← LCCC: two-pass linear scan (replaces greedy)

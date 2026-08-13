@@ -291,7 +291,7 @@ impl X86Codegen {
         }
     }
 
-    /// v5 lazy-flush entry check for an intrinsic about to be emitted: if a
+    /// Lazy-flush entry check for an intrinsic about to be emitted: if a
     /// deferred vector result is pending and this instruction is NOT the
     /// cache-aware consumer of that value, flush the store first — this
     /// instruction may clobber the holding register or rely on slot contents.
@@ -451,7 +451,7 @@ impl X86Codegen {
 
     /// Memory operand for a vector arg, unless the value is still provably in a
     /// register (last-stored/deferred or vec_live) — its slot contents may be
-    /// stale under the v5 deferred-store optimization. Returns None then, so
+    /// stale under the deferred-store optimization. Returns None then, so
     /// the caller routes through the register cache instead of reading memory.
     fn vec_arg_mem(&self, arg: &Operand) -> Option<String> {
         match arg {
@@ -581,7 +581,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_intrinsic_impl(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
-        // v5 lazy flush: a deferred vector result may be pending in a register.
+        // Lazy flush: a deferred vector result may be pending in a register.
         // Flush it before any intrinsic that is not its cache-aware consumer
         // (fences/pause/rdtsc neither clobber XMM regs nor read vector slots,
         // so they let the pending value pass untouched).
@@ -1148,7 +1148,7 @@ impl X86Codegen {
             }
 
             // pabsb/pabsw/pabsd are UNARY (2-operand AT&T: src, dst). Fixes the
-            // v4 latent bug where Pabsb128 was dispatched through the binary
+            // A latent bug where Pabsb128 was dispatched through the binary
             // emitter (panicked / malformed on `_mm_abs_epi8`).
             IntrinsicOp::Pabsb128 | IntrinsicOp::Pabsw128 | IntrinsicOp::Pabsd128 => {
                 if let Some(dptr) = dest_ptr {
@@ -2681,7 +2681,7 @@ impl X86Codegen {
         //
         // A value still provably in a register (last-stored/deferred) must NOT
         // be folded as a memory operand — its slot contents may be stale under
-        // the v5 deferred-store optimization. The loaders route those through
+        // the deferred-store optimization. The loaders route those through
         // the register cache instead. This also removes the old slot-only
         // reuse check, which could fire across coalesced slots holding
         // DIFFERENT values (latent miscompile class).

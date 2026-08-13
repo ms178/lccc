@@ -110,7 +110,7 @@ struct StackLayoutContext {
     /// stack slots — the accumulator register cache keeps them alive.
     immediately_consumed: FxHashSet<u32>,
     /// Values (vector-intrinsic result allocas) whose single use is args[0]/
-    /// args[1] of the immediately-following intrinsic: the v5 deferred-store
+    /// args[1] of the immediately-following intrinsic: the deferred-store
     /// set. The backend may skip their slot store entirely (accumulator
     /// renaming).
     vector_defer_values: FxHashSet<u32>,
@@ -455,7 +455,7 @@ fn build_layout_context(
     // Immediately-consumed value analysis: identify values that can skip stack slots.
     let immediately_consumed = copy_coalescing::compute_immediately_consumed(func, lhs_first_binop);
 
-    // v5 deferred-store analysis: vector-intrinsic results whose single use is
+    // Deferred-store analysis: vector-intrinsic results whose single use is
     // args[0]/args[1] of the immediately-following intrinsic (accumulator renaming).
     if std::env::var("CCC_DEBUG_VDEFER").is_ok() {
         for (bi, block) in func.blocks.iter().enumerate() {
