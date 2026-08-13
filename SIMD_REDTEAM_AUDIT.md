@@ -625,6 +625,43 @@ Measured: expat 3.28x -> 3.13x, hash_table 1.38x -> 1.31x,
 loop_patterns 1.85x -> 1.80x; no regressions; corpus 25/25 correct.
 Differential test (all byte values + INT_MIN/MAX + LLONG edges) bit-exact vs gcc.
 
+## v9 — hint extensions + branchy short-circuit || (branch/boolean, part 2)
+
+**Producer-follow hints extended** beyond FP BinOp LHS to every instruction
+whose emitter computes into the destination with the operand pre-loaded:
+`Copy` (no-op when registers match), GPR unary `Neg/Not/Bswap`
+(`emit_unaryop_impl` loads src into dest then `neg %reg`), and scalar FP
+`Sqrt/Fabs` (`emit_fp_scalar_unary` / Fabs loads arg into dest). Measured
+wall-clock neutral (copy_prop already forwards most GPR copies; the remaining
+mov chains come from casts) — but the mechanism is now general as designed.
+
+**Short-circuit `||` diamonds stay branchy.** `cond ? 1 : rhs` if-converts to a
+cmov chain, but short-circuiting IS a branch — a branch is cheaper and lets the
+backend fuse the compare into the jump. `if_convert` now skips diamonds whose
+phis are all `||`-shaped (true arm == 1) and whose results are consumed only by
+control flow (`value_only_controls_branch`: branch conds, `Cmp(Eq/Ne,0/1)`,
+Select conds, through Copy/Cast/Phi edges). The `&&` shape is still converted
+so the range-check fold can collapse it, and its result then fuses into the
+surrounding `||` branch.
+
+**Flag fusion extended through integer Casts.** The fused Cmp chain walk
+(prologue.rs) now allows flag-neutral integer Casts between the Cmp and its
+consumer, so the range fold's `Cmp -> Cast(bool, I8->I64) -> CondBranch` fuses
+into `sub; cmp; ja` (the Cast dest must still be single-use).
+
+Measured: **expat_xml_scan 3.13x -> 2.89x**, corpus geomean 0.9537 -> 0.9457,
+sqlite_varint back to 2.09x, no regressions. Regression 127/127, correctness
+50/50, intrinsics 3/3, 597 lib tests. New unit tests
+`test_value_only_controls_branch`, `test_skip_boolean_diamond_or_shape`.
+
+**Remaining in this domain:** the inner `||` links still materialize because
+the short-circuit lowering stores the RHS boolean to the result alloca
+(`store rhs_bool` + phi), so only the first link of each `||` level fuses. The
+clean fix is *branch-on-logical* at lowering time (when the `&&`/`||` result is
+used only as a condition, emit pure branches instead of a value + phi), plus
+GPR copy/param coalescing for the byte-load `mov %esi,%r15d; mov %r15d,%ebp`
+chains.
+
 ## v8 roadmap (remaining)
 
 1. **Branch/boolean domain, part 2** (expat still ~3.1x): the range check now

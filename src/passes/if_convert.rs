@@ -41,6 +41,7 @@ use crate::ir::reexports::{
     BasicBlock,
     BlockId,
     Instruction,
+    IrCmpOp,
     IrFunction,
     Operand,
     Terminator,
@@ -48,7 +49,7 @@ use crate::ir::reexports::{
 };
 use crate::ir::analysis;
 use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Run if-conversion on a single function.
 pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
@@ -249,6 +250,139 @@ fn same_value_or_both_zero(a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// Whether `v` is consumed only by control flow (never materialized as data),
+/// so the branchy form is at least as good as a cmov Select. Recursively
+/// follows boolean-preserving edges: `Cmp(Eq/Ne, 0/1)`, `Select` conditions,
+/// `Copy`, `Cast`, and `Phi` incoming values.
+fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashSet<u32>) -> bool {
+    if !visited.insert(v.0) {
+        return true; // cycle: nothing data-like seen yet
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Cmp { dest, op, lhs, rhs, .. } => {
+                    if matches!(lhs, Operand::Value(x) if x.0 == v.0)
+                        || matches!(rhs, Operand::Value(x) if x.0 == v.0)
+                    {
+                        // Only a boolean negation (v == 0 / v != 0 / v == 1 / v != 1)
+                        // preserves branch-likeness; any other comparison is data.
+                        let other = if matches!(lhs, Operand::Value(x) if x.0 == v.0) {
+                            rhs
+                        } else {
+                            lhs
+                        };
+                        let is_bool_cmp = matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
+                            && matches!(other, Operand::Const(c) if c.to_i64() == Some(0) || c.to_i64() == Some(1));
+                        if !is_bool_cmp || !value_only_controls_branch(func, *dest, visited) {
+                            return false;
+                        }
+                    }
+                }
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    if matches!(cond, Operand::Value(x) if x.0 == v.0) {
+                        if !value_only_controls_branch(func, *dest, visited) {
+                            return false;
+                        }
+                    } else if matches!(true_val, Operand::Value(x) if x.0 == v.0)
+                        || matches!(false_val, Operand::Value(x) if x.0 == v.0)
+                    {
+                        return false; // selected as a data value
+                    }
+                }
+                Instruction::Copy { dest, src, .. } => {
+                    if matches!(src, Operand::Value(x) if x.0 == v.0)
+                        && !value_only_controls_branch(func, *dest, visited)
+                    {
+                        return false;
+                    }
+                }
+                Instruction::Cast { dest, src, .. } => {
+                    if matches!(src, Operand::Value(x) if x.0 == v.0)
+                        && !value_only_controls_branch(func, *dest, visited)
+                    {
+                        return false;
+                    }
+                }
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, _) in incoming {
+                        if matches!(op, Operand::Value(x) if x.0 == v.0)
+                            && !value_only_controls_branch(func, *dest, visited)
+                        {
+                            return false;
+                        }
+                    }
+                }
+                other => {
+                    let mut used = false;
+                    other.for_each_used_value(|u| {
+                        if u == v.0 {
+                            used = true;
+                        }
+                    });
+                    if used {
+                        return false; // data use (binop operand, store, call arg, ...)
+                    }
+                }
+            }
+        }
+        match &block.terminator {
+            // A branch condition is control flow — fine.
+            Terminator::CondBranch { cond, .. }
+                if matches!(cond, Operand::Value(x) if x.0 == v.0) => {}
+            // Return/Switch/IndirectBranch use the value as data.
+            Terminator::Return(Some(op)) if matches!(op, Operand::Value(x) if x.0 == v.0) => {
+                return false;
+            }
+            Terminator::Switch { val, .. } if matches!(val, Operand::Value(x) if x.0 == v.0) => {
+                return false;
+            }
+            Terminator::IndirectBranch { target, .. }
+                if matches!(target, Operand::Value(x) if x.0 == v.0) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Skip if-conversion for a short-circuit `||` diamond whose result is
+/// consumed only by control flow. `cond ? 1 : rhs` (`||`) materializes as a
+/// cmov chain, but its whole point is short-circuit evaluation — a branch is
+/// cheaper and lets the backend fuse each compare straight into a jump (no
+/// setcc+movzbl+test+cmov per link). Keeping the branchy form is the
+/// difference between GCC's Expat codegen (`cmpb $X,%dl; ja`) and a wall of
+/// setcc/cmov.
+///
+/// Only the `||` form (true arm == constant 1) is skipped. The `&&` form
+/// (false arm == constant 0) is intentionally still converted: if-converting
+/// it exposes the `Select(cond, Cmp, 0)` pattern the range-check fold
+/// collapses into a single `sub`+`cmp`, which then fuses into the `||` branch.
+fn skip_boolean_diamond(func: &IrFunction, phi_selects: &[(Value, IrType, Operand, Operand)]) -> bool {
+    if phi_selects.is_empty() {
+        return false;
+    }
+    // Every converted phi must be the `||` shape: `cond ? 1 : rhs`.
+    let all_or = phi_selects
+        .iter()
+        .all(|(_, _, tv, _fv)| matches!(tv, Operand::Const(c) if c.to_i64() == Some(1)));
+    if !all_or {
+        return false;
+    }
+    let mut visited = FxHashSet::default();
+    phi_selects
+        .iter()
+        .all(|(dest, _, _, _)| value_only_controls_branch(func, *dest, &mut visited))
+}
+
 /// Detect a diamond pattern starting from a block with a CondBranch terminator.
 fn detect_diamond(
     func: &IrFunction,
@@ -375,6 +509,11 @@ fn detect_diamond(
 
     if phi_selects.is_empty() {
         return None; // No convertible phis
+    }
+
+    // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
+    if skip_boolean_diamond(func, &phi_selects) {
+        return None;
     }
 
     // The merge block should only be reached from the two arms (and not from pred directly).
@@ -549,6 +688,11 @@ fn detect_triangle(
         return None;
     }
 
+    // Keep short-circuit boolean diamonds branchy (see skip_boolean_diamond).
+    if skip_boolean_diamond(func, &phi_selects) {
+        return None;
+    }
+
     // For a triangle, we set the missing arm to merge_idx with empty instructions.
     // apply_diamond will hoist the arm instructions and the empty side is a no-op.
     let (true_idx_out, false_idx_out, true_insts, false_insts) = if arm_is_true {
@@ -666,6 +810,157 @@ mod tests {
     use super::*;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{IrBinOp, IrConst};
+
+    #[test]
+    fn test_value_only_controls_branch() {
+        // v used only as a CondBranch condition => branch-only.
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        let mut visited = FxHashSet::default();
+        assert!(value_only_controls_branch(&func, Value(0), &mut visited));
+
+        // v returned as data => not branch-only.
+        func.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(0))));
+        let mut visited = FxHashSet::default();
+        assert!(!value_only_controls_branch(&func, Value(0), &mut visited));
+
+        // v used by Cmp(Eq, 0) whose result feeds a CondBranch => branch-only.
+        let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
+        func2.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+                Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        let mut visited = FxHashSet::default();
+        assert!(value_only_controls_branch(&func2, Value(0), &mut visited));
+    }
+
+    #[test]
+    fn test_skip_boolean_diamond_or_shape() {
+        // `||` shape: true arm == const 1, result only feeds a branch => skip.
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(1)), BlockId(1)),
+                    (Operand::Value(Value(4)), BlockId(2)),
+                ],
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(4),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 6;
+
+        // `||` shape, branch-only => skipped (not converted).
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, _) = analysis::build_cfg(&func, &label_to_idx);
+        let diamond = detect_diamond(&func, 0, &label_to_idx, &preds);
+        assert!(diamond.is_none(), "branch-only `||` diamond must not be converted");
+
+        // `&&` shape (false arm == const 0) => still converted (range fold needs it).
+        let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
+        func2.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func2.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        func2.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        func2.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(4)), BlockId(1)),
+                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
+                ],
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(4),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func2.next_value_id = 6;
+        let label_to_idx2 = analysis::build_label_map(&func2);
+        let (preds2, _) = analysis::build_cfg(&func2, &label_to_idx2);
+        assert!(detect_diamond(&func2, 0, &label_to_idx2, &preds2).is_some(),
+                "branch-only `&&` diamond must still be converted for range folding");
+    }
+
 
     #[test]
     fn test_simple_diamond_conversion() {

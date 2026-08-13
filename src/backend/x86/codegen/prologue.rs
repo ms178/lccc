@@ -376,6 +376,25 @@ impl X86Codegen {
                                     cur = cd.0;
                                     k += 1;
                                 }
+                                // A widening/shrinking integer Cast of the
+                                // boolean is also flag-neutral: it emits a
+                                // plain mov/movzx/movsx that leaves the Cmp's
+                                // flags intact, and (like the Copy above) its
+                                // destination is never read by anything other
+                                // than the next chain link or the consumer.
+                                // This is what lets the range-check fold's
+                                // `Cmp -> Cast(bool, I8->I64) -> CondBranch`
+                                // fuse into `cmp; jcc` (Expat's name scanner).
+                                Instruction::Cast { dest: cd, src: Operand::Value(sv), from_ty, to_ty }
+                                    if sv.0 == cur && from_ty.is_integer() && to_ty.is_integer() =>
+                                {
+                                    if use_counts.get(&cd.0).copied().unwrap_or(0) != 1 {
+                                        chain_single_use = false;
+                                        break;
+                                    }
+                                    cur = cd.0;
+                                    k += 1;
+                                }
                                 Instruction::Select { cond: Operand::Value(v), .. } if v.0 == cur => {
                                     // The copy chain must terminate here (the
                                     // final value has exactly one use: this

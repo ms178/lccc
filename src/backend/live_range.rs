@@ -16,7 +16,8 @@ use super::liveness::{
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator};
+use crate::ir::intrinsics::IntrinsicOp;
+use crate::ir::reexports::{Instruction, IrFunction, IrUnaryOp, Operand, Terminator};
 
 /// Enhanced live interval with priority, uses, and spill weight.
 ///
@@ -876,41 +877,76 @@ fn record_terminator_uses(term: &Terminator, point: u32, uses: &mut FxHashMap<u3
 
 /// Compute producer→consumer register-following hints.
 ///
-/// For an FP BinOp `d = lhs op rhs`, the x86 FP emitter computes the result
-/// into `d`'s allocated register and first loads the LHS there
-/// (`emit_float_binop_into_reg`). When `d` is allocated to the same register
-/// as `lhs`, that load is a no-op — a whole register copy disappears per
-/// chain link. We therefore record `d → lhs` as a FOLLOW hint: at allocation
-/// time the consumer resolves the producer's already-assigned register and
-/// prefers it (see `LinearScanAllocator::find_free_register`).
+/// A hint `consumer → producer` makes the consumer prefer the producer's
+/// register at allocation time (see `LinearScanAllocator::find_free_register`),
+/// and the allocator's `conflicts_with` honours it only when the producer's
+/// final use IS the consumer's definition (use-before-def at a shared point).
+/// Hints are recorded only for instructions whose emitter computes the result
+/// INTO the destination register with the operand pre-loaded, so die-at-birth
+/// sharing removes a register copy instead of corrupting a value:
 ///
-/// Only the LHS is hinted. The emitter loads the LHS into the destination
-/// register; hinting the RHS would place it in that same register, where the
-/// LHS load would clobber it before it is read (observed miscompile:
-/// `subsd %xmm4, %xmm4` ≡ 0). RHS sharing is therefore never requested.
-///
-/// The allocator's `conflicts_with` performs the soundness check: a follow
-/// hint is honoured only when producer and consumer are die-at-birth
-/// compatible (the producer's final use IS the consumer's definition, so the
-/// read precedes the write). A long-lived or multi-use producer simply leaves
-/// the hint unhonoured and the consumer falls back to a free register —
-/// over-hinting never removes an allocation option.
+/// - FP BinOp LHS: `emit_float_binop_into_reg` loads the LHS into the dest and
+///   applies `addsd/subsd/... rhs, dest`. Only the LHS is hinted — the RHS
+///   would be clobbered by the LHS load before it is read (observed
+///   miscompile: `subsd %xmm4,%xmm4` ≡ 0).
+/// - Copy: `emit_copy_value` emits nothing when dest and source share a
+///   register, so every Copy is a free coalescing edge (GPR and FP alike).
+/// - GPR unary Neg/Not/Bswap: `emit_unaryop_impl` moves the source into the
+///   dest register then applies the op in place (`neg %reg`).
+/// - Scalar FP Sqrt/Fabs intrinsics: `emit_fp_scalar_unary` / the Fabs path
+///   load the argument into the dest register and apply
+///   `sqrtsd/sqrtss/andpd/andps` in place.
 ///
 /// Returns a map: consumer value id → producer value id to follow.
 fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
     let mut hints: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::BinOp {
-                dest,
-                lhs: Operand::Value(lhs),
-                ty,
-                ..
-            } = inst
-            {
-                if *ty == IrType::F64 || *ty == IrType::F32 {
+            match inst {
+                Instruction::BinOp {
+                    dest,
+                    lhs: Operand::Value(lhs),
+                    ty,
+                    ..
+                } if *ty == IrType::F64 || *ty == IrType::F32 => {
                     hints.insert(dest.0, lhs.0);
                 }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } => {
+                    hints.insert(dest.0, src.0);
+                }
+                Instruction::UnaryOp {
+                    dest,
+                    op,
+                    src: Operand::Value(src),
+                    ty,
+                } if !ty.is_float()
+                    && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
+                    && matches!(op, IrUnaryOp::Neg | IrUnaryOp::Not | IrUnaryOp::Bswap) =>
+                {
+                    hints.insert(dest.0, src.0);
+                }
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op,
+                    args,
+                    ..
+                } => {
+                    if matches!(
+                        op,
+                        IntrinsicOp::SqrtF64
+                            | IntrinsicOp::SqrtF32
+                            | IntrinsicOp::FabsF64
+                            | IntrinsicOp::FabsF32
+                    ) {
+                        if let [Operand::Value(src)] = args.as_slice() {
+                            hints.insert(dest.0, src.0);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
