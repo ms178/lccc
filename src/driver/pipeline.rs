@@ -301,6 +301,9 @@ pub struct Driver {
     pub(super) pgo_generate: Option<String>,
     /// PGO: profile use path (from -fprofile-use[=path], -fprofile-use, -fbranch-probabilities, -fauto-profile)
     pub(super) pgo_use: Option<String>,
+    /// PGO: counter update mode ("single" default, or "atomic"
+    /// from -fprofile-update=atomic).
+    pub(super) pgo_update: Option<String>,
 }
 
 impl Driver {
@@ -422,6 +425,7 @@ impl Driver {
             pthread: false,
             pgo_generate: None,
             pgo_use: None,
+            pgo_update: None,
         }
     }
 
@@ -1320,6 +1324,22 @@ impl Driver {
             eprintln!("Lowered to {} IR functions", module.functions.len());
         }
 
+        // PGO v6 use side: load the profile directory (once per process —
+        // per-TU lookups are unit-keyed) and activate it for THIS unit before
+        // any optimization pass runs, so PGO-guided inlining, loop unrolling
+        // and branch profiling see real counts. (Before v6 this path was
+        // never connected: `-fprofile-use` compiled plain code, byte-identical
+        // to `-O3` — verified on zlib-ng minigzip.)
+        let pgo_use_dir = self
+            .pgo_use
+            .clone()
+            .or_else(|| std::env::var("LCCC_PGO_USE").ok());
+        if pgo_use_dir.is_some() {
+            crate::pgo::init_pgo_profile(pgo_use_dir.as_deref());
+            let u0 = crate::pgo::profile::unit_identity(input_file);
+            crate::pgo::prepass_activate(&u0);
+        }
+
         // Run optimization passes
         let t5 = std::time::Instant::now();
         promote_allocas(&mut module);
@@ -1484,17 +1504,19 @@ impl Driver {
         // use therefore fingerprint the same module, while stale profiles fail
         // closed before optional layout.
         let pgo_unit = crate::pgo::profile::unit_identity(input_file);
-        if let Some(ref pgo_path) = self.pgo_use {
-            crate::pgo::init_pgo_profile(Some(pgo_path));
-            crate::pgo::propagate_profile(&module, &pgo_unit);
-        } else if let Ok(p) = std::env::var("LCCC_PGO_USE") {
-            crate::pgo::init_pgo_profile(Some(&p));
-            crate::pgo::propagate_profile(&module, &pgo_unit);
+        if self.pgo_use.is_some() || std::env::var("LCCC_PGO_USE").is_ok() {
+            crate::pgo::propagate_profile(&mut module, &pgo_unit);
         }
         if let Some(ref pgo_dir) = self.pgo_generate {
-            crate::pgo::instrument::instrument_module(&mut module, pgo_dir, &pgo_unit, None);
+            crate::pgo::instrument::instrument_module(
+                &mut module,
+                pgo_dir,
+                &pgo_unit,
+                self.pgo_update.as_deref(),
+                self.target,
+            );
         } else if let Ok(dir) = std::env::var("LCCC_PGO_GENERATE") {
-            crate::pgo::instrument::instrument_module(&mut module, &dir, &pgo_unit, None);
+            crate::pgo::instrument::instrument_module(&mut module, &dir, &pgo_unit, None, self.target);
         }
         if let Some(profile) = crate::pgo::get_pgo_profile() {
             crate::pgo::layout::layout_module(&mut module, profile, &pgo_unit);

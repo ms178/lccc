@@ -188,6 +188,7 @@ fn for_each_operand_value(inst: &Instruction, mut f: impl FnMut(u32)) {
     }
 
     match inst {
+        Instruction::PgoCounterInc { .. } => {}
         Instruction::BinOp { lhs, rhs, .. } => {
             collect(lhs, &mut f);
             collect(rhs, &mut f);

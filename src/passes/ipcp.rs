@@ -467,7 +467,8 @@ fn is_side_effect_free(func: &crate::ir::reexports::IrFunction) -> bool {
         for inst in &block.instructions {
             match inst {
                 // These instructions have side effects:
-                Instruction::Store { .. }
+                Instruction::PgoCounterInc { .. }
+                | Instruction::Store { .. }
                 | Instruction::Call { .. }
                 | Instruction::CallIndirect { .. }
                 | Instruction::InlineAsm { .. }

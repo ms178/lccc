@@ -660,10 +660,254 @@ fn analyze_loop_pattern(
 }
 
 /// Analyze a loop to detect vectorizable reduction patterns (sum += arr[i], sum += a[i] * b[i]).
+/// Soundness gate for reduction vectorization.
+///
+/// The transform rewrites the whole loop into a vector-width loop (N/8
+/// iterations) plus a scalar remainder, and rewires the accumulator phi to a
+/// vector accumulator updated by ONE vector add per iteration. This is only
+/// valid when:
+///
+///  1. the accumulator (and every copy/cast of it) is written by exactly one
+///     instruction — the identified scalar Add — plus the header phi and pure
+///     copy/cast relays;
+///  2. no instruction other than the identified Add (or a relay) READS an
+///     accumulator-derived value — an `else s -= 2` arm or an `if (s > x)
+///     break` test would silently corrupt the vector accumulator;
+///  3. the Add's block dominates the latch, so the update executes on every
+///     path back to the header — data-dependent accumulation (`if (c)
+///     s += a[i];`) is rejected: the scalar condition would gate a whole
+///     8-lane vector add, and the not-taken path would copy an undefined
+///     value (observed miscompile: `if (a[i] & 1) s += a[i]; else s -= 2;`
+///     produced garbage for even elements);
+///  4. the loop contains no foreign memory operations (other loads, stores,
+///     calls, atomics, volatile, intrinsics, inline asm, non-Branch
+///     terminators): every remaining instruction would execute once per
+///     VECTOR iteration with the scaled induction variable and touch the
+///     wrong elements.
+fn reduction_pattern_is_sound(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    loop_blocks: &FxHashSet<usize>,
+    header_idx: usize,
+    body_idx: usize,
+    accumulator_add_idx: usize,
+    add_result: Value,
+    accumulator_phi: Value,
+    accumulator_derived: &FxHashSet<Value>,
+    allowed_loads: &[Value],
+) -> bool {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let is_add = |block_idx: usize, inst_idx: usize, dest: Value| {
+        block_idx == body_idx && inst_idx == accumulator_add_idx && dest == add_result
+    };
+
+    // (4) terminators: only the header may branch (its exit condition);
+    //     every other loop block must end in an unconditional branch.
+    for &block_idx in loop_blocks {
+        if block_idx != header_idx {
+            if !matches!(func.blocks[block_idx].terminator, Terminator::Branch(_)) {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Rejecting: loop block {} terminator {:?}",
+                        block_idx, func.blocks[block_idx].terminator
+                    );
+                }
+                return false;
+            }
+        }
+    }
+
+    for &block_idx in loop_blocks {
+        let block = &func.blocks[block_idx];
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Phi { dest, .. } => {
+                    // The header's own IV phi (and any other non-accumulator
+                    // phi) is fine; only phis writing an accumulator-derived
+                    // value are forbidden (the vector transform rewires the
+                    // accumulator phi to a vector value).
+                    if accumulator_derived.contains(dest)
+                        && (block_idx != header_idx || *dest != accumulator_phi)
+                    {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED]   Rejecting: accumulator-derived phi {} in block {}",
+                                dest.0, block_idx
+                            );
+                        }
+                        return false;
+                    }
+                }
+                Instruction::Copy { dest, src } | Instruction::Cast { dest, src, .. } => {
+                    if accumulator_derived.contains(dest)
+                        && !matches!(src, Operand::Value(v) if accumulator_derived.contains(v))
+                    {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED]   Rejecting: copy/cast {} = {:?} overwrites accumulator with foreign value",
+                                dest.0, src
+                            );
+                        }
+                        return false;
+                    }
+                }
+                Instruction::BinOp { dest, lhs, rhs, .. } => {
+                    let uses_acc =
+                        matches!(lhs, Operand::Value(v) if accumulator_derived.contains(v))
+                            || matches!(rhs, Operand::Value(v) if accumulator_derived.contains(v));
+                    if uses_acc && !is_add(block_idx, inst_idx, *dest) {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED]   Rejecting: BinOp {} reads accumulator outside identified Add",
+                                dest.0
+                            );
+                        }
+                        return false;
+                    }
+                    if accumulator_derived.contains(dest) {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED]   Rejecting: BinOp writes accumulator-derived {}",
+                                dest.0
+                            );
+                        }
+                        return false;
+                    }
+                }
+                // (4) foreign memory / side effects / control
+                Instruction::Store { .. }
+                | Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::Memcpy { .. }
+                | Instruction::VaStart { .. }
+                | Instruction::VaEnd { .. }
+                | Instruction::VaCopy { .. }
+                | Instruction::VaArg { .. }
+                | Instruction::VaArgStruct { .. }
+                | Instruction::AtomicLoad { .. }
+                | Instruction::AtomicStore { .. }
+                | Instruction::AtomicRmw { .. }
+                | Instruction::AtomicInc { .. }
+                | Instruction::AtomicCmpxchg { .. }
+                | Instruction::Fence { .. }
+                | Instruction::DynAlloca { .. }
+                | Instruction::StackRestore { .. }
+                | Instruction::InlineAsm { .. }
+                | Instruction::Intrinsic { .. } => {
+                    if debug {
+                        eprintln!("[VEC-RED]   Rejecting: foreign side-effect instruction in loop block {}", block_idx);
+                    }
+                    return false;
+                }
+                Instruction::Load { dest, .. } => {
+                    if !allowed_loads.iter().any(|l| *l == *dest) {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED]   Rejecting: foreign load {} in loop block {}",
+                                dest.0, block_idx
+                            );
+                        }
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // (2) no instruction other than the identified Add and copy/cast/phi
+    //     relays may READ an accumulator-derived value.
+    for &block_idx in loop_blocks {
+        let block = &func.blocks[block_idx];
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if is_add(block_idx, inst_idx, add_result)
+                || matches!(
+                    inst,
+                    Instruction::Copy { .. }
+                        | Instruction::Cast { .. }
+                        | Instruction::Phi { .. }
+                        | Instruction::Cmp { .. }
+                )
+            {
+                continue;
+            }
+            let mut uses_acc = false;
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if accumulator_derived.contains(v) {
+                        uses_acc = true;
+                    }
+                }
+            });
+            if uses_acc {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Rejecting: instruction {} in block {} reads accumulator",
+                        inst_idx, block_idx
+                    );
+                }
+                return false;
+            }
+        }
+        if block_idx != header_idx {
+            let mut uses_acc = false;
+            crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    if accumulator_derived.contains(v) {
+                        uses_acc = true;
+                    }
+                }
+            });
+            if uses_acc {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Rejecting: terminator in block {} reads accumulator",
+                        block_idx
+                    );
+                }
+                return false;
+            }
+        }
+    }
+
+    // (3) the Add's block must dominate the latch: the accumulator update
+    //     executes on every iteration, unconditionally.
+    let latch_idx = loop_blocks
+        .iter()
+        .copied()
+        .find(|&b| {
+            matches!(func.blocks[b].terminator, Terminator::Branch(t) if t.0 == func.blocks[header_idx].label.0)
+        })
+        .unwrap_or(usize::MAX);
+    if latch_idx == usize::MAX {
+        if debug {
+            eprintln!("[VEC-RED]   Rejecting: no latch found in loop body");
+        }
+        return false;
+    }
+    let mut cur = latch_idx;
+    let mut steps = 0;
+    while cur != body_idx && cur < cfg.num_blocks && cur != cfg.idom[cur] && steps < cfg.num_blocks + 1 {
+        cur = cfg.idom[cur];
+        steps += 1;
+    }
+    if cur != body_idx {
+        if debug {
+            eprintln!(
+                "[VEC-RED]   Rejecting: accumulator Add block {} does not dominate latch {}",
+                body_idx, latch_idx
+            );
+        }
+        return false;
+    }
+
+    true
+}
+
 fn analyze_reduction_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
-    _cfg: &CfgAnalysis,
+    cfg: &CfgAnalysis,
 ) -> Option<ReductionPattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
@@ -987,6 +1231,24 @@ fn analyze_reduction_pattern(
                 eprintln!("[VEC-RED]   Simple sum pattern detected: {:?} += load(arr[iv])", element_type);
             }
 
+            if !reduction_pattern_is_sound(
+                func,
+                cfg,
+                &loop_info.body,
+                header_idx,
+                body_idx,
+                accumulator_add_idx,
+                add_result,
+                accumulator_phi,
+                &accumulator_derived,
+                &[added_value],
+            ) {
+                if debug {
+                    eprintln!("[VEC-RED]   Rejecting unsound reduction (Sum)");
+                }
+                return None;
+            }
+
             Some(ReductionPattern {
                 kind: ReductionKind::Sum,
                 element_type,
@@ -1049,6 +1311,24 @@ fn analyze_reduction_pattern(
                 if element_type.size() > from_ty.size() {
                     if debug {
                         eprintln!("[VEC-RED]   Rejecting: accumulator {:?} wider than element {:?}", element_type, from_ty);
+                    }
+                    return None;
+                }
+
+                if !reduction_pattern_is_sound(
+                    func,
+                    cfg,
+                    &loop_info.body,
+                    header_idx,
+                    body_idx,
+                    accumulator_add_idx,
+                    add_result,
+                    accumulator_phi,
+                    &accumulator_derived,
+                    &[cast_src_val],
+                ) {
+                    if debug {
+                        eprintln!("[VEC-RED]   Rejecting unsound reduction (Cast-Sum)");
                     }
                     return None;
                 }
@@ -1116,6 +1396,24 @@ fn analyze_reduction_pattern(
 
             if debug {
                 eprintln!("[VEC-RED]   Dot product pattern detected: {:?} += load(a[iv]) * load(b[iv])", element_type);
+            }
+
+            if !reduction_pattern_is_sound(
+                func,
+                cfg,
+                &loop_info.body,
+                header_idx,
+                body_idx,
+                accumulator_add_idx,
+                add_result,
+                accumulator_phi,
+                &accumulator_derived,
+                &[mul_lhs_val, mul_rhs_val],
+            ) {
+                if debug {
+                    eprintln!("[VEC-RED]   Rejecting unsound reduction (DotProduct)");
+                }
+                return None;
             }
 
             Some(ReductionPattern {

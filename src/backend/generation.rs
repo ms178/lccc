@@ -1665,6 +1665,13 @@ pub(super) fn generate_instruction(
     dead_global_addrs: &FxHashSet<u32>,
 ) {
     match inst {
+        Instruction::PgoCounterInc { name, offset, atomic } => {
+            if std::env::var("LCCC_PGO_NOP_COUNTERS").is_ok() {
+                cg.emit_pgo_counter_nop(name, *offset, *atomic);
+            } else {
+                cg.emit_pgo_counter_inc(name, *offset, *atomic);
+            }
+        }
         Instruction::Alloca { .. } => {
             // Space already allocated in prologue; does not touch registers
         }

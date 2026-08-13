@@ -2469,6 +2469,11 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
 /// Remap all values and block references in an instruction.
 fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
     match inst {
+        Instruction::PgoCounterInc { name, offset, atomic } => Instruction::PgoCounterInc {
+            name: name.clone(),
+            offset: *offset,
+            atomic: *atomic,
+        },
         Instruction::Alloca {
             dest,
             ty,

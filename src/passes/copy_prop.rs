@@ -453,7 +453,7 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
     let mut count = 0;
 
     match inst {
-        Instruction::Alloca { .. } => {}
+        Instruction::Alloca { .. } | Instruction::PgoCounterInc { .. } => {}
         Instruction::DynAlloca { size, .. } => {
             count += replace_operand(size, copy_map);
         }

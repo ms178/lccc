@@ -12,9 +12,13 @@ pub fn should_unroll_loop(
     p: Option<&ProfileData>,
 ) -> Option<bool> {
     let _ = p?;
-    let fp = crate::pgo::active_profile_for_function(f)?;
-    let l = f.blocks.get(idx)?.label;
-    let n = fp.block_count(l);
+    let n = if crate::pgo::prepass_is_active() {
+        crate::pgo::total_count_for(&f.name)
+    } else {
+        let fp = crate::pgo::active_profile_for_function(f)?;
+        let l = f.blocks.get(idx)?.label;
+        fp.block_count(l)
+    };
     if size_opt() {
         Some(false)
     } else if n > 1000 && size <= 24 {
