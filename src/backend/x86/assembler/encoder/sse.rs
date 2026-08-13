@@ -800,7 +800,7 @@ impl super::InstructionEncoder {
 
     /// EVEX memory operand: ModRM/SIB/disp with disp8 scaled by `scale_n`
     /// (EVEX disp8 is multiplied by the vector length: 16/32/64).
-    fn encode_evex_mem(&mut self, reg_field: u8, mem: &MemoryOperand, scale_n: u32) -> Result<(), String> {
+    pub(crate) fn encode_evex_mem(&mut self, reg_field: u8, mem: &MemoryOperand, scale_n: u32) -> Result<(), String> {
         self.emit_segment_prefix(mem)?;
 
         // RIP-relative
@@ -925,6 +925,73 @@ impl super::InstructionEncoder {
                 self.encode_evex_mem(reg5 & 7, mem, scale_n)
             }
             _ => Err("vmovdqa64/32 requires register, memory operands".to_string()),
+        }
+    }
+
+    /// SSE extract-to-GPR/mem with imm8: extractps (66 0F3A 17 /r ib).
+    /// AT&T ($imm, src, dst); ModRM.reg = src (xmm), r/m = dst (r32/m32),
+    /// matching GNU as (src in reg field, dst in r/m).
+    pub(crate) fn encode_sse_extract_gpr_imm8(&mut self, ops: &[Operand], bytes: &[u8]) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("SSE extract-gpr requires 3 operands (imm, src, dst)".to_string());
+        }
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), dst) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                // Legacy prefix (66) must precede REX.
+                if bytes.first() == Some(&0x66) { self.bytes.push(0x66); }
+                let dst_need_rex = match dst {
+                    Operand::Register(d) => needs_rex_ext(&d.name),
+                    _ => false,
+                };
+                if dst_need_rex { self.bytes.push(0x41); }
+                for &b in &bytes[1..] { self.bytes.push(b); }
+                match dst {
+                    Operand::Register(d) => {
+                        let dst_num = reg_num(&d.name).ok_or("bad dst register")?;
+                        self.bytes.push(self.modrm(3, src_num, dst_num));
+                    }
+                    Operand::Memory(mem) => {
+                        self.encode_modrm_mem(src_num, mem)?;
+                    }
+                    _ => return Err("unsupported extract-gpr destination".to_string()),
+                }
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported SSE extract-gpr operands".to_string()),
+        }
+    }
+
+    /// SSE convert signed integer to scalar float: cvtsi2ss (F3) / cvtsi2sd (F2),
+    /// 0F 2A /r with ModRM.reg = xmm dest, r/m = GPR src (REX.W for r64).
+    pub(crate) fn encode_cvtsi2x(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("cvtsi2ss/cvtsi2sd requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad gpr register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad xmm register")?;
+                match pp { 2 => self.bytes.push(0xF3), 3 => self.bytes.push(0xF2), _ => {} }
+                let is64 = src.name.starts_with('r') && src.name.len() <= 3
+                    || matches!(src.name.as_str(), "rax" | "rcx" | "rdx" | "rbx" | "rsp" | "rbp" | "rsi" | "rdi");
+                if is64 { self.bytes.push(0x48); } // REX.W
+                let rex_b = needs_rex_ext(&src.name);
+                if rex_b { self.bytes.push(0x41); }
+                self.bytes.push(0x0F);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad xmm register")?;
+                match pp { 2 => self.bytes.push(0xF3), 3 => self.bytes.push(0xF2), _ => {} }
+                self.bytes.push(0x0F);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("cvtsi2ss/cvtsi2sd requires gpr/mem source and xmm destination".to_string()),
         }
     }
 }

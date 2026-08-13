@@ -228,6 +228,8 @@ impl super::InstructionEncoder {
                     base: None,
                     index: None,
                     scale: None,
+                    mask: None,
+                    zeroing: false,
                 };
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(reg_ext, &mem)

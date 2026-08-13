@@ -371,6 +371,17 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_ia32_pmovmskb128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmovmskb128));
     m.insert("__builtin_ia32_set1_epi8", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Set1Epi8));
     m.insert("__builtin_ia32_set1_epi32", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Set1Epi32));
+    // Generic SIMD intrinsic family (op encoded in the name):
+    // __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
+    m.insert("__lccc_simd128_i", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd128_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd128_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd256_i", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd256_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd256_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd512_i", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd512_ps", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
+    m.insert("__lccc_simd512_pd", BuiltinInfo::intrinsic(BuiltinIntrinsic::LcccSimd));
     m.insert("__builtin_ia32_crc32qi", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_8));
     m.insert("__builtin_ia32_crc32hi", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_16));
     m.insert("__builtin_ia32_crc32si", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_32));
@@ -965,6 +976,10 @@ pub enum BuiltinIntrinsic {
     X86Rdtsc,
     /// __builtin_ia32_rdtscp(&aux) - rdtscp with aux store
     X86Rdtscp,
+    /// Generic SIMD intrinsic family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}.
+    /// The instruction mnemonic is part of the name; lowering maps it to an
+    /// IntrinsicOp via a table (single audit point for ~1500 intrinsics).
+    LcccSimd,
     // X86 SSE intrinsics
     X86Lfence,
     X86Mfence,
@@ -1156,7 +1171,21 @@ impl BuiltinInfo {
 
 /// Look up a function name and return its builtin info, if it's a known builtin.
 pub fn resolve_builtin(name: &str) -> Option<&'static BuiltinInfo> {
-    BUILTIN_MAP.get(name)
+    if let Some(info) = BUILTIN_MAP.get(name) {
+        return Some(info);
+    }
+    // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
+    // — prefix-registered (the mnemonic is part of the name).
+    for prefix in [
+        "__lccc_simd128_i_", "__lccc_simd128_ps_", "__lccc_simd128_pd_",
+        "__lccc_simd256_i_", "__lccc_simd256_ps_", "__lccc_simd256_pd_",
+        "__lccc_simd512_i_", "__lccc_simd512_ps_", "__lccc_simd512_pd_",
+    ] {
+        if name.starts_with(prefix) {
+            return BUILTIN_MAP.get("__lccc_simd512_i");
+        }
+    }
+    None
 }
 
 /// Check if a name is a known builtin function.
@@ -1167,6 +1196,11 @@ pub fn resolve_builtin(name: &str) -> Option<&'static BuiltinInfo> {
 /// sema does not emit "implicit declaration" warnings for them.
 pub fn is_builtin(name: &str) -> bool {
     if BUILTIN_MAP.contains_key(name) {
+        return true;
+    }
+    // Generic SIMD family prefix (mnemonic suffix in the name).
+    if name.starts_with("__lccc_simd128_") || name.starts_with("__lccc_simd256_")
+        || name.starts_with("__lccc_simd512_") {
         return true;
     }
     // Builtins handled by name in try_lower_builtin_call (before map lookup)

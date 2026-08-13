@@ -526,6 +526,10 @@ impl Lowerer {
             | BuiltinIntrinsic::X86CastReinterpret => {
                 self.lower_x86_intrinsic(intrinsic, args)
             }
+            // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
+            BuiltinIntrinsic::LcccSimd => {
+                self.lower_lccc_simd(name, args)
+            }
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
             // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
             BuiltinIntrinsic::FortifyChk => {

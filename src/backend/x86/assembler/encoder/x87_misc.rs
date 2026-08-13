@@ -63,6 +63,8 @@ impl super::InstructionEncoder {
                     base: None,
                     index: None,
                     scale: None,
+                    mask: None,
+                    zeroing: false,
                 };
                 self.emit_rex_rm(size, "", &mem);
                 let rc = self.relocations.len();

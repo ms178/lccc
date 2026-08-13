@@ -5,33 +5,9 @@
 #include <emmintrin.h>
 
 /* AVX 256-bit vector types */
-typedef struct __attribute__((__aligned__(32))) {
-    float __val[8];
-} __m256;
-
-typedef struct __attribute__((__aligned__(32))) {
-    double __val[4];
-} __m256d;
-
-typedef struct __attribute__((__aligned__(32))) {
-    long long __val[4];
-} __m256i;
-
 #define __CCC_M256I_FROM_BUILTIN(expr) (*(__m256i *)(expr))
 
 /* Unaligned variants */
-typedef struct __attribute__((__aligned__(1))) {
-    float __val[8];
-} __m256_u;
-
-typedef struct __attribute__((__aligned__(1))) {
-    double __val[4];
-} __m256d_u;
-
-typedef struct __attribute__((__aligned__(1))) {
-    long long __val[4];
-} __m256i_u;
-
 /* === Load / Store === */
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -145,14 +121,6 @@ _mm256_castsi128_si256(__m128i __a)
 }
 
 /* Extract 128-bit lane from __m256 (imm must be 0 or 1) */
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm256_extractf128_ps(__m256 __a, int __imm)
-{
-    if (__imm & 1)
-        return (__m128){ { __a.__val[4], __a.__val[5], __a.__val[6], __a.__val[7] } };
-    else
-        return (__m128){ { __a.__val[0], __a.__val[1], __a.__val[2], __a.__val[3] } };
-}
 
 /* === Float Arithmetic === */
 
@@ -212,14 +180,6 @@ _mm256_mul_pd(__m256d __a, __m256d __b)
 
 /* === Double Arithmetic (continued) === */
 
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_div_pd(__m256d __a, __m256d __b)
-{
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r.__val[__i] = __a.__val[__i] / __b.__val[__i];
-    return __r;
-}
 
 /* === Set (broadcast) === */
 
@@ -267,56 +227,12 @@ _mm256_castpd128_pd256(__m128d __a)
 /* === Shuffle / Permute (double) === */
 
 /* Unpack and interleave low doubles from each 128-bit lane */
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_unpacklo_pd(__m256d __a, __m256d __b)
-{
-    /* Within each 128-bit lane: select element 0 from each source */
-    return (__m256d){ { __a.__val[0], __b.__val[0], __a.__val[2], __b.__val[2] } };
-}
 
 /* Unpack and interleave high doubles from each 128-bit lane */
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_unpackhi_pd(__m256d __a, __m256d __b)
-{
-    /* Within each 128-bit lane: select element 1 from each source */
-    return (__m256d){ { __a.__val[1], __b.__val[1], __a.__val[3], __b.__val[3] } };
-}
 
 /* Shuffle doubles within each 128-bit lane based on imm8 control */
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_shuffle_pd(__m256d __a, __m256d __b, int __imm)
-{
-    return (__m256d){ {
-        (__imm & 0x1) ? __a.__val[1] : __a.__val[0],
-        (__imm & 0x2) ? __b.__val[1] : __b.__val[0],
-        (__imm & 0x4) ? __a.__val[3] : __a.__val[2],
-        (__imm & 0x8) ? __b.__val[3] : __b.__val[2]
-    } };
-}
 
 /* Permute 128-bit lanes from two 256-bit sources */
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_permute2f128_pd(__m256d __a, __m256d __b, int __imm)
-{
-    __m256d __r;
-    /* Select low 128-bit lane of result */
-    switch (__imm & 0x3) {
-        case 0: __r.__val[0] = __a.__val[0]; __r.__val[1] = __a.__val[1]; break;
-        case 1: __r.__val[0] = __a.__val[2]; __r.__val[1] = __a.__val[3]; break;
-        case 2: __r.__val[0] = __b.__val[0]; __r.__val[1] = __b.__val[1]; break;
-        case 3: __r.__val[0] = __b.__val[2]; __r.__val[1] = __b.__val[3]; break;
-    }
-    if (__imm & 0x8) { __r.__val[0] = 0.0; __r.__val[1] = 0.0; }
-    /* Select high 128-bit lane of result */
-    switch ((__imm >> 4) & 0x3) {
-        case 0: __r.__val[2] = __a.__val[0]; __r.__val[3] = __a.__val[1]; break;
-        case 1: __r.__val[2] = __a.__val[2]; __r.__val[3] = __a.__val[3]; break;
-        case 2: __r.__val[2] = __b.__val[0]; __r.__val[3] = __b.__val[1]; break;
-        case 3: __r.__val[2] = __b.__val[2]; __r.__val[3] = __b.__val[3]; break;
-    }
-    if (__imm & 0x80) { __r.__val[2] = 0.0; __r.__val[3] = 0.0; }
-    return __r;
-}
 
 /* === Horizontal operations === */
 
@@ -346,50 +262,13 @@ _mm256_hsub_pd(__m256d __a, __m256d __b)
 
 /* === Extract 128-bit lane from __m256d === */
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm256_extractf128_pd(__m256d __a, int __imm)
-{
-    if (__imm & 1)
-        return (__m128d){ { __a.__val[2], __a.__val[3] } };
-    else
-        return (__m128d){ { __a.__val[0], __a.__val[1] } };
-}
 
 /* === Insert 128-bit lane into __m256d === */
 
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_insertf128_pd(__m256d __a, __m128d __b, int __imm)
-{
-    __m256d __r = __a;
-    if (__imm & 1) {
-        __r.__val[2] = __b.__val[0];
-        __r.__val[3] = __b.__val[1];
-    } else {
-        __r.__val[0] = __b.__val[0];
-        __r.__val[1] = __b.__val[1];
-    }
-    return __r;
-}
 
 /* === Comparison === */
 
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_min_pd(__m256d __a, __m256d __b)
-{
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r.__val[__i] = __a.__val[__i] < __b.__val[__i] ? __a.__val[__i] : __b.__val[__i];
-    return __r;
-}
 
-static __inline__ __m256d __attribute__((__always_inline__))
-_mm256_max_pd(__m256d __a, __m256d __b)
-{
-    __m256d __r;
-    for (int __i = 0; __i < 4; __i++)
-        __r.__val[__i] = __a.__val[__i] > __b.__val[__i] ? __a.__val[__i] : __b.__val[__i];
-    return __r;
-}
 
 /* === Bitwise operations (pd) === */
 
@@ -447,16 +326,5 @@ _mm256_andnot_pd(__m256d __a, __m256d __b)
 
 /* === Movemask === */
 
-static __inline__ int __attribute__((__always_inline__))
-_mm256_movemask_pd(__m256d __a)
-{
-    int __r = 0;
-    for (int __i = 0; __i < 4; __i++) {
-        union { double d; long long ll; } __u;
-        __u.d = __a.__val[__i];
-        if (__u.ll < 0) __r |= (1 << __i);
-    }
-    return __r;
-}
 
 #endif /* _AVXINTRIN_H_INCLUDED */

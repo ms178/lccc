@@ -9,33 +9,13 @@
 
 #include <xmmintrin.h>
 
-typedef struct __attribute__((__aligned__(16))) {
-    long long __val[2];
-} __m128i;
-
-typedef struct __attribute__((__aligned__(1))) {
-    long long __val[2];
-} __m128i_u;
-
-typedef struct __attribute__((__aligned__(16))) {
-    double __val[2];
-} __m128d;
-
-typedef struct __attribute__((__aligned__(1))) {
-    double __val[2];
-} __m128d_u;
-
 /* Internal vector types referenced by GCC system headers (wmmintrin.h, etc.).
  * These enable parsing of system headers that use (__v2di)expr casts.
  * Note: vector_size attribute is parsed but vectors are lowered as aggregates. */
-typedef double __v2df __attribute__ ((__vector_size__ (16)));
 typedef long long __v2di __attribute__ ((__vector_size__ (16)));
 typedef unsigned long long __v2du __attribute__ ((__vector_size__ (16)));
-typedef int __v4si __attribute__ ((__vector_size__ (16)));
 typedef unsigned int __v4su __attribute__ ((__vector_size__ (16)));
-typedef short __v8hi __attribute__ ((__vector_size__ (16)));
 typedef unsigned short __v8hu __attribute__ ((__vector_size__ (16)));
-typedef char __v16qi __attribute__ ((__vector_size__ (16)));
 typedef signed char __v16qs __attribute__ ((__vector_size__ (16)));
 typedef unsigned char __v16qu __attribute__ ((__vector_size__ (16)));
 
@@ -779,44 +759,10 @@ _mm_loadl_epi64(__m128i const *__p)
 /* === Float/Int Conversion (SSE2) === */
 
 /* Convert packed 32-bit integers to packed single-precision floats */
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_cvtepi32_ps(__m128i __a)
-{
-    int __i0 = (int)__a.__val[0];
-    int __i1 = (int)(__a.__val[0] >> 32);
-    int __i2 = (int)__a.__val[1];
-    int __i3 = (int)(__a.__val[1] >> 32);
-    return (__m128){ { (float)__i0, (float)__i1, (float)__i2, (float)__i3 } };
-}
 
 /* Convert packed single-precision floats to packed 32-bit integers (round to nearest) */
-static __inline__ __m128i __attribute__((__always_inline__))
-_mm_cvtps_epi32(__m128 __a)
-{
-    /* Round to nearest integer. Use (int)(x + copysignf(0.5f, x)) as a
-     * portable approximation of round-to-nearest-even. This doesn't perfectly
-     * match banker's rounding for .5 cases, but works for typical audio/video usage. */
-    int __i0 = (int)(__a.__val[0] >= 0.0f ? __a.__val[0] + 0.5f : __a.__val[0] - 0.5f);
-    int __i1 = (int)(__a.__val[1] >= 0.0f ? __a.__val[1] + 0.5f : __a.__val[1] - 0.5f);
-    int __i2 = (int)(__a.__val[2] >= 0.0f ? __a.__val[2] + 0.5f : __a.__val[2] - 0.5f);
-    int __i3 = (int)(__a.__val[3] >= 0.0f ? __a.__val[3] + 0.5f : __a.__val[3] - 0.5f);
-    long long __lo = (long long)(unsigned int)__i0 | ((long long)(unsigned int)__i1 << 32);
-    long long __hi = (long long)(unsigned int)__i2 | ((long long)(unsigned int)__i3 << 32);
-    return (__m128i){ { __lo, __hi } };
-}
 
 /* Convert packed single-precision floats to packed 32-bit integers (truncate) */
-static __inline__ __m128i __attribute__((__always_inline__))
-_mm_cvttps_epi32(__m128 __a)
-{
-    int __i0 = (int)__a.__val[0];
-    int __i1 = (int)__a.__val[1];
-    int __i2 = (int)__a.__val[2];
-    int __i3 = (int)__a.__val[3];
-    long long __lo = (long long)(unsigned int)__i0 | ((long long)(unsigned int)__i1 << 32);
-    long long __hi = (long long)(unsigned int)__i2 | ((long long)(unsigned int)__i3 << 32);
-    return (__m128i){ { __lo, __hi } };
-}
 
 /* === Miscellaneous === */
 
@@ -1090,12 +1036,6 @@ _mm_mul_pd(__m128d __a, __m128d __b)
 }
 
 /* _mm_div_pd: packed double divide */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_div_pd(__m128d __a, __m128d __b)
-{
-    return (__m128d){ { __a.__val[0] / __b.__val[0],
-                        __a.__val[1] / __b.__val[1] } };
-}
 
 /* _mm_add_sd: scalar double add (low lane only, high unchanged) */
 static __inline__ __m128d __attribute__((__always_inline__))
@@ -1130,11 +1070,6 @@ _mm_div_sd(__m128d __a, __m128d __b)
 }
 
 /* _mm_sqrt_pd: packed double square root */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_sqrt_pd(__m128d __a)
-{
-    return (__m128d){ { __builtin_sqrt(__a.__val[0]), __builtin_sqrt(__a.__val[1]) } };
-}
 
 /* _mm_sqrt_sd: scalar double square root (low lane only, high from __a) */
 static __inline__ __m128d __attribute__((__always_inline__))
@@ -1146,21 +1081,9 @@ _mm_sqrt_sd(__m128d __a, __m128d __b)
 /* _mm_min_pd: packed double minimum
  * Note: NaN handling may differ from hardware SSE2 (which returns second
  * operand when one input is NaN). This uses C comparison semantics. */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_min_pd(__m128d __a, __m128d __b)
-{
-    return (__m128d){ { __a.__val[0] < __b.__val[0] ? __a.__val[0] : __b.__val[0],
-                        __a.__val[1] < __b.__val[1] ? __a.__val[1] : __b.__val[1] } };
-}
 
 /* _mm_max_pd: packed double maximum
  * Note: NaN handling may differ from hardware SSE2. */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_max_pd(__m128d __a, __m128d __b)
-{
-    return (__m128d){ { __a.__val[0] > __b.__val[0] ? __a.__val[0] : __b.__val[0],
-                        __a.__val[1] > __b.__val[1] ? __a.__val[1] : __b.__val[1] } };
-}
 
 /* _mm_min_sd: scalar double minimum */
 static __inline__ __m128d __attribute__((__always_inline__))
@@ -1234,35 +1157,8 @@ _mm_andnot_pd(__m128d __a, __m128d __b)
 
 /* === Double Compare (returns mask: all 1s for true, all 0s for false) === */
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmpeq_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    __rr[0] = __a.__val[0] == __b.__val[0] ? ~0LL : 0LL;
-    __rr[1] = __a.__val[1] == __b.__val[1] ? ~0LL : 0LL;
-    return __r;
-}
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmplt_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    __rr[0] = __a.__val[0] < __b.__val[0] ? ~0LL : 0LL;
-    __rr[1] = __a.__val[1] < __b.__val[1] ? ~0LL : 0LL;
-    return __r;
-}
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmple_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    __rr[0] = __a.__val[0] <= __b.__val[0] ? ~0LL : 0LL;
-    __rr[1] = __a.__val[1] <= __b.__val[1] ? ~0LL : 0LL;
-    return __r;
-}
 
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmpgt_pd(__m128d __a, __m128d __b)
@@ -1276,35 +1172,8 @@ _mm_cmpge_pd(__m128d __a, __m128d __b)
     return _mm_cmple_pd(__b, __a);
 }
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmpneq_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    __rr[0] = __a.__val[0] != __b.__val[0] ? ~0LL : 0LL;
-    __rr[1] = __a.__val[1] != __b.__val[1] ? ~0LL : 0LL;
-    return __r;
-}
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmpnlt_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    __rr[0] = !(__a.__val[0] < __b.__val[0]) ? ~0LL : 0LL;
-    __rr[1] = !(__a.__val[1] < __b.__val[1]) ? ~0LL : 0LL;
-    return __r;
-}
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmpnle_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    __rr[0] = !(__a.__val[0] <= __b.__val[0]) ? ~0LL : 0LL;
-    __rr[1] = !(__a.__val[1] <= __b.__val[1]) ? ~0LL : 0LL;
-    return __r;
-}
 
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmpngt_pd(__m128d __a, __m128d __b)
@@ -1318,27 +1187,7 @@ _mm_cmpnge_pd(__m128d __a, __m128d __b)
     return _mm_cmpnle_pd(__b, __a);
 }
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmpord_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    /* ordered: both operands are not NaN */
-    __rr[0] = (__a.__val[0] == __a.__val[0] && __b.__val[0] == __b.__val[0]) ? ~0LL : 0LL;
-    __rr[1] = (__a.__val[1] == __a.__val[1] && __b.__val[1] == __b.__val[1]) ? ~0LL : 0LL;
-    return __r;
-}
 
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cmpunord_pd(__m128d __a, __m128d __b)
-{
-    __m128d __r;
-    long long *__rr = (long long *)&__r;
-    /* unordered: at least one operand is NaN */
-    __rr[0] = (__a.__val[0] != __a.__val[0] || __b.__val[0] != __b.__val[0]) ? ~0LL : 0LL;
-    __rr[1] = (__a.__val[1] != __a.__val[1] || __b.__val[1] != __b.__val[1]) ? ~0LL : 0LL;
-    return __r;
-}
 
 /* Scalar double compares (low lane only, high from __a) */
 
@@ -1430,37 +1279,14 @@ _mm_comineq_sd(__m128d __a, __m128d __b)
 /* === Double Shuffle / Unpack === */
 
 /* _mm_unpacklo_pd: interleave low doubles: {a[0], b[0]} */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_unpacklo_pd(__m128d __a, __m128d __b)
-{
-    return (__m128d){ { __a.__val[0], __b.__val[0] } };
-}
 
 /* _mm_unpackhi_pd: interleave high doubles: {a[1], b[1]} */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_unpackhi_pd(__m128d __a, __m128d __b)
-{
-    return (__m128d){ { __a.__val[1], __b.__val[1] } };
-}
 
 /* _mm_shuffle_pd: shuffle two doubles based on immediate mask */
-#define _mm_shuffle_pd(__a, __b, __imm) \
-    ((__m128d){ { (__a).__val[(__imm) & 1], (__b).__val[((__imm) >> 1) & 1] } })
 
 /* _mm_move_sd: move low double from __b, keep high from __a */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_move_sd(__m128d __a, __m128d __b)
-{
-    return (__m128d){ { __b.__val[0], __a.__val[1] } };
-}
 
 /* _mm_movemask_pd: extract sign bits of two doubles */
-static __inline__ int __attribute__((__always_inline__))
-_mm_movemask_pd(__m128d __a)
-{
-    long long *__p = (long long *)&__a;
-    return ((__p[0] >> 63) & 1) | (((__p[1] >> 63) & 1) << 1);
-}
 
 /* === Double Conversion === */
 
@@ -1472,19 +1298,8 @@ _mm_cvtsd_f64(__m128d __a)
 }
 
 /* _mm_cvtsd_si32: convert low double to int (round to nearest) */
-static __inline__ int __attribute__((__always_inline__))
-_mm_cvtsd_si32(__m128d __a)
-{
-    double __d = __a.__val[0];
-    return (int)(__d >= 0.0 ? __d + 0.5 : __d - 0.5);
-}
 
 /* _mm_cvttsd_si32: convert low double to int (truncate) */
-static __inline__ int __attribute__((__always_inline__))
-_mm_cvttsd_si32(__m128d __a)
-{
-    return (int)__a.__val[0];
-}
 
 /* _mm_cvtsd_si64: convert low double to long long (round to nearest) */
 static __inline__ long long __attribute__((__always_inline__))
@@ -1506,81 +1321,24 @@ _mm_cvttsd_si64(__m128d __a)
 #define _mm_cvttsd_si64x(a) _mm_cvttsd_si64(a)
 
 /* _mm_cvtsi32_sd: convert int to double, set low lane, keep high from __a */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cvtsi32_sd(__m128d __a, int __b)
-{
-    __a.__val[0] = (double)__b;
-    return __a;
-}
 
 /* _mm_cvtsi64_sd: convert long long to double, set low lane */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cvtsi64_sd(__m128d __a, long long __b)
-{
-    __a.__val[0] = (double)__b;
-    return __a;
-}
 
 #define _mm_cvtsi64x_sd(a, b) _mm_cvtsi64_sd(a, b)
 
 /* _mm_cvtpd_ps: convert 2 doubles to 2 floats (low half of __m128) */
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_cvtpd_ps(__m128d __a)
-{
-    return (__m128){ { (float)__a.__val[0], (float)__a.__val[1], 0.0f, 0.0f } };
-}
 
 /* _mm_cvtps_pd: convert 2 floats (low half of __m128) to 2 doubles */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cvtps_pd(__m128 __a)
-{
-    return (__m128d){ { (double)__a.__val[0], (double)__a.__val[1] } };
-}
 
 /* _mm_cvtsd_ss: convert low double to float, put in low lane of __a */
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_cvtsd_ss(__m128 __a, __m128d __b)
-{
-    __a.__val[0] = (float)__b.__val[0];
-    return __a;
-}
 
 /* _mm_cvtss_sd: convert low float to double, put in low lane of __a */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cvtss_sd(__m128d __a, __m128 __b)
-{
-    __a.__val[0] = (double)__b.__val[0];
-    return __a;
-}
 
 /* _mm_cvtpd_epi32: convert 2 doubles to 2 packed 32-bit integers (round to nearest) */
-static __inline__ __m128i __attribute__((__always_inline__))
-_mm_cvtpd_epi32(__m128d __a)
-{
-    int __i0 = (int)(__a.__val[0] >= 0.0 ? __a.__val[0] + 0.5 : __a.__val[0] - 0.5);
-    int __i1 = (int)(__a.__val[1] >= 0.0 ? __a.__val[1] + 0.5 : __a.__val[1] - 0.5);
-    long long __lo = (long long)(unsigned int)__i0 | ((long long)(unsigned int)__i1 << 32);
-    return (__m128i){ { __lo, 0LL } };
-}
 
 /* _mm_cvttpd_epi32: convert 2 doubles to 2 packed 32-bit integers (truncate) */
-static __inline__ __m128i __attribute__((__always_inline__))
-_mm_cvttpd_epi32(__m128d __a)
-{
-    int __i0 = (int)__a.__val[0];
-    int __i1 = (int)__a.__val[1];
-    long long __lo = (long long)(unsigned int)__i0 | ((long long)(unsigned int)__i1 << 32);
-    return (__m128i){ { __lo, 0LL } };
-}
 
 /* _mm_cvtepi32_pd: convert 2 packed 32-bit integers (low half) to 2 doubles */
-static __inline__ __m128d __attribute__((__always_inline__))
-_mm_cvtepi32_pd(__m128i __a)
-{
-    int __i0 = (int)__a.__val[0];
-    int __i1 = (int)(__a.__val[0] >> 32);
-    return (__m128d){ { (double)__i0, (double)__i1 } };
-}
 
 /* === Fence / Cache === */
 

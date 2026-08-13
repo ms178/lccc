@@ -57,6 +57,8 @@ impl super::InstructionEncoder {
                     base: None,
                     index: None,
                     scale: None,
+                    mask: None,
+                    zeroing: false,
                 };
                 self.encode_mov_mem_reg(&mem, dst, size)
             }
@@ -68,6 +70,8 @@ impl super::InstructionEncoder {
                     base: None,
                     index: None,
                     scale: None,
+                    mask: None,
+                    zeroing: false,
                 };
                 self.encode_mov_reg_mem(src, &mem, size)
             }
@@ -526,6 +530,7 @@ impl super::InstructionEncoder {
                     segment: None,
                     displacement: Displacement::Symbol(label.clone()),
                     base: None, index: None, scale: None,
+                    mask: None, zeroing: false,
                 };
                 if size == 2 { self.bytes.push(0x66); }
                 self.emit_rex_rm(size, &dst.name, &mem);
@@ -546,6 +551,7 @@ impl super::InstructionEncoder {
                     segment: None,
                     displacement: Displacement::Symbol(label.clone()),
                     base: None, index: None, scale: None,
+                    mask: None, zeroing: false,
                 };
                 if size == 2 { self.bytes.push(0x66); }
                 self.emit_rex_rm(size, &src.name, &mem);
