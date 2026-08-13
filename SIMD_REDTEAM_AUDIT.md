@@ -677,3 +677,71 @@ chains.
    reduction loops).
 4. nbody's remaining `imulq` are preheader pointer-inits for non-constant IV
    inits (reuse `&bodies[i]+56` for `&bodies[i+1]`).
+
+## v10 — regression tests + FP constant-pool fix + ICC/ICX research
+
+**Pre-existing bug found & fixed** (caught by the new `v8_fp_die_at_birth`
+test): `emit_fp_const_pool` emitted every FP constant with `.align 8` and
+8 bytes of data, but the Fabs emitter loads these constants with
+`andpd`/`andps`, whose m128 memory operand must be 16-byte aligned. With one
+FP function the constant lands on a lucky 16-aligned offset; with two or more
+the layout shifts and the mask lands on an 8-mod-16 offset → #GP (SIGSEGV at
+the andpd). Reproduced identically on the pre-v8 base (`d1a129e5`), so it is
+NOT a v8/v9 regression. Fix: 16-byte-aligned 16-byte slots (value + zero pad);
+the zero pad also makes the mask's upper lane zero (correct for scalar lanes).
+`andpd`/`andps` alignment was confirmed empirically: `andpd [8-aligned]`
+faults, `andpd [16-aligned]` does not.
+
+**Regression tests added** (133 total, all differential vs GCC): range-check
+folding (every shape), short-circuit side effects, FP die-at-birth chains,
+GPR unary Neg/Not/Bswap, widen-narrow cast chains, Cmp→Cast→branch fusion.
+
+**ICC/ICX research via godbolt** (`cicc202171` ICC 2021.7.1, `cicxlatest` ICX;
+scripts in work/gb.py + work/gb_*.c):
+
+- **expat name-length**: ICC folds ALL UTF-8 lead-byte ranges into
+  `lea ecx,[-194+r8]; cmp ecx,29; ja` (matches our v8 range fold), uses ONE
+  `movzx` load + `cmp r8d,128; jb` (sign-bit ASCII test) and compact
+  `and cl,-64; cmp cl,-128; jne` continuation checks. lccc's remaining gap:
+  the `movzbl (%r11),%esi; mov %esi,%r15d; mov %r15d,%ebp` byte-copy chains
+  (each SSA copy of the load gets its own register) and the inner `||` links
+  still materializing setcc/cmov.
+- **sqlite varint**: ICX emits `movzx; test cl,cl; js; and; shl; or; ...`
+  with ZERO register-copy chains and no accumulator round-trips. lccc's gap is
+  the same copy-chain / accumulator-round-trip issue (2.09x vs gcc).
+- **adler32**: ICX pipelines two accumulators (`add r9d,r8d; add eax,r9d`
+  per byte); ICC breaks the adler→sum2→adler serial chain with a 4-register
+  rotation. lccc keeps one accumulator with per-iteration slot copies (1.73x).
+- **range check**: ICX emits `add dil,-97; xor eax,eax; cmp dil,26; setb al`
+  (add-negative instead of sub — same cost). Confirms the v8 fold.
+
+**Parameter register allocation — exact blocker diagnosed.** The FP-param XMM
+pre-store was implemented and then REVERTED as inert: (1) at -O2, GVN
+deliberately removes the lowering's `ParamRef`+`Store` pair ("the backend's
+ParamRef optimization reads parameter values from the alloca") so no ParamRef
+reaches codegen; (2) at -O0 the param alloca still has a slot (`has_slot`),
+so the dead-alloca pre-store is skipped. Keeping an FP param in XMM therefore
+needs either (a) preserving the scalar FP ParamRef through GVN (gated to
+call-free functions) so the pre-store fires, or (b) teaching `emit_store_params`
+to recognize a read-only FP param alloca whose loads the regalloc can satisfy
+from an XMM register. (a) is the cleaner fix; the pre-store code to emit
+`movq %xmmN, %xmmM` for `ParamClass::FloatReg` is written and tested in this
+session's working history.
+
+## v10 roadmap (prioritized, informed by ICC/ICX)
+
+1. **GPR copy-chain elimination** (expat 2.89x, sqlite 2.09x). The
+   `mov %esi,%r15d; mov %r15d,%ebp` chains are the single biggest remaining
+   gap vs ICX. Two-pronged: (a) hint int→int `Cast` in the regalloc follow
+   hints when the cast emitter computes into the dest register (extends the
+   v9 Copy/unary hints — the chain is Load→Cast→Cast→Cmp, and Cast is the
+   unhinted link); (b) fuse the load+zero/sign-extend (`movzbl (%r11),%esi`
+   directly into the cmp) by folding the cast into the memory operand.
+2. **Branch-on-logical at lowering**: when `&&`/`||` is used only as a
+   condition, emit pure branches instead of a value+phi so every inner link
+   fuses (extends the v9 `||`-skip; currently only the first link fuses).
+3. **Parameter register allocation** — see the diagnosed blocker above.
+4. **Adler32 chain-breaking reassociation** (1.73x): ICC's 4-register rotation
+   for `adler+=b[i]; sum2+=adler` within the 16-byte unroll; also removes the
+   per-iteration slot copies (loop-carried accumulator in registers).
+5. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).

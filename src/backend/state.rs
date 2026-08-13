@@ -467,6 +467,16 @@ impl CodegenState {
 
     /// Emit all accumulated FP constants as a .rodata section.
     /// Called once at the end of module codegen.
+    ///
+    /// Every constant gets a 16-byte-aligned, 16-byte slot (the 8-byte value
+    /// followed by an 8-byte zero pad). The scalar readers (movsd/movss) only
+    /// read the first 8/4 bytes, but the Fabs emitter loads these constants
+    /// with `andpd`/`andps`, whose m128 memory operand must be 16-byte
+    /// aligned — an 8-byte-aligned slot raises #GP whenever the constant
+    /// lands on an 8-mod-16 offset (reproduced: two FP functions in one TU,
+    /// F64 fabs + F32 fabs, SIGSEGV at the andpd). The zero pad also makes
+    /// the upper lane of the andpd mask zero, which is the correct identity
+    /// for scalar-typed lanes.
     pub fn emit_fp_const_pool(&mut self) {
         if self.fp_const_pool.is_empty() {
             return;
@@ -476,10 +486,11 @@ impl CodegenState {
         let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
         entries.sort_by_key(|(_, label)| (*label).clone());
         for (bits, label) in entries {
-            self.out.emit(".align 8");
+            self.out.emit(".align 16");
             self.out.emit_fmt(format_args!("{}:", label));
             self.out
                 .emit_fmt(format_args!("    .quad {}", *bits as i64));
+            self.out.emit("    .quad 0");
         }
     }
 
