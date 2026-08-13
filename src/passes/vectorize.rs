@@ -1684,6 +1684,81 @@ fn find_inst_in_loop<'a>(func: &'a IrFunction, loop_blocks: &FxHashSet<usize>, d
     None
 }
 
+/// Element size in bytes for a vectorizable reduction element type.
+fn reduction_element_size(ty: IrType) -> Option<u32> {
+    match ty {
+        IrType::F64 => Some(8),
+        IrType::F32 => Some(4),
+        IrType::I32 => Some(4),
+        IrType::I64 => Some(8),
+        _ => None,
+    }
+}
+
+/// For a GEP `base + (iv * elem_size)`, return `(base, byte_iv)` where
+/// `byte_iv` is the I64 cast of the induction variable (i.e. the value that
+/// equals the byte offset once the IV steps by `elem_size * vec_width` bytes
+/// instead of one element). Returns `None` when the offset is not the
+/// canonical `shl/mul(iv_cast, elem_size)` shape, so the caller can fall back
+/// to the element-index scheme (scaled GEP offsets + `iv * vec_width`
+/// remainder start).
+fn find_reduction_byte_iv(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    gep_val: Value,
+    elem_size: u32,
+) -> Option<(Value, Value)> {
+    let log2 = elem_size.trailing_zeros(); // 4 -> 2, 8 -> 3
+    for &block_idx in loop_blocks {
+        let block = &func.blocks[block_idx];
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+                if *dest != gep_val {
+                    continue;
+                }
+                let off_val = match offset {
+                    Operand::Value(v) => *v,
+                    _ => return None, // constant offset: not IV-based
+                };
+                for &b2 in loop_blocks {
+                    for inst2 in &func.blocks[b2].instructions {
+                        if inst2.dest() != Some(off_val) {
+                            continue;
+                        }
+                        match inst2 {
+                            Instruction::BinOp { op: IrBinOp::Shl, lhs, rhs, .. } => {
+                                if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
+                                    if c.to_i64() == Some(log2 as i64) {
+                                        return Some((*base, *v));
+                                    }
+                                }
+                            }
+                            Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. } => {
+                                let iv_op = match (lhs, rhs) {
+                                    (Operand::Value(v), Operand::Const(c)) => {
+                                        c.to_i64().and_then(|k| (k == elem_size as i64).then_some(*v))
+                                    }
+                                    (Operand::Const(c), Operand::Value(v)) => {
+                                        c.to_i64().and_then(|k| (k == elem_size as i64).then_some(*v))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(v) = iv_op {
+                                    return Some((*base, v));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Offset exists but is not a clean shl/mul by elem_size.
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// Verify that a GEP uses the IV as offset (with or without scale).
 fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<()> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
@@ -2950,6 +3025,7 @@ fn insert_reduction_remainder_loop(
     vec_width: u64,
     horizontal_intrinsic: IntrinsicOp,
     vec_sum_value: Value,  // Accumulated vector SSA value
+    byte_offset_iv: bool,
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
@@ -3086,13 +3162,25 @@ fn insert_reduction_remainder_loop(
                 dest_ptr: None,
                 args: vec![Operand::Value(pattern.accumulator_phi)],
             },
-            // Compute starting index for remainder: i_rem_start = iv_final * vec_width
-            Instruction::BinOp {
-                dest: i_rem_start,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(pattern.iv),
-                rhs: Operand::Const(IrConst::I32(vec_width as i32)),
-                ty: IrType::I32,
+            // Compute starting index for the scalar remainder loop.
+            //   byte-offset IV: start = byte_iv_final / element_size
+            //   element-index IV: start = iv_final * vec_width
+            if byte_offset_iv {
+                Instruction::BinOp {
+                    dest: i_rem_start,
+                    op: IrBinOp::SDiv,
+                    lhs: Operand::Value(pattern.iv),
+                    rhs: Operand::Const(IrConst::I32(element_size as i32)),
+                    ty: IrType::I32,
+                }
+            } else {
+                Instruction::BinOp {
+                    dest: i_rem_start,
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(pattern.iv),
+                    rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+                    ty: IrType::I32,
+                }
             },
         ],
         terminator: Terminator::Branch(remainder_header_label),
@@ -3457,10 +3545,36 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // Step 1: Divide loop bound by vector width
+    // v4: byte-offset IV strength reduction (mirrors the matmul path). The IV
+    // steps `elem_sz * vec_width` bytes per iteration instead of one element,
+    // so the GEP offset IS the byte IV (no per-iteration shl/leaq/scale) and
+    // VecLoad can use `(base, byte_iv)` addressing directly. Falls back to the
+    // element-index scheme when the offset chain is not the canonical
+    // `shl/mul(iv_cast, elem_sz)` shape.
+    let elem_sz = reduction_element_size(pattern.element_type).unwrap_or(0) as u64;
+    let byte_stride = elem_sz * vec_width;
+    let byte_iv_a = find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.array_a_gep, elem_sz as u32);
+    let byte_iv_b = pattern
+        .array_b_gep
+        .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+    let use_byte_iv = byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+
+    // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
     let divided_limit = match &pattern.limit {
-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
+        Operand::Const(IrConst::I32(n)) => {
+            if use_byte_iv {
+                Operand::Const(IrConst::I32((*n / vec_width as i32) * byte_stride as i32))
+            } else {
+                Operand::Const(IrConst::I32(*n / vec_width as i32))
+            }
+        }
+        Operand::Const(IrConst::I64(n)) => {
+            if use_byte_iv {
+                Operand::Const(IrConst::I64((*n / vec_width as i64) * byte_stride as i64))
+            } else {
+                Operand::Const(IrConst::I64(*n / vec_width as i64))
+            }
+        }
         Operand::Value(limit_val) => {
             // Dynamic limit: insert division
             let div_dest = Value(next_val_id);
@@ -3491,7 +3605,26 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 eprintln!("[VEC-RED]   Inserted division for dynamic limit: Value({})", div_dest.0);
             }
 
-            Operand::Value(div_dest)
+            if use_byte_iv {
+                let mul_dest = Value(next_val_id);
+                next_val_id += 1;
+                let mul_inst = Instruction::BinOp {
+                    dest: mul_dest,
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(div_dest),
+                    rhs: Operand::Const(match limit_ty {
+                        IrType::I32 => IrConst::I32(byte_stride as i32),
+                        IrType::I64 => IrConst::I64(byte_stride as i64),
+                        _ => IrConst::I64(byte_stride as i64),
+                    }),
+                    ty: limit_ty,
+                };
+                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                changes += 1;
+                Operand::Value(mul_dest)
+            } else {
+                Operand::Value(div_dest)
+            }
         }
         _ => {
             if debug {
@@ -3539,7 +3672,26 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // Step 2: Scale array indexing by vector width.
+    // v4: byte-offset IV — the latch increment steps by `byte_stride` bytes.
+    if use_byte_iv {
+        let latch = &mut func.blocks[pattern.latch_idx];
+        if pattern.iv_inc_idx < latch.instructions.len() {
+            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+                *rhs = match rhs {
+                    Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(byte_stride as i32)),
+                    _ => Operand::Const(IrConst::I64(byte_stride as i64)),
+                };
+                changes += 1;
+                if debug {
+                    eprintln!("[VEC-RED]   Changed IV increment to byte stride {}", byte_stride);
+                }
+            }
+        }
+    }
+
+    // Step 2: Scale array indexing by vector width (element-index scheme only;
+    // the byte-offset IV already covers vec_width elements per iteration).
+    if !use_byte_iv {
     // Each GEP's byte offset (element_index * elem_size) must be multiplied by
     // vec_width so one vector iteration covers vec_width consecutive elements.
     // Collect ALL matching GEPs first — a dot product has two (array A and
@@ -3582,6 +3734,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         if debug {
             eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
         }
+    }
     }
 
     // Step 3: Transform loop body - register-based vector operations
@@ -3665,10 +3818,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                     dest: Some(vec_load),
                     op: vec_load_op,
                     dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.array_a_gep),
-                        Operand::Const(IrConst::I64(0)),
-                    ],
+                    args: {
+                        let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                            (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                            _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                        };
+                        vec![base, off]
+                    },
                 };
 
                 // Vector add: accumulator + loaded vector → new accumulator
@@ -3793,10 +3949,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 dest: Some(vec_load_a),
                 op: vec_load_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.array_a_gep),
-                    Operand::Const(IrConst::I64(0)),
-                ],
+                args: {
+                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                    };
+                    vec![base, off]
+                },
             };
 
             // Load vector from array B
@@ -3804,10 +3963,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 dest: Some(vec_load_b),
                 op: vec_load_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.array_b_gep.unwrap()),
-                    Operand::Const(IrConst::I64(0)),
-                ],
+                args: {
+                    let (base, off) = match (use_byte_iv, &byte_iv_b) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (Operand::Value(pattern.array_b_gep.unwrap()), Operand::Const(IrConst::I64(0))),
+                    };
+                    vec![base, off]
+                },
             };
 
             // Multiply vectors: A * B
@@ -3838,8 +4000,13 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
             body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
             body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
 
-            // Remove old scalar add (and possibly mul) - for now, remove 2 instructions
-            body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+            // Remove the dead scalar add (now after the 4 inserted vector ops).
+            // The dead scalar multiply that fed it becomes unreachable and is
+            // cleaned up by DCE. The old code removed TWO instructions at
+            // accumulator_add_idx + 4, which accidentally deleted the latch's
+            // induction-variable increment once the byte-offset IV stopped
+            // inserting per-GEP multiplies (infinite loop / undefined IV on
+            // dot products).
             body_block.instructions.remove(pattern.accumulator_add_idx + 4);
             changes += 4;
 
@@ -3873,6 +4040,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         vec_width,
         horizontal_intrinsic,
         vec_sum_value,  // Pass the vector accumulator SSA value
+        use_byte_iv,
         &mut next_val_id,
         &mut next_label,
     );
@@ -3975,10 +4143,36 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // Step 1: Divide loop bound by vector width
+    // v4: byte-offset IV strength reduction (mirrors the matmul path). The IV
+    // steps `elem_sz * vec_width` bytes per iteration instead of one element,
+    // so the GEP offset IS the byte IV (no per-iteration shl/leaq/scale) and
+    // VecLoad can use `(base, byte_iv)` addressing directly. Falls back to the
+    // element-index scheme when the offset chain is not the canonical
+    // `shl/mul(iv_cast, elem_sz)` shape.
+    let elem_sz = reduction_element_size(pattern.element_type).unwrap_or(0) as u64;
+    let byte_stride = elem_sz * vec_width;
+    let byte_iv_a = find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.array_a_gep, elem_sz as u32);
+    let byte_iv_b = pattern
+        .array_b_gep
+        .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+    let use_byte_iv = byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+
+    // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
     let divided_limit = match &pattern.limit {
-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
+        Operand::Const(IrConst::I32(n)) => {
+            if use_byte_iv {
+                Operand::Const(IrConst::I32((*n / vec_width as i32) * byte_stride as i32))
+            } else {
+                Operand::Const(IrConst::I32(*n / vec_width as i32))
+            }
+        }
+        Operand::Const(IrConst::I64(n)) => {
+            if use_byte_iv {
+                Operand::Const(IrConst::I64((*n / vec_width as i64) * byte_stride as i64))
+            } else {
+                Operand::Const(IrConst::I64(*n / vec_width as i64))
+            }
+        }
         Operand::Value(limit_val) => {
             // Dynamic limit: insert division
             let div_dest = Value(next_val_id);
@@ -4009,7 +4203,26 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 eprintln!("[VEC-RED]   Inserted division for dynamic limit: Value({})", div_dest.0);
             }
 
-            Operand::Value(div_dest)
+            if use_byte_iv {
+                let mul_dest = Value(next_val_id);
+                next_val_id += 1;
+                let mul_inst = Instruction::BinOp {
+                    dest: mul_dest,
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(div_dest),
+                    rhs: Operand::Const(match limit_ty {
+                        IrType::I32 => IrConst::I32(byte_stride as i32),
+                        IrType::I64 => IrConst::I64(byte_stride as i64),
+                        _ => IrConst::I64(byte_stride as i64),
+                    }),
+                    ty: limit_ty,
+                };
+                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                changes += 1;
+                Operand::Value(mul_dest)
+            } else {
+                Operand::Value(div_dest)
+            }
         }
         _ => {
             if debug {
@@ -4057,7 +4270,26 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // Step 2: Scale array indexing by vector width.
+    // v4: byte-offset IV — the latch increment steps by `byte_stride` bytes.
+    if use_byte_iv {
+        let latch = &mut func.blocks[pattern.latch_idx];
+        if pattern.iv_inc_idx < latch.instructions.len() {
+            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+                *rhs = match rhs {
+                    Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(byte_stride as i32)),
+                    _ => Operand::Const(IrConst::I64(byte_stride as i64)),
+                };
+                changes += 1;
+                if debug {
+                    eprintln!("[VEC-RED]   Changed IV increment to byte stride {}", byte_stride);
+                }
+            }
+        }
+    }
+
+    // Step 2: Scale array indexing by vector width (element-index scheme only;
+    // the byte-offset IV already covers vec_width elements per iteration).
+    if !use_byte_iv {
     // Each GEP's byte offset (element_index * elem_size) must be multiplied by
     // vec_width so one vector iteration covers vec_width consecutive elements.
     // Collect ALL matching GEPs first — a dot product has two (array A and
@@ -4099,6 +4331,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         if debug {
             eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
         }
+    }
     }
 
     // Step 3: Transform loop body - replace scalar operations with vector intrinsics
@@ -4174,10 +4407,13 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 dest: Some(vec_load),
                 op: vec_load_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.array_a_gep),
-                    Operand::Const(IrConst::I64(0)),
-                ],
+                args: {
+                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                    };
+                    vec![base, off]
+                },
             };
 
             // Create vector add (accumulate) - reads from PHI, produces new value
@@ -4303,20 +4539,26 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 dest: Some(vec_load_a),
                 op: vec_load_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.array_a_gep),
-                    Operand::Const(IrConst::I64(0)),
-                ],
+                args: {
+                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                    };
+                    vec![base, off]
+                },
             };
 
             let load_b_inst = Instruction::Intrinsic {
                 dest: Some(vec_load_b),
                 op: vec_load_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.array_b_gep.unwrap()),
-                    Operand::Const(IrConst::I64(0)),
-                ],
+                args: {
+                    let (base, off) = match (use_byte_iv, &byte_iv_b) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (Operand::Value(pattern.array_b_gep.unwrap()), Operand::Const(IrConst::I64(0))),
+                    };
+                    vec![base, off]
+                },
             };
 
             // Create vector multiply (element-wise)
@@ -4349,8 +4591,13 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
                 body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
 
-                // Remove old scalar add (and possibly mul) - for now, remove 2 instructions
-                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                // Remove the dead scalar add (now after the 4 inserted vector
+                // ops). The dead scalar multiply that fed it becomes unreachable
+                // and is cleaned up by DCE. The old code removed TWO
+                // instructions at accumulator_add_idx + 4, which accidentally
+                // deleted the latch's induction-variable increment once the
+                // byte-offset IV stopped inserting per-GEP multiplies
+                // (infinite loop / undefined IV on dot products).
                 body_block.instructions.remove(pattern.accumulator_add_idx + 4);
                 changes += 4;
             }
@@ -4384,6 +4631,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         vec_width,
         horizontal_intrinsic,
         vec_sum_value,  // Pass the vector accumulator SSA value
+        use_byte_iv,
         &mut next_val_id,
         &mut next_label,
     );

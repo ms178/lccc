@@ -355,3 +355,55 @@ remains ~2× faster than GCC/Clang.
    shl/leaq vs the byte-offset IV the matmul path already uses).
 3. Store-loop / general loop vectorization (dataflow-driven).
 4. matmul `BroadcastLoadF64` hoisting (still blocked on register allocation).
+
+---
+
+# v4 (2026-08-13) — byte-offset IV strength reduction + latent dot-product fix
+
+## Delivered
+
+1. **Byte-offset IV for reduction loops.** F64/F32/I32 sum and dot products (AVX2
+   and SSE2) now step a byte-offset induction variable (stride = elem_size ×
+   vec_width) instead of an element index, mirroring the matmul path:
+   - the GEP offset becomes the byte IV itself (per-iteration shl/leaq/scale
+     chain removed),
+   - VecLoad takes `(base, byte_iv)` SIB addressing directly,
+   - the loop bound becomes `floor(N/vec_width) * byte_stride` (running ceil
+     iterations would read/write past the array end — the OOB class fixed in
+     the matmul path),
+   - the scalar remainder start becomes `byte_iv_final / elem_size`.
+   Falls back to the element-index scheme when the offset chain is not the
+   canonical `shl/mul(iv_cast, elem_size)` shape.
+
+2. **Latent dot-product bug fixed.** The dot-product transform removed two
+   instructions at `accumulator_add_idx + 4`, which only deleted dead scalar
+   code while the element-index Step 2 kept inserting per-GEP multiplies that
+   shifted indices. Under byte-offset IV the same removal deleted the loop's
+   induction-variable increment (infinite loop / undefined IV). It now removes
+   only the dead scalar add and lets DCE reclaim the dead multiply.
+
+## Validation
+
+- 5 reduction kernels × N ∈ {0..300} × {AVX2, SSE2}: bit-exact vs scalar
+  reference and GCC (edge cases 0, 1, 3, 4, 7, 8 included).
+- Large-N (10⁶) exact in both modes.
+- regression 126/126, correctness 50/50, intrinsics 3/3.
+
+## Benchmarks (min-of-5, pinned core)
+
+| kernel | lccc v4 | gcc |
+|---|---|---|
+| F64 sum 1M | 0.620 s | 0.614 s |
+| F64 dot 1M | 0.252 s | 0.249 s |
+| F32 dot 1M | 0.123 s | 0.245 s |
+
+## Remaining top-priority work (v5)
+
+1. **YMM register allocation for loop-carried accumulators** — closes the
+   per-iteration accumulator copy + temp-store/load (3–4 instr/iter on every
+   reduction loop) and the adler32 5.3× intrinsic-chain gap. Needs a YMM
+   PhysReg class with XMM/YMM aliasing awareness (or width-partitioned pools).
+2. Remove the dead strength-reduced pointer that IVSR emits on top of the
+   byte-offset SIB addressing (1 instr/iter).
+3. Store-loop / general dataflow-driven loop vectorization.
+4. matmul `BroadcastLoadF64` hoisting (unblocks once registers land).
