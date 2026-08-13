@@ -259,13 +259,14 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
     requested = [item.strip().lower() for item in args.compilers.split(",") if item.strip()]
     aliases = {"icc": "icx"}
     requested = [aliases.get(item, item) for item in requested]
-    known = {"lccc", "ccc", "gcc", "clang", "icx"}
+    known = {"lccc", "lev", "ccc", "gcc", "clang", "icx"}
     unknown = [item for item in requested if item not in known]
     if unknown:
         raise ValueError(f"unknown compiler key(s): {', '.join(unknown)}")
 
     candidates = {
         "lccc": ("LCCC", args.lccc),
+        "lev": ("Lev-LCCC", args.lev),
         "ccc": ("CCC", args.ccc),
         "gcc": ("GCC", args.gcc),
         "clang": ("Clang", args.clang),
@@ -282,7 +283,7 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
         if not executable:
             unavailable[key] = f"not found: {supplied}"
             continue
-        if key in ("lccc", "ccc"):
+        if key in ("lccc", "lev", "ccc"):
             if not gcc_include:
                 unavailable[key] = "GCC builtin include directory unavailable (needed for compiler headers)"
                 continue
@@ -1010,6 +1011,7 @@ def main() -> int:
     parser.add_argument("--clang", default="clang", help="Clang executable")
     parser.add_argument("--icx", default="icx", help="ICX executable")
     parser.add_argument("--ccc", default="", help="path to the original Claude's C Compiler executable (Anthropic upstream)")
+    parser.add_argument("--lev", default="", help="path to Lev Kropp's original lccc executable (levkropp/lccc)")
     parser.add_argument("--opt", default="-O2", help="optimization flag passed uniformly to every compiler")
     parser.add_argument("--cflag", action="append", default=[], help="additional common compiler flag; may be repeated")
     parser.add_argument("--reps", type=int, default=15, help="timed paired rounds per benchmark (default: %(default)s)")
