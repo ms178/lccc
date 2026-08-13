@@ -6,11 +6,13 @@
 
 ## What is LCCC?
 
-CCC (Claude's C Compiler) is a zero-dependency C compiler written entirely in Rust by Claude Opus 4.6 and Arena.ai Agents,
-capable of compiling real projects — gzip, zlib-ng, expat, SQLite, the Linux kernel and glibc — for x86-64, AArch64,
+CCC (Claude's C Compiler) is a zero-dependency C compiler written entirely in Rust by Claude Opus 4.6. Arena.ai Agents 
+did a good job at improving it further.
+
+It is capable of compiling real projects — gzip, zlib-ng, expat, SQLite, the Linux kernel and glibc — for x86-64, AArch64,
 RISC-V 64, and i686, with its own assembler and linker.
 
-LCCC is a performance fork and a personal AI agent research project.
+LCCC is a performance fork and a personal AI agent research project. It is currently still lacking behind GCC/Clang in many areas.
 
 ---
 
