@@ -309,6 +309,16 @@ pub enum Instruction {
         ordering: AtomicOrdering,
     },
 
+    /// PGO counter increment: `[lock] incq sym+off(%rip)` in one instruction.
+    /// Inserted by the PGO instrumentation pass AFTER all optimization
+    /// passes. Carries no values and no destination, so it cannot perturb
+    /// register allocation or value numbering.
+    PgoCounterInc {
+        name: String,
+        offset: i64,
+        atomic: bool,
+    },
+
     /// Memory fence
     Fence { ordering: AtomicOrdering },
 
@@ -502,6 +512,7 @@ impl Instruction {
             | Instruction::VaArgStruct { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::AtomicInc { .. }
+            | Instruction::PgoCounterInc { .. }
             | Instruction::Fence { .. }
             | Instruction::SetReturnF64Second { .. }
             | Instruction::SetReturnF32Second { .. }
@@ -578,7 +589,8 @@ impl Instruction {
             | Instruction::GetReturnF64Second { .. }
             | Instruction::GetReturnF32Second { .. }
             | Instruction::GetReturnF128Second { .. }
-            | Instruction::ParamRef { .. } => {}
+            | Instruction::ParamRef { .. }
+            | Instruction::PgoCounterInc { .. } => {}
 
             Instruction::Load { ptr, .. } => f(ptr.0),
             Instruction::Store { val, ptr, .. } => {
@@ -750,6 +762,7 @@ impl Instruction {
             | Instruction::AtomicLoad { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::AtomicInc { .. }
+            | Instruction::PgoCounterInc { .. }
             | Instruction::Phi { .. }
             | Instruction::Select { .. }
             | Instruction::StackSave { .. }
@@ -779,6 +792,7 @@ impl Instruction {
             | Instruction::Copy { src: size, .. }
             | Instruction::AtomicLoad { ptr: size, .. }
             | Instruction::AtomicInc { ptr: size, .. } => f(size),
+            Instruction::PgoCounterInc { .. } => {}
             Instruction::Store { val, .. } => f(val),
             Instruction::BinOp { lhs, rhs, .. }
             | Instruction::Cmp { lhs, rhs, .. } => {

@@ -3857,6 +3857,8 @@ impl ArchCodegen for X86Codegen {
         fn emit_get_return_f128_second(&mut self, dest: &Value) => emit_get_return_f128_second_impl;
         fn emit_set_return_f128_second(&mut self, src: &Operand) => emit_set_return_f128_second_impl;
         // atomics
+        fn emit_pgo_counter_inc(&mut self, name: &str, offset: i64, atomic: bool) => emit_pgo_counter_inc_impl;
+        fn emit_pgo_counter_nop(&mut self, name: &str, offset: i64, atomic: bool) => emit_pgo_counter_nop_impl;
         fn emit_atomic_inc(&mut self, ptr: &Operand, offset: i64, ty: IrType, ordering: AtomicOrdering) => emit_atomic_inc_impl;
         fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
         fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;

@@ -1154,7 +1154,7 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
 /// verification) should call this rather than hand-rolling its own match.
 pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl FnMut(&Operand)) {
     match inst {
-        Instruction::Alloca { .. } => {}
+        Instruction::Alloca { .. } | Instruction::PgoCounterInc { .. } => {}
         Instruction::DynAlloca { size, .. } => f(size),
         Instruction::Store { val, .. } => f(val),
         Instruction::Load { .. } => {}

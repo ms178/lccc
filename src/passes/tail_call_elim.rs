@@ -526,6 +526,7 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
 /// Does not touch ParamRef (definition) or the phi nodes it creates.
 fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
     match inst {
+        Instruction::PgoCounterInc { .. } => {}
         // ── Definitions with no operands to replace ──────────────────────
         Instruction::ParamRef { .. }
         | Instruction::Alloca { .. }

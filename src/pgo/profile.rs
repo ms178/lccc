@@ -1,4 +1,4 @@
-//! PGO v3 profile identity, deterministic merge, and fail-closed loading.
+//! PGO v4 profile identity, deterministic merge, and fail-closed loading.
 use super::{FunctionProfile, ProfileData};
 use crate::ir::reexports::{IrFunction, Terminator};
 use crate::common::fx_hash::FxHashMap;
@@ -184,10 +184,12 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
         |name: &mut Option<String>, cur: &mut Option<FunctionProfile>| -> std::io::Result<()> {
             if let (Some(n), Some(mut f)) = (name.take(), cur.take()) {
                 f.total_count = f
-                    .block_counts
-                    .get(&f.entry_label)
+                    .edge_counts
+                    .get(&(crate::pgo::instrument::VENTRY, f.entry_label))
                     .copied()
-                    .unwrap_or_else(|| f.block_counts.values().copied().max().unwrap_or(0));
+                    .unwrap_or_else(|| {
+                        f.edge_counts.values().copied().max().unwrap_or(0)
+                    });
                 d.merge(n, f)?;
             }
             Ok(())
@@ -201,7 +203,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
         }
         let mut a = l.split_whitespace();
         match a.next().unwrap_or("") {
-            "lccc-pgo-v3" => {
+            "lccc-pgo-v3" | "lccc-pgo-v4" => {
                 hash = a
                     .next()
                     .ok_or_else(|| bad(p, n, "missing hash"))?
@@ -228,11 +230,46 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                 cur = Some(FunctionProfile {
                     total_count: 0,
                     block_counts: FxHashMap::default(),
+                    edge_counts: FxHashMap::default(),
                     cfg_hash: hash,
                     entry_label: entry,
                 });
             }
+            "f" => {
+                let f = cur
+                    .as_mut()
+                    .ok_or_else(|| bad(p, n, "entry count before func"))?;
+                let c = a.next().ok_or_else(|| bad(p, n, "missing count"))?;
+                let c: u64 = c.parse().map_err(|_| bad(p, n, "bad count"))?;
+                *f.edge_counts
+                    .entry((crate::pgo::instrument::VENTRY, f.entry_label))
+                    .or_insert(0) = c;
+            }
+            "e" => {
+                let f = cur
+                    .as_mut()
+                    .ok_or_else(|| bad(p, n, "edge before func"))?;
+                let src: u32 = a
+                    .next()
+                    .ok_or_else(|| bad(p, n, "missing edge src"))?
+                    .parse()
+                    .map_err(|_| bad(p, n, "bad edge src"))?;
+                let dst: u32 = a
+                    .next()
+                    .ok_or_else(|| bad(p, n, "missing edge dst"))?
+                    .parse()
+                    .map_err(|_| bad(p, n, "bad edge dst"))?;
+                let c = a.next().ok_or_else(|| bad(p, n, "missing count"))?;
+                let c: u64 = c.parse().map_err(|_| bad(p, n, "bad count"))?;
+                *f.edge_counts.entry((src, dst)).or_insert(0) = f
+                    .edge_counts
+                    .get(&(src, dst))
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(c);
+            }
             x => {
+                // v3 block-count lines accepted for compatibility.
                 let f = cur
                     .as_mut()
                     .ok_or_else(|| bad(p, n, "counter before func"))?;
@@ -270,7 +307,19 @@ impl ProfileData {
                     .unwrap_or(0)
                     .saturating_add(c);
             }
-            x.total_count = x.block_counts.get(&x.entry_label).copied().unwrap_or(0);
+            for (e, c) in f.edge_counts {
+                *x.edge_counts.entry(e).or_insert(0) = x
+                    .edge_counts
+                    .get(&e)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(c);
+            }
+            x.total_count = x
+                .edge_counts
+                .get(&(crate::pgo::instrument::VENTRY, x.entry_label))
+                .copied()
+                .unwrap_or(0);
         } else {
             self.functions.insert(k, f);
         }
@@ -320,4 +369,102 @@ pub fn write_text_profile(p: &Path, d: &ProfileData) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Derive every block count and every tree-edge count from the instrumented
+/// edge counts by flow conservation (Knuth–Stevenson / GCC gcov / LLVM).
+pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::Terminator;
+    use crate::pgo::instrument::VENTRY;
+    if fp.edge_counts.is_empty() {
+        return; // v3 block-count profile: nothing to derive
+    }
+    fn succs(t: &Terminator) -> Vec<u32> {
+        match t {
+            Terminator::Branch(x) => vec![x.0],
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => vec![true_label.0, false_label.0],
+            Terminator::Switch { cases, default, .. } => {
+                let mut v: Vec<u32> = cases.iter().map(|(_, b)| b.0).collect();
+                v.push(default.0);
+                v
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => possible_targets.iter().map(|b| b.0).collect(),
+            _ => vec![],
+        }
+    }
+    let mut known_in: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut known_out: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut unknown_in: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    let mut unknown_out: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for b in &f.blocks {
+        for d in succs(&b.terminator) {
+            let e = (b.label.0, d);
+            match fp.edge_counts.get(&e) {
+                Some(&c) => {
+                    *known_in.entry(d).or_insert(0) += c;
+                    *known_out.entry(b.label.0).or_insert(0) += c;
+                }
+                None => {
+                    unknown_in.entry(d).or_default().push(e);
+                    unknown_out.entry(b.label.0).or_default().push(e);
+                }
+            }
+        }
+    }
+    let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
+    let entry_count = fp.edge_counts.get(&(VENTRY, entry)).copied().unwrap_or(0);
+
+    // Children-before-parents order (reverse BFS over unknown edges).
+    let mut order = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(entry);
+        seen.insert(entry);
+        while let Some(b) = queue.pop_front() {
+            order.push(b);
+            if let Some(outs) = unknown_out.get(&b) {
+                for &(_, d) in outs {
+                    if seen.insert(d) {
+                        queue.push_back(d);
+                    }
+                }
+            }
+        }
+    }
+    let mut out_sum: FxHashMap<u32, u64> = known_out.clone();
+    let mut in_sum: FxHashMap<u32, u64> = known_in.clone();
+    let mut counts: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut derived_edges: Vec<((u32, u32), u64)> = Vec::new();
+    for &b in order.iter().rev() {
+        if b == entry {
+            counts.insert(b, entry_count);
+            continue;
+        }
+        let c = out_sum.get(&b).copied().unwrap_or(0);
+        counts.insert(b, c);
+        if let Some(ins) = unknown_in.get(&b) {
+            if let Some(&pe) = ins.first() {
+                let pc = c.saturating_sub(in_sum.get(&b).copied().unwrap_or(0));
+                derived_edges.push((pe, pc));
+                *out_sum.entry(pe.0).or_insert(0) =
+                    out_sum.get(&pe.0).copied().unwrap_or(0).saturating_add(pc);
+            }
+        }
+    }
+    for (b, c) in counts {
+        fp.block_counts.insert(b, c);
+    }
+    for (e, c) in derived_edges {
+        let v = fp.edge_counts.entry(e).or_insert(0);
+        *v = v.saturating_add(c);
+    }
+    fp.total_count = entry_count;
 }

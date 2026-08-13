@@ -1100,6 +1100,19 @@ pub trait ArchCodegen {
         );
     }
 
+    /// Emit a PGO counter increment for a static per-function counter array
+    /// (`name` = array symbol, `offset` = byte offset). The x86-64 backend
+    /// overrides this with a single `[lock] incq name+off(%rip)`; other
+    /// backends must provide their own lowering or refuse.
+    fn emit_pgo_counter_inc(&mut self, _name: &str, _offset: i64, _atomic: bool) {
+        panic!("emit_pgo_counter_inc: this backend needs a dedicated lowering");
+    }
+
+    /// NOP-mode PGO counter (debug only; isolates instruction vs CFG bugs).
+    fn emit_pgo_counter_nop(&mut self, _name: &str, _offset: i64, _atomic: bool) {
+        panic!("emit_pgo_counter_nop: this backend needs a dedicated lowering");
+    }
+
     /// Emit an atomic compare-and-exchange operation.
     fn emit_atomic_cmpxchg(
         &mut self,

@@ -868,6 +868,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
 /// Only variants that produce an SSA value are affected; others are a no-op.
 fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
     match inst {
+        Instruction::PgoCounterInc { .. } => {}
         Instruction::Alloca { dest, .. }
         | Instruction::DynAlloca { dest, .. }
         | Instruction::Load { dest, .. }
@@ -937,6 +938,7 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
 
 fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
     match inst {
+        Instruction::PgoCounterInc { .. } => {}
         // Definitions with no operands to replace.
         Instruction::ParamRef { .. }
         | Instruction::Alloca { .. }

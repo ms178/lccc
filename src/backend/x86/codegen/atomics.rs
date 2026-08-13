@@ -5,6 +5,31 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, IrConst, Operand, Value};
 
 impl X86Codegen {
+    /// PGO counter increment as a SINGLE instruction: `[lock] incq sym+off(%rip)`.
+    /// `incq` clobbers the flags, so the instrumentation pass never places a
+    /// counter between a fused Cmp and its branch/select consumer.
+    pub(super) fn emit_pgo_counter_inc_impl(&mut self, name: &str, offset: i64, atomic: bool) {
+        debug_assert!(self.pending_cmp.is_none(), "counter between fused Cmp and consumer");
+        let op = if atomic { "lock incq" } else { "incq" };
+        if offset == 0 {
+            self.state
+                .emit_fmt(format_args!("    {} {}(%rip)", op, name));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {} {}+{}(%rip)", op, name, offset));
+        }
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    /// NOP-mode counter (debug): used to isolate instruction vs CFG bugs.
+    #[allow(dead_code)]
+    pub(super) fn emit_pgo_counter_nop_impl(&mut self, _name: &str, _offset: i64, _atomic: bool) {
+        self.state.emit("    nop");
+        self.state.reg_cache.invalidate_all();
+    }
+
     /// Result-less atomic increment used by PGO.  No virtual destination or
     /// spill slot is created, so the counter cannot perturb live value
     /// allocation in large C functions.

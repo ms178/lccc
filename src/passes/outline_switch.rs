@@ -335,6 +335,7 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
     }
 
     match inst {
+        Instruction::PgoCounterInc { .. } => {}
         Instruction::Store { val, ptr, ty, .. } => {
             vop!(val, *ty);
             f(*ptr, IrType::Ptr);
@@ -908,6 +909,11 @@ fn remap_instruction(
     };
 
     match inst {
+        Instruction::PgoCounterInc { name, offset, atomic } => Instruction::PgoCounterInc {
+            name: name.clone(),
+            offset: *offset,
+            atomic: *atomic,
+        },
         Instruction::Alloca {
             dest,
             ty,

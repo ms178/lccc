@@ -6,7 +6,9 @@ use crate::pgo::ProfileData;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
-    if std::env::var("LCCC_PGO_LAYOUT").as_deref() != Ok("1") {
+    // PGO v4: block layout is on by default with an active profile.
+    // LCCC_PGO_NO_LAYOUT=1 opts out.
+    if std::env::var("LCCC_PGO_NO_LAYOUT").is_ok() {
         return;
     }
     let max = p.max_total_for_unit(u);
@@ -29,6 +31,10 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         for b in &f.blocks {
             counts.insert(b.label, fp.block_count(b.label));
         }
+        let edge_w = |src: BlockId, dst: BlockId| -> u64 {
+            fp.edge_count(src.0, dst.0)
+                .max(fp.edge_count(crate::pgo::instrument::VENTRY, dst.0))
+        };
         let mut succ = FxHashMap::<BlockId, Vec<BlockId>>::default();
         for b in &f.blocks {
             succ.insert(b.label, successors(&b.terminator));
@@ -50,7 +56,14 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
                 .into_iter()
                 .flatten()
                 .filter(|x| !placed.contains(x))
-                .max_by_key(|x| counts.get(x).copied().unwrap_or(0))
+                .max_by_key(|&&x| {
+                    let e = edge_w(cur, x);
+                    if e > 0 {
+                        e
+                    } else {
+                        counts.get(&x).copied().unwrap_or(0)
+                    }
+                })
                 .copied();
             let Some(n) = next else {
                 break;
@@ -67,6 +80,22 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         ordered.extend(rest);
         if ordered.len() == f.blocks.len() {
             f.blocks = ordered;
+        }
+
+        // PGO switch case ordering: sort each Switch's cases by the frequency
+        // of the (switch block -> case block) edge so compare-and-branch
+        // chains test the most likely cases first.
+        for b in &mut f.blocks {
+            let src = b.label.0;
+            if let crate::ir::reexports::Terminator::Switch { cases, .. } = &mut b.terminator {
+                if cases.len() < 2 {
+                    continue;
+                }
+                let mut idx: Vec<usize> = (0..cases.len()).collect();
+                idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1 .0)));
+                let sorted: Vec<_> = idx.into_iter().map(|i| cases[i]).collect();
+                *cases = sorted;
+            }
         }
     }
 }
