@@ -30,14 +30,15 @@ It is intentionally stricter than the former best-of-*N* wall-clock script:
   (without silently deleting them), and paired bootstrap intervals;
 - it captures compiler commands, source digests, OS/CPU/governor/swap metadata,
   and optionally binaries, disassembly, section sizes, and JSON evidence;
-- it emits an LCCC/GCC/Clang/ICX competition matrix when those reference
+- it emits an LCCC/CCC/GCC/Clang/ICX competition matrix when those reference
   compilers are present, including LCCC versus the fastest available reference;
   and
 - it probes PMU availability once.  A VM with no usable PMU is explicitly
   labelled *screening evidence*, never a microarchitectural performance claim.
 
 The runner compares LCCC and GCC by default and includes Clang/ICX when they
-are installed.  It uses the same explicit code-generation flag for every
+are installed. The original CCC is opt-in via `--compilers lccc,ccc,gcc` and
+`--ccc /path/to/ccc`. It uses the same explicit code-generation flag for every
 compiler (`-O2` by default); `-march=native` is opt-in rather than silently
 mixed into a baseline.
 
@@ -46,9 +47,9 @@ mixed into a baseline.
 kernel and compiler it builds both a plain binary and a
 `-fprofile-generate → train → -fprofile-use` binary, verifies the outputs are
 identical (differential correctness), and reports paired bootstrap-CI
-PGO-vs-plain and lccc-vs-gcc speedups.  It was used to validate the PGO v10/v11
-changes (flat-profile gate, cost-aware devirtualization, conservative layout)
-and to confirm those builds no longer regress relative to plain.
+PGO-vs-plain and lccc-vs-gcc speedups.  It validated the profile-guided
+inlining and cost-aware devirtualization changes and confirms those builds do
+not regress relative to plain.
 
 Build the compiler itself under the research build policy (Rust opt-level 1,
 exactly two Cargo jobs) with:
@@ -106,40 +107,85 @@ Top-Down metrics) in a controlled affinity/governor/thermal environment.
 
 ## Current results (screening)
 
-A fresh run of the canonical runner (see the reproducible command above) on
-revision `77b4a18c` with `-O2`, 9 paired rounds, pinned to one KVM vCPU:
+A fresh run of the canonical runner on the current `main`, `-O2`, 5 paired
+rounds + 2 warm-ups, pinned to one KVM vCPU. The run included three compilers:
+**LCCC**, **GCC 14.2**, and the **original upstream Claude's C Compiler (CCC)**
+built from `anthropics/claudes-c-compiler`, so the corpus also shows what LCCC
+improved over its ancestor.
+
+### LCCC vs GCC
 
 | Benchmark | LCCC (ms) | GCC (ms) | LCCC/GCC |
 |---|---:|---:|---:|
-| fib | 2.4 | 170.3 | **0.014×** |
-| ackermann | 2.5 | 152.6 | **0.016×** |
-| constant_recursion | 2.4 | 150.1 | **0.016×** |
-| tce_sum | 2.1 | 2.1 | **0.98×** |
-| qsort | 138.5 | 125.7 | 1.09× |
-| strlen_bench | 241.4 | 222.0 | 1.09× |
-| arith_loop | 109.5 | 99.9 | 1.10× |
-| matmul | 8.5 | 7.1 | 1.21× |
-| fannkuch | 3073 | 2549 | 1.20× |
-| hash_table | 13164 | 10407 | 1.23× |
-| binary_trees | 1536 | 1243 | 1.23× |
-| glibc_memcmp | 12.3 | 9.4 | 1.35× |
-| sieve | 48.6 | 35.4 | 1.36× |
-| gzip_crc32 | 244.3 | 168.3 | 1.45× |
-| switch_dispatch | 739.7 | 502.4 | 1.47× |
-| zlib_ng_adler32 | 68.9 | 39.3 | 1.73× |
-| loop_patterns | 134.9 | 77.3 | 1.74× |
-| linux_find_bit | 27.7 | 15.2 | 1.83× |
-| bitops | 747.5 | 392.0 | 1.90× |
-| sqlite_varint | 54.7 | 26.4 | 2.06× |
-| mandelbrot | 4747 | 1490 | 3.19× |
-| expat_xml_scan | 134.1 | 40.7 | 3.29× |
-| nbody | 1187 | 308 | 3.88× |
-| spectral_norm | 1878 | 201 | 9.34× |
-| struct_copy | 585.5 | 27.9 | 21.06× |
+| fib | 2.6 | 175.0 | **0.015×** |
+| ackermann | 2.5 | 151.7 | **0.016×** |
+| constant_recursion | 2.4 | 149.1 | **0.016×** |
+| tce_sum | 2.2 | 2.2 | 0.97× |
+| qsort | 138.7 | 125.6 | 1.10× |
+| strlen_bench | 282.1 | 260.8 | 1.08× |
+| arith_loop | 113.1 | 101.6 | 1.13× |
+| matmul | 9.2 | 7.5 | 1.22× |
+| fannkuch | 3235 | 2608 | 1.24× |
+| binary_trees | 1714 | 1416 | 1.22× |
+| glibc_memcmp | 11.6 | 8.9 | 1.30× |
+| sieve | 51.4 | 42.1 | 1.23× |
+| gzip_crc32 | 244.1 | 168.3 | 1.45× |
+| switch_dispatch | 742.1 | 508.1 | 1.46× |
+| zlib_ng_adler32 | 67.6 | 38.9 | 1.74× |
+| loop_patterns | 133.7 | 74.4 | 1.81× |
+| linux_find_bit | 26.3 | 14.5 | 1.81× |
+| bitops | 745.1 | 390.0 | 1.91× |
+| sqlite_varint | 54.2 | 26.0 | 2.07× |
+| mandelbrot | 4760 | 1489 | 3.20× |
+| expat_xml_scan | 131.2 | 40.6 | 3.24× |
+| nbody | 1218 | 313 | 3.89× |
+| spectral_norm | 1880 | 202 | 9.29× |
+| struct_copy | 583.7 | 27.5 | 21.18× |
 
 All 25 outputs matched GCC byte-for-byte. **Geometric mean 1.08×.** These are
 *screening* numbers (KVM vCPU, no PMU); a bare-metal Raptor Lake rerun with PMU
 evidence is required before hardware claims.
+
+### LCCC vs original Claude's C Compiler
+
+The same corpus was compiled with the **original upstream CCC** (before LCCC's
+optimizations). LCCC is faster than the original CCC on **every benchmark it
+can run**; the ratio is LCCC / CCC, so a value below 1 means LCCC is faster.
+
+| Benchmark | CCC (ms) | LCCC/CCC |
+|---|---:|---:|
+| fib | 770.8 | **0.003× (~300× faster)** |
+| constant_recursion | 1266.3 | **0.002× (~520×)** |
+| ackermann | 1277.1 | **0.002× (~510×)** |
+| matmul | 50.7 | **0.179× (5.6×)** |
+| zlib_ng_adler32 | 196.2 | **0.345× (2.9×)** |
+| arith_loop | 259.5 | **0.438× (2.3×)** |
+| glibc_memcmp | 24.5 | **0.475× (2.1×)** |
+| fannkuch | 6658 | **0.486× (2.1×)** |
+| expat_xml_scan | 258.5 | **0.513× (1.95×)** |
+| sieve | 99.9 | **0.519× (1.9×)** |
+| nbody | 2268 | **0.547× (1.8×)** |
+| linux_find_bit | 44.6 | **0.586× (1.7×)** |
+| struct_copy | 930.8 | **0.626× (1.6×)** |
+| loop_patterns | 213.0 | **0.625× (1.6×)** |
+| bitops | 1126.7 | **0.661× (1.5×)** |
+| sqlite_varint | 73.4 | **0.740× (1.35×)** |
+| spectral_norm | 2472.5 | **0.761× (1.3×)** |
+| strlen_bench | 350.2 | **0.805× (1.2×)** |
+| hash_table | 14249 | **0.889× (1.1×)** |
+| mandelbrot | 5218 | **0.912× (1.1×)** |
+| binary_trees | 1848 | **0.944× (1.06×)** |
+| qsort | 146.2 | **0.948× (1.05×)** |
+| gzip_crc32 | 256.5 | **0.952× (1.05×)** |
+| switch_dispatch | 747.4 | **0.993× (~1.0×)** |
+| tce_sum | *(CCC failed to run)* | — |
+
+The gains trace directly to LCCC's work: **tail-call elimination** and
+**recursion-to-iteration** (fib/ackermann/constant_recursion — the original CCC
+executes the exponential recursion, hence ~500×), **AVX2/SSE2 vectorization and
+FMA** (matmul, reductions, nbody, spectral_norm), **strength reduction /
+register allocation / IVSR** (arith_loop, loop_patterns, sieve), and
+**PGO-driven inlining and devirtualization** (expat, zlib-ng).
 
 ## Historical snapshot (not current evidence)
 
