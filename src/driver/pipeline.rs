@@ -1338,6 +1338,13 @@ impl Driver {
             crate::pgo::init_pgo_profile(pgo_use_dir.as_deref());
             let u0 = crate::pgo::profile::unit_identity(input_file);
             crate::pgo::prepass_activate(&u0);
+            // v8: build the data-driven profile summary (percentile hot/cold
+            // thresholds over the unit's count distribution — LLVM
+            // ProfileSummaryInfo analogue) once per unit; inliner, unroller
+            // and layout all consume it.
+            if let Some(p) = crate::pgo::get_pgo_profile() {
+                crate::pgo::summary::set_summary(crate::pgo::summary::build_for_unit(p, &u0));
+            }
         }
 
         // Run optimization passes
@@ -1496,6 +1503,10 @@ impl Driver {
             use crate::ir::instruction::BlockId;
             use crate::common::fx_hash::FxHashMap;
             let mut next_global_label = 0u32;
+            // v8: the renumber map also translates the promoted-hot block
+            // labels recorded by the value-profiling promotion pass (which
+            // runs before this pass); layout reads them AFTER renumbering.
+            let mut renumber_map: FxHashMap<u32, u32> = FxHashMap::default();
 
             for func in &mut module.functions {
                 if func.is_declaration {
@@ -1507,6 +1518,7 @@ impl Driver {
                 for block in &func.blocks {
                     if !label_map.contains_key(&block.label) {
                         label_map.insert(block.label, BlockId(next_global_label));
+                        renumber_map.insert(block.label.0, next_global_label);
                         next_global_label += 1;
                     }
                 }
@@ -1560,6 +1572,7 @@ impl Driver {
                     }
                 }
             }
+            crate::pgo::remap_promoted_hot(&renumber_map);
         }
 
         // PGO is post-optimization and post-label-renumber; profiles are

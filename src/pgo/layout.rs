@@ -39,12 +39,73 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         let Some(fp) = p.get_for_unit(u, &f.name) else {
             continue;
         };
-        if fp.total_count.saturating_mul(100) >= max && fp.total_count > 0 {
+        // v8: hot/cold section classification via the data-driven summary
+        // (percentile thresholds over the unit's count distribution) with
+        // the v7 ratio as fallback when no summary is available.
+        let (hot, cold) = match crate::pgo::summary::get_summary() {
+            Some(s) => (s.is_hot(fp.total_count), s.is_cold(fp.total_count)),
+            None => (
+                fp.total_count > 0 && fp.total_count.saturating_mul(100) >= max,
+                fp.total_count.saturating_mul(10_000) < max,
+            ),
+        };
+        if hot {
             f.section = Some(".text.hot".into());
-        } else if fp.total_count.saturating_mul(10_000) < max {
+        } else if cold {
             f.section = Some(".text.unlikely".into());
         }
         layout_function(f, fp, u);
+    }
+
+    // v8: order functions by hotness class within the TU — hot first, cold
+    // last — for I-cache-friendly object layout (GCC -freorder-functions).
+    // Declarations and helper functions keep their relative order (class 3).
+    if crate::pgo::summary::get_summary().is_some() {
+        let n = m.functions.len();
+        let mut cls: Vec<u8> = vec![3; n];
+        for (i, f) in m.functions.iter().enumerate() {
+            if f.is_declaration || f.blocks.is_empty() {
+                continue;
+            }
+            let Some(fp) = p.get_for_unit(u, &f.name) else { continue };
+            let s = crate::pgo::summary::get_summary().unwrap();
+            if s.is_hot(fp.total_count) {
+                cls[i] = 0;
+            } else if s.is_cold(fp.total_count) {
+                cls[i] = 2;
+            } else {
+                cls[i] = 1;
+            }
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            cls[a]
+                .cmp(&cls[b])
+                .then_with(|| {
+                    let ca = p
+                        .get_for_unit(u, &m.functions[a].name)
+                        .map(|f| f.total_count)
+                        .unwrap_or(0);
+                    let cb = p
+                        .get_for_unit(u, &m.functions[b].name)
+                        .map(|f| f.total_count)
+                        .unwrap_or(0);
+                    cb.cmp(&ca)
+                })
+                .then_with(|| a.cmp(&b))
+        });
+        // In-place permutation (IrFunction is not Clone).
+        let mut perm = order;
+        let mut i = 0;
+        while i < n {
+            if perm[i] == i {
+                i += 1;
+                continue;
+            }
+            let j = perm[i];
+            m.functions.swap(i, j);
+            perm.swap(i, j);
+        }
     }
 }
 
@@ -54,7 +115,7 @@ fn layout_function(
     u: &str,
 ) {
     use crate::ir::reexports::Terminator;
-    let promoted = crate::pgo::promoted_hot_labels(u, &f.name);
+    let promoted: FxHashSet<u32> = crate::pgo::promoted_hot_labels(u, &f.name);
     let entry = f.blocks[0].label;
 
     // Per-block hotness: derived counts; promoted blocks get entry hotness.
@@ -227,6 +288,67 @@ fn layout_function(
     for b in &f.blocks {
         if !placed.contains(&b.label) {
             ordered.push(b.clone());
+        }
+    }
+    // v8: keep promoted (devirtualized) hot blocks adjacent to their
+    // predecessor. The chain heuristic can strand them at the function
+    // tail (their edges to a mid-chain block never merge), hurting the hot
+    // path — observed in zlib-ng deflate_quick.
+    if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
+        eprintln!(
+            "[LAYOUT] {} promoted labels: {:?} ({} blocks)",
+            f.name,
+            promoted.iter().collect::<Vec<_>>(),
+            f.blocks.len()
+        );
+    }
+    let _ = promoted;
+    if !promoted.is_empty() {
+        let succ_of = |t: &Terminator| -> Vec<crate::ir::reexports::BlockId> {
+            match t {
+                Terminator::Branch(x) => vec![*x],
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => vec![*true_label, *false_label],
+                Terminator::Switch { cases, default, .. } => cases
+                    .iter()
+                    .map(|x| x.1)
+                    .chain(std::iter::once(*default))
+                    .collect(),
+                Terminator::IndirectBranch {
+                    possible_targets, ..
+                } => possible_targets.clone(),
+                _ => vec![],
+            }
+        };
+        // Deferred-append: promoted blocks are SKIPPED in the main pass and
+        // appended right after their predecessor; the deferred remainder goes
+        // to the tail. Length is preserved by construction (each block lands
+        // exactly once), so the guarded swap below always applies.
+        let mut placed_prom: FxHashSet<u32> = FxHashSet::default();
+        let mut out2: Vec<crate::ir::reexports::BasicBlock> = Vec::with_capacity(ordered.len());
+        for b in ordered.iter() {
+            if promoted.contains(&b.label.0) {
+                continue; // deferred
+            }
+            out2.push(b.clone());
+            for s in succ_of(&b.terminator) {
+                if promoted.contains(&s.0) && placed_prom.insert(s.0) {
+                    if let Some(pb) = ordered.iter().find(|x| x.label == s) {
+                        out2.push(pb.clone());
+                    }
+                }
+            }
+        }
+        for b in ordered.iter() {
+            if promoted.contains(&b.label.0) && !placed_prom.contains(&b.label.0) {
+                out2.push(b.clone());
+            }
+        }
+        if out2.len() == ordered.len() {
+            ordered = out2;
         }
     }
     if ordered.len() == f.blocks.len() {

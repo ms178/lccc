@@ -799,47 +799,156 @@ fn dump_helper(
     next += 1;
     let fd = Value(next);
     next += 1;
-    // Entry block: fopen + null check.
+    // Entry: resolve the output path — LCCC_PROFILE_FILE or (LLVM
+    // convention) LLVM_PROFILE_FILE override the compile-time path at
+    // RUNTIME, so training runs can redirect/merge profiles without a
+    // rebuild (LLVM_PROFILE_FILE / GCC GCOV_PREFIX behaviour). The value is
+    // used verbatim as the output file path.
     let skip_l = BlockId(910099);
-    let main_l = BlockId(910001);
+    let main_l = BlockId(910010);
+    let pathv = Value(next);
+    next += 1;
+    let e1 = Value(next);
+    next += 1;
+    let e1z = Value(next);
+    next += 1;
+    let e2 = Value(next);
+    next += 1;
+    let e2z = Value(next);
+    next += 1;
     let is_null = Value(next);
     next += 1;
-    let mut entry_is: Vec<Instruction> = Vec::new();
-    entry_is.push(Instruction::GlobalAddr {
-        dest: pp,
+    let env1_sym = format!("__lccc_pgo_env1_{}", m.functions.len());
+    let env2_sym = format!("__lccc_pgo_env2_{}", m.functions.len());
+    m.string_literals
+        .push((env1_sym.clone(), "LCCC_PROFILE_FILE".into()));
+    m.string_literals
+        .push((env2_sym.clone(), "LLVM_PROFILE_FILE".into()));
+    let mut b0: Vec<Instruction> = Vec::new();
+    let e1p = Value(next);
+    next += 1;
+    b0.push(Instruction::GlobalAddr {
+        dest: e1p,
+        name: env1_sym.clone(),
+    });
+    b0.push(Instruction::Call {
+        func: "getenv".into(),
+        info: ci(
+            Some(e1),
+            vec![Operand::Value(e1p)],
+            vec![IrType::Ptr],
+            IrType::Ptr,
+            false,
+        ),
+    });
+    b0.push(Instruction::Cmp {
+        dest: e1z,
+        op: crate::ir::ops::IrCmpOp::Ne,
+        lhs: Operand::Value(e1),
+        rhs: Operand::Const(IrConst::I64(0)),
+        ty: IrType::I64,
+    });
+    let mut b1: Vec<Instruction> = Vec::new();
+    let e2p = Value(next);
+    next += 1;
+    b1.push(Instruction::GlobalAddr {
+        dest: e2p,
+        name: env2_sym.clone(),
+    });
+    b1.push(Instruction::Call {
+        func: "getenv".into(),
+        info: ci(
+            Some(e2),
+            vec![Operand::Value(e2p)],
+            vec![IrType::Ptr],
+            IrType::Ptr,
+            false,
+        ),
+    });
+    b1.push(Instruction::Cmp {
+        dest: e2z,
+        op: crate::ir::ops::IrCmpOp::Ne,
+        lhs: Operand::Value(e2),
+        rhs: Operand::Const(IrConst::I64(0)),
+        ty: IrType::I64,
+    });
+    let use_env = BlockId(910002);
+    let use_env2 = BlockId(910003);
+    let use_tag = BlockId(910004);
+    let open_l = BlockId(910005);
+    let mut b2: Vec<Instruction> = Vec::new();
+    b2.push(Instruction::Copy {
+        dest: pathv,
+        src: Operand::Value(e1),
+    });
+    let mut b3: Vec<Instruction> = Vec::new();
+    b3.push(Instruction::Copy {
+        dest: pathv,
+        src: Operand::Value(e2),
+    });
+    let mut b4: Vec<Instruction> = Vec::new();
+    b4.push(Instruction::GlobalAddr {
+        dest: pathv,
         name: tag,
     });
-    entry_is.push(Instruction::GlobalAddr {
+    let mut b5: Vec<Instruction> = Vec::new();
+    b5.push(Instruction::GlobalAddr {
         dest: mm,
         name: mode,
     });
-    entry_is.push(Instruction::Call {
+    b5.push(Instruction::Call {
         func: "fopen".into(),
         info: ci(
             Some(file),
-            vec![Operand::Value(pp), Operand::Value(mm)],
+            vec![Operand::Value(pathv), Operand::Value(mm)],
             vec![IrType::Ptr, IrType::Ptr],
             IrType::Ptr,
             false,
         ),
     });
-    entry_is.push(Instruction::Cmp {
+    b5.push(Instruction::Cmp {
         dest: is_null,
         op: crate::ir::ops::IrCmpOp::Eq,
         lhs: Operand::Value(file),
         rhs: Operand::Const(IrConst::I64(0)),
         ty: IrType::I64,
     });
-    let entry_block = BasicBlock {
-        label: BlockId(910000),
-        instructions: entry_is,
-        terminator: Terminator::CondBranch {
+    let mk = |label: u32, is: Vec<Instruction>, term: Terminator| BasicBlock {
+        label: BlockId(label),
+        instructions: is,
+        terminator: term,
+        source_spans: vec![],
+    };
+    let entry_block = mk(
+        910000,
+        b0,
+        Terminator::CondBranch {
+            cond: Operand::Value(e1z),
+            true_label: use_env,
+            false_label: BlockId(910001),
+        },
+    );
+    let env2_block = mk(
+        910001,
+        b1,
+        Terminator::CondBranch {
+            cond: Operand::Value(e2z),
+            true_label: use_env2,
+            false_label: use_tag,
+        },
+    );
+    let use_env_block = mk(910002, b2, Terminator::Branch(open_l));
+    let use_env2_block = mk(910003, b3, Terminator::Branch(open_l));
+    let use_tag_block = mk(910004, b4, Terminator::Branch(open_l));
+    let open_block = mk(
+        910005,
+        b5,
+        Terminator::CondBranch {
             cond: Operand::Value(is_null),
             true_label: skip_l,
             false_label: main_l,
         },
-        source_spans: vec![],
-    };
+    );
     let skip_block = BasicBlock {
         label: skip_l,
         instructions: vec![],
@@ -1209,6 +1318,11 @@ fn dump_helper(
         params: vec![],
         blocks: vec![
             entry_block,
+            env2_block,
+            use_env_block,
+            use_env2_block,
+            use_tag_block,
+            open_block,
             BasicBlock {
                 label: main_l,
                 instructions: is,
@@ -1224,7 +1338,7 @@ fn dump_helper(
         is_always_inline: false,
         is_noinline: true,
         next_value_id: next,
-        next_label: 910002,
+        next_label: 910011,
         section: None,
         visibility: Some("hidden".into()),
         is_weak: false,
@@ -1242,6 +1356,7 @@ fn dump_helper(
     m.functions.push(f);
     m.destructors.push(name.into());
     for (n, t, v) in [
+        ("getenv", IrType::Ptr, false),
         ("fopen", IrType::Ptr, true),
         ("fileno", IrType::I32, false),
         ("flock", IrType::I32, false),
