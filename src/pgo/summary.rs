@@ -13,7 +13,7 @@
 //!   * `cold_threshold` = the largest count such that counts <= it carry at
 //!                        least `LCCC_PGO_COLD_FRAC` (default 0.05) of total.
 //!
-//! This replaces the v6/v7 magic ratios (`total_count*100 >= max`,
+//! This replaces fixed count ratios (`total_count*100 >= max`,
 //! `relative_frequency >= 0.10/0.05/0.005`, `n > 1000`) with thresholds that
 //! adapt to the actual count distribution: a unit dominated by one hot
 //! function gets a high threshold, a flat unit gets a low one.
@@ -56,23 +56,22 @@ impl ProfileSummary {
     /// True when the profile reflects genuine hot/cold SEPARATION — the hottest
     /// function is clearly dominant (at least `HOT_DOMINANCE`× the runner-up).
     ///
-    /// Percentile thresholds collapse on sparse or flat distributions and are
-    /// NOT a reliable separation signal (v10 finding: a flat profile of tied
-    /// "hot" functions [48,48,48,1,1] collapses hot==cold==48, and a truly
-    /// skewed one [2.0M,64,1] also collapses because the hot count dominates
-    /// total). What actually matters for whether profile-driven decisions are
-    /// informative is a clear dominant hot path. `has_spread()` is the gate for
-    /// profile-driven inlining/layout: on a flat (tied) profile acting on
-    /// "hotness" is vacuous and regresses hot paths (adler32 -20%), so the
-    /// transforms must be withheld; on a skewed profile they engage.
+    /// Percentile thresholds are not a reliable separation signal: tied hot
+    /// functions [48,48,48,1,1] collapse hot==cold==48, while a skewed profile
+    /// [2.0M,64,1] also collapses because its hottest count dominates the total.
+    /// `has_spread()` therefore requires a clearly dominant hot path before
+    /// enabling profile-guided inlining heuristics.
     pub fn has_spread(&self) -> bool {
         if self.max == 0 {
             return false;
         }
-        // A UNIQUE, dominant hot function: the max count must be strictly
-        // greater than the runner-up (not tied) and at least HOT_DOMINANCE× it.
-        // A tie of several "hot" functions is a flat profile.
-        self.max > self.second_max && self.max >= HOT_DOMINANCE * self.second_max.max(1)
+        // A single profiled function is maximally skewed, not flat: all
+        // execution sits in that function. The flat-profile gate only needs
+        // to reject profiles with multiple functions tied at the top.
+        if self.second_max == 0 {
+            return true;
+        }
+        self.max > self.second_max && self.max >= HOT_DOMINANCE * self.second_max
     }
 }
 

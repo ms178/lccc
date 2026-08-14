@@ -1440,6 +1440,14 @@ fn generate_function(
             cg.state().sse_last_store_slot = None;
             cg.state().sse_last_store_val = None;
             cg.state().sse_last_store_reg = false;
+            // Emit profile-driven alignment immediately before hot loop-header
+            // and join-point labels. Cold blocks never receive a hint.
+            if crate::pgo::block_align_active() {
+                if let Some(log2) = crate::pgo::block_align(block.label.0) {
+                    // log2 4 -> .p2align 4 (16-byte), 5 -> 32-byte.
+                    cg.state().emit_fmt(format_args!(".p2align {}", log2));
+                }
+            }
             cg.state().out.emit_block_label(block.label.0);
         }
 
