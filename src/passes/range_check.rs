@@ -222,8 +222,27 @@ fn try_fold_select(
 
     // `hi - lo` must be representable in the operand type.
     let span = range.hi - range.lo;
-    let span_const = int_const(range.ty, span)?;
+    int_const(range.ty, span)?;
     let lo_const = int_const(range.ty, range.lo)?;
+
+    // Narrow the COMPARE to the operand's source width when the operand is a
+    // widening cast of a byte/short: `(u8)(x - lo) <= span` reads the low
+    // byte of the 32-bit sub and classifies the range identically (the wrap
+    // in the narrow domain is what makes the unsigned-bias check work).
+    // Matches GCC's `add edx,62; cmp dl,29` byte-compare shape. The sub stays
+    // at the promoted width; only the compare narrows, so the emitter reuses
+    // the v11 byte/word compare path.
+    let mut cmp_ty = range.ty;
+    if let Some(Some((_, from_ty, to_ty))) = cast_defs.get(range.value.0 as usize) {
+        if *to_ty == range.ty
+            && from_ty.is_integer()
+            && from_ty.size() < range.ty.size()
+            && int_const(*from_ty, span).is_some()
+        {
+            cmp_ty = *from_ty;
+        }
+    }
+    let span_narrow_const = int_const(cmp_ty, span)?;
 
     let sub_dest = Value(*next_id);
     *next_id += 1;
@@ -244,8 +263,8 @@ fn try_fold_select(
             dest: *dest,
             op: cmp_op,
             lhs: Operand::Value(sub_dest),
-            rhs: Operand::Const(span_const),
-            ty: range.ty,
+            rhs: Operand::Const(span_narrow_const),
+            ty: cmp_ty,
         });
     } else {
         let cmp_dest = Value(*next_id);
@@ -254,8 +273,8 @@ fn try_fold_select(
             dest: cmp_dest,
             op: cmp_op,
             lhs: Operand::Value(sub_dest),
-            rhs: Operand::Const(span_const),
-            ty: range.ty,
+            rhs: Operand::Const(span_narrow_const),
+            ty: cmp_ty,
         });
         out.push(Instruction::Cast {
             dest: *dest,

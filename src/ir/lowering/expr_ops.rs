@@ -822,95 +822,89 @@ impl Lowerer {
             if int_ty == IrType::I32 { IrConst::I32(v as i32) } else { IrConst::I64(v) }
         };
 
-        // ms178: A comparison / logical-operator / logical-NOT RHS already
-        // lowers to a normalized 0/1 boolean, so re-normalizing it with an
-        // extra `!= 0` comparison (`emit_cmp_val(Ne, rhs_val, 0)`) is an
-        // identity that only emits a redundant cmp+setcc+movzbl per condition
-        // in short-circuit chains (gzip's longest_match: `a != b || c != d`
-        // materialized BOTH sides plus a re-compare of the RHS bool). Only
-        // normalize when the RHS lowering can produce an arbitrary nonzero
-        // value (pointers, integers, floats, compound exprs).
-        let rhs_is_normalized_bool = matches!(rhs, Expr::BinaryOp(op, _, _, _) if op.is_comparison())
-            || matches!(rhs, Expr::UnaryOp(UnaryOp::LogicalNot, _, _));
-        // Lower rhs and produce a 0/1 boolean, skipping the identity `!= 0`
-        // when the RHS expression already yields a normalized boolean.
-        let lower_rhs_bool = |slf: &mut Self| -> Operand {
-            let rhs_val = slf.lower_condition_expr(rhs);
-            if rhs_is_normalized_bool {
-                rhs_val
+        // FLAT short-circuit lowering. `a || b || c` parses as `(a || b) || c`;
+        // the old per-link lowering built a right-nested value tree (one
+        // alloca + branch diamond per link), so the intermediate links were
+        // DATA (selected as the next link's false arm) and materialized as
+        // setcc/cmov chains even when the whole result only fed a branch.
+        // Flatten left-associative runs of the SAME operator into ONE branch
+        // sequence with ONE merge value — GCC/ICX's shape for Expat's
+        // `nameLength` (cmp;ja chains, zero boolean materialization).
+        let mut ops: Vec<&Expr> = Vec::with_capacity(4);
+        collect_flat_sc_operands(lhs, is_and, &mut ops);
+        collect_flat_sc_operands(rhs, is_and, &mut ops);
+
+        // Drop constant identity operands (false for `||`, true for `&&`):
+        // they are pure (eval_const_expr has no side effects) and contribute
+        // nothing to the result. A constant that DECIDES the chain (true for
+        // `||`, false for `&&`) short-circuits: evaluate the surviving
+        // operands before it for side effects, then return the constant.
+        let mut kept: Vec<&Expr> = Vec::with_capacity(ops.len());
+        for op in &ops {
+            match self.eval_const_expr(op) {
+                Some(c) => {
+                    let truthy = c.is_nonzero();
+                    // `||` short-circuits on true; `&&` on false.
+                    if truthy != is_and {
+                        for &k in &kept {
+                            let _ = self.lower_condition_expr(k);
+                        }
+                        return Operand::Const(make_int_const(if is_and { 0 } else { 1 }));
+                    }
+                }
+                None => kept.push(op),
+            }
+        }
+        if kept.is_empty() {
+            // Every operand was an identity constant (a||b||0 with a=b=0 => 0;
+            // a&&b&&1 with a=b=1 => 1).
+            return Operand::Const(make_int_const(if is_and { 1 } else { 0 }));
+        }
+
+        // The LAST operand's value flows out as data, so it must be a
+        // normalized 0/1 boolean. A comparison / logical-NOT already yields
+        // 0/1; anything else gets the `!= 0` normalization (same rule as the
+        // old RHS handling — avoids a redundant re-compare per condition).
+        let last = *kept.last().unwrap();
+        let last_is_normalized_bool = matches!(last, Expr::BinaryOp(op, _, _, _) if op.is_comparison())
+            || matches!(last, Expr::UnaryOp(UnaryOp::LogicalNot, _, _));
+        let lower_last_bool = |slf: &mut Self| -> Operand {
+            let val = slf.lower_condition_expr(last);
+            if last_is_normalized_bool {
+                val
             } else {
-                Operand::Value(slf.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty))
+                Operand::Value(slf.emit_cmp_val(IrCmpOp::Ne, val, Operand::Const(make_int_const(0)), int_ty))
             }
         };
 
-        // Constant-fold the LHS to eliminate dead code at lowering time.
-        // This is critical for constructs like IS_ENABLED(CONFIG_X) && func()
-        // where CONFIG_X is not set: without this, the compiler would emit a
-        // reference to func() even though it's never called, causing link errors.
-        if let Some(lhs_const) = self.eval_const_expr(lhs) {
-            let lhs_is_true = lhs_const.is_nonzero();
-            if is_and {
-                if !lhs_is_true {
-                    // 0 && rhs => always 0, skip RHS entirely
-                    return Operand::Const(make_int_const(0));
-                }
-                // nonzero && rhs => result is bool(rhs)
-                return lower_rhs_bool(self);
-            } else {
-                if lhs_is_true {
-                    // nonzero || rhs => always 1, skip RHS entirely
-                    return Operand::Const(make_int_const(1));
-                }
-                // 0 || rhs => result is bool(rhs)
-                return lower_rhs_bool(self);
-            }
+        if kept.len() == 1 {
+            return lower_last_bool(self);
         }
 
-        // Check if the RHS is a compile-time constant. When it is, we can
-        // simplify the short-circuit result without emitting the RHS branch.
-        // This helps patterns like `expr && 0` or `expr || 1` where the RHS
-        // is a literal or compile-time constant expression.
-        if let Some(rhs_const) = self.eval_const_expr(rhs) {
-            let rhs_is_true = rhs_const.is_nonzero();
-            if is_and && !rhs_is_true {
-                // LHS && false => always false. Evaluate LHS for side effects, return 0.
-                let _ = self.lower_condition_expr(lhs);
-                return Operand::Const(make_int_const(0));
-            } else if !is_and && rhs_is_true {
-                // LHS || true => always true. Evaluate LHS for side effects, return 1.
-                let _ = self.lower_condition_expr(lhs);
-                return Operand::Const(make_int_const(1));
-            }
-            // For "LHS && true" or "LHS || false", fall through to normal lowering
-            // since the result depends on LHS.
-        }
-
-        // Use emit_entry_alloca so the alloca is in the entry block, ensuring
-        // mem2reg can promote it to SSA/Phi form. Previously this used self.emit()
-        // which placed the alloca in the current block — if the expression was inside
-        // nested control flow (e.g., inside a loop or if body), the alloca would
-        // be in a non-entry block and mem2reg would refuse to promote it.
+        // Flat branch chain: store the default, branch on each leading
+        // operand, store the normalized last operand, merge and load.
         let result_alloca = self.emit_entry_alloca(int_ty, int_size, 0, false);
-
-        let rhs_label = self.fresh_label();
         let end_label = self.fresh_label();
-
-        let lhs_val = self.lower_condition_expr(lhs);
 
         let default_val = if is_and { 0 } else { 1 };
         self.emit(Instruction::Store { val: Operand::Const(make_int_const(default_val)), ptr: result_alloca, ty: int_ty,
          seg_override: AddressSpace::Default });
 
-        let (true_label, false_label) = if is_and {
-            (rhs_label, end_label)
-        } else {
-            (end_label, rhs_label)
-        };
-        self.terminate(Terminator::CondBranch { cond: lhs_val, true_label, false_label });
+        let n = kept.len();
+        for op in kept.iter().take(n - 1) {
+            let next_label = self.fresh_label();
+            let (true_label, false_label) = if is_and {
+                (next_label, end_label)
+            } else {
+                (end_label, next_label)
+            };
+            let cond = self.lower_condition_expr(op);
+            self.terminate(Terminator::CondBranch { cond, true_label, false_label });
+            self.start_block(next_label);
+        }
 
-        self.start_block(rhs_label);
-        let rhs_bool = lower_rhs_bool(self);
-        self.emit(Instruction::Store { val: rhs_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+        let last_bool = lower_last_bool(self);
+        self.emit(Instruction::Store { val: last_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
@@ -919,7 +913,6 @@ impl Lowerer {
         Operand::Value(result)
     }
 
-    // -----------------------------------------------------------------------
     // Increment/decrement operators
     // -----------------------------------------------------------------------
 
@@ -1030,4 +1023,19 @@ impl Lowerer {
             (Operand::Const(one), wt)
         }
     }
+}
+
+/// Collect the flat operand list of a left-associative short-circuit chain of
+/// ONE operator (`&&` or `||`). A nested chain of the OTHER operator is kept
+/// as a single operand (it evaluates as a unit with its own merge).
+fn collect_flat_sc_operands<'a>(expr: &'a Expr, is_and: bool, ops: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
+        let same_op = if is_and { *op == BinOp::LogicalAnd } else { *op == BinOp::LogicalOr };
+        if same_op {
+            collect_flat_sc_operands(lhs, is_and, ops);
+            collect_flat_sc_operands(rhs, is_and, ops);
+            return;
+        }
+    }
+    ops.push(expr);
 }

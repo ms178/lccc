@@ -993,6 +993,15 @@ impl X86Codegen {
             }
         }
 
+        // Deferred FP pre-stores: (param_idx, abi_xmm_idx, home_phys, dest_name, is_f32).
+        // They are emitted AFTER the main loop in an order where a home register
+        // never clobbers an un-consumed ABI argument register — a home may be
+        // xmm2..xmm7, which double as ABI arg registers for other params, and
+        // pre-storing in param order then destroys a later param's incoming
+        // value (observed miscompile: constp(a, b, scale) computed (a+b)*a
+        // because a's home xmm2 clobbered scale's ABI xmm2).
+        let mut fp_prestores: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
+
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
 
@@ -1037,19 +1046,16 @@ impl X86Codegen {
                                     self.state.param_pre_stored.insert(i);
                                     self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
                                 } else if let ParamClass::FloatReg { reg_idx } = class {
-                                    // The FP argument arrives in xmm0..xmm7;
-                                    // move it straight into its allocated XMM
-                                    // home. movss/movsd are the scalar
-                                    // xmm->xmm moves (movd/movq are xmm<->GPR
-                                    // only, which the assembler rejects).
-                                    let mnemonic = if func.params[i].ty == IrType::F32 {
-                                        "    movss"
-                                    } else {
-                                        "    movsd"
-                                    };
-                                    self.state.out.emit_instr_reg_reg(
-                                        mnemonic, xmm_regs[reg_idx], dest_reg);
-                                    self.state.param_pre_stored.insert(i);
+                                    // FP pre-store: DEFERRED (see above).
+                                    // Record the ABI register and home so the
+                                    // deferred pass can order them safely.
+                                    fp_prestores.push((
+                                        i,
+                                        reg_idx,
+                                        phys_reg,
+                                        dest_reg,
+                                        func.params[i].ty == IrType::F32,
+                                    ));
                                 }
                             }
                         }
@@ -1242,6 +1248,80 @@ impl X86Codegen {
                 ParamClass::LargeStructByRefReg { .. } | ParamClass::LargeStructByRefStack { .. } |
                 ParamClass::StructSplitRegStack { .. } |
                 ParamClass::ZeroSizeSkip => {}
+            }
+        }
+
+        // Emit the deferred FP pre-stores in a safe order (see the collection
+        // above). Greedy: a param may be pre-stored only when its home register
+        // is not the ABI argument register of any still-pending param — reading
+        // that ABI register later would yield the overwritten home value. Cycles
+        // (home(i) == ABI(j) AND home(j) == ABI(i), only possible with 3+ FP
+        // params whose homes are each other's ABI registers) are broken with a
+        // scratch XMM register that is no pending param's home.
+        if !fp_prestores.is_empty() {
+            // (param_idx, abi_idx, home_phys, dest_name, is_f32)
+            let mut pending: Vec<(usize, usize, PhysReg, &'static str, bool)> = fp_prestores;
+            // (dest_name, is_f32, scratch_name)
+            let mut scratch_saves: Vec<(&'static str, bool, &'static str)> = Vec::new();
+            while !pending.is_empty() {
+                let mut progressed = false;
+                let mut remaining: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
+                for cand in &pending {
+                    let (i, abi_idx, _home, dest, is_f32) = *cand;
+                    // Unsafe if the home register IS the ABI argument register
+                    // of a DIFFERENT pending param (reading that ABI register
+                    // later would yield the overwritten home value). Compare
+                    // names: the home is xmm2..xmm15, ABI args are xmm0..xmm7.
+                    let clobbers = pending.iter().any(|&(j, j_abi, _, _, _)| {
+                        j != i && dest == xmm_regs[j_abi]
+                    });
+                    if !clobbers {
+                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
+                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
+                        self.state.param_pre_stored.insert(i);
+                        progressed = true;
+                    } else {
+                        remaining.push(*cand);
+                    }
+                }
+                if !progressed {
+                    // Cycle: save the first pending param's ABI value to a
+                    // scratch XMM register (no pending param's home), so its
+                    // ABI register is free for the others; the scratch value
+                    // moves to its home at the very end.
+                    let (i, abi_idx, home, dest, is_f32) = pending[0];
+                    let scratch = {
+                        let mut s: Option<&'static str> = None;
+                        for r in (26u8..=33).rev() {
+                            let name = phys_reg_name(PhysReg(r));
+                            if pending.iter().all(|&(_, _, h, _, _)| h.0 != r) {
+                                s = Some(name);
+                                break;
+                            }
+                        }
+                        s
+                    };
+                    if let Some(scratch) = scratch {
+                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
+                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], scratch);
+                        self.state.param_pre_stored.insert(i);
+                        scratch_saves.push((dest, is_f32, scratch));
+                        let _ = home;
+                        pending.remove(0);
+                    } else {
+                        // Degenerate (every XMM is a pending home): emit directly.
+                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
+                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
+                        self.state.param_pre_stored.insert(i);
+                        pending.remove(0);
+                    }
+                } else {
+                    pending = remaining;
+                }
+            }
+            for (dest, is_f32, scratch) in scratch_saves {
+                let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
+                self.state.out.emit_instr_reg_reg(mnemonic, scratch, dest);
             }
         }
     }
