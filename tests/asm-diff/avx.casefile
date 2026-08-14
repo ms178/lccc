@@ -1,4 +1,4 @@
-;;; avx_arith
+;;; avx_arith betterok
 .text
 vaddps %xmm0, %xmm1, %xmm2
 vaddps %ymm0, %ymm1, %ymm2
@@ -958,3 +958,33 @@ vmovdqu %ymm9, %ymm0
 vmovaps %xmm0, %xmm9
 vmovaps %xmm9, %xmm10
 vmovaps %xmm1, %xmm2
+;;; vex2_commutative betterok
+.text
+vpaddd %xmm9, %xmm2, %xmm3
+vpaddb %xmm9, %xmm2, %xmm3
+vpaddw %xmm9, %xmm2, %xmm3
+vpaddq %xmm9, %xmm2, %xmm3
+vpand %xmm9, %xmm2, %xmm3
+vpor %xmm9, %xmm2, %xmm3
+vpxor %xmm9, %xmm2, %xmm3
+vpmullw %xmm9, %xmm2, %xmm3
+vxorps %xmm9, %xmm2, %xmm3
+vandps %xmm9, %xmm2, %xmm3
+vorps %xmm9, %xmm2, %xmm3
+vxorpd %xmm9, %xmm2, %xmm3
+vpaddd %ymm9, %ymm2, %ymm3
+vpxor %ymm9, %ymm2, %ymm3
+vpaddd %xmm2, %xmm9, %xmm3
+vpaddd %xmm9, %xmm10, %xmm3
+vpaddd %xmm2, %xmm3, %xmm9
+
+;;; vex_noncommutative_guard
+.text
+vsubps %xmm9, %xmm2, %xmm3
+vdivps %xmm9, %xmm2, %xmm3
+vpsubd %xmm9, %xmm2, %xmm3
+vpsubb %xmm9, %xmm2, %xmm3
+vaddps %xmm9, %xmm2, %xmm3
+vmulps %xmm9, %xmm2, %xmm3
+vaddpd %xmm9, %xmm2, %xmm3
+vmulpd %xmm9, %xmm2, %xmm3

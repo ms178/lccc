@@ -569,3 +569,20 @@ btc $7, %r8
 bt %eax, %ecx
 bt %rax, %rcx
 bt %ax, %cx
+;;; mov_imm32_zeroext betterok
+.text
+movq $4294967295, %rax
+movq $4294967295, %rcx
+movq $4294967295, %r8
+movq $4294967295, %r13
+movq $2147483648, %rax
+movq $2147483648, %r15
+movq $2147483647, %rax
+movq $1, %rax
+movq $0, %rax
+movq $-1, %rax
+movq $-2147483648, %rax
+movq $4294967296, %rax
+movq $-4294967295, %rax
+movabsq $4294967295, %rax
+movl $4294967295, %eax

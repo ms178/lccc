@@ -769,6 +769,36 @@ impl super::InstructionEncoder {
     /// Encode AVX 3-operand instruction with 66 prefix (or no prefix): op src, vvvv, dst
     /// Format: VEX.NDS.128/256.66.0F opcode /r
     pub(crate) fn encode_avx_3op(&mut self, ops: &[Operand], opcode: u8, has_66: bool) -> Result<(), String> {
+        self.encode_avx_3op_commutative(ops, opcode, has_66, false)
+    }
+
+    /// Encode a VEX 3-operand instruction, optionally exploiting commutativity
+    /// to reach the shorter 2-byte VEX prefix.
+    ///
+    /// The 2-byte VEX (C5) can only encode REX.R; it has no bit for B or X.
+    /// So `vpaddd %xmm9,%xmm2,%xmm3` -- where the r/m operand is xmm9 -- needs
+    /// the 3-byte C4 form purely to express VEX.B, costing one byte.
+    ///
+    /// For a COMMUTATIVE operation the two source operands can be exchanged:
+    /// putting xmm9 in vvvv (which has 4 bits of its own, no REX needed) and
+    /// xmm2 in r/m clears B and lets the 2-byte form encode it. clang and icx
+    /// both do this; GAS, GCC and ICC do not.
+    ///
+    /// `commutative` is opt-in per mnemonic and is deliberately restricted to
+    /// INTEGER and BITWISE operations. Bitwise FP ops (vandps/vorps/vxorps and
+    /// their pd forms) qualify: they have no NaN-propagation rule at all, and
+    /// were measured bit-identical under exchange with two distinct NaN
+    /// payloads. Floating-point add/mul are NOT
+    /// bit-commutative on x86: when both sources are NaN the result takes
+    /// SRC1's payload, so exchanging them changes the result bits. Measured on
+    /// this host: `vaddps` with sources (0x7fc00001, 0x7fc00002) yields
+    /// 0x7fc00001 one way and 0x7fc00002 the other. clang performs the swap
+    /// for vaddps/vmulps anyway; we do not, because a one-byte saving is not
+    /// worth changing an architecturally-defined result.
+    pub(crate) fn encode_avx_3op_commutative(&mut self, ops: &[Operand], opcode: u8,
+                                             has_66: bool, commutative: bool)
+        -> Result<(), String>
+    {
         if ops.len() != 3 { return Err("AVX 3-op requires 3 operands".to_string()); }
         let l = self.vex_l_from_ops(ops);
         let pp = if has_66 { 1 } else { 0 };
@@ -776,6 +806,16 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1], &ops[2]) {
             // src_reg, vvvv_reg, dst_reg
             (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
+                // Exchange the sources when doing so removes the only reason we
+                // would need the 3-byte prefix.
+                let (src, vvvv) = if commutative
+                    && needs_vex_ext(&src.name)
+                    && !needs_vex_ext(&vvvv.name)
+                {
+                    (vvvv, src)
+                } else {
+                    (src, vvvv)
+                };
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;

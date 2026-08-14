@@ -177,6 +177,48 @@ _SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
 _ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
 
 
+_COMMUTATIVE_VEX = {
+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+}
+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
+_GP32_TO_64 = {
+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
+    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
+}
+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
+
+
+def _canon_commutative(insn: str) -> str:
+    """Order the two sources of a commutative VEX op canonically.
+
+    Exchanging them is how the 2-byte VEX prefix becomes reachable, so the
+    disassembly differs textually while the operation is identical. Restricted
+    to integer and bitwise ops: FP add/mul propagate SRC1's NaN payload.
+    """
+    m = _VEX3.match(insn.strip())
+    if not m or m.group(1) not in _COMMUTATIVE_VEX:
+        return insn
+    a, b = sorted((m.group(2), m.group(3)))
+    return f"{m.group(1)} {a},{b},{m.group(4)}"
+
+
+def _canon_mov_imm(insn: str) -> str:
+    """A 32-bit immediate load zero-extends, so it equals the 64-bit form."""
+    m = _MOV_IMM.match(insn.strip())
+    if not m:
+        return insn
+    val = int(m.group(2), 0)
+    reg = m.group(3)
+    if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
+        return f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+    return f"mov ${val:#x},%{reg}"
+
+
 def _decode(objdump: str, data: bytes, tmp: Path) -> str:
     """Disassemble raw bytes and normalise away pure encoding choices."""
     if not data:
@@ -197,7 +239,10 @@ def _decode(objdump: str, data: bytes, tmp: Path) -> str:
         # two spellings that differ only by encoding, not by meaning.
         insn = _SCALE1.sub(r"(%\1)", insn)
         insn = _ZERODISP.sub("(", insn)
-        out.append(re.sub(r"\s+", " ", insn))
+        insn = re.sub(r"\s+", " ", insn)
+        insn = _canon_commutative(insn)
+        insn = _canon_mov_imm(insn)
+        out.append(insn)
     return "\n".join(out)
 
 
@@ -307,8 +352,12 @@ def main() -> int:
             # A shorter encoding is only an improvement if it still means the
             # same thing. Confirm that here rather than leaving it to a human:
             # a shorter encoding that decodes differently is a miscompile.
-            if kind == "SHORTER" and verify_shorter(args.objdump, le, ge, tmp):
-                kind = "BETTER"
+            if kind in ("SHORTER", "WRONG-BYTES") and \
+                    verify_shorter(args.objdump, le, ge, tmp):
+                # Equivalent after canonicalisation. Only call it BETTER when
+                # it is actually smaller; equal size is just a different but
+                # equally good spelling.
+                kind = "BETTER" if len(le.data or b"") < len(ge.data or b"") else "ok"
             results.append((inst, kind, le, ge))
 
     results.sort(key=lambda r: (SEVERITY.get(r[1], 9), r[0]))

@@ -43,12 +43,12 @@ a false failure.
 
 ## Status
 
-All 723 cases pass against GNU as 2.47. Across the 9,901 distinct
+All 728 cases pass against GNU as 2.47. Across the 9,918 distinct
 instructions in the corpus, the per-instruction differential reports:
 
 ```
-ok      = 9,712   byte-identical to GNU as
-BETTER  =   126   shorter than GNU as, verified to decode identically
+ok      = 9,695   byte-identical to GNU as
+BETTER  =   160   shorter than GNU as, verified to decode identically
 reject  =    63   deliberate reject list; both assemblers refuse
 ```
 

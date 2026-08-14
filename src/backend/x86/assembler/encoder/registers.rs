@@ -293,7 +293,7 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
         "vpinsr", "vpextr", "extractps", "vextractps", "insertps", "vinsertps",
         "vextract", "vinsert", "vbroadcast", "vpbroadcast", "broadcast",
         "kmov", "movmsk", "vmovmsk",
-        "crc32", "popcnt", "lzcnt", "tzcnt", "bsf", "bsr", "bt", "shld", "shrd",
+        "crc32", "bt", "shld", "shrd",
         "vperm", "vpsll", "vpsrl", "vpsra", "psll", "psrl", "psra",
         "vgather", "vpgather", "vscatter", "vpscatter", "in", "out", "vzero",
         "enter", "lar", "lsl", "lgdt", "lidt", "sgdt", "sidt", "lldt", "sldt",

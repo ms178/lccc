@@ -378,29 +378,23 @@ pub(crate) fn fold_scale1_index(mem: &MemoryOperand) -> Option<MemoryOperand> {
         return None;
     }
     let idx = mem.index.as_ref()?;
-    // reg 4 (%rsp/%r12) stays in the index slot: putting it in the base slot
-    // selects the SIB escape, and the general encoder would then have to
-    // re-derive a SIB with index=none to keep the meaning.  ICC does emit that
-    // form (`mov -1(,%r12,1)` -> 49 8b 4c 24 ff, 5 bytes vs our 8), so this is
-    // a known 3-byte opportunity left on the table deliberately: expressing it
-    // needs a base+"no index" SIB that this helper cannot describe by operand
-    // rewriting alone.
-    //
-    // reg 5 (%rbp/%r13) IS foldable, but only because a non-zero displacement
-    // forces mod=01/10 anyway, which gives base==101 its ordinary meaning.
-    // With mod=00 base==101 means "no base, disp32", so a zero-displacement
-    // fold would change the address; require a displacement in that case.
-    match reg_num(&idx.name) {
-        Some(4) => return None,
-        Some(5) => {
-            let has_disp = !matches!(mem.displacement, Displacement::None)
-                && !matches!(mem.displacement, Displacement::Integer(0));
-            if !has_disp {
-                return None;
-            }
-        }
-        _ => {}
+    // %rsp can never be an index, so an index-only operand naming it is
+    // invalid input; leave it for the validator to reject.
+    if idx.name == "rsp" || idx.name == "esp" {
+        return None;
     }
+    // Every other register folds, including reg 4 (%r12) and reg 5
+    // (%rbp/%r13). Those two need special ModR/M shapes in the base slot --
+    // %r12 needs a SIB with index=none, and %rbp at mod=00 would mean "no
+    // base", so it needs mod=01 with a zero disp8 -- but the general memory
+    // encoder already produces exactly those forms for a plain base operand
+    // (verified byte-identical to GAS for `lea (%r12)`, `lea 0(%rbp)` and
+    // `mov -1(%r12)`), so rewriting the operand is sufficient and no special
+    // case is needed here.
+    //
+    // This is what lets us reach ICC's encoding for the whole family:
+    // `lea 0(,%r12,1),%rdx` becomes 49 8d 14 24 (4 bytes) instead of
+    // 4a 8d 14 25 00000000 (8 bytes).
     Some(MemoryOperand {
         base: mem.index.clone(),
         index: None,

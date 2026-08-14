@@ -192,6 +192,56 @@ _SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
 _ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
 
 
+# VEX 3-operand instructions whose two SOURCE operands may be exchanged with
+# no change to the result bits. Integer and bitwise only: FP add/mul propagate
+# SRC1's NaN payload, so exchanging them is observable and is NOT done.
+_COMMUTATIVE_VEX = {
+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+}
+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
+
+
+# A 32-bit register write zero-extends into its 64-bit parent, so
+# `mov $0xffffffff,%eax` and `movabs $0xffffffff,%rax` leave the same value in
+# %rax -- the first in 5 bytes, the second in 10. Canonicalise the pair so the
+# semantic comparison sees them as equal.
+_GP32_TO_64 = {
+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
+    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
+}
+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
+
+
+def _canon_mov_imm(insn: str) -> str:
+    """Normalise a zero-extending 32-bit immediate load to its 64-bit meaning."""
+    m = _MOV_IMM.match(insn.strip())
+    if not m:
+        return insn
+    val = int(m.group(2), 0)
+    reg = m.group(3)
+    if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
+        return f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+    return f"mov ${val:#x},%{reg}"
+
+
+def _canon_commutative(insn: str) -> str:
+    """Put the two sources of a commutative VEX op in a canonical order.
+
+    An assembler may exchange them to reach the shorter 2-byte VEX prefix, so
+    the disassembly differs textually while denoting the same operation.
+    """
+    m = _VEX3.match(insn.strip())
+    if not m or m.group(1) not in _COMMUTATIVE_VEX:
+        return insn
+    a, b = sorted((m.group(2), m.group(3)))
+    return f"{m.group(1)} {a},{b},{m.group(4)}"
+
+
 def _norm_disasm(text: str) -> str:
     """Normalise a disassembly listing for semantic comparison.
 
@@ -209,6 +259,8 @@ def _norm_disasm(text: str) -> str:
         insn = _SCALE1.sub(r"(%\1)", insn)
         insn = _ZERODISP.sub("(", insn)
         insn = re.sub(r"\s+", " ", insn)
+        insn = _canon_commutative(insn)
+        insn = _canon_mov_imm(insn)
         # Drop the trailing branch-target comment objdump appends.
         insn = insn.split("#")[0].strip()
         out.append(insn)
