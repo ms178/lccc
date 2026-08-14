@@ -1,0 +1,270 @@
+;;; bmi
+.text
+andnl %eax, %ecx, %edx
+andnl %r8d, %r9d, %r10d
+andnl (%rdi), %ecx, %edx
+andnq %rax, %rcx, %rdx
+andnq %r8, %r9, %r10
+andnq (%rdi), %rcx, %rdx
+bextrl %eax, %ecx, %edx
+bextrl %r8d, %r9d, %r10d
+bextrq %rax, %rcx, %rdx
+bextrq %r8, %r9, %r10
+bzhil %eax, %ecx, %edx
+bzhil %r8d, %r9d, %r10d
+bzhiq %rax, %rcx, %rdx
+bzhiq %r8, %r9, %r10
+mulxl %eax, %ecx, %edx
+mulxl %r8d, %r9d, %r10d
+mulxl (%rdi), %ecx, %edx
+mulxq %rax, %rcx, %rdx
+mulxq %r8, %r9, %r10
+mulxq (%rdi), %rcx, %rdx
+pdepl %eax, %ecx, %edx
+pdepl %r8d, %r9d, %r10d
+pdepl (%rdi), %ecx, %edx
+pdepq %rax, %rcx, %rdx
+pdepq %r8, %r9, %r10
+pdepq (%rdi), %rcx, %rdx
+pextl %eax, %ecx, %edx
+pextl %r8d, %r9d, %r10d
+pextl (%rdi), %ecx, %edx
+pextq %rax, %rcx, %rdx
+pextq %r8, %r9, %r10
+pextq (%rdi), %rcx, %rdx
+sarxl %eax, %ecx, %edx
+sarxl %r8d, %r9d, %r10d
+sarxq %rax, %rcx, %rdx
+sarxq %r8, %r9, %r10
+shlxl %eax, %ecx, %edx
+shlxl %r8d, %r9d, %r10d
+shlxq %rax, %rcx, %rdx
+shlxq %r8, %r9, %r10
+shrxl %eax, %ecx, %edx
+shrxl %r8d, %r9d, %r10d
+shrxq %rax, %rcx, %rdx
+shrxq %r8, %r9, %r10
+rorxl $0, %eax, %ecx
+rorxq $0, %rax, %rcx
+rorxq $0, (%rdi), %r15
+rorxl $1, %eax, %ecx
+rorxq $1, %rax, %rcx
+rorxq $1, (%rdi), %r15
+rorxl $7, %eax, %ecx
+rorxq $7, %rax, %rcx
+rorxq $7, (%rdi), %r15
+rorxl $31, %eax, %ecx
+rorxq $31, %rax, %rcx
+rorxq $31, (%rdi), %r15
+rorxl $63, %eax, %ecx
+rorxq $63, %rax, %rcx
+rorxq $63, (%rdi), %r15
+rorxl $255, %eax, %ecx
+rorxq $255, %rax, %rcx
+rorxq $255, (%rdi), %r15
+blsil %eax, %eax
+blsil (%rdi), %eax
+blsiq %rax, %rax
+blsiq (%rdi), %rax
+blsmskl %eax, %eax
+blsmskl (%rdi), %eax
+blsmskq %rax, %rax
+blsmskq (%rdi), %rax
+blsrl %eax, %eax
+blsrl (%rdi), %eax
+blsrq %rax, %rax
+blsrq (%rdi), %rax
+tzcntw %ax, %cx
+tzcntl %eax, %ecx
+tzcntq %rax, %rcx
+lzcntw %ax, %cx
+lzcntl %eax, %ecx
+lzcntq %rax, %rcx
+popcntw %ax, %cx
+popcntl %eax, %ecx
+popcntq %rax, %rcx
+bsfw %ax, %cx
+bsfl %eax, %ecx
+bsfq %rax, %rcx
+bsrw %ax, %cx
+bsrl %eax, %ecx
+bsrq %rax, %rcx
+btw %ax, %ax
+btw $0, %ax
+btw $0, (%rdi)
+btw $1, %ax
+btw $1, (%rdi)
+btw $7, %ax
+btw $7, (%rdi)
+btw $15, %ax
+btw $15, (%rdi)
+btw $31, %ax
+btw $31, (%rdi)
+btw $63, %ax
+btw $63, (%rdi)
+btw %ax, (%rdi)
+btl %eax, %eax
+btl $0, %eax
+btl $0, (%rdi)
+btl $1, %eax
+btl $1, (%rdi)
+btl $7, %eax
+btl $7, (%rdi)
+btl $15, %eax
+btl $15, (%rdi)
+btl $31, %eax
+btl $31, (%rdi)
+btl $63, %eax
+btl $63, (%rdi)
+btl %eax, (%rdi)
+btq %rax, %rax
+btq $0, %rax
+btq $0, (%rdi)
+btq $1, %rax
+btq $1, (%rdi)
+btq $7, %rax
+btq $7, (%rdi)
+btq $15, %rax
+btq $15, (%rdi)
+btq $31, %rax
+btq $31, (%rdi)
+btq $63, %rax
+btq $63, (%rdi)
+btq %rax, (%rdi)
+btcw %ax, %ax
+btcw $0, %ax
+btcw $0, (%rdi)
+btcw $1, %ax
+btcw $1, (%rdi)
+btcw $7, %ax
+btcw $7, (%rdi)
+btcw $15, %ax
+btcw $15, (%rdi)
+btcw $31, %ax
+btcw $31, (%rdi)
+btcw $63, %ax
+btcw $63, (%rdi)
+btcw %ax, (%rdi)
+btcl %eax, %eax
+btcl $0, %eax
+btcl $0, (%rdi)
+btcl $1, %eax
+btcl $1, (%rdi)
+btcl $7, %eax
+btcl $7, (%rdi)
+btcl $15, %eax
+btcl $15, (%rdi)
+btcl $31, %eax
+btcl $31, (%rdi)
+btcl $63, %eax
+btcl $63, (%rdi)
+btcl %eax, (%rdi)
+btcq %rax, %rax
+btcq $0, %rax
+btcq $0, (%rdi)
+btcq $1, %rax
+btcq $1, (%rdi)
+btcq $7, %rax
+btcq $7, (%rdi)
+btcq $15, %rax
+btcq $15, (%rdi)
+btcq $31, %rax
+btcq $31, (%rdi)
+btcq $63, %rax
+btcq $63, (%rdi)
+btcq %rax, (%rdi)
+btrw %ax, %ax
+btrw $0, %ax
+btrw $0, (%rdi)
+btrw $1, %ax
+btrw $1, (%rdi)
+btrw $7, %ax
+btrw $7, (%rdi)
+btrw $15, %ax
+btrw $15, (%rdi)
+btrw $31, %ax
+btrw $31, (%rdi)
+btrw $63, %ax
+btrw $63, (%rdi)
+btrw %ax, (%rdi)
+btrl %eax, %eax
+btrl $0, %eax
+btrl $0, (%rdi)
+btrl $1, %eax
+btrl $1, (%rdi)
+btrl $7, %eax
+btrl $7, (%rdi)
+btrl $15, %eax
+btrl $15, (%rdi)
+btrl $31, %eax
+btrl $31, (%rdi)
+btrl $63, %eax
+btrl $63, (%rdi)
+btrl %eax, (%rdi)
+btrq %rax, %rax
+btrq $0, %rax
+btrq $0, (%rdi)
+btrq $1, %rax
+btrq $1, (%rdi)
+btrq $7, %rax
+btrq $7, (%rdi)
+btrq $15, %rax
+btrq $15, (%rdi)
+btrq $31, %rax
+btrq $31, (%rdi)
+btrq $63, %rax
+btrq $63, (%rdi)
+btrq %rax, (%rdi)
+btsw %ax, %ax
+btsw $0, %ax
+btsw $0, (%rdi)
+btsw $1, %ax
+btsw $1, (%rdi)
+btsw $7, %ax
+btsw $7, (%rdi)
+btsw $15, %ax
+btsw $15, (%rdi)
+btsw $31, %ax
+btsw $31, (%rdi)
+btsw $63, %ax
+btsw $63, (%rdi)
+btsw %ax, (%rdi)
+btsl %eax, %eax
+btsl $0, %eax
+btsl $0, (%rdi)
+btsl $1, %eax
+btsl $1, (%rdi)
+btsl $7, %eax
+btsl $7, (%rdi)
+btsl $15, %eax
+btsl $15, (%rdi)
+btsl $31, %eax
+btsl $31, (%rdi)
+btsl $63, %eax
+btsl $63, (%rdi)
+btsl %eax, (%rdi)
+btsq %rax, %rax
+btsq $0, %rax
+btsq $0, (%rdi)
+btsq $1, %rax
+btsq $1, (%rdi)
+btsq $7, %rax
+btsq $7, (%rdi)
+btsq $15, %rax
+btsq $15, (%rdi)
+btsq $31, %rax
+btsq $31, (%rdi)
+btsq $63, %rax
+btsq $63, (%rdi)
+btsq %rax, (%rdi)
+bswapl %eax
+bswapq %rax
+bswapl %r13d
+bswapq %r13
+adcxl %eax, %ecx
+adcxq %rax, %rcx
+adoxl %eax, %ecx
+movbew (%rdi), %ax
+movbel (%rdi), %eax
+movbeq (%rdi), %rax
+movbeq %rax, (%rdi)

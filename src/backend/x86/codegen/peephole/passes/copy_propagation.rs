@@ -45,6 +45,19 @@ fn try_propagate_into(
         return false;
     }
 
+    // SOUNDNESS: a self-referencing zeroing idiom (`xor %r,%r`, `sub %r,%r`)
+    // does NOT read %r — it is a pure define whose result is always zero, and
+    // the register appears twice only as an encoding artifact. Treating the
+    // first operand as a use and rewriting it to the copy source turns
+    // `xorl %eax,%eax` into `xorl %ecx,%eax`, which computes a garbage value
+    // AND destroys the zeroing. In an argument-setup sequence that silently
+    // wrecks the call: `f(a,b,c,d)` lost its %rdi/%rsi/%rdx/%rcx setup and
+    // clobbered %rcx (reduced from expat's XmlInitUnknownEncodingNS, which
+    // segfaulted when xmltok.c was built at -O2).
+    if is_self_zeroing_idiom(trimmed) {
+        return false;
+    }
+
     // Skip shift/rotate when propagating into %rcx (they need %cl)
     if dst_id == 1 && is_shift_or_rotate(trimmed) {
         return false;

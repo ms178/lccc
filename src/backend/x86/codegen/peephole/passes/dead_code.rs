@@ -11,7 +11,7 @@
 use super::super::types::*;
 use super::helpers::*;
 
-// SOUNDNESS (v7): LCCC compiles with -fomit-frame-pointer, so %rbp is a general
+// SOUNDNESS: LCCC compiles with -fomit-frame-pointer, so %rbp is a general
 // data register unless a function explicitly establishes a frame pointer
 // (`pushq %rbp` + `movq %rsp, %rbp`). When %rbp is NOT the frame pointer, a
 // memory operand such as `movl %eax, 28(%rbp)` is a POINTER DEREFERENCE through
@@ -227,7 +227,7 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
 
     let mut pattern_bytes = [0u8; 24];
 
-    // Frame-pointer status (v7): reset at each .cfi_startproc, set true when a
+    // Frame-pointer status: reset at each .cfi_startproc, set true when a
     // function establishes a frame pointer (`movq %rsp, %rbp`). When %rbp is NOT
     // the frame pointer, `offset(%rbp)` accesses are pointer dereferences and
     // must never be treated as stack slots.
@@ -255,7 +255,7 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
             _ => continue,
         };
 
-        // SOUNDNESS (v7): if %rbp is not the frame pointer and this store uses an
+        // SOUNDNESS: if %rbp is not the frame pointer and this store uses an
         // `(%rbp)` memory operand, it writes ARBITRARY memory (pointer deref), not
         // a stack slot. Never delete it as a dead stack store.
         if !rbp_is_frame && uses_rbp_mem_operand(infos[i].trimmed(store.get(i))) {
@@ -309,7 +309,7 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                 break;
             }
 
-            // SOUNDNESS (v1): an RSP-shifting line between the store and this
+            // SOUNDNESS: an RSP-shifting line between the store and this
             // point makes the store's %rsp-relative address ambiguous (the
             // offsets inside the shifted window refer to different physical
             // slots). Treat as a read so the store is never deleted.
@@ -318,7 +318,7 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                 break;
             }
 
-            // SOUNDNESS (v7): a `(%rbp)` access when %rbp is not the frame pointer
+            // SOUNDNESS: a `(%rbp)` access when %rbp is not the frame pointer
             // is an opaque pointer dereference that may READ or WRITE the slot.
             // Conservatively treat it as a read.
             if !rbp_is_frame && uses_rbp_mem_operand(infos[j].trimmed(store.get(j))) {
@@ -421,7 +421,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // 2. Frame-pointer-less: subq $N,%rsp (without push %rbp)
         let body_start;
 
-        // Frame-pointer status (v7): Form 1 establishes a frame pointer (so
+        // Frame-pointer status: Form 1 establishes a frame pointer (so
         // `(%rbp)` is a genuine stack slot); Form 2 does not (so %rbp is a free
         // data register and `(%rbp)` is a pointer dereference, never a stack slot).
         let mut rbp_is_frame;
@@ -556,7 +556,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 continue;
             }
 
-            // SOUNDNESS (v1): an RSP-shifting instruction (push/pop/subq/addq
+            // SOUNDNESS: an RSP-shifting instruction (push/pop/subq/addq
             // on %rsp) changes the effective address of every %rsp-relative
             // slot after it. Offsets are compared verbatim, so a read of slot
             // X before the shift and a read of slot X after the shift refer
@@ -579,7 +579,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
 
             match infos[k].kind {
                 LineKind::StoreRbp { .. } => {
-                    // SOUNDNESS (v7): when %rbp is not the frame pointer, an
+                    // SOUNDNESS: when %rbp is not the frame pointer, an
                     // `(%rbp)` store is a pointer write to arbitrary memory — it
                     // may read/alias any stack slot. Bail out of never-read
                     // elimination entirely.
@@ -641,7 +641,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 continue;
             }
             if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
-                // SOUNDNESS (v7): never delete an `(%rbp)` store when %rbp is a
+                // SOUNDNESS: never delete an `(%rbp)` store when %rbp is a
                 // data register (pointer store to arbitrary memory).
                 if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
                     continue;

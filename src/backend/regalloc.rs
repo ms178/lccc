@@ -534,7 +534,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // genuinely overlap, so only ~2 groups coalesce in longest_match), sound
     // after the representative fix, and a net win on copy-heavy non-loop code.
     // Kept OFF by default so the default codegen matches the fully-validated
-    // v14 baseline.
+    // previous baseline.
     let coalesce_groups: FxHashMap<u32, Vec<u32>> = if std::env::var("CCC_COALESCE").is_ok() {
         build_coalesce_groups(func, &liveness, &eligible)
     } else {

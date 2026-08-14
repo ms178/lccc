@@ -524,7 +524,7 @@ impl X86Codegen {
             }
         }
 
-        // v6: register-direct F64/F32 store. When the value lives in an
+        // register-direct F64/F32 store. When the value lives in an
         // XMM-allocated register, store it straight to memory (movsd/movss
         // %xmmN, (%ptr)) instead of the GPR round-trip (movq %xmmN,%rax;
         // movq %rax,(%ptr)) the default path pays on every store.
@@ -749,7 +749,7 @@ impl X86Codegen {
             }
         }
 
-        // v5: register-direct F64/F32 load. When the destination is
+        // register-direct F64/F32 load. When the destination is
         // XMM-allocated, load straight into it (movsd/movss (%ptr), %xmmN)
         // instead of the GPR round-trip (movq (%ptr),%rax; movq %rax,%xmmN).
         // Over-aligned allocas fall through (their data lives at a runtime-
@@ -883,7 +883,7 @@ impl X86Codegen {
 
         // Register-direct store: when val has a register, store directly to memory
         // without loading to %rax first. Handles Direct (alloca) and Indirect (ptr) cases.
-        // v6: FP variant — an XMM-allocated F64/F32 value stores straight to the
+        // FP variant — an XMM-allocated F64/F32 value stores straight to the
         // folded-offset address (movsd/movss %xmmN, off(%base)) instead of the
         // GPR round-trip (movq %xmmN,%rax; movq %rax,off(%base)).
         if ty == IrType::F64 || ty == IrType::F32 {
@@ -999,7 +999,7 @@ impl X86Codegen {
             }
             return;
         }
-        // v6: FP register-direct load with a folded constant offset: movsd/movss
+        // FP register-direct load with a folded constant offset: movsd/movss
         // off(%base), %xmmN into the XMM-allocated destination, instead of the
         // GPR round-trip (movq off(%base),%rax; movq %rax,%xmmN) that the
         // fold path otherwise pays for every field load in FP-struct loops.

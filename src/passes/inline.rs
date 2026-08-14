@@ -22,7 +22,7 @@ use crate::common::fx_hash::FxHashMap;
 /// to be eligible for inlining. This handles constant-returning helpers
 /// like IS_ENABLED() wrappers and small accessor functions, as well as
 /// moderately-sized static inline functions with simple control flow.
-/// Lowered from 60 to 32 for v2: for user-space workloads like gzip, inlining
+/// Lowered from 60 to 32: for user-space workloads like gzip, inlining
 /// up-to-60-instruction callees adds large amounts of code (gzip -O3 text was
 /// 437KB vs 343KB with inlining off) with no measurable runtime benefit,
 /// because the from-scratch backend spills heavily in large functions.

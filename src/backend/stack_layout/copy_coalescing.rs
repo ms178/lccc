@@ -94,7 +94,7 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
                 | Instruction::LabelAddr { dest, .. } => Some(dest.0),
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
                     if info.dest.is_some() && scalar_type(info.return_type) => info.dest.map(|v| v.0),
-                // v5: the auto-vectorizer's Vec* vector values participate in
+                // the auto-vectorizer's Vec* vector values participate in
                 // copy coalescing (accumulator-phi group), with their own class.
                 Instruction::Intrinsic { dest: Some(d), op, .. }
                     if op.vector_result_width().is_some() => Some(d.0),
@@ -1210,7 +1210,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadF32x8
             // VecAdd*/VecMul* are NOT raw readers: they are cache-aware
             // two-operand binaries whose codegen goes through
-            // emit_avx_binary_256 / emit_sse_binary_128 (v3), so they can
+            // emit_avx_binary_256 / emit_sse_binary_128, so they can
             // consume a deferred single-use load from the register cache and
             // fold the other operand as a memory operand. VecLoad*/VecZero*/
             // VecHorizontalAdd* stay raw (pointer/scalar operands).
@@ -1422,7 +1422,7 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                     def_blocks.entry(d.0).or_default().insert(bi);
                 }
             }
-            // v3: the auto-vectorizer's Vec* intrinsics produce their result as
+            // the auto-vectorizer's Vec* intrinsics produce their result as
             // an SSA `dest` (not a `dest_ptr` alloca). Register those defs too,
             // so a single-use VecLoad result can have its slot store deferred
             // and its consumer (VecAdd/VecMul) can fold it. VecZero*/VecLoad*/

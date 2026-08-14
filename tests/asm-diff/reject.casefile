@@ -1,0 +1,93 @@
+;;; r00_paddb reject
+.text
+paddb %mm2, %xmm1
+;;; r01_vpaddb reject
+.text
+vpaddb %ymm1, %ymm0
+;;; r02_vbroadcasti128 reject
+.text
+vbroadcasti128 %xmm0, %ymm0
+;;; r03_vmovdqu reject
+.text
+vmovdqu %ymm0, %xmm1
+;;; r04_paddb reject
+.text
+paddb %xmm32, %xmm1
+;;; r05_mov reject
+.text
+mov %rax, %eax
+;;; r06_mov reject
+.text
+mov %eax, %rax
+;;; r07_mov reject
+.text
+mov %al, %ax
+;;; r08_add reject
+.text
+add %rax, %ecx
+;;; r09_movl reject
+.text
+movl $1, %rax
+;;; r10_lea reject
+.text
+lea %rax, %rbx
+;;; r11_mov reject
+.text
+mov (%rax,%rsp,4), %rbx
+;;; r12_mov reject
+.text
+mov (%rax,%rbx,3), %rcx
+;;; r13_mov reject
+.text
+mov (%rax,%rbx,16), %rcx
+;;; r14_push reject
+.text
+push %eax
+;;; r15_pop reject
+.text
+pop %esp
+;;; r16_movsbl reject
+.text
+movsbl %ax, %ecx
+;;; r17_movzbq reject
+.text
+movzbq %eax, %rcx
+;;; r18_shl reject
+.text
+shl $1, $2
+;;; r19_vfmadd132ps reject
+.text
+vfmadd132ps %ymm1, %ymm2
+;;; r20_vextracti128 reject
+.text
+vextracti128 %ymm1, %xmm2
+;;; r21_vaddps reject
+.text
+vaddps %ymm1, %xmm2, %ymm3
+;;; r22_cmovz reject
+.text
+cmovz %al, %bl
+;;; r23_jmp reject
+.text
+jmp $1
+;;; r24_call reject
+.text
+call $1
+;;; r25_movq reject
+.text
+movq %xmm0, %ymm1
+;;; r26_vzeroupper reject
+.text
+vzeroupper %ymm0
+;;; r27_notaninstruction reject
+.text
+notaninstruction %rax, %rbx
+;;; r28_add reject
+.text
+add %rax
+;;; r30_mov reject
+.text
+mov $1, $2
+;;; r31_bswapw reject
+.text
+bswapw %ax

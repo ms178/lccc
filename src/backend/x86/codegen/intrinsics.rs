@@ -241,7 +241,7 @@ impl X86Codegen {
         self.state.sse_last_store_reg_name = Some(xmm);
     }
 
-    /// Lazy-flush a pending deferred vector-result store (v5): the producer
+    /// Lazy-flush a pending deferred vector-result store: the producer
     /// kept its result in the holding register instead of storing it. Called
     /// whenever anything is about to clobber that register, read the slot, or
     /// leave the block without the consumer having taken the value — emits the
@@ -784,7 +784,7 @@ impl X86Codegen {
                 self.emit_fp_scalar_unary(dest, &args[0], IrType::F32, "sqrtss");
             }
             IntrinsicOp::FabsF64 => {
-                // v6: single andpd against a rodata mask, honoring the
+                // single andpd against a rodata mask, honoring the
                 // XMM-allocated destination (was movabsq + movq + andpd +
                 // GPR round-trip).
                 if let Some(d) = dest {
@@ -986,7 +986,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::FabsF32 => {
-                // v6: single andps against a rodata mask, honoring the
+                // single andps against a rodata mask, honoring the
                 // XMM-allocated destination.
                 if let Some(d) = dest {
                     if let Some(&reg) = self.reg_assignments.get(&d.0) {
@@ -2230,7 +2230,7 @@ impl X86Codegen {
             }
 
             IntrinsicOp::VecAddF64x4 => {
-                // v3: route through the defer-aware, memory-operand-folding
+                // route through the defer-aware, memory-operand-folding
                 // emitter so single-use loads fold into the add (vaddpd slot,
                 // %ymm1, %ymm0) instead of load+load+add round-trips.
                 if let Some(d) = dest {
@@ -2253,7 +2253,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
-                // v3: defer-aware emitters (vpaddd is 3-op VEX, paddd is 2-op).
+                // defer-aware emitters (vpaddd is 3-op VEX, paddd is 2-op).
                 if let Some(d) = dest {
                     match op {
                         IntrinsicOp::VecAddI32x8 => self.emit_avx_binary_256(d, args, "vpaddd", true),

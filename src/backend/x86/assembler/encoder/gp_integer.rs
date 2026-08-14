@@ -133,15 +133,20 @@ impl super::InstructionEncoder {
                 // movq $symbol, %reg or movq $(symbol+offset), %reg - load address
                 let addend = if let ImmediateValue::SymbolPlusOffset(_, a) = imm { *a } else { 0 };
                 if size == 8 {
+                    // REX.W + C7 /0 id: imm32 sign-extended to 64 bits, so the
+                    // address must be in the low 2 GiB (R_X86_64_32S enforces
+                    // that at link time).
                     self.emit_rex_unary(8, &dst.name);
                     self.bytes.push(0xC7);
                     self.bytes.push(self.modrm(3, 0, dst_num));
                     self.add_relocation(sym, R_X86_64_32S, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 } else {
+                    // B8+rd id — one byte shorter than C7 /0 because the
+                    // destination register folds into the opcode. Same
+                    // semantics, less I-cache; GAS picks this form too.
                     self.emit_rex_unary(size, &dst.name);
-                    self.bytes.push(0xC7);
-                    self.bytes.push(self.modrm(3, 0, dst_num));
+                    self.bytes.push(0xB8 + (dst_num & 7));
                     self.add_relocation(sym, R_X86_64_32, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 }
@@ -479,16 +484,16 @@ impl super::InstructionEncoder {
                         self.bytes.push(self.modrm(3, alu_op, dst_num));
                         self.bytes.push(val as u8);
                     }
-                } else if (-128..=127).contains(&val)
-                    || (size <= 4 && (-128..=127).contains(&(val as i32 as i64)))
-                {
-                    // Sign-extended imm8. For 32-bit operands, values whose
-                    // low 32 bits fit in a signed imm8 (e.g. 0xffffffff == -1)
-                    // use the 3-byte 83 form — matches GAS (cmp $0xffffffff,
-                    // %r10d → 41 83 fa ff, not the 7-byte 81 form).
+                } else if fits_imm8(val, size) {
+                    // Sign-extended imm8 (3-byte `83` form). The immediate is
+                    // canonicalized to the operand width first, so both the
+                    // signed and unsigned spellings of the same value pick the
+                    // compact encoding: `addw $65535,%ax` and `addw $-1,%ax`
+                    // are the same 16-bit value and both become `66 83 c0 ff`,
+                    // matching GAS.
                     self.bytes.push(0x83);
                     self.bytes.push(self.modrm(3, alu_op, dst_num));
-                    self.bytes.push(val as u8);
+                    self.bytes.push(canonical_imm(val, size) as u8);
                 } else {
                     // imm32
                     if dst_num == 0 && !needs_rex_ext(&dst.name) {
@@ -570,11 +575,12 @@ impl super::InstructionEncoder {
                     self.encode_modrm_mem(alu_op, mem)?;
                     self.bytes.push(val as u8);
                     self.adjust_rip_reloc_addend(rc, 1);
-                } else if (-128..=127).contains(&val) {
+                } else if fits_imm8(val, size) {
+                    // Same width-canonical imm8 rule as the register form.
                     let rc = self.relocations.len();
                     self.bytes.push(0x83);
                     self.encode_modrm_mem(alu_op, mem)?;
-                    self.bytes.push(val as u8);
+                    self.bytes.push(canonical_imm(val, size) as u8);
                     self.adjust_rip_reloc_addend(rc, 1);
                 } else {
                     let rc = self.relocations.len();
@@ -703,18 +709,62 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// `nop r/m16` / `nop r/m32` — the 0F 1F /0 multi-byte NOP forms.
+    pub(crate) fn encode_nop_rm(&mut self, ops: &[Operand], word: bool) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("nop with operand requires exactly 1 operand".to_string());
+        }
+        if word {
+            self.bytes.push(0x66);
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(if word { 2 } else { 4 }, "", mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x1F]);
+                self.encode_modrm_mem(0, mem)
+            }
+            Operand::Register(reg) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                self.emit_rex_unary(if word { 2 } else { 4 }, &reg.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x1F]);
+                self.bytes.push(self.modrm(3, 0, num));
+                Ok(())
+            }
+            _ => Err("nop operand must be register or memory".to_string()),
+        }
+    }
+
+    /// Emit the immediate tail of an `imul` (`0x69`) form.
+    ///
+    /// The immediate is operand-sized: imm16 for a 16-bit operand, imm32
+    /// otherwise. Emitting imm32 for a 16-bit operand — as the previous
+    /// implementation did — desynchronizes the instruction stream by two
+    /// bytes and corrupts everything after it.
+    fn push_imul_imm(&mut self, val: i64, size: u8) {
+        if size == 2 {
+            self.bytes.extend_from_slice(&(canonical_imm(val, 2) as i16).to_le_bytes());
+        } else {
+            self.bytes.extend_from_slice(&(canonical_imm(val, 4) as i32).to_le_bytes());
+        }
+    }
+
     pub(crate) fn encode_imul(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
         match ops.len() {
             1 => {
-                // One-operand form: imul r/m (result in rdx:rax)
+                // The one-operand form is a plain unary r/m. It needs the
+                // 0x66 operand-size prefix for 16-bit operands just like
+                // mul/div/neg/not do; routing through encode_imul previously
+                // skipped it, so `imulw %bx` encoded as the 32-bit `imull`.
+                if size == 2 { self.bytes.push(0x66); }
                 self.encode_unary_rm(ops, 5, size)
             }
             2 => {
-                // Two-operand form: imul src, dst  OR  imul $imm, dst (shorthand for imul $imm, dst, dst)
                 match (&ops[0], &ops[1]) {
                     (Operand::Register(src), Operand::Register(dst)) => {
                         let src_num = reg_num(&src.name).ok_or("bad register")?;
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                        if size == 2 { self.bytes.push(0x66); }
                         self.emit_rex_rr(size, &dst.name, &src.name);
                         self.bytes.extend_from_slice(&[0x0F, 0xAF]);
                         self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -722,22 +772,25 @@ impl super::InstructionEncoder {
                     }
                     (Operand::Memory(mem), Operand::Register(dst)) => {
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                        self.emit_segment_prefix(mem)?;
+                        if size == 2 { self.bytes.push(0x66); }
                         self.emit_rex_rm(size, &dst.name, mem);
                         self.bytes.extend_from_slice(&[0x0F, 0xAF]);
                         self.encode_modrm_mem(dst_num, mem)
                     }
                     (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
-                        // 2-operand imul $imm, %reg is same as 3-operand imul $imm, %reg, %reg
+                        let val = *val;
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                        if size == 2 { self.bytes.push(0x66); }
                         self.emit_rex_rr(size, &dst.name, &dst.name);
-                        if *val >= -128 && *val <= 127 {
+                        if fits_imm8(val, size) {
                             self.bytes.push(0x6B);
                             self.bytes.push(self.modrm(3, dst_num, dst_num));
-                            self.bytes.push(*val as u8);
+                            self.bytes.push(canonical_imm(val, size) as u8);
                         } else {
                             self.bytes.push(0x69);
                             self.bytes.push(self.modrm(3, dst_num, dst_num));
-                            self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                            self.push_imul_imm(val, size);
                         }
                         Ok(())
                     }
@@ -745,25 +798,39 @@ impl super::InstructionEncoder {
                 }
             }
             3 => {
-                // Three-operand form: imul $imm, src, dst
-                match (&ops[0], &ops[1], &ops[2]) {
-                    (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(src), Operand::Register(dst)) => {
+                let (val, dst) = match (&ops[0], &ops[2]) {
+                    (Operand::Immediate(ImmediateValue::Integer(v)),
+                     Operand::Register(d)) => (*v, d),
+                    _ => return Err("unsupported imul operands".to_string()),
+                };
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let short = fits_imm8(val, size);
+                match &ops[1] {
+                    Operand::Register(src) => {
                         let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                        if size == 2 { self.bytes.push(0x66); }
                         self.emit_rex_rr(size, &dst.name, &src.name);
-                        if *val >= -128 && *val <= 127 {
-                            self.bytes.push(0x6B);
-                            self.bytes.push(self.modrm(3, dst_num, src_num));
-                            self.bytes.push(*val as u8);
-                        } else {
-                            self.bytes.push(0x69);
-                            self.bytes.push(self.modrm(3, dst_num, src_num));
-                            self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
-                        }
-                        Ok(())
+                        self.bytes.push(if short { 0x6B } else { 0x69 });
+                        self.bytes.push(self.modrm(3, dst_num, src_num));
                     }
-                    _ => Err("unsupported imul operands".to_string()),
+                    Operand::Memory(mem) => {
+                        self.emit_segment_prefix(mem)?;
+                        if size == 2 { self.bytes.push(0x66); }
+                        self.emit_rex_rm(size, &dst.name, mem);
+                        let rc = self.relocations.len();
+                        self.bytes.push(if short { 0x6B } else { 0x69 });
+                        self.encode_modrm_mem(dst_num, mem)?;
+                        let trailing: i64 = if short { 1 } else if size == 2 { 2 } else { 4 };
+                        self.adjust_rip_reloc_addend(rc, trailing);
+                    }
+                    _ => return Err("unsupported imul operands".to_string()),
                 }
+                if short {
+                    self.bytes.push(canonical_imm(val, size) as u8);
+                } else {
+                    self.push_imul_imm(val, size);
+                }
+                Ok(())
             }
             _ => Err("imul requires 1-3 operands".to_string()),
         }

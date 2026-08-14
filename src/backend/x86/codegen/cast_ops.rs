@@ -190,7 +190,7 @@ impl X86Codegen {
             }
         }
 
-        // v5: register-direct integer -> float casts. Emit cvtsi2sd/cvtsi2ss
+        // register-direct integer -> float casts. Emit cvtsi2sd/cvtsi2ss
         // directly into the destination's allocated XMM register instead of the
         // accumulator path's GPR round-trip (cvtsi2sd %rax,%xmm0; movq
         // %xmm0,%rax; movq %rax,%xmmN). U64 needs the shift+round dance and is

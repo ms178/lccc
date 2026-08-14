@@ -1,0 +1,182 @@
+;;; segments
+.text
+mov %fs:8(%rax), %rbx
+movl $1, %fs:(%rdi)
+mov %fs:0, %rax
+mov %fs:16, %rax
+movw $1, %fs:(%rdi)
+mov %fs:8(%r13,%r12,4), %rax
+mov %gs:8(%rax), %rbx
+movl $1, %gs:(%rdi)
+mov %gs:0, %rax
+mov %gs:16, %rax
+movw $1, %gs:(%rdi)
+mov %gs:8(%r13,%r12,4), %rax
+mov %cs:8(%rax), %rbx
+movl $1, %cs:(%rdi)
+mov %cs:0, %rax
+mov %cs:16, %rax
+movw $1, %cs:(%rdi)
+mov %cs:8(%r13,%r12,4), %rax
+mov %ss:8(%rax), %rbx
+movl $1, %ss:(%rdi)
+mov %ss:0, %rax
+mov %ss:16, %rax
+movw $1, %ss:(%rdi)
+mov %ss:8(%r13,%r12,4), %rax
+mov %ds:8(%rax), %rbx
+movl $1, %ds:(%rdi)
+mov %ds:0, %rax
+mov %ds:16, %rax
+movw $1, %ds:(%rdi)
+mov %ds:8(%r13,%r12,4), %rax
+mov %es:8(%rax), %rbx
+movl $1, %es:(%rdi)
+mov %es:0, %rax
+mov %es:16, %rax
+movw $1, %es:(%rdi)
+mov %es:8(%r13,%r12,4), %rax
+;;; lock
+.text
+lock addb %al, (%rdi)
+lock addb $1, (%rdi)
+lock addw %ax, (%rdi)
+lock addw $1, (%rdi)
+lock addl %eax, (%rdi)
+lock addl $1, (%rdi)
+lock addq %rax, (%rdi)
+lock addq $1, (%rdi)
+lock orb %al, (%rdi)
+lock orb $1, (%rdi)
+lock orw %ax, (%rdi)
+lock orw $1, (%rdi)
+lock orl %eax, (%rdi)
+lock orl $1, (%rdi)
+lock orq %rax, (%rdi)
+lock orq $1, (%rdi)
+lock adcb %al, (%rdi)
+lock adcb $1, (%rdi)
+lock adcw %ax, (%rdi)
+lock adcw $1, (%rdi)
+lock adcl %eax, (%rdi)
+lock adcl $1, (%rdi)
+lock adcq %rax, (%rdi)
+lock adcq $1, (%rdi)
+lock sbbb %al, (%rdi)
+lock sbbb $1, (%rdi)
+lock sbbw %ax, (%rdi)
+lock sbbw $1, (%rdi)
+lock sbbl %eax, (%rdi)
+lock sbbl $1, (%rdi)
+lock sbbq %rax, (%rdi)
+lock sbbq $1, (%rdi)
+lock andb %al, (%rdi)
+lock andb $1, (%rdi)
+lock andw %ax, (%rdi)
+lock andw $1, (%rdi)
+lock andl %eax, (%rdi)
+lock andl $1, (%rdi)
+lock andq %rax, (%rdi)
+lock andq $1, (%rdi)
+lock subb %al, (%rdi)
+lock subb $1, (%rdi)
+lock subw %ax, (%rdi)
+lock subw $1, (%rdi)
+lock subl %eax, (%rdi)
+lock subl $1, (%rdi)
+lock subq %rax, (%rdi)
+lock subq $1, (%rdi)
+lock xorb %al, (%rdi)
+lock xorb $1, (%rdi)
+lock xorw %ax, (%rdi)
+lock xorw $1, (%rdi)
+lock xorl %eax, (%rdi)
+lock xorl $1, (%rdi)
+lock xorq %rax, (%rdi)
+lock xorq $1, (%rdi)
+lock xaddb %al, (%rsi)
+lock cmpxchgb %al, (%rsi)
+lock incb (%rsi)
+lock decb (%rsi)
+lock negb (%rsi)
+lock notb (%rsi)
+xchg %al, (%rsi)
+lock xaddw %ax, (%rsi)
+lock cmpxchgw %ax, (%rsi)
+lock incw (%rsi)
+lock decw (%rsi)
+lock negw (%rsi)
+lock notw (%rsi)
+xchg %ax, (%rsi)
+lock xaddl %eax, (%rsi)
+lock cmpxchgl %eax, (%rsi)
+lock incl (%rsi)
+lock decl (%rsi)
+lock negl (%rsi)
+lock notl (%rsi)
+xchg %eax, (%rsi)
+lock xaddq %rax, (%rsi)
+lock cmpxchgq %rax, (%rsi)
+lock incq (%rsi)
+lock decq (%rsi)
+lock negq (%rsi)
+lock notq (%rsi)
+xchg %rax, (%rsi)
+lock cmpxchg16b (%rdi)
+lock cmpxchg8b (%rdi)
+;;; string
+.text
+rep movsb
+rep movsw
+rep movsl
+rep movsq
+rep stosb
+rep stosw
+rep stosl
+rep stosq
+rep lodsb
+rep lodsw
+rep lodsl
+rep lodsq
+rep scasb
+rep scasw
+rep scasl
+rep scasq
+rep cmpsb
+rep cmpsw
+repe movsb
+repe movsw
+repe movsl
+repe movsq
+repe stosb
+repe stosw
+repe stosl
+repe stosq
+repe lodsb
+repe lodsw
+repe lodsl
+repe lodsq
+repe scasb
+repe scasw
+repe scasl
+repe scasq
+repe cmpsb
+repe cmpsw
+repne movsb
+repne movsw
+repne movsl
+repne movsq
+repne stosb
+repne stosw
+repne stosl
+repne stosq
+repne lodsb
+repne lodsw
+repne lodsl
+repne lodsq
+repne scasb
+repne scasw
+repne scasl
+repne scasq
+repne cmpsb
+repne cmpsw

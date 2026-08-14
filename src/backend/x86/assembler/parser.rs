@@ -141,6 +141,10 @@ pub enum DataValue {
     SymbolDiff(String, String),
     /// symbol - symbol with constant addend
     SymbolDiffAddend(String, String, i64),
+    /// `(a - b) * scale + addend` — a symbol difference folded through an
+    /// arithmetic expression (e.g. `.long (end-start)*2`). Same-section label
+    /// differences are absolute, so this always resolves to a constant.
+    SymbolDiffScaled(String, String, i64, i64),
 }
 
 /// CFI directives (call frame information).
@@ -557,6 +561,19 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".quad" | ".8byte" => {
             let vals = parse_data_values(args)?;
             Ok(AsmItem::Quad(vals))
+        }
+        // Floating-point data. These were previously UNRECOGNIZED and fell
+        // through to the "ignore unknown directive" arm, silently emitting
+        // NOTHING — every `.float`/`.double` constant pool assembled from
+        // hand-written or third-party asm was dropped, shifting all following
+        // data. Emit the IEEE-754 bit patterns, matching GAS.
+        ".float" | ".single" => {
+            let vals = parse_float_values(args, false)?;
+            Ok(AsmItem::Byte(vals))
+        }
+        ".double" => {
+            let vals = parse_float_values(args, true)?;
+            Ok(AsmItem::Byte(vals))
         }
         ".zero" | ".skip" => {
             let (expr_str, fill) = split_skip_args(args);
@@ -1099,7 +1116,7 @@ fn parse_register_operand(s: &str) -> Result<Operand, String> {
     if let Some(colon_pos) = name.find(':') {
         let seg = &name[..colon_pos];
         let rest = &s[1 + colon_pos + 1..]; // after the colon
-        if seg == "fs" || seg == "gs" {
+        if is_segment_name(seg) {
             let mut mem = parse_memory_inner(rest)?;
             mem.segment = Some(seg.to_string());
             mem.mask = mask;
@@ -1221,7 +1238,7 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
     if s.starts_with('%') {
         if let Some(colon_pos) = s.find(':') {
             let seg = s[1..colon_pos].trim_start();
-            if seg == "fs" || seg == "gs" {
+            if is_segment_name(seg) {
                 let rest = &s[colon_pos + 1..];
                 let mut mem = parse_memory_inner(rest)?;
                 mem.segment = Some(seg.to_string());
@@ -1309,7 +1326,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
             if let Some(colon) = p0.find(':') {
                 if p0.starts_with('%') {
                     let seg = &p0[1..colon];
-                    if seg == "fs" || seg == "gs" {
+                    if is_segment_name(seg) {
                         seg_override = Some(seg.to_string());
                         let seg_val = p0[colon + 1..].trim();
                         if !seg_val.is_empty() && seg_val != "0"
@@ -1541,6 +1558,16 @@ fn parse_label_diff(s: &str) -> Option<DataValue> {
     None
 }
 
+/// The six x86 segment registers usable as an address override.
+///
+/// Only `%fs`/`%gs` have a nonzero base in 64-bit mode, but `%cs`/`%ds`/
+/// `%es`/`%ss` overrides are still legal encodings that appear in real code
+/// (multi-byte NOP padding uses a `%cs` prefix; boot code uses the others).
+/// Recognizing only fs/gs made the parser reject them outright.
+fn is_segment_name(s: &str) -> bool {
+    matches!(s, "cs" | "ds" | "es" | "fs" | "gs" | "ss")
+}
+
 /// Check if a string looks like a label (alphanumeric, underscore, dot).
 fn is_label_like(s: &str) -> bool {
     if s.is_empty() {
@@ -1606,6 +1633,40 @@ fn strip_sym_parens(s: &str) -> &str {
 }
 
 /// Parse data values (integers or symbol references).
+/// Parse a comma-separated list of floating-point literals into their
+/// little-endian IEEE-754 byte representation.
+///
+/// `double` selects binary64; otherwise binary32. GAS accepts the usual C
+/// spellings (`1.0`, `-0.0`, `3.14159`, `1e30`) plus its own `0f`/`0d`/`0e`
+/// prefixes, so we accept the same set.
+fn parse_float_values(s: &str, double: bool) -> Result<Vec<DataValue>, String> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let t = t
+            .strip_prefix("0f").or_else(|| t.strip_prefix("0F"))
+            .or_else(|| t.strip_prefix("0d")).or_else(|| t.strip_prefix("0D"))
+            .or_else(|| t.strip_prefix("0e")).or_else(|| t.strip_prefix("0E"))
+            .unwrap_or(t);
+        let v: f64 = t
+            .parse::<f64>()
+            .map_err(|_| format!("bad floating-point literal: {}", t))?;
+        if double {
+            for b in v.to_bits().to_le_bytes() {
+                out.push(DataValue::Integer(b as i64));
+            }
+        } else {
+            for b in (v as f32).to_bits().to_le_bytes() {
+                out.push(DataValue::Integer(b as i64));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
     let mut vals = Vec::new();
     for part in s.split(',') {
@@ -1655,6 +1716,16 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // A parenthesized symbol difference with arithmetic around it must be
+        // folded BEFORE the plain symbol+offset probe, otherwise `(c-a)+7`
+        // would be misread as "symbol named `(c-a)` plus 7".
+        if trimmed.starts_with('(') {
+            if let Some(val) = try_parse_sym_diff_expr(trimmed) {
+                vals.push(val);
+                continue;
+            }
+        }
+
         // Check for symbol+offset or symbol-offset (e.g., GD_struct+128, arr+33)
         if let Some(val) = parse_symbol_offset(trimmed) {
             vals.push(val);
@@ -1667,6 +1738,23 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
         if let Some(val) = try_parse_sym_diff(trimmed) {
             vals.push(val);
             continue;
+        }
+
+        // An arithmetic expression built from a single symbol difference, e.g.
+        // `(end-start)*2` or `(end-start)+7`. GAS folds these to a constant
+        // because the difference of two same-section labels is absolute.
+        // Without this, the whole expression was treated as a SYMBOL NAME and
+        // emitted as a relocation against a nonexistent symbol — the datum
+        // silently became zero and the object gained an undefined reference.
+        if let Some(val) = try_parse_sym_diff_expr(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // Reject anything that cannot be a symbol name outright rather than
+        // emitting a bogus relocation for it.
+        if !is_label_like(trimmed) {
+            return Err(format!("unsupported data expression: {}", trimmed));
         }
 
         // Symbol reference
@@ -1711,6 +1799,105 @@ fn parse_sym_addend(s: &str) -> Option<(String, i64)> {
 /// Parse GNU-as symbol-difference expressions that lack spaces around the
 /// operator or use parentheses: `(a-1)-.`, `a-(b-1)`, `(a+2)-b`, `a-b`.
 /// Returns DataValue::SymbolDiffAddend(a, b, add) meaning `a - b + add`.
+/// Fold an arithmetic expression over ONE symbol difference into a
+/// `SymbolDiffScaled` value: `(A-B)*k + c`.
+///
+/// Accepts `(A-B)`, `(A-B)*k`, `k*(A-B)`, `(A-B)+c`, `(A-B)-c` and the
+/// combination `(A-B)*k+c`. Anything else returns `None` so the caller can
+/// report it rather than silently mis-encoding it.
+fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
+    let t = s.trim();
+    let open = t.find('(')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, c) in t[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let inner = &t[open + 1..close];
+    let (a, b) = split_simple_diff(inner)?;
+
+    let before = t[..open].trim();
+    let after = t[close + 1..].trim();
+
+    let mut scale: i64 = 1;
+    let mut addend: i64 = 0;
+
+    if !before.is_empty() {
+        let f = before.strip_suffix('*')?.trim();
+        scale = scale.checked_mul(parse_integer_expr(f).ok()?)?;
+    }
+
+    let mut rest = after;
+    if let Some(r) = rest.strip_prefix('*') {
+        let (num, tail) = split_leading_int(r.trim())?;
+        scale = scale.checked_mul(num)?;
+        rest = tail.trim();
+    }
+    if !rest.is_empty() {
+        let (sign, r) = if let Some(r) = rest.strip_prefix('+') {
+            (1i64, r)
+        } else if let Some(r) = rest.strip_prefix('-') {
+            (-1i64, r)
+        } else {
+            return None;
+        };
+        addend = sign.checked_mul(parse_integer_expr(r.trim()).ok()?)?;
+        rest = "";
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(DataValue::SymbolDiffScaled(a, b, scale, addend))
+}
+
+/// Split `A-B` into its two label operands, or `None` when the text is not a
+/// plain difference of labels.
+fn split_simple_diff(s: &str) -> Option<(String, String)> {
+    let t = s.trim();
+    for (i, c) in t.char_indices().rev() {
+        if c != '-' || i == 0 {
+            continue;
+        }
+        let a = t[..i].trim();
+        let b = t[i + 1..].trim();
+        if is_label_like(a) && is_label_like(b) {
+            return Some((a.to_string(), b.to_string()));
+        }
+    }
+    None
+}
+
+/// Split a leading decimal/hex integer off the front of `s`.
+fn split_leading_int(s: &str) -> Option<(i64, &str)> {
+    let bytes = s.as_bytes();
+    let mut end = 0;
+    if s.starts_with("0x") || s.starts_with("0X") {
+        end = 2;
+        while end < bytes.len() && (bytes[end] as char).is_ascii_hexdigit() {
+            end += 1;
+        }
+    } else {
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((parse_integer_expr(&s[..end]).ok()?, &s[end..]))
+}
+
 fn try_parse_sym_diff(s: &str) -> Option<DataValue> {
     let s = s.trim();
     if s.is_empty() {

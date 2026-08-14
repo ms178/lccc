@@ -126,7 +126,7 @@ impl X86Codegen {
         // construction), the consumer falls back to materializing the bool —
         // but that path is unreachable for fused cmps.
         //
-        // SOUNDNESS (v13): flag fusion is DISABLED when a select fallback that
+        // SOUNDNESS: flag fusion is DISABLED when a select fallback that
         // materializes the condition via `operand_to_rax(cond)` is forced
         // (CCC_V9_SELECT = legacy v9 select emission; CCC_NO_INPLACE_SELECT =
         // disable the in-place condition test). Those legacy paths READ the
@@ -570,7 +570,7 @@ impl X86Codegen {
         false_val: &Operand,
         _ty: IrType,
     ) {
-        // V9-compat path (debugging): exact v9 emission order.
+        // legacy-compat path (debugging): the legacy emission order.
         if std::env::var("CCC_V9_SELECT").is_ok() {
             if let Some(d_reg) = self.dest_reg(dest) {
                 if !is_xmm_reg(d_reg) {

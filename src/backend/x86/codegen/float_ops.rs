@@ -271,7 +271,7 @@ impl X86Codegen {
             }
             return;
         }
-        // v5: compute directly into an XMM-allocated destination register
+        // compute directly into an XMM-allocated destination register
         // (one reg-reg move per chain link instead of store + reload).
         if let Some(&dreg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(dreg) {

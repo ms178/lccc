@@ -600,7 +600,7 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
         if let Some((offset, size)) = stored {
             // Check rax is dead after the store
             if is_rax_dead_after(store, infos, j + 1, len) {
-                // SOUNDNESS FIX (v6): the folded store must write the SAME number
+                // SOUNDNESS FIX: the folded store must write the SAME number
                 // of bytes as the ORIGINAL store, using the STORE's width — NOT
                 // the source move's width. Previously the mnemonic came from the
                 // source `movq %rX,%rax`/`movl %rXd,%eax`, so a `movq %rX,%rax;
@@ -612,7 +612,7 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
                 if src_fam == REG_NONE || src_fam as usize >= REG_NAMES[0].len() {
                     i += 1; continue;
                 }
-                // SOUNDNESS (v7): a 32-bit source move (`movl %REGd, %eax`) ZERO-EXTENDS
+                // SOUNDNESS: a 32-bit source move (`movl %REGd, %eax`) ZERO-EXTENDS
                 // to %rax, so a 64-bit store of %rax stores 0 in the upper 32 bits.
                 // Folding that to `movq %REG, slot` would store %REG's RAW upper bits
                 // (which may be non-zero) — a value change. Only fold a 64-bit store
@@ -763,7 +763,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
 
-            // SOUNDNESS (v1): an RSP-shifting line between the load and the
+            // SOUNDNESS: an RSP-shifting line between the load and the
             // fold target changes the load's effective slot offset (the fold
             // would substitute a memory operand at the WRONG address). Skip.
             let mut shifted = false;
@@ -781,7 +781,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
             let is_foldable_target = matches!(infos[j].kind,
                 LineKind::Other { .. } | LineKind::Cmp);
             if is_foldable_target {
-                // SOUNDNESS (v1): between the load and the fold target, the
+                // SOUNDNESS: between the load and the fold target, the
                 // loaded register must not be WRITTEN by anything — otherwise
                 // the target instruction operates on a different value than
                 // the one the load produced, and folding the memory operand
@@ -806,7 +806,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 // Special case: testq/testl %REG, %REG where REG is the loaded scratch reg.
                 // Fold to cmpq/cmpl $0, -N(%rbp).
                 //
-                // SOUNDNESS (v7): the folding width MUST come from the TEST
+                // SOUNDNESS: the folding width MUST come from the TEST
                 // instruction itself, NOT from the load width. `testl %eax, %eax`
                 // tests the 32-bit value (so SF reflects bit 31), whereas
                 // `testq %rax, %rax` tests the 64-bit value (SF reflects bit 63).
@@ -823,7 +823,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                     trimmed_j == &format!("testq {}, {}", pat.0, pat.0)
                         || trimmed_j == &format!("testl {}, {}", pat.1, pat.1)
                 } {
-                    // SOUNDNESS (v1): the fold deletes the load — the loaded
+                    // SOUNDNESS: the fold deletes the load — the loaded
                     // register must not be read again before its next write,
                     // or the value is lost (the register then holds stale
                     // data). This check was missing in fold_memory_operands
@@ -836,7 +836,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                     }
                     let load_line = infos[i].trimmed(store.get(i));
                     let mem_op = format_stack_offset(offset, load_line);
-                    // WIDTH SOUNDNESS (v1): the memory test must read exactly
+                    // WIDTH SOUNDNESS: the memory test must read exactly
                     // the bytes the load defined. A 32-bit load
                     // (`movl mem, %reg`) zero-extends into the register, so a
                     // following `testq %reg, %reg` only tests the low 32 bits
@@ -885,7 +885,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                             continue;
                         }
 
-                        // SOUNDNESS (v1): the fold deletes the load; the
+                        // SOUNDNESS: the fold deletes the load; the
                         // loaded register must not be read again before its
                         // next write, or the value is lost.
                         if !is_reg_dead_after(store, infos, j + 1, len, load_reg) {

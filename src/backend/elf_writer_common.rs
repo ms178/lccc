@@ -142,6 +142,11 @@ struct AlignMarker {
     offset: usize,
     padding: usize,
     kind: AlignMarkerKind,
+    /// Whether the item immediately preceding this padding was a complete
+    /// instruction. When it was not (a `.byte`, a lone prefix, raw data),
+    /// GAS emits one plain `0x90` before the long-NOP run; we match that so
+    /// padding is byte-identical and equally decoder-safe.
+    after_insn: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +155,18 @@ enum AlignMarkerKind {
     Align(u32),
     /// .org label + offset — advance to a fixed position.
     Org { label: String, addend: i64 },
+}
+
+/// A pending `(a - b) * scale + addend` datum, folded once both labels are
+/// placed.
+struct ScaledDiff {
+    sec_idx: usize,
+    offset: usize,
+    a: String,
+    b: String,
+    scale: i64,
+    addend: i64,
+    size: usize,
 }
 
 /// A section being built during assembly.
@@ -187,6 +204,124 @@ struct SymbolInfo {
     size: u64,
     is_common: bool,
     common_align: u32,
+}
+
+// ─── Executable padding (multi-byte NOPs) ─────────────────────────────
+
+/// Long-NOP patterns for 64-bit code, indexed by (length - 1).
+///
+/// These are the canonical `0F 1F /0` multi-byte NOP forms recommended by
+/// both the Intel SDM (Vol. 2B, "NOP") and the AMD optimization guides, and
+/// are exactly the patterns GNU as emits for `.p2align` in executable
+/// sections (`alt_patt` in gas/config/tc-i386.c).
+///
+/// WHY THIS MATTERS FOR CODE QUALITY, not just byte-exactness: padding a
+/// 15-byte gap with fifteen `0x90` bytes makes the front end decode, allocate
+/// and retire *fifteen* uops. One `nopw %cs:0(%rax,%rax,1)` plus one shorter
+/// NOP is two uops for the same 15 bytes. On Raptor Lake a long NOP retires
+/// as a single uop, so the long forms cost ~7x less front-end bandwidth.
+/// PGO block alignment deliberately inserts padding on *hot* paths — often
+/// immediately before a loop header executed millions of times — so
+/// single-byte fill burns issue slots in the hottest code in the program.
+const NOP_PATTERNS: [&[u8]; 11] = [
+    &[0x90],                                                        // nop
+    &[0x66, 0x90],                                                  // xchg %ax,%ax
+    &[0x0F, 0x1F, 0x00],                                            // nopl (%rax)
+    &[0x0F, 0x1F, 0x40, 0x00],                                      // nopl 0(%rax)
+    &[0x0F, 0x1F, 0x44, 0x00, 0x00],                                // nopl 0(%rax,%rax,1)
+    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],                          // nopw 0(%rax,%rax,1)
+    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],                    // nopl 0L(%rax)
+    &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],              // nopl 0L(%rax,%rax,1)
+    &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],        // nopw 0L(%rax,%rax,1)
+    &[0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],  // nopw %cs:0L(...)
+    &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+/// The largest single NOP we will emit (matches GAS's `alt_patt` limit).
+const MAX_NOP: usize = NOP_PATTERNS.len();
+
+/// Above this many maximum-size NOPs, jumping over the padding is cheaper
+/// than executing it. Matches GAS's `max_number_of_nops` for the long-NOP
+/// table: at 11 bytes per NOP the switch happens past ~77 bytes of padding,
+/// where a predicted-taken branch clearly beats decoding eight more NOPs.
+const MAX_NOP_RUN: usize = 7;
+
+/// Build `count` bytes of executable padding.
+///
+/// The layout mirrors GAS exactly: an optional remainder NOP sized
+/// `count % MAX_NOP` first, then a run of maximum-size NOPs. When the run
+/// would exceed `MAX_NOP_RUN` NOPs the whole gap is skipped with a single
+/// branch instead, so a large alignment gap costs one predicted-taken jump
+/// rather than dozens of decoded NOPs.
+pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(count);
+    if count == 0 {
+        return out;
+    }
+    let mut count = count;
+
+    // GAS's `last_insn_normal` rule: when the preceding bytes were not a
+    // complete instruction, lead with a single-byte NOP so a decoder that
+    // walked in from data does not mis-parse the multi-byte NOP.
+    if !after_insn {
+        out.push(0x90);
+        count -= 1;
+        if count == 0 {
+            return out;
+        }
+    }
+
+    if count / MAX_NOP > MAX_NOP_RUN {
+        let disp = count - 2;
+        if disp <= 0x7F {
+            out.push(0xEB);
+            out.push(disp as u8);
+            count = disp;
+        } else {
+            let rel = count - 5;
+            out.push(0xE9);
+            out.extend_from_slice(&(rel as u32).to_le_bytes());
+            count = rel;
+        }
+    }
+
+    let remainder = count % MAX_NOP;
+    if remainder != 0 {
+        out.extend_from_slice(NOP_PATTERNS[remainder - 1]);
+        count -= remainder;
+    }
+    while count != 0 {
+        out.extend_from_slice(NOP_PATTERNS[MAX_NOP - 1]);
+        count -= MAX_NOP;
+    }
+    out
+}
+
+/// Parse a `.skip`/`.space` size that is a self-contained constant.
+///
+/// Returns `None` for anything referencing a symbol, so genuinely
+/// forward-referencing sizes keep the deferred-resolution path.
+pub(crate) fn parse_const_skip(expr: &str) -> Option<usize> {
+    let s = expr.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        s.parse::<i64>().ok()?
+    };
+    Some(if v < 0 { 0 } else { v as usize })
+}
+
+/// Padding bytes for a section: multi-byte NOPs when executable, zeros
+/// otherwise.
+pub(crate) fn section_padding(count: usize, is_exec: bool, after_insn: bool) -> Vec<u8> {
+    if is_exec {
+        exec_padding(count, after_insn)
+    } else {
+        vec![0u8; count]
+    }
 }
 
 // ─── Expression evaluator ─────────────────────────────────────────────
@@ -311,6 +446,12 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// Current code mode (16, 32, or 64). Affects instruction encoding.
     /// Set by `.code16`, `.code32`, `.code64` directives.
     code_mode: u8,
+    /// Whether the most recently emitted item in the current section was a
+    /// complete instruction (as opposed to raw data). Drives the leading
+    /// plain-NOP rule for executable alignment padding.
+    last_item_was_insn: bool,
+    /// Scaled symbol differences awaiting label resolution.
+    deferred_scaled_diffs: Vec<ScaledDiff>,
     _arch: std::marker::PhantomData<A>,
 }
 
@@ -339,6 +480,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
             deferred_byte_diffs: Vec::new(),
             deferred_leb_diffs: Vec::new(),
             code_mode: A::default_code_mode(),
+            last_item_was_insn: false,
+            deferred_scaled_diffs: Vec::new(),
             _arch: std::marker::PhantomData,
         }
     }
@@ -401,6 +544,35 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn process_item(&mut self, item: &AsmItem) -> Result<(), String> {
+        let result = self.process_item_inner(item);
+        // Maintain the "previous item was a real instruction" state that
+        // executable alignment padding depends on. Labels and pure metadata
+        // directives are transparent: they emit no bytes, so they must not
+        // clear a preceding instruction's status.
+        match item {
+            AsmItem::Instruction(_) => self.last_item_was_insn = true,
+            AsmItem::Label(_)
+            | AsmItem::Global(_)
+            | AsmItem::Weak(_)
+            | AsmItem::Hidden(_)
+            | AsmItem::Protected(_)
+            | AsmItem::Internal(_)
+            | AsmItem::SymbolType(_, _)
+            | AsmItem::Size(_, _)
+            | AsmItem::Cfi(_)
+            | AsmItem::File(_, _)
+            | AsmItem::Loc(_, _, _)
+            | AsmItem::OptionDirective(_)
+            | AsmItem::Symver(_, _)
+            | AsmItem::Empty
+            | AsmItem::Align(_)
+            | AsmItem::Org(_, _) => {}
+            _ => self.last_item_was_insn = false,
+        }
+        result
+    }
+
+    fn process_item_inner(&mut self, item: &AsmItem) -> Result<(), String> {
         match item {
             AsmItem::Section(dir) => {
                 self.switch_section(dir);
@@ -470,6 +642,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.ensure_symbol(name, sec_idx, offset);
             }
             AsmItem::Align(n) => {
+                let after_insn = self.last_item_was_insn;
                 if let Some(sec_idx) = self.current_section {
                     let section = &mut self.sections[sec_idx];
                     let align = *n as u64;
@@ -485,13 +658,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             offset: current as usize,
                             padding,
                             kind: AlignMarkerKind::Align(*n),
+                            after_insn,
                         });
                     }
-                    if section.flags & SHF_EXECINSTR != 0 {
-                        section.data.extend(std::iter::repeat_n(0x90, padding));
-                    } else {
-                        section.data.extend(std::iter::repeat_n(0, padding));
-                    }
+                    let is_exec = section.flags & SHF_EXECINSTR != 0;
+                    section.data
+                        .extend_from_slice(&section_padding(padding, is_exec, after_insn));
                 }
             }
             AsmItem::Byte(vals) => {
@@ -524,8 +696,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.ensure_section()?;
                 if A::supports_deferred_skips() {
                     let sec_idx = self.current_section.ok_or("no active section for .skip")?;
-                    let offset = self.sections[sec_idx].data.len();
-                    self.deferred_skips.push((sec_idx, offset, expr.clone(), *fill));
+                    // CORRECTNESS: a `.skip` whose size is a plain constant
+                    // must occupy its bytes IMMEDIATELY. Deferring it leaves
+                    // the section cursor short, so a following `.p2align`
+                    // computes padding from the wrong offset and the requested
+                    // alignment is silently not achieved (observed:
+                    // `.skip 11,0xcc` + `.p2align 4` produced ZERO padding
+                    // instead of five bytes). Only genuinely symbolic sizes —
+                    // the kernel-alternatives case deferral exists for — still
+                    // need to wait for label resolution.
+                    if let Some(n) = parse_const_skip(expr) {
+                        let section = self.current_section_mut()?;
+                        section.data.extend(std::iter::repeat_n(*fill, n));
+                    } else {
+                        let offset = self.sections[sec_idx].data.len();
+                        self.deferred_skips.push((sec_idx, offset, expr.clone(), *fill));
+                    }
                 } else {
                     // Simple integer parse for architectures without deferred skip support
                     if let Ok(val) = expr.trim().parse::<u64>() {
@@ -609,6 +795,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn process_org(&mut self, sym: &str, offset: i64) -> Result<(), String> {
+        let after_insn = self.last_item_was_insn;
         let sec_idx = match self.current_section {
             Some(idx) => idx,
             None => return Ok(()),
@@ -642,11 +829,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     label: sym.to_string(),
                     addend: offset,
                 },
+                after_insn,
             });
         }
         if padding > 0 {
-            let fill = if self.sections[sec_idx].flags & SHF_EXECINSTR != 0 { 0x90u8 } else { 0u8 };
-            self.sections[sec_idx].data.extend(std::iter::repeat_n(fill, padding));
+            let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
+            let bytes = section_padding(padding, is_exec, after_insn);
+            self.sections[sec_idx].data.extend_from_slice(&bytes);
         }
         Ok(())
     }
@@ -776,6 +965,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 DataValue::SymbolDiffAddend(a, b, addend) => {
                     self.emit_symbol_diff(sec_idx, a, b, size, *addend)?;
                 }
+                DataValue::SymbolDiffScaled(a, b, scale, addend) => {
+                    // `(a-b)*scale + addend`. A scaled difference cannot be
+                    // expressed by any ELF relocation, so it must be folded to
+                    // a constant here; that is sound precisely because a
+                    // same-section label difference is link-time invariant.
+                    self.deferred_scaled_diffs.push(ScaledDiff {
+                        sec_idx,
+                        offset: self.sections[sec_idx].data.len(),
+                        a: self.aliases.get(a).cloned().unwrap_or_else(|| a.clone()),
+                        b: self.aliases.get(b).cloned().unwrap_or_else(|| b.clone()),
+                        scale: *scale,
+                        addend: *addend,
+                        size,
+                    });
+                    let section = &mut self.sections[sec_idx];
+                    section.data.extend(std::iter::repeat_n(0, size));
+                }
             }
         }
         Ok(())
@@ -840,6 +1046,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
                 DataValue::SymbolDiffAddend(a, b, addend) => {
                     self.defer_leb_diff(sec_idx, a, b, *addend, signed)?;
+                }
+                DataValue::SymbolDiffScaled(..) => {
+                    return Err(
+                        "scaled symbol difference in .uleb128/.sleb128 is unsupported"
+                            .to_string(),
+                    );
                 }
                 DataValue::Symbol(sym) | DataValue::SymbolOffset(sym, _) => {
                     return Err(format!(
@@ -1072,7 +1284,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
         }
-        let diffs = std::mem::take(&mut self.deferred_byte_diffs);
+        // NOTE: `diffs` was already taken above (its offsets are updated while
+        // the LEB placeholders shrink). Taking again here yields an EMPTY
+        // vector and silently drops every deferred byte/word symbol
+        // difference, leaving zeros in the data — which is exactly what
+        // `.byte b-a` and `.word b-a` produced before this fix.
         for (sec_idx, offset, sym_a, sym_b, size, addend) in &diffs {
             let pos_a = self.label_positions.get(sym_a)
                 .ok_or_else(|| format!("undefined label in .byte diff: {}", sym_a))?;
@@ -1292,6 +1508,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
+    /// Fold every pending `(a - b) * scale + addend` datum into its constant.
+    fn resolve_scaled_diffs(&mut self) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.deferred_scaled_diffs);
+        for d in &pending {
+            let pa = self
+                .label_positions
+                .get(&d.a)
+                .ok_or_else(|| format!("undefined label in expression: {}", d.a))?;
+            let pb = self
+                .label_positions
+                .get(&d.b)
+                .ok_or_else(|| format!("undefined label in expression: {}", d.b))?;
+            if pa.0 != pb.0 {
+                return Err(format!(
+                    "difference of labels in different sections is not constant: {} - {}",
+                    d.a, d.b
+                ));
+            }
+            let value = (pa.1 as i64 - pb.1 as i64)
+                .checked_mul(d.scale)
+                .and_then(|v| v.checked_add(d.addend))
+                .ok_or_else(|| format!("overflow folding ({} - {})", d.a, d.b))?;
+            let bytes = value.to_le_bytes();
+            let sec = &mut self.sections[d.sec_idx];
+            if d.offset + d.size > sec.data.len() {
+                return Err("internal: scaled diff placeholder overflow".to_string());
+            }
+            sec.data[d.offset..d.offset + d.size].copy_from_slice(&bytes[..d.size]);
+        }
+        Ok(())
+    }
+
     // ─── ELF emission ─────────────────────────────────────────────────
 
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
@@ -1310,6 +1558,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for sec_idx in 0..self.sections.len() {
             self.fixup_alignment_markers(sec_idx);
         }
+
+        // Fold scaled symbol differences last: alignment fixups above can
+        // still move labels, so the arithmetic must see final positions.
+        self.resolve_scaled_diffs()?;
 
         // Resolve internal relocations
         self.resolve_internal_relocations();
@@ -1818,7 +2070,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.sections[sec_idx].align_markers.sort_by_key(|m| m.offset);
 
         let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
-        let fill_byte = if is_exec { 0x90u8 } else { 0u8 };
 
         let mut marker_idx = 0;
         loop {
@@ -1852,24 +2103,27 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let needed_padding = needed_end.saturating_sub(current_offset);
             let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
 
-            if needed_padding > existing_padding {
-                let insert_at = current_offset + existing_padding;
-                let extra = needed_padding - existing_padding;
-                let insert_bytes = vec![fill_byte; extra];
-                self.sections[sec_idx].data.splice(insert_at..insert_at, insert_bytes);
-                self.shift_offsets_after(sec_idx, insert_at, extra as i64, marker_idx);
-            } else if needed_padding < existing_padding {
-                let remove_count = existing_padding - needed_padding;
-                let remove_start = current_offset + needed_padding;
-                let remove_end = remove_start + remove_count;
-                if remove_end <= self.sections[sec_idx].data.len() {
-                    self.sections[sec_idx].data.drain(remove_start..remove_end);
-                    self.shift_offsets_after(
-                        sec_idx,
-                        remove_start,
-                        -(remove_count as i64),
-                        marker_idx,
-                    );
+            if needed_padding != existing_padding {
+                // Regenerate the ENTIRE padding run rather than splicing the
+                // delta. Executable padding is a sequence of multi-byte NOP
+                // *instructions*, so inserting or deleting bytes in the middle
+                // of it would corrupt an instruction; only a full rebuild
+                // yields a valid, optimally-sized NOP sequence for the new
+                // length.
+                let start = current_offset;
+                let old_end = start + existing_padding;
+                let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
+                let new_bytes = section_padding(needed_padding, is_exec, after_insn);
+                debug_assert_eq!(new_bytes.len(), needed_padding);
+                if old_end <= self.sections[sec_idx].data.len() {
+                    self.sections[sec_idx].data.splice(start..old_end, new_bytes);
+                    let delta = needed_padding as i64 - existing_padding as i64;
+                    if delta != 0 {
+                        // Anchor the shift at the run's END so a label sitting
+                        // exactly at `start` (before the padding) is not
+                        // dragged along with it.
+                        self.shift_offsets_after(sec_idx, old_end, delta, marker_idx);
+                    }
                 }
             }
             // Persist the adjusted size so repeated fixup passes are idempotent.

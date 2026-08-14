@@ -1,4 +1,4 @@
-//! v7 indirect-call value-profile PROMOTION (LLVM `-pgo-indirect-call-promotion`).
+//! Indirect-call value-profile PROMOTION (cf. LLVM `-pgo-indirect-call-promotion`).
 //!
 //! At profile use we load the per-site callee distributions recorded by the
 //! training run. When the top target accounts for at least the promotion
@@ -64,7 +64,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
         .unwrap_or(51)
         .max(1)
         .min(100);
-    // v11 (red-team fix): a site whose top target accounts for >= STABLE_PERCENT
+    // A site whose top target accounts for >= STABLE_PERCENT
     // (default 95%) of calls is effectively SINGLE-TARGET and is already
     // predicted perfectly by the indirect branch predictor (BTB) — the guarded
     // `cmp fp, target; jne cold; call target; cold: call *fp` transform then
@@ -150,7 +150,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                 if tcount.saturating_mul(100) < site.total.saturating_mul(threshold) {
                     continue;
                 }
-                // v11: skip the effectively single-target (stable, perfectly
+                // Skip the effectively single-target (stable, perfectly
                 // predicted) sites — promoting them only adds per-call overhead
                 // (see the stable_percent rationale above).
                 if tcount.saturating_mul(100) >= site.total.saturating_mul(stable_percent) {

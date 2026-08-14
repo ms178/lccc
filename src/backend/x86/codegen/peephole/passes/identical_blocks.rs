@@ -8,7 +8,7 @@
 //! statements (e.g., sqlite3VdbeExec), where many case blocks produce
 //! identical phi copy sequences.
 //!
-//! SOUNDNESS (v6): two blocks with identical TEXT are NOT automatically
+//! SOUNDNESS: two blocks with identical TEXT are NOT automatically
 //! interchangeable — they may be reached with different live register/stack
 //! values from different predecessors. Merging them would give one predecessor
 //! the other path's inputs. We therefore require that two blocks share the
@@ -18,7 +18,7 @@
 use super::super::types::*;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
-// ── Soundness helpers (v8) ────────────────────────────────────────────────────
+// ── Soundness helpers ────────────────────────────────────────────────────
 //
 // Identical TEXT + identical predecessor LABELS is NOT sufficient to prove two
 // blocks are interchangeable, because live-in *state* can still differ:
@@ -255,7 +255,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         label_to_bidx.insert(b.2.clone(), idx);
     }
 
-    // SOUNDNESS (v8): collect labels referenced from JUMP TABLES
+    // SOUNDNESS: collect labels referenced from JUMP TABLES
     // (`.long .LBBxxx - .Ljt_n` entries in .rodata). Redirecting/eliminating a
     // block whose label appears in a jump table leaves the jump-table entry
     // pointing at a removed (NOP) block — `jmp *%rdx` then lands on garbage and
@@ -348,7 +348,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             .map(|j| store.get(j).to_string())
             .collect();
 
-        // SOUNDNESS (v8): skip if the canonical block is flag-dependent, not
+        // SOUNDNESS: skip if the canonical block is flag-dependent, not
         // clean, has a non-clean predecessor, or is a jump-table target.
         if flag_dep[canonical_idx] || !clean[canonical_idx] || !preds_clean[canonical_idx]
             || jump_table_targets.contains(&canonical_label) {
@@ -360,7 +360,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             let other_preds = preds.get(other_label).cloned().unwrap_or_default();
             // SOUNDNESS: require identical predecessor sets.
             if canonical_preds != other_preds { continue; }
-            // SOUNDNESS (v8): never merge/eliminate a jump-table target, a
+            // SOUNDNESS: never merge/eliminate a jump-table target, a
             // flag-dependent block, a non-clean block, or one with a non-clean
             // predecessor.
             if jump_table_targets.contains(other_label) { continue; }
@@ -372,7 +372,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                 .collect();
 
             if canonical_instrs == other_instrs {
-                // SOUNDNESS (v8): the fall-through successor is not part of the
+                // SOUNDNESS: the fall-through successor is not part of the
                 // block text; both blocks must fall through to the SAME next
                 // block (or neither falls through), else redirecting changes
                 // control flow after the merged block.

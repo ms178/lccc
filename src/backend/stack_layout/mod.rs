@@ -310,7 +310,7 @@ pub fn calculate_stack_space_common(
     // store_rax_to / store_eax_to can skip the store for these values.
     state.immediately_consumed = ctx.immediately_consumed.clone();
 
-    // v5: vector-intrinsic results that can skip their slot store (their only
+    // vector-intrinsic results that can skip their slot store (their only
     // use is the adjacent intrinsic's args[0]/args[1] load).
     state.vector_defer_values = ctx.vector_defer_values.clone();
 

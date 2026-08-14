@@ -47,10 +47,31 @@ impl super::InstructionEncoder {
     // Other instruction families that accept memory operands should also call this.
     pub(crate) fn emit_segment_prefix(&mut self, mem: &MemoryOperand) -> Result<(), String> {
         if let Some(ref seg) = mem.segment {
-            match seg.as_str() {
-                "fs" => self.bytes.push(0x64),
-                "gs" => self.bytes.push(0x65),
+            // All six segment override prefixes. In 64-bit mode only fs/gs
+            // change the effective address, but cs/ds/es/ss overrides remain
+            // legal encodings that appear in real code (the canonical long
+            // NOPs carry a %cs prefix), so refusing them rejected valid input.
+            let byte = match seg.as_str() {
+                "es" => Some(0x26u8),
+                "cs" => Some(0x2E),
+                // %ds and %ss are the DEFAULT segments for every addressing
+                // form in 64-bit mode, so an explicit override is a no-op.
+                // GAS elides it; emitting it wastes a byte of I-cache and
+                // diverges from the reference encoding for no benefit.
+                "ss" | "ds" => None,
+                "fs" => Some(0x64),
+                "gs" => Some(0x65),
                 _ => return Err(format!("unsupported segment override: %{}", seg)),
+            };
+            if let Some(b) = byte {
+                // The segment override is the OUTERMOST legacy prefix: it must
+                // precede an operand-size (0x66) or address-size (0x67) prefix
+                // that an earlier stage may already have emitted.
+                let mut at = self.bytes.len();
+                while at > 0 && matches!(self.bytes[at - 1], 0x66 | 0x67) {
+                    at -= 1;
+                }
+                self.bytes.insert(at, b);
             }
         }
         Ok(())

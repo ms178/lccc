@@ -113,7 +113,7 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
         23 => "xmm5",
         24 => "xmm6",
         25 => "xmm7",
-        // v6: xmm8-xmm15 are additional caller-saved F64 homes. Codegen
+        // xmm8-xmm15 are additional caller-saved F64 homes. Codegen
         // scratch only ever touches xmm0/xmm1 (and xmm2 for pblendvb/VNNI),
         // so the upper bank is a safe, stable home; the assembler already
         // encodes them (REX.R/X/B extension bits).

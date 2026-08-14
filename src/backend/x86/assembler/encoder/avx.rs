@@ -680,6 +680,31 @@ impl super::InstructionEncoder {
     }
 
     /// Encode AVX vmovaps/vmovapd/vmovups/vmovupd (no mandatory prefix, or 66 prefix)
+    /// Store-only VEX form: `op %xmm/%ymm, mem`. Used by the non-temporal
+    /// stores, which have no load direction at all.
+    pub(crate) fn encode_avx_store(&mut self, ops: &[Operand], opcode: u8, is_66: bool)
+        -> Result<(), String>
+    {
+        if ops.len() != 2 {
+            return Err("AVX store requires 2 operands".to_string());
+        }
+        let l = self.vex_l_from_ops(ops);
+        let pp = if is_66 { 1 } else { 0 };
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&src.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("non-temporal store requires register source and memory destination"
+                .to_string()),
+        }
+    }
+
     pub(crate) fn encode_avx_mov_np(&mut self, ops: &[Operand], load_op: u8, store_op: u8, is_66: bool) -> Result<(), String> {
         if ops.len() != 2 { return Err("AVX mov requires 2 operands".to_string()); }
         let l = self.vex_l_from_ops(ops);
