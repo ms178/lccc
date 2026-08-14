@@ -509,3 +509,49 @@ imull %eax, %ecx
 imull (%rdi), %ecx
 imulq %rax, %rcx
 imulq (%rdi), %rcx
+;;; misc_gaps
+.text
+cbw
+cbtw
+cwde
+cwtl
+cwd
+cwtd
+cdqe
+cltq
+cdq
+cltd
+cqo
+cqto
+xchg %eax, %eax
+xchg %rax, %rax
+xchg %ax, %ax
+xchg %eax, %ecx
+xchg %ecx, %eax
+xchg %r8, %rax
+xchg %rax, %r12
+xchg %al, %cl
+xchg %ax, %cx
+sysret
+sysretq
+ret $16
+ret
+endbr32
+endbr64
+adcxl %eax, %ecx
+adcxq %rax, %rcx
+adoxl %eax, %ecx
+clflushopt (%rdi)
+clwb (%rdi)
+movbew (%rdi), %ax
+movbel (%rdi), %eax
+movbeq (%rdi), %rax
+movbeq %rax, (%rdi)
+rdrand %rax
+rdrand %eax
+rdseed %r15
+mov 0x7fffffff, %eax
+mov 0x7ffffffe, %eax
+movabs 0x123456789abcdef0, %rax
+movabs 0x123456789abcdef0, %al
+movabs %rax, 0x123456789abcdef0

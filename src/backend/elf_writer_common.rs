@@ -566,7 +566,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::Symver(_, _)
             | AsmItem::Empty
             | AsmItem::Align(_)
-            | AsmItem::Org(_, _) => {}
+            | AsmItem::Org(_, _, _) => {}
             _ => self.last_item_was_insn = false,
         }
         result
@@ -689,8 +689,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let section = self.current_section_mut()?;
                 section.data.extend(std::iter::repeat_n(0u8, *n as usize));
             }
-            AsmItem::Org(sym, offset) => {
-                self.process_org(sym, *offset)?;
+            AsmItem::Org(sym, offset, fill) => {
+                self.process_org(sym, *offset, *fill)?;
             }
             AsmItem::SkipExpr(expr, fill) => {
                 self.ensure_section()?;
@@ -794,7 +794,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(())
     }
 
-    fn process_org(&mut self, sym: &str, offset: i64) -> Result<(), String> {
+    fn process_org(&mut self, sym: &str, offset: i64, fill: u8) -> Result<(), String> {
         let after_insn = self.last_item_was_insn;
         let sec_idx = match self.current_section {
             Some(idx) => idx,
@@ -803,6 +803,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let current = self.sections[sec_idx].data.len() as u64;
         let target = if sym.is_empty() {
             offset as u64
+        } else if sym == "." {
+            // `.` is the location counter, so `.org . + 16` advances 16 bytes
+            // from wherever we currently are rather than seeking to absolute
+            // offset 16.  It is not a label, so it never appears in
+            // `label_positions` and previously fell through to an error.
+            (current as i64 + offset) as u64
         } else if let Some(&(label_sec, label_off)) = self.label_positions.get(sym) {
             if label_sec == sec_idx {
                 (label_off as i64 + offset) as u64
@@ -833,9 +839,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
             });
         }
         if padding > 0 {
-            let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
-            let bytes = section_padding(padding, is_exec, after_insn);
-            self.sections[sec_idx].data.extend_from_slice(&bytes);
+            // `.org` pads with its fill byte, which defaults to ZERO -- even in
+            // an executable section.  This differs from `.p2align`, where GAS
+            // emits multi-byte NOPs so the padding stays executable; `.org` is a
+            // positioning directive, not an alignment one.  Verified against
+            // GAS 2.47: `nop; .org .+16; ret` -> 90 00*15 c3, while
+            // `.org .+16, 0x90` fills with 0x90.
+            let data = &mut self.sections[sec_idx].data;
+            data.resize(data.len() + padding, fill);
         }
         Ok(())
     }
@@ -1786,8 +1797,26 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 continue;
             }
 
-            // Relax in both directions until instruction sizes and alignment
-            // padding converge. Only jumps shortened here may grow again.
+            // Branch relaxation is a fixed-point problem with MORE THAN ONE
+            // solution, and the two obvious search directions do not find the
+            // same one.
+            //
+            // Starting pessimistic (every jump long) and only shrinking gets
+            // stuck: with a long jump in front of it, `.p2align 16` has to
+            // insert more padding, which pushes the target out of disp8 range,
+            // which "justifies" keeping the jump long.  That is self-consistent
+            // but 16 bytes worse than necessary.  A 124-nop test case came out
+            // 145 bytes against GAS's 129.
+            //
+            // Starting optimistic (every relaxable jump short) and only growing
+            // converges on the SMALLEST fixed point instead, and terminates for
+            // the same reason: every step strictly increases the section size,
+            // which is bounded.  That is also what GAS does, so byte-for-byte
+            // agreement comes for free.
+            //
+            // The first iteration therefore shrinks unconditionally; afterwards
+            // only growth is considered.
+            let mut first_pass = true;
             loop {
                 let mut any_change = false;
                 let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
@@ -1838,7 +1867,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         target_off as i64 - (jump.offset as i64 + 2)
                     };
                     let fits_short = (-128..=127).contains(&short_disp);
-                    if !jump.relaxed && fits_short {
+                    if first_pass && !jump.relaxed {
+                        // Speculatively shorten every relaxable jump, even one
+                        // that does not currently fit: the growth phase below
+                        // restores exactly those that still do not fit once the
+                        // layout has settled.
                         actions.push((j_idx, Action::Shrink));
                     } else if jump.relaxed && jump.can_grow && !fits_short {
                         actions.push((j_idx, Action::Grow));
@@ -2014,6 +2047,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
                 // Recompute alignment padding after the size changes.
                 self.fixup_alignment_markers(sec_idx);
+                first_pass = false;
 
                 if !any_change {
                     break;

@@ -268,3 +268,24 @@ movbew (%rdi), %ax
 movbel (%rdi), %eax
 movbeq (%rdi), %rax
 movbeq %rax, (%rdi)
+;;; bmi_gaps
+.text
+blsil %eax, %ecx
+blsiq %rax, %rcx
+blsrl %eax, %ecx
+blsrq %rax, %rcx
+blsmskl %eax, %ecx
+blsmskq %rax, %rcx
+blsil (%rdi), %eax
+blsrq (%rdi), %rax
+mulxl %eax, %ecx, %edx
+mulxq %rax, %rcx, %rdx
+mulxl (%rdi), %ecx, %edx
+pdepl %eax, %ecx, %edx
+pdepq %r8, %r9, %r10
+pextl %eax, %ecx, %edx
+pextq (%rdi), %rcx, %rdx
+shlxl %ecx, %eax, %edx
+shrxq %rcx, %rax, %rdx
+sarxl %ecx, %eax, %edx
+bzhil %ecx, %eax, %edx

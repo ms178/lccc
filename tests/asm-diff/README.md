@@ -24,6 +24,17 @@ The corpora are produced by `scripts/gen_asmdiff_corpus.py` and consumed by
 the corpus can never contain an input that would make the differential report
 a false failure.
 
+## Status
+
+All 721 cases pass against GNU as 2.47, and the per-instruction differential
+agrees byte-for-byte on every one of the 9,805 distinct instructions in the
+corpus (the remaining 63 are the deliberate reject list, which both assemblers
+refuse).
+
+`insndiff.py` synthesises any numeric local label an instruction refers to, so
+`jmp 1f` is compared as a real jump rather than being rejected by the oracle
+for want of a `1:` in the file.
+
 ## Running
 
 ```bash

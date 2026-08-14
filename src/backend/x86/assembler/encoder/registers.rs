@@ -226,7 +226,12 @@ pub(crate) fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
 pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
     // Handle mnemonics that don't follow the simple suffix pattern
     match mnemonic {
-        "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "ret" | "nop" | "ud2"
+        "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "cbtw" | "cbw" | "cwtl"
+        | "cwde" | "cdqe" | "cwtd" | "cwd" | "ret" | "nop" | "ud2"
+        // `rdrand`/`rdseed` end in `d`, and `movbe`/`lddqu` in `e`/`u`; none of
+        // those letters is an AT&T size suffix.  Without an entry here the
+        // width check below compares a bogus suffix against the real register.
+        | "rdrand" | "rdseed" | "movbe" | "lddqu" | "vlddqu" | "bswap"
         | "endbr64" | "pause" | "mfence" | "lfence" | "sfence" | "clflush"
         | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp" | "rdpmc"
         | "clc" | "stc" | "cli" | "sti" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "finit" | "fwait" | "wait" | "fnstcw" | "fstcw"
@@ -518,9 +523,10 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     // 8. Zero-operand instructions must not be given operands.
     if matches!(
         mnemonic,
-        "vzeroupper" | "vzeroall" | "cpuid" | "ret" | "retq" | "leave" | "leaveq"
+        "vzeroupper" | "vzeroall" | "cpuid" | "leave" | "leaveq"
             | "hlt" | "pause" | "syscall" | "sysret" | "ud2" | "cwtl"
             | "cltq" | "cqto" | "cltd" | "cwtd" | "endbr64" | "endbr32"
+            | "cbtw" | "cbw" | "cwde" | "cdqe" | "cwd"
             | "lfence" | "sfence" | "mfence" | "rdtsc" | "rdtscp" | "cdq" | "cqo"
     ) && !ops.is_empty()
     {
@@ -616,4 +622,63 @@ pub(crate) fn cc_from_mnemonic(cc_str: &str) -> Result<u8, String> {
         "nle" | "g" => Ok(15),
         _ => Err(format!("unknown condition code: {}", cc_str)),
     }
+}
+
+/// True for the FMA3 mnemonics that use the VEX 3-operand `0F38` encoding.
+pub(crate) fn is_fma3_vex(m: &str) -> bool {
+    fma3_opcode(m).is_some()
+}
+
+/// Decode an FMA3 mnemonic into its `0F38` opcode and VEX.W bit.
+///
+/// The FMA3 opcode space is a regular grid:
+///
+/// ```text
+///                 132     213     231
+///   vfmadd        0x98    0xA8    0xB8      packed; +1 -> scalar
+///   vfmsub        0x9A    0xAA    0xBA
+///   vfnmadd       0x9C    0xAC    0xBC
+///   vfnmsub       0x9E    0xAE    0xBE
+///   vfmaddsub     0x96    0xA6    0xB6      packed only
+///   vfmsubadd     0x97    0xA7    0xB7      packed only
+/// ```
+///
+/// W=1 selects the double-precision element type (`pd`/`sd`), W=0 selects
+/// single (`ps`/`ss`).  The mandatory prefix is 66 for every form.
+pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
+    let rest = m.strip_prefix("vfm").map(|r| (r, false))
+        .or_else(|| m.strip_prefix("vfnm").map(|r| (r, true)))?;
+    let (rest, negated) = rest;
+
+    // Element type: the last two characters.
+    let (rest, ty) = rest.split_at(rest.len().checked_sub(2)?);
+    let (w, scalar) = match ty {
+        "ps" => (0u8, false),
+        "pd" => (1, false),
+        "ss" => (0, true),
+        "sd" => (1, true),
+        _ => return None,
+    };
+
+    // Operand order: the three digits before the element type.
+    let (op, order) = rest.split_at(rest.len().checked_sub(3)?);
+    let order_step: u8 = match order {
+        "132" => 0,
+        "213" => 1,
+        "231" => 2,
+        _ => return None,
+    };
+
+    let base: u8 = match (op, negated) {
+        ("add", false) => 0x98,
+        ("sub", false) => 0x9A,
+        ("add", true) => 0x9C,
+        ("sub", true) => 0x9E,
+        // addsub/subadd have no scalar form.
+        ("addsub", false) if !scalar => 0x96,
+        ("subadd", false) if !scalar => 0x97,
+        _ => return None,
+    };
+
+    Some((base + 0x10 * order_step + u8::from(scalar), w))
 }

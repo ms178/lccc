@@ -113,9 +113,9 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                 let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
                 result.push(AsmItem::SkipExpr(new_expr, *fill));
             }
-            AsmItem::Org(sym, offset) => {
+            AsmItem::Org(sym, offset, fill) => {
                 if let Some(resolved) = resolve_numeric_name(sym, i, &defs) {
-                    result.push(AsmItem::Org(resolved, *offset));
+                    result.push(AsmItem::Org(resolved, *offset, *fill));
                 } else {
                     result.push(item.clone());
                 }

@@ -277,6 +277,38 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&[0u8; 8]);
                 Ok(())
             }
+            // moffs forms: `movabs 0xADDR, %al/%ax/%eax/%rax` (A0/A1) and the
+            // store direction `movabs %rax, 0xADDR` (A2/A3).  These are the only
+            // instructions that take a full 64-bit absolute address, and they
+            // are hard-wired to the accumulator, so no ModRM byte is emitted.
+            (Operand::Memory(mem), Operand::Register(dst))
+                if mem.base.is_none() && mem.index.is_none() && reg_num(&dst.name) == Some(0) =>
+            {
+                let addr = match &mem.displacement {
+                    Displacement::Integer(v) => *v,
+                    _ => return Err("movabs moffs requires an absolute address".to_string()),
+                };
+                let size = infer_reg_size(&dst.name);
+                if size == 2 { self.bytes.push(0x66); }
+                if size == 8 { self.bytes.push(self.rex(true, false, false, false)); }
+                self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
+                self.bytes.extend_from_slice(&addr.to_le_bytes());
+                Ok(())
+            }
+            (Operand::Register(src), Operand::Memory(mem))
+                if mem.base.is_none() && mem.index.is_none() && reg_num(&src.name) == Some(0) =>
+            {
+                let addr = match &mem.displacement {
+                    Displacement::Integer(v) => *v,
+                    _ => return Err("movabs moffs requires an absolute address".to_string()),
+                };
+                let size = infer_reg_size(&src.name);
+                if size == 2 { self.bytes.push(0x66); }
+                if size == 8 { self.bytes.push(self.rex(true, false, false, false)); }
+                self.bytes.push(if size == 1 { 0xA2 } else { 0xA3 });
+                self.bytes.extend_from_slice(&addr.to_le_bytes());
+                Ok(())
+            }
             _ => Err("unsupported movabsq operands".to_string()),
         }
     }
@@ -1237,6 +1269,45 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+
+                // `xchg` with the accumulator has a one-byte form, 0x90+rd, and
+                // GAS always prefers it: `xchg %rax,%rcx` -> 48 91 rather than
+                // the 3-byte ModRM form.  Two exceptions, both verified against
+                // GAS 2.47:
+                //   * 8-bit `xchg %al,%cl` has no short form at all (86 c1).
+                //   * `xchg %eax,%eax` must NOT become 0x90, because in 64-bit
+                //     mode the bare 0x90 is NOP and does not zero-extend EAX
+                //     into RAX the way a real 32-bit xchg would.  GAS emits
+                //     87 c0.  `xchg %rax,%rax` and `xchg %ax,%ax` are safe
+                //     (48 90 -> canonical 90, and 66 90).
+                if size != 1 {
+                    let other = if src_num == 0 && !needs_rex_ext(&src.name) {
+                        Some(&dst.name)
+                    } else if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                        Some(&src.name)
+                    } else {
+                        None
+                    };
+                    if let Some(other) = other {
+                        let other_is_eax =
+                            size == 4 && reg_num(other) == Some(0) && !needs_rex_ext(other);
+                        if !other_is_eax {
+                            let onum = reg_num(other).ok_or("bad register")?;
+                            if size == 2 {
+                                self.bytes.push(0x66);
+                            }
+                            // `xchg %rax,%rax` needs no REX.W: exchanging the
+                            // accumulator with itself is a no-op either way, so
+                            // GAS folds it to the canonical one-byte NOP.
+                            if !(size == 8 && onum == 0 && !needs_rex_ext(other)) {
+                                self.emit_rex_unary(size, other);
+                            }
+                            self.bytes.push(0x90 + (onum & 7));
+                            return Ok(());
+                        }
+                    }
+                }
+
                 if size == 2 { self.bytes.push(0x66); }
                 self.emit_rex_rr(size, &src.name, &dst.name);
                 self.bytes.push(if size == 1 { 0x86 } else { 0x87 });

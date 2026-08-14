@@ -150,6 +150,28 @@ def encode_gas(gas: str, src: Path, obj: Path, objcopy: str) -> Encoding:
     return Encoding(True, run_objcopy(objcopy, obj, obj.with_suffix(".bin")), "")
 
 
+
+# A bare `jmp 1f` / `je 0b` cannot be assembled on its own: GAS rejects the
+# numeric local label because the matching `1:` is not in the file.  That made
+# every such case look like a FALSE-ACCEPT (LCCC assembles it, GAS errors out)
+# when in fact neither assembler was being asked a meaningful question.
+# Synthesise the labels the instruction refers to so the comparison tests the
+# encoding instead of the harness.
+_LOCAL_LABEL_RE = re.compile(r"(?:^|[\s,])(\d+)([fb])\b")
+
+
+def local_label_scaffold(inst: str) -> tuple[str, str]:
+    """Return (before, after) text defining any numeric local labels used."""
+    before: list[str] = []
+    after: list[str] = []
+    for num, direction in _LOCAL_LABEL_RE.findall(inst):
+        if direction == "b":
+            before.append(f"{num}:")
+        else:
+            after.append(f"{num}:")
+    return ("\n".join(before), "\n".join(after))
+
+
 # ─── Classification ───────────────────────────────────────────────────────
 
 def classify(l: Encoding, g: Encoding) -> str:
@@ -230,7 +252,14 @@ def main() -> int:
         tmp = Path(td)
         src = tmp / "i.s"
         for i, inst in enumerate(insns):
-            src.write_text(f"{args.prologue}\n{inst}\n")
+            before, after = local_label_scaffold(inst)
+            parts = [args.prologue]
+            if before:
+                parts.append(before)
+            parts.append(inst)
+            if after:
+                parts.append(after)
+            src.write_text("\n".join(parts) + "\n")
             le = encode_lccc(args.lccc, src, tmp / f"l{i}.o", args.objcopy)
             ge = encode_gas(args.gas, src, tmp / f"g{i}.o", args.objcopy)
             results.append((inst, classify(le, ge), le, ge))

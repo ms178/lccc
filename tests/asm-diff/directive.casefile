@@ -176,3 +176,10 @@ cf:
         ret
         .cfi_endproc
 .size cf, .-cf
+;;; space_fill
+.data
+.space 8
+.space 4, 0xAA
+.byte 1
+.space 3, 0x5a
+.quad 0x1122334455667788

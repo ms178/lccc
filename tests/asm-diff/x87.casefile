@@ -156,3 +156,14 @@ ftst
 fxam
 fcompp
 fucompp
+;;; x87_gaps
+.text
+fcomi %st(0)
+fcomi %st(3)
+fcomi %st(3), %st
+fcomip %st(2)
+fucomi %st(2)
+fucomip %st(2)
+fists 8(%rsp)
+fistps 8(%rsp)
+fisttps 8(%rsp)

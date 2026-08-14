@@ -54,11 +54,16 @@ impl super::InstructionEncoder {
             let byte = match seg.as_str() {
                 "es" => Some(0x26u8),
                 "cs" => Some(0x2E),
-                // %ds and %ss are the DEFAULT segments for every addressing
-                // form in 64-bit mode, so an explicit override is a no-op.
-                // GAS elides it; emitting it wastes a byte of I-cache and
-                // diverges from the reference encoding for no benefit.
-                "ss" | "ds" => None,
+                // %ds is the default segment for every addressing form in
+                // 64-bit mode, so an explicit override is a pure no-op and GAS
+                // drops it.  %ss is NOT dropped: even though it selects the
+                // same flat segment, GAS still emits 0x36, and hardware treats
+                // the prefix as significant for a few corner cases (it is also
+                // the documented spelling of the CET no-track prefix).
+                // Verified against GAS 2.47: `mov %ds:8(%rax),%rbx` -> 48 8b 58
+                // 08, `mov %ss:8(%rax),%rbx` -> 36 48 8b 58 08.
+                "ds" => None,
+                "ss" => Some(0x36),
                 "fs" => Some(0x64),
                 "gs" => Some(0x65),
                 _ => return Err(format!("unsupported segment override: %{}", seg)),
@@ -113,6 +118,24 @@ impl super::InstructionEncoder {
 
     /// Encode ModR/M + SIB + displacement for a memory operand.
     /// Returns the bytes to append. `reg_field` is the /r value (3 bits).
+    /// True when the instruction currently being encoded carries a REX prefix.
+    ///
+    /// `self.bytes` holds exactly one instruction, so the prefix area is the
+    /// run of legacy prefixes at the front.  A REX byte (0x40-0x4F) is the last
+    /// prefix before the opcode, so scanning past the legacy prefixes and
+    /// testing the next byte identifies it unambiguously.
+    pub(crate) fn has_rex_prefix(&self) -> bool {
+        for &b in &self.bytes {
+            match b {
+                // Legacy prefixes: segment, operand/address size, lock/rep.
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {}
+                0x40..=0x4F => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     pub(crate) fn encode_modrm_mem(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
@@ -140,7 +163,23 @@ impl super::InstructionEncoder {
                         // Modifiers are case-insensitive in GNU as: glibc's
                         // multiarch sources emit lowercase `sym@gottpoff(%rip)`.
                         let reloc_type = match modifier.to_ascii_lowercase().as_str() {
-                            "gotpcrel" => R_X86_64_GOTPCREL,
+                            // GAS never emits the plain, un-relaxable
+                            // R_X86_64_GOTPCREL (9) for a RIP-relative GOT load.
+                            // It emits the "X" variants, which tell the linker
+                            // it may rewrite `mov sym@GOTPCREL(%rip),%reg` into
+                            // a direct `lea` when the symbol turns out to be
+                            // local -- removing a GOT entry and a load.  Which
+                            // of the two applies is decided purely by whether
+                            // the instruction carries a REX prefix.
+                            "gotpcrel" => {
+                                if self.has_rex_prefix() {
+                                    R_X86_64_REX_GOTPCRELX
+                                } else {
+                                    R_X86_64_GOTPCRELX
+                                }
+                            }
+                            "gotpcrelx" => R_X86_64_GOTPCRELX,
+                            "rex_gotpcrelx" => R_X86_64_REX_GOTPCRELX,
                             "gottpoff" => R_X86_64_GOTTPOFF,
                             "tpoff" => R_X86_64_TPOFF32,
                             "plt" => R_X86_64_PLT32,
