@@ -8,8 +8,12 @@ use crate::common::fx_hash::FxHashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 
-pub(super) fn collect_ifunc_symbols(globals: &FxHashMap<String, GlobalSymbol>, is_static: bool) -> Vec<String> {
-    if !is_static { return Vec::new(); }
+pub(super) fn collect_ifunc_symbols(globals: &FxHashMap<String, GlobalSymbol>, _is_static: bool) -> Vec<String> {
+    // IFUNCs need IRELATIVE handling in BOTH static and dynamic executables.
+    // Static: .rela.iplt applied by glibc csu via __rela_iplt_start/end.
+    // Dynamic: IRELATIVE entries appended to .rela.dyn, applied by ld.so.
+    // Without this, calls bind directly to the RESOLVER, so callers receive
+    // the implementation's address as the "return value" of the call.
     let mut ifunc_symbols: Vec<String> = globals.iter()
         .filter(|(_, g)| g.defined_in.is_some() && (g.info & 0xf) == STT_GNU_IFUNC)
         .map(|(n, _)| n.clone())
@@ -21,9 +25,17 @@ pub(super) fn collect_ifunc_symbols(globals: &FxHashMap<String, GlobalSymbol>, i
 pub(super) fn create_plt_got(
     objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
 ) -> (Vec<String>, Vec<(String, bool)>) {
+    // Ordered vectors preserve deterministic layout; the shadow HashSets make
+    // membership tests O(1). With tens of thousands of GOT symbols (e.g. a
+    // kernel-sized link) the previous Vec::contains scans were O(n^2) and
+    // dominated total link time.
+    use crate::common::fx_hash::FxHashSet;
     let mut plt_names: Vec<String> = Vec::new();
+    let mut plt_set: FxHashSet<String> = FxHashSet::default();
     let mut got_only_names: Vec<String> = Vec::new();
+    let mut got_only_set: FxHashSet<String> = FxHashSet::default();
     let mut copy_reloc_names: Vec<String> = Vec::new();
+    let mut copy_reloc_set: FxHashSet<String> = FxHashSet::default();
 
     for obj in objects {
         for sec_idx in 0..obj.sections.len() {
@@ -39,12 +51,12 @@ pub(super) fn create_plt_got(
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type == STT_OBJECT {
                             // Dynamic data symbol - needs copy relocation
-                            if !copy_reloc_names.contains(&sym.name) {
+                            if copy_reloc_set.insert(sym.name.clone()) {
                                 copy_reloc_names.push(sym.name.clone());
                             }
                         } else {
                             // Dynamic function symbol - needs PLT
-                            if !plt_names.contains(&sym.name) { plt_names.push(sym.name.clone()); }
+                            if plt_set.insert(sym.name.clone()) { plt_names.push(sym.name.clone()); }
                         }
                     }
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
@@ -54,12 +66,23 @@ pub(super) fn create_plt_got(
                         // for address-of. For symbols with PLT, the GOT entry is
                         // statically filled with the PLT address (no GLOB_DAT);
                         // for other dynamic symbols, GLOB_DAT is used.
-                        if !got_only_names.contains(&sym.name) {
+                        if got_only_set.insert(sym.name.clone()) {
                             got_only_names.push(sym.name.clone());
                         }
                     }
                     R_X86_64_GOTTPOFF => {
-                        if !got_only_names.contains(&sym.name) && !plt_names.contains(&sym.name) {
+                        if !plt_set.contains(&sym.name) && got_only_set.insert(sym.name.clone()) {
+                            got_only_names.push(sym.name.clone());
+                        }
+                    }
+                    R_X86_64_TLSGD => {
+                        // GD against a dynamic TLS symbol relaxes to IE, which
+                        // needs a GOT slot carrying an R_X86_64_TPOFF64 dynamic
+                        // relocation. GD against local symbols relaxes to LE
+                        // (no GOT entry needed).
+                        if gsym_info.map(|g| g.0).unwrap_or(false)
+                            && !plt_set.contains(&sym.name)
+                            && got_only_set.insert(sym.name.clone()) {
                             got_only_names.push(sym.name.clone());
                         }
                     }
@@ -67,8 +90,8 @@ pub(super) fn create_plt_got(
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type != STT_OBJECT && rela.rela_type == R_X86_64_64 {
                             // R_X86_64_64 for dynamic function (e.g. function pointer init) needs PLT
-                            if !plt_names.contains(&sym.name) { plt_names.push(sym.name.clone()); }
-                        } else if !plt_names.contains(&sym.name) && !got_only_names.contains(&sym.name) {
+                            if plt_set.insert(sym.name.clone()) { plt_names.push(sym.name.clone()); }
+                        } else if !plt_set.contains(&sym.name) && got_only_set.insert(sym.name.clone()) {
                             got_only_names.push(sym.name.clone());
                         }
                     }
@@ -101,7 +124,7 @@ pub(super) fn create_plt_got(
         let alias_names: Vec<String> = globals.iter()
             .filter(|(name, g)| {
                 g.is_dynamic && !g.copy_reloc && (g.info & 0xf) == STT_OBJECT
-                    && !copy_reloc_names.contains(name)
+                    && !copy_reloc_set.contains(*name)
                     && g.from_lib.is_some() && g.lib_sym_value != 0
                     && copy_reloc_lib_addrs.contains(
                         &(g.from_lib.as_ref().unwrap().clone(), g.lib_sym_value))

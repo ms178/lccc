@@ -5,7 +5,7 @@ pub(crate) mod common;
 pub(crate) mod elf;
 pub(crate) mod elf_writer_common; // Shared x86/i686 assembler ELF writer
 #[cfg_attr(feature = "gcc_linker", allow(dead_code))] // Built-in linker code unused when gcc handles linking
-pub(crate) mod linker_common;
+pub mod linker_common;
 pub(crate) mod peephole_common; // Shared peephole optimizer utilities (word matching, LineStore)
 
 // Shared codegen framework, split into focused modules:
@@ -26,7 +26,7 @@ pub(crate) mod regalloc;     // Linear scan register allocator
 pub(crate) mod split_ranges; // Live range splitting for call-spanning values
 
 
-pub(crate) mod x86;
+pub mod x86;
 pub(crate) mod i686;
 pub(crate) mod arm;
 pub(crate) mod riscv;

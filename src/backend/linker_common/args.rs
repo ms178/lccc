@@ -30,6 +30,14 @@ pub struct LinkerArgs {
     pub gc_sections: bool,
     /// Whether `-static` was passed.
     pub is_static: bool,
+    /// Entry point symbol from `-e SYM` / `--entry=SYM` (default `_start`).
+    pub entry_symbol: Option<String>,
+    /// Symbols to wrap from `--wrap=SYM`: references to SYM are redirected to
+    /// `__wrap_SYM`, and references to `__real_SYM` are redirected to SYM.
+    pub wrap_symbols: Vec<String>,
+    /// Symbols forced undefined via `-u SYM` / `--undefined=SYM` (forces
+    /// archive members that define them to be pulled in).
+    pub undefined_symbols: Vec<String>,
 }
 
 /// Parse user linker arguments into a structured `LinkerArgs`.
@@ -106,6 +114,32 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.gc_sections = false;
                 } else if part == "-static" {
                     result.is_static = true;
+                } else if let Some(sym) = part.strip_prefix("--entry=") {
+                    result.entry_symbol = Some(sym.to_string());
+                } else if (part == "-e" || part == "--entry") && j + 1 < parts.len() {
+                    j += 1;
+                    result.entry_symbol = Some(parts[j].to_string());
+                } else if let Some(sym) = part.strip_prefix("--wrap=") {
+                    result.wrap_symbols.push(sym.to_string());
+                } else if part == "--wrap" && j + 1 < parts.len() {
+                    j += 1;
+                    result.wrap_symbols.push(parts[j].to_string());
+                } else if let Some(sym) = part.strip_prefix("--undefined=") {
+                    result.undefined_symbols.push(sym.to_string());
+                } else if (part == "-u" || part == "--undefined") && j + 1 < parts.len() {
+                    j += 1;
+                    result.undefined_symbols.push(parts[j].to_string());
+                } else if let Some(sym) = part.strip_prefix("-u") {
+                    if !sym.is_empty() && !sym.starts_with('-') {
+                        result.undefined_symbols.push(sym.to_string());
+                    }
+                } else if let Some(sym) = part.strip_prefix("-e") {
+                    // -e<sym> joined form (only if it looks like a symbol, not
+                    // another flag such as -export-dynamic which is handled above)
+                    if !sym.is_empty() && !sym.starts_with('-')
+                        && !part.starts_with("-enable") && !part.starts_with("-export") {
+                        result.entry_symbol = Some(sym.to_string());
+                    }
                 }
                 // TODO: --whole-archive / --no-whole-archive are positional flags
                 // that need per-file tracking; currently handled in link_shared's

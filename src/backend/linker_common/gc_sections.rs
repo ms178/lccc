@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::elf::{
-    SHF_ALLOC, SHF_EXCLUDE,
+    SHF_ALLOC, SHF_EXCLUDE, SHF_GNU_RETAIN,
     SHT_NULL, SHT_STRTAB, SHT_SYMTAB, SHT_RELA, SHT_REL, SHT_GROUP,
     STB_GLOBAL, STB_WEAK,
     SHN_UNDEF, SHN_ABS, SHN_COMMON,
@@ -21,6 +21,16 @@ use super::Elf64Object;
 /// arrays, follows relocations transitively to find all reachable sections.
 pub fn gc_collect_sections_elf64(
     objects: &[Elf64Object],
+) -> FxHashSet<(usize, usize)> {
+    gc_collect_sections_elf64_roots(objects, &[])
+}
+
+/// Like `gc_collect_sections_elf64` but with additional root symbols
+/// (custom entry point from `-e`, forced-undefined symbols from `-u`,
+/// exported symbols, etc.).
+pub fn gc_collect_sections_elf64_roots(
+    objects: &[Elf64Object],
+    extra_roots: &[String],
 ) -> FxHashSet<(usize, usize)> {
     // Build the set of all allocatable input sections
     let mut all_sections: FxHashSet<(usize, usize)> = FxHashSet::default();
@@ -48,6 +58,21 @@ pub fn gc_collect_sections_elf64(
         }
     }
 
+    // Collect section names referenced via __start_<X> / __stop_<X> symbols.
+    // GNU ld treats sections whose name is referenced this way as GC roots
+    // (they are reachable through the auto-generated bracket symbols even
+    // though no relocation points into them directly).
+    let mut start_stop_referenced: FxHashSet<&str> = FxHashSet::default();
+    for obj in objects.iter() {
+        for sym in &obj.symbols {
+            if sym.shndx != SHN_UNDEF { continue; }
+            if let Some(suffix) = sym.name.strip_prefix("__start_")
+                .or_else(|| sym.name.strip_prefix("__stop_")) {
+                start_stop_referenced.insert(suffix);
+            }
+        }
+    }
+
     // Seed the worklist with entry-point sections and sections that must be kept
     let mut live: FxHashSet<(usize, usize)> = FxHashSet::default();
     let mut worklist: VecDeque<(usize, usize)> = VecDeque::new();
@@ -62,6 +87,11 @@ pub fn gc_collect_sections_elf64(
     let entry_symbols = ["_start", "main", "__libc_csu_init", "__libc_csu_fini"];
     for &entry_name in &entry_symbols {
         if let Some(&key) = sym_to_section.get(entry_name) {
+            mark_live(key, &mut live, &mut worklist);
+        }
+    }
+    for root in extra_roots {
+        if let Some(&key) = sym_to_section.get(root.as_str()) {
             mark_live(key, &mut live, &mut worklist);
         }
     }
@@ -80,6 +110,10 @@ pub fn gc_collect_sections_elf64(
                 || name == ".init" || name == ".fini"
                 || name == ".note.GNU-stack"
                 || name == ".note.gnu.build-id"
+                // SHF_GNU_RETAIN: __attribute__((retain)) sections must survive GC.
+                || sec.flags & SHF_GNU_RETAIN != 0
+                // Sections referenced via __start_/__stop_ bracket symbols.
+                || start_stop_referenced.contains(name.as_str())
             {
                 mark_live((obj_idx, sec_idx), &mut live, &mut worklist);
             }

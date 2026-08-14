@@ -22,6 +22,7 @@ pub fn map_section_name(name: &str) -> &str {
     if name.starts_with(".data.") || name == ".data" { return ".data"; }
     if name.starts_with(".rodata.") || name == ".rodata" { return ".rodata"; }
     if name.starts_with(".bss.") || name == ".bss" { return ".bss"; }
+    if name.starts_with(".preinit_array") { return ".preinit_array"; }
     if name.starts_with(".init_array") { return ".init_array"; }
     if name.starts_with(".fini_array") { return ".fini_array"; }
     if name.starts_with(".tbss.") || name == ".tbss" { return ".tbss"; }

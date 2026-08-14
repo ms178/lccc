@@ -7,6 +7,7 @@ pub(crate) mod ir;
 pub(crate) mod passes;
 pub mod backend;
 pub mod driver;
+pub mod linker_entry;
 pub(crate) mod pgo;
 
 /// Shared entry point for all compiler binaries. Spawns the real work on a

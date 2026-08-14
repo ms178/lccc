@@ -52,6 +52,24 @@ pub fn link_builtin(
     let use_runpath = parsed_args.use_runpath;
     let defsym_defs = parsed_args.defsym_defs;
     let gc_sections = parsed_args.gc_sections;
+    let entry_symbol = parsed_args.entry_symbol;
+    let wrap_symbols = parsed_args.wrap_symbols;
+    let undefined_symbols = parsed_args.undefined_symbols;
+
+    // Force-undefined symbols (-u SYM): enter them into the global table as
+    // undefined so the archive group-resolution loop below pulls in defining
+    // members, exactly like GNU ld/mold.
+    for sym_name in &undefined_symbols {
+        if !globals.contains_key(sym_name) {
+            let fake = linker_common::Elf64Symbol {
+                name_idx: 0, name: sym_name.clone(),
+                info: 1 << 4, // STB_GLOBAL, STT_NOTYPE
+                other: 0, shndx: 0, value: 0, size: 0,
+            };
+            globals.insert(sym_name.clone(),
+                <GlobalSymbol as linker_common::GlobalSymbolOps>::new_undefined(&fake));
+        }
+    }
 
     // Load extra .o files immediately; archives (.a) and shared libraries (.so)
     // are deferred to the group resolution loop. Archives need iterative re-scanning
@@ -138,11 +156,44 @@ pub fn link_builtin(
         }
     }
 
+    // Apply --wrap=SYM: undefined references to SYM become references to
+    // __wrap_SYM, and undefined references to __real_SYM become references
+    // to SYM. Definitions are never renamed (GNU ld semantics). This is done
+    // by rewriting the per-object symbol tables, so every later phase
+    // (PLT/GOT construction, relocation application, GC) sees the redirected
+    // names with zero extra bookkeeping.
+    if !wrap_symbols.is_empty() {
+        for obj in objects.iter_mut() {
+            for sym in obj.symbols.iter_mut() {
+                if sym.shndx == 0 && !sym.name.is_empty() {
+                    if wrap_symbols.contains(&sym.name) {
+                        sym.name = format!("__wrap_{}", sym.name);
+                    } else if let Some(real) = sym.name.strip_prefix("__real_") {
+                        if wrap_symbols.iter().any(|w| w == real) {
+                            sym.name = real.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        // Drop stale undefined entries created before the rewrite.
+        for w in &wrap_symbols {
+            globals.remove(&format!("__real_{}", w));
+            if globals.get(w).map(|g| g.defined_in.is_none() && !g.is_dynamic).unwrap_or(false) {
+                globals.remove(w);
+            }
+        }
+        // The wrapper may be undefined if the user forgot to provide it.
+        // Leave that to the normal undefined-symbol check below.
+    }
+
     // Garbage-collect unreferenced sections when --gc-sections is active.
     // This removes sections not reachable from entry points, which may also
     // eliminate undefined symbol references from dead code.
     let dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
-        linker_common::gc_collect_sections_elf64(&objects)
+        let mut gc_roots: Vec<String> = undefined_symbols.clone();
+        if let Some(ref e) = entry_symbol { gc_roots.push(e.clone()); }
+        linker_common::gc_collect_sections_elf64_roots(&objects, &gc_roots)
     } else {
         FxHashSet::default()
     };
@@ -196,7 +247,7 @@ pub fn link_builtin(
         &objects, &mut globals, &mut output_sections, &section_map,
         &plt_names, &got_entries, &needed_sonames, output_path,
         export_dynamic, &rpath_entries, use_runpath, is_static,
-        &ifunc_symbols,
+        &ifunc_symbols, entry_symbol.as_deref(),
     )
 }
 

@@ -75,6 +75,29 @@ pub fn merge_sections_elf64_gc(
         }
     }
 
+    // Sort .init_array/.fini_array inputs by their numeric priority suffix
+    // (GNU SORT_BY_INIT_PRIORITY semantics): `.init_array.NNNNN` runs in
+    // ascending N order, and unsuffixed `.init_array` entries run last.
+    // Without this, __attribute__((constructor(P))) ordering is broken.
+    // The same rule applies to `.ctors.N`/`.dtors.N` (whose names encode
+    // 65535-P, but ascending name order is still correct within the group).
+    for out_sec in output_sections.iter_mut() {
+        if out_sec.name != ".init_array" && out_sec.name != ".fini_array"
+            && out_sec.name != ".ctors" && out_sec.name != ".dtors"
+            && out_sec.name != ".preinit_array" {
+            continue;
+        }
+        let prio_key = |input: &InputSection| -> (u64, usize, usize) {
+            let name = &objects[input.object_idx].sections[input.section_idx].name;
+            let prio = name.rsplit('.').next()
+                .and_then(|suf| suf.parse::<u64>().ok())
+                // Unsuffixed sections sort AFTER all prioritized ones.
+                .unwrap_or(u64::MAX);
+            (prio, input.object_idx, input.section_idx)
+        };
+        out_sec.inputs.sort_by_key(prio_key);
+    }
+
     for out_sec in output_sections.iter_mut() {
         let mut off: u64 = 0;
         for input in &mut out_sec.inputs {

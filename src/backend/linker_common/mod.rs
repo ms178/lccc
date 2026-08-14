@@ -53,6 +53,7 @@
 
 // ── Submodule declarations ──────────────────────────────────────────────
 
+pub mod linker_script;
 mod types;
 mod parse_object;
 mod parse_shared;
@@ -125,4 +126,4 @@ pub use check::check_undefined_symbols_elf64;
 pub use eh_frame::{count_eh_frame_fdes, build_eh_frame_hdr};
 
 // gc_sections.rs
-pub use gc_sections::gc_collect_sections_elf64;
+pub use gc_sections::{gc_collect_sections_elf64, gc_collect_sections_elf64_roots};

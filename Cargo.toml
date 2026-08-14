@@ -28,6 +28,10 @@ path = "src/bin/ccc_riscv.rs"
 name = "lccc-i686"
 path = "src/bin/ccc_i686.rs"
 
+[[bin]]
+name = "lccc-ld"
+path = "src/bin/lccc_ld.rs"
+
 [features]
 # Allow GCC as a linker fallback. When enabled and GCC is used, a warning is printed.
 gcc_linker = []

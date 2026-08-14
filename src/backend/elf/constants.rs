@@ -70,6 +70,7 @@ pub const SHF_INFO_LINK: u64 = 0x40;
 pub const SHF_GROUP: u64 = 0x200;
 pub const SHF_TLS: u64 = 0x400;
 pub const SHF_EXCLUDE: u64 = 0x8000_0000;
+pub const SHF_GNU_RETAIN: u64 = 0x20_0000;
 
 // ── Symbol binding ───────────────────────────────────────────────────────────
 

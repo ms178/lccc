@@ -176,6 +176,7 @@ pub(super) fn emit_shared_library(
     // In shared libraries, undefined symbols are resolved at runtime by the
     // dynamic linker, so we need PLT entries for all of them.
     let mut plt_names: Vec<String> = Vec::new();
+    let mut plt_seen: FxHashSet<String> = FxHashSet::default();
     for obj in objects.iter() {
         for sec_relas in &obj.relocations {
             for rela in sec_relas {
@@ -192,7 +193,7 @@ pub(super) fn emit_shared_library(
                             // or undefined symbols not defined in any loaded object
                             let needs_plt = gsym.is_dynamic
                                 || (gsym.defined_in.is_none() && gsym.section_idx == SHN_UNDEF);
-                            if needs_plt && !plt_names.contains(&sym.name) {
+                            if needs_plt && plt_seen.insert(sym.name.clone()) {
                                 plt_names.push(sym.name.clone());
                             }
                         }
@@ -230,25 +231,45 @@ pub(super) fn emit_shared_library(
     // For undefined symbols, these need R_X86_64_GLOB_DAT relocations
     // (or R_X86_64_TPOFF64 for TLS symbols referenced via GOTTPOFF).
     let mut got_needed_names: Vec<String> = Vec::new();
+    let mut got_needed_seen: FxHashSet<String> = FxHashSet::default();
+    let mut tlsgd_seen: FxHashSet<String> = FxHashSet::default();
     let mut tls_got_names: FxHashSet<String> = FxHashSet::default();
+    // TLS General-Dynamic symbols: each needs a GOT slot PAIR
+    // (DTPMOD64 at slot, DTPOFF64 at slot+8).
+    let mut tlsgd_names: Vec<String> = Vec::new();
+    // TLS Local-Dynamic: one shared GOT pair (DTPMOD64, 0) per module.
+    let mut needs_tlsld_slot = false;
     for obj in objects.iter() {
         for sec_relas in &obj.relocations {
             for rela in sec_relas {
                 let si = rela.sym_idx as usize;
                 if si >= obj.symbols.len() { continue; }
                 let sym = &obj.symbols[si];
+                if rela.rela_type == R_X86_64_TLSLD { needs_tlsld_slot = true; continue; }
                 if sym.name.is_empty() { continue; }
                 // Skip local symbols - they don't need GOT entries in dynsym
                 // (e.g. static _Thread_local variables referenced via GOTTPOFF)
-                if sym.is_local() { continue; }
+                if sym.is_local() {
+                    // ...but a local symbol referenced via TLSGD still needs a
+                    // GOT pair; use the symbol's mangled per-object identity.
+                    if rela.rela_type == R_X86_64_TLSGD && tlsgd_seen.insert(sym.name.clone()) {
+                        tlsgd_names.push(sym.name.clone());
+                    }
+                    continue;
+                }
                 match rela.rela_type {
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX | R_X86_64_GOTTPOFF => {
-                        if !got_needed_names.contains(&sym.name) {
+                        if got_needed_seen.insert(sym.name.clone()) {
                             got_needed_names.push(sym.name.clone());
                         }
                         // Track TLS symbols for proper dynamic relocation emission
                         if sym.sym_type() == STT_TLS {
                             tls_got_names.insert(sym.name.clone());
+                        }
+                    }
+                    R_X86_64_TLSGD => {
+                        if tlsgd_seen.insert(sym.name.clone()) {
+                            tlsgd_names.push(sym.name.clone());
                         }
                     }
                     _ => {}
@@ -292,6 +313,7 @@ pub(super) fn emit_shared_library(
 
     // Collect all defined global symbols for export
     let mut dyn_sym_names: Vec<String> = Vec::new();
+    let mut dyn_sym_seen: FxHashSet<String> = FxHashSet::default();
     let mut exported: Vec<String> = globals.iter()
         .filter(|(name, g)| {
             if !(g.defined_in.is_some() && !g.is_dynamic
@@ -314,7 +336,7 @@ pub(super) fn emit_shared_library(
         .collect();
     exported.sort();
     for name in exported {
-        if !dyn_sym_names.contains(&name) {
+        if dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name);
         }
     }
@@ -322,8 +344,9 @@ pub(super) fn emit_shared_library(
     // Also add undefined/dynamic symbols (from -l libs and PLT imports)
     for (name, gsym) in globals.iter() {
         if (gsym.is_dynamic || (gsym.defined_in.is_none() && gsym.section_idx == SHN_UNDEF))
-            && !dyn_sym_names.contains(name)
+            && !dyn_sym_seen.contains(name)
         {
+            dyn_sym_seen.insert(name.clone());
             dyn_sym_names.push(name.clone());
         }
     }
@@ -334,7 +357,7 @@ pub(super) fn emit_shared_library(
     for name in &abs64_sym_names {
         let is_version_local = version_script.as_ref().is_some_and(|vs|
             vs.local_star && !vs.matches_global(name));
-        if !is_version_local && !dyn_sym_names.contains(name) {
+        if !is_version_local && dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
     }
@@ -436,6 +459,12 @@ pub(super) fn emit_shared_library(
 
     let hashed_sym_hashes: Vec<u32> = dyn_sym_names[undef_syms.len()..].iter()
         .map(|name| linker_common::gnu_hash(sym_base(name).as_bytes()))
+        .collect();
+
+    // O(1) name -> dynsym index (1-based), valid from this point on (after the
+    // .gnu.hash bucket sort has frozen the final dynsym order).
+    let dyn_sym_index: FxHashMap<&str, u64> = dyn_sym_names.iter().enumerate()
+        .map(|(i, n)| (n.as_str(), (i + 1) as u64))
         .collect();
 
     let mut gnu_hash_buckets = vec![0u32; gnu_hash_nbuckets as usize];
@@ -688,6 +717,8 @@ pub(super) fn emit_shared_library(
     }
     // GOT entries need either RELATIVE (local) or GLOB_DAT (external) relocations
     max_rela_count += got_needed.len();
+    // Each TLSGD pair may emit DTPMOD64 + DTPOFF64; the TLSLD slot emits DTPMOD64.
+    max_rela_count += tlsgd_names.len() * 2 + if needs_tlsld_slot { 1 } else { 0 };
     let rela_dyn_max_size = max_rela_count as u64 * 24;
     offset += rela_dyn_max_size;
 
@@ -716,9 +747,13 @@ pub(super) fn emit_shared_library(
     let got_plt_addr = base_addr + offset;
     offset += got_plt_size;
 
-    // GOT for locally-resolved symbols
+    // GOT for locally-resolved symbols, followed by TLS GD pairs and the
+    // optional LD pair. Layout:
+    //   [got_needed slots][GD pair 0][GD pair 1]...[LD pair]
     let got_offset = offset; let got_addr = base_addr + offset;
-    let got_size = got_needed.len() as u64 * 8;
+    let tlsgd_got_base = got_needed.len() as u64 * 8; // offset of first GD pair within .got
+    let tlsld_got_off = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
+    let got_size = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
     offset += got_size;
 
     for sec in output_sections.iter_mut() {
@@ -1009,7 +1044,7 @@ pub(super) fn emit_shared_library(
         for (i, name) in plt_names.iter().enumerate() {
             let gea = gpb + i as u64 * 8;
             // Find symbol index in dynsym
-            let si = dyn_sym_names.iter().position(|n| n == name).map(|j| j+1).unwrap_or(0) as u64;
+            let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
             w64(&mut out, rp, gea);             // r_offset = GOT.PLT slot address
             w64(&mut out, rp+8, (si << 32) | R_X86_64_JUMP_SLOT as u64);
             w64(&mut out, rp+16, 0);            // r_addend = 0
@@ -1038,6 +1073,52 @@ pub(super) fn emit_shared_library(
     let mut glob_dat_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for GLOB_DAT relocs
     let mut tpoff64_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for R_X86_64_TPOFF64 relocs
     let mut abs64_entries: Vec<(u64, String, i64)> = Vec::new(); // (offset, sym_name, addend) for R_X86_64_64 relocs
+    // TLS module-id relocations: (got_slot_vaddr, sym_name_or_empty).
+    // DTPMOD64 always needed (module id known only at load time). DTPOFF64
+    // needed only for symbols that may be interposed (named globals).
+    let mut dtpmod64_entries: Vec<(u64, String)> = Vec::new();
+    let mut dtpoff64_entries: Vec<(u64, String)> = Vec::new();
+
+    // TLS GD/LD GOT pair setup
+    let mut tlsgd_slot_addr: FxHashMap<String, u64> = FxHashMap::default();
+    for (i, name) in tlsgd_names.iter().enumerate() {
+        let slot = got_addr + tlsgd_got_base + i as u64 * 16;
+        tlsgd_slot_addr.insert(name.clone(), slot);
+        dtpmod64_entries.push((slot, String::new())); // module id of THIS module
+        // DTPOFF: statically known when the symbol is defined here; store it.
+        let mut static_off: Option<u64> = None;
+        if let Some(g) = globals_snap.get(name) {
+            if g.defined_in.is_some() && !g.is_dynamic && g.section_idx != SHN_UNDEF {
+                static_off = Some(g.value.wrapping_sub(tls_addr));
+            }
+        }
+        // Local TLS symbols (not in globals): resolve from object symtabs.
+        if static_off.is_none() && !globals_snap.contains_key(name) {
+            'outer: for (oi, obj) in objects.iter().enumerate() {
+                for sym in &obj.symbols {
+                    if sym.name == *name && sym.shndx != 0 {
+                        if let Some(&(out_i, so)) = section_map.get(&(oi, sym.shndx as usize)) {
+                            static_off = Some((output_sections[out_i].addr + so + sym.value)
+                                .wrapping_sub(tls_addr));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        match static_off {
+            Some(off) => {
+                w64(&mut out, (got_offset + tlsgd_got_base + i as u64 * 16 + 8) as usize, off);
+            }
+            None => dtpoff64_entries.push((slot + 8, name.clone())),
+        }
+    }
+    let tlsld_slot = if needs_tlsld_slot {
+        let slot = got_addr + tlsld_got_off;
+        dtpmod64_entries.push((slot, String::new()));
+        // slot+8 stays 0 (offsets computed via DTPOFF32 addends)
+        Some(slot)
+    } else { None };
 
     // Add RELATIVE entries for GOT entries that point to local symbols,
     // GLOB_DAT entries for GOT entries that point to external non-TLS symbols,
@@ -1166,13 +1247,21 @@ pub(super) fn emit_shared_library(
                             // Patch the instruction to reference the GOT entry
                             w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                         } else {
-                            // No GOT entry: IE-to-LE relaxation for locally-resolved symbols
+                            // No GOT entry: IE-to-LE relaxation for locally-resolved symbols.
+                            // Handles mov (8b) and add (03); transplants REX.R
+                            // into REX.B since the register moves from ModRM.reg
+                            // to ModRM.rm (see emit_exec.rs for details).
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            if fp >= 2 && fp + 4 <= out.len() && out[fp-2] == 0x8b {
+                            let opc = if fp >= 2 { out[fp-2] } else { 0 };
+                            if fp >= 3 && fp + 4 <= out.len() && (opc == 0x8b || opc == 0x03) {
                                 let modrm = out[fp-1];
                                 let reg = (modrm >> 3) & 7;
-                                out[fp-2] = 0xc7;
+                                out[fp-2] = if opc == 0x8b { 0xc7 } else { 0x81 };
                                 out[fp-1] = 0xc0 | reg;
+                                let rex = out[fp-3];
+                                if (rex & 0xf0) == 0x40 {
+                                    out[fp-3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
+                                }
                                 w32(&mut out, fp, (tpoff + a) as u32);
                             }
                         }
@@ -1180,6 +1269,28 @@ pub(super) fn emit_shared_library(
                     R_X86_64_TPOFF32 => {
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                         w32(&mut out, fp, (tpoff + a) as u32);
+                    }
+                    R_X86_64_TLSGD => {
+                        // Point the lea at the (DTPMOD64, DTPOFF64) GOT pair.
+                        if let Some(&slot) = tlsgd_slot_addr.get(&sym.name) {
+                            w32(&mut out, fp, (slot as i64 + a - p as i64) as u32);
+                        } else {
+                            eprintln!("warning: TLSGD without GOT pair for '{}'", sym.name);
+                        }
+                    }
+                    R_X86_64_TLSLD => {
+                        if let Some(slot) = tlsld_slot {
+                            w32(&mut out, fp, (slot as i64 + a - p as i64) as u32);
+                        }
+                    }
+                    R_X86_64_DTPOFF32 => {
+                        // Offset of the symbol within this module's TLS block.
+                        let dtpoff = s as i64 - tls_addr as i64;
+                        w32(&mut out, fp, (dtpoff + a) as u32);
+                    }
+                    R_X86_64_DTPOFF64 => {
+                        let dtpoff = s as i64 - tls_addr as i64;
+                        w64(&mut out, fp, (dtpoff + a) as u64);
                     }
                     R_X86_64_NONE => {}
                     other => {
@@ -1192,7 +1303,8 @@ pub(super) fn emit_shared_library(
 
     // Write .rela.dyn entries
     let relative_count = rela_dyn_entries.len();
-    let total_rela_count = relative_count + glob_dat_entries.len() + tpoff64_entries.len() + abs64_entries.len();
+    let total_rela_count = relative_count + glob_dat_entries.len() + tpoff64_entries.len()
+        + abs64_entries.len() + dtpmod64_entries.len() + dtpoff64_entries.len();
     let rela_dyn_size = total_rela_count as u64 * 24;
     let mut rd = rela_dyn_offset as usize;
     // First: R_X86_64_RELATIVE entries (type 8, no symbol)
@@ -1206,7 +1318,7 @@ pub(super) fn emit_shared_library(
     }
     // Then: R_X86_64_GLOB_DAT entries (type 6, with symbol index)
     for (rel_offset, sym_name) in &glob_dat_entries {
-        let si = dyn_sym_names.iter().position(|n| n == sym_name).map(|j| j + 1).unwrap_or(0) as u64;
+        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset);         // r_offset = GOT entry address
             w64(&mut out, rd+8, (si << 32) | R_X86_64_GLOB_DAT as u64);
@@ -1218,7 +1330,7 @@ pub(super) fn emit_shared_library(
     // The dynamic linker fills these GOT slots with the thread-pointer offset of the
     // TLS symbol, so that `%fs:0 + GOT[n]` gives the correct address.
     for (rel_offset, sym_name) in &tpoff64_entries {
-        let si = dyn_sym_names.iter().position(|n| n == sym_name).map(|j| j + 1).unwrap_or(0) as u64;
+        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset);         // r_offset = GOT entry address
             w64(&mut out, rd+8, (si << 32) | R_X86_64_TPOFF64 as u64);
@@ -1226,10 +1338,32 @@ pub(super) fn emit_shared_library(
             rd += 24;
         }
     }
+    // TLS module/offset relocations for General/Local-Dynamic GOT pairs.
+    // DTPMOD64 with sym 0 = "this module"; ld.so writes the module id.
+    for (rel_offset, sym_name) in &dtpmod64_entries {
+        let si = if sym_name.is_empty() { 0 } else {
+            dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0)
+        };
+        if rd + 24 <= out.len() {
+            w64(&mut out, rd, *rel_offset);
+            w64(&mut out, rd+8, (si << 32) | R_X86_64_DTPMOD64 as u64);
+            w64(&mut out, rd+16, 0);
+            rd += 24;
+        }
+    }
+    for (rel_offset, sym_name) in &dtpoff64_entries {
+        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
+        if rd + 24 <= out.len() {
+            w64(&mut out, rd, *rel_offset);
+            w64(&mut out, rd+8, (si << 32) | R_X86_64_DTPOFF64 as u64);
+            w64(&mut out, rd+16, 0);
+            rd += 24;
+        }
+    }
     // Then: R_X86_64_64 entries (type 1, with symbol index) for named symbol
     // references in data sections (function pointer tables, vtables, etc.)
     for (rel_offset, sym_name, addend) in &abs64_entries {
-        let si = dyn_sym_names.iter().position(|n| n == sym_name).map(|j| j + 1).unwrap_or(0) as u64;
+        let si = dyn_sym_index.get(sym_name.as_str()).copied().unwrap_or(0);
         if rd + 24 <= out.len() {
             w64(&mut out, rd, *rel_offset);         // r_offset
             w64(&mut out, rd+8, (si << 32) | R_X86_64_64 as u64);
