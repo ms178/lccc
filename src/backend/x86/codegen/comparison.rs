@@ -112,8 +112,7 @@ impl X86Codegen {
         if self.cmp_replay.contains_key(&dest.0) {
             return;
         }
-        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-        self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
 
         // FLAG FUSION: when this Cmp's boolean result is consumed ONLY by the
         // immediately-following Select or CondBranch (precomputed in
@@ -190,8 +189,7 @@ impl X86Codegen {
         true_label: &str,
         false_label: &str,
     ) {
-        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-        self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
 
         let jcc = match op {
             IrCmpOp::Eq => "je",
@@ -220,8 +218,7 @@ impl X86Codegen {
         true_block: BlockId,
         false_block: BlockId,
     ) {
-        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-        self.emit_int_cmp_insn_typed(lhs, rhs, use_32bit);
+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
 
         let jcc = match op {
             IrCmpOp::Eq => "je",
@@ -378,8 +375,7 @@ impl X86Codegen {
         // directly — kills the setcc/movzbl + testq chain per branch.
         if let Some((op, lhs, rhs, ty)) = self.take_replay_cmp(cond) {
             self.state.reg_cache.invalidate_acc();
-            let use_32bit = ty == IrType::I32 || ty == IrType::U32;
-            self.emit_int_cmp_replay_insn(&lhs, &rhs, use_32bit);
+            self.emit_int_cmp_replay_insn(&lhs, &rhs, ty);
             let jcc = Self::cmp_jcc(op);
             let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
             if hot_next {
@@ -645,8 +641,7 @@ impl X86Codegen {
         let replay_op = self.take_replay_cmp(cond);
         if let Some((op, lhs, rhs, ty)) = &replay_op {
             self.state.reg_cache.invalidate_acc();
-            let use_32bit = *ty == IrType::I32 || *ty == IrType::U32;
-            self.emit_int_cmp_replay_insn(lhs, rhs, use_32bit);
+            self.emit_int_cmp_replay_insn(lhs, rhs, *ty);
         }
         // Test the condition in place (no pushfq). Only when the condition is
         // not directly testable (rare) do we fall back to the legacy

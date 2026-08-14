@@ -197,6 +197,20 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
     }
 }
 
+/// Width info for an integer compare at `ty`: (cmp mnemonic, test mnemonic,
+/// accumulator register). Sub-word types use their native byte/word width so a
+/// narrowed comparison (`c < 0x80` on a promoted byte) emits `cmpb`/`testb`
+/// instead of widening through a 32/64-bit compare — GCC/ICX's byte-compare
+/// shape. I32/U32 use 32-bit ops; everything else stays 64-bit (unchanged).
+pub(super) fn cmp_width_info(ty: IrType) -> (&'static str, &'static str, &'static str) {
+    match ty {
+        IrType::I8 | IrType::U8 => ("cmpb", "testb", "al"),
+        IrType::I16 | IrType::U16 => ("cmpw", "testw", "ax"),
+        IrType::I32 | IrType::U32 => ("cmpl", "testl", "eax"),
+        _ => ("cmpq", "testq", "rax"),
+    }
+}
+
 /// Scan inline asm instructions in a function and collect any callee-saved
 /// registers that are used via specific constraints or listed in clobbers.
 /// These must be saved/restored in the function prologue/epilogue.
@@ -337,6 +351,11 @@ pub struct X86Codegen {
     /// materialization (setcc/movzbl/store) and the consumer uses the live
     /// flags directly (jcc/cmovcc).
     pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
+    /// Destinations of the flag-neutral forwarding Copy/Cast instructions in a
+    /// fused Cmp chain. Their value is never materialized (the consumer uses
+    /// the live flags), so their emitters must skip them — emitting them would
+    /// read the never-written stale register (a dead, wasted instruction).
+    pub(super) fused_forward_dests: FxHashSet<u32>,
     /// Cmp destinations eligible for compare-replay: the Cmp's single use is
     /// a Select or CondBranch that is NOT adjacent to the Cmp (flags would be
     /// clobbered in between), so the consumer re-emits `cmp` from the
@@ -496,6 +515,7 @@ impl X86Codegen {
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
+            fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
             load_cast_fold: FxHashMap::default(),
@@ -779,8 +799,9 @@ impl X86Codegen {
     /// non-register-allocated value, and the replay candidates are filtered
     /// to slot-resident operands at build time — so the slot is always the
     /// correct, stable source here.
-    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, use_32bit: bool) {
-        let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
+    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        let (cmp_instr, _test_instr, acc_reg) = cmp_width_info(ty);
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
         // Load lhs from its slot with the TYPE-AWARE width. A raw `movq` slot
         // load is unsound for narrow values: the slot stores are 8-byte
         // (movq) but only the low N bytes hold the value; the upper bytes are
@@ -798,10 +819,9 @@ impl X86Codegen {
             }
         }
         // Prefer the immediate form whenever rhs is an encodable constant,
-        // matching emit_int_cmp_insn_typed (cmp $imm, %rax / %eax).
+        // matching emit_int_cmp_insn_typed (cmp $imm, %al/%eax/%rax).
         if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
-            let lreg = if use_32bit { "eax" } else { "rax" };
-            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lreg));
+            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
             return;
         }
         match rhs {
@@ -812,18 +832,18 @@ impl X86Codegen {
                 self.operand_to_rcx(rhs);
             }
         }
-        let lreg = if use_32bit { "eax" } else { "rax" };
         let rreg = if use_32bit { "ecx" } else { "rcx" };
-        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, lreg));
+        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, acc_reg));
     }
 
     pub(super) fn emit_int_cmp_insn_typed(
         &mut self,
         lhs: &Operand,
         rhs: &Operand,
-        use_32bit: bool,
+        ty: IrType,
     ) {
-        let cmp_instr = if use_32bit { "cmpl" } else { "cmpq" };
+        let (cmp_instr, test_instr, acc_reg) = cmp_width_info(ty);
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
         let lhs_phys = self.operand_reg(lhs);
         let rhs_phys = self.operand_reg(rhs);
         // Prefer the immediate form whenever rhs is an encodable constant —
@@ -832,63 +852,40 @@ impl X86Codegen {
         if rhs_phys.is_none() || matches!(rhs, Operand::Const(_)) {
             if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
                 if imm == 0 {
-                    let test_instr = if use_32bit { "testl" } else { "testq" };
                     if let Some(lhs_r) = lhs_phys {
-                        let lhs_name = if use_32bit {
-                            phys_reg_name_32(lhs_r)
-                        } else {
-                            phys_reg_name(lhs_r)
-                        };
+                        let lhs_name = typed_phys_reg_name(lhs_r, ty);
                         self.state.emit_fmt(format_args!(
                             "    {} %{}, %{}",
                             test_instr, lhs_name, lhs_name
                         ));
                     } else {
                         self.operand_to_rax(lhs);
-                        let reg = if use_32bit { "eax" } else { "rax" };
                         self.state
-                            .emit_fmt(format_args!("    {} %{}, %{}", test_instr, reg, reg));
+                            .emit_fmt(format_args!("    {} %{}, %{}", test_instr, acc_reg, acc_reg));
                     }
                 } else if let Some(lhs_r) = lhs_phys {
-                    let lhs_name = if use_32bit {
-                        phys_reg_name_32(lhs_r)
-                    } else {
-                        phys_reg_name(lhs_r)
-                    };
+                    let lhs_name = typed_phys_reg_name(lhs_r, ty);
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lhs_name));
                 } else {
                     self.operand_to_rax(lhs);
-                    let reg = if use_32bit { "eax" } else { "rax" };
                     self.state
-                        .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, reg));
+                        .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
                 }
                 return;
             }
         }
         if let (Some(lhs_r), Some(rhs_r)) = (lhs_phys, rhs_phys) {
-            // Both in callee-saved registers: compare directly
-            let lhs_name = if use_32bit {
-                phys_reg_name_32(lhs_r)
-            } else {
-                phys_reg_name(lhs_r)
-            };
-            let rhs_name = if use_32bit {
-                phys_reg_name_32(rhs_r)
-            } else {
-                phys_reg_name(rhs_r)
-            };
+            // Both in registers: compare directly
+            let lhs_name = typed_phys_reg_name(lhs_r, ty);
+            let rhs_name = typed_phys_reg_name(rhs_r, ty);
             self.state.emit_fmt(format_args!(
                 "    {} %{}, %{}",
                 cmp_instr, rhs_name, lhs_name
             ));
         } else if let Some(lhs_r) = lhs_phys {
-            let lhs_name = if use_32bit {
-                phys_reg_name_32(lhs_r)
-            } else {
-                phys_reg_name(lhs_r)
-            };
-            // Memory-operand: cmpq N(%rsp), %lhs_reg directly
+            let lhs_name = typed_phys_reg_name(lhs_r, ty);
+            // Memory-operand: cmp N(%rsp), %lhs_reg directly
             if let Operand::Value(rv) = rhs {
                 if self.dest_reg(rv).is_none() {
                     if let Some(slot) = self.state.get_slot(rv.0) {
@@ -908,26 +905,20 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, lhs_name));
         } else if let Some(rhs_r) = rhs_phys {
-            let rhs_name = if use_32bit {
-                phys_reg_name_32(rhs_r)
-            } else {
-                phys_reg_name(rhs_r)
-            };
+            let rhs_name = typed_phys_reg_name(rhs_r, ty);
             self.operand_to_rax(lhs);
-            let reg = if use_32bit { "eax" } else { "rax" };
             self.state
-                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, reg));
+                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, acc_reg));
         } else {
             // Neither operand has a register. Load lhs to %rax.
             self.operand_to_rax(lhs);
-            let reg = if use_32bit { "eax" } else { "rax" };
-            // Memory-operand: cmpq N(%rsp), %rax directly for rhs
+            // Memory-operand: cmp N(%rsp), %rax directly for rhs
             if let Operand::Value(rv) = rhs {
                 if let Some(slot) = self.state.get_slot(rv.0) {
                     if !self.state.is_alloca(rv.0) {
                         let sref = self.slot_ref(slot.0);
                         self.state
-                            .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, reg));
+                            .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, acc_reg));
                         return;
                     }
                 }
@@ -935,11 +926,10 @@ impl X86Codegen {
             self.operand_to_rcx(rhs);
             let rcx = if use_32bit { "ecx" } else { "rcx" };
             self.state
-                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, reg));
+                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, acc_reg));
         }
     }
 
-    /// Load an operand into a specific callee-saved register.
     /// Handles constants, register-allocated values, and stack values.
     pub(super) fn operand_to_callee_reg(&mut self, op: &Operand, target: PhysReg) {
         let target_name = phys_reg_name(target);
@@ -3585,6 +3575,12 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        // Flag-fusion forwarding: this copy's destination is never read (the
+        // fused consumer uses the live Cmp flags), and its source is the
+        // never-materialized boolean — emitting it would read a stale register.
+        if self.fused_forward_dests.contains(&dest.0) {
+            return;
+        }
         // Handle vector Copy instructions: %dest_vec = copy %src_vec
         // Vectors are stored directly in stack slots (not as pointers), so we copy
         // with ymm/xmm registers instead of scalar movq.

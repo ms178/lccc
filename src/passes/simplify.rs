@@ -248,7 +248,7 @@ fn try_simplify(
             simplify_gep(*dest, *base, offset, *ty, gep_defs)
         }
         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, is_boolean)
+            simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, cast_defs, is_boolean)
         }
         Instruction::Select { dest, cond, true_val, false_val, .. } => {
             // select cond, x, x => x (both arms are the same)
@@ -496,6 +496,22 @@ fn fold_int_cast(val: i64, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
 }
 
 /// Invert a comparison operator (negate the condition).
+/// Rebuild an integer constant of type `ty` from an i64 value (bit-pattern
+/// semantics for unsigned types, like the range-check fold's int_const).
+/// Returns None if the value does not fit the type's width.
+fn int_const_of_type(ty: IrType, v: i64) -> Option<IrConst> {
+    match ty {
+        IrType::I8 => i8::try_from(v).ok().map(IrConst::I8),
+        IrType::U8 => u8::try_from(v).ok().map(|x| IrConst::I8(x as i8)),
+        IrType::I16 => i16::try_from(v).ok().map(IrConst::I16),
+        IrType::U16 => u16::try_from(v).ok().map(|x| IrConst::I16(x as i16)),
+        IrType::I32 => i32::try_from(v).ok().map(IrConst::I32),
+        IrType::U32 => u32::try_from(v).ok().map(|x| IrConst::I32(x as i32)),
+        IrType::I64 | IrType::U64 => Some(IrConst::I64(v)),
+        _ => None,
+    }
+}
+
 fn invert_cmp_op(op: IrCmpOp) -> IrCmpOp {
     match op {
         IrCmpOp::Eq => IrCmpOp::Ne,
@@ -538,6 +554,8 @@ fn swap_cmp_op(op: IrCmpOp) -> IrCmpOp {
 ///   (checking if comparison result is not-true = inverted)
 /// - Cmp(Eq, cmp_result, 1) => Copy(cmp_result) when cmp_result is from another Cmp
 ///   (comparing a 0/1 value against 1 is the same as the original comparison)
+/// - Comparison narrowing: Cmp(op, Cast(x, T->W), C, W) => Cmp(op, x, C', T)
+///   when the extension T->W preserves op's ordering and C fits in T.
 fn simplify_cmp(
     dest: Value,
     op: IrCmpOp,
@@ -545,6 +563,7 @@ fn simplify_cmp(
     rhs: &Operand,
     ty: IrType,
     cmp_defs: &[Option<CmpDef>],
+    cast_defs: &[Option<CastDef>],
     is_boolean: &[bool],
 ) -> Option<Instruction> {
     // Self-comparison: Cmp(op, x, x) => constant
@@ -572,6 +591,53 @@ fn simplify_cmp(
     let const_i64 = cval.to_i64();
     let is_zero_const = const_i64 == Some(0);
     let is_one_const = const_i64 == Some(1);
+
+    // Comparison narrowing: Cmp(op, Cast(x, T->W), C, W) => Cmp(op, x, C', T).
+    //
+    // A value widened for C's integer promotions (e.g. a `movzbl`-loaded byte
+    // promoted to int for `c < 0x80`) is compared AT ITS NATIVE WIDTH, so the
+    // widening cast — and its register copy — disappears and the backend emits
+    // `cmpb`/`testb` directly (GCC's `test dl,dl; jns`, ICX's `cmp cl,-62`).
+    // The extension must preserve the comparison's ordering, and the constant
+    // must fit in T:
+    //   - unsigned T (zero-extend):  Ult/Ule/Ugt/Uge + Eq/Ne, C in [0, 2^n).
+    //   - signed   T (sign-extend):  Slt/Sle/Sgt/Sge + Eq/Ne, C in signed range.
+    if let Some(const_i64) = const_i64 {
+        if let Some(Some(cdef)) = cast_defs.get(val.0 as usize) {
+            let narrow_ty = cdef.from_ty;
+            if cdef.to_ty == ty
+                && narrow_ty.is_integer()
+                && narrow_ty.size() < ty.size()
+            {
+                let bits = narrow_ty.size() * 8;
+                let fits = if narrow_ty.is_unsigned() {
+                    const_i64 >= 0 && (const_i64 as u64) <= (1u64 << bits) - 1
+                } else {
+                    const_i64 >= -(1i64 << (bits - 1)) && const_i64 <= (1i64 << (bits - 1)) - 1
+                };
+                let order_ok = match effective_op {
+                    IrCmpOp::Eq | IrCmpOp::Ne => true,
+                    IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
+                        narrow_ty.is_unsigned()
+                    }
+                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => {
+                        narrow_ty.is_signed()
+                    }
+                };
+                if fits && order_ok {
+                    if let Some(narrowed_const) = int_const_of_type(narrow_ty, const_i64) {
+                        return Some(Instruction::Cmp {
+                            dest,
+                            op: effective_op,
+                            lhs: cdef.src,
+                            rhs: Operand::Const(narrowed_const),
+                            ty: narrow_ty,
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // Check if the value is known boolean (0 or 1). This includes:
     // - Values defined by Cmp instructions

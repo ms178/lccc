@@ -745,3 +745,65 @@ session's working history.
    for `adler+=b[i]; sum2+=adler` within the 16-byte unroll; also removes the
    per-iteration slot copies (loop-carried accumulator in registers).
 5. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
+
+## v11 — ICC/ICX distills delivered (narrowing, byte compares, FP-param XMM)
+
+Three of the five v10 roadmap items are now implemented and measured; the FP-
+parameter work is done properly (not backed down).
+
+**1. U32 operand cast-type fix.** The U32 comparison-operand masking cast was
+emitted as `Cast(x, I64 -> U32)` — a hardcoded wrong source type (the operand
+is already U32). The type-lying identity cast survived simplify and emitted a
+spurious `mov` per operand. Now `Cast(op_ty -> U32)` folds away. Removed one
+copy per comparison operand (the expat/sqlite mov-chains).
+
+**2. Comparison narrowing** (simplify): `Cmp(op, Cast(x,T->W), C, W)` ->
+`Cmp(op, x, C', T)` for order-preserving extensions with C fitting in T.
+Unsigned T zero-extends (Ult/Ule/Ugt/Uge + Eq/Ne), signed T sign-extends
+(Slt/... + Eq/Ne) — exactly LLVM InstCombine's icmp-narrowing.
+
+**3. Byte/word compares** (x86 emitter): `emit_int_cmp_insn_typed` /
+`emit_int_cmp_replay_insn` are width-aware (cmpb/testb/cmpw/testw). A promoted
+byte now compares at native width: `movzbl (%r11),%esi; cmpb $0x80,%sil; jae`
+— GCC/ICX's shape, no widening cast, no copy chain.
+
+**4. GPR simple-ALU LHS hint**: Add/Sub/And/Or/Xor/Mul compute into the dest
+with the LHS pre-loaded (emit_alu_reg_direct), so the v9 follow-hint now
+covers GPR simple ALU too (the range fold's sub lands in the cast's register).
+
+**5. FP-parameter XMM allocation (delivered, not backed down).** Three
+coordinated changes: (a) FP ParamRef dests join the Phase 3 XMM scan;
+(b) find_dead_param_allocas accepts an XMM home as a stable destination;
+(c) emit_store_params pre-stores FloatReg args into the allocated XMM home
+(movss/movsd). A runtime FP param now lives in XMM (`movq %xmm0,%xmm3`) with
+no slot round-trip. Bonus: a param whose ParamRef was constant-propagated
+away (nbody's advance(0.01,...)) or that is simply unused is now dead,
+eliminating the entry spill (frame 0xd8 -> 0xc8).
+
+**6. Dead forwarding Cast/Copy skip**: fused chains record their flag-neutral
+forwarding destinations (fused_forward_dests); the Cast/Copy emitters skip
+them, removing the dead `movsbq %r14b,%r15` that read the never-materialized
+boolean after each fused range check.
+
+Measured (pinned, paired; VM CV note below): bitops 1.91x -> 1.63x,
+gzip_crc32 1.45x -> 1.33x, expat 2.89x -> 2.77x, sqlite 2.09x -> 1.98x,
+nbody 3.47x -> 3.39x. Regression 133/133, correctness 50/50, intrinsics 3/3,
+597 lib tests. New test v11_cmp_narrowing.
+NOTE: the VM's gcc baseline drifts 15-25% between runs, so absolute ratios
+are screening-only; relative deltas within one run are the signal.
+
+## v11 roadmap (remaining, prioritized)
+
+1. **Branch-on-logical at lowering** (expat still 2.77x): `a || b || c` is
+   lowered to value-producing diamonds whose intermediate results are DATA
+   (returned), so the inner links materialize setcc/cmov. GCC/ICX lower it as
+   a pure branch chain that sets the result ONCE at the merge. When the
+   &&/|| result is used only as a condition (or as a return value), emit
+   branches + a single setcc at each merge.
+2. **Adler32 chain-breaking reassociation** (1.73x): ICC's 4-register rotation
+   breaks the adler->sum2->adler serial dependency; also removes the
+   per-iteration slot copies (loop-carried accumulator in registers).
+3. **Range-fold at source width**: the range fold emits a 32-bit sub+cmp; GCC
+   emits `add dl,62; cmp dl,29` (8-bit). Narrow the fold's sub+cmp to the
+   operand's natural width when the span fits.
+4. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).

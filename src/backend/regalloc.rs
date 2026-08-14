@@ -841,6 +841,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         {
                             dest.0 == iv.value_id
                         }
+                        Instruction::ParamRef { dest, ty, .. }
+                            if *ty == IrType::F64 || *ty == IrType::F32 =>
+                        {
+                            dest.0 == iv.value_id
+                        }
                         Instruction::Cast { dest, to_ty, .. }
                             if *to_ty == IrType::F64 || *to_ty == IrType::F32 =>
                         {
@@ -1406,6 +1411,17 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                     }
                 }
                 Instruction::Load { dest, ty, .. } => {
+                    if is_non_gpr_type(ty) {
+                        non_gpr_values.insert(dest.0);
+                    }
+                }
+                Instruction::ParamRef { dest, ty, .. } => {
+                    // An FP (or i128/long-double) parameter arrives in an XMM
+                    // register per the ABI. Marking its ParamRef dest non-GPR
+                    // makes it eligible for the Phase 3 XMM scan, so a hot
+                    // call-free function keeps the parameter in an XMM
+                    // register instead of spilling it to a slot at entry and
+                    // reloading it on every use.
                     if is_non_gpr_type(ty) {
                         non_gpr_values.insert(dest.0);
                     }
