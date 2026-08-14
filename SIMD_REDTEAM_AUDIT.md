@@ -875,3 +875,18 @@ Remaining known gaps (unchanged): the last-link boolean sign-extension
 adler load→cast copy under register pressure (the reassociated closed form
 double-uses each byte, which can defeat the single-use load→cast fold), and
 nbody's preheader `imulq`.
+
+## PGO redesign: hot-loop alignment and sectioning
+
+The profile pipeline now addresses five defects:
+
+1. **Single-function profiles were treated as flat.** A missing runner-up now means the profile is maximally skewed, preserving profile-guided inlining even when the function is entered once.
+2. **x86 jump relaxation only shortened jumps.** Alignment can move a short jump out of range, so growable jumps now return to their long form and final short displacements are range-checked.
+3. **Alignment fixups were not idempotent.** Each marker now records its adjusted padding, allowing repeated fixup passes to converge safely.
+4. **Percentile-based section classification over-selected hot functions.** Section placement now uses the hottest entry count directly: hot functions reach 10% of it, while cold functions stay below 0.1%. Inlining retains percentile thresholds.
+5. **Single-block functions skipped section placement.** Whole-function classification now covers them while intra-function layout remains limited to multi-block functions.
+
+Derived block counts also drive 16-byte alignment for hot loop headers and join
+points, with 32-byte alignment for very hot larger loops. The `pgo_sections`
+roundtrip covers section splitting, alignment, and output equivalence. Assembler
+relaxation fixes apply to both PGO and non-PGO builds.

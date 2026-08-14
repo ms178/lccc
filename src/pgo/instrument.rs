@@ -12,11 +12,9 @@
 //! increment — the GCC/LLVM default); `-fprofile-update=atomic` selects the
 //! `lock` prefix.
 //!
-//! v7 adds indirect-call VALUE profiling (LLVM `IPVK_IndirectCallTarget`):
-//! each `CallIndirect` site gets a 72-byte global (4 target slots, 4 counts,
-//! total) and a call to a per-TU runtime helper that records the top-4
-//! callees seen at run time. At profile use the top target is promoted to a
-//! guarded direct call when it dominates the site (>= 51%).
+//! Indirect-call value profiling gives each `CallIndirect` site a 72-byte
+//! global (four target slots, four counts, and a total) plus a per-unit runtime
+//! recorder. Profile use promotes a dominant target to a guarded direct call.
 //!
 //! Soundness: counters are placed so they never sit between a fused Cmp and
 //! its branch/select consumer (`incq` clobbers flags), and instrumentation
@@ -726,7 +724,7 @@ pub fn instrument_module(
         }
         let _ = slot;
 
-        // ── v7 indirect-call value profiling ─────────────────────────────
+        // ── Indirect-call value profiling ─────────────────────────────────
         // Each CallIndirect site gets a 72-byte site global and a call to the
         // per-TU recorder immediately before the call: record(site, fp).
         // The recorder keeps the top-4 callee addresses (evicting the least
@@ -2120,7 +2118,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         let mut eqs: Vec<Value> = Vec::new();
         for i in 0..4 {
             let tmp = e.gep(site, (i * 8) as i64);
-        let tv = e.load(tmp);;
+            let tv = e.load(tmp);
             t.push(tv);
             let q = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(tv), Operand::Value(fp));
             eqs.push(q);

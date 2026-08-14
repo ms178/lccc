@@ -234,13 +234,10 @@ pub fn switch_hints_snapshot() -> FxHashMap<u32, SwitchHint> {
     SWITCH_HINTS.lock().unwrap().clone()
 }
 
-/// v11: per-unit preferred-fallthrough successor for conditional branches,
-/// keyed by the branch block's label (TU-unique after the renumber pass). The
-/// layout pass computes these from the profile edge weights — the successor
-/// carrying more executions becomes the preferred fallthrough — and codegen
-/// consumes them so the HOT path falls through (Intel branch-prediction
-/// guidance: minimize taken branches on the hot path, without reordering
-/// blocks and thus without perturbing register allocation).
+/// Per-unit preferred-fallthrough successor for conditional branches, keyed
+/// by the branch block's label after renumbering. Layout chooses the successor
+/// with the greater edge count so the hot path falls through without reordering
+/// blocks.
 static COND_FALLTHROUGHS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<u32, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
 /// Pending preferred-fallthrough for the conditional branch being emitted
@@ -267,6 +264,28 @@ pub fn set_cond_fallthrough(h: Option<u32>) {
 /// Take (and clear) the pending preferred-fallthrough in the backend.
 pub fn take_cond_fallthrough() -> Option<u32> {
     PENDING_COND_FALLTHROUGH.lock().unwrap().take()
+}
+
+/// Per-unit basic-block alignment hints, keyed by block label. Values are
+/// alignment exponents: 4 means 16 bytes and 5 means 32 bytes. Layout derives
+/// hints for hot loop headers and join points; codegen consumes them directly
+/// before emitting each label.
+static BLOCK_ALIGNS: std::sync::LazyLock<std::sync::Mutex<FxHashMap<u32, u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FxHashMap::default()));
+
+/// Replace the per-unit block-alignment map (called once per unit by layout).
+pub fn record_block_aligns(map: FxHashMap<u32, u8>) {
+    *BLOCK_ALIGNS.lock().unwrap() = map;
+}
+/// The alignment (log2) for `label`, if the profile made it a hot branch
+/// target. Consumed by codegen immediately before the block label is emitted.
+pub fn block_align(label: u32) -> Option<u8> {
+    BLOCK_ALIGNS.lock().unwrap().get(&label).copied()
+}
+/// True when profile-driven block alignment is engaged (used by codegen to
+/// skip the map lookups on plain builds).
+pub fn block_align_active() -> bool {
+    !BLOCK_ALIGNS.lock().unwrap().is_empty()
 }
 
 /// Translate recorded promoted-block labels through the label-renumber map
@@ -307,10 +326,9 @@ pub fn active_unit() -> Option<String> {
         .or_else(|| ACTIVE_UNIT.with(|s| s.borrow().clone()))
 }
 
-/// Raw (instrumented-edge) profile for a function in the PRE-pass unit.
-/// Block/tree-edge counts are NOT yet derived; callers that need them must
-/// run `profile::derive_block_counts` on the CURRENT IrFunction (the v8
-/// inliner does exactly that for per-call-site hotness).
+/// Raw instrumented-edge profile for a function in the pre-pass unit.
+/// Callers needing block or tree-edge counts must derive them from the current
+/// `IrFunction` with `profile::derive_block_counts`.
 pub fn prepass_profile(name: &str) -> Option<FunctionProfile> {
     let p = get_pgo_profile()?;
     let u = ACTIVE_UNIT2.with(|slot| slot.borrow().clone())?;

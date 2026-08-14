@@ -121,14 +121,18 @@ pub struct JumpDetection {
 
 // ─── Internal types ───────────────────────────────────────────────────
 
-/// Tracks a jump instruction for relaxation (long -> short).
+/// Tracks a jump instruction for relaxation (long <-> short).
 #[derive(Clone, Debug)]
 struct JumpInfo {
     offset: usize,
     len: usize,
     target: String,
     is_conditional: bool,
+    /// Whether the jump currently uses its short form.
     relaxed: bool,
+    /// Whether this writer shortened the jump and can restore its long form.
+    /// Short-only instructions remain false.
+    can_grow: bool,
 }
 
 /// Tracks an alignment or .org marker within a section.
@@ -891,6 +895,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         target: label.clone(),
                         is_conditional: jump_det.is_conditional,
                         relaxed: true,
+                        can_grow: false,
                     });
                 } else {
                     let expected_len = if jump_det.is_conditional { 6 } else { 5 };
@@ -901,6 +906,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             target: label.clone(),
                             is_conditional: jump_det.is_conditional,
                             relaxed: false,
+                            can_grow: false,
                         });
                     }
                 }
@@ -1528,9 +1534,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 continue;
             }
 
-            // Iterative relaxation until convergence
+            // Relax in both directions until instruction sizes and alignment
+            // padding converge. Only jumps shortened here may grow again.
             loop {
-                let mut any_relaxed = false;
+                let mut any_change = false;
                 let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
                 for (name, &(s_idx, offset)) in &self.label_positions {
                     if s_idx == sec_idx {
@@ -1538,167 +1545,264 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 }
 
-                let mut to_relax: Vec<usize> = Vec::new();
+                // Classify every jump by its target distance.
+                enum Action {
+                    Shrink,
+                    Grow,
+                }
+                let mut actions: Vec<(usize, Action)> = Vec::new();
                 let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
-                    if jump.relaxed { continue; }
-                    let target_off_opt = local_labels.get(&jump.target).copied()
+                    let target_off_opt = local_labels
+                        .get(&jump.target)
+                        .copied()
                         .or_else(|| {
                             self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
                                 .map(|(_, off)| off as usize)
                         });
                     if dbg {
-                        eprintln!("[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?}",
-                            sec_idx, j_idx, jump.offset, jump.len, jump.is_conditional,
-                            jump.target, target_off_opt);
+                        eprintln!(
+                            "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
+                            sec_idx,
+                            j_idx,
+                            jump.offset,
+                            jump.len,
+                            jump.is_conditional,
+                            jump.target,
+                            target_off_opt,
+                            jump.relaxed,
+                            jump.can_grow
+                        );
                     }
-                    if let Some(target_off) = target_off_opt {
-                        // SOUNDNESS (GAS oracle): the short-form displacement
-                        // must account for the jump's OWN shrink when the
-                        // target lies after the jump. Relaxing a forward jump
-                        // moves the target left by (old_len - new_len), so the
-                        // short displacement equals the 32-bit displacement
-                        // target - (offset + old_len). The previous code used
-                        // target - (offset + 2) for every jump, overestimating
-                        // forward displacements by 4 (jcc) / 3 (jmp) — jumps
-                        // with true short displacement 124/127 were computed
-                        // as 128/131 and never relaxed, diverging from GAS
-                        // (sqlite3 pblendvb_implicit_mask corpus t58).
-                        // Backward jumps are unaffected by the own-shrink
-                        // (the target precedes the jump), so their short
-                        // displacement is target - (offset + 2).
-                        let old_len = jump.len as i64;
-                        let disp = if (target_off as i64) > jump.offset as i64 {
-                            target_off as i64 - (jump.offset as i64 + old_len)
-                        } else {
-                            target_off as i64 - (jump.offset as i64 + 2)
-                        };
-                        if dbg { eprintln!("[RELAX]   disp={} relaxable={}", disp, (-128..=127).contains(&disp)); }
-                        if (-128..=127).contains(&disp) {
-                            to_relax.push(j_idx);
-                        }
-                    }
-                }
-
-                if to_relax.is_empty() { break; }
-
-                // Process from back to front so offsets stay valid
-                to_relax.sort_unstable();
-                to_relax.reverse();
-
-                for &j_idx in &to_relax {
-                    let jump = &self.sections[sec_idx].jumps[j_idx];
-                    let offset = jump.offset;
-                    let old_len = jump.len;
-                    let is_conditional = jump.is_conditional;
-                    let new_len = 2usize;
-                    let shrink = old_len - new_len;
-
-                    // Rewrite instruction bytes
-                    let data = &mut self.sections[sec_idx].data;
-                    if is_conditional {
-                        let cc = data[offset + 1] - 0x80;
-                        data[offset] = 0x70 + cc;
-                        data[offset + 1] = 0;
+                    let Some(target_off) = target_off_opt else {
+                        continue;
+                    };
+                    // A forward target moves left with the jump's own shrink;
+                    // a backward target does not.
+                    let old_len = jump.len as i64;
+                    let short_disp = if (target_off as i64) > jump.offset as i64 {
+                        target_off as i64 - (jump.offset as i64 + old_len)
                     } else {
-                        data[offset] = 0xEB;
-                        data[offset + 1] = 0;
+                        target_off as i64 - (jump.offset as i64 + 2)
+                    };
+                    let fits_short = (-128..=127).contains(&short_disp);
+                    if !jump.relaxed && fits_short {
+                        actions.push((j_idx, Action::Shrink));
+                    } else if jump.relaxed && jump.can_grow && !fits_short {
+                        actions.push((j_idx, Action::Grow));
                     }
-
-                    let remove_start = offset + new_len;
-                    let remove_end = offset + old_len;
-                    data.drain(remove_start..remove_end);
-
-                    // Update label positions
-                    for (_, pos) in self.label_positions.iter_mut() {
-                        if pos.0 == sec_idx && (pos.1 as usize) > offset {
-                            pos.1 -= shrink as u64;
-                        }
-                    }
-                    for (_, positions) in self.numeric_label_positions.iter_mut() {
-                        for pos in positions.iter_mut() {
-                            if pos.0 == sec_idx && (pos.1 as usize) > offset {
-                                pos.1 -= shrink as u64;
-                            }
-                        }
-                    }
-
-                    // Update relocations: remove the one for this jump, shift others
-                    self.sections[sec_idx].relocations.retain_mut(|reloc| {
-                        let reloc_off = reloc.offset as usize;
-                        let old_reloc_pos = if is_conditional { offset + 2 } else { offset + 1 };
-                        if reloc_off == old_reloc_pos {
-                            return false;
-                        }
-                        if reloc_off > offset {
-                            reloc.offset -= shrink as u64;
-                        }
-                        true
-                    });
-
-                    // Update other jump offsets
-                    for other_jump in self.sections[sec_idx].jumps.iter_mut() {
-                        if other_jump.offset > offset {
-                            other_jump.offset -= shrink;
-                        }
-                    }
-
-                    // Update alignment markers
-                    for marker in self.sections[sec_idx].align_markers.iter_mut() {
-                        if marker.offset > offset {
-                            marker.offset -= shrink;
-                        }
-                    }
-
-                    // Update deferred skip offsets
-                    for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
-                        if *s_idx == sec_idx && *s_off > offset {
-                            *s_off -= shrink;
-                        }
-                    }
-
-                    // Update deferred byte diff offsets
-                    for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
-                        if *s_idx == sec_idx && *s_off > offset {
-                            *s_off -= shrink;
-                        }
-                    }
-
-                    self.sections[sec_idx].jumps[j_idx].relaxed = true;
-                    self.sections[sec_idx].jumps[j_idx].len = new_len;
-                    any_relaxed = true;
                 }
 
-                if !any_relaxed { break; }
+                if actions.is_empty() {
+                    break;
+                }
+
+                // Process back to front so earlier offsets stay valid.
+                actions.sort_unstable_by_key(|&(j, _)| j);
+                actions.reverse();
+
+                for &(j_idx, ref action) in &actions {
+                    // Snapshot every field the transition needs so the
+                    // immutable borrow ends before the mutable section edits.
+                    let (offset, old_len, is_conditional, target) = {
+                        let jump = &self.sections[sec_idx].jumps[j_idx];
+                        (
+                            jump.offset,
+                            jump.len,
+                            jump.is_conditional,
+                            jump.target.clone(),
+                        )
+                    };
+
+                    match action {
+                        Action::Shrink => {
+                            let new_len = 2usize;
+                            let shrink = old_len - new_len;
+                            let data = &mut self.sections[sec_idx].data;
+                            if is_conditional {
+                                let cc = data[offset + 1] - 0x80;
+                                data[offset] = 0x70 + cc;
+                                data[offset + 1] = 0;
+                            } else {
+                                data[offset] = 0xEB;
+                                data[offset + 1] = 0;
+                            }
+                            let remove_start = offset + new_len;
+                            let remove_end = offset + old_len;
+                            data.drain(remove_start..remove_end);
+                            // Shift label positions.
+                            for (_, pos) in self.label_positions.iter_mut() {
+                                if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                                    pos.1 -= shrink as u64;
+                                }
+                            }
+                            for (_, positions) in self.numeric_label_positions.iter_mut() {
+                                for pos in positions.iter_mut() {
+                                    if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                                        pos.1 -= shrink as u64;
+                                    }
+                                }
+                            }
+                            self.sections[sec_idx].relocations.retain_mut(|reloc| {
+                                let reloc_off = reloc.offset as usize;
+                                let old_reloc_pos = if is_conditional {
+                                    offset + 2
+                                } else {
+                                    offset + 1
+                                };
+                                if reloc_off == old_reloc_pos {
+                                    return false;
+                                }
+                                if reloc_off > offset {
+                                    reloc.offset -= shrink as u64;
+                                }
+                                true
+                            });
+                            for other_jump in self.sections[sec_idx].jumps.iter_mut() {
+                                if other_jump.offset > offset {
+                                    other_jump.offset -= shrink;
+                                }
+                            }
+                            for marker in self.sections[sec_idx].align_markers.iter_mut() {
+                                if marker.offset > offset {
+                                    marker.offset -= shrink;
+                                }
+                            }
+                            for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
+                                if *s_idx == sec_idx && *s_off > offset {
+                                    *s_off -= shrink;
+                                }
+                            }
+                            for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
+                                if *s_idx == sec_idx && *s_off > offset {
+                                    *s_off -= shrink;
+                                }
+                            }
+                            self.sections[sec_idx].jumps[j_idx].relaxed = true;
+                            self.sections[sec_idx].jumps[j_idx].can_grow = true;
+                            self.sections[sec_idx].jumps[j_idx].len = new_len;
+                        }
+                        Action::Grow => {
+                            let new_len = if is_conditional { 6usize } else { 5usize };
+                            let grow = new_len - old_len;
+                            let data = &mut self.sections[sec_idx].data;
+                            if is_conditional {
+                                // short 0x7x disp8 -> long 0x0f 0x8x disp32
+                                let cc = data[offset] - 0x70;
+                                let insert = vec![0u8; grow];
+                                data.splice(offset + 2..offset + 2, insert);
+                                data[offset] = 0x0f;
+                                data[offset + 1] = 0x80 + cc;
+                            } else {
+                                // short 0xeb disp8 -> long 0xe9 disp32
+                                let insert = vec![0u8; grow];
+                                data.splice(offset + 2..offset + 2, insert);
+                                data[offset] = 0xE9;
+                            }
+                            // Re-record the rel32 relocation for the grown jump.
+                            let reloc_pos = (if is_conditional {
+                                offset + 2
+                            } else {
+                                offset + 1
+                            }) as u64;
+                            self.sections[sec_idx].relocations.push(ElfRelocation {
+                                offset: reloc_pos,
+                                symbol: target.clone(),
+                                reloc_type: A::reloc_pc32(),
+                                addend: -4,
+                                diff_symbol: None,
+                                patch_size: 4,
+                            });
+                            // Shift everything at or after the insertion point.
+                            for (_, pos) in self.label_positions.iter_mut() {
+                                if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                                    pos.1 += grow as u64;
+                                }
+                            }
+                            for (_, positions) in self.numeric_label_positions.iter_mut() {
+                                for pos in positions.iter_mut() {
+                                    if pos.0 == sec_idx && (pos.1 as usize) > offset {
+                                        pos.1 += grow as u64;
+                                    }
+                                }
+                            }
+                            for reloc in self.sections[sec_idx].relocations.iter_mut() {
+                                if (reloc.offset as usize) > offset
+                                    && reloc.offset as usize != reloc_pos as usize
+                                {
+                                    reloc.offset += grow as u64;
+                                }
+                            }
+                            for other_jump in self.sections[sec_idx].jumps.iter_mut() {
+                                if other_jump.offset > offset {
+                                    other_jump.offset += grow;
+                                }
+                            }
+                            for marker in self.sections[sec_idx].align_markers.iter_mut() {
+                                if marker.offset > offset {
+                                    marker.offset += grow;
+                                }
+                            }
+                            for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
+                                if *s_idx == sec_idx && *s_off > offset {
+                                    *s_off += grow;
+                                }
+                            }
+                            for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
+                                if *s_idx == sec_idx && *s_off > offset {
+                                    *s_off += grow;
+                                }
+                            }
+                            self.sections[sec_idx].jumps[j_idx].relaxed = false;
+                            self.sections[sec_idx].jumps[j_idx].len = new_len;
+                        }
+                    }
+                    any_change = true;
+                }
+
+                // Recompute alignment padding after the size changes.
+                self.fixup_alignment_markers(sec_idx);
+
+                if !any_change {
+                    break;
+                }
             }
 
-            // Post-relaxation fixup for alignment/org markers
-            self.fixup_alignment_markers(sec_idx);
-
-            // Resolve short jump displacements
+            // Final short-displacement resolution (after layout is stable).
             let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
             for (name, &(s_idx, offset)) in &self.label_positions {
                 if s_idx == sec_idx {
                     local_labels.insert(name.clone(), offset as usize);
                 }
             }
-
-            let patches: Vec<(usize, u8)> = self.sections[sec_idx].jumps.iter()
+            let patches: Vec<(usize, u8)> = self.sections[sec_idx]
+                .jumps
+                .iter()
                 .filter(|j| j.relaxed)
                 .filter_map(|jump| {
-                    let target = local_labels.get(&jump.target).copied()
+                    let target = local_labels
+                        .get(&jump.target)
+                        .copied()
                         .or_else(|| {
                             self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
                                 .map(|(_, off)| off as usize)
                         });
                     target.map(|target_off| {
                         let end_of_instr = jump.offset + 2;
-                        let disp = (target_off as i64 - end_of_instr as i64) as i8;
+                        let disp = target_off as i64 - end_of_instr as i64;
+                        // A surviving short jump must be representable exactly.
+                        assert!(
+                            (-128..=127).contains(&disp),
+                            "short jump displacement out of range after relaxation ({}: {} -> {} = {})",
+                            jump.target,
+                            jump.offset,
+                            target_off,
+                            disp
+                        );
                         (jump.offset + 1, disp as u8)
                     })
                 })
                 .collect();
-
             for (off, byte) in patches {
                 self.sections[sec_idx].data[off] = byte;
             }
@@ -1758,9 +1862,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let remove_count = existing_padding - needed_padding;
                 let remove_start = current_offset + needed_padding;
                 let remove_end = remove_start + remove_count;
-                self.sections[sec_idx].data.drain(remove_start..remove_end);
-                self.shift_offsets_after(sec_idx, remove_start, -(remove_count as i64), marker_idx);
+                if remove_end <= self.sections[sec_idx].data.len() {
+                    self.sections[sec_idx].data.drain(remove_start..remove_end);
+                    self.shift_offsets_after(
+                        sec_idx,
+                        remove_start,
+                        -(remove_count as i64),
+                        marker_idx,
+                    );
+                }
             }
+            // Persist the adjusted size so repeated fixup passes are idempotent.
+            self.sections[sec_idx].align_markers[marker_idx].padding = needed_padding;
 
             marker_idx += 1;
         }

@@ -1,26 +1,10 @@
-//! PGO block/function placement. The backend's fall-through-aware conditional
-//! emitter consumes block order and inverts the branch when the hot edge is the
-//! physical fall-through.
-//!
-//! v7 layout: proper chain-based placement (Petis–Hansen / GCC
-//! `-freorder-blocks` family):
-//!   1. each block starts as its own chain;
-//!   2. repeatedly merge the highest-weight edge whose endpoints are chain
-//!      ends (tail -> head, or tail -> tail with reversal) — this makes hot
-//!      edges fall through and leaves backedges as jumps (after the first
-//!      joins the backedge's endpoints are in the same chain);
-//!   3. the entry chain is rotated so the function entry is first;
-//!   4. chains are ordered by hotness (max block count), so zero-count cold
-//!      blocks cluster at the function tail (I-cache friendly hot prefix);
-//!   5. switch cases are sorted by edge frequency so compare chains test the
-//!      likely cases first.
-//!
-//! Promoted indirect-call blocks (v7 devirtualization) carry no profile
-//! entries; the promotion pass records their labels and layout assigns them
-//! the entry hotness so the devirtualized hot path stays in the hot prefix.
+//! Profile-guided function and block placement. It preserves source block
+//! order while using validated profile data to classify function sections,
+//! choose conditional fallthroughs, order switch cases, place devirtualized
+//! blocks, and align hot loop headers and join points.
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{BlockId, IrModule};
 use crate::pgo::ProfileData;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // PGO block layout is on by default with an active profile.
@@ -31,21 +15,22 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // Fresh per-unit switch-hint map (labels are TU-unique post
     // renumber; layout runs immediately before codegen for this unit).
     crate::pgo::record_switch_hints(crate::common::fx_hash::FxHashMap::default());
-    // v11: fresh per-unit conditional-branch fallthrough map.
+    // Fresh per-unit conditional-branch fallthrough map.
     crate::pgo::record_cond_fallthroughs(crate::common::fx_hash::FxHashMap::default());
+    // Fresh per-unit block-alignment map (profile-driven loop-header /
+    // join-point alignment).
+    crate::pgo::record_block_aligns(crate::common::fx_hash::FxHashMap::default());
     let max = p.max_total_for_unit(u);
     if max == 0 {
         return;
     }
     for f in &mut m.functions {
-        if f.is_declaration || f.blocks.len() < 2 {
+        if f.is_declaration {
             continue;
         }
-        // F9: use the DERIVED profile (flow-conservation solver output) —
-        // raw v5 profiles carry only instrumented EDGE counts; block counts
-        // are derived at propagate time. Reading the raw profile made every
-        // block count 0: chain ordering degenerated and every switch block
-        // looked cold.
+        // Classify single-block functions too; only intra-function layout
+        // requires multiple blocks. Use flow-derived block counts because raw
+        // profiles contain instrumented edge counts.
         //
         // Edge-derived block layout is ONLY sound for
         // functions whose post-pass CFG matches the training build (the
@@ -64,22 +49,27 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
                 None => continue,
             },
         };
-        // Hot/cold section classification via the data-driven summary
-        // (percentile thresholds over the unit's count distribution) with
-        // the v7 ratio as fallback when no summary is available.
-        let (hot, cold) = match crate::pgo::summary::get_summary() {
-            Some(s) => (s.is_hot(fp.total_count), s.is_cold(fp.total_count)),
-            None => (
-                fp.total_count > 0 && fp.total_count.saturating_mul(100) >= max,
-                fp.total_count.saturating_mul(10_000) < max,
-            ),
-        };
+        // Hot/cold section classification (whole-function I-cache placement).
+        // Section splitting trades I-cache space, so it must be STRICTER than
+        // the summary's is_hot/is_cold (which drive inlining decisions): a
+        // function is HOT iff it reaches at least 10% of the unit's hottest
+        // function's entry count (the dominant functions that deserve the
+        // contiguous hot region), and COLD iff it is 1000x below the hottest
+        // (truly rare code that belongs in .text.unlikely). A percentile-only
+        // threshold mislabels a skewed unit's 1%-execution helpers as hot
+        // (the [3x1.2M, 10x40K, 1] shape: the 90% percentile lands at 40K,
+        // so every helper cleared `c >= hot_threshold`), polluting .text.hot
+        // with cold code — the opposite of the I-cache goal.
+        let hot = fp.total_count > 0 && fp.total_count.saturating_mul(10) >= max;
+        let cold = max > 0 && fp.total_count.saturating_mul(1000) < max;
         if hot {
             f.section = Some(".text.hot".into());
         } else if cold {
             f.section = Some(".text.unlikely".into());
         }
-        layout_function(f, fp, u, edges_valid);
+        if f.blocks.len() >= 2 {
+            layout_function(f, fp, u, edges_valid);
+        }
     }
 
     // Order functions by hotness class within the TU — hot first, cold
@@ -137,12 +127,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         }
     }
 
-    // v11: profile-driven conditional-branch fallthrough. For every
-    // CondBranch whose edge profile is valid (non-drifted, derived), the
-    // successor with the higher edge execution count becomes the preferred
-    // fallthrough. The backend then emits the branch so the HOT successor
-    // falls through (fewer taken branches / branch misses on the hot path),
-    // WITHOUT reordering blocks — so register allocation is never perturbed.
+    // Prefer the more frequently executed successor as the fallthrough when
+    // derived edge counts are valid. This avoids block reordering and therefore
+    // does not perturb register allocation.
     use crate::ir::reexports::Terminator;
     let mut cf_map: crate::common::fx_hash::FxHashMap<u32, u32> =
         crate::common::fx_hash::FxHashMap::default();
@@ -175,6 +162,121 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     if !cf_map.is_empty() {
         crate::pgo::record_cond_fallthroughs(cf_map);
     }
+
+    // ── Profile-driven block alignment ────────────────────────────────────
+    // Hot loop headers and join points get 16-byte alignment. Very hot loop
+    // headers with larger bodies get 32-byte alignment. Candidates are gated
+    // on per-block execution count, so cold blocks receive no padding.
+    {
+        let mut align_map: crate::common::fx_hash::FxHashMap<u32, u8> =
+            crate::common::fx_hash::FxHashMap::default();
+        for f in &m.functions {
+            if f.is_declaration || f.blocks.len() < 3 {
+                continue;
+            }
+            let Some(fp) = crate::pgo::active_derived_profile(f) else {
+                continue;
+            };
+            let entry_count = fp.total_count.max(1);
+            // In-degree per block (number of CFG predecessors + entry).
+            let mut indeg: crate::common::fx_hash::FxHashMap<u32, u32> =
+                crate::common::fx_hash::FxHashMap::default();
+            for b in &f.blocks {
+                match &b.terminator {
+                    Terminator::Branch(x) => *indeg.entry(x.0).or_insert(0) += 1,
+                    Terminator::CondBranch { true_label, false_label, .. } => {
+                        *indeg.entry(true_label.0).or_insert(0) += 1;
+                        *indeg.entry(false_label.0).or_insert(0) += 1;
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        for (_, x) in cases {
+                            *indeg.entry(x.0).or_insert(0) += 1;
+                        }
+                        *indeg.entry(default.0).or_insert(0) += 1;
+                    }
+                    Terminator::IndirectBranch { possible_targets, .. } => {
+                        for x in possible_targets {
+                            *indeg.entry(x.0).or_insert(0) += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let entry = f.blocks.first().map(|b| b.label.0).unwrap_or(0);
+            *indeg.entry(entry).or_insert(0) += 1;
+            // Block order index, to detect backedges (edge from a LATER block
+            // to an EARLIER one = loop backedge; the earlier block is the
+            // loop header).
+            let pos: crate::common::fx_hash::FxHashMap<u32, usize> = f
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.label.0, i))
+                .collect();
+            let hot = |label: u32| -> bool {
+                // Require at least 1/16 of the function entry count.
+                let c = fp.block_count(crate::ir::reexports::BlockId(label));
+                c > 0 && c.saturating_mul(16) >= entry_count
+            };
+            // Treat the target of a backward branch as a loop header.
+            let mut is_loop_header: crate::common::fx_hash::FxHashSet<u32> =
+                crate::common::fx_hash::FxHashSet::default();
+            for p in &f.blocks {
+                let pp = *pos.get(&p.label.0).unwrap_or(&usize::MAX);
+                let mut mark = |t: u32| {
+                    if let Some(&tl) = pos.get(&t) {
+                        if pp > tl {
+                            is_loop_header.insert(t);
+                        }
+                    }
+                };
+                match &p.terminator {
+                    Terminator::Branch(x) => mark(x.0),
+                    Terminator::CondBranch { true_label, false_label, .. } => {
+                        mark(true_label.0);
+                        mark(false_label.0);
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        for (_, x) in cases {
+                            mark(x.0);
+                        }
+                        mark(default.0);
+                    }
+                    Terminator::IndirectBranch { possible_targets, .. } => {
+                        for x in possible_targets {
+                            mark(x.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for b in &f.blocks {
+                let l = b.label.0;
+                let c = fp.block_count(b.label);
+                if !hot(l) {
+                    continue;
+                }
+                if is_loop_header.contains(&l) {
+                    // Use 32 bytes for very hot headers with at least eight
+                    // instructions; otherwise use 16 bytes.
+                    let body = b.instructions.len();
+                    let alignment = if c.saturating_mul(4) >= entry_count && body >= 8 {
+                        5
+                    } else {
+                        4
+                    };
+                    align_map.insert(l, alignment);
+                } else if indeg.get(&l).copied().unwrap_or(0) >= 2 {
+                    // Hot join point (multiple predecessors): align the merge
+                    // so the fall-in is decode-friendly.
+                    align_map.insert(l, 4);
+                }
+            }
+        }
+        if !align_map.is_empty() {
+            crate::pgo::record_block_aligns(align_map);
+        }
+    }
 }
 
 fn layout_function(
@@ -203,24 +305,10 @@ fn layout_function(
     // edge-frequency switch-case sorting — they would scatter blocks by stale
     // weights. Preserve original order (still run hot/cold sectioning,
     // promoted-block placement, and count-based cold switch lowering).
-    let mut ordered: Vec<crate::ir::reexports::BasicBlock> = if edges_valid {
-        // v10 (red-team fix): PRESERVE the original block order. The prior
-        // chain-based (Petis-Hansen) reorder and even cold-block sinking can,
-        // for a function dominated by ONE hot loop, perturb the hot loop body
-        // and its register allocation — expat's multi-byte UTF-8 handling was
-        // placed before the hot ASCII loop (frame 40->72B, ~2x regression,
-        // measured 131ms -> 248ms), and cold-block sinking alone cost ~7ms
-        // (128.5 -> 135.5ms). The source order already provides good
-        // fallthrough for a hot loop. Robust no-regression rule: keep the
-        // ORIGINAL block order byte-for-byte (no reordering, no sinking), so
-        // the hot path is IDENTICAL to the plain build. Profile value comes
-        // from the (safe, local) switch-case ordering, hot/cold FUNCTION
-        // sections, promoted-block placement, and the PGO inliner's
-        // cold-classification fix — not from intra-function block movement.
-        f.blocks.clone()
-    } else {
-        f.blocks.clone()
-    };
+    // Preserve block order because reordering can perturb register allocation
+    // in hot loops. Profile-guided changes remain local to fallthrough choices,
+    // switch ordering, section placement, promoted blocks, and alignment.
+    let mut ordered: Vec<crate::ir::reexports::BasicBlock> = f.blocks.clone();
 
     // Profile-driven switch hints. For every Switch block:
     //   * cold per the summary -> force a compare chain (no jump table);
@@ -273,10 +361,8 @@ fn layout_function(
         }
     }
 
-    // Keep promoted (devirtualized) hot blocks adjacent to their
-    // predecessor. The chain heuristic can strand them at the function
-    // tail (their edges to a mid-chain block never merge), hurting the hot
-    // path — observed in zlib-ng deflate_quick.
+    // Keep promoted hot blocks adjacent to their predecessor. These synthetic
+    // blocks have no profile entries and can otherwise fall to the function tail.
     if std::env::var("LCCC_DEBUG_LAYOUT").is_ok() {
         eprintln!(
             "[LAYOUT] {} promoted labels: {:?} ({} blocks)",
@@ -340,10 +426,8 @@ fn layout_function(
 
 
 
-    // PGO switch case ordering: sort each Switch's cases by the frequency
-    // of the (switch block -> case block) edge so compare-and-branch
-    // chains test the most likely cases first. Only when the edge profile is
-    // valid (v9 drift gate).
+    // Sort switch cases by edge frequency so compare-and-branch chains test
+    // likely cases first. Only derived, non-drifted edge counts are valid.
     if edges_valid {
         for b in &mut f.blocks {
             let src = b.label.0;

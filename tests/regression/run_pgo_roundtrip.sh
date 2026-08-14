@@ -81,4 +81,25 @@ echo "cost-aware devirt: promoted sites = ${NPROM}"
 # A single-stable-target site must NOT be promoted (would add hot-path overhead).
 [ "$NPROM" -gt 0 ] && { echo "SINGLE-TARGET-PROMOTED-REGRESSION"; exit 1; }
 echo "cost-aware devirtualization roundtrip OK (single target not promoted)"
+
+# ── hot/cold section splitting + loop-header alignment ─────────────────────
+# A skewed multi-function unit must emit hot and unlikely sections plus
+# loop-header alignment while preserving the training build's output.
+SEC="pgo_sections"
+rm -rf /tmp/pgd_sections && mkdir -p /tmp/pgd_sections
+$CCC -O2 -fprofile-generate=/tmp/pgd_sections "$DIR/$SEC.c" -o /tmp/sec_pg 2>/dev/null || { echo "SEC-GEN-FAIL"; exit 1; }
+/tmp/sec_pg 3000000 > /tmp/sec_pg.out || { echo "SEC-TRAIN-FAIL"; exit 1; }
+grep -q '^[0-9]' /tmp/sec_pg.out || { echo "SEC-OUT-FAIL"; exit 1; }
+$CCC -O2 -fprofile-use=/tmp/pgd_sections "$DIR/$SEC.c" -o /tmp/sec_pu 2>/dev/null || { echo "SEC-USE-FAIL"; exit 1; }
+/tmp/sec_pu 3000000 > /tmp/sec_pu.out || { echo "SEC-USE-RUN-FAIL"; exit 1; }
+cmp -s /tmp/sec_pg.out /tmp/sec_pu.out || { echo "SEC-OUTPUT-DIFFERS"; exit 1; }
+$CCC -O2 -fprofile-use=/tmp/pgd_sections "$DIR/$SEC.c" -c -o /tmp/sec_pu.o 2>/dev/null || { echo "SEC-OBJ-FAIL"; exit 1; }
+SECTIONS=$(readelf -S /tmp/sec_pu.o 2>/dev/null | grep -oE '\.text(\.hot|\.unlikely)?')
+echo "sections emitted: $(echo $SECTIONS | tr ' ' ',')"
+echo "$SECTIONS" | grep -q '.text.hot' || { echo "SEC-NO-HOT-SECTION"; exit 1; }
+echo "$SECTIONS" | grep -q '.text.unlikely' || { echo "SEC-NO-COLD-SECTION"; exit 1; }
+# The hot loop header must carry an alignment directive in the text output.
+$CCC -O2 -fprofile-use=/tmp/pgd_sections "$DIR/$SEC.c" -S -o /tmp/sec_pu.s 2>/dev/null
+grep -q 'p2align' /tmp/sec_pu.s || { echo "SEC-NO-ALIGN"; exit 1; }
+echo "sections + alignment roundtrip OK (hot/cold split, .p2align present)"
 exit 0
