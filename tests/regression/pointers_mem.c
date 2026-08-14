@@ -1,4 +1,4 @@
-/* v4 regression: pointer arithmetic, casts, function pointers, arrays,
+/* pointer arithmetic, casts, function pointers, arrays,
  * string literals, memcpy/memset behavior. */
 #include <stdio.h>
 #include <string.h>

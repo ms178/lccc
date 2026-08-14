@@ -1,4 +1,4 @@
-/* v4 regression: AVX2 256-bit intrinsics vs scalar reference — 256-bit loads,
+/* AVX2 256-bit intrinsics vs scalar reference — 256-bit loads,
  * arithmetic, comparisons, shuffles, broadcasts, inserts/extracts. */
 #include <immintrin.h>
 #include <stdint.h>

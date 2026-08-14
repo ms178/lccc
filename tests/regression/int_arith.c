@@ -1,4 +1,4 @@
-/* v4 regression: integer arithmetic correctness — signedness, promotion,
+/* integer arithmetic correctness — signedness, promotion,
  * overflow, division, modulo. Verifies against compile-time-known values. */
 #include <stdio.h>
 #include <limits.h>

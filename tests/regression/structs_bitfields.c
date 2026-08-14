@@ -1,4 +1,4 @@
-/* v4 regression: struct/union layout, bitfield semantics, alignment,
+/* struct/union layout, bitfield semantics, alignment,
  * by-value passing, return-in-memory. */
 #include <stdio.h>
 #include <stddef.h>

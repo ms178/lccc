@@ -1,4 +1,4 @@
-/* v4 regression: global/static initialization, common symbols, TLS, and
+/* global/static initialization, common symbols, TLS, and
  * cross-TU-style linkage of globals and functions. */
 #include <stdio.h>
 #include <string.h>

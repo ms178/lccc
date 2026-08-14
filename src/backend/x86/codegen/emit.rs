@@ -3675,9 +3675,19 @@ impl ArchCodegen for X86Codegen {
                 self.state.reg_cache.invalidate_acc();
             }
             (Some(d), None) => {
-                self.operand_to_rax(src);
-                let d_name = phys_reg_name(d);
-                self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+                // A constant copied into a register-allocated dest is emitted
+                // directly (movq $imm, %reg / xorl for zero) instead of the
+                // relay `movq $imm, %rax; movq %rax, %reg` — the short-circuit
+                // merge value (`x = 1`) and loop preambles pay this copy per
+                // execution. Values (slots / accumulator-cached) keep the rax
+                // relay (their width-aware load semantics must be preserved).
+                if matches!(src, Operand::Const(_)) {
+                    self.operand_to_callee_reg(src, d);
+                } else {
+                    self.operand_to_rax(src);
+                    let d_name = phys_reg_name(d);
+                    self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+                }
                 self.state.reg_cache.invalidate_acc();
             }
             _ => {

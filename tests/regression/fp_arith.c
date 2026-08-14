@@ -1,4 +1,4 @@
-/* v4 regression: FP arithmetic — float/double, signed zero, rounding,
+/* FP arithmetic — float/double, signed zero, rounding,
  * inf/nan propagation, conversions. */
 #include <stdio.h>
 #include <math.h>

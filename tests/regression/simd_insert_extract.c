@@ -1,4 +1,4 @@
-/* v5 regression: SIMD insert/extract family correctness (register-aware loaders).
+/* SIMD insert/extract family correctness (register-aware loaders).
  * Exercises Pinsrw/Pinsrd/Pinsrb/Pinsrq, Pextrw/Pextrd/Pextrb/Pextrq,
  * Cvtsi128Si32/Si64, Pmovmskb128/256 and Pabsb against scalar references.
  * Extract/insert indices are compile-time immediates (pextr and pinsr require

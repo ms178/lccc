@@ -3391,7 +3391,7 @@ fn insert_reduction_remainder_loop(
                         // rewiring: a surviving Cmp operand kept the vector
                         // accumulator, emitted as leaq (vectors are
                         // addressed) — comparing a stack address instead of
-                        // the sum (regr_v2_reduction_two_sums regression).
+                        // the sum (the reduction_two_sums regression).
                         if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
                         if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
                     }

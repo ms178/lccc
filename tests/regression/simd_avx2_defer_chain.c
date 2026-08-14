@@ -1,4 +1,4 @@
-/* v5 regression: 256-bit deferred-store chain (AVX2 compare loop).
+/* 256-bit deferred-store chain (AVX2 compare loop).
  * `acc = _mm256_xor_si256(acc, eq)` with eq used only by the adjacent
  * intrinsic (args[1]) exercises: (a) the deferred store + load-order swap
  * (eq must flow register-to-register via vmovdqa, NOT through its slot), and

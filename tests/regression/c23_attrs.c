@@ -1,4 +1,4 @@
-/* v4 regression: C23 [[fallthrough]] + [[maybe_unused]] statement attributes
+/* C23 [[fallthrough]] + [[maybe_unused]] statement attributes
  * (v1 glibc cpu-features bug class), plus _Static_assert and _Alignas. */
 #include <stdio.h>
 #include <stddef.h>

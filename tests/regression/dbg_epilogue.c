@@ -1,4 +1,4 @@
-/* v5 regression: -g (debug info) must not lose function epilogues.
+/* -g (debug info) must not lose function epilogues.
  * gzip -v crashed at -O2 -g because the .loc directive between a tail varargs
  * call and a conditionally-labeled epilogue fragmented basic blocks, and the
  * identical-block merge then mis-fired and deleted a function's epilogue+ret

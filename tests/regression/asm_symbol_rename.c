@@ -1,4 +1,4 @@
-/* v5 regression (Agent B audit): a file-scope asm label that is NOT a register
+/* A file-scope asm label that is NOT a register
  * name is a linker-symbol redirect, never a register variable. Before the fix
  * both trees emitted `movl %abccb, %abccb` self-moves (register-global path
  * fired for any asm label); register pinning (`__asm__("rbx")`) must keep
