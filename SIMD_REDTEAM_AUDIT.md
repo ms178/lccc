@@ -807,3 +807,44 @@ are screening-only; relative deltas within one run are the signal.
    emits `add dl,62; cmp dl,29` (8-bit). Narrow the fold's sub+cmp to the
    operand's natural width when the span fits.
 4. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
+
+## v12 — flat short-circuit, byte compares, FP-param fix, accumulator reassoc
+
+All four v11 roadmap items plus a critical miscompile fix, an exhaustive test
+sweep, and one more ICC/ICX distill.
+
+1. **Flat short-circuit lowering** (the big one). `a || b || c` parsed as
+   `(a || b) || c`; the per-link lowering built a right-nested value tree (one
+   alloca + branch diamond per link), so the intermediate links were DATA
+   (each selected as the next link's false arm) and materialized as setcc/cmov
+   even when the whole result only fed a branch. Now left-associative runs of
+   the SAME operator flatten into ONE branch sequence with ONE merge value —
+   GCC/ICX's Expat shape (cmp;ja chains). Constants are dropped (identity) or
+   short-circuit (decisive, evaluating prior operands for side effects).
+   **expat_xml_scan 2.77x -> 2.01x.**
+
+2. **Range-fold compare narrowing.** The range check's COMPARE narrows to the
+   operand's source width ((u8)(x - lo) <= span reads the low byte of the
+   32-bit sub), matching GCC's `add edx,62; cmp dl,29`.
+
+3. **FP-param pre-store ordering fix (critical miscompile, caught by the new
+   v12_fp_param test).** The v11 FP-param pre-store stored each param's ABI
+   register into its XMM home in param order; a home (xmm2..xmm7) can DOUBLE as
+   another param's ABI argument register, so constp(a,b,scale) = (a+b)*scale
+   compiled to (a+b)*a. Pre-stores now run in a topological order (a home
+   never clobbers a pending ABI arg); cycles (3+ FP params) break via a
+   scratch XMM register.
+
+4. **Loop-carried accumulator reassociation (ICC's Adler-32 rotation).**
+   sum1 += b[i]; sum2 += sum1; is reassociated (unsigned only) into the closed
+   form sum2' = sum2 + N*sum1 + Σ (N-i)*b[i], breaking the serial dependency.
+   **zlib_ng_adler32 1.73x -> 1.57x.**
+
+5. **8 exhaustive regression tests** (141 total): flat short-circuit,
+   range-fold edges, ALU peepholes/strength reduction, bitops builtins,
+   FP params, dead params, ALU chains, accumulator reassociation.
+
+Remaining known gaps (next session): the adler load→register copy chains
+(movzbl (%r11),%edx; mov %r12d,%esi — the load should land directly in the
+add's register), the expat last-link materialization (function-return bool),
+and nbody's preheader imulq.

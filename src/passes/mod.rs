@@ -28,6 +28,7 @@ pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
 pub(crate) mod range_check;
+pub(crate) mod reassoc_accum;
 pub(crate) mod recursion_to_iter;
 mod resolve_asm;
 pub(crate) mod simplify;
@@ -686,6 +687,21 @@ macro_rules! preloop_dump {
                 run_on_visited(module, &dirty, &mut changed, simplify::simplify_function)
             );
             cur_pass_changes[3] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 3b: Loop-carried accumulator reassociation.
+        // `sum1 += b[i]; sum2 += sum1;` (unsigned) is reassociated into the
+        // closed form sum2' = sum2 + N*sum1 + Σ (N-i)*b[i], breaking the serial
+        // dependency between the two chains (ICC's Adler-32 rotation). Idempotent
+        // (the pattern no longer matches after the rewrite). Pass name for
+        // CCC_DISABLE_PASSES: "reassoc_accum".
+        if !disabled.contains("reassoc_accum") {
+            let n = timed_pass!(
+                "reassoc_accum",
+                run_on_visited(module, &dirty, &mut changed, reassoc_accum::run_function)
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }
