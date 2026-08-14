@@ -433,7 +433,7 @@ impl GvnState {
                 offset,
                 ty,
             } => {
-                // v6: re-enable GEP CSE. Two GEPs with the same base and
+                // re-enable GEP CSE. Two GEPs with the same base and
                 // offset compute the same address; the duplicate becomes a
                 // Copy that the copy-coalescer folds to one home slot (the
                 // nbody inner-loop recomputes `&bodies[i]` once per field

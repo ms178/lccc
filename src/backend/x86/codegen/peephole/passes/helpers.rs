@@ -237,6 +237,30 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
 }
 
 /// Get the destination register of an instruction (the register it writes to).
+/// Whether `trimmed` is a self-referencing zeroing idiom such as
+/// `xorl %eax, %eax`, `xorq %r12, %r12` or `subl %ecx, %ecx`.
+///
+/// These instructions do not READ the named register: the CPU recognizes the
+/// pattern as a dependency-breaking define of zero. Any analysis that treats
+/// the source operand as a use will happily rewrite it and destroy both the
+/// zero and the register it was supposed to clear.
+pub(super) fn is_self_zeroing_idiom(trimmed: &str) -> bool {
+    let mut it = trimmed.split_whitespace();
+    let Some(op) = it.next() else { return false };
+    if !matches!(
+        op,
+        "xor" | "xorb" | "xorw" | "xorl" | "xorq"
+            | "sub" | "subb" | "subw" | "subl" | "subq"
+            | "pxor" | "xorps" | "xorpd"
+    ) {
+        return false;
+    }
+    let rest: String = it.collect::<Vec<_>>().join(" ");
+    let Some((a, b)) = rest.split_once(',') else { return false };
+    let (a, b) = (a.trim(), b.trim());
+    !a.is_empty() && a == b && a.starts_with('%')
+}
+
 pub(super) fn get_dest_reg(info: &LineInfo) -> RegId {
     match info.kind {
         LineKind::Other { dest_reg } => dest_reg,

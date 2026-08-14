@@ -1,0 +1,1155 @@
+;;; sse_pd
+.text
+addpd %xmm0, %xmm1
+addpd %xmm7, %xmm8
+addpd %xmm8, %xmm15
+addpd %xmm15, %xmm0
+addpd %xmm3, %xmm12
+addpd 16(%rdi), %xmm5
+addpd (%r13,%r14,8), %xmm13
+subpd %xmm0, %xmm1
+subpd %xmm7, %xmm8
+subpd %xmm8, %xmm15
+subpd %xmm15, %xmm0
+subpd %xmm3, %xmm12
+subpd 16(%rdi), %xmm5
+subpd (%r13,%r14,8), %xmm13
+mulpd %xmm0, %xmm1
+mulpd %xmm7, %xmm8
+mulpd %xmm8, %xmm15
+mulpd %xmm15, %xmm0
+mulpd %xmm3, %xmm12
+mulpd 16(%rdi), %xmm5
+mulpd (%r13,%r14,8), %xmm13
+divpd %xmm0, %xmm1
+divpd %xmm7, %xmm8
+divpd %xmm8, %xmm15
+divpd %xmm15, %xmm0
+divpd %xmm3, %xmm12
+divpd 16(%rdi), %xmm5
+divpd (%r13,%r14,8), %xmm13
+minpd %xmm0, %xmm1
+minpd %xmm7, %xmm8
+minpd %xmm8, %xmm15
+minpd %xmm15, %xmm0
+minpd %xmm3, %xmm12
+minpd 16(%rdi), %xmm5
+minpd (%r13,%r14,8), %xmm13
+maxpd %xmm0, %xmm1
+maxpd %xmm7, %xmm8
+maxpd %xmm8, %xmm15
+maxpd %xmm15, %xmm0
+maxpd %xmm3, %xmm12
+maxpd 16(%rdi), %xmm5
+maxpd (%r13,%r14,8), %xmm13
+andpd %xmm0, %xmm1
+andpd %xmm7, %xmm8
+andpd %xmm8, %xmm15
+andpd %xmm15, %xmm0
+andpd %xmm3, %xmm12
+andpd 16(%rdi), %xmm5
+andpd (%r13,%r14,8), %xmm13
+andnpd %xmm0, %xmm1
+andnpd %xmm7, %xmm8
+andnpd %xmm8, %xmm15
+andnpd %xmm15, %xmm0
+andnpd %xmm3, %xmm12
+andnpd 16(%rdi), %xmm5
+andnpd (%r13,%r14,8), %xmm13
+orpd %xmm0, %xmm1
+orpd %xmm7, %xmm8
+orpd %xmm8, %xmm15
+orpd %xmm15, %xmm0
+orpd %xmm3, %xmm12
+orpd 16(%rdi), %xmm5
+orpd (%r13,%r14,8), %xmm13
+xorpd %xmm0, %xmm1
+xorpd %xmm7, %xmm8
+xorpd %xmm8, %xmm15
+xorpd %xmm15, %xmm0
+xorpd %xmm3, %xmm12
+xorpd 16(%rdi), %xmm5
+xorpd (%r13,%r14,8), %xmm13
+unpcklpd %xmm0, %xmm1
+unpcklpd %xmm7, %xmm8
+unpcklpd %xmm8, %xmm15
+unpcklpd %xmm15, %xmm0
+unpcklpd %xmm3, %xmm12
+unpcklpd 16(%rdi), %xmm5
+unpcklpd (%r13,%r14,8), %xmm13
+unpckhpd %xmm0, %xmm1
+unpckhpd %xmm7, %xmm8
+unpckhpd %xmm8, %xmm15
+unpckhpd %xmm15, %xmm0
+unpckhpd %xmm3, %xmm12
+unpckhpd 16(%rdi), %xmm5
+unpckhpd (%r13,%r14,8), %xmm13
+sqrtpd %xmm0, %xmm1
+sqrtpd %xmm7, %xmm8
+sqrtpd %xmm8, %xmm15
+sqrtpd %xmm15, %xmm0
+sqrtpd %xmm3, %xmm12
+sqrtpd 16(%rdi), %xmm5
+sqrtpd (%r13,%r14,8), %xmm13
+;;; sse_ps
+.text
+addps %xmm0, %xmm1
+addps %xmm7, %xmm8
+addps %xmm8, %xmm15
+addps %xmm15, %xmm0
+addps %xmm3, %xmm12
+addps 16(%rdi), %xmm5
+addps (%r13,%r14,8), %xmm13
+subps %xmm0, %xmm1
+subps %xmm7, %xmm8
+subps %xmm8, %xmm15
+subps %xmm15, %xmm0
+subps %xmm3, %xmm12
+subps 16(%rdi), %xmm5
+subps (%r13,%r14,8), %xmm13
+mulps %xmm0, %xmm1
+mulps %xmm7, %xmm8
+mulps %xmm8, %xmm15
+mulps %xmm15, %xmm0
+mulps %xmm3, %xmm12
+mulps 16(%rdi), %xmm5
+mulps (%r13,%r14,8), %xmm13
+divps %xmm0, %xmm1
+divps %xmm7, %xmm8
+divps %xmm8, %xmm15
+divps %xmm15, %xmm0
+divps %xmm3, %xmm12
+divps 16(%rdi), %xmm5
+divps (%r13,%r14,8), %xmm13
+minps %xmm0, %xmm1
+minps %xmm7, %xmm8
+minps %xmm8, %xmm15
+minps %xmm15, %xmm0
+minps %xmm3, %xmm12
+minps 16(%rdi), %xmm5
+minps (%r13,%r14,8), %xmm13
+maxps %xmm0, %xmm1
+maxps %xmm7, %xmm8
+maxps %xmm8, %xmm15
+maxps %xmm15, %xmm0
+maxps %xmm3, %xmm12
+maxps 16(%rdi), %xmm5
+maxps (%r13,%r14,8), %xmm13
+andps %xmm0, %xmm1
+andps %xmm7, %xmm8
+andps %xmm8, %xmm15
+andps %xmm15, %xmm0
+andps %xmm3, %xmm12
+andps 16(%rdi), %xmm5
+andps (%r13,%r14,8), %xmm13
+andnps %xmm0, %xmm1
+andnps %xmm7, %xmm8
+andnps %xmm8, %xmm15
+andnps %xmm15, %xmm0
+andnps %xmm3, %xmm12
+andnps 16(%rdi), %xmm5
+andnps (%r13,%r14,8), %xmm13
+orps %xmm0, %xmm1
+orps %xmm7, %xmm8
+orps %xmm8, %xmm15
+orps %xmm15, %xmm0
+orps %xmm3, %xmm12
+orps 16(%rdi), %xmm5
+orps (%r13,%r14,8), %xmm13
+xorps %xmm0, %xmm1
+xorps %xmm7, %xmm8
+xorps %xmm8, %xmm15
+xorps %xmm15, %xmm0
+xorps %xmm3, %xmm12
+xorps 16(%rdi), %xmm5
+xorps (%r13,%r14,8), %xmm13
+unpcklps %xmm0, %xmm1
+unpcklps %xmm7, %xmm8
+unpcklps %xmm8, %xmm15
+unpcklps %xmm15, %xmm0
+unpcklps %xmm3, %xmm12
+unpcklps 16(%rdi), %xmm5
+unpcklps (%r13,%r14,8), %xmm13
+unpckhps %xmm0, %xmm1
+unpckhps %xmm7, %xmm8
+unpckhps %xmm8, %xmm15
+unpckhps %xmm15, %xmm0
+unpckhps %xmm3, %xmm12
+unpckhps 16(%rdi), %xmm5
+unpckhps (%r13,%r14,8), %xmm13
+sqrtps %xmm0, %xmm1
+sqrtps %xmm7, %xmm8
+sqrtps %xmm8, %xmm15
+sqrtps %xmm15, %xmm0
+sqrtps %xmm3, %xmm12
+sqrtps 16(%rdi), %xmm5
+sqrtps (%r13,%r14,8), %xmm13
+rcpps %xmm0, %xmm1
+rcpps %xmm7, %xmm8
+rcpps %xmm8, %xmm15
+rcpps %xmm15, %xmm0
+rcpps %xmm3, %xmm12
+rcpps 16(%rdi), %xmm5
+rcpps (%r13,%r14,8), %xmm13
+rsqrtps %xmm0, %xmm1
+rsqrtps %xmm7, %xmm8
+rsqrtps %xmm8, %xmm15
+rsqrtps %xmm15, %xmm0
+rsqrtps %xmm3, %xmm12
+rsqrtps 16(%rdi), %xmm5
+rsqrtps (%r13,%r14,8), %xmm13
+;;; sse_sd
+.text
+addsd %xmm0, %xmm1
+addsd %xmm7, %xmm8
+addsd %xmm8, %xmm15
+addsd %xmm15, %xmm0
+addsd %xmm3, %xmm12
+addsd 16(%rdi), %xmm5
+addsd (%r13,%r14,8), %xmm13
+subsd %xmm0, %xmm1
+subsd %xmm7, %xmm8
+subsd %xmm8, %xmm15
+subsd %xmm15, %xmm0
+subsd %xmm3, %xmm12
+subsd 16(%rdi), %xmm5
+subsd (%r13,%r14,8), %xmm13
+mulsd %xmm0, %xmm1
+mulsd %xmm7, %xmm8
+mulsd %xmm8, %xmm15
+mulsd %xmm15, %xmm0
+mulsd %xmm3, %xmm12
+mulsd 16(%rdi), %xmm5
+mulsd (%r13,%r14,8), %xmm13
+divsd %xmm0, %xmm1
+divsd %xmm7, %xmm8
+divsd %xmm8, %xmm15
+divsd %xmm15, %xmm0
+divsd %xmm3, %xmm12
+divsd 16(%rdi), %xmm5
+divsd (%r13,%r14,8), %xmm13
+minsd %xmm0, %xmm1
+minsd %xmm7, %xmm8
+minsd %xmm8, %xmm15
+minsd %xmm15, %xmm0
+minsd %xmm3, %xmm12
+minsd 16(%rdi), %xmm5
+minsd (%r13,%r14,8), %xmm13
+maxsd %xmm0, %xmm1
+maxsd %xmm7, %xmm8
+maxsd %xmm8, %xmm15
+maxsd %xmm15, %xmm0
+maxsd %xmm3, %xmm12
+maxsd 16(%rdi), %xmm5
+maxsd (%r13,%r14,8), %xmm13
+sqrtsd %xmm0, %xmm1
+sqrtsd %xmm7, %xmm8
+sqrtsd %xmm8, %xmm15
+sqrtsd %xmm15, %xmm0
+sqrtsd %xmm3, %xmm12
+sqrtsd 16(%rdi), %xmm5
+sqrtsd (%r13,%r14,8), %xmm13
+;;; sse_ss
+.text
+addss %xmm0, %xmm1
+addss %xmm7, %xmm8
+addss %xmm8, %xmm15
+addss %xmm15, %xmm0
+addss %xmm3, %xmm12
+addss 16(%rdi), %xmm5
+addss (%r13,%r14,8), %xmm13
+subss %xmm0, %xmm1
+subss %xmm7, %xmm8
+subss %xmm8, %xmm15
+subss %xmm15, %xmm0
+subss %xmm3, %xmm12
+subss 16(%rdi), %xmm5
+subss (%r13,%r14,8), %xmm13
+mulss %xmm0, %xmm1
+mulss %xmm7, %xmm8
+mulss %xmm8, %xmm15
+mulss %xmm15, %xmm0
+mulss %xmm3, %xmm12
+mulss 16(%rdi), %xmm5
+mulss (%r13,%r14,8), %xmm13
+divss %xmm0, %xmm1
+divss %xmm7, %xmm8
+divss %xmm8, %xmm15
+divss %xmm15, %xmm0
+divss %xmm3, %xmm12
+divss 16(%rdi), %xmm5
+divss (%r13,%r14,8), %xmm13
+minss %xmm0, %xmm1
+minss %xmm7, %xmm8
+minss %xmm8, %xmm15
+minss %xmm15, %xmm0
+minss %xmm3, %xmm12
+minss 16(%rdi), %xmm5
+minss (%r13,%r14,8), %xmm13
+maxss %xmm0, %xmm1
+maxss %xmm7, %xmm8
+maxss %xmm8, %xmm15
+maxss %xmm15, %xmm0
+maxss %xmm3, %xmm12
+maxss 16(%rdi), %xmm5
+maxss (%r13,%r14,8), %xmm13
+sqrtss %xmm0, %xmm1
+sqrtss %xmm7, %xmm8
+sqrtss %xmm8, %xmm15
+sqrtss %xmm15, %xmm0
+sqrtss %xmm3, %xmm12
+sqrtss 16(%rdi), %xmm5
+sqrtss (%r13,%r14,8), %xmm13
+rcpss %xmm0, %xmm1
+rcpss %xmm7, %xmm8
+rcpss %xmm8, %xmm15
+rcpss %xmm15, %xmm0
+rcpss %xmm3, %xmm12
+rcpss 16(%rdi), %xmm5
+rcpss (%r13,%r14,8), %xmm13
+rsqrtss %xmm0, %xmm1
+rsqrtss %xmm7, %xmm8
+rsqrtss %xmm8, %xmm15
+rsqrtss %xmm15, %xmm0
+rsqrtss %xmm3, %xmm12
+rsqrtss 16(%rdi), %xmm5
+rsqrtss (%r13,%r14,8), %xmm13
+;;; sse_int
+.text
+paddb %xmm0, %xmm1
+paddb %xmm7, %xmm8
+paddb %xmm8, %xmm15
+paddb %xmm15, %xmm0
+paddb %xmm3, %xmm12
+paddb 16(%rdi), %xmm5
+paddb (%r13,%r14,8), %xmm13
+paddw %xmm0, %xmm1
+paddw %xmm7, %xmm8
+paddw %xmm8, %xmm15
+paddw %xmm15, %xmm0
+paddw %xmm3, %xmm12
+paddw 16(%rdi), %xmm5
+paddw (%r13,%r14,8), %xmm13
+paddd %xmm0, %xmm1
+paddd %xmm7, %xmm8
+paddd %xmm8, %xmm15
+paddd %xmm15, %xmm0
+paddd %xmm3, %xmm12
+paddd 16(%rdi), %xmm5
+paddd (%r13,%r14,8), %xmm13
+paddq %xmm0, %xmm1
+paddq %xmm7, %xmm8
+paddq %xmm8, %xmm15
+paddq %xmm15, %xmm0
+paddq %xmm3, %xmm12
+paddq 16(%rdi), %xmm5
+paddq (%r13,%r14,8), %xmm13
+psubb %xmm0, %xmm1
+psubb %xmm7, %xmm8
+psubb %xmm8, %xmm15
+psubb %xmm15, %xmm0
+psubb %xmm3, %xmm12
+psubb 16(%rdi), %xmm5
+psubb (%r13,%r14,8), %xmm13
+psubw %xmm0, %xmm1
+psubw %xmm7, %xmm8
+psubw %xmm8, %xmm15
+psubw %xmm15, %xmm0
+psubw %xmm3, %xmm12
+psubw 16(%rdi), %xmm5
+psubw (%r13,%r14,8), %xmm13
+psubd %xmm0, %xmm1
+psubd %xmm7, %xmm8
+psubd %xmm8, %xmm15
+psubd %xmm15, %xmm0
+psubd %xmm3, %xmm12
+psubd 16(%rdi), %xmm5
+psubd (%r13,%r14,8), %xmm13
+psubq %xmm0, %xmm1
+psubq %xmm7, %xmm8
+psubq %xmm8, %xmm15
+psubq %xmm15, %xmm0
+psubq %xmm3, %xmm12
+psubq 16(%rdi), %xmm5
+psubq (%r13,%r14,8), %xmm13
+pand %xmm0, %xmm1
+pand %xmm7, %xmm8
+pand %xmm8, %xmm15
+pand %xmm15, %xmm0
+pand %xmm3, %xmm12
+pand 16(%rdi), %xmm5
+pand (%r13,%r14,8), %xmm13
+pandn %xmm0, %xmm1
+pandn %xmm7, %xmm8
+pandn %xmm8, %xmm15
+pandn %xmm15, %xmm0
+pandn %xmm3, %xmm12
+pandn 16(%rdi), %xmm5
+pandn (%r13,%r14,8), %xmm13
+por %xmm0, %xmm1
+por %xmm7, %xmm8
+por %xmm8, %xmm15
+por %xmm15, %xmm0
+por %xmm3, %xmm12
+por 16(%rdi), %xmm5
+por (%r13,%r14,8), %xmm13
+pxor %xmm0, %xmm1
+pxor %xmm7, %xmm8
+pxor %xmm8, %xmm15
+pxor %xmm15, %xmm0
+pxor %xmm3, %xmm12
+pxor 16(%rdi), %xmm5
+pxor (%r13,%r14,8), %xmm13
+pmullw %xmm0, %xmm1
+pmullw %xmm7, %xmm8
+pmullw %xmm8, %xmm15
+pmullw %xmm15, %xmm0
+pmullw %xmm3, %xmm12
+pmullw 16(%rdi), %xmm5
+pmullw (%r13,%r14,8), %xmm13
+pmulhw %xmm0, %xmm1
+pmulhw %xmm7, %xmm8
+pmulhw %xmm8, %xmm15
+pmulhw %xmm15, %xmm0
+pmulhw %xmm3, %xmm12
+pmulhw 16(%rdi), %xmm5
+pmulhw (%r13,%r14,8), %xmm13
+pmulhuw %xmm0, %xmm1
+pmulhuw %xmm7, %xmm8
+pmulhuw %xmm8, %xmm15
+pmulhuw %xmm15, %xmm0
+pmulhuw %xmm3, %xmm12
+pmulhuw 16(%rdi), %xmm5
+pmulhuw (%r13,%r14,8), %xmm13
+pmuludq %xmm0, %xmm1
+pmuludq %xmm7, %xmm8
+pmuludq %xmm8, %xmm15
+pmuludq %xmm15, %xmm0
+pmuludq %xmm3, %xmm12
+pmuludq 16(%rdi), %xmm5
+pmuludq (%r13,%r14,8), %xmm13
+pavgb %xmm0, %xmm1
+pavgb %xmm7, %xmm8
+pavgb %xmm8, %xmm15
+pavgb %xmm15, %xmm0
+pavgb %xmm3, %xmm12
+pavgb 16(%rdi), %xmm5
+pavgb (%r13,%r14,8), %xmm13
+pavgw %xmm0, %xmm1
+pavgw %xmm7, %xmm8
+pavgw %xmm8, %xmm15
+pavgw %xmm15, %xmm0
+pavgw %xmm3, %xmm12
+pavgw 16(%rdi), %xmm5
+pavgw (%r13,%r14,8), %xmm13
+pmaxub %xmm0, %xmm1
+pmaxub %xmm7, %xmm8
+pmaxub %xmm8, %xmm15
+pmaxub %xmm15, %xmm0
+pmaxub %xmm3, %xmm12
+pmaxub 16(%rdi), %xmm5
+pmaxub (%r13,%r14,8), %xmm13
+pminub %xmm0, %xmm1
+pminub %xmm7, %xmm8
+pminub %xmm8, %xmm15
+pminub %xmm15, %xmm0
+pminub %xmm3, %xmm12
+pminub 16(%rdi), %xmm5
+pminub (%r13,%r14,8), %xmm13
+pmaxsw %xmm0, %xmm1
+pmaxsw %xmm7, %xmm8
+pmaxsw %xmm8, %xmm15
+pmaxsw %xmm15, %xmm0
+pmaxsw %xmm3, %xmm12
+pmaxsw 16(%rdi), %xmm5
+pmaxsw (%r13,%r14,8), %xmm13
+pminsw %xmm0, %xmm1
+pminsw %xmm7, %xmm8
+pminsw %xmm8, %xmm15
+pminsw %xmm15, %xmm0
+pminsw %xmm3, %xmm12
+pminsw 16(%rdi), %xmm5
+pminsw (%r13,%r14,8), %xmm13
+psadbw %xmm0, %xmm1
+psadbw %xmm7, %xmm8
+psadbw %xmm8, %xmm15
+psadbw %xmm15, %xmm0
+psadbw %xmm3, %xmm12
+psadbw 16(%rdi), %xmm5
+psadbw (%r13,%r14,8), %xmm13
+packsswb %xmm0, %xmm1
+packsswb %xmm7, %xmm8
+packsswb %xmm8, %xmm15
+packsswb %xmm15, %xmm0
+packsswb %xmm3, %xmm12
+packsswb 16(%rdi), %xmm5
+packsswb (%r13,%r14,8), %xmm13
+packssdw %xmm0, %xmm1
+packssdw %xmm7, %xmm8
+packssdw %xmm8, %xmm15
+packssdw %xmm15, %xmm0
+packssdw %xmm3, %xmm12
+packssdw 16(%rdi), %xmm5
+packssdw (%r13,%r14,8), %xmm13
+packuswb %xmm0, %xmm1
+packuswb %xmm7, %xmm8
+packuswb %xmm8, %xmm15
+packuswb %xmm15, %xmm0
+packuswb %xmm3, %xmm12
+packuswb 16(%rdi), %xmm5
+packuswb (%r13,%r14,8), %xmm13
+punpcklbw %xmm0, %xmm1
+punpcklbw %xmm7, %xmm8
+punpcklbw %xmm8, %xmm15
+punpcklbw %xmm15, %xmm0
+punpcklbw %xmm3, %xmm12
+punpcklbw 16(%rdi), %xmm5
+punpcklbw (%r13,%r14,8), %xmm13
+punpckhbw %xmm0, %xmm1
+punpckhbw %xmm7, %xmm8
+punpckhbw %xmm8, %xmm15
+punpckhbw %xmm15, %xmm0
+punpckhbw %xmm3, %xmm12
+punpckhbw 16(%rdi), %xmm5
+punpckhbw (%r13,%r14,8), %xmm13
+punpckldq %xmm0, %xmm1
+punpckldq %xmm7, %xmm8
+punpckldq %xmm8, %xmm15
+punpckldq %xmm15, %xmm0
+punpckldq %xmm3, %xmm12
+punpckldq 16(%rdi), %xmm5
+punpckldq (%r13,%r14,8), %xmm13
+punpcklqdq %xmm0, %xmm1
+punpcklqdq %xmm7, %xmm8
+punpcklqdq %xmm8, %xmm15
+punpcklqdq %xmm15, %xmm0
+punpcklqdq %xmm3, %xmm12
+punpcklqdq 16(%rdi), %xmm5
+punpcklqdq (%r13,%r14,8), %xmm13
+punpckhqdq %xmm0, %xmm1
+punpckhqdq %xmm7, %xmm8
+punpckhqdq %xmm8, %xmm15
+punpckhqdq %xmm15, %xmm0
+punpckhqdq %xmm3, %xmm12
+punpckhqdq 16(%rdi), %xmm5
+punpckhqdq (%r13,%r14,8), %xmm13
+pcmpeqb %xmm0, %xmm1
+pcmpeqb %xmm7, %xmm8
+pcmpeqb %xmm8, %xmm15
+pcmpeqb %xmm15, %xmm0
+pcmpeqb %xmm3, %xmm12
+pcmpeqb 16(%rdi), %xmm5
+pcmpeqb (%r13,%r14,8), %xmm13
+pcmpeqw %xmm0, %xmm1
+pcmpeqw %xmm7, %xmm8
+pcmpeqw %xmm8, %xmm15
+pcmpeqw %xmm15, %xmm0
+pcmpeqw %xmm3, %xmm12
+pcmpeqw 16(%rdi), %xmm5
+pcmpeqw (%r13,%r14,8), %xmm13
+pcmpeqd %xmm0, %xmm1
+pcmpeqd %xmm7, %xmm8
+pcmpeqd %xmm8, %xmm15
+pcmpeqd %xmm15, %xmm0
+pcmpeqd %xmm3, %xmm12
+pcmpeqd 16(%rdi), %xmm5
+pcmpeqd (%r13,%r14,8), %xmm13
+pcmpgtb %xmm0, %xmm1
+pcmpgtb %xmm7, %xmm8
+pcmpgtb %xmm8, %xmm15
+pcmpgtb %xmm15, %xmm0
+pcmpgtb %xmm3, %xmm12
+pcmpgtb 16(%rdi), %xmm5
+pcmpgtb (%r13,%r14,8), %xmm13
+pcmpgtw %xmm0, %xmm1
+pcmpgtw %xmm7, %xmm8
+pcmpgtw %xmm8, %xmm15
+pcmpgtw %xmm15, %xmm0
+pcmpgtw %xmm3, %xmm12
+pcmpgtw 16(%rdi), %xmm5
+pcmpgtw (%r13,%r14,8), %xmm13
+pcmpgtd %xmm0, %xmm1
+pcmpgtd %xmm7, %xmm8
+pcmpgtd %xmm8, %xmm15
+pcmpgtd %xmm15, %xmm0
+pcmpgtd %xmm3, %xmm12
+pcmpgtd 16(%rdi), %xmm5
+pcmpgtd (%r13,%r14,8), %xmm13
+pmaddwd %xmm0, %xmm1
+pmaddwd %xmm7, %xmm8
+pmaddwd %xmm8, %xmm15
+pmaddwd %xmm15, %xmm0
+pmaddwd %xmm3, %xmm12
+pmaddwd 16(%rdi), %xmm5
+pmaddwd (%r13,%r14,8), %xmm13
+;;; sse_moves
+.text
+movaps %xmm1, %xmm9
+movaps 32(%rsp), %xmm2
+movaps %xmm10, -64(%rbp)
+movapd %xmm1, %xmm9
+movapd 32(%rsp), %xmm2
+movapd %xmm10, -64(%rbp)
+movups %xmm1, %xmm9
+movups 32(%rsp), %xmm2
+movups %xmm10, -64(%rbp)
+movupd %xmm1, %xmm9
+movupd 32(%rsp), %xmm2
+movupd %xmm10, -64(%rbp)
+movdqa %xmm1, %xmm9
+movdqa 32(%rsp), %xmm2
+movdqa %xmm10, -64(%rbp)
+movdqu %xmm1, %xmm9
+movdqu 32(%rsp), %xmm2
+movdqu %xmm10, -64(%rbp)
+movd %eax, %xmm0
+movd %xmm0, %eax
+movd %r13d, %xmm9
+movd %xmm9, %r13d
+movq %rax, %xmm0
+movq %xmm0, %rax
+movq %r12, %xmm11
+movq %xmm11, %r12
+movq %xmm1, %xmm2
+movq (%rdi), %xmm3
+movq %xmm3, (%rdi)
+movss %xmm1, %xmm2
+movss (%rdi), %xmm3
+movss %xmm3, (%rdi)
+movsd %xmm1, %xmm2
+movsd (%rdi), %xmm3
+movsd %xmm3, (%rdi)
+movhps (%rdi), %xmm0
+movhps %xmm0, (%rdi)
+movlps (%rdi), %xmm0
+movlps %xmm0, (%rdi)
+movhpd (%rdi), %xmm0
+movlpd (%rdi), %xmm0
+movhlps %xmm1, %xmm2
+movlhps %xmm1, %xmm2
+movmskps %xmm3, %eax
+movmskpd %xmm3, %r8d
+pmovmskb %xmm3, %eax
+movddup %xmm1, %xmm2
+movshdup %xmm1, %xmm2
+movsldup %xmm1, %xmm2
+movntdqa (%rdi), %xmm0
+;;; sse_shifts
+.text
+psllw $0, %xmm4
+psllw $0, %xmm12
+psllw $1, %xmm4
+psllw $1, %xmm12
+psllw $7, %xmm4
+psllw $7, %xmm12
+psllw $15, %xmm4
+psllw $15, %xmm12
+psllw $31, %xmm4
+psllw $31, %xmm12
+psllw $63, %xmm4
+psllw $63, %xmm12
+psllw $127, %xmm4
+psllw $127, %xmm12
+psllw $255, %xmm4
+psllw $255, %xmm12
+psllw %xmm1, %xmm2
+psllw (%rdi), %xmm2
+pslld $0, %xmm4
+pslld $0, %xmm12
+pslld $1, %xmm4
+pslld $1, %xmm12
+pslld $7, %xmm4
+pslld $7, %xmm12
+pslld $15, %xmm4
+pslld $15, %xmm12
+pslld $31, %xmm4
+pslld $31, %xmm12
+pslld $63, %xmm4
+pslld $63, %xmm12
+pslld $127, %xmm4
+pslld $127, %xmm12
+pslld $255, %xmm4
+pslld $255, %xmm12
+pslld %xmm1, %xmm2
+pslld (%rdi), %xmm2
+psllq $0, %xmm4
+psllq $0, %xmm12
+psllq $1, %xmm4
+psllq $1, %xmm12
+psllq $7, %xmm4
+psllq $7, %xmm12
+psllq $15, %xmm4
+psllq $15, %xmm12
+psllq $31, %xmm4
+psllq $31, %xmm12
+psllq $63, %xmm4
+psllq $63, %xmm12
+psllq $127, %xmm4
+psllq $127, %xmm12
+psllq $255, %xmm4
+psllq $255, %xmm12
+psllq %xmm1, %xmm2
+psllq (%rdi), %xmm2
+psrlw $0, %xmm4
+psrlw $0, %xmm12
+psrlw $1, %xmm4
+psrlw $1, %xmm12
+psrlw $7, %xmm4
+psrlw $7, %xmm12
+psrlw $15, %xmm4
+psrlw $15, %xmm12
+psrlw $31, %xmm4
+psrlw $31, %xmm12
+psrlw $63, %xmm4
+psrlw $63, %xmm12
+psrlw $127, %xmm4
+psrlw $127, %xmm12
+psrlw $255, %xmm4
+psrlw $255, %xmm12
+psrlw %xmm1, %xmm2
+psrlw (%rdi), %xmm2
+psrld $0, %xmm4
+psrld $0, %xmm12
+psrld $1, %xmm4
+psrld $1, %xmm12
+psrld $7, %xmm4
+psrld $7, %xmm12
+psrld $15, %xmm4
+psrld $15, %xmm12
+psrld $31, %xmm4
+psrld $31, %xmm12
+psrld $63, %xmm4
+psrld $63, %xmm12
+psrld $127, %xmm4
+psrld $127, %xmm12
+psrld $255, %xmm4
+psrld $255, %xmm12
+psrld %xmm1, %xmm2
+psrld (%rdi), %xmm2
+psrlq $0, %xmm4
+psrlq $0, %xmm12
+psrlq $1, %xmm4
+psrlq $1, %xmm12
+psrlq $7, %xmm4
+psrlq $7, %xmm12
+psrlq $15, %xmm4
+psrlq $15, %xmm12
+psrlq $31, %xmm4
+psrlq $31, %xmm12
+psrlq $63, %xmm4
+psrlq $63, %xmm12
+psrlq $127, %xmm4
+psrlq $127, %xmm12
+psrlq $255, %xmm4
+psrlq $255, %xmm12
+psrlq %xmm1, %xmm2
+psrlq (%rdi), %xmm2
+psraw $0, %xmm4
+psraw $0, %xmm12
+psraw $1, %xmm4
+psraw $1, %xmm12
+psraw $7, %xmm4
+psraw $7, %xmm12
+psraw $15, %xmm4
+psraw $15, %xmm12
+psraw $31, %xmm4
+psraw $31, %xmm12
+psraw $63, %xmm4
+psraw $63, %xmm12
+psraw $127, %xmm4
+psraw $127, %xmm12
+psraw $255, %xmm4
+psraw $255, %xmm12
+psraw %xmm1, %xmm2
+psraw (%rdi), %xmm2
+psrad $0, %xmm4
+psrad $0, %xmm12
+psrad $1, %xmm4
+psrad $1, %xmm12
+psrad $7, %xmm4
+psrad $7, %xmm12
+psrad $15, %xmm4
+psrad $15, %xmm12
+psrad $31, %xmm4
+psrad $31, %xmm12
+psrad $63, %xmm4
+psrad $63, %xmm12
+psrad $127, %xmm4
+psrad $127, %xmm12
+psrad $255, %xmm4
+psrad $255, %xmm12
+psrad %xmm1, %xmm2
+psrad (%rdi), %xmm2
+pslldq $0, %xmm4
+pslldq $0, %xmm12
+pslldq $1, %xmm4
+pslldq $1, %xmm12
+pslldq $8, %xmm4
+pslldq $8, %xmm12
+pslldq $15, %xmm4
+pslldq $15, %xmm12
+pslldq $16, %xmm4
+pslldq $16, %xmm12
+pslldq $255, %xmm4
+pslldq $255, %xmm12
+psrldq $0, %xmm4
+psrldq $0, %xmm12
+psrldq $1, %xmm4
+psrldq $1, %xmm12
+psrldq $8, %xmm4
+psrldq $8, %xmm12
+psrldq $15, %xmm4
+psrldq $15, %xmm12
+psrldq $16, %xmm4
+psrldq $16, %xmm12
+psrldq $255, %xmm4
+psrldq $255, %xmm12
+;;; sse_imm
+.text
+pshufd $0, %xmm1, %xmm2
+pshufd $0, (%rdi), %xmm10
+pshufhw $0, %xmm1, %xmm2
+pshufhw $0, (%rdi), %xmm10
+pshuflw $0, %xmm1, %xmm2
+pshuflw $0, (%rdi), %xmm10
+shufps $0, %xmm1, %xmm2
+shufpd $0, %xmm1, %xmm2
+pshufd $1, %xmm1, %xmm2
+pshufd $1, (%rdi), %xmm10
+pshufhw $1, %xmm1, %xmm2
+pshufhw $1, (%rdi), %xmm10
+pshuflw $1, %xmm1, %xmm2
+pshuflw $1, (%rdi), %xmm10
+shufps $1, %xmm1, %xmm2
+shufpd $1, %xmm1, %xmm2
+pshufd $27, %xmm1, %xmm2
+pshufd $27, (%rdi), %xmm10
+pshufhw $27, %xmm1, %xmm2
+pshufhw $27, (%rdi), %xmm10
+pshuflw $27, %xmm1, %xmm2
+pshuflw $27, (%rdi), %xmm10
+shufps $27, %xmm1, %xmm2
+shufpd $3, %xmm1, %xmm2
+pshufd $78, %xmm1, %xmm2
+pshufd $78, (%rdi), %xmm10
+pshufhw $78, %xmm1, %xmm2
+pshufhw $78, (%rdi), %xmm10
+pshuflw $78, %xmm1, %xmm2
+pshuflw $78, (%rdi), %xmm10
+shufps $78, %xmm1, %xmm2
+shufpd $2, %xmm1, %xmm2
+pshufd $228, %xmm1, %xmm2
+pshufd $228, (%rdi), %xmm10
+pshufhw $228, %xmm1, %xmm2
+pshufhw $228, (%rdi), %xmm10
+pshuflw $228, %xmm1, %xmm2
+pshuflw $228, (%rdi), %xmm10
+shufps $228, %xmm1, %xmm2
+shufpd $0, %xmm1, %xmm2
+pshufd $255, %xmm1, %xmm2
+pshufd $255, (%rdi), %xmm10
+pshufhw $255, %xmm1, %xmm2
+pshufhw $255, (%rdi), %xmm10
+pshuflw $255, %xmm1, %xmm2
+pshuflw $255, (%rdi), %xmm10
+shufps $255, %xmm1, %xmm2
+shufpd $3, %xmm1, %xmm2
+cmpps $0, %xmm1, %xmm2
+cmppd $0, %xmm1, %xmm2
+cmpss $0, %xmm1, %xmm2
+cmpsd $0, %xmm1, %xmm2
+cmpps $1, %xmm1, %xmm2
+cmppd $1, %xmm1, %xmm2
+cmpss $1, %xmm1, %xmm2
+cmpsd $1, %xmm1, %xmm2
+cmpps $2, %xmm1, %xmm2
+cmppd $2, %xmm1, %xmm2
+cmpss $2, %xmm1, %xmm2
+cmpsd $2, %xmm1, %xmm2
+cmpps $3, %xmm1, %xmm2
+cmppd $3, %xmm1, %xmm2
+cmpss $3, %xmm1, %xmm2
+cmpsd $3, %xmm1, %xmm2
+cmpps $4, %xmm1, %xmm2
+cmppd $4, %xmm1, %xmm2
+cmpss $4, %xmm1, %xmm2
+cmpsd $4, %xmm1, %xmm2
+cmpps $5, %xmm1, %xmm2
+cmppd $5, %xmm1, %xmm2
+cmpss $5, %xmm1, %xmm2
+cmpsd $5, %xmm1, %xmm2
+cmpps $6, %xmm1, %xmm2
+cmppd $6, %xmm1, %xmm2
+cmpss $6, %xmm1, %xmm2
+cmpsd $6, %xmm1, %xmm2
+cmpps $7, %xmm1, %xmm2
+cmppd $7, %xmm1, %xmm2
+cmpss $7, %xmm1, %xmm2
+cmpsd $7, %xmm1, %xmm2
+pinsrw $0, %eax, %xmm1
+pinsrw $0, (%rdi), %xmm1
+pextrw $0, %xmm1, %eax
+pinsrw $1, %eax, %xmm1
+pinsrw $1, (%rdi), %xmm1
+pextrw $1, %xmm1, %eax
+pinsrw $3, %eax, %xmm1
+pinsrw $3, (%rdi), %xmm1
+pextrw $3, %xmm1, %eax
+pinsrw $7, %eax, %xmm1
+pinsrw $7, (%rdi), %xmm1
+pextrw $7, %xmm1, %eax
+;;; sse_cvt
+.text
+cvtsi2sd %eax, %xmm0
+cvtsi2sd %rax, %xmm0
+cvtsi2sdl (%rdi), %xmm0
+cvtsi2sdq (%rdi), %xmm0
+cvtsi2ss %eax, %xmm0
+cvtsi2ss %rax, %xmm0
+cvtsd2si %xmm0, %eax
+cvtsd2si %xmm0, %rax
+cvttsd2si %xmm0, %eax
+cvttsd2si %xmm0, %rax
+cvtss2si %xmm0, %eax
+cvttss2si %xmm0, %rax
+cvtsd2ss %xmm1, %xmm2
+cvtss2sd %xmm1, %xmm2
+cvtdq2ps %xmm1, %xmm2
+cvtps2dq %xmm1, %xmm2
+cvttps2dq %xmm1, %xmm2
+cvtdq2pd %xmm1, %xmm2
+cvtpd2dq %xmm1, %xmm2
+cvttpd2dq %xmm1, %xmm2
+cvtps2pd %xmm1, %xmm2
+cvtpd2ps %xmm1, %xmm2
+comiss %xmm1, %xmm2
+comisd %xmm1, %xmm2
+ucomiss %xmm1, %xmm2
+ucomisd %xmm1, %xmm2
+comiss (%rdi), %xmm12
+ucomisd (%r13), %xmm12
+;;; sse4
+.text
+pabsb %xmm1, %xmm2
+pabsb %xmm9, %xmm14
+pabsb (%rdi), %xmm3
+pabsw %xmm1, %xmm2
+pabsw %xmm9, %xmm14
+pabsw (%rdi), %xmm3
+pabsd %xmm1, %xmm2
+pabsd %xmm9, %xmm14
+pabsd (%rdi), %xmm3
+phaddw %xmm1, %xmm2
+phaddw %xmm9, %xmm14
+phaddw (%rdi), %xmm3
+phaddd %xmm1, %xmm2
+phaddd %xmm9, %xmm14
+phaddd (%rdi), %xmm3
+phsubw %xmm1, %xmm2
+phsubw %xmm9, %xmm14
+phsubw (%rdi), %xmm3
+phsubd %xmm1, %xmm2
+phsubd %xmm9, %xmm14
+phsubd (%rdi), %xmm3
+psignb %xmm1, %xmm2
+psignb %xmm9, %xmm14
+psignb (%rdi), %xmm3
+psignw %xmm1, %xmm2
+psignw %xmm9, %xmm14
+psignw (%rdi), %xmm3
+psignd %xmm1, %xmm2
+psignd %xmm9, %xmm14
+psignd (%rdi), %xmm3
+pmulhrsw %xmm1, %xmm2
+pmulhrsw %xmm9, %xmm14
+pmulhrsw (%rdi), %xmm3
+pmaddubsw %xmm1, %xmm2
+pmaddubsw %xmm9, %xmm14
+pmaddubsw (%rdi), %xmm3
+pshufb %xmm1, %xmm2
+pshufb %xmm9, %xmm14
+pshufb (%rdi), %xmm3
+pmuldq %xmm1, %xmm2
+pmuldq %xmm9, %xmm14
+pmuldq (%rdi), %xmm3
+pmulld %xmm1, %xmm2
+pmulld %xmm9, %xmm14
+pmulld (%rdi), %xmm3
+pminsb %xmm1, %xmm2
+pminsb %xmm9, %xmm14
+pminsb (%rdi), %xmm3
+pminsd %xmm1, %xmm2
+pminsd %xmm9, %xmm14
+pminsd (%rdi), %xmm3
+pminuw %xmm1, %xmm2
+pminuw %xmm9, %xmm14
+pminuw (%rdi), %xmm3
+pminud %xmm1, %xmm2
+pminud %xmm9, %xmm14
+pminud (%rdi), %xmm3
+pmaxsb %xmm1, %xmm2
+pmaxsb %xmm9, %xmm14
+pmaxsb (%rdi), %xmm3
+pmaxsd %xmm1, %xmm2
+pmaxsd %xmm9, %xmm14
+pmaxsd (%rdi), %xmm3
+pmaxuw %xmm1, %xmm2
+pmaxuw %xmm9, %xmm14
+pmaxuw (%rdi), %xmm3
+pmaxud %xmm1, %xmm2
+pmaxud %xmm9, %xmm14
+pmaxud (%rdi), %xmm3
+packusdw %xmm1, %xmm2
+packusdw %xmm9, %xmm14
+packusdw (%rdi), %xmm3
+pcmpeqq %xmm1, %xmm2
+pcmpeqq %xmm9, %xmm14
+pcmpeqq (%rdi), %xmm3
+pcmpgtq %xmm1, %xmm2
+pcmpgtq %xmm9, %xmm14
+pcmpgtq (%rdi), %xmm3
+ptest %xmm1, %xmm2
+ptest %xmm9, %xmm14
+ptest (%rdi), %xmm3
+phminposuw %xmm1, %xmm2
+phminposuw %xmm9, %xmm14
+phminposuw (%rdi), %xmm3
+pmovsxbw %xmm1, %xmm2
+pmovsxbw %xmm9, %xmm14
+pmovsxbw (%rdi), %xmm3
+pmovsxbd %xmm1, %xmm2
+pmovsxbd %xmm9, %xmm14
+pmovsxbd (%rdi), %xmm3
+pmovsxbq %xmm1, %xmm2
+pmovsxbq %xmm9, %xmm14
+pmovsxbq (%rdi), %xmm3
+pmovsxwd %xmm1, %xmm2
+pmovsxwd %xmm9, %xmm14
+pmovsxwd (%rdi), %xmm3
+pmovsxwq %xmm1, %xmm2
+pmovsxwq %xmm9, %xmm14
+pmovsxwq (%rdi), %xmm3
+pmovsxdq %xmm1, %xmm2
+pmovsxdq %xmm9, %xmm14
+pmovsxdq (%rdi), %xmm3
+pmovzxbw %xmm1, %xmm2
+pmovzxbw %xmm9, %xmm14
+pmovzxbw (%rdi), %xmm3
+pmovzxbd %xmm1, %xmm2
+pmovzxbd %xmm9, %xmm14
+pmovzxbd (%rdi), %xmm3
+pmovzxbq %xmm1, %xmm2
+pmovzxbq %xmm9, %xmm14
+pmovzxbq (%rdi), %xmm3
+pmovzxwd %xmm1, %xmm2
+pmovzxwd %xmm9, %xmm14
+pmovzxwd (%rdi), %xmm3
+pmovzxwq %xmm1, %xmm2
+pmovzxwq %xmm9, %xmm14
+pmovzxwq (%rdi), %xmm3
+pmovzxdq %xmm1, %xmm2
+pmovzxdq %xmm9, %xmm14
+pmovzxdq (%rdi), %xmm3
+palignr $0, %xmm1, %xmm2
+blendps $0, %xmm1, %xmm2
+blendpd $0, %xmm1, %xmm2
+pblendw $0, %xmm1, %xmm2
+dpps $0, %xmm1, %xmm2
+dppd $0, %xmm1, %xmm2
+mpsadbw $0, %xmm1, %xmm2
+roundps $0, %xmm1, %xmm2
+roundsd $0, %xmm1, %xmm2
+palignr $1, %xmm1, %xmm2
+blendps $1, %xmm1, %xmm2
+blendpd $1, %xmm1, %xmm2
+pblendw $1, %xmm1, %xmm2
+dpps $1, %xmm1, %xmm2
+dppd $1, %xmm1, %xmm2
+mpsadbw $1, %xmm1, %xmm2
+roundps $1, %xmm1, %xmm2
+roundsd $1, %xmm1, %xmm2
+palignr $5, %xmm1, %xmm2
+blendps $5, %xmm1, %xmm2
+blendpd $1, %xmm1, %xmm2
+pblendw $5, %xmm1, %xmm2
+dpps $5, %xmm1, %xmm2
+dppd $5, %xmm1, %xmm2
+mpsadbw $5, %xmm1, %xmm2
+roundps $5, %xmm1, %xmm2
+roundsd $5, %xmm1, %xmm2
+palignr $15, %xmm1, %xmm2
+blendps $15, %xmm1, %xmm2
+blendpd $3, %xmm1, %xmm2
+pblendw $15, %xmm1, %xmm2
+dpps $15, %xmm1, %xmm2
+dppd $15, %xmm1, %xmm2
+mpsadbw $7, %xmm1, %xmm2
+roundps $15, %xmm1, %xmm2
+roundsd $15, %xmm1, %xmm2
+palignr $255, %xmm1, %xmm2
+blendps $15, %xmm1, %xmm2
+blendpd $3, %xmm1, %xmm2
+pblendw $255, %xmm1, %xmm2
+dpps $255, %xmm1, %xmm2
+dppd $255, %xmm1, %xmm2
+mpsadbw $7, %xmm1, %xmm2
+roundps $15, %xmm1, %xmm2
+roundsd $15, %xmm1, %xmm2
+insertps $0, %xmm1, %xmm2
+extractps $0, %xmm1, %eax
+pinsrd $0, %eax, %xmm1
+pextrd $0, %xmm1, %eax
+pinsrq $0, %rax, %xmm1
+pextrq $0, %xmm1, %rax
+pinsrb $0, %eax, %xmm1
+pextrb $0, %xmm1, %eax
+insertps $1, %xmm1, %xmm2
+extractps $1, %xmm1, %eax
+pinsrd $1, %eax, %xmm1
+pextrd $1, %xmm1, %eax
+pinsrq $1, %rax, %xmm1
+pextrq $1, %xmm1, %rax
+pinsrb $1, %eax, %xmm1
+pextrb $1, %xmm1, %eax
+insertps $3, %xmm1, %xmm2
+extractps $3, %xmm1, %eax
+pinsrd $3, %eax, %xmm1
+pextrd $3, %xmm1, %eax
+pinsrq $1, %rax, %xmm1
+pextrq $1, %xmm1, %rax
+pinsrb $3, %eax, %xmm1
+pextrb $3, %xmm1, %eax
+blendvps %xmm0, %xmm1, %xmm2
+blendvpd %xmm0, %xmm1, %xmm2
+pblendvb %xmm0, %xmm1, %xmm2
+crc32b %al, %eax
+crc32w %ax, %eax
+crc32l %eax, %eax
+crc32q %rax, %rax
+crc32b (%rdi), %eax
+crc32q (%rdi), %rax
+popcntl %eax, %ecx
+popcntq %rax, %rcx
+popcntw %ax, %cx
+;;; aes
+.text
+aesenc %xmm1, %xmm2
+aesenc (%rdi), %xmm11
+aesenclast %xmm1, %xmm2
+aesenclast (%rdi), %xmm11
+aesdec %xmm1, %xmm2
+aesdec (%rdi), %xmm11
+aesdeclast %xmm1, %xmm2
+aesdeclast (%rdi), %xmm11
+aesimc %xmm1, %xmm2
+aesimc (%rdi), %xmm11
+aeskeygenassist $0, %xmm1, %xmm2
+pclmulqdq $0, %xmm1, %xmm2
+aeskeygenassist $1, %xmm1, %xmm2
+pclmulqdq $1, %xmm1, %xmm2
+aeskeygenassist $16, %xmm1, %xmm2
+pclmulqdq $16, %xmm1, %xmm2
+aeskeygenassist $17, %xmm1, %xmm2
+pclmulqdq $17, %xmm1, %xmm2
+aeskeygenassist $255, %xmm1, %xmm2
+pclmulqdq $17, %xmm1, %xmm2

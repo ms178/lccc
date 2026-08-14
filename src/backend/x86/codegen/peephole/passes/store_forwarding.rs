@@ -305,7 +305,7 @@ fn gsf_handle_other(
     slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut [SmallVec; 16],
     rbp_is_frame: bool,
 ) {
-    // SOUNDNESS (v7): if rbp is NOT the frame pointer, any %rbp reference in an
+    // SOUNDNESS: if rbp is NOT the frame pointer, any %rbp reference in an
     // Other instruction is a pointer dereference / address computation that may
     // read or write arbitrary memory. Invalidate ALL mappings so a stack slot is
     // never forwarded across a potentially-aliasing pointer operation.
@@ -376,7 +376,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
         return false;
     }
 
-    // SOUNDNESS (v7): if rbp is NOT the frame pointer (e.g. -fomit-frame-pointer
+    // SOUNDNESS: if rbp is NOT the frame pointer (e.g. -fomit-frame-pointer
     // with rbp used as a general register), then `offset(%rbp)` accesses are
     // pointer dereferences. We must not store-forward them as stack slots, and
     // they must be treated as opaque indirect memory (alias anything).
@@ -460,7 +460,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
                 invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
             }
 
-            // SOUNDNESS (v1): push/pop shift RSP, so every %rsp-relative slot
+            // SOUNDNESS: push/pop shift RSP, so every %rsp-relative slot
             // offset in the shifted window refers to a different physical
             // slot. Any mapping recorded before the push is stale after it;
             // invalidate everything (conservative).

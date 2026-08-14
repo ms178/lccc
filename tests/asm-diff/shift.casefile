@@ -1,0 +1,320 @@
+;;; shifts
+.text
+rolb %bl
+rolb $1, %bl
+rolb $0, %bl
+rolb $2, %bl
+rolb $7, %bl
+rolb $15, %bl
+rolb $31, %bl
+rolb $63, %bl
+rolb $255, %bl
+rolb %cl, %bl
+rolb %cl, 8(%r12,%rax,4)
+rolw %bx
+rolw $1, %bx
+rolw $0, %bx
+rolw $2, %bx
+rolw $7, %bx
+rolw $15, %bx
+rolw $31, %bx
+rolw $63, %bx
+rolw $255, %bx
+rolw %cl, %bx
+rolw %cl, 8(%r12,%rax,4)
+roll %ebx
+roll $1, %ebx
+roll $0, %ebx
+roll $2, %ebx
+roll $7, %ebx
+roll $15, %ebx
+roll $31, %ebx
+roll $63, %ebx
+roll $255, %ebx
+roll %cl, %ebx
+roll %cl, 8(%r12,%rax,4)
+rolq %rbx
+rolq $1, %rbx
+rolq $0, %rbx
+rolq $2, %rbx
+rolq $7, %rbx
+rolq $15, %rbx
+rolq $31, %rbx
+rolq $63, %rbx
+rolq $255, %rbx
+rolq %cl, %rbx
+rolq %cl, 8(%r12,%rax,4)
+rorb %bl
+rorb $1, %bl
+rorb $0, %bl
+rorb $2, %bl
+rorb $7, %bl
+rorb $15, %bl
+rorb $31, %bl
+rorb $63, %bl
+rorb $255, %bl
+rorb %cl, %bl
+rorb %cl, 8(%r12,%rax,4)
+rorw %bx
+rorw $1, %bx
+rorw $0, %bx
+rorw $2, %bx
+rorw $7, %bx
+rorw $15, %bx
+rorw $31, %bx
+rorw $63, %bx
+rorw $255, %bx
+rorw %cl, %bx
+rorw %cl, 8(%r12,%rax,4)
+rorl %ebx
+rorl $1, %ebx
+rorl $0, %ebx
+rorl $2, %ebx
+rorl $7, %ebx
+rorl $15, %ebx
+rorl $31, %ebx
+rorl $63, %ebx
+rorl $255, %ebx
+rorl %cl, %ebx
+rorl %cl, 8(%r12,%rax,4)
+rorq %rbx
+rorq $1, %rbx
+rorq $0, %rbx
+rorq $2, %rbx
+rorq $7, %rbx
+rorq $15, %rbx
+rorq $31, %rbx
+rorq $63, %rbx
+rorq $255, %rbx
+rorq %cl, %rbx
+rorq %cl, 8(%r12,%rax,4)
+rclb %bl
+rclb $1, %bl
+rclb $0, %bl
+rclb $2, %bl
+rclb $7, %bl
+rclb $15, %bl
+rclb $31, %bl
+rclb $63, %bl
+rclb $255, %bl
+rclb %cl, %bl
+rclb %cl, 8(%r12,%rax,4)
+rclw %bx
+rclw $1, %bx
+rclw $0, %bx
+rclw $2, %bx
+rclw $7, %bx
+rclw $15, %bx
+rclw $31, %bx
+rclw $63, %bx
+rclw $255, %bx
+rclw %cl, %bx
+rclw %cl, 8(%r12,%rax,4)
+rcll %ebx
+rcll $1, %ebx
+rcll $0, %ebx
+rcll $2, %ebx
+rcll $7, %ebx
+rcll $15, %ebx
+rcll $31, %ebx
+rcll $63, %ebx
+rcll $255, %ebx
+rcll %cl, %ebx
+rcll %cl, 8(%r12,%rax,4)
+rclq %rbx
+rclq $1, %rbx
+rclq $0, %rbx
+rclq $2, %rbx
+rclq $7, %rbx
+rclq $15, %rbx
+rclq $31, %rbx
+rclq $63, %rbx
+rclq $255, %rbx
+rclq %cl, %rbx
+rclq %cl, 8(%r12,%rax,4)
+rcrb %bl
+rcrb $1, %bl
+rcrb $0, %bl
+rcrb $2, %bl
+rcrb $7, %bl
+rcrb $15, %bl
+rcrb $31, %bl
+rcrb $63, %bl
+rcrb $255, %bl
+rcrb %cl, %bl
+rcrb %cl, 8(%r12,%rax,4)
+rcrw %bx
+rcrw $1, %bx
+rcrw $0, %bx
+rcrw $2, %bx
+rcrw $7, %bx
+rcrw $15, %bx
+rcrw $31, %bx
+rcrw $63, %bx
+rcrw $255, %bx
+rcrw %cl, %bx
+rcrw %cl, 8(%r12,%rax,4)
+rcrl %ebx
+rcrl $1, %ebx
+rcrl $0, %ebx
+rcrl $2, %ebx
+rcrl $7, %ebx
+rcrl $15, %ebx
+rcrl $31, %ebx
+rcrl $63, %ebx
+rcrl $255, %ebx
+rcrl %cl, %ebx
+rcrl %cl, 8(%r12,%rax,4)
+rcrq %rbx
+rcrq $1, %rbx
+rcrq $0, %rbx
+rcrq $2, %rbx
+rcrq $7, %rbx
+rcrq $15, %rbx
+rcrq $31, %rbx
+rcrq $63, %rbx
+rcrq $255, %rbx
+rcrq %cl, %rbx
+rcrq %cl, 8(%r12,%rax,4)
+shlb %bl
+shlb $1, %bl
+shlb $0, %bl
+shlb $2, %bl
+shlb $7, %bl
+shlb $15, %bl
+shlb $31, %bl
+shlb $63, %bl
+shlb $255, %bl
+shlb %cl, %bl
+shlb %cl, 8(%r12,%rax,4)
+shlw %bx
+shlw $1, %bx
+shlw $0, %bx
+shlw $2, %bx
+shlw $7, %bx
+shlw $15, %bx
+shlw $31, %bx
+shlw $63, %bx
+shlw $255, %bx
+shlw %cl, %bx
+shlw %cl, 8(%r12,%rax,4)
+shll %ebx
+shll $1, %ebx
+shll $0, %ebx
+shll $2, %ebx
+shll $7, %ebx
+shll $15, %ebx
+shll $31, %ebx
+shll $63, %ebx
+shll $255, %ebx
+shll %cl, %ebx
+shll %cl, 8(%r12,%rax,4)
+shlq %rbx
+shlq $1, %rbx
+shlq $0, %rbx
+shlq $2, %rbx
+shlq $7, %rbx
+shlq $15, %rbx
+shlq $31, %rbx
+shlq $63, %rbx
+shlq $255, %rbx
+shlq %cl, %rbx
+shlq %cl, 8(%r12,%rax,4)
+shrb %bl
+shrb $1, %bl
+shrb $0, %bl
+shrb $2, %bl
+shrb $7, %bl
+shrb $15, %bl
+shrb $31, %bl
+shrb $63, %bl
+shrb $255, %bl
+shrb %cl, %bl
+shrb %cl, 8(%r12,%rax,4)
+shrw %bx
+shrw $1, %bx
+shrw $0, %bx
+shrw $2, %bx
+shrw $7, %bx
+shrw $15, %bx
+shrw $31, %bx
+shrw $63, %bx
+shrw $255, %bx
+shrw %cl, %bx
+shrw %cl, 8(%r12,%rax,4)
+shrl %ebx
+shrl $1, %ebx
+shrl $0, %ebx
+shrl $2, %ebx
+shrl $7, %ebx
+shrl $15, %ebx
+shrl $31, %ebx
+shrl $63, %ebx
+shrl $255, %ebx
+shrl %cl, %ebx
+shrl %cl, 8(%r12,%rax,4)
+shrq %rbx
+shrq $1, %rbx
+shrq $0, %rbx
+shrq $2, %rbx
+shrq $7, %rbx
+shrq $15, %rbx
+shrq $31, %rbx
+shrq $63, %rbx
+shrq $255, %rbx
+shrq %cl, %rbx
+shrq %cl, 8(%r12,%rax,4)
+sarb %bl
+sarb $1, %bl
+sarb $0, %bl
+sarb $2, %bl
+sarb $7, %bl
+sarb $15, %bl
+sarb $31, %bl
+sarb $63, %bl
+sarb $255, %bl
+sarb %cl, %bl
+sarb %cl, 8(%r12,%rax,4)
+sarw %bx
+sarw $1, %bx
+sarw $0, %bx
+sarw $2, %bx
+sarw $7, %bx
+sarw $15, %bx
+sarw $31, %bx
+sarw $63, %bx
+sarw $255, %bx
+sarw %cl, %bx
+sarw %cl, 8(%r12,%rax,4)
+sarl %ebx
+sarl $1, %ebx
+sarl $0, %ebx
+sarl $2, %ebx
+sarl $7, %ebx
+sarl $15, %ebx
+sarl $31, %ebx
+sarl $63, %ebx
+sarl $255, %ebx
+sarl %cl, %ebx
+sarl %cl, 8(%r12,%rax,4)
+sarq %rbx
+sarq $1, %rbx
+sarq $0, %rbx
+sarq $2, %rbx
+sarq $7, %rbx
+sarq $15, %rbx
+sarq $31, %rbx
+sarq $63, %rbx
+sarq $255, %rbx
+sarq %cl, %rbx
+sarq %cl, 8(%r12,%rax,4)
+shldl $0, %eax, %ecx
+shrdq $0, %rax, %rcx
+shldl $1, %eax, %ecx
+shrdq $1, %rax, %rcx
+shldl $31, %eax, %ecx
+shrdq $31, %rax, %rcx
+shldl $63, %eax, %ecx
+shrdq $63, %rax, %rcx
+shldl %cl, %eax, %ecx
+shrdq %cl, %rax, %r15

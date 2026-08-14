@@ -359,7 +359,7 @@ impl X86Codegen {
                                     if sv.0 == cur => {
                                     // Flag-neutral forwarding copy.
                                     //
-                                    // SOUNDNESS (v13): with flag fusion, the Cmp
+                                    // SOUNDNESS: with flag fusion, the Cmp
                                     // SKIPS materializing the boolean, so `dest`
                                     // and every intermediate copy destination are
                                     // NEVER WRITTEN (the copies just forward a

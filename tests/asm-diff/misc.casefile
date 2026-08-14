@@ -1,0 +1,511 @@
+;;; misc
+.text
+nop
+nopw (%rax)
+nopl (%rax)
+nopl 0(%rax)
+nopw 0(%rax,%rax,1)
+nopl 0(%rax,%rax,1)
+nopw %cs:0(%rax,%rax,1)
+xchg %ax, %ax
+xchg %eax, %eax
+xchg %rax, %rax
+xchg %eax, %ecx
+xchg %rax, %r12
+xchg %r8, %rax
+xchg %cl, %dl
+cbw
+cwde
+cdqe
+cwd
+cdq
+cqo
+cltq
+cqto
+cltd
+leave
+ret
+retq
+ret $16
+int3
+int $0x80
+iretq
+ud2
+hlt
+pause
+cpuid
+rdtsc
+rdtscp
+rdpmc
+clc
+stc
+cmc
+cld
+std
+cli
+sti
+lahf
+sahf
+pushfq
+popfq
+mfence
+lfence
+sfence
+clflush (%rdi)
+clflushopt (%rdi)
+clwb (%rdi)
+prefetcht0 (%rdi)
+prefetcht1 (%rdi)
+prefetcht2 (%rdi)
+prefetchnta (%rdi)
+prefetchw (%rdi)
+endbr64
+endbr32
+syscall
+sysret
+swapgs
+xgetbv
+rdrand %eax
+rdrand %rax
+rdseed %r15
+wbinvd
+xsave (%rdi)
+xrstor (%rdi)
+fxsave (%rdi)
+fxrstor (%rdi)
+stmxcsr (%rsp)
+ldmxcsr (%rsp)
+;;; pushpop
+.text
+push %rax
+push %rcx
+push %rdx
+push %rbx
+push %rsp
+push %rbp
+push %rsi
+push %rdi
+push %r8
+push %r9
+push %r10
+push %r11
+push %r12
+push %r13
+push %r14
+push %r15
+pop %rax
+pop %rcx
+pop %rdx
+pop %rbx
+pop %rsp
+pop %rbp
+pop %rsi
+pop %rdi
+pop %r8
+pop %r9
+pop %r10
+pop %r11
+pop %r12
+pop %r13
+pop %r14
+pop %r15
+push %ax
+push %cx
+push %dx
+push %bx
+push %sp
+push %bp
+push %si
+push %di
+push %r8w
+push %r9w
+push %r10w
+push %r11w
+push %r12w
+push %r13w
+push %r14w
+push %r15w
+pop %ax
+pop %cx
+pop %dx
+pop %bx
+pop %sp
+pop %bp
+pop %si
+pop %di
+pop %r8w
+pop %r9w
+pop %r10w
+pop %r11w
+pop %r12w
+pop %r13w
+pop %r14w
+pop %r15w
+push (%rdi)
+pop (%rdi)
+pushq 8(%r13)
+popq 8(%r13)
+pushq $0
+pushq $127
+pushq $128
+pushq $-1
+;;; inout
+.text
+inb $0, %al
+outb %al, $0
+inw $0, %ax
+outw %ax, $0
+inl $0, %eax
+outl %eax, $0
+inb $1, %al
+outb %al, $1
+inw $1, %ax
+outw %ax, $1
+inl $1, %eax
+outl %eax, $1
+inb $128, %al
+outb %al, $128
+inw $128, %ax
+outw %ax, $128
+inl $128, %eax
+outl %eax, $128
+inb $255, %al
+outb %al, $255
+inw $255, %ax
+outw %ax, $255
+inl $255, %eax
+outl %eax, $255
+inb %dx, %al
+outb %al, %dx
+inw %dx, %ax
+outw %ax, %dx
+inl %dx, %eax
+outl %eax, %dx
+;;; muldiv
+.text
+mulb %al
+mulb %cl
+mulb %dl
+mulb %bl
+mulb %spl
+mulb %bpl
+mulb %r8b
+mulb %r9b
+mulb %r10b
+mulb 8(%r13,%r12,2)
+mulw %ax
+mulw %cx
+mulw %dx
+mulw %bx
+mulw %sp
+mulw %bp
+mulw %r8w
+mulw %r9w
+mulw %r10w
+mulw 8(%r13,%r12,2)
+mull %eax
+mull %ecx
+mull %edx
+mull %ebx
+mull %esp
+mull %ebp
+mull %r8d
+mull %r9d
+mull %r10d
+mull 8(%r13,%r12,2)
+mulq %rax
+mulq %rcx
+mulq %rdx
+mulq %rbx
+mulq %rsp
+mulq %rbp
+mulq %r8
+mulq %r9
+mulq %r10
+mulq 8(%r13,%r12,2)
+imulb %al
+imulb %cl
+imulb %dl
+imulb %bl
+imulb %spl
+imulb %bpl
+imulb %r8b
+imulb %r9b
+imulb %r10b
+imulb 8(%r13,%r12,2)
+imulw %ax
+imulw %cx
+imulw %dx
+imulw %bx
+imulw %sp
+imulw %bp
+imulw %r8w
+imulw %r9w
+imulw %r10w
+imulw 8(%r13,%r12,2)
+imull %eax
+imull %ecx
+imull %edx
+imull %ebx
+imull %esp
+imull %ebp
+imull %r8d
+imull %r9d
+imull %r10d
+imull 8(%r13,%r12,2)
+imulq %rax
+imulq %rcx
+imulq %rdx
+imulq %rbx
+imulq %rsp
+imulq %rbp
+imulq %r8
+imulq %r9
+imulq %r10
+imulq 8(%r13,%r12,2)
+divb %al
+divb %cl
+divb %dl
+divb %bl
+divb %spl
+divb %bpl
+divb %r8b
+divb %r9b
+divb %r10b
+divb 8(%r13,%r12,2)
+divw %ax
+divw %cx
+divw %dx
+divw %bx
+divw %sp
+divw %bp
+divw %r8w
+divw %r9w
+divw %r10w
+divw 8(%r13,%r12,2)
+divl %eax
+divl %ecx
+divl %edx
+divl %ebx
+divl %esp
+divl %ebp
+divl %r8d
+divl %r9d
+divl %r10d
+divl 8(%r13,%r12,2)
+divq %rax
+divq %rcx
+divq %rdx
+divq %rbx
+divq %rsp
+divq %rbp
+divq %r8
+divq %r9
+divq %r10
+divq 8(%r13,%r12,2)
+idivb %al
+idivb %cl
+idivb %dl
+idivb %bl
+idivb %spl
+idivb %bpl
+idivb %r8b
+idivb %r9b
+idivb %r10b
+idivb 8(%r13,%r12,2)
+idivw %ax
+idivw %cx
+idivw %dx
+idivw %bx
+idivw %sp
+idivw %bp
+idivw %r8w
+idivw %r9w
+idivw %r10w
+idivw 8(%r13,%r12,2)
+idivl %eax
+idivl %ecx
+idivl %edx
+idivl %ebx
+idivl %esp
+idivl %ebp
+idivl %r8d
+idivl %r9d
+idivl %r10d
+idivl 8(%r13,%r12,2)
+idivq %rax
+idivq %rcx
+idivq %rdx
+idivq %rbx
+idivq %rsp
+idivq %rbp
+idivq %r8
+idivq %r9
+idivq %r10
+idivq 8(%r13,%r12,2)
+negb %al
+negb %cl
+negb %dl
+negb %bl
+negb %spl
+negb %bpl
+negb %r8b
+negb %r9b
+negb %r10b
+negb 8(%r13,%r12,2)
+negw %ax
+negw %cx
+negw %dx
+negw %bx
+negw %sp
+negw %bp
+negw %r8w
+negw %r9w
+negw %r10w
+negw 8(%r13,%r12,2)
+negl %eax
+negl %ecx
+negl %edx
+negl %ebx
+negl %esp
+negl %ebp
+negl %r8d
+negl %r9d
+negl %r10d
+negl 8(%r13,%r12,2)
+negq %rax
+negq %rcx
+negq %rdx
+negq %rbx
+negq %rsp
+negq %rbp
+negq %r8
+negq %r9
+negq %r10
+negq 8(%r13,%r12,2)
+notb %al
+notb %cl
+notb %dl
+notb %bl
+notb %spl
+notb %bpl
+notb %r8b
+notb %r9b
+notb %r10b
+notb 8(%r13,%r12,2)
+notw %ax
+notw %cx
+notw %dx
+notw %bx
+notw %sp
+notw %bp
+notw %r8w
+notw %r9w
+notw %r10w
+notw 8(%r13,%r12,2)
+notl %eax
+notl %ecx
+notl %edx
+notl %ebx
+notl %esp
+notl %ebp
+notl %r8d
+notl %r9d
+notl %r10d
+notl 8(%r13,%r12,2)
+notq %rax
+notq %rcx
+notq %rdx
+notq %rbx
+notq %rsp
+notq %rbp
+notq %r8
+notq %r9
+notq %r10
+notq 8(%r13,%r12,2)
+incb %al
+incb %cl
+incb %dl
+incb %bl
+incb %spl
+incb %bpl
+incb %r8b
+incb %r9b
+incb %r10b
+incb 8(%r13,%r12,2)
+incw %ax
+incw %cx
+incw %dx
+incw %bx
+incw %sp
+incw %bp
+incw %r8w
+incw %r9w
+incw %r10w
+incw 8(%r13,%r12,2)
+incl %eax
+incl %ecx
+incl %edx
+incl %ebx
+incl %esp
+incl %ebp
+incl %r8d
+incl %r9d
+incl %r10d
+incl 8(%r13,%r12,2)
+incq %rax
+incq %rcx
+incq %rdx
+incq %rbx
+incq %rsp
+incq %rbp
+incq %r8
+incq %r9
+incq %r10
+incq 8(%r13,%r12,2)
+decb %al
+decb %cl
+decb %dl
+decb %bl
+decb %spl
+decb %bpl
+decb %r8b
+decb %r9b
+decb %r10b
+decb 8(%r13,%r12,2)
+decw %ax
+decw %cx
+decw %dx
+decw %bx
+decw %sp
+decw %bp
+decw %r8w
+decw %r9w
+decw %r10w
+decw 8(%r13,%r12,2)
+decl %eax
+decl %ecx
+decl %edx
+decl %ebx
+decl %esp
+decl %ebp
+decl %r8d
+decl %r9d
+decl %r10d
+decl 8(%r13,%r12,2)
+decq %rax
+decq %rcx
+decq %rdx
+decq %rbx
+decq %rsp
+decq %rbp
+decq %r8
+decq %r9
+decq %r10
+decq 8(%r13,%r12,2)
+imulw %ax, %cx
+imulw (%rdi), %cx
+imull %eax, %ecx
+imull (%rdi), %ecx
+imulq %rax, %rcx
+imulq (%rdi), %rcx

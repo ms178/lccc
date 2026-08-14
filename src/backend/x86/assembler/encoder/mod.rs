@@ -71,18 +71,52 @@ impl InstructionEncoder {
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
         let start_len = self.bytes.len();
 
-        // Handle prefix
-        if let Some(ref prefix) = instr.prefix {
-            match prefix.as_str() {
-                "lock" => self.bytes.push(0xF0),
-                "rep" | "repz" | "repe" => self.bytes.push(0xF3),
-                "repnz" | "repne" => self.bytes.push(0xF2),
-                "notrack" => self.bytes.push(0x3E),
-                _ => return Err(format!("unknown prefix: {}", prefix)),
+        // PREFIX ORDER. x86 legacy prefixes come from four groups and, while
+        // the hardware accepts any order, the canonical encoding used by GAS,
+        // LLVM and every disassembler is:
+        //
+        //     [segment override] [0x66 operand-size] [F0/F2/F3 group-1] [REX]
+        //
+        // The instruction body emits the segment override and 0x66 itself, so
+        // a group-1 prefix pushed up front lands BEFORE them and produces e.g.
+        // `f0 66 01 07` where GAS produces `66 f0 01 07`. Both decode
+        // identically, but the non-canonical order defeats byte-comparison
+        // against the reference assembler and breaks tools (including kernel
+        // alternatives patchers) that assume the canonical form. Encode the
+        // body first, then splice the group-1 prefix into its correct slot.
+        let group1: Option<u8> = match instr.prefix.as_deref() {
+            None => None,
+            Some("lock") => Some(0xF0),
+            Some("rep") | Some("repz") | Some("repe") => Some(0xF3),
+            Some("repnz") | Some("repne") => Some(0xF2),
+            Some("notrack") => Some(0x3E),
+            Some(p) => return Err(format!("unknown prefix: {}", p)),
+        };
+
+        let reloc_base = self.relocations.len();
+        let result = self.encode_mnemonic(instr);
+
+        if let (Ok(()), Some(pfx)) = (&result, group1) {
+            let mut at = start_len;
+            while at < self.bytes.len() {
+                let b = self.bytes[at];
+                let is_seg = matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65);
+                // 0x3E is both the DS override and notrack; when inserting
+                // notrack itself, do not skip past a 0x3E.
+                let is_seg = is_seg && !(b == 0x3E && pfx == 0x3E);
+                if is_seg || b == 0x66 || b == 0x67 {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            self.bytes.insert(at, pfx);
+            // Relocation offsets recorded by the body are instruction-relative;
+            // the inserted prefix moves all of them by one.
+            for r in &mut self.relocations[reloc_base..] {
+                r.offset += 1;
             }
         }
-
-        let result = self.encode_mnemonic(instr);
 
         if result.is_ok() {
             self.offset += (self.bytes.len() - start_len) as u64;
@@ -442,6 +476,18 @@ impl InstructionEncoder {
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
 
+        // SOUNDNESS GATE. Reject malformed operands BEFORE dispatch.
+        //
+        // Every encoder below derives the operand size from ONE operand (a
+        // suffix, or the first register it finds) and encodes the others with
+        // that size. When the operands disagree the result is not an error but
+        // a DIFFERENT, silently wrong instruction: `mov %rax,%eax` encoded as
+        // `mov %rax,%rax`, `movq %xmm0,%ymm1` as `movq %xmm0,%rcx`,
+        // `mov (%rax,%rsp,4),%rbx` as an index-less address. GAS rejects all
+        // of these; accepting them turns a typo in hand-written assembly into
+        // a miscompile with no diagnostic.
+        validate_operands(mnemonic, ops)?;
+
         // AVX-512: instructions touching zmm or k (opmask) registers, plus the
         // AVX-512 byte/word vector moves, route through the EVEX dispatcher.
         // Without this guard, zmm operands would silently encode as 128-bit VEX.
@@ -720,7 +766,12 @@ impl InstructionEncoder {
             "vmfunc" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD4]); Ok(()) }
 
             // No-ops and misc
-            "nop" => { self.bytes.push(0x90); Ok(()) }
+            "nop" if ops.is_empty() => { self.bytes.push(0x90); Ok(()) }
+            // `nop r/m16` and `nop r/m32` (0F 1F /0) are the multi-byte NOPs.
+            // Compilers and hand-written asm emit them explicitly to pad hot
+            // code, so the assembler must accept the operand form.
+            "nop" | "nopl" => self.encode_nop_rm(ops, false),
+            "nopw" => self.encode_nop_rm(ops, true),
             "hlt" => { self.bytes.push(0xF4); Ok(()) }
             "leave" | "leaveq" => { self.bytes.push(0xC9); Ok(()) }
             "ud2" => { self.bytes.extend_from_slice(&[0x0F, 0x0B]); Ok(()) }
@@ -825,10 +876,10 @@ impl InstructionEncoder {
             "stosd" => { self.bytes.push(0xAB); Ok(()) }
             "stosq" => { self.bytes.extend_from_slice(&[0x48, 0xAB]); Ok(()) }
             "lodsb" => { self.bytes.push(0xAC); Ok(()) }
-            "lodsd" => { self.bytes.push(0xAD); Ok(()) }
+            "lodsd" | "lodsl" => { self.bytes.push(0xAD); Ok(()) }
             "lodsq" => { self.bytes.extend_from_slice(&[0x48, 0xAD]); Ok(()) }
             "scasb" => { self.bytes.push(0xAE); Ok(()) }
-            "scasd" => { self.bytes.push(0xAF); Ok(()) }
+            "scasd" | "scasl" => { self.bytes.push(0xAF); Ok(()) }
             "scasq" => { self.bytes.extend_from_slice(&[0x48, 0xAF]); Ok(()) }
             "cmpsb" => { self.bytes.push(0xA6); Ok(()) }
             "cmpsd" if ops.is_empty() => { self.bytes.push(0xA7); Ok(()) }
@@ -933,6 +984,8 @@ impl InstructionEncoder {
             "paddsb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xEC]),
             "paddsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xED]),
             "pmuludq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF4]),
+            // SSE4.1 signed 32x32->64 multiply (66 0F 38 28 /r).
+            "pmuldq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x28]),
             "pmullw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xD5]),
             "paddb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xFC]),
             "psubb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF8]),
@@ -1432,6 +1485,20 @@ impl InstructionEncoder {
             "vblendvps" => self.encode_avx_4op_3a(ops, 0x4A, true),
             "vblendvpd" => self.encode_avx_4op_3a(ops, 0x4B, true),
             "vpblendvb" => self.encode_avx_4op_3a(ops, 0x4C, true),
+            // VEX.128/256.66.0F3A.W0 0E /r ib — packed word blend by imm8.
+            "vpblendw" => self.encode_avx_3op_3a_imm8(ops, 0x0E, true),
+            // VEX.256.66.0F38.W0 1A /r — broadcast 128 bits of FP data.
+            "vbroadcastf128" => {
+                if !matches!(ops.first(), Some(Operand::Memory(_))) {
+                    return Err("vbroadcastf128 requires memory source".to_string());
+                }
+                self.encode_avx_broadcast(ops, &[0x1A])
+            }
+            // Non-temporal stores: VEX.0F.WIG 2B (ps) / 66.0F.WIG 2B (pd)
+            // and VEX.66.0F.WIG E7 (integer). Store-only forms.
+            "vmovntps" => self.encode_avx_store(ops, 0x2B, false),
+            "vmovntpd" => self.encode_avx_store(ops, 0x2B, true),
+            "vmovntdq" => self.encode_avx_store(ops, 0xE7, true),
 
             // AVX2 broadcast from 128-bit memory
             "vbroadcasti128" => { if !matches!(ops.first(), Some(Operand::Memory(_))) { return Err("vbroadcasti128 requires memory source".to_string()); } self.encode_avx_broadcast(ops, &[0x5A]) }
@@ -1673,6 +1740,9 @@ impl InstructionEncoder {
             // ---- Suffix-less forms (infer size from operands) ----
             // These are commonly emitted by inline asm
             "push" => self.encode_push(ops),
+            // 16-bit push/pop: 0x66 operand-size prefix + the normal form.
+            "pushw" => { self.bytes.push(0x66); self.encode_push(ops) }
+            "popw" => { self.bytes.push(0x66); self.encode_pop(ops) }
             "pop" => self.encode_pop(ops),
             "mov" => self.encode_suffixless_mov(ops),
             "add" => self.encode_suffixless_alu(ops, 0),
@@ -1776,6 +1846,7 @@ impl InstructionEncoder {
 
             // ---- imul with suffix forms we haven't caught ----
             "imulw" => self.encode_imul(ops, 2),
+            "imulb" => self.encode_imul(ops, 1),
 
             // ---- Additional ADC/SBB sizes ----
             "adcw" | "adcb" => self.encode_alu(ops, mnemonic, 2),

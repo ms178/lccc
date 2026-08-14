@@ -96,7 +96,7 @@ fn direct_stack_slot_in_line(line: &str) -> Option<(u8, i32)> {
 /// opaque.  Volatile access is observable even when an ordinary dataflow pass
 /// believes the slot value is available in a register.
 ///
-/// SOUNDNESS (v9): the `# LCCC_VOLATILE_SLOT` markers describe THIS function's
+/// SOUNDNESS: the `# LCCC_VOLATILE_SLOT` markers describe THIS function's
 /// frame only, but stack offsets repeat across functions.  A file-wide slot set
 /// demoted unrelated accesses in other functions (e.g. a `movl 24(%rsp), %eax`
 /// load in sqlite3MultiValues matched the `24(%rsp)` marker emitted by
@@ -219,7 +219,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Always-on, provably-safe pass: eliminate redundant zero-extensions
     // (movzbl %al,%eax where upper bits are already zero). Runs before gate.
     let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
-    // v3: the peephole optimizer is now ENABLED BY DEFAULT with a curated,
+    // the peephole optimizer is now ENABLED BY DEFAULT with a curated,
     // gzip-validated safe subset. The two passes that were proven to miscompile
     // gzip 1.14 (full 30-test suite) are skipped by default: `store_fwd`
     // (global store-load forwarding) and `combined` (combined_local_pass).
@@ -310,7 +310,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
 
     // CCC_PEEPHOLE_SKIP=pass1,pass2,... to disable specific sub-passes.
     //
-    // v7: ALL peephole passes are now ENABLED BY DEFAULT. The previously-disabled
+    // ALL peephole passes are now ENABLED BY DEFAULT. The previously-disabled
     // passes were fixed properly (not merely skipped):
     //   - copy_prop: clear copy state at every barrier (incl. CondJmp).
     //   - store_relay: use the STORE's width, do not widen a 32-bit zero-extension
@@ -412,7 +412,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
         let mut pass_count2 = 0;
         while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
             changed2 = false;
-            // Gated (v7): previously combined_local_pass ran UNGATED here, so it
+            // Gated: previously combined_local_pass ran UNGATED here, so it
             // executed even when the user skipped `combined` — this caused
             // interaction miscompiles (e.g. redundant `xorl %eax,%eax` removal
             // across loop boundaries). Honor the skip set.

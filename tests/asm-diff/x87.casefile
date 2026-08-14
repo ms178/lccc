@@ -1,0 +1,158 @@
+;;; x87
+.text
+fadd %st(0)
+fsub %st(0)
+fsubr %st(0)
+fmul %st(0)
+fdiv %st(0)
+fdivr %st(0)
+fcom %st(0)
+fcomp %st(0)
+fucomi %st(0)
+fcomi %st(0)
+fxch %st(0)
+ffree %st(0)
+fadd %st(1)
+fsub %st(1)
+fsubr %st(1)
+fmul %st(1)
+fdiv %st(1)
+fdivr %st(1)
+fcom %st(1)
+fcomp %st(1)
+fucomi %st(1)
+fcomi %st(1)
+fxch %st(1)
+ffree %st(1)
+fadd %st(2)
+fsub %st(2)
+fsubr %st(2)
+fmul %st(2)
+fdiv %st(2)
+fdivr %st(2)
+fcom %st(2)
+fcomp %st(2)
+fucomi %st(2)
+fcomi %st(2)
+fxch %st(2)
+ffree %st(2)
+fadd %st(3)
+fsub %st(3)
+fsubr %st(3)
+fmul %st(3)
+fdiv %st(3)
+fdivr %st(3)
+fcom %st(3)
+fcomp %st(3)
+fucomi %st(3)
+fcomi %st(3)
+fxch %st(3)
+ffree %st(3)
+fadd %st(4)
+fsub %st(4)
+fsubr %st(4)
+fmul %st(4)
+fdiv %st(4)
+fdivr %st(4)
+fcom %st(4)
+fcomp %st(4)
+fucomi %st(4)
+fcomi %st(4)
+fxch %st(4)
+ffree %st(4)
+fadd %st(5)
+fsub %st(5)
+fsubr %st(5)
+fmul %st(5)
+fdiv %st(5)
+fdivr %st(5)
+fcom %st(5)
+fcomp %st(5)
+fucomi %st(5)
+fcomi %st(5)
+fxch %st(5)
+ffree %st(5)
+fadd %st(6)
+fsub %st(6)
+fsubr %st(6)
+fmul %st(6)
+fdiv %st(6)
+fdivr %st(6)
+fcom %st(6)
+fcomp %st(6)
+fucomi %st(6)
+fcomi %st(6)
+fxch %st(6)
+ffree %st(6)
+fadd %st(7)
+fsub %st(7)
+fsubr %st(7)
+fmul %st(7)
+fdiv %st(7)
+fdivr %st(7)
+fcom %st(7)
+fcomp %st(7)
+fucomi %st(7)
+fcomi %st(7)
+fxch %st(7)
+ffree %st(7)
+fadds 8(%rsp)
+faddl 8(%rsp)
+fmuls 8(%rsp)
+fmull 8(%rsp)
+fdivs 8(%rsp)
+fdivl 8(%rsp)
+flds 8(%rsp)
+fldl 8(%rsp)
+fldt 8(%rsp)
+fsts 8(%rsp)
+fstl 8(%rsp)
+fstps 8(%rsp)
+fstpl 8(%rsp)
+fstpt 8(%rsp)
+filds 8(%rsp)
+fildl 8(%rsp)
+fildll 8(%rsp)
+fists 8(%rsp)
+fistl 8(%rsp)
+fistps 8(%rsp)
+fistpl 8(%rsp)
+fistpll 8(%rsp)
+fisttps 8(%rsp)
+fisttpl 8(%rsp)
+fisttpll 8(%rsp)
+fld1
+fldz
+fldpi
+fldl2e
+fldl2t
+fldlg2
+fldln2
+fabs
+fchs
+fsqrt
+fsin
+fcos
+fptan
+fpatan
+f2xm1
+fyl2x
+fyl2xp1
+fprem
+fprem1
+frndint
+fscale
+fxtract
+fnop
+fwait
+fnclex
+fninit
+fnstsw %ax
+fnstcw (%rsp)
+fldcw (%rsp)
+fincstp
+fdecstp
+ftst
+fxam
+fcompp
+fucompp

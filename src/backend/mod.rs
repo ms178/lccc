@@ -309,7 +309,13 @@ impl Target {
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
-                x86::codegen::peephole::peephole_optimize(raw)
+                // Escape hatch for bisecting a suspected peephole miscompile:
+                // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
+                if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
+                    raw
+                } else {
+                    x86::codegen::peephole::peephole_optimize(raw)
+                }
             }
             Target::I686 => {
                 let mut cg = i686::I686Codegen::new();

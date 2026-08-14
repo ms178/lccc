@@ -3,7 +3,7 @@
 //! Hotness classification is DATA-DRIVEN via the profile summary
 //! (`summary::ProfileSummary`, an LLVM `ProfileSummaryInfo` analogue):
 //! percentile thresholds computed from the unit's count distribution replace
-//! the v6/v7 magic ratios (`relative_frequency >= 0.10/0.05/0.005`).
+//! the fixed magic ratios (`relative_frequency >= 0.10/0.05/0.005`).
 //! Per-call-site hotness uses the derived count of the block containing the
 //! call (LLVM `isHotCallSite`/BFI), which is a strictly stronger signal than
 //! function entry counts for call sites in hot loops.
@@ -40,7 +40,7 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
         let dh = s.is_hot(to_count(df));
         let dc = s.is_cold(to_count(df));
         let cc = s.is_cold(to_count(cf));
-        // v10: the hot-caller/hot-callee bonus is only meaningful when the
+        // The hot-caller/hot-callee bonus is only meaningful when the
         // profile has genuine hot/cold separation. On a flat profile
         // (`has_spread()` == false) "both hot" is vacuous, and returning 1.75
         // makes the base inliner over-inline helpers into hot functions —
@@ -81,12 +81,12 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
     }
 }
 
-/// v10: whether profile-driven inlining decisions are meaningfully active.
+/// Whether profile-driven inlining decisions are meaningfully active.
 ///
 /// On a FLAT profile (no hot/cold spread) every call site and function looks
 /// "hot" to the percentile thresholds, so the PGO inliner has no informative
 /// signal. Merely reading the profile in that state can perturb the inliner's
-/// pass iterations and change the final code, regressing hot paths (v10
+/// pass iterations and change the final code, regressing hot paths (measured
 /// finding: zlib-ng adler32 and expat kernels regressed ~20-26% under
 /// `-fprofile-use` on flat profiles, and the regression survived disabling
 /// layout and the identifiable consumers). Gate the entire PGO inline filter on
@@ -95,7 +95,7 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
 pub fn inline_decisions_active() -> bool {
     match crate::pgo::summary::get_summary() {
         Some(s) => s.has_spread(),
-        None => true, // no summary: use the v7 relative-frequency heuristics
+        None => true, // no summary: use the relative-frequency heuristics
     }
 }
 
@@ -143,7 +143,7 @@ fn should_inline_impl(
                 site_count > 0 && s.is_cold(site_count),
             ),
             None => {
-                // Fallback: v7 relative-frequency ratios.
+                // Fallback: relative-frequency ratios.
                 let m = p
                     .functions
                     .values()
@@ -177,7 +177,7 @@ fn should_inline_impl(
     if (caller_hot || site_hot) && callee_hot && size <= 48 {
         return Some(true);
     }
-    // v11: a LOOPED hot call site — the site executes substantially more often
+    // A LOOPED hot call site — the site executes substantially more often
     // than its caller's entry (site_count >> caller entry), i.e. it is inside a
     // hot loop. Inlining it removes call overhead from every iteration and
     // exposes the callee to the caller's optimizations, which a plain build
@@ -186,11 +186,11 @@ fn should_inline_impl(
     if site_count > 0 && site_count.saturating_mul(2) >= cf.max(1) && size <= 200 {
         return Some(true);
     }
-    // v11 (novel): ENTRY-COUNT-RATIO force-inline. Per-block site counts are
+    // ENTRY-COUNT-RATIO force-inline. Per-block site counts are
     // unavailable at pre-pass time — the pre-pass CFG's block labels differ
     // from the post-pass labels the instrumentation recorded, so
     // `derive_block_counts` yields zero and the block-level hot-site signal is
-    // destroyed (this is exactly why v10's force-inline never fired). The
+    // destroyed (this is exactly why a block-count force-inline never fires). The
     // function ENTRY counts, however, are LABEL-INDEPENDENT and survive across
     // pre/post pass. The ratio `df / cf` is the average number of times the
     // callee runs per caller invocation: when it is large, the callee is called

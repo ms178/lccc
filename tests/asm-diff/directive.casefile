@@ -1,0 +1,178 @@
+;;; data
+.data
+.globl gd
+gd:     .byte 1, 2, 3, 0xff, -1, 127, -128
+        .word 1, 0xffff, -1, 32767, -32768
+        .long 1, 0xffffffff, -1, 2147483647, -2147483648
+        .quad 1, 0xffffffffffffffff, -1
+        .ascii "abc"
+        .asciz "def"
+        .string "ghi"
+        .space 8
+        .space 4, 0xAA
+        .zero 5
+        .byte 0
+.align 8
+        .long 42
+.p2align 4
+        .long 43
+.balign 32
+        .long 45
+;;; floats
+.section .rodata
+.globl fp
+fp:     .float 1.0, -0.0, 3.14159, 1e30, -1e-30
+        .double 1.0, -0.0, 3.141592653589793, 1e300, -1e-300
+        .single 0.5
+        .quad 0x7ff0000000000000
+        .long 0x7f800000
+;;; symbols
+.text
+.globl g1
+.type g1, @function
+g1:     ret
+.size g1, .-g1
+.weak w1
+w1:     ret
+.globl alias1
+.set alias1, g1
+.globl alias2
+alias2 = g1
+.hidden h1
+.globl h1
+h1:     ret
+.protected p1
+.globl p1
+p1:     ret
+.comm c1, 8, 8
+.comm c2, 16, 16
+;;; sections nosym
+.section .text.hot,"ax",@progbits
+hotf:   ret
+.section .text.unlikely,"ax",@progbits
+coldf:  ret
+.section .rodata.cst16,"aM",@progbits,16
+        .quad 1, 2
+.section .data.rel.ro,"aw",@progbits
+        .quad 0
+.section .bss,"aw",@nobits
+        .zero 64
+.section .tdata,"awT",@progbits
+        .long 7
+.section .init_array,"aw",@init_array
+        .quad hotf
+.text
+        ret
+;;; symdiff nosym
+.text
+a:      nop
+        nop
+b:      nop
+c:
+.data
+        .byte b-a
+        .word b-a
+        .long b-a
+        .quad b-a
+        .long c-a
+        .long a-b
+        .long (c-a)*2
+        .long (c-a)+7
+        .long 2*(c-a)
+.text
+        .long b-a
+;;; equ_forward nosym
+.text
+.set  sz, end - beg
+beg:    nop
+        nop
+        nop
+end:    ret
+.data
+        .long sz
+        .byte sz
+;;; rept_irp
+.text
+.rept 4
+        nop
+.endr
+.irp reg, rax, rbx, rcx, rdx
+        push %\reg
+.endr
+.irp reg, rdx, rcx, rbx, rax
+        pop %\reg
+.endr
+        ret
+;;; macro
+.macro tri a, b, c
+        add %\a, %\b
+        add %\b, %\c
+.endm
+.text
+        tri rax, rbx, rcx
+        tri r8, r9, r10
+.macro withdef x=7
+        .byte \x
+.endm
+        withdef
+        withdef 9
+        ret
+;;; conditionals
+.text
+.set  v, 3
+.if v == 3
+        nop
+.else
+        ud2
+.endif
+.ifdef v
+        nop
+.endif
+.ifndef nothere
+        nop
+.endif
+.if v > 1 && v < 10
+        nop
+.endif
+        ret
+;;; relocs nosym
+.text
+.extern ext
+.globl f
+f:
+        call ext
+        call ext@PLT
+        jmp  ext
+        mov  ext(%rip), %rax
+        mov  ext@GOTPCREL(%rip), %rax
+        lea  ext(%rip), %rax
+        movq $ext, %rax
+        movabs $ext, %rax
+        mov  $ext, %eax
+        ret
+.data
+        .quad ext
+        .long ext
+        .quad ext+8
+        .quad f
+;;; cfi nosym
+.text
+.globl cf
+.type cf, @function
+cf:
+        .cfi_startproc
+        push %rbp
+        .cfi_def_cfa_offset 16
+        .cfi_offset %rbp, -16
+        mov %rsp, %rbp
+        .cfi_def_cfa_register %rbp
+        sub $32, %rsp
+        push %rbx
+        .cfi_offset %rbx, -24
+        pop %rbx
+        .cfi_restore %rbx
+        leave
+        .cfi_def_cfa %rsp, 8
+        ret
+        .cfi_endproc
+.size cf, .-cf

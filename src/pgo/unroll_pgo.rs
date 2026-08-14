@@ -45,7 +45,7 @@ fn successors(t: &crate::ir::reexports::Terminator) -> Vec<crate::ir::reexports:
 /// after the pass pipeline). The raw profile only carries instrumented
 /// NON-tree edges; a loop's backedge is the maximum-spanning-tree edge (weight
 /// 2000) and is therefore NOT instrumented, so `edge_count(backedge)` is 0 on
-/// the raw profile — the v8 "derived trip count" path was dead during
+/// the raw profile — the "derived trip count" path was dead during
 /// unrolling and always fell back to the entry-count heuristic. Fix: derive
 /// the tree/backedge counts on the current (pre-pass) CFG right here, exactly
 /// as the PGO inliner already does for per-call-site hotness.
@@ -99,7 +99,7 @@ pub fn should_unroll_loop(
         }
         return None;
     }
-    // Pre-pass fallback: entry-count heuristic (v7 behavior) for functions
+    // Pre-pass fallback: entry-count heuristic for functions
     // without a usable derived backedge (e.g. no profile for this function).
     let n = if crate::pgo::prepass_is_active() {
         crate::pgo::total_count_for(&f.name)

@@ -44,6 +44,27 @@ fn reg_64_to_32(r64: &str) -> String {
     }
 }
 
+/// 64-bit register name WITHOUT a leading `%` to its 32-bit sub-register.
+///
+/// Only `%r8`-`%r15` take the `d` suffix; the eight classic registers change
+/// their `r` prefix to `e`. Appending `d` unconditionally produces names like
+/// `rdxd`, which no assembler accepts — this rejected valid programs at the
+/// integrated-assembler stage (observed building expat's xmlparse.c at -O2).
+fn bare_reg_64_to_32(r64: &str) -> Option<String> {
+    Some(match r64 {
+        "rax" => "eax".into(), "rcx" => "ecx".into(),
+        "rdx" => "edx".into(), "rbx" => "ebx".into(),
+        "rsp" => "esp".into(), "rbp" => "ebp".into(),
+        "rsi" => "esi".into(), "rdi" => "edi".into(),
+        _ if r64.starts_with('r')
+            && !r64[1..].is_empty()
+            && r64[1..].chars().all(|c| c.is_ascii_digit()) => format!("{}d", r64),
+        // Already a 32-bit name: leave it alone.
+        _ if r64.starts_with('e') || r64.ends_with('d') => r64.to_string(),
+        _ => return None,
+    })
+}
+
 fn stack_offset_str(offset: i32, context: &str) -> String {
     if context.contains("(%rsp)") {
         format!("{}(%rsp)", offset)
@@ -124,7 +145,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 // Handled below via the source-register check.
                                 || nj.starts_with("xorl %eax"); // duplicate xorl
                             if is_mov_into_rax {
-                                // SOUNDNESS (v7): the instruction only "overwrites"
+                                // SOUNDNESS: the instruction only "overwrites"
                                 // %rax with a FRESH value if its source does NOT read
                                 // %rax. A self-move such as `movl %eax, %eax` (or
                                 // `movq %rax, %rax`, `leaq (%rax), %rax`) READS the
@@ -1271,7 +1292,7 @@ pub(super) fn fold_accumulator_alu_store(
         // Step 3: The instruction after the ALU must be a 32-bit STORE of
         // %eax directly (no `cltq` sign-extension in between).
         //
-        // SOUNDNESS (v8): the original pattern was `movl %REGd,%eax;
+        // SOUNDNESS: the original pattern was `movl %REGd,%eax;
         // OP mem,%eax; cltq; movq %rax,slot`, and the pass rewrote it to
         // `OP mem,%REGd; movl %REGd,slot`. That was UNSOUND: `cltq` sign-extends
         // the 32-bit ALU result to 64 bits, so the original `movq %rax,slot`
@@ -2075,7 +2096,7 @@ pub(super) fn fuse_copy_and_operation(
 
 /// Returns true if %rax is live (potentially read) at instruction index `at`.
 /// Conservative: treats "movq %<non-rax>, %rax" as a pure write (not live).
-/// v5: returns true iff eliding the value currently in %rax is SOUND from
+/// returns true iff eliding the value currently in %rax is SOUND from
 /// instruction `at` onward: nothing reads %rax before it is written, and no
 /// control-flow boundary (jump/call/ret) is crossed before a write. Reads of
 /// the 32-bit sub-register (%eax) also count (a later `movl %eax, ...` would
@@ -2597,7 +2618,7 @@ pub(super) fn coalesce_phi_register_copies(
             let mut src_referenced = false;
             let mut has_implicit_hazard = false;
             let mut copy_back_pos = None;
-            // SOUNDNESS (v7): TMP must NOT be WRITTEN between the copy-out and the
+            // SOUNDNESS: TMP must NOT be WRITTEN between the copy-out and the
             // copy-back (or, for a chain, before the defining movslq). If TMP is
             // modified (e.g. xorq/addq into it), then the copy-back moves the
             // MODIFIED value to SRC, and coalescing away the copy-back would lose
@@ -2616,7 +2637,7 @@ pub(super) fn coalesce_phi_register_copies(
 
                 let tj = infos[j].trimmed(store.get(j));
 
-                // SOUNDNESS (v7): if TMP is WRITTEN between the copy-out and the
+                // SOUNDNESS: if TMP is WRITTEN between the copy-out and the
                 // copy-back, coalescing is unsound (the copy-back would carry a
                 // modified value). Detect writes to TMP.
                 match infos[j].kind {
@@ -2656,7 +2677,7 @@ pub(super) fn coalesce_phi_register_copies(
                         let other_reg = &tj[chain_prefix.len() - 1..];
                         let other_fam = register_family_fast(other_reg);
                         if other_fam != REG_NONE && other_fam != tmp_family && other_fam != src_family && other_fam > 1 {
-                            // SOUNDNESS (v7): the chain register (%OTHER) is DEFINED
+                            // SOUNDNESS: the chain register (%OTHER) is DEFINED
                             // by this movslq. It may not be READ before this point:
                             // before the movslq, %OTHER holds an unrelated live value,
                             // and rewriting it to %SRC would corrupt that use. Record
@@ -2682,7 +2703,7 @@ pub(super) fn coalesce_phi_register_copies(
                 i += 1; continue;
             }
 
-            // SOUNDNESS (v7): if a chain register (%OTHER from movslq %TMP,%OTHER)
+            // SOUNDNESS: if a chain register (%OTHER from movslq %TMP,%OTHER)
             // is READ before its defining movslq, it holds an unrelated live value
             // there and must NOT be rewritten to %SRC. Abort the coalesce.
             if let Some(cp) = chain_pos {
@@ -2941,7 +2962,7 @@ pub(super) fn hoist_loop_invariant_gpr_load(
 
             // All checks passed. Hoist the load into the PREHEADER.
             //
-            // SOUND FIX (v5): the previous implementation placed the hoisted load
+            // SOUND FIX: the previous implementation placed the hoisted load
             // either in a NOP slot before the header or prepended to the header
             // label line. Both are wrong: the header label sits AFTER the entry
             // `jmp .LBB1`, so a load prepended to the header label (or placed in
@@ -3227,7 +3248,7 @@ pub(super) fn fuse_add_sign_extend(
         if tmp_used_elsewhere { i += 1; continue; }
 
         // Transform!
-        let dst_reg32 = format!("{}d", dst_reg);
+        let Some(dst_reg32) = bare_reg_64_to_32(&dst_reg) else { i += 1; continue; };
         let new_add = format!("    addl %{}, %{}", src_reg, dst_reg32);
         let t2_raw_owned = store.get(i + 1).to_string();
         store.replace(i, new_add);
@@ -3732,16 +3753,10 @@ pub(super) fn rotate_loops(
             if let Some(comma) = first_text.find(", %") {
                 let src_32 = &first_text[7..comma]; // e.g., "%r12d"
                 let dst_64 = &first_text[comma + 2..]; // e.g., "%r14"
-                let dst_32 = if dst_64.starts_with("%r") && dst_64.len() >= 3 {
-                    format!("{}d", dst_64)
-                } else {
-                    match dst_64 {
-                        "%rax" => "%eax".to_string(), "%rcx" => "%ecx".to_string(),
-                        "%rdx" => "%edx".to_string(), "%rbx" => "%ebx".to_string(),
-                        "%rsi" => "%esi".to_string(), "%rdi" => "%edi".to_string(),
-                        _ => String::new(),
-                    }
-                };
+                // `starts_with("%r")` is TRUE for %rdx/%rsi/... too, so the
+                // numbered-register test must be explicit or `%rdx` becomes
+                // the nonexistent `%rdxd`.
+                let dst_32 = reg_64_to_32(dst_64);
                 let last_setup_idx = *header_instrs.last().unwrap();
                 let cmp_text = store.get(last_setup_idx).to_string();
                 let optimized_cmp = cmp_text.trim_end().replace(&dst_32, src_32);

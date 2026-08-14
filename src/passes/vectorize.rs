@@ -3545,7 +3545,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // v4: byte-offset IV strength reduction (mirrors the matmul path). The IV
+    // byte-offset IV strength reduction (mirrors the matmul path). The IV
     // steps `elem_sz * vec_width` bytes per iteration instead of one element,
     // so the GEP offset IS the byte IV (no per-iteration shl/leaq/scale) and
     // VecLoad can use `(base, byte_iv)` addressing directly. Falls back to the
@@ -3672,7 +3672,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // v4: byte-offset IV — the latch increment steps by `byte_stride` bytes.
+    // byte-offset IV — the latch increment steps by `byte_stride` bytes.
     if use_byte_iv {
         let latch = &mut func.blocks[pattern.latch_idx];
         if pattern.iv_inc_idx < latch.instructions.len() {
@@ -4143,7 +4143,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // v4: byte-offset IV strength reduction (mirrors the matmul path). The IV
+    // byte-offset IV strength reduction (mirrors the matmul path). The IV
     // steps `elem_sz * vec_width` bytes per iteration instead of one element,
     // so the GEP offset IS the byte IV (no per-iteration shl/leaq/scale) and
     // VecLoad can use `(base, byte_iv)` addressing directly. Falls back to the
@@ -4270,7 +4270,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
         }
     }
 
-    // v4: byte-offset IV — the latch increment steps by `byte_stride` bytes.
+    // byte-offset IV — the latch increment steps by `byte_stride` bytes.
     if use_byte_iv {
         let latch = &mut func.blocks[pattern.latch_idx];
         if pattern.iv_inc_idx < latch.instructions.len() {

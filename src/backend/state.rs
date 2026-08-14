@@ -611,7 +611,7 @@ impl CodegenState {
     /// Check if a value uses a 4-byte (small) stack slot.
     /// Used by store/load paths to emit 4-byte instructions instead of 8-byte.
     ///
-    /// RE-ENABLED (v1): the previous disable note claimed movl corrupts
+    /// RE-ENABLED: the previous disable note claimed movl corrupts
     /// signed I32 values flowing into 64-bit operations. That is solved by
     /// type-aware loads: signed I32 values that are consumed in 64-bit
     /// contexts (tracked by the needs-sext analysis) are loaded with
