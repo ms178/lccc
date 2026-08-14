@@ -130,15 +130,31 @@ pub(super) fn find_dead_param_allocas(
 
     for (idx, pv) in func.param_alloca_values.iter().enumerate() {
         if !used_values.contains(&pv.0) {
-            // Only eliminate the alloca if the ParamRef dest is assigned to a
-            // callee-saved register. Caller-saved registers overlap with ABI
-            // argument registers, so using them would clobber other params'
-            // values before they're saved.
-            if let Some(dest_id) = paramref_dests.get(idx).copied().flatten() {
-                let is_callee_saved = reg_assigned.get(&dest_id)
-                    .map(|phys| callee_saved_regs.contains(phys))
-                    .unwrap_or(false);
-                if is_callee_saved {
+            match paramref_dests.get(idx).copied().flatten() {
+                Some(dest_id) => {
+                    // ParamRef survived: eliminate the alloca only when the
+                    // ParamRef dest has a stable register home that
+                    // emit_store_params can pre-store the ABI arg into:
+                    // - a callee-saved GPR (survives calls, never clobbered);
+                    // - an XMM register (PhysReg 20+), which the allocator
+                    //   only assigns to values that do NOT span calls.
+                    // Caller-saved GPRs overlap with ABI argument registers
+                    // and would clobber other params' values before they're
+                    // saved, so they are deliberately excluded.
+                    let has_stable_home = reg_assigned.get(&dest_id)
+                        .map(|phys| callee_saved_regs.contains(phys) || phys.0 >= 20)
+                        .unwrap_or(false);
+                    if has_stable_home {
+                        dead.insert(pv.0);
+                    }
+                }
+                None => {
+                    // The ParamRef is gone (constant-propagated away by IPCP,
+                    // or the parameter is genuinely unused after DCE) AND the
+                    // alloca has no uses. The parameter value flows nowhere,
+                    // so the alloca is dead: skip the entry-store slot write
+                    // (nbody's advance(0.01, ...) previously spilled the
+                    // constant-folded dt to 0xc8(%rsp) every call).
                     dead.insert(pv.0);
                 }
             }

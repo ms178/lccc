@@ -17,7 +17,7 @@ use super::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::reexports::{Instruction, IrFunction, IrUnaryOp, Operand, Terminator};
+use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator};
 
 /// Enhanced live interval with priority, uses, and spill weight.
 ///
@@ -907,8 +907,30 @@ fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
                     dest,
                     lhs: Operand::Value(lhs),
                     ty,
+                    op,
                     ..
                 } if *ty == IrType::F64 || *ty == IrType::F32 => {
+                    hints.insert(dest.0, lhs.0);
+                }
+                // GPR simple-ALU ops also compute into the destination with
+                // the LHS pre-loaded (emit_alu_reg_direct:
+                // operand_to_callee_reg(lhs, dest); op dest). Only the LHS is
+                // hinted; the RHS is read AFTER the LHS load and would be
+                // clobbered (the FP RHS rule, observed as `or %r9,%r9` ≡ 0).
+                Instruction::BinOp {
+                    dest,
+                    lhs: Operand::Value(lhs),
+                    ty,
+                    op,
+                    ..
+                } if ty.is_integer()
+                    && !matches!(ty, IrType::I128 | IrType::U128)
+                    && matches!(
+                        op,
+                        IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or
+                            | IrBinOp::Xor | IrBinOp::Mul
+                    ) =>
+                {
                     hints.insert(dest.0, lhs.0);
                 }
                 Instruction::Copy {

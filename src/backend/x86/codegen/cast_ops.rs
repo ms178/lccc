@@ -11,6 +11,12 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        // Flag-fusion forwarding: this cast's destination is never read (the
+        // fused consumer uses the live Cmp flags), and its source is the
+        // never-materialized boolean — emitting it would read a stale register.
+        if self.fused_forward_dests.contains(&dest.0) {
+            return;
+        }
         // W2 Load->Cast fold handshake: skip ONLY when the adjacent load
         // ACTUALLY emitted the redirected load into this value's register
         // (handshake set by emit_load_impl). Any other situation emits the

@@ -303,12 +303,22 @@ impl Lowerer {
                 // truncation to U32 so that 64-bit operations (like divq) see the correct
                 // 32-bit unsigned values.
                 // On 32-bit: not needed since U32 operations are native width.
+                //
+                // from_ty must be the operand's ACTUAL type (`op_ty`, which is
+                // U32 here: `widened_op_type(U32) == U32`), not the hardcoded
+                // I64. The old I64 label made this a type-lying identity cast
+                // that simplify could not fold (its chain check requires
+                // inner_to == from_ty), so it survived to codegen as a
+                // spurious `mov` per comparison operand — the expat/sqlite
+                // `mov %esi,%ebp; mov %ebp,%r15d` copy chains. With the
+                // correct label the cast is Cast(U32->U32), which simplify
+                // folds to a Copy and copy-prop eliminates.
                 if lhs_ty.size() <= 4 {
-                    let masked = self.emit_cast_val(lhs_val, IrType::I64, IrType::U32);
+                    let masked = self.emit_cast_val(lhs_val, op_ty, IrType::U32);
                     lhs_val = Operand::Value(masked);
                 }
                 if rhs_ty.size() <= 4 {
-                    let masked = self.emit_cast_val(rhs_val, IrType::I64, IrType::U32);
+                    let masked = self.emit_cast_val(rhs_val, op_ty, IrType::U32);
                     rhs_val = Operand::Value(masked);
                 }
             }

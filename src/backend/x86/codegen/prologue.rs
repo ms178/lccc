@@ -335,6 +335,11 @@ impl X86Codegen {
             // consumer is adjacent). The Cmp emitter records pending flags
             // under the chain-end value so the consumer matches.
             let mut fused: FxHashMap<u32, u32> = FxHashMap::default();
+            // Forwarding Copy/Cast destinations in fused chains: their value is
+            // never materialized, so the emitters must skip them (see
+            // fused_forward_dests on the emitter state).
+            let mut fused_forward: crate::common::fx_hash::FxHashSet<u32> =
+                crate::common::fx_hash::FxHashSet::default();
             for block in &func.blocks {
                 let insts = &block.instructions;
                 for (ii, inst) in insts.iter().enumerate() {
@@ -347,6 +352,7 @@ impl X86Codegen {
                         let mut k = ii + 1;
                         let mut is_consumer = false;
                         let mut chain_single_use = true;
+                        let mut forward_dests: Vec<u32> = Vec::new();
                         while k < insts.len() {
                             match &insts[k] {
                                 Instruction::Copy { dest: cd, src: Operand::Value(sv) }
@@ -373,6 +379,7 @@ impl X86Codegen {
                                         chain_single_use = false;
                                         break;
                                     }
+                                    forward_dests.push(cd.0);
                                     cur = cd.0;
                                     k += 1;
                                 }
@@ -392,6 +399,7 @@ impl X86Codegen {
                                         chain_single_use = false;
                                         break;
                                     }
+                                    forward_dests.push(cd.0);
                                     cur = cd.0;
                                     k += 1;
                                 }
@@ -409,11 +417,13 @@ impl X86Codegen {
                         }
                         if is_consumer && chain_single_use {
                             fused.insert(dest.0, cur);
+                            fused_forward.extend(forward_dests.iter().copied());
                         } else if !is_consumer && chain_single_use && k == insts.len() && insts.len() >= 1 {
                             // Check the block terminator as the consumer.
                             if let Terminator::CondBranch { cond: Operand::Value(v), .. } = &block.terminator {
                                 if v.0 == cur && use_counts.get(&cur).copied().unwrap_or(0) == 1 {
                                     fused.insert(dest.0, cur);
+                                    fused_forward.extend(forward_dests.iter().copied());
                                 }
                             }
                         }
@@ -513,6 +523,7 @@ impl X86Codegen {
             self.cmp_replay = cmp_replay;
 
             self.fused_cmp_dests = fused;
+            self.fused_forward_dests = fused_forward;
             self.value_use_counts = use_counts;
 
 
@@ -1003,16 +1014,19 @@ impl X86Codegen {
                 }
                 if !has_slot {
                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
-                        // Only pre-store to callee-saved registers (PhysReg 1-5).
-                        // Caller-saved registers (rdi, rsi, r8-r11) cannot be used
-                        // because they overlap with ABI argument registers that
-                        // haven't been saved yet.
+                        // Pre-store to a callee-saved GPR (PhysReg 1-5) or an
+                        // allocated XMM register (PhysReg 20+). Caller-saved
+                        // GPRs (rdi, rsi, r8-r11) cannot be used because they
+                        // overlap ABI argument registers that haven't been
+                        // saved yet; XMM homes are fine because the allocator
+                        // only assigns them to values that do not span calls.
                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                        let is_xmm = super::emit::is_xmm_reg(phys_reg);
                         if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
                             let shared = reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
                             eprintln!("[PRE-STORE]   callee={} shared={} class={:?}", is_callee_saved, shared, class);
                         }
-                        if is_callee_saved {
+                        if is_callee_saved || is_xmm {
                             let shared = reg_to_params.get(&phys_reg.0)
                                 .is_some_and(|users| users.len() > 1);
                             if !shared {
@@ -1022,7 +1036,21 @@ impl X86Codegen {
                                         "    movq", X86_ARG_REGS[reg_idx], dest_reg);
                                     self.state.param_pre_stored.insert(i);
                                     self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
-                                } // TODO: handle StackSlot/SSE params
+                                } else if let ParamClass::FloatReg { reg_idx } = class {
+                                    // The FP argument arrives in xmm0..xmm7;
+                                    // move it straight into its allocated XMM
+                                    // home. movss/movsd are the scalar
+                                    // xmm->xmm moves (movd/movq are xmm<->GPR
+                                    // only, which the assembler rejects).
+                                    let mnemonic = if func.params[i].ty == IrType::F32 {
+                                        "    movss"
+                                    } else {
+                                        "    movsd"
+                                    };
+                                    self.state.out.emit_instr_reg_reg(
+                                        mnemonic, xmm_regs[reg_idx], dest_reg);
+                                    self.state.param_pre_stored.insert(i);
+                                }
                             }
                         }
                     }
