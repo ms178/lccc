@@ -241,7 +241,7 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     obj: &Elf64Object,
     globals: &mut FxHashMap<String, G>,
     should_replace_extra: fn(existing: &G) -> bool,
-) {
+) -> Result<(), String> {
     for sym in &obj.symbols {
         if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
         if sym.name.is_empty() || sym.is_local() { continue; }
@@ -249,24 +249,45 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
         let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON;
 
         if is_defined {
-            let should_replace = match globals.get(&sym.name) {
-                None => true,
-                Some(e) => !e.is_defined() || should_replace_extra(e)
-                    || (e.info() >> 4 == STB_WEAK && sym.is_global()),
-            };
-            if should_replace {
-                globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym));
+            match globals.get(&sym.name) {
+                None => { globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym)); }
+                Some(e) => {
+                    let e_weak = e.info() >> 4 == STB_WEAK;
+                    // A tentative (COMMON) definition is superseded by any
+                    // real definition (GNU ld / mold behavior).
+                    let e_common = e.section_idx() == SHN_COMMON;
+                    if !e.is_defined() || should_replace_extra(e) || e_common
+                        || (e_weak && sym.is_global())
+                    {
+                        globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym));
+                    } else if sym.is_global() && !e_weak && !e.is_dynamic() && e.is_defined() {
+                        // Two strong definitions of the same symbol: this is a
+                        // hard error in every mainstream linker. Silently keeping
+                        // the first definition produces subtly wrong programs.
+                        return Err(format!(
+                            "multiple definition of '{}' (duplicate in {})",
+                            sym.name, obj.source_name
+                        ));
+                    }
+                    // else: new definition is weak and existing is strong; keep existing.
+                }
             }
         } else if sym.shndx == SHN_COMMON {
-            let should_insert = match globals.get(&sym.name) {
-                None => true,
-                Some(e) => !e.is_defined(),
-            };
-            if should_insert {
-                globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
+            match globals.get(&sym.name) {
+                None => { globals.insert(sym.name.clone(), G::new_common(obj_idx, sym)); }
+                Some(e) => {
+                    if !e.is_defined() {
+                        globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
+                    } else if e.section_idx() == SHN_COMMON && sym.size > e.size() {
+                        // COMMON vs COMMON: the largest instance wins (GNU semantics).
+                        globals.insert(sym.name.clone(), G::new_common(obj_idx, sym));
+                    }
+                    // COMMON vs real definition: the real definition wins; ignore.
+                }
             }
         } else if !globals.contains_key(&sym.name) {
             globals.insert(sym.name.clone(), G::new_undefined(sym));
         }
     }
+    Ok(())
 }

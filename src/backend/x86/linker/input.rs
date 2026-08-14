@@ -72,7 +72,7 @@ pub(super) fn load_file(
     // Regular ELF object
     let obj = parse_object(&data, path)?;
     let obj_idx = objects.len();
-    linker_common::register_symbols_elf64(obj_idx, &obj, globals, x86_should_replace_extra);
+    linker_common::register_symbols_elf64(obj_idx, &obj, globals, x86_should_replace_extra)?;
     objects.push(obj);
     Ok(())
 }

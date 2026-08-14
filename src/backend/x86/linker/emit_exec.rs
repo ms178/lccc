@@ -33,6 +33,7 @@ pub(super) fn emit_executable(
     needed_sonames: &[String], output_path: &str,
     export_dynamic: bool, rpath_entries: &[String], use_runpath: bool,
     is_static: bool, ifunc_symbols: &[String],
+    entry_symbol: Option<&str>,
 ) -> Result<(), String> {
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
@@ -47,13 +48,16 @@ pub(super) fn emit_executable(
     // 2. Hashed symbols (copy-reloc symbols) - these are defined and must be
     //    findable through .gnu.hash so the dynamic linker can redirect references
     let mut dyn_sym_names: Vec<String> = Vec::new();
+    let mut dyn_sym_seen: crate::common::fx_hash::FxHashSet<String> =
+        crate::common::fx_hash::FxHashSet::default();
     for name in plt_names {
-        if !dyn_sym_names.contains(name) { dyn_sym_names.push(name.clone()); }
+        if dyn_sym_seen.insert(name.clone()) { dyn_sym_names.push(name.clone()); }
     }
     for (name, is_plt) in got_entries {
-        if !name.is_empty() && !*is_plt && !dyn_sym_names.contains(name) {
+        if !name.is_empty() && !*is_plt && !dyn_sym_seen.contains(name) {
             if let Some(gsym) = globals.get(name) {
                 if gsym.is_dynamic && !gsym.copy_reloc {
+                    dyn_sym_seen.insert(name.clone());
                     dyn_sym_names.push(name.clone());
                 }
             }
@@ -69,7 +73,7 @@ pub(super) fn emit_executable(
         .map(|(n, g)| (n.clone(), g.size))
         .collect();
     for (name, _) in &copy_reloc_syms {
-        if !dyn_sym_names.contains(name) {
+        if dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
     }
@@ -88,7 +92,7 @@ pub(super) fn emit_executable(
             .collect();
         exported.sort(); // deterministic output
         for name in exported {
-            if !dyn_sym_names.contains(&name) {
+            if dyn_sym_seen.insert(name.clone()) {
                 dyn_sym_names.push(name);
             }
         }
@@ -181,7 +185,12 @@ pub(super) fn emit_executable(
     let rela_dyn_glob_count = got_entries.iter().filter(|(n, p)| {
         !n.is_empty() && !*p && globals.get(n).map(|g| g.is_dynamic && !g.copy_reloc && g.plt_idx.is_none()).unwrap_or(false)
     }).count();
-    let rela_dyn_count = rela_dyn_glob_count + copy_reloc_syms.len();
+    // Dynamic executables carry IFUNC IRELATIVE relocations at the END of
+    // .rela.dyn (ld.so applies IRELATIVE last, matching GNU ld/mold layout).
+    // Static executables use the separate .rela.iplt + __rela_iplt_start/end
+    // protocol handled by glibc's static startup instead.
+    let dyn_irelative_count = if is_static { 0 } else { ifunc_symbols.len() };
+    let rela_dyn_count = rela_dyn_glob_count + copy_reloc_syms.len() + dyn_irelative_count;
     let rela_dyn_size = rela_dyn_count as u64 * 24;
 
     // Build .gnu.hash table for hashed symbols (copy-reloc + exported)
@@ -253,6 +262,12 @@ pub(super) fn emit_executable(
 
     let versym_size = versym_data.len() as u64;
 
+    // O(1) name -> dynsym index (1-based; 0 is the null symbol). Built AFTER
+    // the .gnu.hash bucket sort so indices match the final table order.
+    let dyn_sym_index: FxHashMap<&str, u64> = dyn_sym_names.iter().enumerate()
+        .map(|(i, n)| (n.as_str(), (i + 1) as u64))
+        .collect();
+
     // Recompute hashes after sorting
     let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
         .iter()
@@ -293,11 +308,13 @@ pub(super) fn emit_executable(
     let got_size = got_globdat_count as u64 * 8; // GOT needed even for static (TLS, GOTPCREL)
 
     let has_init_array = output_sections.iter().any(|s| s.name == ".init_array" && s.mem_size > 0);
+    let has_preinit_array = output_sections.iter().any(|s| s.name == ".preinit_array" && s.mem_size > 0);
     let has_fini_array = output_sections.iter().any(|s| s.name == ".fini_array" && s.mem_size > 0);
     let dynamic_size = if is_static { 0u64 } else {
         let mut dyn_count = needed_sonames.len() as u64 + 14; // fixed entries + NULL
         if has_init_array { dyn_count += 2; }
         if has_fini_array { dyn_count += 2; }
+        if has_preinit_array { dyn_count += 2; }
         if rpath_string.is_some() { dyn_count += 1; }
         if verneed_size > 0 { dyn_count += 3; } // DT_VERSYM + DT_VERNEED + DT_VERNEEDNUM
         dyn_count * 16
@@ -394,7 +411,17 @@ pub(super) fn emit_executable(
 
     let mut init_array_addr = 0u64; let mut init_array_size = 0u64;
     let mut fini_array_addr = 0u64; let mut fini_array_size = 0u64;
+    let mut preinit_array_addr = 0u64; let mut preinit_array_size = 0u64;
 
+    for sec in output_sections.iter_mut() {
+        if sec.name == ".preinit_array" {
+            let a = sec.alignment.max(8);
+            offset = (offset + a - 1) & !(a - 1);
+            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            preinit_array_addr = sec.addr; preinit_array_size = sec.mem_size;
+            offset += sec.mem_size; break;
+        }
+    }
     for sec in output_sections.iter_mut() {
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
@@ -427,15 +454,17 @@ pub(super) fn emit_executable(
     let ifunc_got_size = num_ifunc as u64 * 8;
     offset += ifunc_got_size;
 
-    // .rela.iplt (24 bytes per RELA entry for R_X86_64_IRELATIVE)
+    // .rela.iplt (24 bytes per RELA entry for R_X86_64_IRELATIVE).
+    // Only emitted for STATIC executables: dynamic executables put their
+    // IRELATIVE entries in .rela.dyn instead (ld.so ignores .rela.iplt).
     offset = (offset + 7) & !7;
     let rela_iplt_offset = offset; let rela_iplt_addr = BASE_ADDR + offset;
-    let rela_iplt_size = num_ifunc as u64 * 24;
+    let rela_iplt_size = if is_static { num_ifunc as u64 * 24 } else { 0 };
     offset += rela_iplt_size;
 
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 &&
-           sec.sh_type != SHT_NOBITS && sec.name != ".init_array" && sec.name != ".fini_array" &&
+           sec.sh_type != SHT_NOBITS && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" &&
            sec.flags & SHF_TLS == 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
@@ -564,8 +593,8 @@ pub(super) fn emit_executable(
         init_array_size,
         fini_array_start: fini_array_addr,
         fini_array_size,
-        preinit_array_start: 0,
-        preinit_array_size: 0,
+        preinit_array_start: preinit_array_addr,
+        preinit_array_size,
         rela_iplt_start: rela_iplt_addr,
         rela_iplt_size,
     };
@@ -605,7 +634,10 @@ pub(super) fn emit_executable(
         }
     }
 
-    let entry_addr = globals.get("_start").map(|s| s.value).unwrap_or(text_page_addr);
+    let entry_name = entry_symbol.unwrap_or("_start");
+    let entry_addr = globals.get(entry_name).map(|s| s.value)
+        .or_else(|| globals.get("_start").map(|s| s.value))
+        .unwrap_or(text_page_addr);
 
     // === .symtab / .strtab (debug symbol table) ===
     // ms178: previously the executable emitted ONLY .dynsym, so nm/gdb/perf
@@ -640,7 +672,7 @@ pub(super) fn emit_executable(
         }
         for (i, sec) in output_sections.iter().enumerate() {
             if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-                && sec.name != ".init_array" && sec.name != ".fini_array"
+                && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array"
             {
                 out_sec_to_hdr.insert(i, h as u16);
                 h += 1;
@@ -662,6 +694,9 @@ pub(super) fn emit_executable(
             h += 1;
         }
         if has_fini_array {
+            h += 1;
+        }
+        if has_preinit_array {
             h += 1;
         }
         if !is_static {
@@ -700,7 +735,7 @@ pub(super) fn emit_executable(
         if !is_static && plt_size > 0 { h += 1; }
         for sec in output_sections.iter() {
             if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-                && sec.name != ".init_array" && sec.name != ".fini_array" { h += 1; }
+                && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" { h += 1; }
         }
         for sec in output_sections.iter() {
             if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS { h += 1; }
@@ -710,6 +745,7 @@ pub(super) fn emit_executable(
         }
         if has_init_array { h += 1; }
         if has_fini_array { h += 1; }
+        if has_preinit_array { h += 1; }
         if !is_static { h += 1; }
         if got_size > 0 { h += 1; }
         if !is_static { h += 1; }
@@ -925,8 +961,12 @@ pub(super) fn emit_executable(
             // their GOT entry is statically filled with the PLT address to match
             // the canonical address used by R_X86_64_64 data relocations.
             if is_dynamic && !has_plt {
-                let si = dyn_sym_names.iter().position(|n| n == name).map(|i| i+1).unwrap_or(0) as u64;
-                w64(&mut out, rd, gd_a); w64(&mut out, rd+8, (si << 32) | R_X86_64_GLOB_DAT as u64); w64(&mut out, rd+16, 0);
+                let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
+                // TLS symbols get R_X86_64_TPOFF64 (ld.so stores the TP offset);
+                // everything else gets GLOB_DAT.
+                let is_tls = globals.get(name).map(|g| (g.info & 0xf) == STT_TLS).unwrap_or(false);
+                let rtype = if is_tls { R_X86_64_TPOFF64 } else { R_X86_64_GLOB_DAT } as u64;
+                w64(&mut out, rd, gd_a); w64(&mut out, rd+8, (si << 32) | rtype); w64(&mut out, rd+16, 0);
                 rd += 24;
             }
             gd_a += 8;
@@ -934,11 +974,20 @@ pub(super) fn emit_executable(
         // R_X86_64_COPY relocations for copy-relocated symbols
         for (name, _) in &copy_reloc_syms {
             if let Some(gsym) = globals.get(name) {
-                let si = dyn_sym_names.iter().position(|n| n == name).map(|i| i+1).unwrap_or(0) as u64;
+                let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
                 let copy_addr = gsym.value;
                 w64(&mut out, rd, copy_addr); w64(&mut out, rd+8, (si << 32) | 5); w64(&mut out, rd+16, 0);
                 rd += 24;
             }
+        }
+        // R_X86_64_IRELATIVE for IFUNCs in dynamic executables: ld.so calls
+        // the resolver (addend) and stores the result into the IFUNC GOT slot.
+        for i in 0..dyn_irelative_count {
+            let slot = ifunc_got_addr + i as u64 * 8;
+            w64(&mut out, rd, slot);
+            w64(&mut out, rd+8, R_X86_64_IRELATIVE as u64);
+            w64(&mut out, rd+16, ifunc_resolver_addrs[i]);
+            rd += 24;
         }
 
         // .rela.plt
@@ -946,7 +995,7 @@ pub(super) fn emit_executable(
         let gpb = got_plt_addr + 24;
         for (i, name) in plt_names.iter().enumerate() {
             let gea = gpb + i as u64 * 8;
-            let si = dyn_sym_names.iter().position(|n| n == name).map(|j| j+1).unwrap_or(0) as u64;
+            let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
             w64(&mut out, rp, gea); w64(&mut out, rp+8, (si << 32) | R_X86_64_JUMP_SLOT as u64); w64(&mut out, rp+16, 0);
             rp += 24;
         }
@@ -993,6 +1042,10 @@ pub(super) fn emit_executable(
         if has_fini_array {
             w64(&mut out, dd, DT_FINI_ARRAY as u64); w64(&mut out, dd+8, fini_array_addr); dd += 16;
             w64(&mut out, dd, DT_FINI_ARRAYSZ as u64); w64(&mut out, dd+8, fini_array_size); dd += 16;
+        }
+        if has_preinit_array {
+            w64(&mut out, dd, DT_PREINIT_ARRAY as u64); w64(&mut out, dd+8, preinit_array_addr); dd += 16;
+            w64(&mut out, dd, DT_PREINIT_ARRAYSZ as u64); w64(&mut out, dd+8, preinit_array_size); dd += 16;
         }
         if let Some(ref rp) = rpath_string {
             let rp_off = dynstr.get_offset(rp) as u64;
@@ -1066,20 +1119,41 @@ pub(super) fn emit_executable(
             w64(&mut out, go, resolver_addr);
         }
 
-        // .rela.iplt - R_X86_64_IRELATIVE relocations
-        for i in 0..num_ifunc {
-            let rp = rela_iplt_offset as usize + i * 24;
-            let r_offset = ifunc_got_addr + i as u64 * 8;
-            // r_info: (0 << 32) | R_X86_64_IRELATIVE
-            w64(&mut out, rp, r_offset);
-            w64(&mut out, rp+8, R_X86_64_IRELATIVE as u64);
-            w64(&mut out, rp+16, ifunc_resolver_addrs[i]); // r_addend = resolver address
+        // .rela.iplt - R_X86_64_IRELATIVE relocations (static executables only;
+        // dynamic executables emit IRELATIVE into .rela.dyn above)
+        if rela_iplt_size > 0 {
+            for i in 0..num_ifunc {
+                let rp = rela_iplt_offset as usize + i * 24;
+                let r_offset = ifunc_got_addr + i as u64 * 8;
+                // r_info: (0 << 32) | R_X86_64_IRELATIVE
+                w64(&mut out, rp, r_offset);
+                w64(&mut out, rp+8, R_X86_64_IRELATIVE as u64);
+                w64(&mut out, rp+16, ifunc_resolver_addrs[i]); // r_addend = resolver address
+            }
         }
     }
 
     // === Apply relocations ===
     // Snapshot globals to avoid borrow issues
     let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
+
+    // Precomputed ordinal of each non-PLT GOT entry (index into the .got
+    // section). Replaces per-relocation prefix scans that were O(GOT^2).
+    let got_slot_ordinal: Vec<usize> = {
+        let mut v = Vec::with_capacity(got_entries.len());
+        let mut nb = 0usize;
+        for (n, p) in got_entries.iter() {
+            v.push(nb);
+            if !n.is_empty() && !*p { nb += 1; }
+        }
+        v
+    };
+
+    // Byte ranges consumed by TLS GD/LD -> LE relaxation. The __tls_get_addr
+    // call that follows a relaxed TLSGD/TLSLD sequence has its own PLT32 /
+    // GOTPCRELX relocation which must NOT be applied (the call bytes have been
+    // overwritten). Ranges are file offsets.
+    let mut tls_consumed: Vec<(usize, usize)> = Vec::new();
 
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
@@ -1098,6 +1172,10 @@ pub(super) fn emit_executable(
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
+
+                // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
+                // rewrite (the __tls_get_addr call no longer exists).
+                if tls_consumed.iter().any(|&(cs, ce)| fp >= cs && fp < ce) { continue; }
                 let s = resolve_sym(obj_idx, sym, &globals_snap, section_map, output_sections,
                                     plt_addr);
 
@@ -1132,7 +1210,7 @@ pub(super) fn emit_executable(
                                     let gea = if entry.1 {
                                         got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
                                     } else {
-                                        let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
+                                        let nb = got_slot_ordinal[gi];
                                         got_addr + nb as u64 * 8
                                     };
                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
@@ -1142,21 +1220,33 @@ pub(super) fn emit_executable(
                         }
                         if !resolved {
                             // IE-to-LE relaxation: convert GOT-indirect to immediate TPOFF.
-                            // Transform: movq GOT(%rip), %reg -> movq $tpoff, %reg
-                            // Encoding: 48 8b XX YY YY YY YY -> 48 c7 CX YY YY YY YY
-                            //   where XX encodes the register via ModR/M
+                            //   movq  sym@GOTTPOFF(%rip), %reg  ->  movq $tpoff, %reg
+                            //   addq  sym@GOTTPOFF(%rip), %reg  ->  addq $tpoff, %reg
+                            // Encodings (fp points at the disp32):
+                            //   REX 8b /r disp32  ->  REX' c7 (0xc0|reg) imm32
+                            //   REX 03 /r disp32  ->  REX' 81 (0xc0|reg) imm32
+                            // CRITICAL: the destination register moves from the
+                            // ModRM.reg field to the ModRM.rm field, so the REX.R
+                            // bit must be transplanted to REX.B. Without this,
+                            // e.g. %r12 (REX.R + reg=100) silently becomes %rsp,
+                            // corrupting the stack pointer (observed as glibc
+                            // static-TLS crashes).
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            if fp >= 2 && fp + 4 <= out.len() && out[fp-2] == 0x8b {
-                                // Get the register from ModR/M byte
+                            let opc = if fp >= 2 { out[fp-2] } else { 0 };
+                            if fp >= 3 && fp + 4 <= out.len() && (opc == 0x8b || opc == 0x03) {
                                 let modrm = out[fp-1];
                                 let reg = (modrm >> 3) & 7;
-                                // Change mov r/m64,reg to mov $imm32,reg (opcode 0xc7, /0)
-                                out[fp-2] = 0xc7;
+                                out[fp-2] = if opc == 0x8b { 0xc7 } else { 0x81 };
                                 out[fp-1] = 0xc0 | reg;
+                                let rex = out[fp-3];
+                                if (rex & 0xf0) == 0x40 {
+                                    // Keep W and X; move R into B.
+                                    out[fp-3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
+                                }
                                 w32(&mut out, fp, (tpoff + a) as u32);
                             } else {
                                 return Err(format!(
-                                    "GOTTPOFF IE-to-LE relaxation failed: unrecognized instruction pattern at offset 0x{:x} for symbol '{}' (expected movq GOT(%rip), %reg)",
+                                    "GOTTPOFF IE-to-LE relaxation failed: unrecognized instruction pattern at offset 0x{:x} for symbol '{}' (expected movq/addq GOT(%rip), %reg)",
                                     fp, sym.name
                                 ));
                             }
@@ -1170,11 +1260,11 @@ pub(super) fn emit_executable(
                                     let gea = if entry.1 {
                                         got_plt_addr + 24 + g.plt_idx.unwrap_or(0) as u64 * 8
                                     } else {
-                                        let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
+                                        let nb = got_slot_ordinal[gi];
                                         got_addr + nb as u64 * 8
                                     };
                                     if std::env::var("LCCC_DEBUG_GOT").is_ok() {
-                                        let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
+                                        let nb = got_slot_ordinal[gi];
                                         eprintln!("[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
                                             sym.name, gi, entry.1, nb, gea, got_addr, p, a);
                                     }
@@ -1200,6 +1290,101 @@ pub(super) fn emit_executable(
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                         w32(&mut out, fp, (tpoff + a) as u32);
                     }
+                    R_X86_64_TLSGD => {
+                        // General-Dynamic TLS in an executable. Canonical sequence:
+                        //   66 48 8d 3d <disp32>      data16 lea sym@tlsgd(%rip),%rdi
+                        //   66 66 48 e8 <disp32>      data16 data16 rex.W call __tls_get_addr
+                        // fp points at the lea's disp32, so the sequence spans
+                        // [fp-4, fp+12) = 16 bytes.
+                        let seq = fp.checked_sub(4)
+                            .filter(|&st| st + 16 <= out.len()
+                                && out[st] == 0x66 && out[st+1] == 0x48
+                                && out[st+2] == 0x8d && out[st+3] == 0x3d
+                                && out[fp+4] == 0x66 && out[fp+5] == 0x66
+                                && out[fp+6] == 0x48 && out[fp+7] == 0xe8);
+                        let Some(st) = seq else {
+                            return Err(format!(
+                                "TLSGD relaxation failed: unrecognized code sequence for '{}' in {}",
+                                sym.name, objects[obj_idx].source_name));
+                        };
+                        let is_dyn_tls = globals_snap.get(&sym.name)
+                            .map(|g| g.is_dynamic).unwrap_or(false);
+                        if !is_dyn_tls {
+                            // GD -> LE:  mov %fs:0,%rax ; lea tpoff(%rax),%rax
+                            let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                            out[st..st+9].copy_from_slice(&[0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
+                            out[st+9] = 0x48; out[st+10] = 0x8d; out[st+11] = 0x80;
+                            w32(&mut out, st+12, tpoff as u32);
+                        } else {
+                            // GD -> IE:  mov %fs:0,%rax ; add got(%rip),%rax
+                            // Requires a GOT slot with an R_X86_64_TPOFF64 dynamic
+                            // relocation (created by the got_entries scan).
+                            let gi = globals_snap.get(&sym.name).and_then(|g| g.got_idx);
+                            let Some(gi) = gi else {
+                                return Err(format!(
+                                    "TLSGD->IE: no GOT entry for dynamic TLS symbol '{}'",
+                                    sym.name));
+                            };
+                            let nb = got_slot_ordinal[gi];
+                            let gea = got_addr + nb as u64 * 8;
+                            let seq_addr = sa + sec_off + rela.offset - 4;
+                            out[st..st+9].copy_from_slice(&[0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
+                            out[st+9] = 0x48; out[st+10] = 0x03; out[st+11] = 0x05;
+                            w32(&mut out, st+12, (gea as i64 - (seq_addr as i64 + 16)) as u32);
+                        }
+                        tls_consumed.push((fp + 4, fp + 12));
+                    }
+                    R_X86_64_TLSLD => {
+                        // Local-Dynamic TLS in an executable -> LE. Sequence:
+                        //   48 8d 3d <disp32>    lea sym@tlsld(%rip),%rdi
+                        //   e8 <disp32>          call __tls_get_addr
+                        // spans [fp-3, fp+9) = 12 bytes. Replaced by a 12-byte
+                        //   66 66 66 64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax
+                        // after which DTPOFF32 values are TP-relative.
+                        let seq = fp.checked_sub(3)
+                            .filter(|&st| st + 12 <= out.len()
+                                && out[st] == 0x48 && out[st+1] == 0x8d && out[st+2] == 0x3d
+                                && out[fp+4] == 0xe8);
+                        let Some(st) = seq else {
+                            return Err(format!(
+                                "TLSLD relaxation failed: unrecognized code sequence in {}",
+                                objects[obj_idx].source_name));
+                        };
+                        out[st..st+12].copy_from_slice(
+                            &[0x66,0x66,0x66,0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
+                        tls_consumed.push((fp + 4, fp + 9));
+                    }
+                    R_X86_64_DTPOFF32 => {
+                        // After LD->LE relaxation %rax holds TP, so DTPOFF becomes
+                        // a TP-relative offset (same formula as TPOFF32).
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        w32(&mut out, fp, (tpoff + a) as u32);
+                    }
+                    R_X86_64_DTPOFF64 => {
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        w64(&mut out, fp, (tpoff + a) as u64);
+                    }
+                    R_X86_64_GOTPC32_TLSDESC => {
+                        // TLSDESC -> LE relaxation:
+                        //   48 8d 05 <disp32>  lea sym@tlsdesc(%rip),%rax
+                        // becomes
+                        //   48 c7 c0 <tpoff32> mov $tpoff,%rax
+                        if fp >= 3 && out[fp-3] == 0x48 && out[fp-2] == 0x8d && out[fp-1] == 0x05 {
+                            let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                            out[fp-2] = 0xc7; out[fp-1] = 0xc0;
+                            w32(&mut out, fp, tpoff as u32);
+                        } else {
+                            return Err(format!(
+                                "TLSDESC relaxation failed: unrecognized sequence for '{}'",
+                                sym.name));
+                        }
+                    }
+                    R_X86_64_TLSDESC_CALL => {
+                        // call *(%rax) [ff 10] -> xchg %ax,%ax [66 90] after LE relax
+                        if fp + 2 <= out.len() && out[fp] == 0xff && out[fp+1] == 0x10 {
+                            out[fp] = 0x66; out[fp+1] = 0x90;
+                        }
+                    }
                     R_X86_64_NONE => {}
                     other => {
                         return Err(format!(
@@ -1220,7 +1405,7 @@ pub(super) fn emit_executable(
         ".interp", ".gnu.hash", ".dynsym", ".dynstr",
         ".gnu.version", ".gnu.version_r",
         ".rela.dyn", ".rela.plt", ".plt", ".dynamic",
-        ".got", ".got.plt", ".init_array", ".fini_array",
+        ".got", ".got.plt", ".init_array", ".fini_array", ".preinit_array",
         ".tdata", ".tbss", ".bss", ".shstrtab",
         ".iplt", ".rela.iplt",
         ".symtab", ".strtab",
@@ -1264,7 +1449,7 @@ pub(super) fn emit_executable(
     // Merged output sections (non-BSS, non-TLS, non-init/fini)
     for sec in output_sections.iter() {
         if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-           && sec.name != ".init_array" && sec.name != ".fini_array" {
+           && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" {
             sh_count += 1;
         }
     }
@@ -1277,6 +1462,7 @@ pub(super) fn emit_executable(
     }
     if has_init_array { sh_count += 1; }
     if has_fini_array { sh_count += 1; }
+    if has_preinit_array { sh_count += 1; }
     if !is_static { sh_count += 1; } // .dynamic
     if got_size > 0 { sh_count += 1; } // .got (needed for static too: TLS, GOTPCREL)
     if !is_static { sh_count += 1; } // .got.plt
@@ -1355,7 +1541,7 @@ pub(super) fn emit_executable(
     // Merged output sections (text/rodata/data, excluding BSS/TLS/init_array/fini_array)
     for sec in output_sections.iter() {
         if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-           && sec.name != ".init_array" && sec.name != ".fini_array" {
+           && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" {
             write_shdr(&mut out, get_shname(&sec.name), sec.sh_type, sec.flags,
                        sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
         }
@@ -1386,6 +1572,13 @@ pub(super) fn emit_executable(
         if let Some(fa_sec) = output_sections.iter().find(|s| s.name == ".fini_array") {
             write_shdr(&mut out, get_shname(".fini_array"), SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE,
                        fini_array_addr, fa_sec.file_offset, fini_array_size, 0, 0, 8, 8);
+        }
+    }
+    // .preinit_array
+    if has_preinit_array {
+        if let Some(pa_sec) = output_sections.iter().find(|s| s.name == ".preinit_array") {
+            write_shdr(&mut out, get_shname(".preinit_array"), SHT_PREINIT_ARRAY, SHF_ALLOC | SHF_WRITE,
+                       preinit_array_addr, pa_sec.file_offset, preinit_array_size, 0, 0, 8, 8);
         }
     }
     if !is_static {
