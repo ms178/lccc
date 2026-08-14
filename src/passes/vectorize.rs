@@ -85,12 +85,15 @@ use crate::ir::ops::{IrBinOp, IrCmpOp};
 use crate::ir::reexports::{IrConst, IrFunction};
 use crate::passes::loop_analysis;
 
-/// Per-loop rejection reason for the "why was this not vectorized" diagnostic
-/// (project goal §57). The analysis functions record the most specific reason
-/// they bail out with; `vectorize_with_analysis` prints it when either
-/// `LCCC_DEBUG_VECTORIZE=1` (full trace) or `LCCC_WHY_NOT_VECTORIZE=1`
-/// (one-line-per-loop summary) is set. Purely diagnostic — never changes
-/// codegen.
+// Per-loop rejection reason for the "why was this not vectorized" diagnostic
+// (project goal §57). The analysis functions record the most specific reason
+// they bail out with; `vectorize_with_analysis` prints it when either
+// `LCCC_DEBUG_VECTORIZE=1` (full trace) or `LCCC_WHY_NOT_VECTORIZE=1`
+// (one-line-per-loop summary) is set. Purely diagnostic — never changes
+// codegen.
+//
+// A `///` doc comment cannot attach to a `thread_local!` invocation (the macro
+// expands to items the comment never reaches), so this is a plain comment.
 thread_local! {
     static REJECT_REASON: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
 }

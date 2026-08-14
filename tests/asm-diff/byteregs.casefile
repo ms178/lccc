@@ -1,0 +1,651 @@
+;;; movb_imm_all_byte_regs
+.text
+movb $0, %al
+movb $0, %cl
+movb $0, %dl
+movb $0, %bl
+movb $0, %spl
+movb $0, %bpl
+movb $0, %sil
+movb $0, %dil
+movb $0, %r8b
+movb $0, %r9b
+movb $0, %r10b
+movb $0, %r11b
+movb $0, %r12b
+movb $0, %r13b
+movb $0, %r14b
+movb $0, %r15b
+movb $0, %ah
+movb $0, %ch
+movb $0, %dh
+movb $0, %bh
+movb $1, %al
+movb $1, %cl
+movb $1, %dl
+movb $1, %bl
+movb $1, %spl
+movb $1, %bpl
+movb $1, %sil
+movb $1, %dil
+movb $1, %r8b
+movb $1, %r9b
+movb $1, %r10b
+movb $1, %r11b
+movb $1, %r12b
+movb $1, %r13b
+movb $1, %r14b
+movb $1, %r15b
+movb $1, %ah
+movb $1, %ch
+movb $1, %dh
+movb $1, %bh
+movb $80, %al
+movb $80, %cl
+movb $80, %dl
+movb $80, %bl
+movb $80, %spl
+movb $80, %bpl
+movb $80, %sil
+movb $80, %dil
+movb $80, %r8b
+movb $80, %r9b
+movb $80, %r10b
+movb $80, %r11b
+movb $80, %r12b
+movb $80, %r13b
+movb $80, %r14b
+movb $80, %r15b
+movb $80, %ah
+movb $80, %ch
+movb $80, %dh
+movb $80, %bh
+movb $127, %al
+movb $127, %cl
+movb $127, %dl
+movb $127, %bl
+movb $127, %spl
+movb $127, %bpl
+movb $127, %sil
+movb $127, %dil
+movb $127, %r8b
+movb $127, %r9b
+movb $127, %r10b
+movb $127, %r11b
+movb $127, %r12b
+movb $127, %r13b
+movb $127, %r14b
+movb $127, %r15b
+movb $127, %ah
+movb $127, %ch
+movb $127, %dh
+movb $127, %bh
+movb $-1, %al
+movb $-1, %cl
+movb $-1, %dl
+movb $-1, %bl
+movb $-1, %spl
+movb $-1, %bpl
+movb $-1, %sil
+movb $-1, %dil
+movb $-1, %r8b
+movb $-1, %r9b
+movb $-1, %r10b
+movb $-1, %r11b
+movb $-1, %r12b
+movb $-1, %r13b
+movb $-1, %r14b
+movb $-1, %r15b
+movb $-1, %ah
+movb $-1, %ch
+movb $-1, %dh
+movb $-1, %bh
+movb $255, %al
+movb $255, %cl
+movb $255, %dl
+movb $255, %bl
+movb $255, %spl
+movb $255, %bpl
+movb $255, %sil
+movb $255, %dil
+movb $255, %r8b
+movb $255, %r9b
+movb $255, %r10b
+movb $255, %r11b
+movb $255, %r12b
+movb $255, %r13b
+movb $255, %r14b
+movb $255, %r15b
+movb $255, %ah
+movb $255, %ch
+movb $255, %dh
+movb $255, %bh
+movb $0x50, %al
+movb $0x50, %cl
+movb $0x50, %dl
+movb $0x50, %bl
+movb $0x50, %spl
+movb $0x50, %bpl
+movb $0x50, %sil
+movb $0x50, %dil
+movb $0x50, %r8b
+movb $0x50, %r9b
+movb $0x50, %r10b
+movb $0x50, %r11b
+movb $0x50, %r12b
+movb $0x50, %r13b
+movb $0x50, %r14b
+movb $0x50, %r15b
+movb $0x50, %ah
+movb $0x50, %ch
+movb $0x50, %dh
+movb $0x50, %bh
+
+;;; movb_imm_mem_and_mixed
+.text
+movb $0, (%rax)
+movb $0, 8(%rdx)
+movb $0, (%r13)
+movb $0, -1(%r12)
+movb $0, (%rbp)
+movb $0, (%rsp)
+movb $0, 16(%rsp)
+movb $80, (%rax)
+movb $80, 8(%rdx)
+movb $80, (%r13)
+movb $80, -1(%r12)
+movb $80, (%rbp)
+movb $80, (%rsp)
+movb $80, 16(%rsp)
+movb $-1, (%rax)
+movb $-1, 8(%rdx)
+movb $-1, (%r13)
+movb $-1, -1(%r12)
+movb $-1, (%rbp)
+movb $-1, (%rsp)
+movb $-1, 16(%rsp)
+
+;;; byte_reg_alu_rex8
+.text
+addb %spl, %al
+addb %spl, %dil
+addb %spl, %sil
+addb %spl, %r8b
+addb %spl, %bpl
+addb %spl, (%rcx)
+addb (%rcx), %spl
+addb %bpl, %al
+addb %bpl, %dil
+addb %bpl, %sil
+addb %bpl, %r8b
+addb %bpl, %bpl
+addb %bpl, (%rcx)
+addb (%rcx), %bpl
+addb %sil, %al
+addb %sil, %dil
+addb %sil, %sil
+addb %sil, %r8b
+addb %sil, %bpl
+addb %sil, (%rcx)
+addb (%rcx), %sil
+addb %dil, %al
+addb %dil, %dil
+addb %dil, %sil
+addb %dil, %r8b
+addb %dil, %bpl
+addb %dil, (%rcx)
+addb (%rcx), %dil
+addb $7, %spl
+addb $7, %bpl
+addb $7, %sil
+addb $7, %dil
+subb %spl, %al
+subb %spl, %dil
+subb %spl, %sil
+subb %spl, %r8b
+subb %spl, %bpl
+subb %spl, (%rcx)
+subb (%rcx), %spl
+subb %bpl, %al
+subb %bpl, %dil
+subb %bpl, %sil
+subb %bpl, %r8b
+subb %bpl, %bpl
+subb %bpl, (%rcx)
+subb (%rcx), %bpl
+subb %sil, %al
+subb %sil, %dil
+subb %sil, %sil
+subb %sil, %r8b
+subb %sil, %bpl
+subb %sil, (%rcx)
+subb (%rcx), %sil
+subb %dil, %al
+subb %dil, %dil
+subb %dil, %sil
+subb %dil, %r8b
+subb %dil, %bpl
+subb %dil, (%rcx)
+subb (%rcx), %dil
+subb $7, %spl
+subb $7, %bpl
+subb $7, %sil
+subb $7, %dil
+andb %spl, %al
+andb %spl, %dil
+andb %spl, %sil
+andb %spl, %r8b
+andb %spl, %bpl
+andb %spl, (%rcx)
+andb (%rcx), %spl
+andb %bpl, %al
+andb %bpl, %dil
+andb %bpl, %sil
+andb %bpl, %r8b
+andb %bpl, %bpl
+andb %bpl, (%rcx)
+andb (%rcx), %bpl
+andb %sil, %al
+andb %sil, %dil
+andb %sil, %sil
+andb %sil, %r8b
+andb %sil, %bpl
+andb %sil, (%rcx)
+andb (%rcx), %sil
+andb %dil, %al
+andb %dil, %dil
+andb %dil, %sil
+andb %dil, %r8b
+andb %dil, %bpl
+andb %dil, (%rcx)
+andb (%rcx), %dil
+andb $7, %spl
+andb $7, %bpl
+andb $7, %sil
+andb $7, %dil
+orb %spl, %al
+orb %spl, %dil
+orb %spl, %sil
+orb %spl, %r8b
+orb %spl, %bpl
+orb %spl, (%rcx)
+orb (%rcx), %spl
+orb %bpl, %al
+orb %bpl, %dil
+orb %bpl, %sil
+orb %bpl, %r8b
+orb %bpl, %bpl
+orb %bpl, (%rcx)
+orb (%rcx), %bpl
+orb %sil, %al
+orb %sil, %dil
+orb %sil, %sil
+orb %sil, %r8b
+orb %sil, %bpl
+orb %sil, (%rcx)
+orb (%rcx), %sil
+orb %dil, %al
+orb %dil, %dil
+orb %dil, %sil
+orb %dil, %r8b
+orb %dil, %bpl
+orb %dil, (%rcx)
+orb (%rcx), %dil
+orb $7, %spl
+orb $7, %bpl
+orb $7, %sil
+orb $7, %dil
+xorb %spl, %al
+xorb %spl, %dil
+xorb %spl, %sil
+xorb %spl, %r8b
+xorb %spl, %bpl
+xorb %spl, (%rcx)
+xorb (%rcx), %spl
+xorb %bpl, %al
+xorb %bpl, %dil
+xorb %bpl, %sil
+xorb %bpl, %r8b
+xorb %bpl, %bpl
+xorb %bpl, (%rcx)
+xorb (%rcx), %bpl
+xorb %sil, %al
+xorb %sil, %dil
+xorb %sil, %sil
+xorb %sil, %r8b
+xorb %sil, %bpl
+xorb %sil, (%rcx)
+xorb (%rcx), %sil
+xorb %dil, %al
+xorb %dil, %dil
+xorb %dil, %sil
+xorb %dil, %r8b
+xorb %dil, %bpl
+xorb %dil, (%rcx)
+xorb (%rcx), %dil
+xorb $7, %spl
+xorb $7, %bpl
+xorb $7, %sil
+xorb $7, %dil
+cmpb %spl, %al
+cmpb %spl, %dil
+cmpb %spl, %sil
+cmpb %spl, %r8b
+cmpb %spl, %bpl
+cmpb %spl, (%rcx)
+cmpb (%rcx), %spl
+cmpb %bpl, %al
+cmpb %bpl, %dil
+cmpb %bpl, %sil
+cmpb %bpl, %r8b
+cmpb %bpl, %bpl
+cmpb %bpl, (%rcx)
+cmpb (%rcx), %bpl
+cmpb %sil, %al
+cmpb %sil, %dil
+cmpb %sil, %sil
+cmpb %sil, %r8b
+cmpb %sil, %bpl
+cmpb %sil, (%rcx)
+cmpb (%rcx), %sil
+cmpb %dil, %al
+cmpb %dil, %dil
+cmpb %dil, %sil
+cmpb %dil, %r8b
+cmpb %dil, %bpl
+cmpb %dil, (%rcx)
+cmpb (%rcx), %dil
+cmpb $7, %spl
+cmpb $7, %bpl
+cmpb $7, %sil
+cmpb $7, %dil
+adcb %spl, %al
+adcb %spl, %dil
+adcb %spl, %sil
+adcb %spl, %r8b
+adcb %spl, %bpl
+adcb %spl, (%rcx)
+adcb (%rcx), %spl
+adcb %bpl, %al
+adcb %bpl, %dil
+adcb %bpl, %sil
+adcb %bpl, %r8b
+adcb %bpl, %bpl
+adcb %bpl, (%rcx)
+adcb (%rcx), %bpl
+adcb %sil, %al
+adcb %sil, %dil
+adcb %sil, %sil
+adcb %sil, %r8b
+adcb %sil, %bpl
+adcb %sil, (%rcx)
+adcb (%rcx), %sil
+adcb %dil, %al
+adcb %dil, %dil
+adcb %dil, %sil
+adcb %dil, %r8b
+adcb %dil, %bpl
+adcb %dil, (%rcx)
+adcb (%rcx), %dil
+adcb $7, %spl
+adcb $7, %bpl
+adcb $7, %sil
+adcb $7, %dil
+sbbb %spl, %al
+sbbb %spl, %dil
+sbbb %spl, %sil
+sbbb %spl, %r8b
+sbbb %spl, %bpl
+sbbb %spl, (%rcx)
+sbbb (%rcx), %spl
+sbbb %bpl, %al
+sbbb %bpl, %dil
+sbbb %bpl, %sil
+sbbb %bpl, %r8b
+sbbb %bpl, %bpl
+sbbb %bpl, (%rcx)
+sbbb (%rcx), %bpl
+sbbb %sil, %al
+sbbb %sil, %dil
+sbbb %sil, %sil
+sbbb %sil, %r8b
+sbbb %sil, %bpl
+sbbb %sil, (%rcx)
+sbbb (%rcx), %sil
+sbbb %dil, %al
+sbbb %dil, %dil
+sbbb %dil, %sil
+sbbb %dil, %r8b
+sbbb %dil, %bpl
+sbbb %dil, (%rcx)
+sbbb (%rcx), %dil
+sbbb $7, %spl
+sbbb $7, %bpl
+sbbb $7, %sil
+sbbb $7, %dil
+testb %spl, %al
+testb %spl, %dil
+testb %spl, %sil
+testb %spl, %r8b
+testb %spl, %bpl
+testb %spl, (%rcx)
+testb (%rcx), %spl
+testb %bpl, %al
+testb %bpl, %dil
+testb %bpl, %sil
+testb %bpl, %r8b
+testb %bpl, %bpl
+testb %bpl, (%rcx)
+testb (%rcx), %bpl
+testb %sil, %al
+testb %sil, %dil
+testb %sil, %sil
+testb %sil, %r8b
+testb %sil, %bpl
+testb %sil, (%rcx)
+testb (%rcx), %sil
+testb %dil, %al
+testb %dil, %dil
+testb %dil, %sil
+testb %dil, %r8b
+testb %dil, %bpl
+testb %dil, (%rcx)
+testb (%rcx), %dil
+movb %spl, %al
+movb %spl, %dil
+movb %spl, %sil
+movb %spl, %r8b
+movb %spl, %bpl
+movb %spl, (%rcx)
+movb (%rcx), %spl
+movb %bpl, %al
+movb %bpl, %dil
+movb %bpl, %sil
+movb %bpl, %r8b
+movb %bpl, %bpl
+movb %bpl, (%rcx)
+movb (%rcx), %bpl
+movb %sil, %al
+movb %sil, %dil
+movb %sil, %sil
+movb %sil, %r8b
+movb %sil, %bpl
+movb %sil, (%rcx)
+movb (%rcx), %sil
+movb %dil, %al
+movb %dil, %dil
+movb %dil, %sil
+movb %dil, %r8b
+movb %dil, %bpl
+movb %dil, (%rcx)
+movb (%rcx), %dil
+movb $7, %spl
+movb $7, %bpl
+movb $7, %sil
+movb $7, %dil
+
+;;; byte_reg_unary_rex8
+.text
+incb %spl
+incb %bpl
+incb %sil
+incb %dil
+decb %spl
+decb %bpl
+decb %sil
+decb %dil
+negb %spl
+negb %bpl
+negb %sil
+negb %dil
+notb %spl
+notb %bpl
+notb %sil
+notb %dil
+mulb %spl
+mulb %bpl
+mulb %sil
+mulb %dil
+imulb %spl
+imulb %bpl
+imulb %sil
+imulb %dil
+divb %spl
+divb %bpl
+divb %sil
+divb %dil
+idivb %spl
+idivb %bpl
+idivb %sil
+idivb %dil
+shlb $1, %spl
+shlb %cl, %spl
+shlb $1, %bpl
+shlb %cl, %bpl
+shlb $1, %sil
+shlb %cl, %sil
+shlb $1, %dil
+shlb %cl, %dil
+shrb $1, %spl
+shrb %cl, %spl
+shrb $1, %bpl
+shrb %cl, %bpl
+shrb $1, %sil
+shrb %cl, %sil
+shrb $1, %dil
+shrb %cl, %dil
+sarb $1, %spl
+sarb %cl, %spl
+sarb $1, %bpl
+sarb %cl, %bpl
+sarb $1, %sil
+sarb %cl, %sil
+sarb $1, %dil
+sarb %cl, %dil
+rolb $1, %spl
+rolb %cl, %spl
+rolb $1, %bpl
+rolb %cl, %bpl
+rolb $1, %sil
+rolb %cl, %sil
+rolb $1, %dil
+rolb %cl, %dil
+rorb $1, %spl
+rorb %cl, %spl
+rorb $1, %bpl
+rorb %cl, %bpl
+rorb $1, %sil
+rorb %cl, %sil
+rorb $1, %dil
+rorb %cl, %dil
+
+;;; byte_reg_setcc_movx_rex8
+.text
+sete %spl
+sete %bpl
+sete %sil
+sete %dil
+sete (%rdi)
+setne %spl
+setne %bpl
+setne %sil
+setne %dil
+setne (%rdi)
+setl %spl
+setl %bpl
+setl %sil
+setl %dil
+setl (%rdi)
+setge %spl
+setge %bpl
+setge %sil
+setge %dil
+setge (%rdi)
+seta %spl
+seta %bpl
+seta %sil
+seta %dil
+seta (%rdi)
+setbe %spl
+setbe %bpl
+setbe %sil
+setbe %dil
+setbe (%rdi)
+sets %spl
+sets %bpl
+sets %sil
+sets %dil
+sets (%rdi)
+seto %spl
+seto %bpl
+seto %sil
+seto %dil
+seto (%rdi)
+movzbl %spl, %eax
+movsbl %spl, %eax
+movzbl %spl, %edi
+movsbl %spl, %edi
+movzbl %spl, %r8d
+movsbl %spl, %r8d
+movzbq %spl, %rax
+movsbq %spl, %rax
+movzbq %spl, %rdi
+movsbq %spl, %rdi
+movzbl %bpl, %eax
+movsbl %bpl, %eax
+movzbl %bpl, %edi
+movsbl %bpl, %edi
+movzbl %bpl, %r8d
+movsbl %bpl, %r8d
+movzbq %bpl, %rax
+movsbq %bpl, %rax
+movzbq %bpl, %rdi
+movsbq %bpl, %rdi
+movzbl %sil, %eax
+movsbl %sil, %eax
+movzbl %sil, %edi
+movsbl %sil, %edi
+movzbl %sil, %r8d
+movsbl %sil, %r8d
+movzbq %sil, %rax
+movsbq %sil, %rax
+movzbq %sil, %rdi
+movsbq %sil, %rdi
+movzbl %dil, %eax
+movsbl %dil, %eax
+movzbl %dil, %edi
+movsbl %dil, %edi
+movzbl %dil, %r8d
+movsbl %dil, %r8d
+movzbq %dil, %rax
+movsbq %dil, %rax
+movzbq %dil, %rdi
+movsbq %dil, %rdi
+xchgb %spl, %sil
+xchgb %spl, %al
+xchgb %bpl, %sil
+xchgb %bpl, %al
+xchgb %sil, %sil
+xchgb %sil, %al
+xchgb %dil, %sil
+xchgb %dil, %al

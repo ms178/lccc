@@ -141,8 +141,18 @@ impl super::InstructionEncoder {
                 } else {
                     // 8-bit: B0+r8 ib is 2 bytes (vs 3 for C6 /0) for
                     // AL/CL/DL/BL; with REX it matches C6 length. Matches GAS.
-                    if needs_rex_ext(&dst.name) {
-                        self.bytes.push(self.rex(false, false, false, true));
+                    //
+                    // %spl/%bpl/%sil/%dil encode as 4..7 -- the SAME numbers as
+                    // %ah/%ch/%dh/%bh -- and are only reachable when a REX
+                    // prefix is present. Emitting B0+r without REX therefore
+                    // silently assembles `movb $imm, %dil` as `movb $imm, %bh`,
+                    // writing bits 8-15 of RBX. That corrupted a live pointer
+                    // (`lea 0x54(%rsp),%rbx; mov $0x50,%bh; mov %dil,(%rbx)`)
+                    // and made struct_copy SIGSEGV intermittently at -O0.
+                    // needs_rex_ext alone only covers r8b-r15b, so the
+                    // mandatory-REX set must be tested as well.
+                    if needs_rex_ext(&dst.name) || is_rex_required_8bit(&dst.name) {
+                        self.bytes.push(self.rex(false, false, false, needs_rex_ext(&dst.name)));
                         self.bytes.push(0xB0 + (dst_num & 7));
                     } else {
                         self.bytes.push(0xB0 + (dst_num & 7));
@@ -737,6 +747,23 @@ impl super::InstructionEncoder {
                 self.emit_rex_rm(size, &src.name, mem);
                 self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
                 self.encode_modrm_mem(src_num, mem)
+            }
+            // test mem, %reg -- the AT&T source/destination order reversed.
+            //
+            // TEST has no 8A/8B-style "load" direction: only 84 /r and 85 /r
+            // exist, both with the register in ModRM.reg and the memory operand
+            // in r/m. TEST is also symmetric (it discards the AND result and
+            // only sets flags), so GNU as encodes `testb (%rcx), %dil` and
+            // `testb %dil, (%rcx)` to the exact same bytes -- verified against
+            // GAS 2.47 for all four operand sizes. Without this arm the valid
+            // memory-source form was rejected outright.
+            (Operand::Memory(mem), Operand::Register(reg)) => {
+                let reg_n = reg_num(&reg.name).ok_or("bad register")?;
+                self.emit_segment_prefix(mem)?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_rm(size, &reg.name, mem);
+                self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
+                self.encode_modrm_mem(reg_n, mem)
             }
             // test $imm, mem
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {

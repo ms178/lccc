@@ -1,0 +1,1 @@
+vpbroadcast GPR-source lowering must load through a 64-bit register (movq %r8,%eax is unencodable; broke zlib-ng slide_hash_avx2)

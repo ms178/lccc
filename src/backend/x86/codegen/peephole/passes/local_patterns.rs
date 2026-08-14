@@ -1171,6 +1171,146 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
     false
 }
 
+/// Fold `leaq (%base,%index[,scale]), %tmp` into EVERY memory operand that
+/// uses `(%tmp)` within the same basic block, then delete the LEA.
+///
+/// `fold_lea_into_memory_op` only rewrites the IMMEDIATELY following
+/// instruction and only when the temporary dies at that single use. Vectorized
+/// inner loops break both assumptions at once. matmul's kernel is
+///
+///     leaq (%r8,%r10), %r11
+///     leaq (%rsi,%r10), %r13          <- next insn is another LEA
+///     vmovupd (%r13), %ymm0           <- %r13 used here ...
+///     vfmadd231pd (%r11), %ymm1, %ymm0
+///     vmovupd %ymm0, (%r13)           <- ... and again here
+///
+/// so neither LEA folds and the loop pays two address computations plus two
+/// registers per iteration. x86 addresses the whole thing for free in the SIB
+/// byte, which is what ICX emits (`vfmadd213pd ymm1, ymm0, [rax+8*r8-64]`).
+///
+/// Soundness requirements, all enforced below:
+///   * scan stops at the first barrier — folding across a branch would move an
+///     address computation onto a path that never executed it;
+///   * every intervening instruction must leave BOTH base and index untouched,
+///     otherwise the folded operand would read different registers than the
+///     LEA did (this is the check the older pass gets for free by only ever
+///     looking at the very next line);
+///   * `%tmp` must be dead after the last rewritten use, and must not be read
+///     in any form the rewrite does not cover (a bare `(%tmp)` is the only
+///     shape matched; `8(%tmp)` and plain register reads block the fold);
+///   * `%tmp` must differ from base and index, or deleting the LEA would
+///     change the value the folded operand reads.
+pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        let lea = infos[i].trimmed(store.get(i));
+        if !lea.starts_with("leaq ") { i += 1; continue; }
+
+        let Some((addr_text, dst_text)) = lea[5..].rsplit_once(',') else { i += 1; continue };
+        let (addr_text, dst_text) = (addr_text.trim(), dst_text.trim());
+        if !dst_text.starts_with('%') { i += 1; continue; }
+        let dst_family = register_family_fast(dst_text);
+        if dst_family == REG_NONE || dst_family > REG_GP_MAX { i += 1; continue; }
+
+        let (Some(open), Some(close)) = (addr_text.find('('), addr_text.rfind(')')) else {
+            i += 1; continue;
+        };
+        if close <= open || close + 1 != addr_text.len() { i += 1; continue; }
+        let displacement = addr_text[..open].trim();
+        let fields: Vec<&str> = addr_text[open + 1..close].split(',').map(str::trim).collect();
+        // Only the two- and three-field SIB forms; the single-base form is
+        // already handled (and folding it here would duplicate that work).
+        if fields.len() < 2 || fields.len() > 3 { i += 1; continue; }
+        if fields.iter().any(|f| !f.starts_with('%')) { i += 1; continue; }
+        if fields.len() == 3 && !matches!(fields[2], "1" | "2" | "4" | "8") { i += 1; continue; }
+
+        let base_family = register_family_fast(fields[0]);
+        let index_family = register_family_fast(fields[1]);
+        if base_family == REG_NONE || index_family == REG_NONE
+            || base_family > REG_GP_MAX || index_family > REG_GP_MAX
+            || dst_family == base_family || dst_family == index_family
+        { i += 1; continue; }
+
+        let sib = if fields.len() == 3 {
+            format!("{}({},{},{})", displacement, fields[0], fields[1], fields[2])
+        } else {
+            format!("{}({},{})", displacement, fields[0], fields[1])
+        };
+        let addr_pat = format!("({})", dst_text);
+        let dst64 = REG_NAMES[0][dst_family as usize];
+        let dst32 = REG_NAMES[1][dst_family as usize];
+        let base_mask = 1u16 << base_family;
+        let index_mask = 1u16 << index_family;
+        let dst_mask = 1u16 << dst_family;
+
+        // Collect every rewritable use up to the end of the block.
+        let mut uses: Vec<usize> = Vec::new();
+        let mut ok = true;
+        let mut n = i + 1;
+        while n < len {
+            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_barrier() { break; }
+            let t = infos[n].trimmed(store.get(n));
+
+            // Base or index redefined => the LEA's value is no longer
+            // reproducible from them; stop (uses collected so far are still
+            // valid only if we fold nothing after this point).
+            let writes = get_dest_reg(&infos[n]);
+            if writes == base_family || writes == index_family { break; }
+
+            if infos[n].reg_refs & dst_mask != 0 {
+                // A bare `(%tmp)` operand is rewritable. Anything else that
+                // mentions the register (displacement form, plain read, or a
+                // write) is not, so the LEA has to stay.
+                let bare = t.match_indices(&addr_pat).any(|(pos, _)| {
+                    pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
+                });
+                let mentions = t.contains(&format!("%{}", dst64))
+                    || t.contains(&format!("%{}", dst32));
+                if bare {
+                    // Reject a line that ALSO uses %tmp in a non-bare position.
+                    let stripped = t.replace(&addr_pat, "");
+                    if stripped.contains(&format!("%{}", dst64))
+                        || stripped.contains(&format!("%{}", dst32))
+                    { ok = false; break; }
+                    uses.push(n);
+                } else if mentions {
+                    // A pure redefinition of %tmp ends its live range cleanly:
+                    // everything after belongs to a different value.
+                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())]
+                        .contains(&format!("%{}", dst64)) { break; }
+                    ok = false; break;
+                }
+            }
+            let _ = (base_mask, index_mask);
+            n += 1;
+        }
+
+        // Need at least two rewritable uses to beat the existing single-use
+        // pass; with one use that pass already fires (and is better tested).
+        if !ok || uses.len() < 2 { i += 1; continue; }
+        // %tmp must be dead after the block region we rewrote.
+        if fam_read_after(store, infos, n, dst_family) { i += 1; continue; }
+
+        for &u in &uses {
+            let t = infos[u].trimmed(store.get(u));
+            let replacement = t.replacen(&addr_pat, &sib, 1);
+            if replacement == t { ok = false; break; }
+            replace_line(store, &mut infos[u], u, format!("    {}", replacement));
+        }
+        if ok {
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
 pub(super) fn fold_base_index_addressing(
     store: &mut LineStore,
     infos: &mut [LineInfo],
