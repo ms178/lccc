@@ -1,4 +1,4 @@
-/* v4 regression: string library ops — the hot paths in gzip/expat/zlib
+/* string library ops — the hot paths in gzip/expat/zlib
  * (strcmp/strlen/strcpy/strchr/memchr on edge cases). */
 #include <stdio.h>
 #include <string.h>

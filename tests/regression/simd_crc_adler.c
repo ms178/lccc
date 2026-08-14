@@ -1,4 +1,4 @@
-/* v4 regression: CRC32 (pclmulqdq fold + braid) and Adler32 (SSE2/AVX2)
+/* CRC32 (pclmulqdq fold + braid) and Adler32 (SSE2/AVX2)
  * against scalar reference implementations. This is the exact bug class that
  * a v4 vector-cache experiment regressed (crc32 returned 0xffffffff); the
  * test must stay byte-exact across compiler changes. */

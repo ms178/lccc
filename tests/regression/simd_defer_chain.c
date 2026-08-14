@@ -1,4 +1,4 @@
-/* v5 regression: deferred single-use vector stores (accumulator renaming).
+/* deferred single-use vector stores (accumulator renaming).
  * Chains where each fresh result is consumed by the immediately-following
  * intrinsic (as args[0] AND as args[1]) must produce exact results — the
  * store->reload round trip is eliminated, so any stale-slot read shows up

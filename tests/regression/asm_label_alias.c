@@ -1,4 +1,4 @@
-/* v4 regression: __asm__("label") linker redirects + alias/weak attributes
+/* __asm__("label") linker redirects + alias/weak attributes
  * (the v1 glibc-configure bug class). Verifies the symbols resolve and the
  * aliased function is callable under both names. */
 #include <stdio.h>

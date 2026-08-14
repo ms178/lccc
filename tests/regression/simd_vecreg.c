@@ -1,4 +1,4 @@
-/* v5 regression: XMM register allocation for vector values.
+/* XMM register allocation for vector values.
  * `t` is a multi-use 128-bit value: the backend may keep it in an XMM
  * register for its whole live range (CCC_ENABLE_VECREG) or in its slot —
  * both must produce identical, correct results. */

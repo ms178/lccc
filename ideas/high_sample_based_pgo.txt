@@ -5,7 +5,7 @@ Priority: HIGH
 Problem
 -------
 The current PGO is instrumentation-based. Two real limits showed up in the
-v10/v11 audit:
+performance audit:
 
 1. A function that is *fully inlined in the training build* has no profile
    entry, so at use time it looks "cold/absent" and the PGO inliner cannot see

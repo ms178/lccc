@@ -1,4 +1,4 @@
-/* v4 regression: constant-size __builtin_memcpy/memmove inlining (v3 fix)
+/* constant-size __builtin_memcpy/memmove inlining
  * — exact copies at 1,2,4,8,16,24,32 bytes and non-multiple sizes, plus
  * overlapping memmove. */
 #include <stdio.h>

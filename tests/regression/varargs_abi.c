@@ -1,4 +1,4 @@
-/* v4 regression: variadic functions + FP/GP ABI mixing (the classic x86-64
+/* variadic functions + FP/GP ABI mixing (the classic x86-64
  * varargs hazard: %al = number of vector args), plus qsort callback ABI. */
 #include <stdio.h>
 #include <stdlib.h>

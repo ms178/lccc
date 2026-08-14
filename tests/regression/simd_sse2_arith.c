@@ -1,4 +1,4 @@
-/* v4 regression: SSE2 arithmetic intrinsics vs scalar reference.
+/* SSE2 arithmetic intrinsics vs scalar reference.
  * Requires: -msse2 (default on x86-64). Verifies exact lane semantics. */
 #include <immintrin.h>
 #include <stdint.h>

@@ -1,4 +1,4 @@
-/* v5 regression: non-temporal vector stores (Movntdq/Movntpd) correctness and
+/* non-temporal vector stores (Movntdq/Movntpd) correctness and
  * the register-aware loaders feeding them. Also covers _mm_storel_epi64 /
  * _mm_loadl_epi64 (the raw movq helpers). _Alignas(32) guarantees the
  * runtime-aligned slot (>16), which movntdq/movntpd require. */

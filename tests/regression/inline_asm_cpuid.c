@@ -1,4 +1,4 @@
-/* v4 regression: inline asm — cpuid with memory-output operands + matching
+/* inline asm — cpuid with memory-output operands + matching
  * constraints (the v1 bug class: previously wrong slots at -O1+ and SIGSEGV
  * at -O0), plus simple asm blocks with clobbers. */
 #include <stdio.h>

@@ -1,4 +1,4 @@
-/* v4 regression: SSE float ops (ps/pd) vs scalar reference — xor/and/or/add/
+/* SSE float ops (ps/pd) vs scalar reference — xor/and/or/add/
  * sub/mul/div/min/max/sqrt/cmp. The bundled headers implement these via
  * __builtin_memcpy fallbacks; this validates the v3 real-intrinsic lowering. */
 #include <immintrin.h>

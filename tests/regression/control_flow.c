@@ -1,4 +1,4 @@
-/* v4 regression: control flow — loops, switches (incl. ranges), goto,
+/* control flow — loops, switches (incl. ranges), goto,
  * recursion, TCE (tail-call elimination), short-circuit, ternary. */
 #include <stdio.h>
 

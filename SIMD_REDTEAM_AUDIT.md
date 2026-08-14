@@ -248,8 +248,8 @@ GCC reference is a defective oracle**, not lccc bugs (verified per test):
 | glibc_f128_builtins | PASS | cannot compile (no-arg `__builtin_nanf128()`) |
 | glibc_gottpoff | PASS | wrong TLS value (stale `@gottpoff` read) |
 | glibc_x87_forms | PASS | SIGILL (GAS emits invalid x87 encoding) |
-| regr_v2_abs_symbol_value | PASS | wrong value (GNU ld rebases absolute symbols) |
-| regr_v5_clmul256 | PASS | cannot compile (256-bit VPCLMULQDQ gated behind AVX-512) |
+| abs_symbol_value | PASS | wrong value (GNU ld rebases absolute symbols) |
+| clmul256 | PASS | cannot compile (256-bit VPCLMULQDQ gated behind AVX-512) |
 
 Added a `LCCC_NO_COMPARE=1` per-test opt-out via `<name>.env`: the test still
 runs and must pass under lccc, only the invalid GCC diff is skipped.
@@ -558,7 +558,7 @@ Correctness: nbody/spectral_norm/mandelbrot/struct_copy bit-exact vs gcc.
 Correctness: 14 benchmarks bit-exact vs gcc; F32/F64 difftests 0..300 exact;
 zlib-ng adler32 correct.
 
-## v8 — in-allocator producer→consumer register hints (die-at-birth coalescing)
+## In-allocator producer→consumer register hints (die-at-birth coalescing)
 
 Resurrected the linear-scan hint approach, with the liveness interaction fixed
 properly (the earlier attempt miscompiled `energy()` and was reverted).
@@ -602,7 +602,7 @@ zlib_ng_adler32 1.746x).
 25/25 correct, geomean 0.953 vs gcc (v7: 0.951); sqlite_varint + zlib_ng_adler32
 bit-exact. New unit test `test_conflicts_with_die_at_birth`.
 
-## v8 — range-check folding (branch/boolean domain, part 1)
+## Range-check folding (branch/boolean domain, part 1)
 
 `a && b` / `a || b` lower to short-circuit control flow; if-conversion turns
 that into `Select` chains. A new pass (`src/passes/range_check.rs`, runs right
@@ -625,7 +625,7 @@ Measured: expat 3.28x -> 3.13x, hash_table 1.38x -> 1.31x,
 loop_patterns 1.85x -> 1.80x; no regressions; corpus 25/25 correct.
 Differential test (all byte values + INT_MIN/MAX + LLONG edges) bit-exact vs gcc.
 
-## v9 — hint extensions + branchy short-circuit || (branch/boolean, part 2)
+## Hint extensions + branchy short-circuit || (branch/boolean, part 2)
 
 **Producer-follow hints extended** beyond FP BinOp LHS to every instruction
 whose emitter computes into the destination with the operand pre-loaded:
@@ -662,7 +662,7 @@ used only as a condition, emit pure branches instead of a value + phi), plus
 GPR copy/param coalescing for the byte-load `mov %esi,%r15d; mov %r15d,%ebp`
 chains.
 
-## v8 roadmap (remaining)
+## Remaining work (after the folding milestones)
 
 1. **Branch/boolean domain, part 2** (expat still ~3.1x): the range check now
    collapses to one `sub`+`cmp`, but the boolean is still MATERIALIZED
@@ -678,9 +678,9 @@ chains.
 4. nbody's remaining `imulq` are preheader pointer-inits for non-constant IV
    inits (reuse `&bodies[i]+56` for `&bodies[i+1]`).
 
-## v10 — regression tests + FP constant-pool fix + ICC/ICX research
+## Regression tests + FP constant-pool fix + ICC/ICX research
 
-**Pre-existing bug found & fixed** (caught by the new `v8_fp_die_at_birth`
+**Pre-existing bug found & fixed** (caught by the new `fp_die_at_birth`
 test): `emit_fp_const_pool` emitted every FP constant with `.align 8` and
 8 bytes of data, but the Fabs emitter loads these constants with
 `andpd`/`andps`, whose m128 memory operand must be 16-byte aligned. With one
@@ -728,7 +728,7 @@ from an XMM register. (a) is the cleaner fix; the pre-store code to emit
 `movq %xmmN, %xmmM` for `ParamClass::FloatReg` is written and tested in this
 session's working history.
 
-## v10 roadmap (prioritized, informed by ICC/ICX)
+## Prioritized roadmap (informed by ICC/ICX)
 
 1. **GPR copy-chain elimination** (expat 2.89x, sqlite 2.09x). The
    `mov %esi,%r15d; mov %r15d,%ebp` chains are the single biggest remaining
@@ -746,7 +746,7 @@ session's working history.
    per-iteration slot copies (loop-carried accumulator in registers).
 5. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
 
-## v11 — ICC/ICX distills delivered (narrowing, byte compares, FP-param XMM)
+## ICC/ICX distills delivered (narrowing, byte compares, FP-param XMM)
 
 Three of the five v10 roadmap items are now implemented and measured; the FP-
 parameter work is done properly (not backed down).
@@ -788,11 +788,11 @@ boolean after each fused range check.
 Measured (pinned, paired; VM CV note below): bitops 1.91x -> 1.63x,
 gzip_crc32 1.45x -> 1.33x, expat 2.89x -> 2.77x, sqlite 2.09x -> 1.98x,
 nbody 3.47x -> 3.39x. Regression 133/133, correctness 50/50, intrinsics 3/3,
-597 lib tests. New test v11_cmp_narrowing.
+597 lib tests. New test cmp_narrowing.
 NOTE: the VM's gcc baseline drifts 15-25% between runs, so absolute ratios
 are screening-only; relative deltas within one run are the signal.
 
-## v11 roadmap (remaining, prioritized)
+## Remaining work (prioritized)
 
 1. **Branch-on-logical at lowering** (expat still 2.77x): `a || b || c` is
    lowered to value-producing diamonds whose intermediate results are DATA
@@ -808,7 +808,7 @@ are screening-only; relative deltas within one run are the signal.
    operand's natural width when the span fits.
 4. nbody's 2 remaining preheader `imulq` (reuse `&bodies[i*56]+56`).
 
-## v12 — flat short-circuit, byte compares, FP-param fix, accumulator reassoc
+## Flat short-circuit, byte compares, FP-param fix, accumulator reassoc
 
 All four v11 roadmap items plus a critical miscompile fix, an exhaustive test
 sweep, and one more ICC/ICX distill.
@@ -828,7 +828,7 @@ sweep, and one more ICC/ICX distill.
    32-bit sub), matching GCC's `add edx,62; cmp dl,29`.
 
 3. **FP-param pre-store ordering fix (critical miscompile, caught by the new
-   v12_fp_param test).** The v11 FP-param pre-store stored each param's ABI
+   fp_param_regalloc test).** The v11 FP-param pre-store stored each param's ABI
    register into its XMM home in param order; a home (xmm2..xmm7) can DOUBLE as
    another param's ABI argument register, so constp(a,b,scale) = (a+b)*scale
    compiled to (a+b)*a. Pre-stores now run in a topological order (a home
@@ -848,3 +848,30 @@ Remaining known gaps (next session): the adler load→register copy chains
 (movzbl (%r11),%edx; mov %r12d,%esi — the load should land directly in the
 add's register), the expat last-link materialization (function-return bool),
 and nbody's preheader imulq.
+
+## Regression suite renamed + constant-copy fold
+
+**Test rename.** Every regression test that carried a patch-revision prefix
+(revision-prefixed names and the legacy regression-prefix pattern) now has a descriptive
+name stating what it covers (`range_check_fold`, `flat_short_circuit`,
+`accumulator_reassociation`, `sqlite_yy_shift`, ...). Header comments drop the
+revision tags; `.flags`/`.env` companions move with their tests; the PGO
+roundtrip script, per-test profile paths, and cross-references are updated.
+Suite is 144 tests, all differential vs GCC.
+
+**Constant-copy fold.** `emit_copy_value` relayed every constant copy through
+`%rax` (`movq $imm,%rax; movq %rax,%reg`); the short-circuit merge value
+(`x = 1`) and loop preambles pay this per execution. Constants now go straight
+to the destination register via `operand_to_callee_reg` (which already
+special-cases every integer constant form, incl. xor-zero). Expat's nameLength
+hot path drops 4 `mov`-relay instructions per scanned character.
+
+**New tests.** `bool_return_materialization` (short-circuit return-bool across
+inlining boundaries), `fp_param_wide` (8-F64 / 5-F32 parameter lists exercising
+the FP-param pre-store ordering and its scratch cycle break).
+
+Remaining known gaps (unchanged): the last-link boolean sign-extension
+(`setcc; movzbl; movslq; test` — the movslq of a 0/1 bool is identity), the
+adler load→cast copy under register pressure (the reassociated closed form
+double-uses each byte, which can defeat the single-use load→cast fold), and
+nbody's preheader `imulq`.
