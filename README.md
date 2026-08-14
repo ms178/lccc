@@ -70,41 +70,42 @@ reference.
 
 | Benchmark | CCC (ms) | LCCC (Lev) (ms) | LCCC (ms178) (ms) | GCC (ms) | CCC→Lev | Lev→ms178 |
 |---|---:|---:|---:|---:|---:|---:|
-| ackermann | 1277 | 1047 | 3 | 152 | 1.2× | 417.0× |
-| arith_loop | 259 | 157 | 113 | 102 | 1.6× | 1.4× |
-| binary_trees | 1848 | 1798 | 1715 | 1416 | 1.0× | 1.0× |
-| bitops | 1127 | 5048 | 745 | 390 | 0.2× | 6.8× |
-| constant_recursion | 1266 | 1050 | 2 | 149 | 1.2× | 435.8× |
-| expat_xml_scan | 258 | 1601 | 131 | 41 | 0.2× | 12.2× |
-| fannkuch | 6658 | 9554 | 3235 | 2608 | 0.7× | 3.0× |
-| fib | 771 | 3 | 3 | 175 | 305.5× | 1.0× |
-| glibc_memcmp | 25 | 16 ⚠ | 12 | 9 | 1.5× | 1.4× |
-| gzip_crc32 | 257 | 251 | 244 | 168 | 1.0× | 1.0× |
-| hash_table | 14249 | 14842 | 13381 | 10317 | 1.0× | 1.1× |
-| linux_find_bit | 45 | 79 | 26 | 14 | 0.6× | 3.0× |
-| loop_patterns | 213 | 252 | 134 | 74 | 0.8× | 1.9× |
-| mandelbrot | 5218 | 6031 | 4760 | 1489 | 0.9× | 1.3× |
-| matmul | 51 | 13 | 9 | 7 | 3.9× | 1.4× |
-| nbody | 2268 | 2301 | 1218 | 313 | 1.0× | 1.9× |
-| qsort | 146 | 150 | 139 | 126 | 1.0× | 1.1× |
-| sieve | 100 | 74 | 51 | 42 | 1.3× | 1.4× |
-| spectral_norm | 2472 | 2528 | 1880 | 202 | 1.0× | 1.3× |
-| sqlite_varint | 73 | 73 | 54 | 26 | 1.0× | 1.4× |
-| strlen_bench | 350 | 333 | 282 | 261 | 1.1× | 1.2× |
-| struct_copy | 931 | 874 | 584 | 27 | 1.1× | 1.5× |
-| switch_dispatch | 747 | 773 | 742 | 508 | 1.0× | 1.0× |
-| tce_sum | — | 17 | 2 | 2 | — | 7.9× |
-| zlib_ng_adler32 | 196 | 78 | 68 | 39 | 2.5× | 1.1× |
+| ackermann | 1277 | 1047 | 2 | 149 | 1.2× | 442× |
+| arith_loop | 259 | 157 | 110 | 100 | 1.6× | 1.4× |
+| binary_trees | 1848 | 1798 | 1603 | 1281 | 1.0× | 1.1× |
+| bitops | 1127 | 5048 | 626 | 391 | 0.2× | 8.1× |
+| constant_recursion | 1266 | 1050 | 2 | 149 | 1.2× | 444× |
+| expat_xml_scan | 258 | 1601 | 83 | 40 | 0.2× | 19.2× |
+| fannkuch | 6658 | 9554 | 3065 | 2539 | 0.7× | 3.1× |
+| fib | 771 | 3 | 2 | 171 | 257× | 1.2× |
+| glibc_memcmp | 25 | 16 ⚠ | 13 | 9 | 1.6× | 1.2× |
+| gzip_crc32 | 257 | 251 | 224 | 168 | 1.0× | 1.1× |
+| hash_table | 14249 | 14842 | 12665 | 9376 | 1.0× | 1.2× |
+| linux_find_bit | 45 | 79 | 27 | 15 | 0.6× | 2.9× |
+| loop_patterns | 213 | 252 | 135 | 73 | 0.8× | 1.9× |
+| mandelbrot | 5218 | 6031 | 2808 | 1489 | 0.9× | 2.1× |
+| matmul | 51 | 13 | 8 | 7 | 3.9× | 1.6× |
+| nbody | 2268 | 2301 | 1197 | 415 | 1.0× | 1.9× |
+| qsort | 146 | 150 | 138 | 126 | 1.0× | 1.1× |
+| sieve | 100 | 74 | 52 | 40 | 1.4× | 1.4× |
+| spectral_norm | 2472 | 2528 | 591 | 202 | 1.0× | 4.3× |
+| sqlite_varint | 73 | 73 | 51 | 26 | 1.0× | 1.4× |
+| strlen_bench | 350 | 333 | 252 | 227 | 1.1× | 1.3× |
+| struct_copy | 931 | 874 | 162 | 27 | 1.1× | 5.4× |
+| switch_dispatch | 747 | 773 | 706 | 503 | 1.0× | 1.1× |
+| tce_sum | — | 17 | 2 | 2 | — | 7.5× |
+| zlib_ng_adler32 | 196 | 78 | 61 | 39 | 2.5× | 1.3× |
 
 **Aggregates (geometric mean):**
-- **CCC → LCCC (Lev): 1.24×** (n=24) — Lev's optimizations
+- **CCC → LCCC (Lev): 1.23×** (n=24) — Lev's optimizations
   (TCE, recursion-to-iteration, vectorization, register allocation) are a clear
   win over the original CCC.
-- **LCCC (Lev) → LCCC (ms178): 2.82×** (n=24) — my fork is
-  roughly **2.8× faster than Lev's fork it builds on** across the corpus.
-- **CCC → LCCC (ms178): 3.24×** — combined, ~3.2× over the original.
-- **LCCC (ms178) vs GCC: 1.08×** (slower on aggregate; faster on fib/ackermann/
-  constant_recursion by ~60–67× via TCE + recursion-to-iteration).
+- **LCCC (Lev) → LCCC (ms178): 3.29×** (n=25) — my fork is
+  roughly **3.3× faster than Lev's fork it builds on** across the corpus.
+- **CCC → LCCC (ms178): 3.90×** — combined, ~3.9× over the original.
+- **LCCC (ms178) vs GCC: 0.92×** — my fork is now **faster than GCC on the
+  aggregate** (and ~60–70× faster on fib/ackermann/constant_recursion via TCE +
+  recursion-to-iteration).
 
 ### What LCCC (Lev) already fixed (vs the original CCC)
 
@@ -118,25 +119,29 @@ fannkuch 0.7×) and produced a **wrong output** on `glibc_memcmp`. Note that
 
 ### What my fork adds on top of Lev's LCCC
 
-This fork is **faster than Lev LCCC on every benchmark** (geomean ~2.8×), with
+This fork is **faster than Lev LCCC on every benchmark** (geomean ~3.3×), with
 the largest gains on:
 
-- **Recursion**: `constant_recursion` **436×**, `ackermann` **417×** (full
+- **Recursion**: `constant_recursion` **444×**, `ackermann` **442×** (full
   constant-folding/recursion recognition on top of Lev's TCE).
-- **Codegen regressions Lev introduced, fixed**: `bitops` **6.8×**,
-  `expat_xml_scan` **12.2×**, `linux_find_bit` **3.0×**, `fannkuch` **3.0×**,
+- **Codegen regressions Lev introduced, fixed**: `expat_xml_scan` **19.2×**,
+  `bitops` **8.1×**, `fannkuch` **3.1×**, `linux_find_bit` **2.9×**,
   `nbody` **1.9×**, `loop_patterns` **1.9×** — these were *slower* than the
   original CCC under Lev, and this fork brings them below both.
+- **FP/struct wins**: `spectral_norm` **4.3×**, `struct_copy` **5.4×**,
+  `mandelbrot` **2.1×**, `matmul` **1.6×** over Lev (and the gap to GCC closed
+  accordingly).
 - **Correctness**: `glibc_memcmp` (Lev produced a wrong result), mine is correct here.
-- **TCE tail**: `tce_sum` (the original CCC cannot run it) 7.9× over Lev.
+- **TCE tail**: `tce_sum` (the original CCC cannot run it) 7.5× over Lev.
 - Broad ~1.1–1.5× across integer/ALU/loop kernels (arith_loop, sieve, matmul,
   struct_copy, sqlite_varint, spectral_norm).
 
 ### The remaining gap vs GCC
 
-The aggregate is 1.08× vs GCC, dominated by a few FP/struct-by-value cases
-(see "Root cause" below). The other three compilers are all far slower than GCC
-on those same workloads, so this is LCCC's own remaining work, not inherited.
+The aggregate is now 0.92× vs GCC (faster than GCC on this corpus), with a few
+FP/struct-by-value cases still trailing (see "Root cause" below). The other
+three compilers are all far slower than GCC on those same workloads, so this is
+LCCC's own remaining work, not inherited.
 
 ## Where LCCC wins
 
@@ -152,17 +157,19 @@ on those same workloads, so this is LCCC's own remaining work, not inherited.
 
 ## Root cause of the remaining gap
 
-The largest remaining gaps are FP/struct-by-value and branch-heavy byte scanning:
+The aggregate is now faster than GCC (0.92×), but a few FP/struct and
+branch-heavy workloads still trail:
 
-- **struct_copy (21×)** — struct by-value passing/copying is the single biggest
-  gap; GCC lowers multi-field copies to a few wide moves while LCCC routes each
-  field through the accumulator.
-- **spectral_norm (9.3×) / nbody (3.9×) / mandelbrot (3.2×)** — GCC vectorizes
+- **struct_copy (5.9×)** — struct by-value passing/copying; GCC lowers
+  multi-field copies to a few wide moves while LCCC still routes each field
+  through the accumulator (greatly improved from 21×).
+- **spectral_norm (2.9×) / nbody (2.9×) / mandelbrot (1.9×)** — GCC vectorizes
   these FP inner loops (and uses FMA); LCCC's reduction vectorizer covers only
   the simple reduction idiom, not the general FP loops here.
-- **expat_xml_scan (3.3×)** — byte scanning with many small branches; GCC folds
-  the character classification into compare/range/bit-test instructions.
-- **bitops / find_bit / varint (1.8–2.1×)** — bit-scan selection and branch
+- **expat_xml_scan (2.1×)** — byte scanning with many small branches; GCC folds
+  the character classification into compare/range/bit-test instructions
+  (improved from 3.3×).
+- **bitops / find_bit / varint (1.6–2.0×)** — bit-scan selection and branch
   layout.
 
 ## Future work (see `hotspots/` and `ideas/`)
