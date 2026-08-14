@@ -1,0 +1,1 @@
+FP spill round-trip through the GPR accumulator must fold to a direct movsd for every XMM register

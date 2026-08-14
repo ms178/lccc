@@ -1903,12 +1903,22 @@ impl X86Codegen {
                         "rax"
                     };
 
-                    // FMA3: load C, fused multiply-add with B, store back
-                    self.state.emit_fmt(format_args!("    movsd (%{}), %xmm1", a_name));  // xmm1 = A scalar
-                    self.state.emit("    unpcklpd %xmm1, %xmm1");                         // xmm1 = {A, A}
-                    self.state.emit_fmt(format_args!("    movupd (%{}), %xmm0", c_name)); // xmm0 = {C[j], C[j+1]}
+                    // FMA3: load C, fused multiply-add with B, store back.
+                    //
+                    // Every move here uses the VEX encoding even though the
+                    // 128-bit legacy forms are the same length. vfmadd231pd is
+                    // VEX-only, so a legacy movsd/unpcklpd/movupd next to it
+                    // would straddle the two domains; and this kernel runs
+                    // inside loops that elsewhere emit 256-bit ymm code, where
+                    // a dirty upper half turns each legacy instruction into an
+                    // AVX->SSE state transition (~70 cycles on Intel). VEX-128
+                    // zeroes the upper bits by definition, so no transition can
+                    // occur. See scripts/check_avx_sse_transitions.py.
+                    self.state.emit_fmt(format_args!("    vmovsd (%{}), %xmm1", a_name));  // xmm1 = A scalar
+                    self.state.emit("    vunpcklpd %xmm1, %xmm1, %xmm1");                  // xmm1 = {A, A}
+                    self.state.emit_fmt(format_args!("    vmovupd (%{}), %xmm0", c_name)); // xmm0 = {C[j], C[j+1]}
                     self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %xmm1, %xmm0", b_name));
-                    self.state.emit_fmt(format_args!("    movupd %xmm0, (%{})", c_name)); // store back
+                    self.state.emit_fmt(format_args!("    vmovupd %xmm0, (%{})", c_name)); // store back
 
                     self.state.reg_cache.invalidate_all();
                 }
@@ -1948,7 +1958,7 @@ impl X86Codegen {
                         self.value_to_reg(&Value(c_base), "rax");
                         self.operand_to_reg(&args[0], "rcx");
 
-                        self.state.emit("    movsd (%rcx), %xmm1");
+                        self.state.emit("    vmovsd (%rcx), %xmm1");
                         self.state.emit("    vbroadcastsd %xmm1, %ymm1");
                         self.state.emit("    vmovupd (%rax,%rsi), %ymm0");
                         self.state.emit("    vfmadd231pd (%rdx,%rsi), %ymm1, %ymm0");
@@ -1976,7 +1986,7 @@ impl X86Codegen {
                             "rax"
                         };
 
-                        self.state.emit_fmt(format_args!("    movsd (%{}), %xmm1", a_name));
+                        self.state.emit_fmt(format_args!("    vmovsd (%{}), %xmm1", a_name));
                         self.state.emit("    vbroadcastsd %xmm1, %ymm1");
                         self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
                         self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
@@ -2007,7 +2017,7 @@ impl X86Codegen {
                 // Load scalar F64 from pointer and broadcast to ymm1.
                 // Placed before the vectorized j-loop.
                 self.operand_to_reg(&args[0], "rcx");
-                self.state.emit("    movsd (%rcx), %xmm1");
+                self.state.emit("    vmovsd (%rcx), %xmm1");
                 self.state.emit("    vbroadcastsd %xmm1, %ymm1");
             }
             IntrinsicOp::FmaF64x4SIB => {
@@ -2028,7 +2038,7 @@ impl X86Codegen {
                 self.operand_to_reg(&args[3], "rsi");          // byte offset → %rsi
 
                 // Load A, broadcast
-                self.state.emit("    movsd (%rcx), %xmm1");
+                self.state.emit("    vmovsd (%rcx), %xmm1");
                 self.state.emit("    vbroadcastsd %xmm1, %ymm1");
 
                 // FMA with SIB addressing

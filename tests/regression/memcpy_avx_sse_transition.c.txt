@@ -1,0 +1,1 @@
+small inline struct copies must not leave a dirty ymm (AVX->SSE transition made struct_copy 46x slower); all memcpy expansion arms must be byte-exact
