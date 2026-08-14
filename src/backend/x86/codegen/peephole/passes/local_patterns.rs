@@ -2508,7 +2508,7 @@ pub(super) fn fuse_signext_and_move(
         // can have long stretches of non-barrier instructions.
         let src_32_name = REG_NAMES[1][src_family as usize];
         let mut rax_dead = false; // conservative default: assume alive
-        let mut cmpl_line: Option<usize> = None;
+        let mut cmpl_lines: Vec<usize> = Vec::new();
         let mut n = j + 1;
         while n < len {
             if infos[n].is_nop() { n += 1; continue; }
@@ -2553,7 +2553,7 @@ pub(super) fn fuse_signext_and_move(
                 }
                 // Check if it's a cmpl $imm, %eax
                 let tn = infos[n].trimmed(store.get(n));
-                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") && cmpl_line.is_none() {
+                if tn.starts_with("cmpl $") && tn.ends_with(", %eax") {
                     // Check src_family is not modified between i and n.
                     // Must check ALL instruction kinds that can write to a register,
                     // including calls (clobber caller-saved) and pop.
@@ -2582,7 +2582,7 @@ pub(super) fn fuse_signext_and_move(
                         }
                     }
                     if !src_modified {
-                        cmpl_line = Some(n);
+                        cmpl_lines.push(n);
                         n += 1;
                         continue;
                     }
@@ -2594,7 +2594,21 @@ pub(super) fn fuse_signext_and_move(
             n += 1;
         }
 
-        if !rax_dead && cmpl_line.is_none() { i += 1; continue; }
+        // The transform retargets the movslq away from %rax, DELETING the only
+        // definition of %rax. That is legal only when %rax is provably dead
+        // afterwards. Redirecting the cmpl operands we happened to find is not
+        // sufficient on its own: the forward scan stops at the first barrier,
+        // so a `cmpl $imm, %eax` in a SUCCESSOR block is never examined and
+        // would be left reading a register nothing defines any more.
+        //
+        // (Reproducer: a switch lowered to a compare chain. The first
+        // `cmpl $1, %eax` was redirected, the `je` ended the scan with %rax
+        // still conservatively live, and the next block's `cmpl $2, %eax` read
+        // a dead register -- `switch(x){case 1: ... case 2: ...}` returned the
+        // default value for x == 2. This previously stayed hidden because the
+        // parameter spill reloaded %rax; eliminating that dead spill exposed
+        // it.)
+        if !rax_dead { i += 1; continue; }
 
         // Apply the transformation
         let dest_reg_stripped = &dest_reg[1..]; // without leading %
@@ -2602,8 +2616,9 @@ pub(super) fn fuse_signext_and_move(
         replace_line(store, &mut infos[i], i, new_signext);
         mark_nop(&mut infos[j]); // remove movq %rax, %Y
 
-        // If there's a cmpl to redirect, do it
-        if let Some(cmp_idx) = cmpl_line {
+        // Redirect EVERY cmpl that read %eax, not just the first one: they all
+        // lose their operand's definition when the movslq is retargeted.
+        for cmp_idx in cmpl_lines {
             let tc = infos[cmp_idx].trimmed(store.get(cmp_idx));
             let new_cmp = format!("    {}", tc.replace(", %eax", &format!(", {}", src_32_name)));
             replace_line(store, &mut infos[cmp_idx], cmp_idx, new_cmp);
