@@ -896,3 +896,65 @@ vstmxcsr (%rsp)
 vmovntps %ymm3, (%rdi)
 vmovntpd %ymm3, (%r12)
 vmovntdq %xmm13, (%r13,%rax,8)
+;;; avx_fma_grid
+.text
+vfmadd132ps %ymm1, %ymm2, %ymm3
+vfmadd132pd %ymm1, %ymm2, %ymm3
+vfmadd132ss %xmm1, %xmm2, %xmm3
+vfmadd132sd %xmm1, %xmm2, %xmm3
+vfmadd213ss %xmm1, %xmm2, %xmm3
+vfmadd231sd %xmm1, %xmm2, %xmm3
+vfmsub132ps %ymm1, %ymm2, %ymm3
+vfmsub213sd %xmm1, %xmm2, %xmm3
+vfnmadd231ps %ymm1, %ymm2, %ymm3
+vfnmsub132sd %xmm1, %xmm2, %xmm3
+vfnmsub231ps %ymm1, %ymm2, %ymm3
+vfmaddsub132ps %ymm1, %ymm2, %ymm3
+vfmsubadd231pd %ymm1, %ymm2, %ymm3
+vfmadd132sd (%r13), %xmm1, %xmm2
+
+;;; avx_gaps
+.text
+vpermps %ymm1, %ymm2, %ymm3
+vpermpd $0x1b, %ymm1, %ymm2
+vlddqu (%rdi), %ymm0
+vlddqu (%rdi), %xmm0
+vmovntdqa (%rdi), %ymm0
+vpmovzxdq (%rdi), %ymm2
+vpsllvd %ymm1, %ymm2, %ymm3
+vpsllvq %ymm1, %ymm2, %ymm3
+vpsrlvd %ymm1, %ymm2, %ymm3
+vpsrlvq %ymm1, %ymm2, %ymm3
+vpsravd %ymm1, %ymm2, %ymm3
+vrsqrtps %ymm1, %ymm2
+vrcpps %ymm1, %ymm2
+vcomiss %xmm1, %xmm2
+vucomisd (%r13), %xmm12
+vcvtsd2ss %xmm1, %xmm2, %xmm3
+vcvtss2sd %xmm1, %xmm2, %xmm3
+vcvtsd2si %xmm0, %eax
+vcvtsd2si %xmm0, %rax
+vcvttsd2si %xmm0, %eax
+vcvttss2si %xmm0, %rax
+vcvtsi2sdl (%rdi), %xmm1, %xmm2
+vcvtsi2sdq (%rdi), %xmm1, %xmm2
+vroundps $3, %ymm1, %ymm2
+vroundpd $3, %xmm1, %xmm2
+vroundps $3, (%rdi), %ymm2
+vmaskmovps (%rdi), %ymm1, %ymm2
+vmaskmovps %ymm2, %ymm1, (%rdi)
+vmaskmovpd (%rdi), %ymm1, %ymm2
+vgatherdps %ymm2, (%rdi,%ymm1,4), %ymm3
+vpgatherdd %ymm2, (%r13,%ymm1,4), %ymm3
+
+;;; avx_mov_shortform
+.text
+vmovaps %xmm9, %xmm0
+vmovaps %ymm9, %ymm0
+vmovapd %xmm9, %xmm0
+vmovups %ymm9, %ymm0
+vmovdqa %xmm9, %xmm0
+vmovdqu %ymm9, %ymm0
+vmovaps %xmm0, %xmm9
+vmovaps %xmm9, %xmm10
+vmovaps %xmm1, %xmm2

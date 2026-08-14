@@ -157,7 +157,13 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
                 name: alias.clone(),
                 value: abs_val as u64,
                 size: 0,
-                binding: alias_binding.unwrap_or(STB_GLOBAL),
+                // `.set` alone does not export anything: the symbol is LOCAL
+                // unless a separate `.globl`/`.weak` says otherwise, which is
+                // what `alias_binding` carries.  Defaulting to STB_GLOBAL here
+                // (while the label branch above defaults to STB_LOCAL) leaked
+                // every assembler-internal constant into the object's global
+                // namespace, where it could collide at link time.
+                binding: alias_binding.unwrap_or(STB_LOCAL),
                 sym_type: alias_type.unwrap_or(STT_NOTYPE),
                 visibility: alias_vis.unwrap_or(STV_DEFAULT),
                 section_name: "*ABS*".to_string(),

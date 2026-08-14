@@ -80,7 +80,9 @@ pub enum AsmItem {
     /// Swap current and previous sections: `.previous`
     Previous,
     /// `.org` directive: advance to position symbol + offset within the section.
-    Org(String, i64),
+    /// `.org new-lc, fill` -- symbol (may be empty or "." for the location
+    /// counter), offset, and the fill byte (GAS defaults to 0).
+    Org(String, i64, u8),
     /// `.incbin "file"[, skip[, count]]` — include binary file contents
     Incbin { path: String, skip: u64, count: Option<u64> },
     /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`
@@ -521,9 +523,21 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             }
         }
         ".org" => {
-            let args = args.trim();
+            // `.org new-lc, fill` -- the fill byte is optional and defaults to
+            // zero, which is what the ELF writer emits.  It has to be split off
+            // before the expression is parsed, or the whole `8, 0x90` string is
+            // handed to the integer parser and rejected.
+            let (args, fill) = match args.split_once(',') {
+                Some((lc, f)) => (
+                    lc.trim(),
+                    parse_integer_expr(f.trim())
+                        .map_err(|_| format!("bad .org fill: {}", f.trim()))?
+                        as u8,
+                ),
+                None => (args, 0u8),
+            };
             if let Ok(val) = parse_integer_expr(args) {
-                Ok(AsmItem::Org(String::new(), val))
+                Ok(AsmItem::Org(String::new(), val, fill))
             } else {
                 let mut sym = args.to_string();
                 let mut offset = 0i64;
@@ -535,7 +549,7 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                             .map_err(|_| format!("bad .org offset: {}", offset_str))?;
                     }
                 }
-                Ok(AsmItem::Org(sym, offset))
+                Ok(AsmItem::Org(sym, offset, fill))
             }
         }
         ".byte" => {
@@ -575,7 +589,11 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let vals = parse_float_values(args, true)?;
             Ok(AsmItem::Byte(vals))
         }
-        ".zero" | ".skip" => {
+        // `.space` is an exact synonym of `.skip` in GAS (both take an optional
+        // fill byte).  It was missing from this list, and because unrecognized
+        // directives are silently ignored, `.space 8` emitted NOTHING -- every
+        // following byte in the section landed at the wrong offset.
+        ".zero" | ".skip" | ".space" => {
             let (expr_str, fill) = split_skip_args(args);
             if let Ok(val) = parse_integer_expr(expr_str) {
                 if fill == 0 {
@@ -1050,8 +1068,18 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     // In AT&T syntax, a bare number without `$` prefix is an absolute memory address.
     // Only treat it as a memory operand if it parses as a pure integer and doesn't
     // look like a numeric label reference (e.g., `1f`, `1b`).
-    if s.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'-')
-        && !s.ends_with('f') && !s.ends_with('b')
+    // A GAS numeric local label is a run of DECIMAL DIGITS followed by a single
+    // `f` or `b` and nothing else (`1f`, `42b`).  Rejecting every operand that
+    // merely ends in those letters also threw away legitimate hex constants:
+    // `mov 0x7fffffff, %eax` was treated as a label reference and silently
+    // assembled with a zero displacement.  Test the whole shape instead.
+    let is_numeric_label = {
+        let stem = &s[..s.len().saturating_sub(1)];
+        matches!(s.bytes().last(), Some(b'f') | Some(b'b'))
+            && !stem.is_empty()
+            && stem.bytes().all(|c| c.is_ascii_digit())
+    };
+    if s.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'-') && !is_numeric_label
     {
         if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(s) {
             return Ok(Operand::Memory(MemoryOperand {

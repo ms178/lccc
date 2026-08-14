@@ -9,6 +9,13 @@ impl super::InstructionEncoder {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
         let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        // 16-bit forms need the operand-size prefix.  It is pushed here, before
+        // any REX byte is emitted, so that `emit_segment_prefix` (which scans
+        // back over 0x66/0x67) still places a segment override outside it and
+        // the REX byte produced by `emit_rex_*` lands after it.
+        if size == 2 {
+            self.bytes.push(0x66);
+        }
         // Determine which bt variant
         let base = &mnemonic[..mnemonic.len()-1]; // strip size suffix
         let (reg_opcode, imm_ext) = match base {
@@ -108,7 +115,7 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 {
+        if ops.len() == 2 || ops.len() == 1 {
             // fcomip %st(N), %st
             match &ops[0] {
                 Operand::Register(reg) => {
@@ -122,7 +129,7 @@ impl super::InstructionEncoder {
             self.bytes.extend_from_slice(&[0xDF, 0xF1]);
             Ok(())
         } else {
-            Err("fcomip requires 0 or 2 operands".to_string())
+            Err("fcomip requires 0-2 operands".to_string())
         }
     }
 
@@ -147,7 +154,7 @@ impl super::InstructionEncoder {
 
     /// Encode fcomi/fucomi (compare, no pop): fcomi = DB F0+i, fucomi = DB E8+i.
     pub(crate) fn encode_fcomi(&mut self, ops: &[Operand], base: u8) -> Result<(), String> {
-        if ops.len() == 2 {
+        if ops.len() == 2 || ops.len() == 1 {
             match &ops[0] {
                 Operand::Register(reg) => {
                     let n = parse_st_num(&reg.name)?;
@@ -160,12 +167,12 @@ impl super::InstructionEncoder {
             self.bytes.extend_from_slice(&[0xDB, base + 1]);
             Ok(())
         } else {
-            Err("fcomi requires 0 or 2 operands".to_string())
+            Err("fcomi requires 0-2 operands".to_string())
         }
     }
 
     pub(crate) fn encode_fucomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 {
+        if ops.len() == 2 || ops.len() == 1 {
             match &ops[0] {
                 Operand::Register(reg) => {
                     let n = parse_st_num(&reg.name)?;
@@ -178,7 +185,7 @@ impl super::InstructionEncoder {
             self.bytes.extend_from_slice(&[0xDF, 0xE9]);
             Ok(())
         } else {
-            Err("fucomip requires 0 or 2 operands".to_string())
+            Err("fucomip requires 0-2 operands".to_string())
         }
     }
 

@@ -41,6 +41,11 @@ pub const R_X86_64_32: u32 = 10;
 pub const R_X86_64_32S: u32 = 11;
 pub const R_X86_64_16: u32 = 12;
 pub const R_X86_64_GOTPCREL: u32 = 9;
+// Relaxable GOT-load relocations.  The linker may rewrite the instruction into
+// a direct LEA when the target resolves locally; the REX_ variant records that
+// the instruction has a REX prefix, so the rewrite must preserve its length.
+pub const R_X86_64_GOTPCRELX: u32 = 41;
+pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_GOTTPOFF: u32 = 22;
 #[allow(dead_code)] // ELF standard constant, defined for reference/future use
@@ -643,10 +648,16 @@ impl InstructionEncoder {
             "shldq" => self.encode_double_shift(ops, 0xA4, 8),
             "shrdq" => self.encode_double_shift(ops, 0xAC, 8),
 
-            // Sign extension
-            "cltq" => { self.bytes.extend_from_slice(&[0x48, 0x98]); Ok(()) }
-            "cqto" | "cqo" => { self.bytes.extend_from_slice(&[0x48, 0x99]); Ok(()) }
+            // Sign extension.  Both the AT&T spellings and the Intel aliases GAS
+            // accepts map onto the same three opcodes, distinguished only by the
+            // operand-size prefix: 0x98 widens AL/AX/EAX into AX/EAX/RAX, 0x99
+            // widens AX/EAX/RAX into DX:AX/EDX:EAX/RDX:RAX.
+            "cbtw" | "cbw" => { self.bytes.extend_from_slice(&[0x66, 0x98]); Ok(()) }
+            "cwtl" | "cwde" => { self.bytes.push(0x98); Ok(()) }
+            "cltq" | "cdqe" => { self.bytes.extend_from_slice(&[0x48, 0x98]); Ok(()) }
+            "cwtd" | "cwd" => { self.bytes.extend_from_slice(&[0x66, 0x99]); Ok(()) }
             "cltd" | "cdq" => { self.bytes.push(0x99); Ok(()) }
+            "cqto" | "cqo" => { self.bytes.extend_from_slice(&[0x48, 0x99]); Ok(()) }
 
             // Byte swap
             "bswapl" => self.encode_bswap(ops, 4),
@@ -719,8 +730,8 @@ impl InstructionEncoder {
 
             // System instructions
             "syscall" => { self.bytes.extend_from_slice(&[0x0F, 0x05]); Ok(()) }
-            "sysretq" | "sysret" => { self.bytes.extend_from_slice(&[0x48, 0x0F, 0x07]); Ok(()) }
-            "sysretl" => { self.bytes.extend_from_slice(&[0x0F, 0x07]); Ok(()) }
+            "sysretq" => { self.bytes.extend_from_slice(&[0x48, 0x0F, 0x07]); Ok(()) }
+            "sysret" | "sysretl" => { self.bytes.extend_from_slice(&[0x0F, 0x07]); Ok(()) }
             "sysenter" => { self.bytes.extend_from_slice(&[0x0F, 0x34]); Ok(()) }
             "sysexitq" => { self.bytes.extend_from_slice(&[0x48, 0x0F, 0x35]); Ok(()) }
             "sysexit" => { self.bytes.extend_from_slice(&[0x0F, 0x35]); Ok(()) }
@@ -776,6 +787,7 @@ impl InstructionEncoder {
             "leave" | "leaveq" => { self.bytes.push(0xC9); Ok(()) }
             "ud2" => { self.bytes.extend_from_slice(&[0x0F, 0x0B]); Ok(()) }
             "endbr64" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFA]); Ok(()) }
+            "endbr32" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFB]); Ok(()) }
             // CET shadow stack: rdsspq %r64, rdsspd %r32
             "rdsspq" => {
                 if let Some(Operand::Register(reg)) = ops.first() {
@@ -863,6 +875,15 @@ impl InstructionEncoder {
             "lfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xE8]); Ok(()) }
             "sfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF8]); Ok(()) }
             "clflush" => self.encode_clflush(ops),
+            // clflushopt is clflush with a 66 prefix; clwb reuses the opcode
+            // with ModRM.reg = 6.
+            "clflushopt" => { self.bytes.push(0x66); self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 7) }
+            "clwb" => { self.bytes.push(0x66); self.encode_sse_mem_only(ops, &[0x0F, 0xAE], 6) }
+            // ADX: adcx is 66.0F38.F6, adox is F3.0F38.F6.
+            "adcxl" => self.encode_adx(ops, 0x66, 4),
+            "adcxq" => self.encode_adx(ops, 0x66, 8),
+            "adoxl" => self.encode_adx(ops, 0xF3, 4),
+            "adoxq" => self.encode_adx(ops, 0xF3, 8),
 
             // Direction flag
             "cld" => { self.bytes.push(0xFC); Ok(()) }
@@ -939,10 +960,26 @@ impl InstructionEncoder {
             "cvtss2sd" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5A]),
             "cvtsi2sdq" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF2, 0x0F, 0x2A], 8),
             "cvtsi2ssq" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF3, 0x0F, 0x2A], 8),
-            "cvttsd2siq" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C], 8),
-            "cvttss2siq" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2C], 8),
-            "cvtsd2siq" | "cvtsd2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2D], 8),
-            "cvtss2siq" | "cvtss2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2D], 8),
+            "cvtsd2siq" | "cvtsd2si" | "cvtss2siq" | "cvtss2si"
+            | "cvttsd2siq" | "cvttsd2si" | "cvttss2siq" | "cvttss2si" => {
+                // 0x2D converts with rounding, 0x2C truncates; F2 selects the
+                // double source, F3 the single.  REX.W comes from the actual
+                // destination register width, not from the mnemonic: an
+                // unsuffixed `cvtsd2si %xmm0,%eax` is a 32-bit convert.
+                let truncating = mnemonic.starts_with("cvtt");
+                let is_sd = mnemonic.contains("sd2si");
+                let prefix = if is_sd { 0xF2u8 } else { 0xF3 };
+                let opcode = if truncating { 0x2Cu8 } else { 0x2D };
+                let size = if mnemonic.ends_with('q') {
+                    8
+                } else {
+                    match ops.get(1) {
+                        Some(Operand::Register(d)) if is_reg64(&d.name) => 8,
+                        _ => 4,
+                    }
+                };
+                self.encode_sse_cvt_xmm_to_gp(ops, &[prefix, 0x0F, opcode], size)
+            }
             "cvtsd2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2D], 4),
             "cvtss2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2D], 4),
             "cvttsd2sil" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C], 4),
@@ -996,7 +1033,6 @@ impl InstructionEncoder {
             "pabsb" => self.encode_sse_op_38(ops, 0x1C),
             "pabsw" => self.encode_sse_op_38(ops, 0x1D),
             "pabsd" => self.encode_sse_op_38(ops, 0x1E),
-            "pblendvb" => self.encode_sse_op_38(ops, 0x10),
             "pmovzxbw" => self.encode_sse_op_38(ops, 0x30),
             "pmovzxwd" => self.encode_sse_op_38(ops, 0x33),
             "palignr" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0F]),
@@ -1275,6 +1311,7 @@ impl InstructionEncoder {
             // blendv instructions use xmm0 as implicit mask; 3-op form names it explicitly
             "blendvpd" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x15]) }
             "blendvps" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x14]) }
+            "pblendvb" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x10]) }
             "roundsd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0B]),
             "roundss" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0A]),
             "roundpd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x09]),
@@ -1305,13 +1342,12 @@ impl InstructionEncoder {
             "cvtsi2sd" => self.encode_cvtsi2x(ops, 0x2A, 3),
             // Plain cvtss2si/cvtsd2si are handled by the q-suffixed arms above
             // (which select the REX.W width); these duplicates were dead.
-            "cvttss2si" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x2C]),
-            "cvttsd2si" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x2C]),
             "packusdw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2B]),
             "packsswb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x63]),
             "movhlps" => self.encode_sse_op(ops, &[0x0F, 0x12]),
             "movlhps" => self.encode_sse_op(ops, &[0x0F, 0x16]),
             "movddup" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x12]),
+            "lddqu" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xF0]),
             "movshdup" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x16]),
             "movsldup" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x12]),
             "cvtps2pd" => self.encode_sse_op(ops, &[0x0F, 0x5A]),
@@ -1321,6 +1357,8 @@ impl InstructionEncoder {
             "cvttps2dq" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5B]),
             "cvtdq2pd" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0xE6]),
             "cvtpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
+            "cvttpd2dq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE6]),
+            "mpsadbw" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x42]),
 
             // SSE4.1 zero/sign extension
             "pmovzxbd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x31]),
@@ -1334,6 +1372,7 @@ impl InstructionEncoder {
             "pmovsxwq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x24]),
             "pmovsxdq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x25]),
             "pcmpgtq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x37]),
+            "pcmpeqq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x29]),
 
             // SSSE3 instructions
             "psignb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x08]),
@@ -1376,13 +1415,42 @@ impl InstructionEncoder {
             "vmulpd" => self.encode_avx_3op(ops, 0x59, true),
             "vdivpd" => self.encode_avx_3op(ops, 0x5E, true),
             // FMA3 (0F38 map, W=1 for F64, pp=66)
-            "vfmadd132ps" => self.encode_avx_3op_38(ops, 0x98, true),
-            "vfmadd132pd" => self.encode_avx_3op_38_w1(ops, 0x98, true),
-            "vfmadd213ps" => self.encode_avx_3op_38(ops, 0xA8, true),
-            "vfmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xA8, true),
-            "vfmadd231ps" => self.encode_avx_3op_38(ops, 0xB8, true),
-            "vfmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xB8, true),
             "vsqrtps" => self.encode_avx_2op_0f(ops, 0x51, 0),
+            "vrsqrtps" => self.encode_avx_2op_0f(ops, 0x52, 0),
+            "vrcpps" => self.encode_avx_2op_0f(ops, 0x53, 0),
+            // Unordered/ordered scalar compares: NP.0F for the ss forms,
+            // 66.0F for the sd forms.  Two operands, no NDS source.
+            "vcomiss" => self.encode_avx_2op_0f(ops, 0x2F, 0),
+            "vucomiss" => self.encode_avx_2op_0f(ops, 0x2E, 0),
+            "vcomisd" => self.encode_avx_2op_0f(ops, 0x2F, 1),
+            "vucomisd" => self.encode_avx_2op_0f(ops, 0x2E, 1),
+            // Scalar precision conversions keep the NDS operand: the prefix
+            // names the SOURCE type (F2 = from double, F3 = from single).
+            "vcvtsd2ss" => self.encode_avx_scalar_3op(ops, 0x5A, 3),
+            // VEX scalar converts to/from general-purpose registers.
+            // pp: 2 = F3 (single), 3 = F2 (double).  0x2D rounds, 0x2C truncates.
+            "vcvtsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 3),
+            "vcvtss2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 2),
+            "vcvttsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2C, 3),
+            "vcvttss2si" => self.encode_avx_cvt_to_gp(ops, 0x2C, 2),
+            "vcvtsi2sdl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 3, 0),
+            "vcvtsi2sdq" => self.encode_avx_cvt_from_gp(ops, 0x2A, 3, 1),
+            "vcvtsi2ssl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 0),
+            "vcvtsi2ssq" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 1),
+            // Conditional vector load/store.
+            "vmaskmovps" => self.encode_avx_maskmov(ops, 0x2C, 0x2E, 0),
+            "vmaskmovpd" => self.encode_avx_maskmov(ops, 0x2D, 0x2F, 0),
+            // AVX2 gathers (VSIB).  W selects the element width, the opcode the
+            // index width: 0x92/0x90 = dword index, 0x93/0x91 = qword index.
+            "vgatherdps" => self.encode_avx_gather(ops, 0x92, 0),
+            "vgatherdpd" => self.encode_avx_gather(ops, 0x92, 1),
+            "vgatherqps" => self.encode_avx_gather(ops, 0x93, 0),
+            "vgatherqpd" => self.encode_avx_gather(ops, 0x93, 1),
+            "vpgatherdd" => self.encode_avx_gather(ops, 0x90, 0),
+            "vpgatherdq" => self.encode_avx_gather(ops, 0x90, 1),
+            "vpgatherqd" => self.encode_avx_gather(ops, 0x91, 0),
+            "vpgatherqq" => self.encode_avx_gather(ops, 0x91, 1),
+            "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
@@ -1412,6 +1480,13 @@ impl InstructionEncoder {
             "vpabsw" => self.encode_avx_2op_38(ops, 0x1D, true),
             "vpabsd" => self.encode_avx_2op_38(ops, 0x1E, true),
             "vpmovzxbw" => self.encode_avx_2op_38(ops, 0x30, true),
+            "vpmovzxdq" => self.encode_avx_2op_38(ops, 0x35, true),
+            "vpsllvd" => self.encode_avx_3op_38(ops, 0x47, true),
+            "vpsllvq" => self.encode_avx_3op_38_w1(ops, 0x47, true),
+            "vpsrlvd" => self.encode_avx_3op_38(ops, 0x45, true),
+            "vpsrlvq" => self.encode_avx_3op_38_w1(ops, 0x45, true),
+            "vpsravd" => self.encode_avx_3op_38(ops, 0x46, true),
+            "vmovntdqa" => self.encode_avx_2op_38(ops, 0x2A, true),
             "vpmovzxbd" => self.encode_avx_2op_38(ops, 0x31, true),
             "vpmovzxwd" => self.encode_avx_2op_38(ops, 0x33, true),
             "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
@@ -1478,7 +1553,9 @@ impl InstructionEncoder {
             "vperm2i128" => self.encode_avx_3op_3a_imm8(ops, 0x46, true),
             "vperm2f128" => self.encode_avx_3op_3a_imm8(ops, 0x06, true),
             "vpermd" => self.encode_avx_3op_38(ops, 0x36, true),
+            "vpermps" => self.encode_avx_3op_38(ops, 0x16, true),
             "vpermq" => self.encode_avx_shuffle_3a_w1(ops, 0x00, true),
+            "vpermpd" => self.encode_avx_shuffle_3a_w1(ops, 0x01, true),
 
             // AVX blend (additional)
             "vpblendd" => self.encode_avx_3op_3a_imm8(ops, 0x02, true),
@@ -1582,6 +1659,7 @@ impl InstructionEncoder {
             "vmovlhps" => self.encode_avx_3op_np(ops, 0x16),
             "vmovhlps" => self.encode_avx_3op_np(ops, 0x12),
             "vmovddup" => self.encode_avx_2op_0f(ops, 0x12, 3),  // VEX.F2.0F 12 /r
+            "vlddqu" => self.encode_avx_2op_0f(ops, 0xF0, 3),    // VEX.F2.0F F0 /r
             "vmovshdup" => self.encode_avx_2op_0f(ops, 0x16, 2), // VEX.F3.0F 16 /r
             "vmovsldup" => self.encode_avx_2op_0f(ops, 0x12, 2), // VEX.F3.0F 12 /r
             // AVX FP min/max + horizontal + converts (pp: 0=none,1=66,2=F3,3=F2)
@@ -1615,22 +1693,27 @@ impl InstructionEncoder {
             "vextractps" => self.encode_avx_extract_gpr_imm8(ops, 0x17, true),
             "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
             "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
-            // FMA3 remaining forms (0F38 map; W=1 for pd/sd)
-            // FMA3 scalar forms: ss uses F3 (pp=2), sd uses F2 (pp=3). The old
-            // code routed them through the 66-prefix path (pp=1), encoding
-            // illegal instructions.
-            "vfmadd132ss" => self.encode_avx_3op_38_pp(ops, 0x99, 2),
-            "vfmadd213ss" => self.encode_avx_3op_38_pp(ops, 0xA9, 2),
-            "vfmadd231ss" => self.encode_avx_3op_38_pp(ops, 0xB9, 2),
-            "vfmadd132sd" => self.encode_avx_3op_38_pp_w1(ops, 0x99, 3),
-            "vfmadd213sd" => self.encode_avx_3op_38_pp_w1(ops, 0xA9, 3),
-            "vfmadd231sd" => self.encode_avx_3op_38_pp_w1(ops, 0xB9, 3),
-            "vfmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAA, true),
-            "vfmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBA, true),
-            "vfnmadd213pd" => self.encode_avx_3op_38_w1(ops, 0xAC, true),
-            "vfnmadd231pd" => self.encode_avx_3op_38_w1(ops, 0xBC, true),
-            "vfnmsub213pd" => self.encode_avx_3op_38_w1(ops, 0xAE, true),
-            "vfnmsub231pd" => self.encode_avx_3op_38_w1(ops, 0xBE, true),
+
+            // FMA3: all 48 VEX forms in one rule.  The encoding is completely
+            // regular, so a table beats 48 hand-written arms that each risked a
+            // transcription error (the previous scalar arms did in fact select
+            // F3/F2 prefixes, which encode illegal instructions).
+            //
+            //   VEX.66.0F38.W0 for the ps/ss element types, W1 for pd/sd.
+            //   The mandatory prefix is ALWAYS 66; the scalar-vs-packed choice
+            //   is carried by the opcode's low bit, not by the prefix.
+            //   opcode = base(operation) + 0x10 * (order/100 - 1) + is_scalar
+            // Verified against GAS 2.47, e.g.
+            //   vfmadd132sd %xmm1,%xmm2,%xmm3 -> c4 e2 e9 99 d9
+            //   vfnmsub231ps %ymm1,%ymm2,%ymm3 -> c4 e2 6d be d9
+            m if is_fma3_vex(m) => {
+                let (opcode, w) = fma3_opcode(m).ok_or("bad FMA3 mnemonic")?;
+                if w == 1 {
+                    self.encode_avx_3op_38_w1(ops, opcode, true)
+                } else {
+                    self.encode_avx_3op_38(ops, opcode, true)
+                }
+            }
 
             // AVX comparison with immediate (vcmpps/vcmppd/vcmpss/vcmpsd)
             "vcmpps" => self.encode_avx_3op_0f_imm8(ops, 0xC2, false),
@@ -1721,6 +1804,14 @@ impl InstructionEncoder {
             "mulxl" => self.encode_bmi2_shift(ops, 0xF6, 3, 0), // F2.0F38.W0
             "andnq" => self.encode_bmi_andn(ops, 1), // NP.0F38.W1
             "andnl" => self.encode_bmi_andn(ops, 0), // NP.0F38.W0
+            // BMI1 blsi/blsr/blsmsk share opcode F3; ModRM.reg selects which:
+            //   /3 = blsi, /1 = blsr, /2 = blsmsk.  Destination goes in vvvv.
+            "blsil" => self.encode_bmi_blsx(ops, 3, 0),
+            "blsiq" => self.encode_bmi_blsx(ops, 3, 1),
+            "blsrl" => self.encode_bmi_blsx(ops, 1, 0),
+            "blsrq" => self.encode_bmi_blsx(ops, 1, 1),
+            "blsmskl" => self.encode_bmi_blsx(ops, 2, 0),
+            "blsmskq" => self.encode_bmi_blsx(ops, 2, 1),
             "bextrl" | "bextrq" => {
                 let w = if mnemonic == "bextrq" { 1 } else { 0 };
                 self.encode_bmi2_shift(ops, 0xF7, 0, w)          // NP.0F38.Wx
@@ -1858,10 +1949,6 @@ impl InstructionEncoder {
             "idivw" => { self.bytes.push(0x66); self.encode_unary_rm(ops, 7, 2) }
             "idivb" => self.encode_unary_rm(ops, 7, 1),
             "mulb" => self.encode_unary_rm(ops, 4, 1),
-
-            // ---- CBW/CWDE/CWD ----
-            "cbw" => { self.bytes.extend_from_slice(&[0x66, 0x98]); Ok(()) }
-            "cwd" => { self.bytes.extend_from_slice(&[0x66, 0x99]); Ok(()) }
 
             // ---- AVX: vzeroupper ----
             "vzeroupper" => {
@@ -2005,9 +2092,12 @@ impl InstructionEncoder {
             // ---- Additional x87 ----
             "fistpl" => self.encode_x87_mem(ops, &[0xDB], 3),
             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
+            // `s` suffix = 16-bit integer operand (DF opcode group).
+            "fists" => self.encode_x87_mem(ops, &[0xDF], 2),
+            "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
+            "fisttps" => self.encode_x87_mem(ops, &[0xDF], 1),
             "fildl" => self.encode_x87_mem(ops, &[0xDB], 0),
             "filds" => self.encode_x87_mem(ops, &[0xDF], 0),
-            "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
             "fisttpl" => self.encode_x87_mem(ops, &[0xDB], 1),
             "fdivl" => self.encode_x87_mem(ops, &[0xDC], 6),
             "fdivs" => self.encode_x87_mem(ops, &[0xD8], 6),
@@ -2140,6 +2230,10 @@ impl InstructionEncoder {
 
             // Prefetch instructions (0F 18 /0-3)
             "prefetcht0" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 1),
+            // MOVBE: 0F38 F0 loads (mem -> reg), F1 stores (reg -> mem).
+            "movbew" => self.encode_movbe(ops, 2),
+            "movbel" => self.encode_movbe(ops, 4),
+            "movbeq" => self.encode_movbe(ops, 8),
             "prefetcht1" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 2),
             "prefetcht2" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 3),
             "prefetchnta" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 0),

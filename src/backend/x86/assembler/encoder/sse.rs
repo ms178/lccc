@@ -293,6 +293,67 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode the 64-bit ADX forms (`adcxq`/`adoxq`).
+    ///
+    /// These are `<prefix> REX.W 0F 38 F6 /r`.  The mandatory prefix must come
+    /// BEFORE the REX byte, so the generic SSE path (which emits the whole
+    /// opcode array first) cannot be reused for the W=1 spelling.
+    pub(crate) fn encode_adx(&mut self, ops: &[Operand], prefix: u8, size: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("ADX requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(prefix);
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(prefix);
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(size, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported ADX operands".to_string()),
+        }
+    }
+
+    /// Encode MOVBE (load/store with byte-order swap).
+    ///
+    /// `0F 38 F0 /r` moves memory to register, `0F 38 F1 /r` register to
+    /// memory.  There is no register-to-register form.  The 16-bit spelling
+    /// takes the 0x66 operand-size prefix ahead of any REX byte.
+    pub(crate) fn encode_movbe(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movbe requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Memory(mem), Operand::Register(reg)) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(size, &reg.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF0]);
+                self.encode_modrm_mem(num, mem)
+            }
+            (Operand::Register(reg), Operand::Memory(mem)) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(size, &reg.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF1]);
+                self.encode_modrm_mem(num, mem)
+            }
+            _ => Err("movbe requires one memory and one register operand".to_string()),
+        }
+    }
+
     pub(crate) fn encode_rdrand(&mut self, ops: &[Operand], mnemonic: &str, opcode2: u8, reg_ext: u8) -> Result<(), String> {
         if ops.len() != 1 { return Err("rdrand requires 1 operand".to_string()); }
         match &ops[0] {
@@ -373,6 +434,20 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&opcode[prefix_len..]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
+            }
+            // Integer source may also come from memory: `cvtsi2sdl (%rdi),%xmm0`.
+            // The `l`/`q` suffix (not any register) decides REX.W here, which is
+            // exactly what the caller already passed in `gp_size`.
+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_segment_prefix(mem)?;
+                self.emit_rex_rm(gp_size, &dst.name, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem(dst_num, mem)
             }
             _ => Err("unsupported cvt operands".to_string()),
         }

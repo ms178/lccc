@@ -180,3 +180,13 @@ repne scasl
 repne scasq
 repne cmpsb
 repne cmpsw
+;;; seg_ss
+.text
+mov %ss:8(%rax), %rbx
+mov %ss:0, %rax
+mov %ss:8(%r13,%r12,4), %rax
+movl $1, %ss:(%rdi)
+movw $1, %ss:(%rdi)
+mov %ds:8(%rax), %rbx
+mov %es:8(%rax), %rbx
+mov %cs:8(%rax), %rbx

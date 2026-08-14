@@ -649,9 +649,24 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) if (is_xmm(&src.name) && is_xmm(&dst.name)) || (is_ymm(&src.name) && is_ymm(&dst.name)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_vex(r, false, b, 1, 0, 0, l, pp);
+                // Register-to-register moves can be spelled either direction:
+                // the load form (opcode 28/6F/10) with reg=dst,rm=src, or the
+                // store form (29/7F/11) with reg=src,rm=dst.  They differ only
+                // in which operand lands in VEX.R vs VEX.B.  VEX.B has no
+                // 2-byte encoding, so when the source needs the extension bit
+                // (xmm8-15) but the destination does not, the load form is
+                // forced to a 3-byte VEX while the store form fits in two.
+                // GAS picks the shorter one: `vmovaps %xmm9,%xmm0` -> c5 79 29
+                // c8, not c4 c1 78 28 c1.  One byte saved on a common move.
+                let src_ext = needs_vex_ext(&src.name);
+                let dst_ext = needs_vex_ext(&dst.name);
+                if src_ext && !dst_ext {
+                    self.emit_vex(src_ext, false, dst_ext, 1, 0, 0, l, pp);
+                    self.bytes.push(store_op);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
+                self.emit_vex(dst_ext, false, src_ext, 1, 0, 0, l, pp);
                 self.bytes.push(load_op);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
@@ -714,9 +729,17 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) if (is_xmm(&src.name) && is_xmm(&dst.name)) || (is_ymm(&src.name) && is_ymm(&dst.name)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_vex(r, false, b, 1, 0, 0, l, pp);
+                // Prefer the store direction when it avoids a 3-byte VEX; see
+                // the matching comment in `encode_avx_mov`.
+                let src_ext = needs_vex_ext(&src.name);
+                let dst_ext = needs_vex_ext(&dst.name);
+                if src_ext && !dst_ext {
+                    self.emit_vex(src_ext, false, dst_ext, 1, 0, 0, l, pp);
+                    self.bytes.push(store_op);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
+                self.emit_vex(dst_ext, false, src_ext, 1, 0, 0, l, pp);
                 self.bytes.push(load_op);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
@@ -907,7 +930,12 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let r = needs_vex_ext(&dst.name);
                 let b = needs_vex_ext(&src.name);
-                self.emit_vex(r, false, b, 3, 0, dst_num, l, pp);
+                // This is a two-operand instruction: there is no NDS source, so
+                // VEX.vvvv must be left unused.  `emit_vex` inverts this field,
+                // so the "unused" 1111 encoding is requested by passing 0.  Passing
+                // dst_num here made `vroundps $3,%ymm1,%ymm2` come out as
+                // c4 e3 6d ... instead of GAS's c4 e3 7d ...
+                self.emit_vex(r, false, b, 3, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 self.bytes.push(imm);
@@ -918,7 +946,7 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_vex(r, x, b_ext, 3, 0, dst_num, l, pp);
+                self.emit_vex(r, x, b_ext, 3, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
                 self.bytes.push(imm);
@@ -2104,14 +2132,40 @@ impl super::InstructionEncoder {
     pub(crate) fn encode_bmi2_shift(&mut self, ops: &[Operand], opcode: u8, pp: u8, w: u8) -> Result<(), String> {
         if ops.len() != 3 { return Err("BMI2 instruction requires 3 operands".to_string()); }
 
-        let vvvv_reg = match &ops[0] {
+        // Two different AT&T operand conventions share this encoder.
+        //
+        // The shift-style forms (shlx/shrx/sarx/bzhi/bextr) put the r/m source
+        // first and the vvvv operand second:  `shlxl %ecx, %eax, %edx`
+        //   ops[0]=vvvv, ops[1]=r/m, ops[2]=dst.
+        //
+        // The data-manipulation forms (mulx/pdep/pext) instead follow the andn
+        // convention, with the r/m operand FIRST:
+        //   `mulxl %eax, %ecx, %edx`  ->  ops[0]=r/m, ops[1]=vvvv, ops[2]=dst.
+        // Treating those as shift-style swapped vvvv with r/m, which silently
+        // produced a valid but wrong instruction (c4 e2 7b f6 d1 instead of
+        // c4 e2 73 f6 d0), and rejected the memory form outright.
+        //
+        // Distinguish by position: only the r/m operand may be memory, so if
+        // ops[0] is memory this is the andn-style order.  For the all-register
+        // case the caller tells us via the opcode: F5/F6 with pp!=0 are
+        // pext/pdep/mulx, while bzhi (F5, pp=0) and the F7 shifts are
+        // shift-style.
+        let andn_order = matches!(ops[0], Operand::Memory(_))
+            || (matches!(opcode, 0xF5 | 0xF6) && pp != 0);
+        let (rm_op, vvvv_op) = if andn_order {
+            (&ops[0], &ops[1])
+        } else {
+            (&ops[1], &ops[0])
+        };
+
+        let vvvv_reg = match vvvv_op {
             Operand::Register(r) => r,
-            _ => return Err("BMI2: first operand must be register".to_string()),
+            _ => return Err("BMI2: vvvv operand must be register".to_string()),
         };
         let vvvv_num = reg_num(&vvvv_reg.name).ok_or("bad vvvv register")?;
         let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv_reg.name) { 8 } else { 0 });
 
-        match (&ops[1], &ops[2]) {
+        match (rm_op, &ops[2]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
@@ -2132,6 +2186,207 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(dst_num, mem)
             }
             _ => Err("BMI2: unsupported operand combination".to_string()),
+        }
+    }
+
+    /// Encode the VEX scalar convert-to-GP forms (`vcvtsd2si`, `vcvttss2si`...).
+    ///
+    /// Two operands: an XMM source and a general-purpose destination.  VEX.W
+    /// selects the destination width, which means the 64-bit spelling cannot
+    /// use the 2-byte VEX prefix.  LIG, so L is left at 0.
+    /// `pp`: 2 = F3 (single source), 3 = F2 (double source).
+    pub(crate) fn encode_avx_cvt_to_gp(&mut self, ops: &[Operand], opcode: u8, pp: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("VEX cvt-to-GP requires 2 operands".to_string());
+        }
+        let dst = match &ops[1] {
+            Operand::Register(r) if !is_xmm_or_ymm(&r.name) => r,
+            _ => return Err("VEX cvt-to-GP requires a general-purpose destination".to_string()),
+        };
+        let dst_num = reg_num(&dst.name).ok_or("bad destination register")?;
+        let w = u8::from(is_reg64(&dst.name));
+        let r = needs_vex_ext(&dst.name);
+
+        match &ops[0] {
+            Operand::Register(src) if is_xmm(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad source register")?;
+                let b = needs_vex_ext(&src.name);
+                self.emit_vex(r, false, b, 1, w, 0, 0, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 1, w, 0, 0, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported VEX cvt-to-GP operands".to_string()),
+        }
+    }
+
+    /// Encode the VEX scalar convert-from-GP forms (`vcvtsi2sd`/`vcvtsi2ss`).
+    ///
+    /// Three operands: an integer source (register or memory), an NDS operand
+    /// that supplies the upper bits of the result, and an XMM destination.
+    /// VEX.W selects the SOURCE width, taken from the `l`/`q` suffix because a
+    /// memory source carries no width of its own.
+    pub(crate) fn encode_avx_cvt_from_gp(&mut self, ops: &[Operand], opcode: u8, pp: u8, w: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("VEX cvt-from-GP requires 3 operands".to_string());
+        }
+        let nds = match &ops[1] {
+            Operand::Register(r) => r,
+            _ => return Err("VEX cvt-from-GP: second operand must be a register".to_string()),
+        };
+        let dst = match &ops[2] {
+            Operand::Register(r) => r,
+            _ => return Err("VEX cvt-from-GP: destination must be a register".to_string()),
+        };
+        let dst_num = reg_num(&dst.name).ok_or("bad destination register")?;
+        let vvvv = reg_num(&nds.name).ok_or("bad NDS register")?
+            | (if needs_vex_ext(&nds.name) { 8 } else { 0 });
+        let r = needs_vex_ext(&dst.name);
+
+        match &ops[0] {
+            Operand::Register(src) => {
+                let src_num = reg_num(&src.name).ok_or("bad source register")?;
+                let b = needs_vex_ext(&src.name);
+                self.emit_vex(r, false, b, 1, w, vvvv, 0, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 1, w, vvvv, 0, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported VEX cvt-from-GP operands".to_string()),
+        }
+    }
+
+    /// Encode `vmaskmov{ps,pd}` in both directions.
+    ///
+    /// Load:  `vmaskmovps (%rdi), %ymm1, %ymm2`  -> 66.0F38.W0 2C, mem is r/m.
+    /// Store: `vmaskmovps %ymm2, %ymm1, (%rdi)` -> 66.0F38.W0 2E, mem is r/m.
+    /// In both spellings the middle operand is the mask and goes in VEX.vvvv.
+    pub(crate) fn encode_avx_maskmov(&mut self, ops: &[Operand], load_op: u8, store_op: u8, w: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("vmaskmov requires 3 operands".to_string());
+        }
+        let mask = match &ops[1] {
+            Operand::Register(r) => r,
+            _ => return Err("vmaskmov: mask must be a register".to_string()),
+        };
+        let vvvv = reg_num(&mask.name).ok_or("bad mask register")?
+            | (if needs_vex_ext(&mask.name) { 8 } else { 0 });
+        let l = u8::from(is_ymm(&mask.name));
+
+        match (&ops[0], &ops[2]) {
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
+                self.bytes.push(load_op);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&src.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
+                self.bytes.push(store_op);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported vmaskmov operands".to_string()),
+        }
+    }
+
+    /// Encode the AVX2 gathers (`vgatherdps`, `vpgatherdd`, ...).
+    ///
+    /// `vgatherdps %ymm2, (%rdi,%ymm1,4), %ymm3` has three operands: the mask
+    /// register (VEX.vvvv), a VSIB memory operand whose index is a VECTOR
+    /// register, and the destination.  The VSIB index supplies VEX.X, exactly
+    /// like a scalar index would, so the normal memory path already encodes it
+    /// correctly -- the only special part is that the index is an xmm/ymm.
+    pub(crate) fn encode_avx_gather(&mut self, ops: &[Operand], opcode: u8, w: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("gather requires 3 operands".to_string());
+        }
+        let mask = match &ops[0] {
+            Operand::Register(r) => r,
+            _ => return Err("gather: mask must be a register".to_string()),
+        };
+        let mem = match &ops[1] {
+            Operand::Memory(m) => m,
+            _ => return Err("gather: second operand must be a VSIB memory operand".to_string()),
+        };
+        let dst = match &ops[2] {
+            Operand::Register(r) => r,
+            _ => return Err("gather: destination must be a register".to_string()),
+        };
+        if mem.index.is_none() {
+            return Err("gather: VSIB memory operand requires a vector index".to_string());
+        }
+
+        let dst_num = reg_num(&dst.name).ok_or("bad destination register")?;
+        let vvvv = reg_num(&mask.name).ok_or("bad mask register")?
+            | (if needs_vex_ext(&mask.name) { 8 } else { 0 });
+        let l = u8::from(is_ymm(&dst.name));
+        let r = needs_vex_ext(&dst.name);
+        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+
+        self.emit_vex(r, x, b_ext, 2, w, vvvv, l, 1);
+        self.bytes.push(opcode);
+        self.encode_modrm_mem(dst_num, mem)
+    }
+
+    /// Encode the BMI1 single-source bit-manipulation forms blsi/blsr/blsmsk.
+    ///
+    /// `blsrl %eax, %ecx` reads a single r/m source and writes one destination,
+    /// but the destination is encoded in VEX.vvvv rather than ModRM.reg -- the
+    /// reg field is repurposed as an opcode extension selecting the operation
+    /// (/1 blsr, /2 blsmsk, /3 blsi).  All three share opcode 0xF3 in the
+    /// NP.0F38 map, with W selecting the 32- vs 64-bit form.
+    /// AT&T operand order: ops[0] = r/m source, ops[1] = destination.
+    pub(crate) fn encode_bmi_blsx(&mut self, ops: &[Operand], ext: u8, w: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("BMI1 bls* requires 2 operands".to_string());
+        }
+        let dst = match &ops[1] {
+            Operand::Register(r) => r,
+            _ => return Err("BMI1 bls*: destination must be a register".to_string()),
+        };
+        let vvvv = reg_num(&dst.name).ok_or("bad destination register")?
+            | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
+
+        match &ops[0] {
+            Operand::Register(src) => {
+                let src_num = reg_num(&src.name).ok_or("bad source register")?;
+                let b = needs_vex_ext(&src.name);
+                // VEX.R is unused (the reg field is an opcode extension).
+                self.emit_vex(false, false, b, 2, w, vvvv, 0, 0);
+                self.bytes.push(0xF3);
+                self.bytes.push(self.modrm(3, ext, src_num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(false, x, b_ext, 2, w, vvvv, 0, 0);
+                self.bytes.push(0xF3);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("BMI1 bls*: unsupported source operand".to_string()),
         }
     }
 

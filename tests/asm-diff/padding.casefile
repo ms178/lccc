@@ -10653,3 +10653,11 @@ nop
 nop
 .p2align 4
 ret
+;;; org_dot
+.text
+nop
+.org . + 16
+ret
+nop
+.org . + 8, 0x90
+ret

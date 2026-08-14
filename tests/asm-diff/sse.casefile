@@ -1153,3 +1153,19 @@ aeskeygenassist $17, %xmm1, %xmm2
 pclmulqdq $17, %xmm1, %xmm2
 aeskeygenassist $255, %xmm1, %xmm2
 pclmulqdq $17, %xmm1, %xmm2
+;;; sse4_extra
+.text
+pcmpeqq %xmm1, %xmm2
+pcmpeqq %xmm9, %xmm14
+pcmpeqq (%rdi), %xmm3
+mpsadbw $0, %xmm1, %xmm2
+mpsadbw $7, %xmm9, %xmm14
+pblendvb %xmm0, %xmm1, %xmm2
+lddqu (%rdi), %xmm0
+cvttpd2dq %xmm1, %xmm2
+cvtsi2sdl (%rdi), %xmm0
+cvtsi2sdq (%rdi), %xmm0
+cvtsd2si %xmm0, %eax
+cvtsd2si %xmm0, %rax
+cvttsd2si %xmm0, %eax
+cvttss2si %xmm0, %rax
