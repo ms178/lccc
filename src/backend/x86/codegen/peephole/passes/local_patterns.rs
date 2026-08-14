@@ -14,7 +14,7 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
-use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family};
+use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family, extract_jump_target};
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
 /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
@@ -918,9 +918,68 @@ pub(super) fn fold_lea_into_memory_op(
             .split(',')
             .map(str::trim)
             .collect();
-        if fields.len() < 2 || fields.len() > 3
-            || fields.iter().any(|field| !field.starts_with('%'))
-        {
+        // Single-base form: `leaq disp(%base), %dst` with no index/scale.
+        // This is the dominant shape emitted for pointer induction in hot
+        // loops (gzip longest_match): `leaq 2(%r9),%rdx; movzbl (%rdx),%edi`.
+        // The SIB-only matcher below never fired on it, so each byte compare
+        // paid a dead LEA + a register round-trip. Fold it to
+        // `movzbl disp(%base),%edi` when the temporary is provably dead.
+        if fields.len() == 1 {
+            let base = fields[0];
+            if !base.starts_with('%') {
+                i += 1;
+                continue;
+            }
+            let base_family = register_family_fast(base);
+            if base_family == REG_NONE
+                || base_family > REG_GP_MAX
+                || dst_family == base_family
+            {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len || infos[j].is_barrier() {
+                i += 1;
+                continue;
+            }
+            let next = infos[j].trimmed(store.get(j));
+            let addr_pat = format!("({})", dst_text);
+            // Match a BARE `(%dst)` memory operand. A displacement form like
+            // `8(%rdx)` or `0x2(%rdx)` must not match — the replacement would
+            // corrupt `8(` into `8disp(`.
+            let bare_ok = next.match_indices(&addr_pat).any(|(pos, _)| {
+                pos == 0 || {
+                    let c = next.as_bytes()[pos - 1] as char;
+                    c == ' ' || c == ',' || c == '\t'
+                }
+            });
+            if !bare_ok {
+                i += 1;
+                continue;
+            }
+            // The address was already computed by the LEA; dropping it is valid
+            // only if the destination register is dead after the memory op.
+            if fam_read_after(store, infos, j + 1, dst_family) {
+                i += 1;
+                continue;
+            }
+            let sib = format!("{}({})", displacement, base);
+            let replacement = next.replacen(&addr_pat, &sib, 1);
+            if replacement == next {
+                i += 1;
+                continue;
+            }
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, format!("    {}", replacement));
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+        if fields.len() > 3 || fields.iter().any(|field| !field.starts_with('%')) {
             i += 1;
             continue;
         }
@@ -3011,6 +3070,35 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                 i += 1;
                 continue;
             };
+            // SAFETY: replacing the preheader's `jmp <header>` with the hoisted
+            // load relies on that load executing on EVERY entry into the loop via
+            // fall-through from the preheader. That is only sound when the header
+            // has NO other FORWARD entry edge: a conditional branch (e.g.
+            // `je <header>`) from a different predecessor enters the loop
+            // directly, bypassing the preheader, and would observe an
+            // uninitialized destination register. (gzip's deflate: the `rsync`
+            // guard's `je` into the hash-table loop header — `head` was reloaded
+            // into %rcx only on the fall-through edge, so `head[ins_h]=strstart`
+            // wrote through `&rsync`, corrupted globals and SIGSEGV'd.) Back-edges
+            // (position > header) are fine: the load is invariant and the
+            // destination is not written inside the loop (verified above).
+            let mut forward_entries = 0u32;
+            for idx in 0..header {
+                if infos[idx].is_nop() { continue; }
+                if matches!(infos[idx].kind, LineKind::Jmp | LineKind::CondJmp) {
+                    let t = infos[idx].trimmed(store.get(idx));
+                    if let Some(tg) = extract_jump_target(t) {
+                        if tg == target.as_str() {
+                            forward_entries += 1;
+                        }
+                    }
+                }
+            }
+            // Exactly one forward reference (the entry jmp itself) is allowed.
+            if forward_entries != 1 {
+                i += 1;
+                continue;
+            }
             // Replace the entry jmp with the load; execution falls through into the
             // header. The load is invariant (slot not written in loop, no calls) and
             // the dest register is not written in the loop (checked above).

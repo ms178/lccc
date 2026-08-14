@@ -669,6 +669,63 @@ mod tests {
     }
 
     #[test]
+    fn test_gpr_hoist_skips_multi_entry_loop() {
+        // Regression: hoisting a loop-invariant GPR load into the preheader is
+        // sound only when the header has a SINGLE forward entry edge (the entry
+        // jmp). A conditional `je <header>` from a different predecessor enters
+        // the loop directly, bypassing the preheader, and would observe a stale
+        // destination register. (gzip deflate: the `rsync` guard's `je` into the
+        // hash-table loop header left `head` unloaded in %rcx, so
+        // `head[ins_h]=strstart` wrote through `&rsync`, corrupted globals, and
+        // SIGSEGV'd under PGO builds.)
+        let asm = [
+            "    movq 16(%rsp), %rcx",
+            "    movslq (%rcx), %rax",
+            "    testq %rax, %rax",
+            "    je .LBB1",
+            ".LBB2:",
+            "    movl (%rbx), %eax",
+            "    jmp .LBB1",
+            ".p2align 4",
+            ".LBB1:",
+            "    movl (%rbx), %edi",
+            "    movq 304(%rsp), %rcx",
+            "    addq %rcx, %rax",
+            "    jne .LBB1",
+        ].join("\n") + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        assert!(!changed, "must not hoist when the header has a second forward entry edge");
+        let result = store.build_result(|i| infos[i].is_nop());
+        assert!(result.contains("jmp .LBB1"), "entry jmp must be preserved: {}", result);
+        assert!(result.contains("movq 304(%rsp), %rcx"), "invariant load must stay in the loop: {}", result);
+    }
+
+    #[test]
+    fn test_gpr_hoist_single_entry() {
+        // Positive control: with a single forward entry edge (the entry jmp),
+        // the invariant load SHOULD still be hoisted into the preheader.
+        let asm = [
+            ".LBB2:",
+            "    movl (%rbx), %eax",
+            "    jmp .LBB1",
+            ".LBB1:",
+            "    movl (%rbx), %edi",
+            "    movq 304(%rsp), %rcx",
+            "    addq %rcx, %rax",
+            "    jne .LBB1",
+        ].join("\n") + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        assert!(changed, "single-entry loop should still hoist the invariant load");
+        let result = store.build_result(|i| infos[i].is_nop());
+        assert!(!result.contains("jmp .LBB1"), "entry jmp should be replaced by the hoisted load: {}", result);
+        assert!(result.contains("movq 304(%rsp), %rcx"), "hoisted load must be present in the preheader: {}", result);
+    }
+
+    #[test]
     fn test_push_pop_elimination() {
         let asm = "    pushq %rax\n    movq %rax, %rcx\n    popq %rax\n".to_string();
         let result = peephole_optimize(asm);

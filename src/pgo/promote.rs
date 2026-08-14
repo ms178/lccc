@@ -55,6 +55,9 @@ pub fn sig_of(info: &CallInfo) -> String {
 /// Promote indirect calls in `m` using the loaded profile for unit `u`.
 /// Returns the number of sites promoted and records hot labels for layout.
 pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
+    if std::env::var("LCCC_PGO_NO_PROMOTE").is_ok() {
+        return 0;
+    }
     let Some(p) = crate::pgo::get_pgo_profile() else {
         return 0;
     };

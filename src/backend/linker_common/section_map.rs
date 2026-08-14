@@ -9,6 +9,14 @@
 /// like `.text.foo` are merged into `.text`, `.rodata.bar` into `.rodata`, etc.
 /// RISC-V additionally maps `.sdata`/`.sbss` (via `map_section_name_riscv()`).
 pub fn map_section_name(name: &str) -> &str {
+    // Profile-guided hot/cold partitioning (PGO `-fprofile-use`) emits
+    // `.text.hot` and `.text.unlikely` sections; the linker must KEEP them
+    // separate (ordered `.text` → `.text.hot` → `.text.unlikely`) so hot
+    // functions stay contiguous for I-cache locality and cold code is pushed
+    // to the end of the executable region. Folding them into `.text` (the old
+    // `.text.*` → `.text` rule) interleaved hot and cold functions per object
+    // and threw away the entire benefit of the compiler's partitioning.
+    if name == ".text.hot" || name == ".text.unlikely" { return name; }
     if name.starts_with(".text.") || name == ".text" { return ".text"; }
     if name.starts_with(".data.rel.ro") { return ".data.rel.ro"; }
     if name.starts_with(".data.") || name == ".data" { return ".data"; }

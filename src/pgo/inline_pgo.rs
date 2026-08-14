@@ -93,6 +93,9 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
 /// this: a flat profile compiles exactly like plain `-O2` for inlining, and PGO
 /// inlining only engages where the profile is genuinely skewed.
 pub fn inline_decisions_active() -> bool {
+    if std::env::var("LCCC_PGO_NO_INLINE").is_ok() {
+        return false;
+    }
     match crate::pgo::summary::get_summary() {
         Some(s) => s.has_spread(),
         None => true, // no summary: use the relative-frequency heuristics

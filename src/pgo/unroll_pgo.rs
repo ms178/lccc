@@ -80,6 +80,9 @@ pub fn should_unroll_loop(
     size: usize,
     p: Option<&ProfileData>,
 ) -> Option<bool> {
+    if std::env::var("LCCC_PGO_NO_UNROLL").is_ok() {
+        return None; // let the size/feature-driven unroller decide on its own
+    }
     let _ = p?;
     if size_opt() {
         return Some(false);

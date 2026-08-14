@@ -137,5 +137,10 @@ pub(super) fn create_plt_got(
         }
     }
 
+    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
+        for (i, (name, is_plt)) in got_entries.iter().enumerate() {
+            eprintln!("[GOT] idx={} plt={} name={:?}", i, is_plt, name);
+        }
+    }
     (plt_names, got_entries)
 }

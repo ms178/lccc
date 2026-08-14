@@ -1173,6 +1173,11 @@ pub(super) fn emit_executable(
                                         let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
                                         got_addr + nb as u64 * 8
                                     };
+                                    if std::env::var("LCCC_DEBUG_GOT").is_ok() {
+                                        let nb = got_entries[..gi].iter().filter(|(n,p)| !n.is_empty() && !*p).count();
+                                        eprintln!("[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
+                                            sym.name, gi, entry.1, nb, gea, got_addr, p, a);
+                                    }
                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                                     continue;
                                 }

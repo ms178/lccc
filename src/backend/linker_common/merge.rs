@@ -101,9 +101,23 @@ pub fn merge_sections_elf64_gc(
         let is_exec = sec.flags & SHF_EXECINSTR != 0;
         let is_write = sec.flags & SHF_WRITE != 0;
         let is_nobits = sec.sh_type == SHT_NOBITS;
-        if is_exec { (1u32, is_nobits as u32) }
-        else if !is_write { (0, is_nobits as u32) }
-        else { (2, is_nobits as u32) }
+        // Executable sections are ordered so PGO hot/cold partitioning is
+        // honored: `.text` → `.text.hot` → `.text.unlikely` → other exec.
+        // Hot functions stay in a contiguous region and cold functions are
+        // pushed to the tail of the executable segment.
+        let exec_rank = if is_exec {
+            match sec.name.as_str() {
+                ".text" => 0u32,
+                ".text.hot" => 1,
+                ".text.unlikely" => 2,
+                _ => 3,
+            }
+        } else {
+            0
+        };
+        if is_exec { (1u32, exec_rank, is_nobits as u32) }
+        else if !is_write { (0, 0u32, is_nobits as u32) }
+        else { (2, 0u32, is_nobits as u32) }
     });
 
     let mut index_remap: FxHashMap<usize, usize> = FxHashMap::default();
