@@ -32,7 +32,6 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut whole_archive = false;
     let mut emit_symtab = true;
     let mut entry_override: Option<String> = None;
-    let mut wl_args: Vec<String> = Vec::new(); // forwarded to fallback linker path
 
     let mut i = 0;
     while i < args.len() {

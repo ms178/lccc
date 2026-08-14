@@ -1669,44 +1669,73 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
                 if j < len && !infos[j].is_nop() {
                     let line_j = infos[j].trimmed(store.get(j));
-                    let (expected, xmm_str) = if load_reg == 0 {
-                        ("movq %rax, %xmm0", "%xmm0")
-                    } else {
-                        ("movq %rcx, %xmm1", "%xmm1")
-                    };
-                    if line_j == expected {
-                        let load_text = infos[i].trimmed(store.get(i));
-                        let base = if load_text.contains("(%rsp)") { "rsp" } else { "rbp" };
-                        let new_text = format!("    movsd {}(%{}), {}", offset, base, xmm_str);
-                        replace_line(store, &mut infos[i], i, new_text);
-                        mark_nop(&mut infos[j]);
-                        changed = true;
-                        i += 1;
-                        continue;
+                    // Generalize to any %xmmN destination (the emitter rotates
+                    // through xmm2..xmm13); the load_reg selects the bridge GPR.
+                    let bridge = if load_reg == 0 { "movq %rax, " } else { "movq %rcx, " };
+                    if line_j.starts_with(bridge) {
+                        let xmm_str = &line_j[bridge.len()..];
+                        // SOUNDNESS: this rewrites the LOAD itself, so the
+                        // bridge GPR loses its only definition. It may only be
+                        // dropped when nothing reads it afterwards. Pattern B
+                        // has always checked this (rax_elidable_after); Pattern
+                        // A never did, and generalising it from %xmm0/%xmm1 to
+                        // all sixteen XMM registers widened a latent
+                        // miscompile: for
+                        //     movq -24(%rbp), %rax
+                        //     movq %rax, %xmm7
+                        //     addq $7, %rax        <- still reads %rax
+                        // the pass emitted `movsd -24(%rbp), %xmm7` and left
+                        // `addq $7, %rax` reading a register nothing defines.
+                        if xmm_str.starts_with("%xmm") && !xmm_str.contains(' ') {
+                            let mut k = j + 1;
+                            while k < len && infos[k].is_nop() { k += 1; }
+                            let bridge_dead = if load_reg == 0 {
+                                rax_elidable_after(store, infos, k, len)
+                            } else {
+                                !fam_read_after(store, infos, k, 1 /* rcx */)
+                            };
+                            if bridge_dead {
+                                let load_text = infos[i].trimmed(store.get(i));
+                                let base = if load_text.contains("(%rsp)") { "rsp" } else { "rbp" };
+                                let new_text = format!("    movsd {}(%{}), {}", offset, base, xmm_str);
+                                replace_line(store, &mut infos[i], i, new_text);
+                                mark_nop(&mut infos[j]);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Pattern B: "movq %xmm0, %rax" then StoreRbp{rax, Q}
+        // Pattern B: "movq %xmmN, %rax" then StoreRbp{rax, Q} → one movsd.
+        // The original pass only matched %xmm0; the accumulator-based FP
+        // emitter rotates through %xmm2..%xmm13, so every other spill still
+        // paid the GPR round-trip. Match any %xmmN (a valid 64-bit bit-copy
+        // source) whose %rax bridge register is dead afterwards.
         if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
             let line_i = infos[i].trimmed(store.get(i));
-            if line_i == "movq %xmm0, %rax" {
-                let mut j = i + 1;
-                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
-                if j < len {
-                    if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
-                        let mut k = j + 1;
-                        while k < len && infos[k].is_nop() { k += 1; }
-                        if rax_elidable_after(store, infos, k, len) {
-                            let store_text = infos[j].trimmed(store.get(j));
-                            let base = if store_text.contains("(%rsp)") { "rsp" } else { "rbp" };
-                            let new_text = format!("    movsd %xmm0, {}(%{})", offset, base);
-                            mark_nop(&mut infos[i]);
-                            replace_line(store, &mut infos[j], j, new_text);
-                            changed = true;
-                            i = j + 1;
-                            continue;
+            if line_i.starts_with("movq %xmm") && line_i.ends_with(", %rax") {
+                let src_xmm = &line_i[5..line_i.len() - 6]; // strip "movq " and ", %rax"
+                if src_xmm.starts_with("%xmm") {
+                    let mut j = i + 1;
+                    while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                    if j < len {
+                        if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
+                            let mut k = j + 1;
+                            while k < len && infos[k].is_nop() { k += 1; }
+                            if rax_elidable_after(store, infos, k, len) {
+                                let store_text = infos[j].trimmed(store.get(j));
+                                let base = if store_text.contains("(%rsp)") { "rsp" } else { "rbp" };
+                                let new_text = format!("    movsd {}, {}(%{})", src_xmm, offset, base);
+                                mark_nop(&mut infos[i]);
+                                replace_line(store, &mut infos[j], j, new_text);
+                                changed = true;
+                                i = j + 1;
+                                continue;
+                            }
                         }
                     }
                 }

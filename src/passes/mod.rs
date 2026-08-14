@@ -11,6 +11,7 @@
 //! - Os: O2 with code-size-increasing transforms disabled
 //! - Oz: Os with inlining disabled
 
+pub(crate) mod aggregate_sroa;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
@@ -518,6 +519,32 @@ macro_rules! preloop_dump {
         module.for_each_function(dce::eliminate_dead_code);
         copy_prop::forward_memcpy_chains(module);
         copy_prop::forward_large_memcpy_loads(module);
+    }
+    // Aggregate SROA: replace struct/array Memcpy copies with scalar field
+    // accesses so the surrounding mem2reg can promote the fields to SSA
+    // (by-value struct args/returns and struct assignment after the final
+    // inlining). Covers the cases the narrower memcpy forwards miss: copies
+    // below the 128-byte large-copy threshold, sources that are GEPs into a
+    // local alloca, and the copy-out write path.
+    //
+    // Enabled by default. It was previously opt-in because the IR it produced
+    // violated SSA def-before-use -- the planner's insert and remove indices
+    // both referenced the ORIGINAL instruction list, but removals were applied
+    // first, so every later insert landed one slot too late and a fresh
+    // GetElementPtr ended up AFTER the Load consuming it. The backend then
+    // faithfully emitted `movsd (%r11),%xmm5` before `leaq 8(%rdx),%r11` and
+    // struct_copy segfaulted. That was misattributed to a backend scheduling
+    // defect; the backend is innocent. Edits are now applied in a single
+    // index-stable rebuild per block. Two further soundness holes are fixed:
+    // the escape scan is an allowlist (Intrinsic operands used to be invisible,
+    // which deleted live SIMD copies), and dead aggregate allocas are dropped
+    // only after re-checking the final instruction stream.
+    if std::env::var("CCC_DISABLE_AGGREGATE_SROA").is_err() {
+        aggregate_sroa::run(module);
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        module.for_each_function(dce::eliminate_dead_code);
     }
     preloop_dump!("post-structural-inline");
 

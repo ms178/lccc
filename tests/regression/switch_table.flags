@@ -1,1 +1,1 @@
--fprofile-generate=/tmp/pgd_switch
+-fprofile-generate=@PROFDIR@

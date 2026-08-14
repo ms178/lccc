@@ -583,6 +583,59 @@ mod tests {
     }
 
     #[test]
+    fn test_fp_xmm_roundtrip_store_any_xmm_reg() {
+        // The accumulator-based FP emitter rotates through %xmm2..%xmm13;
+        // every spill through those registers must fold to a direct movsd,
+        // not just %xmm0.
+        let asm = "    movq %xmm4, %rax\n    movq %rax, 296(%rsp)\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsd %xmm4, 296(%rsp)"),
+            "should fold movq %xmm4->rax + store: {}", result);
+        assert!(!result.contains("movq %xmm4, %rax"),
+            "GPR bridge should be gone: {}", result);
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_store_high_xmm_reg() {
+        let asm = "    movq %xmm13, %rax\n    movq %rax, 112(%rbp)\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsd %xmm13, 112(%rbp)"),
+            "should fold high xmm register: {}", result);
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_keeps_live_bridge() {
+        // Pattern A rewrites the LOAD, deleting the bridge GPR's definition.
+        // With %rax still read afterwards the fold must NOT happen.
+        let asm = "    movq -24(%rbp), %rax\n    movq %rax, %xmm7\n    addq $7, %rax\n".to_string();
+        let result = peephole_optimize(asm);
+        let defined = result.contains("movq -24(%rbp), %rax");
+        let read = result.contains("addq $7, %rax");
+        assert!(!(read && !defined),
+            "folded away a LIVE %rax definition:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_rcx_keeps_live_bridge() {
+        let asm = "    movq -8(%rbp), %rcx\n    movq %rcx, %xmm3\n    addq $1, %rcx\n".to_string();
+        let result = peephole_optimize(asm);
+        let defined = result.contains("movq -8(%rbp), %rcx");
+        let read = result.contains("addq $1, %rcx");
+        assert!(!(read && !defined),
+            "folded away a LIVE %rcx definition:\n{}", result);
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_any_xmm_reg() {
+        let asm = "    movq -24(%rbp), %rax\n    movq %rax, %xmm7\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsd -24(%rbp), %xmm7"),
+            "should fold load into any xmm register: {}", result);
+        assert!(!result.contains("movq %rax, %xmm7"),
+            "bridge movq should be gone: {}", result);
+    }
+
+    #[test]
     fn test_fp_memory_fold_mulsd() {
         let asm = [
             "    movsd -40(%rbp), %xmm1",

@@ -12,9 +12,22 @@ for src in "$dir"/*.c; do
   name=$(basename "$src" .c)
   # Per-test flags: a sibling <name>.flags file adds compiler flags
   # (e.g. "-mavx2" for SIMD tests that need explicit ISA enablement).
+  #
+  # @PROFDIR@ expands to a directory unique to this checkout and this test.
+  # The PGO tests previously hard-coded paths like /tmp/pgd_switch, so two
+  # working trees on one machine (or a rerun racing a stale directory) shared
+  # profile state and the first run after a rebuild reported spurious
+  # mismatches. Each test now gets its own directory, wiped before use.
   extra_flags=""
   if [ -f "$dir/$name.flags" ]; then
     extra_flags=$(cat "$dir/$name.flags")
+    case "$extra_flags" in
+      *@PROFDIR@*)
+        profdir="${TMPDIR:-/tmp}/lccc-prof.$(printf '%s' "$dir" | cksum | cut -d" " -f1)/$name"
+        rm -rf "$profdir"; mkdir -p "$profdir"
+        extra_flags=${extra_flags//@PROFDIR@/$profdir}
+        ;;
+    esac
   fi
   # Per-test environment: a sibling <name>.env file is sourced so tests can
   # select non-default compiler modes (e.g. LCCC_FORCE_SSE2=1 for the legacy

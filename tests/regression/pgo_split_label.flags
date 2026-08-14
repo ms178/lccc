@@ -1,1 +1,1 @@
--fprofile-generate=/tmp/pgd_split_label
+-fprofile-generate=@PROFDIR@

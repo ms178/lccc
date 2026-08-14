@@ -165,12 +165,6 @@ pub fn link_with_script(
     // empty marker sections (.init.begin) share addresses with real ones.
     let mut placed_owner: FxHashMap<(usize, usize), usize> = FxHashMap::default();
 
-    macro_rules! make_ctx {
-        ($symbols:expr, $dot:expr) => {
-            EvalCtx { dot: $dot, symbols: $symbols, sections: &sections_meta }
-        };
-    }
-
     // Resolve symbol via assignments or object definitions.
     fn lookup_sym(
         name: &str,
