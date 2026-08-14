@@ -774,10 +774,19 @@ fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
     if max == 0 {
         return out;
     }
+    // Default factor is 1 (NEUTRAL). Inflating use counts by up to 4x made
+    // the allocator treat hot-loop values as near-unevictable, which measured
+    // as a ~20% increase in stack-slot traffic inside gzip's `longest_match`
+    // hot loop (+16 stack accesses) and a +4.7% runtime regression on gzip
+    // compress versus plain -O2. The weighting also double-counts loop depth:
+    // `priority` already carries a 10^loop_depth multiplier, so per-use
+    // hotness on top over-amplifies inner-loop temporaries and perturbs the
+    // eviction heuristic. The knob remains for experiments that show a real
+    // win on their own workload.
     let max_factor = std::env::var("CCC_PGO_WEIGHT_MAX")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(4)
+        .unwrap_or(1)
         .clamp(1, 16);
     let span = max_factor - 1;
     let mut point = 0u32;

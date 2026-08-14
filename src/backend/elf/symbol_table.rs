@@ -225,13 +225,28 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
 /// True if the relocation type is a TLS relocation (x86-64 and i386).
 /// Undefined symbols referenced by these must be emitted as STT_TLS so the
 /// static linker can match them against TLS definitions.
+///
+/// The relocation-type numbers COLLIDE across the two architectures, so the
+/// classifier must be target-aware. The old naive union included 42, which is
+/// `R_X86_64_REX_GOTPCRELX` (a relaxable GOT reference) — NOT a TLS
+/// relocation on either architecture. Every `@GOTPCRELX`-referenced symbol
+/// was therefore emitted as STT_TLS, and the linker laid it out as a
+/// thread-local symbol whose address resolved to the WRONG symbol (gzip:
+/// `prev` resolved to `&rsync`, so `head = prev + WSIZE` wrote hash entries
+/// into the globals region and corrupted `strstart` — SIGSEGV in deflate
+/// under PGO builds, and only there because block alignment changed the
+/// GOT-layout path).
 fn is_tls_reloc(rtype: u32) -> bool {
-    // x86-64: R_X86_64_DTPMOD64=16, DTPOFF64=17, TPOFF64=18, TPOFF32=23,
-    //          DTPOFF32=21, GOTTPOFF=22, TLSDESC=36, TLSDESC_CALL=42
-    // i386:    R_386_TLS_TPOFF=14, TLS_IE=15, TLS_GOTIE=16, TLS_LE=17,
-    //          TLS_GD=18, TLS_LDM=19, TLS_GD_32=24..TLS_TPOFF32=35
-    // Deduplicated union of the two arch sets: the 16/17/18 overlap between
-    // x86-64 and i386 made the original arms unreachable (rustc warning).
-    // x86-64 {16,17,18,21,22,23,36,42} ∪ i386 {14..19, 24..35} = {14..19, 21..23, 24..35, 36, 42}
-    matches!(rtype, 14..=19 | 21..=23 | 24..=35 | 36 | 42)
+    if crate::common::types::target_is_32bit() {
+        // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
+        // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
+        matches!(rtype, 14..=19 | 24..=37 | 39..=41)
+    } else {
+        // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
+        // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
+        // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
+        // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
+        // NOT TLS — deliberately excluded.
+        matches!(rtype, 16..=23 | 29..=31)
+    }
 }

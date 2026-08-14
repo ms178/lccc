@@ -62,10 +62,12 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
         // with cold code — the opposite of the I-cache goal.
         let hot = fp.total_count > 0 && fp.total_count.saturating_mul(10) >= max;
         let cold = max > 0 && fp.total_count.saturating_mul(1000) < max;
-        if hot {
-            f.section = Some(".text.hot".into());
-        } else if cold {
-            f.section = Some(".text.unlikely".into());
+        if std::env::var("LCCC_PGO_NO_SECTION").is_err() {
+            if hot {
+                f.section = Some(".text.hot".into());
+            } else if cold {
+                f.section = Some(".text.unlikely".into());
+            }
         }
         if f.blocks.len() >= 2 {
             layout_function(f, fp, u, edges_valid);
@@ -75,7 +77,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // Order functions by hotness class within the TU — hot first, cold
     // last — for I-cache-friendly object layout (GCC -freorder-functions).
     // Declarations and helper functions keep their relative order (class 3).
-    if crate::pgo::summary::get_summary().is_some() {
+    if crate::pgo::summary::get_summary().is_some()
+        && std::env::var("LCCC_PGO_NO_REORDER").is_err()
+    {
         let n = m.functions.len();
         let mut cls: Vec<u8> = vec![3; n];
         for (i, f) in m.functions.iter().enumerate() {
@@ -134,6 +138,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     let mut cf_map: crate::common::fx_hash::FxHashMap<u32, u32> =
         crate::common::fx_hash::FxHashMap::default();
     for f in &m.functions {
+        if std::env::var("LCCC_PGO_NO_CFALL").is_ok() {
+            break;
+        }
         if f.is_declaration || f.blocks.is_empty() {
             continue;
         }
@@ -167,6 +174,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // Hot loop headers and join points get 16-byte alignment. Very hot loop
     // headers with larger bodies get 32-byte alignment. Candidates are gated
     // on per-block execution count, so cold blocks receive no padding.
+    if std::env::var("LCCC_PGO_NO_ALIGN").is_err()
     {
         let mut align_map: crate::common::fx_hash::FxHashMap<u32, u8> =
             crate::common::fx_hash::FxHashMap::default();
@@ -252,20 +260,18 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
             }
             for b in &f.blocks {
                 let l = b.label.0;
-                let c = fp.block_count(b.label);
                 if !hot(l) {
                     continue;
                 }
                 if is_loop_header.contains(&l) {
-                    // Use 32 bytes for very hot headers with at least eight
-                    // instructions; otherwise use 16 bytes.
-                    let body = b.instructions.len();
-                    let alignment = if c.saturating_mul(4) >= entry_count && body >= 8 {
-                        5
-                    } else {
-                        4
-                    };
-                    align_map.insert(l, alignment);
+                    // 16-byte loop-header alignment only. The former 32-byte
+                    // tier for very hot headers with at least eight
+                    // instructions bloated hot functions with multi-byte NOP
+                    // padding (gzip: longest_match grew ~11%, 7 padding
+                    // sites) and measured SLOWER than 16-byte alignment on
+                    // gzip compress — GCC's -falign-loops default is 16 and
+                    // LLVM aligns hot loops to 16 too.
+                    align_map.insert(l, 4);
                 } else if indeg.get(&l).copied().unwrap_or(0) >= 2 {
                     // Hot join point (multiple predecessors): align the merge
                     // so the fall-in is decode-friendly.
