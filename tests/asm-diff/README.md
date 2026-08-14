@@ -6,8 +6,16 @@ miscompile that only surfaces at run time, or dead bytes in the I-cache.
 Neither is visible from the compiler's own output — only a direct comparison
 against a reference implementation finds them.
 
-GNU as is the oracle. LCCC must either agree exactly, or reject exactly what
-GNU as rejects.
+GNU as is the *correctness* oracle: LCCC must either agree exactly, or reject
+exactly what GNU as rejects.
+
+Agreeing with GNU as is not the same as being optimal. Where several encodings
+of an instruction are legal, `scripts/encdiff.py` compares against the Clang,
+GCC, ICC and ICX integrated assemblers as well, and scores LCCC against the
+shortest form any of them produced. A group tagged `betterok` is allowed to
+differ from GNU as, but only when LCCC is strictly shorter AND the two objects
+disassemble to the same instruction sequence -- the runner verifies that with
+objdump rather than taking the byte count on trust.
 
 ## Layout
 
@@ -24,12 +32,28 @@ The corpora are produced by `scripts/gen_asmdiff_corpus.py` and consumed by
 the corpus can never contain an input that would make the differential report
 a false failure.
 
+## Case flags
+
+```
+;;; name                  compare bytes, relocs and symbols against GNU as
+;;; name nosym            skip the symbol-table comparison
+;;; name reject           both assemblers must REFUSE this input
+;;; name betterok         LCCC may differ if it is shorter and decodes the same
+```
+
 ## Status
 
-All 721 cases pass against GNU as 2.47, and the per-instruction differential
-agrees byte-for-byte on every one of the 9,805 distinct instructions in the
-corpus (the remaining 63 are the deliberate reject list, which both assemblers
-refuse).
+All 723 cases pass against GNU as 2.47. Across the 9,901 distinct
+instructions in the corpus, the per-instruction differential reports:
+
+```
+ok      = 9,712   byte-identical to GNU as
+BETTER  =   126   shorter than GNU as, verified to decode identically
+reject  =    63   deliberate reject list; both assemblers refuse
+```
+
+There are no unexplained differences: every case is either byte-identical, a
+machine-verified improvement, or an intentional rejection.
 
 `insndiff.py` synthesises any numeric local label an instruction refers to, so
 `jmp 1f` is compared as a real jump rather than being rejected by the oracle

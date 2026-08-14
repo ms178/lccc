@@ -555,3 +555,17 @@ mov 0x7ffffffe, %eax
 movabs 0x123456789abcdef0, %rax
 movabs 0x123456789abcdef0, %al
 movabs %rax, 0x123456789abcdef0
+;;; bt_width_inference
+.text
+bt $7, %ax
+bt $7, %eax
+bt $7, %rax
+bts $7, %eax
+bts $7, %rax
+btr $7, %ecx
+btr $7, %rcx
+btc $7, %r8d
+btc $7, %r8
+bt %eax, %ecx
+bt %rax, %rcx
+bt %ax, %cx

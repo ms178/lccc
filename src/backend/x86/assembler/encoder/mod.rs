@@ -2123,10 +2123,28 @@ impl InstructionEncoder {
             }
 
             // ---- Additional suffixless forms ----
-            "bt" => self.encode_bt(ops, "btq"),
-            "bts" => self.encode_bt(ops, "btsq"),
-            "btr" => self.encode_bt(ops, "btrq"),
-            "btc" => self.encode_bt(ops, "btcq"),
+            // Unsuffixed bt/bts/btr/btc take their width from the operand, the
+            // same way GAS does.  Hard-coding the `q` form put a REX.W on
+            // `bt $7,%eax`, making it 5 bytes where every other assembler
+            // (GAS, clang, gcc, icc, icx) emits 4.  The bit-offset semantics
+            // are unchanged for an in-range immediate, so the REX.W was pure
+            // waste.  Memory operands with no register to inspect keep the
+            // 32-bit default, which is what GAS picks (with a warning).
+            "bt" | "bts" | "btr" | "btc" => {
+                let width = ops.iter().find_map(|op| match op {
+                    Operand::Register(r) => match reg_class(&r.name) {
+                        RegClass::Gp(w) => Some(w),
+                        _ => None,
+                    },
+                    _ => None,
+                }).unwrap_or(4);
+                let suffixed = match width {
+                    8 => format!("{}q", mnemonic),
+                    2 => format!("{}w", mnemonic),
+                    _ => format!("{}l", mnemonic),
+                };
+                self.encode_bt(ops, &suffixed)
+            }
             "rcl" => self.encode_suffixless_shift(ops, 2),
             "rcr" => self.encode_suffixless_shift(ops, 3),
             "rol" => self.encode_suffixless_shift(ops, 0),
