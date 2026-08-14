@@ -2082,7 +2082,7 @@ mov 128(%r15,%r15,8), %rdx
 mov -128(%r15,%r15,8), %rdx
 mov -129(%r15,%r15,8), %rdx
 mov 2147483647(%r15,%r15,8), %rdx
-;;; nobase_rax
+;;; nobase_rax betterok
 .text
 mov 0(,%rax,1), %rcx
 mov 4(,%rax,1), %rcx
@@ -2108,7 +2108,7 @@ mov 127(,%rax,8), %rcx
 mov 128(,%rax,8), %rcx
 mov -1(,%rax,8), %rcx
 mov 2147483647(,%rax,8), %rcx
-;;; nobase_rcx
+;;; nobase_rcx betterok
 .text
 mov 0(,%rcx,1), %rcx
 mov 4(,%rcx,1), %rcx
@@ -2134,7 +2134,7 @@ mov 127(,%rcx,8), %rcx
 mov 128(,%rcx,8), %rcx
 mov -1(,%rcx,8), %rcx
 mov 2147483647(,%rcx,8), %rcx
-;;; nobase_rdx
+;;; nobase_rdx betterok
 .text
 mov 0(,%rdx,1), %rcx
 mov 4(,%rdx,1), %rcx
@@ -2160,7 +2160,7 @@ mov 127(,%rdx,8), %rcx
 mov 128(,%rdx,8), %rcx
 mov -1(,%rdx,8), %rcx
 mov 2147483647(,%rdx,8), %rcx
-;;; nobase_rbx
+;;; nobase_rbx betterok
 .text
 mov 0(,%rbx,1), %rcx
 mov 4(,%rbx,1), %rcx
@@ -2186,7 +2186,7 @@ mov 127(,%rbx,8), %rcx
 mov 128(,%rbx,8), %rcx
 mov -1(,%rbx,8), %rcx
 mov 2147483647(,%rbx,8), %rcx
-;;; nobase_rbp
+;;; nobase_rbp betterok
 .text
 mov 0(,%rbp,1), %rcx
 mov 4(,%rbp,1), %rcx
@@ -2212,7 +2212,7 @@ mov 127(,%rbp,8), %rcx
 mov 128(,%rbp,8), %rcx
 mov -1(,%rbp,8), %rcx
 mov 2147483647(,%rbp,8), %rcx
-;;; nobase_rsi
+;;; nobase_rsi betterok
 .text
 mov 0(,%rsi,1), %rcx
 mov 4(,%rsi,1), %rcx
@@ -2238,7 +2238,7 @@ mov 127(,%rsi,8), %rcx
 mov 128(,%rsi,8), %rcx
 mov -1(,%rsi,8), %rcx
 mov 2147483647(,%rsi,8), %rcx
-;;; nobase_rdi
+;;; nobase_rdi betterok
 .text
 mov 0(,%rdi,1), %rcx
 mov 4(,%rdi,1), %rcx
@@ -2264,7 +2264,7 @@ mov 127(,%rdi,8), %rcx
 mov 128(,%rdi,8), %rcx
 mov -1(,%rdi,8), %rcx
 mov 2147483647(,%rdi,8), %rcx
-;;; nobase_r8
+;;; nobase_r8 betterok
 .text
 mov 0(,%r8,1), %rcx
 mov 4(,%r8,1), %rcx
@@ -2290,7 +2290,7 @@ mov 127(,%r8,8), %rcx
 mov 128(,%r8,8), %rcx
 mov -1(,%r8,8), %rcx
 mov 2147483647(,%r8,8), %rcx
-;;; nobase_r9
+;;; nobase_r9 betterok
 .text
 mov 0(,%r9,1), %rcx
 mov 4(,%r9,1), %rcx
@@ -2316,7 +2316,7 @@ mov 127(,%r9,8), %rcx
 mov 128(,%r9,8), %rcx
 mov -1(,%r9,8), %rcx
 mov 2147483647(,%r9,8), %rcx
-;;; nobase_r10
+;;; nobase_r10 betterok
 .text
 mov 0(,%r10,1), %rcx
 mov 4(,%r10,1), %rcx
@@ -2342,7 +2342,7 @@ mov 127(,%r10,8), %rcx
 mov 128(,%r10,8), %rcx
 mov -1(,%r10,8), %rcx
 mov 2147483647(,%r10,8), %rcx
-;;; nobase_r11
+;;; nobase_r11 betterok
 .text
 mov 0(,%r11,1), %rcx
 mov 4(,%r11,1), %rcx
@@ -2394,7 +2394,7 @@ mov 127(,%r12,8), %rcx
 mov 128(,%r12,8), %rcx
 mov -1(,%r12,8), %rcx
 mov 2147483647(,%r12,8), %rcx
-;;; nobase_r13
+;;; nobase_r13 betterok
 .text
 mov 0(,%r13,1), %rcx
 mov 4(,%r13,1), %rcx
@@ -2420,7 +2420,7 @@ mov 127(,%r13,8), %rcx
 mov 128(,%r13,8), %rcx
 mov -1(,%r13,8), %rcx
 mov 2147483647(,%r13,8), %rcx
-;;; nobase_r14
+;;; nobase_r14 betterok
 .text
 mov 0(,%r14,1), %rcx
 mov 4(,%r14,1), %rcx
@@ -2446,7 +2446,7 @@ mov 127(,%r14,8), %rcx
 mov 128(,%r14,8), %rcx
 mov -1(,%r14,8), %rcx
 mov 2147483647(,%r14,8), %rcx
-;;; nobase_r15
+;;; nobase_r15 betterok
 .text
 mov 0(,%r15,1), %rcx
 mov 4(,%r15,1), %rcx
@@ -2509,3 +2509,30 @@ movabs 0x123456789abcdef0, %al
 movabs $0x123456789abcdef0, %rax
 movabs $0, %rax
 movabs $-1, %r15
+;;; nobase_fold_guard betterok
+.text
+mov -1(,%rax,1), %rcx
+mov -1(,%rbx,1), %rcx
+mov -1(,%rcx,1), %rcx
+mov -1(,%rdx,1), %rcx
+mov -1(,%rsi,1), %rcx
+mov -1(,%rdi,1), %rcx
+mov -1(,%rbp,1), %rcx
+mov -1(,%r8,1), %rcx
+mov -1(,%r9,1), %rcx
+mov -1(,%r10,1), %rcx
+mov -1(,%r11,1), %rcx
+mov -1(,%r12,1), %rcx
+mov -1(,%r13,1), %rcx
+mov -1(,%r14,1), %rcx
+mov -1(,%r15,1), %rcx
+mov 0(,%r13,1), %rcx
+mov 0(,%r12,1), %rcx
+mov (,%r13,1), %rcx
+mov 127(,%r13,1), %rcx
+mov 128(,%r13,1), %rcx
+mov 8(,%rax,2), %rcx
+mov 8(,%rax,4), %rcx
+mov 8(,%rax,8), %rcx
+leaq (,%rbx,1), %rdx
+leaq -1(,%r15,1), %rdx

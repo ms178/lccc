@@ -1,4 +1,4 @@
-;;; lea
+;;; lea betterok
 .text
 leaq (%rax,%rcx,1), %rdx
 leal (%rax,%rcx,1), %edx

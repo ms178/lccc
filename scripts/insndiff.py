@@ -172,6 +172,43 @@ def local_label_scaffold(inst: str) -> tuple[str, str]:
     return ("\n".join(before), "\n".join(after))
 
 
+
+_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
+_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
+
+
+def _decode(objdump: str, data: bytes, tmp: Path) -> str:
+    """Disassemble raw bytes and normalise away pure encoding choices."""
+    if not data:
+        return ""
+    raw = tmp / "d.bin"
+    raw.write_bytes(data)
+    r = subprocess.run(
+        [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
+         "-M", "att", str(raw)],
+        capture_output=True, text=True, timeout=120)
+    out = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
+        if not m:
+            continue
+        insn = m.group(2).split("#")[0].strip()
+        # A redundant scale-1 index and an explicit zero displacement are the
+        # two spellings that differ only by encoding, not by meaning.
+        insn = _SCALE1.sub(r"(%\1)", insn)
+        insn = _ZERODISP.sub("(", insn)
+        out.append(re.sub(r"\s+", " ", insn))
+    return "\n".join(out)
+
+
+def verify_shorter(objdump: str, l: Encoding, g: Encoding, tmp: Path) -> bool:
+    """True when LCCC's shorter encoding decodes to the same instruction."""
+    try:
+        return _decode(objdump, l.data, tmp) == _decode(objdump, g.data, tmp)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 # ─── Classification ───────────────────────────────────────────────────────
 
 def classify(l: Encoding, g: Encoding) -> str:
@@ -198,7 +235,8 @@ SEVERITY = {
     "WRONG-BYTES": 1,    # same length, different meaning
     "REJECTS-VALID": 2,  # cannot build valid code
     "LONGER": 3,         # correct but wastes I-cache
-    "SHORTER": 4,        # correct and smaller; verify semantics, then keep
+    "SHORTER": 4,        # smaller, but the decode check could not confirm it
+    "BETTER": 7,         # smaller AND verified to decode identically
     "both-reject": 5,
     "ok": 6,
 }
@@ -209,6 +247,9 @@ def main() -> int:
         description="Per-instruction LCCC vs GNU as encoding differential.")
     ap.add_argument("--lccc", default=str(DEFAULT_LCCC))
     ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
+    ap.add_argument("--objdump",
+                    default=os.environ.get("LCCC_OBJDUMP", "objdump"),
+                    help="disassembler used to verify SHORTER encodings")
     ap.add_argument("--objcopy", default=os.environ.get("LCCC_OBJCOPY", "objcopy"))
     ap.add_argument("--file", type=Path, help="one instruction per line")
     ap.add_argument("--sweep", action="append", default=[],
@@ -262,14 +303,20 @@ def main() -> int:
             src.write_text("\n".join(parts) + "\n")
             le = encode_lccc(args.lccc, src, tmp / f"l{i}.o", args.objcopy)
             ge = encode_gas(args.gas, src, tmp / f"g{i}.o", args.objcopy)
-            results.append((inst, classify(le, ge), le, ge))
+            kind = classify(le, ge)
+            # A shorter encoding is only an improvement if it still means the
+            # same thing. Confirm that here rather than leaving it to a human:
+            # a shorter encoding that decodes differently is a miscompile.
+            if kind == "SHORTER" and verify_shorter(args.objdump, le, ge, tmp):
+                kind = "BETTER"
+            results.append((inst, kind, le, ge))
 
     results.sort(key=lambda r: (SEVERITY.get(r[1], 9), r[0]))
     shown = 0
     for inst, kind, le, ge in results:
         if args.quiet:
             break
-        if args.only_diff and kind in ("ok", "both-reject"):
+        if args.only_diff and kind in ("ok", "both-reject", "BETTER"):
             continue
         if shown >= args.max_report:
             print(f"... ({len(results) - shown} more)")

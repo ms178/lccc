@@ -188,6 +188,45 @@ def hexdiff(a: bytes, b: bytes, limit: int = 8) -> str:
     return "\n".join(out)
 
 
+_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
+_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
+
+
+def _norm_disasm(text: str) -> str:
+    """Normalise a disassembly listing for semantic comparison.
+
+    Two encodings are equivalent when they decode to the same instruction with
+    the same effective address. The two spellings that differ purely by
+    encoding choice are a redundant scale-1 index (`-0x1(,%rdi,1)` is the same
+    address as `-0x1(%rdi)`) and an explicit zero displacement.
+    """
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
+        if not m:
+            continue
+        insn = m.group(2).strip()
+        insn = _SCALE1.sub(r"(%\1)", insn)
+        insn = _ZERODISP.sub("(", insn)
+        insn = re.sub(r"\s+", " ", insn)
+        # Drop the trailing branch-target comment objdump appends.
+        insn = insn.split("#")[0].strip()
+        out.append(insn)
+    return "\n".join(out)
+
+
+def semantically_equal(a_obj: Path, b_obj: Path, objdump: str) -> bool:
+    """True when two objects disassemble to the same instruction sequence."""
+    try:
+        ta = subprocess.run([objdump, "-d", str(a_obj)],
+                            capture_output=True, text=True, timeout=120).stdout
+        tb = subprocess.run([objdump, "-d", str(b_obj)],
+                            capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return _norm_disasm(ta) == _norm_disasm(tb)
+
+
 def compare(lo: ElfImage, go: ElfImage, *, check_symbols: bool) -> list[str]:
     errs: list[str] = []
     names = sorted({n for n in lo.content if _interesting(n)} |
@@ -234,6 +273,11 @@ class Case:
     text: str
     mode: str = "accept"
     check_symbols: bool = True
+    # When set, a section may differ from GNU as provided LCCC's encoding is
+    # strictly shorter AND decodes to the same instruction sequence. This is
+    # how a deliberate encoding win is asserted without weakening the check
+    # into "any difference is fine".
+    allow_better: bool = False
 
 
 HEADER = re.compile(r"^;;;\s*(\S+)\s*(.*)$")
@@ -252,7 +296,8 @@ def load_cases(path: Path) -> list[Case]:
             flags = m.group(2).split()
             cur = Case(f"{path.stem}/{m.group(1)}", "",
                        "reject" if "reject" in flags else "accept",
-                       "nosym" not in flags)
+                       "nosym" not in flags,
+                       "betterok" in flags)
             buf = []
         elif cur is not None:
             buf.append(line)
@@ -290,6 +335,18 @@ def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool):
         errs = compare(read_elf(lo), read_elf(go), check_symbols=c.check_symbols)
     except Exception as exc:  # noqa: BLE001
         return (c.name, False, f"ELF parse error: {exc}")
+
+    if errs and c.allow_better:
+        # Accept the difference only if every byte-level complaint is LCCC
+        # being smaller, and the two objects still decode identically.
+        objdump = os.environ.get("LCCC_OBJDUMP") or (
+            shutil.which("objdump") or "objdump")
+        size_l = len(read_elf(lo).content.get(".text", b""))
+        size_g = len(read_elf(go).content.get(".text", b""))
+        only_size = all("bytes differ" in e for e in errs)
+        if only_size and size_l < size_g and semantically_equal(lo, go, objdump):
+            return (c.name, True, f"BETTER: {size_l}B vs gas {size_g}B, "
+                                  f"same disassembly")
     if errs:
         body = "\n".join(errs)
         return (c.name, False, body if verbose else body[:1800])

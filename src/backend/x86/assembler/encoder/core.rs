@@ -91,6 +91,11 @@ impl super::InstructionEncoder {
         // it — the address was encoded as 64-bit, which GAS-oracle caught as
         // a one-byte divergence from GNU as (and is semantically wrong for
         // addresses >= 4 GiB).
+        // Fold BEFORE computing REX: if the index moves into the base slot the
+        // extension bit for r8-r15 must be REX.B, not REX.X.
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+
         let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
             || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
         if addr32 {
@@ -137,6 +142,9 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_modrm_mem(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
 
@@ -342,4 +350,61 @@ impl super::InstructionEncoder {
             }
         }
     }
+}
+
+/// Fold an index-only, scale-1 address into a plain base address.
+///
+/// `-1(,%rdi,1)` and `-1(%rdi)` compute the same effective address, but the
+/// first needs a SIB byte and -- because SIB with no base only supports
+/// mod=00 + disp32 -- a full 4-byte displacement.  Moving the index into the
+/// base slot removes the SIB byte and lets the displacement shrink to disp8,
+/// turning 8 bytes into 4.  ICC performs this fold; GAS 2.47, clang 22.1,
+/// gcc 16.2 and icx 2024.0 all emit the longer form.
+///
+/// Two register numbers can never be folded, because the base slot assigns
+/// them a meaning the index slot does not have:
+///   * reg 4 (%rsp/%r12) -- base==100 is the escape that selects a SIB byte,
+///     so folding produced `(%rsp,%r12,1)`.
+///   * reg 5 (%rbp/%r13) -- mod=00 with base==101 means "no base, disp32",
+///     so folding produced `(%rbp)`.
+///
+/// Returning the rewritten operand (rather than mutating in place) lets the
+/// REX emitter and the ModR/M emitter share one decision: the extension bit
+/// for r8-r15 has to move from REX.X to REX.B along with the register, and
+/// having two code paths decide independently is what made an earlier version
+/// of this fold emit `rex.WX mov -0x1(%rdx)` for `mov -1(,%r10,1)`.
+pub(crate) fn fold_scale1_index(mem: &MemoryOperand) -> Option<MemoryOperand> {
+    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
+        return None;
+    }
+    let idx = mem.index.as_ref()?;
+    // reg 4 (%rsp/%r12) stays in the index slot: putting it in the base slot
+    // selects the SIB escape, and the general encoder would then have to
+    // re-derive a SIB with index=none to keep the meaning.  ICC does emit that
+    // form (`mov -1(,%r12,1)` -> 49 8b 4c 24 ff, 5 bytes vs our 8), so this is
+    // a known 3-byte opportunity left on the table deliberately: expressing it
+    // needs a base+"no index" SIB that this helper cannot describe by operand
+    // rewriting alone.
+    //
+    // reg 5 (%rbp/%r13) IS foldable, but only because a non-zero displacement
+    // forces mod=01/10 anyway, which gives base==101 its ordinary meaning.
+    // With mod=00 base==101 means "no base, disp32", so a zero-displacement
+    // fold would change the address; require a displacement in that case.
+    match reg_num(&idx.name) {
+        Some(4) => return None,
+        Some(5) => {
+            let has_disp = !matches!(mem.displacement, Displacement::None)
+                && !matches!(mem.displacement, Displacement::Integer(0));
+            if !has_disp {
+                return None;
+            }
+        }
+        _ => {}
+    }
+    Some(MemoryOperand {
+        base: mem.index.clone(),
+        index: None,
+        scale: None,
+        ..mem.clone()
+    })
 }
