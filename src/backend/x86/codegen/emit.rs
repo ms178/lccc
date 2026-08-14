@@ -1767,6 +1767,15 @@ impl X86Codegen {
         if depth >= 32 {
             panic!("x86 codegen: cyclic or excessive Copy chain for value {}", val.0);
         }
+        // Every materialisation below is a 64-bit `movq`/`leaq` into `reg`, so
+        // `reg` must name a 64-bit register. Passing a 32-bit name produced
+        // `movq %r8, %eax`, which is not encodable; the integrated assembler
+        // rejected it and zlib-ng's slide_hash_avx2.c failed to build. Catch
+        // the mistake at its source instead of in the assembler.
+        debug_assert!(
+            reg.starts_with('r') && !reg.ends_with('d'),
+            "value_to_reg expects a 64-bit register name, got %{reg}"
+        );
         // Check register allocation first (allocas are never register-allocated)
         if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {
             if is_xmm_reg(phys_reg) {

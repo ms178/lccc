@@ -352,6 +352,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("lea_mem_sib") {
             changed |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
         }
+        if !sk("lea_all_uses") {
+            changed |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
+        }
         if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
         if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
         if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
@@ -418,6 +421,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
             // across loop boundaries). Honor the skip set.
             if !sk("combined") { changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos); }
             if !sk("lea_mem_sib") { changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
+            if !sk("lea_all_uses") { changed2 |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos); }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);

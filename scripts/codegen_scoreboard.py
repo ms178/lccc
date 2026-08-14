@@ -34,6 +34,8 @@ Examples
 """
 from __future__ import annotations
 
+import hashlib
+import shlex
 import argparse
 import concurrent.futures
 import json
@@ -130,6 +132,47 @@ def strip_noise(lines: list[str]) -> list[str]:
                                                           ".data", ".bss"))]
 
 
+# Godbolt compiler ids. scripts/godbolt.py exposes only compile_on_godbolt(),
+# so the id table and the local-compile path live here.
+ORACLE_IDS = {
+    "gcc":   "cg162",
+    "clang": "cclang2210",
+    "icc":   "cicc2021100",
+    "icx":   "cicx202400",
+}
+
+CACHE = Path(__file__).resolve().parent.parent / ".godbolt-cache"
+
+
+def compile_local(lccc: str, path: Path, flags: str) -> list[str]:
+    """Compile with the local lccc and return assembly lines."""
+    out = path.with_suffix(".local.s")
+    cmd = [lccc, *shlex.split(flags), "-S", str(path), "-o", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1:] or "lccc failed")
+    try:
+        return out.read_text().splitlines()
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def compile_remote(name: str, src: str, flags: str) -> list[str]:
+    """Compile on godbolt, caching by (compiler, flags, source) digest."""
+    cid = ORACLE_IDS.get(name, name)
+    key = hashlib.sha256(f"{cid}\0{flags}\0{src}".encode()).hexdigest()[:32]
+    CACHE.mkdir(exist_ok=True)
+    hit = CACHE / f"{key}.s"
+    if hit.exists():
+        return hit.read_text().splitlines()
+    data = godbolt.compile_on_godbolt(cid, src, flags)
+    if data is None:
+        raise RuntimeError(f"{name}: compile failed")
+    lines = [x.get("text", "") for x in (data.get("asm") or [])]
+    hit.write_text("\n".join(lines))
+    return lines
+
+
 @dataclass
 class FileResult:
     path: str
@@ -143,15 +186,14 @@ def measure(path: Path, lccc: str, flags: str, oracles: list[str],
     src = path.read_text()
 
     try:
-        lines = godbolt.compile_local(lccc, path, local_flags or flags)
+        lines = compile_local(lccc, path, local_flags or flags)
         res.per_compiler["lccc"] = parse_functions(strip_noise(lines))
     except Exception as e:  # noqa: BLE001
         res.errors["lccc"] = f"{type(e).__name__}: {e}"
 
     def one(name: str):
         try:
-            cid, _ = godbolt.resolve(name)
-            lines = godbolt.compile_remote(cid, src, flags)
+            lines = compile_remote(name, src, flags)
             return name, parse_functions(strip_noise(lines)), None
         except Exception as e:  # noqa: BLE001
             return name, {}, f"{type(e).__name__}: {e}"

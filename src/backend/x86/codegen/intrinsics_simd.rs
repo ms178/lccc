@@ -485,10 +485,10 @@ impl X86Codegen {
             | Movddup128 | Movsldup128 | Movshdup128
             | RoundPs128 | RoundPd128 | BlendPs128 | BlendPd128 | BlendvPs128 | BlendvPd128
             | DpPs128 | DpPd128 | InsertPs128 | InsertPd128 | VpermilPs128
-            | Movss128 | Movsd128 | CvtSi2Ss_128 | CvtSi2Sd_128 | CvtSi2Ss64_128 | CvtSi2Sd64_128
-            | CvtSs2Sd_128 | CvtSd2Ss_128
-            | CvtPs2Ep32_128 | CvtEp32_2Ps_128 | CvttPs2Ep32_128
-            | CvtPs2Pd_128 | CvtPd2Ps_128 | CvtPd2Ep32_128 | CvtEp32_2Pd_128 | CvttPd2Ep32_128
+            | Movss128 | Movsd128 | CvtSi2Ss128 | CvtSi2Sd128 | CvtSi2Ss64_128 | CvtSi2Sd64_128
+            | CvtSs2Sd128 | CvtSd2Ss128
+            | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128
+            | CvtPs2Pd128 | CvtPd2Ps128 | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128
             | FmaPs132 | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
                 self.emit_sse_fp_128_op(dptr, op, args);
                 true
@@ -501,8 +501,8 @@ impl X86Codegen {
             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256
             | BlendvPs256 | BlendvPd256 | VpermilPs256 | Vperm2f128 | Vinsertf128
             | Vextractf128 | Vbroadcastss | Vbroadcastsd
-            | CvtPs2Ep32_256 | CvtEp32_2Ps_256 | CvttPs2Ep32_256
-            | CvtPs2Pd_256 | CvtPd2Ps_256 | CvtPd2Ep32_256 | CvtEp32_2Pd_256 | CvttPd2Ep32_256
+            | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
+            | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
             | VpermilvarPs256 | VpermilvarPd256
             | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
             | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
@@ -853,8 +853,8 @@ impl X86Codegen {
             MovemaskPs256 => ("vmovmskps", 0, true),
             MovemaskPd256 => ("vmovmskpd", 0, true),
             ExtractPs128 => ("extractps", 0, true),
-            CvtSs2Si_128 => ("cvtss2si", 0, true),
-            CvtSd2Si_128 => ("cvtsd2si", 0, true),
+            CvtSs2Si128 => ("cvtss2si", 0, true),
+            CvtSd2Si128 => ("cvtsd2si", 0, true),
             TestzPs128 => ("vtestps", 0, true),
             TestzPs256 => ("vtestps", 0, true),
             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),
@@ -915,7 +915,7 @@ impl X86Codegen {
                 }
                 true
             }
-            CvtSs2Si_128 | CvtSd2Si_128 => {
+            CvtSs2Si128 | CvtSd2Si128 => {
                 self.sse_load_arg(&args[0], "xmm0");
                 self.state.emit_fmt(format_args!("    {} %xmm0, %eax", inst));
                 if let Some(d) = dest {
@@ -1016,12 +1016,12 @@ impl X86Codegen {
             Movsldup128 => unary(self, "movsldup"),
             Movshdup128 => unary(self, "movshdup"),
             CvtPs2Ep32_128 => unary(self, "cvtps2dq"),
-            CvtEp32_2Ps_128 => unary(self, "cvtdq2ps"),
+            CvtEp32ToPs128 => unary(self, "cvtdq2ps"),
             CvttPs2Ep32_128 => unary(self, "cvttps2dq"),
-            CvtPs2Pd_128 => unary(self, "cvtps2pd"),
-            CvtPd2Ps_128 => unary(self, "cvtpd2ps"),
+            CvtPs2Pd128 => unary(self, "cvtps2pd"),
+            CvtPd2Ps128 => unary(self, "cvtpd2ps"),
             CvtPd2Ep32_128 => unary(self, "cvtpd2dq"),
-            CvtEp32_2Pd_128 => unary(self, "cvtdq2pd"),
+            CvtEp32ToPd128 => unary(self, "cvtdq2pd"),
             CvttPd2Ep32_128 => unary(self, "cvttpd2dq"),
             HaddPs128 | HsubPs128 | AddsubPs128 | HaddPd128 | HsubPd128 | AddsubPd128
             | UnpcklPs128 | UnpckhPs128 | UnpcklPd128 | UnpckhPd128 => {
@@ -1105,8 +1105,8 @@ impl X86Codegen {
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             // cvtsi2ss/cvtsi2sd (a, i): convert i into xmm0 holding a
-            CvtSi2Ss_128 | CvtSi2Sd_128 => {
-                let inst = if matches!(op, CvtSi2Ss_128) { "cvtsi2ss" } else { "cvtsi2sd" };
+            CvtSi2Ss128 | CvtSi2Sd128 => {
+                let inst = if matches!(op, CvtSi2Ss128) { "cvtsi2ss" } else { "cvtsi2sd" };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.operand_to_reg(&args[1], "rax");
                 self.state.emit_fmt(format_args!("    {} %eax, %xmm0", inst));
@@ -1120,8 +1120,8 @@ impl X86Codegen {
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             // cvtss2sd/cvtsd2ss (a, b)
-            CvtSs2Sd_128 | CvtSd2Ss_128 => {
-                let inst = if matches!(op, CvtSs2Sd_128) { "cvtss2sd" } else { "cvtsd2ss" };
+            CvtSs2Sd128 | CvtSd2Ss128 => {
+                let inst = if matches!(op, CvtSs2Sd128) { "cvtss2sd" } else { "cvtsd2ss" };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.sse_load_arg(&args[1], "xmm1");
                 self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
@@ -1191,12 +1191,12 @@ impl X86Codegen {
             VpermilvarPs256 => binary(self, "vpermilps", false),
             VpermilvarPd256 => binary(self, "vpermilpd", false),
             CvtPs2Ep32_256 => unary(self, "vcvtps2dq"),
-            CvtEp32_2Ps_256 => unary(self, "vcvtdq2ps"),
+            CvtEp32ToPs256 => unary(self, "vcvtdq2ps"),
             CvttPs2Ep32_256 => unary(self, "vcvttps2dq"),
-            CvtPs2Pd_256 => unary(self, "vcvtps2pd"),
-            CvtPd2Ps_256 => unary(self, "vcvtpd2ps"),
+            CvtPs2Pd256 => unary(self, "vcvtps2pd"),
+            CvtPd2Ps256 => unary(self, "vcvtpd2ps"),
             CvtPd2Ep32_256 => unary(self, "vcvtpd2dq"),
-            CvtEp32_2Pd_256 => unary(self, "vcvtdq2pd"),
+            CvtEp32ToPd256 => unary(self, "vcvtdq2pd"),
             CvttPd2Ep32_256 => unary(self, "vcvttpd2dq"),
             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {

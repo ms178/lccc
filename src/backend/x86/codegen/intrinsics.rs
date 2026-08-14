@@ -1382,13 +1382,23 @@ impl X86Codegen {
                         self.state.emit_fmt(format_args!("    {} {}, %ymm0", inst, operand));
                     } else if self.avx512_enabled {
                         // EVEX GPR-source vpbroadcast: 1 uop on port 5, no movd.
+                        // operand_to_reg materialises through a 64-bit `movq`,
+                        // so it must be handed the 64-bit register name; only
+                        // the broadcast operand itself is width-specific.
+                        self.operand_to_reg(&args[0], "rax");
                         let reg = if bits == 8 { "rax" } else { "eax" };
-                        self.operand_to_reg(&args[0], reg);
                         self.state.emit_fmt(format_args!("    {} %{}, %ymm0", inst, reg));
                     } else {
                         // AVX2: vmovd + xmm-source vpbroadcast (matches GCC/LLVM).
-                        let reg = if bits == 8 { "rax" } else { "eax" };
-                        self.operand_to_reg(&args[0], reg);
+                        //
+                        // Always load through %rax: operand_to_reg emits
+                        // `movq %src, %dst` and passing "eax" produced the
+                        // invalid `movq %r8, %eax`, which the integrated
+                        // assembler rightly rejected -- zlib-ng's
+                        // slide_hash_avx2.c (`_mm256_set1_epi16((short)wsize)`)
+                        // failed to build because of it. The narrowing to 32
+                        // or 8 bits is expressed by the movd/movq that follows.
+                        self.operand_to_reg(&args[0], "rax");
                         if bits == 8 {
                             self.state.emit("    movq %rax, %xmm0");
                         } else {
