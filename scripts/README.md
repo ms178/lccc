@@ -8,6 +8,7 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
 | `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Judges LCCC against the *shortest legal encoding any oracle produced*, not against GAS alone. |
+| `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
 | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
 | `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
 | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
@@ -27,6 +28,11 @@ for `mov -1(,%rdi,1),%rcx`, GAS, clang, gcc and icx all emit 8 bytes while ICC
 emits 4, because ICC folds a scale-1 index into the base slot and drops the
 SIB byte. Comparing only against GAS would have shown a clean pass forever.
 
+`encdiff.py` batches many instructions into one Compiler Explorer request
+(each probe fenced by `ud2` inside its own naked function) and queries the
+oracles concurrently, so a 1,900-instruction sweep against five assemblers
+takes ~30 s rather than ~2 h.
+
 A shorter encoding is never accepted on size alone. Both `encdiff.py` and
 `insndiff.py` disassemble the two candidates and require them to decode to the
 same instruction; `asmdiff.py` does the same for a whole object when a case is
@@ -34,6 +40,21 @@ marked `betterok`. This is not ceremony -- the first version of the fold was
 4 bytes shorter *and wrong* for `%r12`/`%r13`, because those register numbers
 mean something different in the base slot than in the index slot, and only the
 round-trip check caught it.
+
+Two verdicts record deliberate refusals, so they are not mistaken for work
+left undone:
+
+* `DECLINED-FP` -- clang and icx exchange the sources of `vaddps`/`vmulps`
+  (and the pd/scalar forms) to reach the 2-byte VEX prefix. x86 FP add and
+  multiply are not bit-commutative: with two NaN inputs the result carries
+  SRC1's payload. Measured here, `vaddps` over (0x7fc00001, 0x7fc00002) gives
+  0x7fc00001 one way and 0x7fc00002 the other, so the byte is not taken.
+  Bitwise FP ops (`vandps`/`vorps`/`vxorps`) have no NaN rule and were
+  measured bit-identical under exchange, so those ARE shortened.
+* `DECLINED-WRONG` -- ICC encodes `xchg %eax, %eax` as the one-byte `0x90`.
+  That is not equivalent: the xchg is a 32-bit register write and zeroes the
+  upper half of RAX, while NOP does nothing. Measured from
+  RAX=0x1122334455667788, `87 c0` leaves 0x0000000055667788.
 
 ## Oracles
 

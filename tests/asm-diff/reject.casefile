@@ -91,3 +91,13 @@ mov $1, $2
 ;;; r31_bswapw reject
 .text
 bswapw %ax
+;;; suffix_width_mismatch reject
+.text
+bsfq %r8d, %r9d
+bsrq %r8d, %r9d
+popcntq %r8d, %r9d
+lzcntq %r8d, %r9d
+tzcntq %r8d, %r9d
+bsfq %r8d, %r9
+bsfq %r8, %r9d
+bsfl %r8, %r9

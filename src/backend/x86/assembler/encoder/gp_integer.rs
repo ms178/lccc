@@ -92,8 +92,29 @@ impl super::InstructionEncoder {
                         self.bytes.push(0xC7);
                         self.bytes.push(self.modrm(3, 0, dst_num));
                         self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
+                    } else if (0..=0xFFFF_FFFFi64).contains(&val) {
+                        // A value that fits in UNSIGNED 32 bits needs no 64-bit
+                        // immediate at all: writing a 32-bit register zeroes
+                        // the upper half of its 64-bit parent, so
+                        // `movl $imm32, %eax` leaves exactly imm32 in %rax.
+                        // That is 5 bytes (6 with REX.B) against 10 for the
+                        // movabs form -- the single largest per-instruction
+                        // saving in the whole encoder.
+                        //
+                        // The sign-extended C7 /0 form CANNOT be used here:
+                        // it would load 0xFFFFFFFF_FFFFFFFF for 0xFFFFFFFF.
+                        // ICC emits exactly that and is wrong; verified against
+                        // GAS 2.47, which decodes `48 c7 c0 ff ff ff ff` as
+                        // `mov $0xffffffffffffffff,%rax`.  Only the
+                        // zero-extending 32-bit form is both short and correct.
+                        let b = needs_rex_ext(&dst.name);
+                        if b {
+                            self.bytes.push(self.rex(false, false, false, true));
+                        }
+                        self.bytes.push(0xB8 + (dst_num & 7));
+                        self.bytes.extend_from_slice(&(val as u32).to_le_bytes());
                     } else {
-                        // Need movabsq for 64-bit immediate
+                        // Need movabsq for a true 64-bit immediate.
                         let b = needs_rex_ext(&dst.name);
                         self.bytes.push(self.rex(true, false, false, b));
                         self.bytes.push(0xB8 + (dst_num & 7));

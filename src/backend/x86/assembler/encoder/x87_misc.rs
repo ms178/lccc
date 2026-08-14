@@ -204,16 +204,26 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_fstp_st(&mut self, ops: &[Operand]) -> Result<(), String> {
+        self.encode_x87_st_reg(ops, "fstp", 0xDD, 0xD8)
+    }
+
+    /// Encode a one-operand x87 instruction that takes a stack register:
+    /// `<opcode> <base + N>` for `%st(N)`.
+    ///
+    /// `fst %st(N)` is DD D0+N and `fstp %st(N)` is DD D8+N -- adjacent rows of
+    /// the same opcode block, so the two differ only in the base byte.
+    pub(crate) fn encode_x87_st_reg(&mut self, ops: &[Operand], name: &str,
+                                    opcode: u8, base: u8) -> Result<(), String> {
         if ops.len() != 1 {
-            return Err("fstp requires 1 operand".to_string());
+            return Err(format!("{} requires 1 operand", name));
         }
         match &ops[0] {
             Operand::Register(reg) => {
                 let n = parse_st_num(&reg.name)?;
-                self.bytes.extend_from_slice(&[0xDD, 0xD8 + n]);
+                self.bytes.extend_from_slice(&[opcode, base + n]);
                 Ok(())
             }
-            _ => Err("fstp requires st register".to_string()),
+            _ => Err(format!("{} requires st register", name)),
         }
     }
 

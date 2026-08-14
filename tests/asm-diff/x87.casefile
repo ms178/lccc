@@ -167,3 +167,12 @@ fucomip %st(2)
 fists 8(%rsp)
 fistps 8(%rsp)
 fisttps 8(%rsp)
+;;; x87_st_reg
+.text
+fst %st(0)
+fst %st(1)
+fst %st(7)
+fstp %st(0)
+fstp %st(3)
+fld %st(0)
+fld %st(5)
