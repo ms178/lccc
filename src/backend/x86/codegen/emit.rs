@@ -741,8 +741,20 @@ impl X86Codegen {
                 } else {
                     self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
                 }
+                // Width-correct store: vec_live_regs can hold xmm (128-bit),
+                // ymm (256-bit) or zmm (512-bit) names; movdqu is the SSE
+                // 128-bit form and is ILLEGAL for the wider registers (the
+                // internal assembler rightly rejected `movdqu %zmm0, (%rax)`
+                // in zlib-ng's adler32_avx512).
+                let mov = if reg_name.starts_with("zmm") {
+                    "vmovdqu64"
+                } else if reg_name.starts_with("ymm") {
+                    "vmovdqu"
+                } else {
+                    "movdqu"
+                };
                 self.state
-                    .emit_fmt(format_args!("    movdqu %{}, (%rax)", reg_name));
+                    .emit_fmt(format_args!("    {} %{}, (%rax)", mov, reg_name));
             }
         }
     }

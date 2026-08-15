@@ -357,6 +357,56 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     for root in invalid { copies.remove(&root); }
     if copies.is_empty() { return 0; }
 
+    // DEST-LIVENESS WINDOW: forwarding moves every write of `root` up to the
+    // memcpy so that it lands in `dest` EARLY. That is only sound if dest's
+    // OLD contents are provably dead throughout [first redirected use, copy):
+    // any read of dest's memory in that window would now observe the new
+    // value; any write would be clobbered by the redirected stores. The
+    // previous validation only inspected uses of ROOT — never of DEST.
+    // zlib-ng fold_1: `x_tmp3=*c3; *c3=*c0; *c1=*c2; ...; *c2=x_tmp3` — the
+    // snapshot write was redirected into c2 while `*c1=*c2` still read c2's
+    // old value (CRC mismatch on every odd-length fold_copy+fold sequence).
+    {
+        let mut reject = FxHashSet::default();
+        for (&root, &(copy_b, copy_i, dest)) in &copies {
+            // dest's aliasing root (dest may be a GEP into a larger object;
+            // any access to that object is conservatively a conflict).
+            let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
+            // First instruction that references `root` before the copy.
+            let mut first_use = copy_i;
+            for (ii, inst) in func.blocks[copy_b].instructions.iter().enumerate() {
+                if ii >= copy_i { break; }
+                let mut hit = false;
+                inst.for_each_used_value(|v| {
+                    if paths.get(&v).is_some_and(|p| p.0 == root) { hit = true; }
+                });
+                if let Some(d) = inst.dest() {
+                    if paths.get(&d.0).is_some_and(|p| p.0 == root) { hit = true; }
+                }
+                if hit { first_use = ii; break; }
+            }
+            // dest's object must be untouched inside the window (the memcpy
+            // itself at copy_i is the legitimate final write).
+            for ii in first_use..copy_i {
+                let inst = &func.blocks[copy_b].instructions[ii];
+                let mut touches_dest = false;
+                inst.for_each_used_value(|v| {
+                    if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
+                        touches_dest = true;
+                    }
+                });
+                if let Some(d) = inst.dest() {
+                    if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
+                        touches_dest = true;
+                    }
+                }
+                if touches_dest { reject.insert(root); break; }
+            }
+        }
+        for root in reject { copies.remove(&root); }
+    }
+    if copies.is_empty() { return 0; }
+
     let mut changes = 0;
     for (&root, &(bi, copy_i, dest)) in &copies {
         for (ii, inst) in func.blocks[bi].instructions.iter_mut().enumerate() {
@@ -511,6 +561,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         source
     }
 
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for (root, c) in &candidates {
+            eprintln!("[AGGFWD] {} root=v{} src=v{} src_root=v{} at b{}:{}",
+                func.name, root, c.source.0, c.source_root, c.block, c.inst);
+        }
+    }
     let mut changes = 0;
     for bi in 0..func.blocks.len() {
         let old = std::mem::take(&mut func.blocks[bi].instructions);
