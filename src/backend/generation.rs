@@ -2128,16 +2128,23 @@ pub(super) fn generate_instruction(
             // the register allocator at -O2 (the dest register was clobbered,
             // corrupting overlapping moves). libc memmove is direction-aware
             // and optimized; keep the call.
-            let inline_copy = match func.as_str() {
-                "memcpy" | "__memcpy_chk" => {
-                    info.args.len() >= 3
-                        && matches!(info.args.get(2),
-                            Some(crate::ir::reexports::Operand::Const(c))
-                                if c.to_i64().map_or(false, |s| s >= 0 && s <= 32))
-                        && !info.is_variadic
-                }
-                _ => false,
-            };
+            // GATE ON BACKEND SUPPORT: the trait default of
+            // emit_inline_memcpy_call is an EMPTY body. Dispatching to it on
+            // a backend that has not implemented the expansion silently
+            // deletes the copy — on AArch64 `memcpy(&s,&t,16)` emitted NO
+            // instructions at all and the destination kept its old bytes
+            // (struct copy read back 7+8 instead of 100+200).
+            let inline_copy = cg.supports_inline_memcpy_call()
+                && match func.as_str() {
+                    "memcpy" | "__memcpy_chk" => {
+                        info.args.len() >= 3
+                            && matches!(info.args.get(2),
+                                Some(crate::ir::reexports::Operand::Const(c))
+                                    if c.to_i64().map_or(false, |s| s >= 0 && s <= 32))
+                            && !info.is_variadic
+                    }
+                    _ => false,
+                };
             if inline_copy {
                 if let Some(crate::ir::reexports::Operand::Const(c)) = info.args.get(2) {
                     let size = c.to_i64().unwrap_or(0) as usize;

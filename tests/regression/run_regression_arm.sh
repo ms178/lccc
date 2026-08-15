@@ -20,6 +20,11 @@ for src in "$dir"/*.c; do
 
   extra_flags=""
   [ -f "$dir/$name.flags" ] && extra_flags=$(cat "$dir/$name.flags")
+  # PGO round-trip tests use the @PROFDIR@ placeholder that only the x86
+  # driver substitutes. Passing it through verbatim makes gcc create a
+  # literal '@PROFDIR@/' directory in the repo (which once polluted a
+  # format-patch with .gcda binary blobs). Skip them here.
+  case "$extra_flags" in *@PROFDIR@*) skip=$((skip+1)); continue ;; esac
   # x86-only tests: intrinsics headers, SSE/AVX flags, x86 inline asm.
   if grep -qE '(immintrin|emmintrin|xmmintrin|pmmintrin|smmintrin|tmmintrin|wmmintrin|nmmintrin)\.h' "$src" \
      || echo "$extra_flags" | grep -qE '(-m(sse|avx|pclmul|fma|gfni|vaes))' \

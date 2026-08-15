@@ -40,6 +40,7 @@ pub(crate) mod reassoc_accum;
 pub(crate) mod recursion_to_iter;
 mod resolve_asm;
 pub(crate) mod simplify;
+pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod vector_temp_promotion;
@@ -1040,6 +1041,16 @@ macro_rules! preloop_dump {
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
         for _ in 0..8 {
             if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
+    }
+    // Forward alloca-field stores to later loads of the same constant-offset
+    // field (the SROA effect for scalarized aggregates: struct memory traffic
+    // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
+    // default-closed transfer function, volatile/escape/segment guards.
+    // Iterate: each round can expose new dead stores for the next.
+    if !disabled.contains("slforward") {
+        for _ in 0..4 {
+            if module.for_each_function(store_load_forward::run) == 0 { break; }
         }
     }
     module.for_each_function(dce::eliminate_dead_code);
