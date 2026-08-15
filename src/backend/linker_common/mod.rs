@@ -54,6 +54,7 @@
 // ── Submodule declarations ──────────────────────────────────────────────
 
 pub mod linker_script;
+pub mod build_id;
 pub mod strmerge;
 mod types;
 mod parse_object;

@@ -56,6 +56,7 @@ pub fn link_with_script(
     script_src: &str,
     output_path: &str,
     emit_symtab: bool,
+    is_pie: bool,
 ) -> Result<(), String> {
     let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
@@ -274,6 +275,20 @@ pub fn link_with_script(
                     let a = eval_full(al, sec_start, &symbols, &sections_meta, &def_syms, &placed_map)
                         .unwrap_or(1).max(1);
                     sec_start = (sec_start + a - 1) & !(a - 1);
+                } else if def.address.is_none() {
+                    // GNU ld aligns the OUTPUT section start to the largest
+                    // alignment among its (first-item) input sections, not
+                    // just each input within the section. Without this,
+                    // .text can start at an unaligned dot (observed as a
+                    // 0x35-byte skew vs GNU ld on the kernel decompressor).
+                    let di_self = di;
+                    let max_in_align = unassigned.iter()
+                        .filter(|k| assigned.get(k) == Some(&di_self))
+                        .map(|&(oi, si)| objects[oi].sections[si].addralign.max(1))
+                        .max().unwrap_or(1);
+                    if max_in_align > 1 {
+                        sec_start = (sec_start + max_in_align - 1) & !(max_in_align - 1);
+                    }
                 }
 
                 let mut cur = sec_start;
@@ -662,7 +677,8 @@ pub fn link_with_script(
 
     out[0..4].copy_from_slice(&ELF_MAGIC);
     out[4] = ELFCLASS64; out[5] = ELFDATA2LSB; out[6] = 1;
-    w16(&mut out, 16, ET_EXEC); w16(&mut out, 18, EM_X86_64); w32(&mut out, 20, 1);
+    w16(&mut out, 16, if is_pie { ET_DYN } else { ET_EXEC });
+    w16(&mut out, 18, EM_X86_64); w32(&mut out, 20, 1);
     w64(&mut out, 24, entry);
     w64(&mut out, 32, 64);
     w32(&mut out, 48, 0); w16(&mut out, 52, 64); w16(&mut out, 54, 56);
@@ -871,6 +887,32 @@ pub fn link_with_script(
     out[40..48].copy_from_slice(&shoff.to_le_bytes());
     out[60..62].copy_from_slice(&sh_count.to_le_bytes());
     out[62..64].copy_from_slice(&((sh_count - 1)).to_le_bytes());
+
+    // --build-id=sha1: the synthetic "<build-id>" object carries a
+    // .note.gnu.build-id section that the script's *(.note.*) pattern
+    // placed like any input. Fill the header now and hash the COMPLETE
+    // image with a zeroed descriptor, then patch the digest in.
+    {
+        let bid = objects.iter().enumerate()
+            .filter(|(_, o)| o.source_name == "<build-id>")
+            .flat_map(|(oi, o)| o.sections.iter().enumerate()
+                .filter(|(_, sec)| sec.name == ".note.gnu.build-id")
+                .map(move |(si, _)| (oi, si)))
+            .next();
+        if let Some((oi, si)) = bid {
+            if let (Some(&vaddr), Some(&owner)) =
+                (placed_map.get(&(oi, si)), placed_owner.get(&(oi, si))) {
+                let os = &out_secs[owner];
+                if !os.nobits && os.is_alloc {
+                    let foff = (os.file_offset + (vaddr - os.vaddr)) as usize;
+                    if foff + linker_common::build_id::BUILD_ID_NOTE_SIZE as usize <= out.len() {
+                        linker_common::build_id::write_build_id_skeleton(&mut out, foff);
+                        linker_common::build_id::patch_build_id(&mut out, foff);
+                    }
+                }
+            }
+        }
+    }
 
     std::fs::write(output_path, &out)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
