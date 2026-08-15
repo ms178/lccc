@@ -226,7 +226,28 @@ pub fn link_builtin(
     }
 
     // Check for truly undefined (non-weak, non-dynamic, non-linker-defined) symbols
-    linker_common::check_undefined_symbols_elf64(&globals, 20)?;
+    linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
+
+    // SHF_MERGE string/constant deduplication (.rodata.str1.1, .rodata.cst8):
+    // build pools across all objects, rewrite relocations to pool symbols,
+    // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
+    let mut dead_sections = dead_sections;
+    if std::env::var("LCCC_NO_STRING_MERGE").is_err() {
+        if let Some(plan) = linker_common::strmerge::plan_string_merge(
+            &objects, &dead_sections, linker_common::map_section_name) {
+            let applied = linker_common::strmerge::apply_string_merge(
+                &mut objects, &mut globals, &mut dead_sections, &plan);
+            if std::env::var("LCCC_DEBUG_STRMERGE").is_ok() {
+                eprintln!("[strmerge] pools={} applied={}",
+                    plan.pools.len(), applied);
+                for p in &plan.pools {
+                    eprintln!("[strmerge]   {} {} bytes", p.name, p.data.len());
+                }
+            }
+        } else if std::env::var("LCCC_DEBUG_STRMERGE").is_ok() {
+            eprintln!("[strmerge] no plan (no eligible sections)");
+        }
+    }
 
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
@@ -248,6 +269,7 @@ pub fn link_builtin(
         &plt_names, &got_entries, &needed_sonames, output_path,
         export_dynamic, &rpath_entries, use_runpath, is_static,
         &ifunc_symbols, entry_symbol.as_deref(),
+        parsed_args.z_now, parsed_args.z_relro,
     )
 }
 

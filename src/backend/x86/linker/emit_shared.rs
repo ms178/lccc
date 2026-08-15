@@ -476,15 +476,13 @@ pub(super) fn emit_shared_library(
         }
         gnu_hash_chains[i] = h & !1;
     }
-    for bucket_idx in 0..gnu_hash_nbuckets as usize {
-        if gnu_hash_buckets[bucket_idx] == 0 { continue; }
-        let mut last_in_bucket = 0;
-        for (i, &h) in hashed_sym_hashes.iter().enumerate() {
-            if (h % gnu_hash_nbuckets) as usize == bucket_idx {
-                last_in_bucket = i;
-            }
-        }
-        gnu_hash_chains[last_in_bucket] |= 1;
+    // Single-pass end-of-chain marking (entries are bucket-sorted); the old
+    // per-bucket rescan was O(buckets * symbols).
+    for i in 0..hashed_sym_hashes.len() {
+        let last = i + 1 == hashed_sym_hashes.len()
+            || (hashed_sym_hashes[i + 1] % gnu_hash_nbuckets)
+                != (hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        if last { gnu_hash_chains[i] |= 1; }
     }
 
 

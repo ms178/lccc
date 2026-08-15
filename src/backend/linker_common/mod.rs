@@ -54,6 +54,7 @@
 // ── Submodule declarations ──────────────────────────────────────────────
 
 pub mod linker_script;
+pub mod strmerge;
 mod types;
 mod parse_object;
 mod parse_shared;
@@ -81,6 +82,7 @@ pub use types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object, DynSymbol};
 
 // parse_object.rs
 pub use parse_object::parse_elf64_object;
+pub use section_map::map_section_name;
 
 // parse_shared.rs
 pub use parse_shared::{parse_shared_library_symbols, parse_soname};
@@ -120,7 +122,7 @@ pub use write::{write_elf64_shdr, write_elf64_phdr, write_elf64_phdr_at, align_u
 pub use args::parse_linker_args;
 
 // check.rs
-pub use check::check_undefined_symbols_elf64;
+pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};
 
 // eh_frame.rs
 pub use eh_frame::{count_eh_frame_fdes, build_eh_frame_hdr};

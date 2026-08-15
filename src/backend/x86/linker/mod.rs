@@ -17,6 +17,7 @@
 
 #[allow(dead_code)]
 pub mod elf;
+pub mod emit_rel;
 pub mod emit_script;
 pub mod types;
 mod input;

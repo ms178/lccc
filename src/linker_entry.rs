@@ -11,6 +11,14 @@ pub fn load_inputs_x86(
     crate::backend::x86::linker::load_inputs_for_ld(inputs, objects)
 }
 
+/// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
+pub fn link_relocatable_x86(
+    objects: &[Elf64Object],
+    output: &str,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_rel::link_relocatable(objects, output)
+}
+
 /// Link pre-loaded objects with a full GNU linker script (x86-64).
 pub fn link_with_script_x86(
     objects: &[Elf64Object],

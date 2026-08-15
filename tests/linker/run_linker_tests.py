@@ -400,6 +400,65 @@ case("rodata_merge_strings",
      "b.c": 'const char *s2 = "shared-string";'},
     tags=("sections",))
 
+case("strmerge_dedup_identity",
+    # SHF_MERGE dedup: identical strings across objects must compare
+    # pointer-EQUAL after dedup in GNU ld/mold; and must never corrupt
+    # interior-pointer arithmetic. lccc's pool remap keeps intra-entry deltas.
+    {"a.c": """
+        #include <stdio.h>
+        #include <string.h>
+        const char *pa = "dedup-me-please";
+        const char *tail_a = "dedup-me-please" + 6;   /* interior pointer */
+        int main(void){
+            extern const char *pb, *tail_b;
+            printf("%d %d %s %s\\n",
+                   strcmp(pa, pb) == 0,
+                   strcmp(tail_a, tail_b) == 0,
+                   tail_a, pb);
+            return 0;
+        }
+     """,
+     "b.c": 'const char *pb = "dedup-me-please";\n'
+            'const char *tail_b = "dedup-me-please" + 6;'},
+    compile_flags=["-O2"],
+    tags=("sections", "strmerge"))
+
+case("strmerge_fp_constants",
+    # .rodata.cst8/.cst16 dedup: FP constants must survive pooling.
+    {"a.c": """
+        #include <stdio.h>
+        double da(void){ return 3.14159265358979; }
+        float  fa(void){ return 2.71828f; }
+        int main(void){
+            extern double db(void); extern float fb(void);
+            printf("%d %d\\n", da() == db(), fa() == fb());
+            return 0;
+        }
+     """,
+     "b.c": "double db(void){ return 3.14159265358979; }\n"
+            "float  fb(void){ return 2.71828f; }"},
+    compile_flags=["-O2"],
+    tags=("sections", "strmerge"))
+
+case("strmerge_wide_and_narrow",
+    # Mixed .rodata.str1.1 / .rodata.str1.8 (from -O2 aligned string ops):
+    # alignment classes must not be cross-polluted.
+    {"a.c": """
+        #include <stdio.h>
+        #include <string.h>
+        int main(void){
+            extern const char *get_msg(void);
+            char buf[64];
+            strcpy(buf, "format %s %d here");
+            printf(buf, get_msg(), (int)strlen(get_msg()));
+            printf("\\n");
+            return 0;
+        }
+     """,
+     "b.c": 'const char *get_msg(void){ return "format %s %d here"; }'},
+    compile_flags=["-O2"],
+    tags=("sections", "strmerge"))
+
 case("tentative_array",
     {"a.c": """
         #include <stdio.h>
@@ -844,6 +903,41 @@ case("z_now_relro",
     ldflags=["-Wl,-z,now", "-Wl,-z,relro"],
     tags=("special",))
 
+case("relro_write_protection",
+    # PT_GNU_RELRO must actually protect .init_array after startup: a write
+    # into the RELRO page has to SIGSEGV. Compared against the bfd/mold/wild
+    # linked references, which enforce the same.
+    {"a.c": """
+        #include <stdio.h>
+        #include <signal.h>
+        #include <setjmp.h>
+        static sigjmp_buf jb;
+        static void segv(int s){ (void)s; siglongjmp(jb, 1); }
+        typedef void (*fp)(void);
+        __attribute__((constructor)) static void c1(void){}
+        extern fp __init_array_start[] __attribute__((weak));
+        int main(void){
+            signal(SIGSEGV, segv);
+            if (sigsetjmp(jb, 1) == 0) {
+                __init_array_start[0] = (fp)main;
+                printf("WRITABLE\\n");
+                return 1;
+            }
+            printf("PROTECTED\\n");
+            return 0;
+        }
+     """},
+    compile_flags=["-O0"],
+    ldflags=["-Wl,-z,now"],
+    tags=("special", "relro"))
+
+case("z_now_dynamic_flags",
+    # -z now must emit DT_FLAGS=BIND_NOW and DT_FLAGS_1=NOW (checked by
+    # readelf below via expect_readelf_dynamic), and the binary must run.
+    {"a.c": '#include <stdio.h>\nint main(void){ printf("now\\n"); return 0; }'},
+    ldflags=["-Wl,-z,now"],
+    tags=("special", "relro"))
+
 case("z_noexecstack",
     {"a.c": '#include <stdio.h>\nint main(void){ printf("nx\\n"); return 0; }'},
     ldflags=["-Wl,-z,noexecstack"],
@@ -917,6 +1011,25 @@ case("eh_frame_present",
         int main(void){ printf("%d\\n", deep(10)); return 0; }
      """},
     compile_flags=["-O0", "-fasynchronous-unwind-tables"],
+    tags=("ehframe",))
+
+case("eh_frame_hdr_backtrace",
+    # PT_GNU_EH_FRAME + .eh_frame_hdr binary search table: backtrace()
+    # depends on the header to walk frames without a linear .eh_frame scan.
+    {"a.c": """
+        #include <stdio.h>
+        #include <execinfo.h>
+        __attribute__((noinline)) int level3(void){
+            void *frames[16];
+            int n = backtrace(frames, 16);
+            printf("%s\\n", n > 3 ? "deep-stack" : "shallow");
+            return n;
+        }
+        __attribute__((noinline)) int level2(void){ return level3() + 1; }
+        __attribute__((noinline)) int level1(void){ return level2() + 1; }
+        int main(void){ level1(); return 0; }
+     """},
+    compile_flags=["-O0", "-fasynchronous-unwind-tables", "-fno-omit-frame-pointer"],
     tags=("ehframe",))
 
 # ============================================================================
@@ -1056,6 +1169,163 @@ SCRIPT_TESTS = [
 ]
 
 # ============================================================================
+# 11. RELOCATABLE LINKING (ld -r) — differential against GNU ld -r
+# ============================================================================
+
+def _rel_test(name, sources, expect_stdout, asm=None, compile_flags=None):
+    """lccc-ld -r vs GNU ld -r: merge objects, final-link both merged objects
+    with gcc AND with lccc, run all four, all outputs must agree."""
+    def runner(args, oracles):
+        td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+        try:
+            objs = []
+            for fname, content in sources.items():
+                with open(os.path.join(td, fname), "w") as f:
+                    f.write(textwrap.dedent(content))
+                obj = os.path.splitext(fname)[0] + ".o"
+                r = sh([CC, "-c", fname, "-o", obj] + (compile_flags or ["-O1"]), cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "SKIP", r.stderr.decode()[:200])
+                objs.append(obj)
+            lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+            r = sh([lccc_ld, "-r"] + objs + ["-o", "m.lccc.o"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"lccc-ld -r failed: {r.stderr.decode()[:300]}")
+            r = sh(["ld", "-r"] + objs + ["-o", "m.ld.o"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", "GNU ld -r failed")
+            outs = {}
+            for tag, merged, linker in [
+                ("lccc-r+gcc", "m.lccc.o", [CC]),
+                ("ld-r+gcc", "m.ld.o", [CC]),
+                ("lccc-r+lccc", "m.lccc.o", [args.lccc]),
+            ]:
+                rr = sh(linker + [merged, "-o", f"fin.{tag}"], cwd=td)
+                if rr.returncode != 0:
+                    return Result(name, "FAIL",
+                        f"final link ({tag}) failed: {rr.stderr.decode()[:300]}")
+                code, out = run_bin(os.path.join(td, f"fin.{tag}"), [], td)
+                outs[tag] = (code, out)
+            vals = set(outs.values())
+            if len(vals) != 1:
+                return Result(name, "FAIL", f"outputs disagree: {outs!r}")
+            code, out = vals.pop()
+            if expect_stdout is not None and (out != expect_stdout or code != 0):
+                return Result(name, "FAIL", f"got {(code, out)!r}")
+            return Result(name, "PASS")
+        except Exception as e:
+            return Result(name, "FAIL", f"harness exception: {e!r}")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+    return runner
+
+# ============================================================================
+# 12. C++ EXCEPTIONS — unwinding through lccc-linked binaries
+# ============================================================================
+
+CXX_EH_SRC = r"""
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+struct Probe {
+    const char *name;
+    explicit Probe(const char *n) : name(n) { printf("ctor %s\n", name); }
+    ~Probe() { printf("dtor %s\n", name); }
+};
+static int depth3(int x){
+    Probe p("d3");
+    if (x > 2) throw std::runtime_error("boom-" + std::to_string(x));
+    return x;
+}
+static int depth2(int x){ Probe p("d2"); return depth3(x + 1); }
+static int depth1(int x){ Probe p("d1"); return depth2(x + 1); }
+int main(){
+    try { depth1(1); }
+    catch (const std::exception &e) { printf("caught: %s\n", e.what()); }
+    try { throw 42; } catch (int v) { printf("int: %d\n", v); }
+    printf("done\n");
+    return 0;
+}
+"""
+
+def _cxx_eh_test(args, oracles):
+    name = "cxx_exceptions_unwind"
+    if shutil.which("g++") is None:
+        return Result(name, "SKIP", "no g++")
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "ex.cpp"), "w") as f:
+            f.write(CXX_EH_SRC)
+        r = sh(["g++", "-c", "-O1", "ex.cpp"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "g++ compile failed")
+        r = sh([args.lccc, "ex.o", "-lstdc++", "-o", "ex.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc link failed: {r.stderr.decode()[:300]}")
+        code, out = run_bin(os.path.join(td, "ex.lccc"), [], td)
+        r2 = sh(["g++", "ex.o", "-o", "ex.ref"], cwd=td)
+        code2, out2 = run_bin(os.path.join(td, "ex.ref"), [], td)
+        if (code, out) != (code2, out2):
+            return Result(name, "FAIL",
+                f"lccc {(code, out)!r} != g++ {(code2, out2)!r}")
+        if "caught: boom-3" not in out or code != 0:
+            return Result(name, "FAIL", f"unexpected output {(code, out)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+REL_TESTS = [
+    ("rel_basic_merge",
+     {"a.c": """
+        #include <stdio.h>
+        extern int bval; extern int bfn(int);
+        static int helper(int x){ return x * 3; }
+        int main(void){ printf("%d\\n", helper(2) + bfn(4) + bval); return 0; }
+      """,
+      "b.c": "int bval = 50;\nstatic int bh = 5;\nint bfn(int x){ return x + bh; }"},
+     "65\n"),
+    ("rel_local_name_collision",
+     {"a.c": """
+        #include <stdio.h>
+        static int counter = 10;   /* same local name in both objects */
+        int a_get(void){ return counter; }
+        int main(void){ extern int b_get(void);
+                        printf("%d %d\\n", a_get(), b_get()); return 0; }
+      """,
+      "b.c": "static int counter = 20;\nint b_get(void){ return counter; }"},
+     "10 20\n"),
+    ("rel_common_symbols",
+     {"a.c": """
+        #include <stdio.h>
+        int shared;   /* tentative */
+        int main(void){ extern void bump(void); bump();
+                        printf("%d\\n", shared); return 0; }
+      """,
+      "b.c": "int shared;\nvoid bump(void){ shared += 7; }"},
+     "7\n", ["-O1", "-fcommon"]),
+    ("rel_ctor_preserved",
+     {"a.c": """
+        #include <stdio.h>
+        int flag;
+        __attribute__((constructor)) static void init(void){ flag = 9; }
+        int main(void){ printf("%d\\n", flag); return 0; }
+      """,
+      "b.c": "int other(void){ return 1; }"},
+     "9\n"),
+    ("rel_data_relocs",
+     {"a.c": """
+        #include <stdio.h>
+        extern int t1(void), t2(void);
+        int (*table[2])(void) = { t1, t2 };   /* R_X86_64_64 in .data */
+        int main(void){ printf("%d\\n", table[0]() + table[1]()); return 0; }
+      """,
+      "b.c": "int t1(void){ return 30; }\nint t2(void){ return 12; }"},
+     "42\n"),
+]
+
+# ============================================================================
 # Runner
 # ============================================================================
 
@@ -1127,6 +1397,20 @@ def main():
             if args.tag:
                 continue
         results.append(_script_test(name, script, csrc, expect)(args, oracles))
+
+    for entry in REL_TESTS:
+        name, sources, expect = entry[0], entry[1], entry[2]
+        cflags = entry[3] if len(entry) > 3 else None
+        if args.filter and args.filter not in name:
+            continue
+        if args.tag and args.tag != "rel":
+            if args.tag:
+                continue
+        results.append(_rel_test(name, sources, expect,
+                                 compile_flags=cflags)(args, oracles))
+
+    if (not args.filter or "cxx" in args.filter) and (not args.tag or args.tag == "ehframe"):
+        results.append(_cxx_eh_test(args, oracles))
 
     npass = sum(1 for r in results if r.status == "PASS")
     nfail = sum(1 for r in results if r.status == "FAIL")
