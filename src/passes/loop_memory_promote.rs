@@ -135,6 +135,18 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     if !disjoint(&paths, ptr, load_ty, Value(other_ptr), *other_ty) { alias = true; }
                 }
             }
+            // OTHER LOADS through a different pointer value that aliases the
+            // promoted location must also block promotion: the in-loop store
+            // is removed, so such a load reads STALE memory. The C frontend
+            // routinely materializes the same field address twice (two GEPs
+            // with identical base+offset but different value ids) — sqlite
+            // sqlite3FpDecode's trailing-zero trimmer read p->n through one
+            // GEP while the decrement was promoted through the other,
+            // making `while(z[n-1]=='0') n--` an infinite loop.
+            for (&other_ptr, _other_loads) in &loads {
+                if other_ptr == ptr_id { continue; }
+                if !disjoint(&paths, ptr, load_ty, Value(other_ptr), load_ty) { alias = true; }
+            }
             if alias { continue; }
 
             let init = Value(func.next_value_id); func.next_value_id += 1;
