@@ -1988,6 +1988,18 @@ impl ArchCodegen for ArmCodegen {
         fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) => emit_i128_divrem_call_impl;
         fn emit_i128_store_result(&mut self, dest: &Value) => emit_i128_store_result_impl;
         fn emit_i128_to_float_call(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) => emit_i128_to_float_call_impl;
+    }
+
+    /// F128 libcall results live in q0 on aarch64: store all 16 bytes.
+    fn emit_store_f128_xmm0(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_sp("q0", slot.0, "str");
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    // (macro block continues)
+    delegate_to_impl! {
         fn emit_float_to_i128_call(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) => emit_float_to_i128_call_impl;
         fn emit_i128_cmp_eq(&mut self, is_ne: bool) => emit_i128_cmp_eq_impl;
         fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp) => emit_i128_cmp_ordered_impl;

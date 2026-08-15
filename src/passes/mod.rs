@@ -494,10 +494,13 @@ macro_rules! preloop_dump {
 
     // Switch case outlining: extract case bodies from large switch statements
     // (like SQLite's VdbeExec with 170+ cases) into separate functions.
-    // Runs after inlining so we see the final function sizes, and before all
-    // other passes so the smaller outlined functions benefit from the full
-    // optimization pipeline. Pass name for CCC_DISABLE_PASSES: "outline"
-    if !disabled.contains("outline") {
+    // OPT-IN ONLY (CCC_OUTLINE_SWITCH=1): the pass miscompiles dispatch
+    // loops whose cursor lives in a caller-saved register (see the header
+    // comment in outline_switch.rs). Previously the pass ran on every
+    // compile with an unreachable threshold (999999), paying a full module
+    // walk for guaranteed no-ops; now the walk is skipped entirely unless
+    // explicitly requested for experiments.
+    if std::env::var("CCC_OUTLINE_SWITCH").is_ok() && !disabled.contains("outline") {
         outline_switch::run(module);
     }
     preloop_dump!("outline");

@@ -2300,6 +2300,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 } else if psz == 2 {
                     let bytes = (value as i16).to_le_bytes();
                     self.sections[sec_idx].data[offset..offset + 2].copy_from_slice(&bytes);
+                } else if psz == 8 {
+                    // .quad a - b: full 64-bit patch. The old catch-all wrote
+                    // only 4 bytes, silently truncating negative or >4GiB
+                    // differences (e.g. `.quad a - b` with a < b kept its
+                    // upper half zero instead of sign-extending).
+                    let bytes = value.to_le_bytes();
+                    self.sections[sec_idx].data[offset..offset + 8].copy_from_slice(&bytes);
                 } else {
                     let bytes = (value as i32).to_le_bytes();
                     self.sections[sec_idx].data[offset..offset + 4].copy_from_slice(&bytes);

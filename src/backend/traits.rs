@@ -1247,10 +1247,13 @@ pub trait ArchCodegen {
     /// `from_ty` is F32 or F64. Result should be left in the acc pair.
     fn emit_float_to_i128_call(&mut self, src: &Operand, to_signed: bool, from_ty: IrType);
 
-    /// Store a _Float128 result still in %xmm0 (single-XMM SysV ABI) to `dest`.
-    /// Only needed for the i128 -> _Float128 cast path; other arches panic.
-    fn emit_store_f128_xmm0(&mut self, _dest: &Value) {
-        unimplemented!("_Float128 i128-cast result storage not implemented on this target")
+    /// Store a _Float128 result from the ABI return register to `dest`.
+    /// x86-64: %xmm0 (single-XMM SysV ABI). aarch64: q0. Targets without an
+    /// override fall back to the acc-pair store, which is correct wherever
+    /// the F128 libcall result travels through the integer pair (RISC-V
+    /// LP64: __floattitf returns in a0/a1).
+    fn emit_store_f128_xmm0(&mut self, dest: &Value) {
+        self.emit_store_acc_pair(dest);
     }
 
     // --- Return primitives ---

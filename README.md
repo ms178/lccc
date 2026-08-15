@@ -103,9 +103,13 @@ reference.
 - **LCCC (Lev) → LCCC (ms178): 3.29×** (n=25) — my fork is
   roughly **3.3× faster than Lev's fork it builds on** across the corpus.
 - **CCC → LCCC (ms178): 3.90×** — combined, ~3.9× over the original.
-- **LCCC (ms178) vs GCC: 0.92×** — my fork is now **faster than GCC on the
-  aggregate** (and ~60–70× faster on fib/ackermann/constant_recursion via TCE +
-  recursion-to-iteration).
+- **LCCC (ms178) vs GCC: 0.92× geomean on this corpus** — but read this
+  honestly: the aggregate is dominated by two benchmarks
+  (`ackermann`/`constant_recursion`, ~440× each) that LCCC folds at
+  COMPILE TIME via IPCP + recursion-to-iteration. Excluding those two,
+  the corpus geomean is roughly **1.5–2× slower than GCC**, concentrated
+  in FP/struct-by-value and branch-heavy workloads (see "Root cause"
+  below). Both numbers are real; neither alone is the full story.
 
 ### What LCCC (Lev) already fixed (vs the original CCC)
 
@@ -138,10 +142,12 @@ the largest gains on:
 
 ### The remaining gap vs GCC
 
-The aggregate is now 0.92× vs GCC (faster than GCC on this corpus), with a few
-FP/struct-by-value cases still trailing (see "Root cause" below). The other
-three compilers are all far slower than GCC on those same workloads, so this is
-LCCC's own remaining work, not inherited.
+The 0.92× corpus geomean flatters LCCC because two compile-time-folded
+recursion benchmarks contribute ~440× each; on the remaining real-runtime
+workloads LCCC trails GCC by ~1.5–2× overall, with FP/struct-by-value cases
+the worst (see "Root cause" below). The other three compilers are all far
+slower than GCC on those same workloads, so this is LCCC's own remaining
+work, not inherited.
 
 ## Where LCCC wins
 
@@ -157,8 +163,8 @@ LCCC's own remaining work, not inherited.
 
 ## Root cause of the remaining gap
 
-The aggregate is now faster than GCC (0.92×), but a few FP/struct and
-branch-heavy workloads still trail:
+Excluding the two compile-time-folded outliers, the following FP/struct and
+branch-heavy workloads drive the remaining ~1.5–2× runtime gap vs GCC:
 
 - **struct_copy (5.9×)** — struct by-value passing/copying; GCC lowers
   multi-field copies to a few wide moves while LCCC still routes each field

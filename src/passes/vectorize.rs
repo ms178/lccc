@@ -156,15 +156,19 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
             let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
-            // Check: if the loop limit is a known constant smaller than the vector width,
-            // skip vectorization — the vectorized loop would never execute, and the
-            // remainder loop may not correctly handle the full trip count.
+            // Profitability: with a KNOWN constant trip count, require the
+            // vector body to run at least twice (trip >= 2*width). One vector
+            // iteration + setup + horizontal combine + scalar remainder is a
+            // net LOSS vs the plain scalar loop (verified: a 4-iteration sum
+            // previously produced a 1-iteration vector body + 3-iteration
+            // remainder for zero win and ~3x code size). Unknown (dynamic)
+            // trip counts still vectorize - the runtime guard handles n < width.
             let skip_small = match &pattern.limit {
-                Operand::Const(c) => c.to_i64().map_or(false, |n| n <= vec_width),
+                Operand::Const(c) => c.to_i64().map_or(false, |n| n < 2 * vec_width),
                 _ => false,
             };
             if skip_small {
-                if debug { eprintln!("[VEC] Skip: loop limit < vector width ({})", vec_width); }
+                if debug { eprintln!("[VEC] Skip: constant trip count < 2x vector width ({})", vec_width); }
             } else
 
             if use_sse2 {
@@ -182,8 +186,19 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
         } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg) {
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
             let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+            let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
-            if use_sse2 {
+            // Same profitability gate as the matmul path (the reduction path
+            // historically had NO trip-count check at all).
+            let skip_small = match &red_pattern.limit {
+                Operand::Const(c) => c.to_i64().map_or(false, |n| n < 2 * vec_width),
+                _ => false,
+            };
+            if skip_small {
+                if debug {
+                    eprintln!("[VEC] Skip reduction: constant trip count < 2x vector width ({})", vec_width);
+                }
+            } else if use_sse2 {
                 if debug {
                     eprintln!("[VEC] Reduction pattern matched! Transforming to SSE2 2-wide");
                 }

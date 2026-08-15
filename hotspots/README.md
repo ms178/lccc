@@ -79,3 +79,17 @@ keeps the **why** (and the rejected alternatives):
   loop can blow up register allocation (expat 131→248 ms); the layout pass now
   preserves source order and gets profile value from sections, switch ordering,
   and branch inversion instead.
+
+
+## Directory layout (2026-08-15)
+
+- `RESEARCH_BACKLOG.md` — the scored queue of OPEN performance items.
+- `*.md` (top level) — open hotspots with reproducers (`screening`/`prototype`).
+- `integrated/` — completed cycles kept for provenance; their conclusions are
+  superseded by the current benchmark suite. Do not cite them as current.
+
+Recently integrated elsewhere (see git log, tests/linker/, docs/simd-audit.md):
+SHF_MERGE string dedup (link-time), univsr indexed-addressing reversion
+(wired + soundness-hardened 2026-08-15), pextrw/data-expression assembler
+parity, TLS GD/LD, kernel-capable linker (script engine, -r, PIE, build-id,
+RELRO, .eh_frame_hdr).
