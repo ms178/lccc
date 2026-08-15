@@ -376,7 +376,15 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("phi_coalesce") { changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
         if !sk("signext_move") { changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
         if !sk("inc_chain") { changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos); }
-        if !sk("add_signext") { changed |= local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
+        // add_signext (fuse_add_sign_extend) REMOVED: it rewrote
+        // `addl %X,%X; movslq %X,%DST` into `addl %X,%DSTd`, which (a) reads
+        // an uninitialized %DSTd — its own SAFETY comment required "DST was
+        // initialized with the same value" but never checked it — and
+        // (b) drops the sign extension (addl zero-extends the upper half).
+        // expat xmlparse.c reportProcessingInstruction: the PI-target length
+        // became garbage and XmlNameLength walked off the buffer (SIGSEGV).
+        // A sound fusion saves nothing (still needs init + sext), so the
+        // pass is deleted rather than gated.
         if !sk("copy_shift_back") { changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos); }
         if !sk("xor_move_fold") { changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos); }
         if !sk("rotate_idiom") { changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos); }
@@ -454,7 +462,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
 
     // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
     // which may remove the conditional back-edge that this pass uses to detect loops).
-    if !skip_phase4 && !sk("fuse_add_sign_extend") { local_patterns::fuse_add_sign_extend(&mut store, &mut infos); }
+    // fuse_add_sign_extend removed (unsound: uninitialized dest + dropped sext).
 
     // Phase 4: Eliminate loop backedge trampoline blocks.
     let trampoline_changed = if skip_phase4 || sk("loop_trampoline") { false } else {
@@ -500,11 +508,6 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Phase 4d: Loop rotation — move condition from header to latch.
     if !skip_phase4 && !sk("loop_rotation") {
         local_patterns::rotate_loops(&mut store, &mut infos);
-    }
-
-    // Phase 4e: Fuse addl+movslq after loop rotation.
-    if !skip_phase4 && !sk("fuse_add_sign_extend") {
-        local_patterns::fuse_add_sign_extend(&mut store, &mut infos);
     }
 
     // Phase 5: Tail call optimization.

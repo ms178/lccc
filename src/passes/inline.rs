@@ -2517,6 +2517,28 @@ fn inline_call_site(
                 }
             });
         }
+        // CRITICAL: phi_incoming was collected from the callee's Return
+        // terminators BEFORE this substitution ran (those Returns are
+        // already rewritten to Branch(merge), so the loop above cannot see
+        // their operands). A callee that returns its own parameter (e.g.
+        // expat's checkCharRefNumber: `return result` where result IS the
+        // ParamRef value after copy-prop) left the stale pre-substitution
+        // id in the merge phi — an undefined value at codegen time (the
+        // switch 'break' path returned 0 instead of result; char refs
+        // &#60; etc. all decoded to 0).
+        for (op, _) in phi_incoming.iter_mut() {
+            if let Operand::Value(v) = op {
+                if let Some(&replacement) = paramref_subst.get(&v.0) {
+                    if paramref_debug {
+                        eprintln!(
+                            "[INLINE_PARAMREF] {} return-phi v{} -> {:?}",
+                            site.callee_name, v.0, replacement
+                        );
+                    }
+                    *op = replacement;
+                }
+            }
+        }
     }
 
     // Now split the caller's block at the call site:
