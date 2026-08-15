@@ -114,6 +114,16 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             let (load_b, load_i, load_dest, load_ty) = load_list[0];
             let (store_b, store_i, store_val, store_ty) = &store_list[0];
             if *store_b != latch || load_ty != *store_ty { continue; }
+            // RECURRENCE DIRECTION: the transform models `load OLD value at
+            // iteration start; store NEW value at iteration end`. When load
+            // and store share the latch block, the load must PRECEDE the
+            // store — otherwise the pattern is store-then-load (block-local
+            // temporary like `int a[2]={i,..}; acc+=a[0]`), where the load
+            // must observe the CURRENT iteration's store. Rewriting such a
+            // load to the phi handed it the PREVIOUS iteration's value (and
+            // an uninitialized preheader read on iteration 0):
+            // loop_alloca_scalar returned 281 instead of 290.
+            if load_b == *store_b && load_i > *store_i { continue; }
             if def_block.get(&ptr_id).is_some_and(|b| lp.body.contains(b)) { continue; }
             let ptr = Value(ptr_id);
             if paths.get(&ptr_id).is_some_and(|p| volatile_roots.contains(&p.root)) { continue; }

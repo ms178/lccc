@@ -20,31 +20,66 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
     // Track aggregate roots separately from precise paths. Loop pointer phis
     // commonly merge offsets 0 and 48; they still share the same allocation
     // root even though `pointer_paths` deliberately rejects the differing paths.
-    let mut root_suffix: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
+    // suffix None = variable/unknown offset: such a pointer can reach ANY
+    // byte of the aggregate. Loads through it read the whole root; stores
+    // through it are never dead. (The previous code mapped variable offsets
+    // to 0, so a `exp[i]` loop-load only "read" bytes 0..size and every
+    // store at offset >= size was deleted — simd_vhaddps lane corruption.)
+    let mut root_suffix: FxHashMap<u32, (u32, Option<i64>)> = FxHashMap::default();
+    // Values whose defs reference two DIFFERENT roots: not attributable to a
+    // single allocation; permanently untracked (tombstone prevents the
+    // insert/remove oscillation a plain remove would cause in the fixpoint).
+    let mut mixed_root: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks { for inst in &block.instructions {
-        if let Instruction::Alloca { dest, .. } = inst { root_suffix.insert(dest.0, (dest.0, 0)); }
+        if let Instruction::Alloca { dest, .. } = inst { root_suffix.insert(dest.0, (dest.0, Some(0))); }
     }}
     loop {
         let mut changed = false;
         for block in &func.blocks { for inst in &block.instructions {
             let derived = match inst {
                 Instruction::GetElementPtr { dest, base, offset, .. } => root_suffix.get(&base.0).copied().map(|(root, suffix)| {
-                    let next = match offset { Operand::Const(c) => suffix + c.to_i64().unwrap_or(0), Operand::Value(_) => 0 };
+                    let next = match (offset, suffix) {
+                        (Operand::Const(c), Some(s)) => c.to_i64().map(|o| s + o),
+                        _ => None, // variable or already-unknown offset
+                    };
                     (dest.0, (root, next))
                 }),
                 Instruction::Copy { dest, src: Operand::Value(src) } => root_suffix.get(&src.0).copied().map(|p| (dest.0, p)),
                 Instruction::Phi { dest, incoming, .. } => {
-                    let vals: Vec<(u32, i64)> = incoming.iter().filter_map(|(op, _)| match op {
+                    let vals: Vec<(u32, Option<i64>)> = incoming.iter().filter_map(|(op, _)| match op {
                         Operand::Value(v) => root_suffix.get(&v.0).copied(), _ => None }).collect();
                     if !vals.is_empty() && vals.iter().all(|p| p.0 == vals[0].0) {
-                        let suffix = if vals.iter().all(|p| p.1 == vals[0].1) { vals[0].1 } else { 0 };
+                        // Diverging offsets across phi arms => unknown, NOT 0.
+                        let suffix = if vals.iter().all(|p| p.1 == vals[0].1) { vals[0].1 } else { None };
                         Some((dest.0, (vals[0].0, suffix)))
                     } else { None }
                 }
                 _ => None,
             };
             if let Some((dest, path)) = derived {
-                if !root_suffix.contains_key(&dest) { root_suffix.insert(dest, path); changed = true; }
+                if mixed_root.contains(&dest) { continue; }
+                match root_suffix.get(&dest) {
+                    None => { root_suffix.insert(dest, path); changed = true; }
+                    // MULTI-DEF pointer (post-phi Copy web: `p = base; ...;
+                    // p = p+12` in a loop): the same SSA id denotes different
+                    // offsets at different times. Keeping the first-seen
+                    // suffix understated the read set and initializing
+                    // stores got deleted (structs_bitfields). Same root =>
+                    // demote to unknown offset; different root => not
+                    // attributable to one allocation — tombstone (fail closed).
+                    Some(&(old_root, old_suffix)) => {
+                        if old_root == path.0 {
+                            if old_suffix != path.1 && old_suffix.is_some() {
+                                root_suffix.insert(dest, (old_root, None));
+                                changed = true;
+                            }
+                        } else {
+                            root_suffix.remove(&dest);
+                            mixed_root.insert(dest);
+                            changed = true;
+                        }
+                    }
+                }
             }
         }}
         if !changed { break; }
@@ -58,41 +93,78 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
         for inst in &block.instructions {
             if let Instruction::Load { ptr, ty, .. } = inst {
                 if let Some((root, suffix)) = root_suffix.get(&ptr.0) {
-                    loaded.entry(*root).or_default().push((*suffix, type_size(*ty)));
+                    match suffix {
+                        Some(off) => loaded.entry(*root).or_default().push((*off, type_size(*ty))),
+                        // Unknown offset: conservatively reads everything.
+                        None => { loaded.entry(*root).or_default().push((i64::MIN / 4, i64::MAX / 2)); }
+                    }
                 }
             }
+            // DEFAULT-CLOSED escape analysis: only instructions whose
+            // memory semantics this pass models precisely (Load's read range,
+            // Store's written range, and the GEP/Copy/Phi derivations above)
+            // may reference a tracked root without escaping it. EVERYTHING
+            // else — calls, intrinsics (dest_ptr AND args are raw pointers
+            // into aggregates!), memcpy, atomics, inline asm, va_arg, selects,
+            // terminator operands — escapes the root. The previous allowlist
+            // missed Intrinsic entirely, so SSE/AVX stores into __m128i
+            // allocas were "never read" and every initializing store was
+            // deleted (simd regression cluster: paddd on zeroed inputs).
             match inst {
-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                    for arg in &info.args { if let Operand::Value(v) = arg {
+                Instruction::Load { .. } => {}
+                Instruction::Store { ptr: _, val, .. } => {
+                    // The written-to pointer is modeled; a tracked root used
+                    // as the *value* being stored escapes (pointer written to
+                    // memory can be reloaded and read anywhere).
+                    if let Operand::Value(v) = val {
                         if let Some((root, _)) = root_suffix.get(&v.0) { escaping.insert(*root); }
-                    }}
+                    }
                 }
-                Instruction::Memcpy { dest, src, .. } => {
-                    if let Some((root, _)) = root_suffix.get(&dest.0) { escaping.insert(*root); }
-                    if let Some((root, _)) = root_suffix.get(&src.0) { escaping.insert(*root); }
+                Instruction::GetElementPtr { .. }
+                | Instruction::Copy { .. }
+                | Instruction::Phi { .. } => {
+                    // Pure derivations, tracked in root_suffix above.
                 }
-                Instruction::Store { val: Operand::Value(v), .. } => {
-                    if let Some((root, _)) = root_suffix.get(&v.0) { escaping.insert(*root); }
+                _ => {
+                    // Escape every tracked root referenced by any operand,
+                    // value use (incl. Intrinsic dest_ptr/args, Memcpy
+                    // endpoints, call args), fail-closed.
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            if let Some((root, _)) = root_suffix.get(&v.0) { escaping.insert(*root); }
+                        }
+                    });
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                        if let Some((root, _)) = root_suffix.get(&v.0) { escaping.insert(*root); }
+                    });
                 }
-                _ => {}
             }
         }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if let Some((root, _)) = root_suffix.get(&v.0) { escaping.insert(*root); }
+            }
+        });
     }
     let mut changes = 0;
     for block in &mut func.blocks {
         let old = std::mem::take(&mut block.instructions);
         let old_spans = std::mem::take(&mut block.source_spans);
-        let has_spans = !old_spans.is_empty();
+        // Spans are only trustworthy when they parallel the instruction list
+        // 1:1 (upstream convention, see dce.rs). Other passes may insert
+        // instructions without maintaining spans; indexing old_spans[ii]
+        // with a mismatched length was an out-of-bounds ICE.
+        let has_spans = old_spans.len() == old.len();
         let mut kept = Vec::with_capacity(old.len());
         let mut spans = Vec::with_capacity(old_spans.len());
         for (ii, inst) in old.into_iter().enumerate() {
             let dead = if let Instruction::Store { ptr, ty, .. } = &inst {
-                if let Some((root, off)) = root_suffix.get(&ptr.0) {
+                if let Some((root, Some(off))) = root_suffix.get(&ptr.0) {
                     if !volatile_roots.contains(root) && !escaping.contains(root) {
                         let size = type_size(*ty);
                         !loaded.get(root).is_some_and(|ranges| ranges.iter().any(|(lo, ls)| *off < lo + ls && *lo < *off + size))
                     } else { false }
-                } else { false }
+                } else { false } // unknown store offset: never dead
             } else { false };
             if dead { changes += 1; continue; }
             kept.push(inst);
@@ -184,18 +256,69 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
         .filter_map(|(&v, (root, path))| (v == *root && path.is_empty()).then_some(v))
         .collect();
     let mut copies: FxHashMap<u32, (usize, usize, Value)> = FxHashMap::default();
+    let mut copy_sizes: FxHashMap<u32, i64> = FxHashMap::default();
     let mut duplicate = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Memcpy { dest, src, .. } = inst {
+            if let Instruction::Memcpy { dest, src, size } = inst {
                 let Some((root, path)) = paths.get(&src.0) else { continue };
                 if !path.is_empty() || !roots.contains(root) { continue; }
                 if paths.get(&dest.0).is_some_and(|p| p.0 == *root) { continue; }
                 if copies.insert(*root, (bi, ii, *dest)).is_some() { duplicate.insert(*root); }
+                copy_sizes.insert(*root, *size as i64);
             }
         }
     }
     for root in duplicate { copies.remove(&root); }
+
+    // Byte offset of a tracked pointer when its whole GEP path is constant.
+    let const_offset = |value: u32| -> Option<i64> {
+        let (_, path) = paths.get(&value)?;
+        let mut total = 0i64;
+        for (op, _) in path {
+            match op { Operand::Const(c) => total += c.to_i64()?, _ => return None }
+        }
+        Some(total)
+    };
+
+    // The rewrite below redirects uses of `root` (at indices BEFORE the
+    // memcpy) onto `dest`. That is only sound if `dest` is already DEFINED
+    // at every redirected point. `dest` is frequently the sret pointer
+    // loaded immediately before the memcpy — rewriting an earlier Store to
+    // use it produced a use-before-def (uninitialized %r11 store, SIGSEGV
+    // in struct_by_value). Fail closed: `dest` must be defined in the same
+    // block strictly before the FIRST use of `root`, or be an entry-block
+    // definition when the copy lives in a later block.
+    let mut def_site: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest() { def_site.entry(d.0).or_insert((bi, ii)); }
+        }
+    }
+    let mut first_root_use: FxHashMap<u32, usize> = FxHashMap::default();
+    for (root, (copy_b, _, _)) in &copies {
+        for (ii, inst) in func.blocks[*copy_b].instructions.iter().enumerate() {
+            let mut hit = false;
+            inst.for_each_used_value(|v| if v == *root { hit = true; });
+            if hit { first_root_use.insert(*root, ii); break; }
+        }
+    }
+    copies.retain(|root, (copy_b, _, dest)| {
+        match def_site.get(&dest.0) {
+            Some((db, di)) => {
+                if db == copy_b {
+                    // Defined in the copy's block: must precede every
+                    // redirected use, i.e. the first use of root.
+                    *di < first_root_use.get(root).copied().unwrap_or(usize::MAX)
+                } else {
+                    // Only the entry block is guaranteed to dominate.
+                    *db == 0 && *copy_b != 0
+                }
+            }
+            // No def site: function parameter — defined on entry.
+            None => true,
+        }
+    });
 
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -204,9 +327,19 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
             for value in used {
                 let Some((root, _)) = paths.get(&value) else { continue };
                 let Some((copy_b, copy_i, _)) = copies.get(root) else { continue };
+                let copy_size = copy_sizes.get(root).copied().unwrap_or(0);
+                // Every redirected memory access must land STRICTLY inside the
+                // copied byte range [0, copy_size). A bitfield read-modify-write
+                // can legally overhang the source aggregate into its own
+                // padding — but after forwarding, the same overhang lands in
+                // the DESTINATION object and corrupts whatever neighbors it
+                // there (structs_bitfields: 12-byte memcpy, 8..16 store).
+                let within_copy = |v: u32, ty: crate::common::types::IrType| -> bool {
+                    const_offset(v).is_some_and(|off| off >= 0 && off + type_size(ty) <= copy_size)
+                };
                 let allowed = match inst {
                     Instruction::GetElementPtr { base, .. } => base.0 == value,
-                    Instruction::Store { ptr, .. } => ptr.0 == value,
+                    Instruction::Store { ptr, ty, .. } => ptr.0 == value && within_copy(value, *ty),
                     Instruction::Copy { src: Operand::Value(v), .. } => v.0 == value,
                     Instruction::Phi { incoming, .. } => incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)),
                     Instruction::Memcpy { dest, src, .. } =>
@@ -382,7 +515,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     for bi in 0..func.blocks.len() {
         let old = std::mem::take(&mut func.blocks[bi].instructions);
         let old_spans = std::mem::take(&mut func.blocks[bi].source_spans);
-        let has_spans = !old_spans.is_empty();
+        // Same 1:1 length requirement as above (mismatch => drop spans, never index OOB).
+        let has_spans = old_spans.len() == old.len();
         let mut out = Vec::with_capacity(old.len());
         let mut spans = Vec::new();
         for (ii, mut inst) in old.into_iter().enumerate() {
@@ -438,8 +572,8 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false },
-                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 4, volatile: false },
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false, semantic_volatile: false },
+                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 4, volatile: false, semantic_volatile: false },
                 Instruction::Store {
                     val: Operand::Const(IrConst::I32(1)), ptr: Value(0), ty: IrType::I32,
                     seg_override: AddressSpace::Default,

@@ -827,7 +827,8 @@ pub(super) fn build_copy_alias_map(
             }
             let already_aliased: FxHashSet<u32> =
                 raw_aliases.iter().map(|&(a, _)| a).collect();
-            for (phi_dest, backedge_src) in detect_phi_coalesce_groups(func, liveness) {
+            for cand in detect_phi_coalesce_groups(func, liveness) {
+                let (phi_dest, backedge_src) = (cand.phi_dest, cand.backedge_src);
                 if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
                     eprintln!(
                         "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",

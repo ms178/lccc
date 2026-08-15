@@ -1034,14 +1034,20 @@ macro_rules! preloop_dump {
     // DCE can remove aggregate-copy consumers that previously made forwarding
     // unsafe (for example a full returned struct whose only surviving use is
     // one field load). Re-run forwarding before final loop promotion.
-    for _ in 0..8 {
-        if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+    // Honors the same kill switch as the first invocation (a gate that only
+    // silences one of two callsites is a debugging trap, not a gate).
+    if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        for _ in 0..8 {
+            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
     }
     module.for_each_function(dce::eliminate_dead_code);
     // Run memory-recurrence promotion again after CFG and copy cleanup have
     // exposed canonical natural loops.
-    module.for_each_function(loop_memory_promote::run);
-    module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+    if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
+        module.for_each_function(loop_memory_promote::run);
+        module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+    }
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can
     // stay in FP registers across the loop (AArch64 constant-pool literal loads
