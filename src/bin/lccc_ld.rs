@@ -31,6 +31,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut inputs: Vec<(String, bool)> = Vec::new(); // (path, whole_archive)
     let mut whole_archive = false;
     let mut emit_symtab = true;
+    let mut relocatable = false;
     let mut entry_override: Option<String> = None;
 
     let mut i = 0;
@@ -44,6 +45,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
                 script_path = Some(args.get(i).cloned().ok_or("-T needs an argument")?);
             }
+            "-r" | "--relocatable" | "-i" => relocatable = true,
             "--whole-archive" => whole_archive = true,
             "--no-whole-archive" => whole_archive = false,
             "--start-group" | "--end-group" | "-(" | "-)" => {}
@@ -99,8 +101,15 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut objects = Vec::new();
     lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
 
+    if relocatable {
+        if script_path.is_some() {
+            eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
+        }
+        return lccc::linker_entry::link_relocatable_x86(&objects, &output);
+    }
+
     let Some(script_path) = script_path else {
-        return Err("lccc-ld currently requires a linker script (-T/--script); \
+        return Err("lccc-ld currently requires a linker script (-T/--script) or -r; \
                     use the lccc driver for standard userspace links".into());
     };
     let mut script_src = std::fs::read_to_string(&script_path)

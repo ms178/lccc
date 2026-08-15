@@ -34,6 +34,7 @@ pub(super) fn emit_executable(
     export_dynamic: bool, rpath_entries: &[String], use_runpath: bool,
     is_static: bool, ifunc_symbols: &[String],
     entry_symbol: Option<&str>,
+    z_now: bool, z_relro: bool,
 ) -> Result<(), String> {
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
@@ -285,16 +286,16 @@ pub(super) fn emit_executable(
         // Chain value = hash with bit 0 indicating end of chain
         gnu_hash_chains[i] = h & !1; // clear bit 0 (will set later for last in chain)
     }
-    // Mark the last symbol in each bucket chain with bit 0 set
-    for bucket_idx in 0..gnu_hash_nbuckets as usize {
-        if gnu_hash_buckets[bucket_idx] == 0 { continue; }
-        let mut last_in_bucket = 0;
-        for (i, &h) in hashed_sym_hashes.iter().enumerate() {
-            if (h % gnu_hash_nbuckets) as usize == bucket_idx {
-                last_in_bucket = i;
-            }
-        }
-        gnu_hash_chains[last_in_bucket] |= 1; // set end-of-chain bit
+    // Mark the last symbol of each bucket chain (bit 0). Symbols are already
+    // bucket-sorted, so a single linear pass suffices: entry i ends its chain
+    // when the next entry hashes into a different bucket. The previous
+    // per-bucket rescan was O(buckets * symbols) - quadratic for large
+    // export tables (glibc-sized .so builds).
+    for i in 0..hashed_sym_hashes.len() {
+        let last = i + 1 == hashed_sym_hashes.len()
+            || (hashed_sym_hashes[i + 1] % gnu_hash_nbuckets)
+                != (hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        if last { gnu_hash_chains[i] |= 1; }
     }
 
     // gnu_hash_size = header(16) + bloom(bloom_size*8) + buckets(nbuckets*4) + chains(num_hashed*4)
@@ -315,6 +316,7 @@ pub(super) fn emit_executable(
         if has_init_array { dyn_count += 2; }
         if has_fini_array { dyn_count += 2; }
         if has_preinit_array { dyn_count += 2; }
+        if z_now { dyn_count += 2; } // DT_FLAGS(BIND_NOW) + DT_FLAGS_1(NOW)
         if rpath_string.is_some() { dyn_count += 1; }
         if verneed_size > 0 { dyn_count += 3; } // DT_VERSYM + DT_VERNEED + DT_VERNEEDNUM
         dyn_count * 16
@@ -328,11 +330,28 @@ pub(super) fn emit_executable(
     let verneed_size = if is_static { 0u64 } else { verneed_size };
 
     let has_tls_sections = output_sections.iter().any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
+    // .eh_frame_hdr + PT_GNU_EH_FRAME: required for libgcc/libunwind binary-
+    // search unwinding (C++ exceptions, backtrace()) instead of linear scans.
+    let eh_frame_fde_count: usize = output_sections.iter()
+        .filter(|s| s.name == ".eh_frame" && s.mem_size > 0)
+        .flat_map(|s| s.inputs.iter())
+        .map(|input| linker_common::count_eh_frame_fdes(
+            &objects[input.object_idx].section_data[input.section_idx]))
+        .sum();
+    let eh_frame_hdr_size: u64 = if eh_frame_fde_count > 0 {
+        (12 + 8 * eh_frame_fde_count) as u64
+    } else { 0 };
     // Static: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), GNU_STACK, [TLS]
     // Dynamic: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, [TLS]
-    let phdr_count: u64 = if is_static {
+    let mut phdr_count: u64 = if is_static {
         if has_tls_sections { 7 } else { 6 }
     } else if has_tls_sections { 9 } else { 8 };
+    if eh_frame_hdr_size > 0 { phdr_count += 1; }
+    // PT_GNU_RELRO: covers the head of the RW segment (init/fini arrays,
+    // .dynamic, .got — plus .got.plt under -z now). Static executables get
+    // it too when they carry protectable content.
+    let has_relro = z_relro && !is_static;
+    if has_relro { phdr_count += 1; }
     let phdr_total_size = phdr_count * 56;
 
     // === Layout ===
@@ -392,6 +411,12 @@ pub(super) fn emit_executable(
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let rodata_page_offset = offset;
     let rodata_page_addr = BASE_ADDR + offset;
+    // .eh_frame_hdr leads the rodata segment (data filled after relocation).
+    let (eh_frame_hdr_offset, eh_frame_hdr_vaddr) = if eh_frame_hdr_size > 0 {
+        let o = offset; let v = BASE_ADDR + offset;
+        offset += eh_frame_hdr_size;
+        (o, v)
+    } else { (0u64, 0u64) };
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
            sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS {
@@ -445,8 +470,28 @@ pub(super) fn emit_executable(
     let dynamic_offset = offset; let dynamic_addr = BASE_ADDR + offset; offset += dynamic_size;
     offset = (offset + 7) & !7;
     let got_offset = offset; let got_addr = BASE_ADDR + offset; offset += got_size;
-    offset = (offset + 7) & !7;
-    let got_plt_offset = offset; let got_plt_addr = BASE_ADDR + offset; offset += got_plt_size;
+    // Under -z now the .got.plt is never written after startup, so it can be
+    // protected too (Full RELRO). Under lazy binding it must stay writable
+    // and is placed after the RELRO page boundary below.
+    let (mut got_plt_offset, mut got_plt_addr) = (0u64, 0u64);
+    if has_relro && z_now {
+        offset = (offset + 7) & !7;
+        got_plt_offset = offset; got_plt_addr = BASE_ADDR + offset;
+        offset += got_plt_size;
+    }
+    // RELRO boundary: everything before this is mprotect(PROT_READ)ed by
+    // ld.so after relocation; the boundary must be page-aligned.
+    let relro_start = rw_page_offset;
+    let mut relro_size = 0u64;
+    if has_relro {
+        offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        relro_size = offset - relro_start;
+    }
+    if !(has_relro && z_now) {
+        offset = (offset + 7) & !7;
+        got_plt_offset = offset; got_plt_addr = BASE_ADDR + offset;
+        offset += got_plt_size;
+    }
 
     // IFUNC GOT (8 bytes per entry, stores resolver addresses initially)
     offset = (offset + 7) & !7;
@@ -670,6 +715,7 @@ pub(super) fn emit_executable(
         if !is_static && plt_size > 0 {
             h += 1;
         }
+        if eh_frame_hdr_size > 0 { h += 1; } // .eh_frame_hdr
         for (i, sec) in output_sections.iter().enumerate() {
             if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
                 && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array"
@@ -733,6 +779,7 @@ pub(super) fn emit_executable(
         if !is_static && rela_dyn_size > 0 { h += 1; }
         if !is_static && rela_plt_size > 0 { h += 1; }
         if !is_static && plt_size > 0 { h += 1; }
+        if eh_frame_hdr_size > 0 { h += 1; }
         for sec in output_sections.iter() {
             if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
                 && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" { h += 1; }
@@ -860,7 +907,18 @@ pub(super) fn emit_executable(
     if !is_static {
         wphdr(&mut out, ph, PT_DYNAMIC, PF_R|PF_W, dynamic_offset, dynamic_addr, dynamic_size, dynamic_size, 8); ph += 56;
     }
+    if has_relro && relro_size > 0 {
+        wphdr(&mut out, ph, PT_GNU_RELRO, PF_R,
+              relro_start, BASE_ADDR + relro_start, relro_size, relro_size, 1);
+        ph += 56;
+    }
     wphdr(&mut out, ph, PT_GNU_STACK, PF_R|PF_W, 0, 0, 0, 0, 0x10); ph += 56;
+    if eh_frame_hdr_size > 0 {
+        wphdr(&mut out, ph, PT_GNU_EH_FRAME, PF_R,
+              eh_frame_hdr_offset, eh_frame_hdr_vaddr,
+              eh_frame_hdr_size, eh_frame_hdr_size, 4);
+        ph += 56;
+    }
     if has_tls {
         wphdr(&mut out, ph, PT_TLS, PF_R, tls_file_offset, tls_addr, tls_file_size, tls_mem_size, tls_align);
     }
@@ -1057,6 +1115,10 @@ pub(super) fn emit_executable(
             w64(&mut out, dd, DT_VERNEED as u64); w64(&mut out, dd+8, verneed_addr); dd += 16;
             w64(&mut out, dd, DT_VERNEEDNUM as u64); w64(&mut out, dd+8, verneed_count as u64); dd += 16;
         }
+        if z_now {
+            w64(&mut out, dd, DT_FLAGS as u64); w64(&mut out, dd+8, DF_BIND_NOW as u64); dd += 16;
+            w64(&mut out, dd, DT_FLAGS_1 as u64); w64(&mut out, dd+8, DF_1_NOW as u64); dd += 16;
+        }
         w64(&mut out, dd, DT_NULL as u64); w64(&mut out, dd+8, 0);
 
         // .got.plt
@@ -1196,10 +1258,28 @@ pub(super) fn emit_executable(
                                 if let Some(pi) = g.plt_idx { plt_addr + 16 + pi as u64 * 16 } else { s }
                             } else { s }
                         } else { s };
-                        w32(&mut out, fp, (t as i64 + a - p as i64) as u32);
+                        let v = t as i64 + a - p as i64;
+                        if v > i32::MAX as i64 || v < i32::MIN as i64 {
+                            return Err(reloc_truncated("R_X86_64_PC32", v, sym, obj_idx, objects));
+                        }
+                        w32(&mut out, fp, v as u32);
                     }
-                    R_X86_64_32 => { w32(&mut out, fp, (s as i64 + a) as u32); }
-                    R_X86_64_32S => { w32(&mut out, fp, (s as i64 + a) as u32); }
+                    R_X86_64_32 => {
+                        // Zero-extended 32-bit absolute: value must fit unsigned.
+                        let v = s as i64 + a;
+                        if v < 0 || v > u32::MAX as i64 {
+                            return Err(reloc_truncated("R_X86_64_32", v, sym, obj_idx, objects));
+                        }
+                        w32(&mut out, fp, v as u32);
+                    }
+                    R_X86_64_32S => {
+                        // Sign-extended 32-bit absolute: value must fit signed.
+                        let v = s as i64 + a;
+                        if v > i32::MAX as i64 || v < i32::MIN as i64 {
+                            return Err(reloc_truncated("R_X86_64_32S", v, sym, obj_idx, objects));
+                        }
+                        w32(&mut out, fp, v as u32);
+                    }
                     R_X86_64_GOTTPOFF => {
                         // Initial Exec TLS via GOT: GOT entry contains TPOFF value
                         let mut resolved = false;
@@ -1397,11 +1477,30 @@ pub(super) fn emit_executable(
         }
     }
 
+    // Build .eh_frame_hdr from the RELOCATED .eh_frame bytes (initial_location
+    // fields are only meaningful after R_X86_64_PC32 application).
+    if eh_frame_hdr_size > 0 {
+        if let Some(ef) = output_sections.iter().find(|s| s.name == ".eh_frame" && s.mem_size > 0) {
+            let ef_start = ef.file_offset as usize;
+            let ef_end = ef_start + ef.mem_size as usize;
+            if ef_end <= out.len() {
+                let relocated = out[ef_start..ef_end].to_vec();
+                let hdr = linker_common::build_eh_frame_hdr(
+                    &relocated, ef.addr, eh_frame_hdr_vaddr, true);
+                if !hdr.is_empty()
+                    && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
+                    write_bytes(&mut out, eh_frame_hdr_offset as usize, &hdr);
+                }
+            }
+        }
+    }
+
     // === Append section headers ===
     // Build .shstrtab string table
     let mut shstrtab = vec![0u8]; // null byte at offset 0
     let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
     let known_names = [
+        ".eh_frame_hdr",
         ".interp", ".gnu.hash", ".dynsym", ".dynstr",
         ".gnu.version", ".gnu.version_r",
         ".rela.dyn", ".rela.plt", ".plt", ".dynamic",
@@ -1446,6 +1545,7 @@ pub(super) fn emit_executable(
     if !is_static && rela_dyn_size > 0 { sh_count += 1; }
     if !is_static && rela_plt_size > 0 { sh_count += 1; }
     if !is_static && plt_size > 0 { sh_count += 1; }
+    if eh_frame_hdr_size > 0 { sh_count += 1; } // .eh_frame_hdr
     // Merged output sections (non-BSS, non-TLS, non-init/fini)
     for sec in output_sections.iter() {
         if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
@@ -1537,6 +1637,11 @@ pub(super) fn emit_executable(
             write_shdr(&mut out, get_shname(".plt"), SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
                        plt_addr, plt_offset, plt_size, 0, 0, 16, 16);
         }
+    }
+    // .eh_frame_hdr (before the merged sections; matches the count walks above)
+    if eh_frame_hdr_size > 0 {
+        write_shdr(&mut out, get_shname(".eh_frame_hdr"), SHT_PROGBITS, SHF_ALLOC,
+                   eh_frame_hdr_vaddr, eh_frame_hdr_offset, eh_frame_hdr_size, 0, 0, 4, 0);
     }
     // Merged output sections (text/rodata/data, excluding BSS/TLS/init_array/fini_array)
     for sec in output_sections.iter() {
@@ -1666,4 +1771,17 @@ pub(super) fn resolve_sym(
     if sym.shndx == SHN_ABS { return sym.value; }
     section_map.get(&(obj_idx, sym.shndx as usize))
         .map(|&(oi, so)| output_sections[oi].addr + so + sym.value).unwrap_or(sym.value)
+}
+
+/// Format a "relocation truncated to fit" error in the GNU ld style,
+/// with the referencing object file for actionable diagnostics.
+pub(super) fn reloc_truncated(
+    rtype: &str, value: i64, sym: &Symbol, obj_idx: usize, objects: &[ElfObject],
+) -> String {
+    let target = if sym.name.is_empty() { "<local>" } else { sym.name.as_str() };
+    format!(
+        "relocation truncated to fit: {} against symbol '{}' in {} (value 0x{:x} out of range); \
+         recompile with -mcmodel=large or -fpic if the image exceeds 2 GiB",
+        rtype, target, objects[obj_idx].source_name, value
+    )
 }

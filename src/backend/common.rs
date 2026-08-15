@@ -216,6 +216,24 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
     #[cfg(not(feature = "gcc_linker"))]
     {
         if is_relocatable {
+            // Native `ld -r`: merge ET_REL inputs into one ET_REL output.
+            // Only x86-64 has the emitter today; other arches keep the old error.
+            if config.expected_elf_machine == EM_X86_64 {
+                let mut inputs: Vec<(String, bool)> = Vec::new();
+                for f in object_files {
+                    inputs.push((f.to_string(), false));
+                }
+                for a in user_args {
+                    if !a.starts_with('-') && std::path::Path::new(a).exists()
+                        && (a.ends_with(".o") || a.ends_with(".a")) {
+                        inputs.push((a.clone(), false));
+                    }
+                }
+                let mut objects = Vec::new();
+                crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects)?;
+                return crate::backend::x86::linker::emit_rel::link_relocatable(
+                    &objects, output_path);
+            }
             return Err("Relocatable linking (-r) requires the gcc_linker feature. \
                        Rebuild with: cargo build --features gcc_linker".to_string());
         }

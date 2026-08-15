@@ -38,6 +38,10 @@ pub struct LinkerArgs {
     /// Symbols forced undefined via `-u SYM` / `--undefined=SYM` (forces
     /// archive members that define them to be pulled in).
     pub undefined_symbols: Vec<String>,
+    /// `-z now`: eager binding (DT_FLAGS: BIND_NOW, DT_FLAGS_1: NOW).
+    pub z_now: bool,
+    /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
+    pub z_relro: bool,
 }
 
 /// Parse user linker arguments into a structured `LinkerArgs`.
@@ -46,6 +50,7 @@ pub struct LinkerArgs {
 /// `-rpath`, `--gc-sections`), `-rdynamic`, `-static`, and bare file paths.
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
+    result.z_relro = true; // RELRO is on by default, like GNU ld/mold
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     let mut pending_rpath = false; // for -Wl,-rpath -Wl,/path two-arg form
     let mut i = 0;
@@ -114,6 +119,15 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.gc_sections = false;
                 } else if part == "-static" {
                     result.is_static = true;
+                } else if part == "-z" && j + 1 < parts.len() {
+                    j += 1;
+                    match parts[j] {
+                        "now" => result.z_now = true,
+                        "lazy" => result.z_now = false,
+                        "relro" => result.z_relro = true,
+                        "norelro" => result.z_relro = false,
+                        _ => {} // noexecstack, defs, ... accepted elsewhere
+                    }
                 } else if let Some(sym) = part.strip_prefix("--entry=") {
                     result.entry_symbol = Some(sym.to_string());
                 } else if (part == "-e" || part == "--entry") && j + 1 < parts.len() {
