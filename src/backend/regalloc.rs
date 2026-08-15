@@ -1204,8 +1204,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         for candidate in &all_phi_pairs {
             let phi_dest = candidate.phi_dest;
             let backedge_src = candidate.backedge_src;
-            let d_reg = assignments.get(&phi_dest).copied().filter(|r| (40..=55).contains(&r.0));
-            let s_reg = assignments.get(&backedge_src).copied().filter(|r| (40..=55).contains(&r.0));
+            // FP pool spans caller-saved d16..d31 (40..=55) AND callee-saved
+            // d8..d14 (32..=38) — both are valid coalesce targets.
+            let is_fp = |r: &PhysReg| (32..=38).contains(&r.0) || (40..=55).contains(&r.0);
+            let d_reg = assignments.get(&phi_dest).copied().filter(is_fp);
+            let s_reg = assignments.get(&backedge_src).copied().filter(is_fp);
             let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
             if d == s {
                 continue;
@@ -2260,7 +2263,15 @@ pub(crate) fn detect_phi_coalesce_groups(
 
     let debug = std::env::var("CCC_DEBUG_PHI_COALESCE").is_ok();
     let mut candidates = Vec::new();
-    let mut seen_phi_dests: FxHashSet<u32> = FxHashSet::default();
+    // A phi dest may have several loop-block copies (loop-entry initialization
+    // plus the true backedge update, or multiple latches via `continue`). ALL
+    // pairs are returned: keeping only the first found meant an entry copy
+    // shadowed the true backedge copy, so the accumulator update kept a
+    // register shuffle in the loop. Safety relies on the consumers' own
+    // proofs: the same-block window revalidation + interval conflict check in
+    // register propagation (later pairs see earlier pairs' assignments and
+    // fail closed), and the one-NEW-alias-per-dest claim set in slot
+    // coalescing (claimed_dests).
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         if liveness
@@ -2281,10 +2292,7 @@ pub(crate) fn detect_phi_coalesce_groups(
             else {
                 continue;
             };
-            if !multi_def.contains(&dest.0)
-                || seen_phi_dests.contains(&dest.0)
-                || multi_def.contains(&src.0)
-            {
+            if !multi_def.contains(&dest.0) || multi_def.contains(&src.0) {
                 continue;
             }
 
@@ -2343,7 +2351,6 @@ pub(crate) fn detect_phi_coalesce_groups(
                 source_def_idx,
                 copy_idx,
             });
-            seen_phi_dests.insert(dest.0);
         }
     }
 

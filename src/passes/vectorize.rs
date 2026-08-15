@@ -1576,8 +1576,23 @@ fn gep_uses_iv(
     for &block_idx in loop_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, offset, .. } = inst {
+            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
                 if *dest == gep {
+                    // The reduction transform models the access as
+                    // `invariant_base + iv * element_size` and later rewrites
+                    // the IV to step in bytes. That model is WRONG when the
+                    // GEP's BASE itself depends on the IV — multi-level GEPs
+                    // like C[i][i] lower to
+                    //     row  = C + (i << 11)      ; IV-dependent base!
+                    //     addr = row + (i << 3)     ; looks like stride-8
+                    // and after the byte-stride rewrite the row computation
+                    // scales with the byte IV (i<<11 over 0..2048 = 4 MB):
+                    // out-of-bounds segfault (256x256 matmul diagonal-sum
+                    // reproducer). Fail closed: the base must be defined
+                    // outside the loop or be a loop-invariant address.
+                    if !gep_base_is_loop_invariant(func, loop_blocks, *base, iv, iv_derived) {
+                        return false;
+                    }
                     // Check if offset uses IV or IV-derived value
                     if let Operand::Value(v) = offset {
                         if v == &iv || iv_derived.contains(v) {
@@ -1592,6 +1607,43 @@ fn gep_uses_iv(
         }
     }
     false
+}
+
+/// A GEP base is loop-invariant when its defining instruction lives outside
+/// the loop, or is a loop-materialized but constant address (GlobalAddr,
+/// Alloca). Anything defined inside the loop — in particular another GEP or
+/// arithmetic that involves the IV — disqualifies the access from the
+/// contiguous-stream reduction model. Chains of Copy/GlobalAddr are followed;
+/// unknown shapes fail closed.
+fn gep_base_is_loop_invariant(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    base: Value,
+    iv: Value,
+    iv_derived: &FxHashSet<Value>,
+) -> bool {
+    if base == iv || iv_derived.contains(&base) {
+        return false;
+    }
+    for &block_idx in loop_blocks {
+        for inst in &func.blocks[block_idx].instructions {
+            if inst.dest() == Some(base) {
+                return match inst {
+                    // Constant addresses are invariant regardless of where
+                    // they are materialized.
+                    Instruction::GlobalAddr { .. } | Instruction::Alloca { .. } => true,
+                    Instruction::Copy { src: Operand::Value(v), .. } => {
+                        gep_base_is_loop_invariant(func, loop_blocks, *v, iv, iv_derived)
+                    }
+                    // GEP/BinOp/Cast/Load/Phi defined IN the loop: treat as
+                    // variant (fail closed).
+                    _ => false,
+                };
+            }
+        }
+    }
+    // Not defined in any loop block: defined before the loop — invariant.
+    true
 }
 
 /// Check if a value depends on the IV (transitively through operations)

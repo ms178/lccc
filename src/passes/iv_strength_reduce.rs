@@ -33,10 +33,10 @@ use crate::ir::reexports::{
 };
 use super::loop_analysis::{self, NaturalLoop};
 
-/// Maximum stride (in bytes) for an induction variable to be eligible for
-/// strength reduction. Covers common element sizes up to 1 KB; larger strides
-/// are unlikely to benefit and may indicate non-array access patterns.
-const MAX_IV_STRIDE: i64 = 1024;
+/// Maximum byte stride eligible for pointer induction. Matrix row strides are
+/// routinely several KiB (256 doubles = 2048 bytes), and are especially worth
+/// reducing because their multiply executes in an enclosing hot loop.
+const MAX_IV_STRIDE: i64 = 1 << 20;
 
 /// Maximum number of Cast/Copy instructions to follow when looking through
 /// cast chains to find the root value. Guards against infinite loops on
