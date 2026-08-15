@@ -8,8 +8,10 @@
 //! For UNSIGNED accumulation the additions are associative modulo 2^n (no
 //! overflow UB), so an N-step unroll has the exact closed form
 //!
+//! ```text
 //!     sum1' = sum1 + Σᵢ b[i]
 //!     sum2' = sum2 + N·sum1 + Σᵢ (N−i)·b[i]
+//! ```
 //!
 //! which recomputes `sum2'` directly from the OLD `sum1` and the byte loads —
 //! breaking the serial dependency between the two chains (ICC's 4-register

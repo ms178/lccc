@@ -255,6 +255,21 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     let roots: FxHashSet<u32> = paths.iter()
         .filter_map(|(&v, (root, path))| (v == *root && path.is_empty()).then_some(v))
         .collect();
+    // Entry-block allocas homing register parameters are written by the
+    // PROLOGUE, not by IR-visible stores (find_param_alloca maps param i to
+    // the i-th entry-block alloca; the x86/arm prologues spill incoming
+    // registers there). Forwarding such a root redirects only the IR stores
+    // and deletes the copy — the implicit prologue write is lost and the
+    // copy destination stays uninitialized (dump128(__m128 v): the
+    // `memcpy tmp, v_home` snapshot was deleted outright because v_home has
+    // ZERO IR stores; tmp then fed printf with stack garbage). Exclude the
+    // first params.len() entry allocas as forwarding sources, fail closed.
+    let param_slot_roots: FxHashSet<u32> = func.blocks.first()
+        .map(|b| b.instructions.iter()
+            .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
+            .take(func.params.len())
+            .collect())
+        .unwrap_or_default();
     let mut copies: FxHashMap<u32, (usize, usize, Value)> = FxHashMap::default();
     let mut copy_sizes: FxHashMap<u32, i64> = FxHashMap::default();
     let mut duplicate = FxHashSet::default();
@@ -263,6 +278,7 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
             if let Instruction::Memcpy { dest, src, size } = inst {
                 let Some((root, path)) = paths.get(&src.0) else { continue };
                 if !path.is_empty() || !roots.contains(root) { continue; }
+                if param_slot_roots.contains(root) { continue; }
                 if paths.get(&dest.0).is_some_and(|p| p.0 == *root) { continue; }
                 if copies.insert(*root, (bi, ii, *dest)).is_some() { duplicate.insert(*root); }
                 copy_sizes.insert(*root, *size as i64);
@@ -407,6 +423,11 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     }
     if copies.is_empty() { return 0; }
 
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for (&root, &(bi, copy_i, dest)) in &copies {
+            eprintln!("[STOREFWD] {} root=v{} dest=v{} at b{}:{}", func.name, root, dest.0, bi, copy_i);
+        }
+    }
     let mut changes = 0;
     for (&root, &(bi, copy_i, dest)) in &copies {
         for (ii, inst) in func.blocks[bi].instructions.iter_mut().enumerate() {
@@ -441,7 +462,14 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    let reverse_changes = forward_store_only_temporaries(func);
+    // Sub-pass gates for miscompile bisection (this pass family has produced
+    // eight distinct unsoundness bugs; being able to isolate the store-only
+    // forwarding, the main forwarding, and the dead-store elimination
+    // independently cuts a bisection from hours to minutes).
+    let reverse_changes = if std::env::var("CCC_NO_AGG_STORE_FWD").is_ok() { 0 } else { forward_store_only_temporaries(func) };
+    if std::env::var("CCC_NO_AGG_MAIN").is_ok() {
+        return reverse_changes + if std::env::var("CCC_NO_AGG_DEAD_STORES").is_ok() { 0 } else { eliminate_dead_aggregate_field_stores(func) };
+    }
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
     let dominates = |a: usize, mut b: usize| {
         if a == b { return true; }
