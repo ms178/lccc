@@ -11,12 +11,13 @@
 
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::fx_hash::FxHashMap as FxInlineMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
     Operand, Terminator, Value,
 };
-use crate::common::fx_hash::FxHashMap;
+use crate::passes::loop_analysis;
 
 /// Maximum number of IR instructions (across all blocks) in a callee for it
 /// to be eligible for inlining. This handles constant-returning helpers
@@ -156,6 +157,22 @@ const MAX_STATIC_NONINLINE_INSTRUCTIONS: usize = 30;
 /// Maximum blocks for a `static` (non-`inline`) function to be eligible.
 const MAX_STATIC_NONINLINE_BLOCKS: usize = 4;
 
+/// Maximum instructions for a `static` (non-`inline`) function that has exactly
+/// one call site in the whole module. GCC at -O2 inlines such functions almost
+/// unconditionally: after inlining, the callee is dead (net code shrink), so
+/// even moderately-sized bodies are worth inlining. This matters for hot
+/// benchmarks where helpers like clz32 (72 inst, 14 blocks) or reverse_bits
+/// (102 inst) exceed the multi-call-site static limits but are only called
+/// once. Limits are still bounded (unlike always_inline) so that pathological
+/// single-call-site statics in huge translation units (e.g., the SQLite
+/// amalgamation) cannot inline unbounded bodies into their caller.
+const MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS: usize = 300;
+
+/// Maximum blocks for a `static` function with a single call site (see above).
+/// High enough to cover if/else chains like clz32 (14 blocks) and small loops
+/// like struct-building helpers (13 blocks).
+const MAX_SINGLE_CALL_SITE_STATIC_BLOCKS: usize = 24;
+
 /// Budget for always_inline callees per caller. This budget is ONLY consumed
 /// by true __attribute__((always_inline)) callees that exceed the "small"
 /// threshold (> MAX_SMALL_INLINE_INSTRUCTIONS or > MAX_SMALL_INLINE_BLOCKS).
@@ -273,6 +290,8 @@ fn select_inline_site(
     always_inline_budget_remaining: usize,
     pgo_force_budget_remaining: usize,
     small_only: bool,
+    loop_blocks: &FxHashSet<usize>,
+    caller_has_loops: bool,
 ) -> Option<(InlineCallSite, usize, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
     // These are always inlined regardless of caller size because:
@@ -379,8 +398,34 @@ fn select_inline_site(
             // When the caller has a section attribute (e.g., .init.text),
             // allow inlining small callees even into large callers to
             // prevent section mismatch errors.
+            // Single-call-site static callees are exempt from the soft
+            // caller-size cap: the callee is dead after inlining (net code
+            // shrink), so growing the caller does not increase total code
+            // size. The hard and absolute caps below still apply as safety
+            // brakes.
+            //
+            // Call sites inside loops are also exempt (up to the normal
+            // callee size limit): a call in a hot loop pays its overhead
+            // every iteration, so inlining it is almost always a win even in
+            // a large caller.
+            //
+            // Exception: inlining a loop-containing callee into a caller that
+            // already has loops merges two hot loop nests into one function,
+            // and the combined register pressure forces the loop variables to
+            // spill. Such callees may not use the single-call-site exemption
+            // once the caller is large — keep them as calls (matching GCC).
+            let in_loop = loop_blocks.contains(&site.block_idx);
+            let loop_nest_merge = callee_data.has_loops
+                && caller_has_loops
+                && callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS;
+            let size_cap_exempt =
+                callee_data.is_single_call_site_static && !loop_nest_merge;
             if caller_too_large
                 && !callee_data.is_always_inline
+                && !size_cap_exempt
+                && !(in_loop
+                    && !callee_data.has_loops
+                    && callee_inst_count <= MAX_INLINE_INSTRUCTIONS)
                 && (!caller_has_section || callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS)
             {
                 continue;
@@ -416,7 +461,10 @@ fn select_inline_site(
             if callee_inst_count > pgo_force_budget_remaining {
                 continue;
             }
-        } else if callee_inst_count > budget_remaining {
+        } else if !callee_data.is_single_call_site_static && callee_inst_count > budget_remaining {
+            // Single-call-site statics don't consume the normal budget: each
+            // is inlined at most once module-wide, so they cannot cause the
+            // exponential blowup the budget guards against.
             continue;
         }
         return Some((site.clone(), callee_inst_count, use_relaxed));
@@ -614,6 +662,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                                     ret_eightbyte_classes: vec![],
                                     ret_is_f128_sse: false,
                                     is_gnu_inline_def: false,
+                                    loop_promoted_f64_values: Vec::new(),
                                 };
                                 dummy
                             },
@@ -654,6 +703,24 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             }
 
             // Select best call site (prioritizes tiny/small, respects budgets).
+            // Compute which blocks are inside loops: call sites there are
+            // high-value (per-iteration call overhead) and exempt from the
+            // caller-size caps. Also used to avoid inlining loop-containing
+            // callees into a caller that already has loops.
+            let needs_loop_info = caller_too_large
+                || call_sites.iter().any(|s| callee_map[&s.callee_name].has_loops);
+            let loop_blocks: FxHashSet<usize> = if needs_loop_info {
+                let cfg = crate::ir::analysis::CfgAnalysis::build(&module.functions[func_idx]);
+                let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+                let mut s = FxHashSet::default();
+                for lp in &loops {
+                    s.extend(lp.body.iter().copied());
+                }
+                s
+            } else {
+                FxHashSet::default()
+            };
+            let caller_has_loops = !loop_blocks.is_empty();
             let found_site = select_inline_site(
                 &call_sites,
                 &callee_map,
@@ -666,6 +733,8 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 always_inline_budget_remaining,
                 pgo_force_budget_remaining,
                 small_only,
+                &loop_blocks,
+                caller_has_loops,
             );
             let (site, callee_inst_count, _use_relaxed) = match found_site {
                 Some(s) => s,
@@ -839,6 +908,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                                     ret_eightbyte_classes: vec![],
                                     ret_is_f128_sse: false,
                                     is_gnu_inline_def: false,
+                                    loop_promoted_f64_values: Vec::new(),
                                 };
                                 dummy
                             },
@@ -1394,6 +1464,11 @@ struct CalleeData {
     /// same to match GCC behavior and enable critical optimizations (e.g.,
     /// constant propagation of shift amounts in ror32 used by blake2s).
     is_static_inline: bool,
+    /// Whether this callee is a `static` (non-`inline`) function with exactly
+    /// one call site in the whole module. Such callees are dead after inlining
+    /// (net code shrink), so they are exempt from the caller-size caps and the
+    /// per-caller inlining budget, matching GCC's -O2 behavior.
+    is_single_call_site_static: bool,
     /// Whether this callee contains any back-edges (loops).
     /// Functions without loops can use a higher block limit for inlining.
     has_loops: bool,
@@ -1509,6 +1584,20 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
     let call_counts = direct_call_counts(module);
     let mut map = FxHashMap::default();
 
+    // Count direct call sites per callee across the whole module. A static
+    // function with exactly one call site is dead after inlining (net code
+    // shrink), so it gets more generous size limits below.
+    let mut call_site_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for f in &module.functions {
+        for block in &f.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Call { func: callee_name, .. } = inst {
+                    *call_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
     for func in &module.functions {
         if func.is_declaration {
@@ -1622,15 +1711,43 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                         func.blocks.len(),
                         direct_call_count,
                     )));
+        // A static (non-inline) function with exactly one call site in the
+        // module is dead after inlining (net code shrink), so GCC -O2 inlines
+        // it even when it exceeds the multi-call-site static limits above.
+        // Admit these with the more generous single-call-site limits.
+        let has_single_call_site =
+            call_site_counts.get(&func.name).copied().unwrap_or(0) == 1;
+        // A single-call-site static leaf function whose body is a switch
+        // dispatcher (no further calls) is a prime inline candidate even past
+        // the generic block cap: the switch merges into the caller and the
+        // call/return per dispatch disappears (VM interpreter loops).
+        let is_leaf_switch_dispatch = func
+            .blocks
+            .iter()
+            .any(|block| matches!(block.terminator, Terminator::Switch { .. }))
+            && !func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. })
+                })
+            });
+        let fits_single_call_site_static = func.is_static
+            && !func.is_inline
+            && !is_small_static
+            && !is_medium_static
+            && has_single_call_site
+            && ((inst_count_for_static <= MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS
+                && func.blocks.len() <= MAX_SINGLE_CALL_SITE_STATIC_BLOCKS)
+                || (is_leaf_switch_dispatch && func.blocks.len() <= 64));
         if !is_always_inline
             && !is_trivially_empty
             && !is_small_static
             && !is_medium_static
+            && !fits_single_call_site_static
             && (!func.is_static || !func.is_inline)
         {
             if debug_callee {
                 eprintln!(
-                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, blocks={}, inst_count={}, has_loops={}, direct_calls={}, medium_block_limit={}, is_declaration={}",
+                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, blocks={}, inst_count={}, has_loops={}, direct_calls={}, medium_block_limit={}, single_site={}, leaf_switch={}, is_declaration={}",
                     func.name,
                     func.is_static,
                     func.is_inline,
@@ -1639,6 +1756,8 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     has_loops,
                     direct_call_count,
                     medium_block_limit,
+                    has_single_call_site,
+                    is_leaf_switch_dispatch,
                     func.is_declaration,
                 );
             }
@@ -1696,7 +1815,11 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count));
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
-        let exceeds_normal = !is_always_inline && !fits_normal;
+        // Single-call-site statics were already size-checked above against
+        // their own limits; treat them as fitting normal limits so they are
+        // inlinable into ordinary callers (not just section-attributed ones).
+        let exceeds_normal =
+            !is_always_inline && !fits_normal && !fits_single_call_site_static;
         if is_always_inline {
             if !fits_relaxed {
                 continue;
@@ -1704,7 +1827,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         } else {
             // For static inline: admit if within normal limits OR within relaxed limits
             // (the latter only used for section-attributed callers).
-            if !fits_normal && !fits_relaxed {
+            if !fits_normal && !fits_single_call_site_static && !fits_relaxed {
                 continue;
             }
         }
@@ -1781,6 +1904,13 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 is_always_inline,
                 exceeds_normal_limits: exceeds_normal,
                 is_static_inline: func.is_static && func.is_inline,
+                // Any static (non-inline) callee with a single call site is
+                // dead after inlining, so it is exempt from the soft caller-
+                // size cap and the per-caller budget in select_inline_site
+                // (regardless of which size bucket above admitted it).
+                is_single_call_site_static: func.is_static
+                    && !func.is_inline
+                    && has_single_call_site,
                 has_loops,
                 is_recursive,
                 has_vector_intrinsics: func_has_vector_intrinsics(func),

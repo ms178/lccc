@@ -302,6 +302,23 @@ impl Lowerer {
         }
     }
 
+    /// Lower an expression in a discarded-value context. Integer postfix
+    /// increments do not need the old-value snapshot. Keep pointer postfix
+    /// operations on the established path: their snapshot currently also
+    /// prevents an unsafe pointer-phi coalescing in the backend.
+    pub(super) fn lower_expr_discarded(&mut self, expr: &Expr) {
+        match expr {
+            Expr::PostfixOp(op, inner, _) if self.get_expr_type(inner) != IrType::Ptr => {
+                self.lower_inc_dec_impl(inner, *op == PostfixOp::PostInc, true);
+            }
+            Expr::Comma(lhs, rhs, _) => {
+                self.lower_expr_discarded(lhs);
+                self.lower_expr_discarded(rhs);
+            }
+            _ => { self.lower_expr(expr); }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Literal and identifier helpers
     // -----------------------------------------------------------------------

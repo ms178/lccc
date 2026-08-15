@@ -112,6 +112,10 @@ fn take_reject() -> Option<&'static str> {
 
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
+    vectorize_with_analysis_mode(func, cfg, false)
+}
+
+fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool) -> usize {
     let num_blocks = func.blocks.len();
     let loops = loop_analysis::find_natural_loops(
         num_blocks,
@@ -153,7 +157,7 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
         take_reject();
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
-            let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+            let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
             // Profitability: with a KNOWN constant trip count, require the
@@ -183,9 +187,9 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
                 }
                 total_changes += transform_to_fma_f64x4(func, &pattern);
             }
-        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg) {
+        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide) {
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
-            let use_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+            let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
             // Same profitability gate as the matmul path (the reduction path
@@ -272,6 +276,8 @@ struct ReductionPattern {
     kind: ReductionKind,
     /// Element type being reduced (F64, F32, I32, I64)
     element_type: IrType,
+    /// Scalar accumulator type, which may be wider than element_type.
+    accumulator_type: IrType,
     /// Loop header block index
     header_idx: usize,
     /// Loop body block (where the accumulation happens)
@@ -319,11 +325,26 @@ fn analyze_loop_pattern(
     let header_idx = loop_info.header;
     let header = &func.blocks[header_idx];
 
-    // Find the induction variable phi in header.
+    // Find the header phi that reaches the loop-exit comparison through local
+    // casts/copies. The first phi is often a reduction accumulator.
     let mut iv = None;
     for inst in &header.instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
-            if incoming.len() == 2 {
+            if incoming.len() != 2 { continue; }
+            let mut derived = FxHashSet::default();
+            derived.insert(*dest);
+            for candidate in &header.instructions {
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate {
+                    if matches!(src, Operand::Value(v) if derived.contains(v)) {
+                        derived.insert(*dest);
+                    }
+                }
+            }
+            let reaches_exit_cmp = header.instructions.iter().any(|candidate| {
+                matches!(candidate, Instruction::Cmp { lhs, rhs, .. }
+                    if matches!(lhs, Operand::Value(v) if derived.contains(v)))
+            });
+            if reaches_exit_cmp {
                 iv = Some(dest);
                 break;
             }
@@ -968,6 +989,7 @@ fn analyze_reduction_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    allow_widening_i32: bool,
 ) -> Option<ReductionPattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
@@ -997,27 +1019,40 @@ fn analyze_reduction_pattern(
     let latch_idx = latch_idx?;
     let latch = &func.blocks[latch_idx];
 
-    // Find the induction variable by looking for increments in latch
+    // This reduction transform assumes every scalar iteration contributes to
+    // the accumulator.  Predicated/conditional reductions need masking (and
+    // independent pointer progression), which this transform does not yet
+    // implement.  Treat any internal conditional as a legality failure.
+    if loop_info.body.iter().copied().any(|block_idx| {
+        block_idx != header_idx
+            && matches!(func.blocks[block_idx].terminator, Terminator::CondBranch { .. })
+    }) {
+        if debug {
+            eprintln!("[VEC-RED]   Rejecting conditional reduction loop");
+        }
+        return None;
+    }
+
+    // Identify the induction phi from the header exit comparison. There may be
+    // unrelated unit increments in the latch (especially after unrolling), so
+    // choosing the first `add ?, 1` is not reliable.
     let mut iv = None;
-    for inst in &latch.instructions {
-        if let Instruction::BinOp {
-            dest,
-            op: IrBinOp::Add,
-            lhs,
-            rhs,
-            ..
-        } = inst
-        {
-            // Check if incrementing by 1
-            if let Operand::Const(c) = rhs {
-                if c.to_i64() == Some(1) {
-                    // lhs should be the IV phi
-                    if let Operand::Value(lhs_val) = lhs {
-                        iv = Some(*lhs_val);
-                        break;
-                    }
-                }
+    for inst in &header.instructions {
+        let Instruction::Phi { dest, incoming, .. } = inst else { continue };
+        if incoming.len() != 2 { continue; }
+        let mut derived = FxHashSet::default();
+        derived.insert(*dest);
+        for candidate in &header.instructions {
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate {
+                if matches!(src, Operand::Value(v) if derived.contains(v)) { derived.insert(*dest); }
             }
+        }
+        if header.instructions.iter().any(|candidate| matches!(candidate,
+            Instruction::Cmp { lhs, rhs, .. }
+                if matches!(lhs, Operand::Value(v) if derived.contains(v))))
+        {
+            iv = Some(*dest);
+            break;
         }
     }
     if iv.is_none() && debug {
@@ -1316,6 +1351,7 @@ fn analyze_reduction_pattern(
             Some(ReductionPattern {
                 kind: ReductionKind::Sum,
                 element_type,
+                accumulator_type: element_type,
                 header_idx,
                 body_idx,
                 latch_idx,
@@ -1375,7 +1411,16 @@ fn analyze_reduction_pattern(
                 // add cannot reproduce. The old check only rejected widening,
                 // so `float s += (float)int_arr[i]` slipped through, vectorized
                 // as I32 adds on a F32 accumulator, and returned 0.0.
-                if *from_ty != element_type {
+                //
+                // ONE exception: signed I32 -> I64 widening when the target
+                // provides a true widening load+add (AArch64 NEON
+                // VecLoadWidenI32ToI64x2: ldr + saddlp/smlal keeps full I64
+                // precision per lane). Gated by allow_widening_i32 so x86
+                // never takes this path.
+                let allowed_widen = allow_widening_i32
+                    && element_type == IrType::I64
+                    && *from_ty == IrType::I32;
+                if *from_ty != element_type && !allowed_widen {
                     if debug {
                         eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
                     }
@@ -1405,6 +1450,7 @@ fn analyze_reduction_pattern(
                 Some(ReductionPattern {
                     kind: ReductionKind::Sum,
                     element_type: *from_ty,  // Use the actual array element type
+                    accumulator_type: element_type,
                     header_idx,
                     body_idx,
                     latch_idx,
@@ -1490,6 +1536,7 @@ fn analyze_reduction_pattern(
             Some(ReductionPattern {
                 kind: ReductionKind::DotProduct,
                 element_type,
+                accumulator_type: element_type,
                 header_idx,
                 body_idx,
                 latch_idx,
@@ -2266,10 +2313,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Step 1: Modify ALL comparisons in the loop that compare IV-derived values against the limit
     // This ensures we catch the actual loop exit condition regardless of loop transformations
     {
-        // First, create the halved limit value
+        // Process two two-lane NEON vectors per iteration (four doubles).
         let halved_limit = match &pattern.limit {
-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / 2)),
-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / 2)),
+            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / 4)),
+            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / 4)),
             Operand::Value(limit_val) => {
                 // Dynamic limit: insert division in header
                 let div_dest = Value(next_val_id);
@@ -2285,9 +2332,9 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     op: IrBinOp::UDiv,
                     lhs: Operand::Value(*limit_val),
                     rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(2),
-                        IrType::I64 => IrConst::I64(2),
-                        _ => IrConst::I64(2),
+                        IrType::I32 => IrConst::I32(4),
+                        IrType::I64 => IrConst::I64(4),
+                        _ => IrConst::I64(4),
                     }),
                     ty: limit_ty,
                 };
@@ -2362,7 +2409,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 2: Modify GEP offset calculation from IV*8 to IV*16
+    // Step 2: Modify GEP offset calculation from IV*8 to IV*32.
     // Handle both explicit multiplies and strength-reduced pointer increments
     {
         let mut found_any_mul = false;
@@ -2395,11 +2442,11 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     }
 
                     if lhs_is_iv_derived && rhs_is_8 {
-                        // Change 8 to 16 (process 2 doubles = 16 bytes)
+                        // Change 8 to 32 (process 4 doubles).
                         *rhs = match rhs {
-                            Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(16)),
-                            Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(16)),
-                            _ => Operand::Const(IrConst::I64(16)),
+                            Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),
+                            Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
+                            _ => Operand::Const(IrConst::I64(32)),
                         };
                         changes += 1;
                         modified_any_increment = true;
@@ -2490,9 +2537,9 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
                         if is_pointer_add && is_8 {
                             *rhs = match rhs {
-                                Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(16)),
-                                Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(16)),
-                                _ => Operand::Const(IrConst::I64(16)),
+                                Operand::Const(IrConst::I64(_)) => Operand::Const(IrConst::I64(32)),
+                                Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
+                                _ => Operand::Const(IrConst::I64(32)),
                             };
                             changes += 1;
                             modified_any_increment = true;
@@ -2543,7 +2590,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     dest: mul_dest,
                     op: IrBinOp::Mul,
                     lhs: Operand::Value(offset_val),
-                    rhs: Operand::Const(IrConst::I64(2)),
+                    rhs: Operand::Const(IrConst::I64(4)),
                     ty: offset_ty,
                 };
 
@@ -2568,17 +2615,32 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 3: Replace the body accumulation with FmaF64x2
+    // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
+    // AArch64 codegen keeps it in v15, outside the allocator's v16-v31 pool.
+    if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
+        if pattern.loop_blocks.contains(&idx) { return None; }
+        matches!(block.terminator, Terminator::Branch(label)
+            if label == func.blocks[pattern.header_idx].label).then_some(idx)
+    }) {
+        func.blocks[preheader_idx].instructions.push(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::BroadcastLoadF64,
+            dest_ptr: None,
+            args: vec![Operand::Value(pattern.a_ptr)],
+        });
+        changes += 1;
+    }
+
+    // Step 3: Replace the body accumulation with a hoisted FmaF64x2.
     {
         let body = &mut func.blocks[pattern.body_idx];
 
         // Create FmaF64x2 intrinsic: writes directly to memory, no dest value.
         let intrinsic = Instruction::Intrinsic {
             dest: None,
-            op: IntrinsicOp::FmaF64x2,
+            op: IntrinsicOp::FmaF64x2Hoisted,
             dest_ptr: Some(pattern.c_gep),
             args: vec![
-                Operand::Value(pattern.a_ptr),
                 Operand::Value(pattern.b_gep),
             ],
         };
@@ -2596,8 +2658,8 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
         changes += 1;
         if debug {
-            eprintln!("[VEC]   Inserted FmaF64x2 intrinsic, dest_ptr=Value({}), args=[Value({}), Value({})]",
-                pattern.c_gep.0, pattern.a_ptr.0, pattern.b_gep.0);
+            eprintln!("[VEC]   Inserted hoisted FmaF64x2 intrinsic, dest_ptr=Value({}), B=Value({})",
+                pattern.c_gep.0, pattern.b_gep.0);
         }
 
         // The old load/mul/add instructions are now dead. DCE will clean them up.
@@ -2608,7 +2670,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         let remainder_changes = insert_remainder_loop(
             func,
             pattern,
-            2,  // SSE2 vector width
+            4,  // two NEON vectors per iteration
             &mut next_val_id,
             &mut next_label,
         );
@@ -3119,6 +3181,8 @@ fn insert_reduction_remainder_loop(
     *next_val_id += 1;
     let load_rem_a = Value(*next_val_id);
     *next_val_id += 1;
+    let load_rem_a_acc = Value(*next_val_id);
+    *next_val_id += 1;
     let sum_rem_phi = Value(*next_val_id);
     *next_val_id += 1;
     let sum_rem_next = Value(*next_val_id);
@@ -3137,6 +3201,8 @@ fn insert_reduction_remainder_loop(
     } else {
         (Value(0), Value(0), Value(0), Value(0))
     };
+    let load_rem_b_acc = Value(*next_val_id);
+    *next_val_id += 1;
 
     if debug {
         eprintln!("[VEC-RED] Creating remainder loop blocks...");
@@ -3221,7 +3287,7 @@ fn insert_reduction_remainder_loop(
             // Accumulator phi (receives scalar_sum from horizontal reduction!)
             Instruction::Phi {
                 dest: sum_rem_phi,
-                ty: pattern.element_type,
+                ty: pattern.accumulator_type,
                 incoming: vec![
                     (Operand::Value(scalar_sum), vec_exit_label),
                     (Operand::Value(sum_rem_next), remainder_latch_label),
@@ -3277,6 +3343,18 @@ fn insert_reduction_remainder_loop(
         },
     ];
 
+    let scalar_a = if pattern.element_type != pattern.accumulator_type {
+        remainder_body_instructions.push(Instruction::Cast {
+            dest: load_rem_a_acc,
+            src: Operand::Value(load_rem_a),
+            from_ty: pattern.element_type,
+            to_ty: pattern.accumulator_type,
+        });
+        load_rem_a_acc
+    } else {
+        load_rem_a
+    };
+
     // Add pattern-specific operations
     match pattern.kind {
         ReductionKind::Sum => {
@@ -3285,8 +3363,8 @@ fn insert_reduction_remainder_loop(
                 dest: sum_rem_next,
                 op: IrBinOp::Add,
                 lhs: Operand::Value(sum_rem_phi),
-                rhs: Operand::Value(load_rem_a),
-                ty: pattern.element_type,
+                rhs: Operand::Value(scalar_a),
+                ty: pattern.accumulator_type,
             });
         }
         ReductionKind::DotProduct => {
@@ -3314,13 +3392,26 @@ fn insert_reduction_remainder_loop(
                     ty: pattern.element_type,
                     seg_override: AddressSpace::Default,
                 },
+            ]);
+            let scalar_b = if pattern.element_type != pattern.accumulator_type {
+                remainder_body_instructions.push(Instruction::Cast {
+                    dest: load_rem_b_acc,
+                    src: Operand::Value(load_rem_b),
+                    from_ty: pattern.element_type,
+                    to_ty: pattern.accumulator_type,
+                });
+                load_rem_b_acc
+            } else {
+                load_rem_b
+            };
+            remainder_body_instructions.extend_from_slice(&[
                 // Multiply a[i] * b[i]
                 Instruction::BinOp {
                     dest: mul_rem,
                     op: IrBinOp::Mul,
-                    lhs: Operand::Value(load_rem_a),
-                    rhs: Operand::Value(load_rem_b),
-                    ty: pattern.element_type,
+                    lhs: Operand::Value(scalar_a),
+                    rhs: Operand::Value(scalar_b),
+                    ty: pattern.accumulator_type,
                 },
                 // Add to accumulator
                 Instruction::BinOp {
@@ -3328,7 +3419,7 @@ fn insert_reduction_remainder_loop(
                     op: IrBinOp::Add,
                     lhs: Operand::Value(sum_rem_phi),
                     rhs: Operand::Value(mul_rem),
-                    ty: pattern.element_type,
+                    ty: pattern.accumulator_type,
                 },
             ]);
         }
@@ -3356,6 +3447,7 @@ fn insert_reduction_remainder_loop(
     };
 
     // Step 6: Add all new blocks to the function
+    let original_block_count = func.blocks.len();
     func.blocks.push(vec_exit_block);
     func.blocks.push(remainder_header_block);
     func.blocks.push(remainder_body_block);
@@ -3446,7 +3538,7 @@ fn insert_reduction_remainder_loop(
                 }
                 _ => {}
             }
-        }
+            }
 
         if debug {
             eprintln!("[VEC-RED]   Rewired {} uses of accumulator outside the loop", updates);
@@ -3816,7 +3908,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -3952,7 +4044,7 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -4098,6 +4190,13 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
             IntrinsicOp::AddF64x2,
             Some(IntrinsicOp::MulF64x2),
             IntrinsicOp::HorizontalAddF64x2,
+        ),
+        IrType::I32 if pattern.accumulator_type == IrType::I64 => (
+            2u64,
+            IntrinsicOp::VecLoadWidenI32ToI64x2,
+            IntrinsicOp::VecAddI64x2,
+            Some(IntrinsicOp::VecMulI64x2),
+            IntrinsicOp::VecHorizontalAddI64x2,
         ),
         IrType::I32 => {
             // I32 multiply intrinsics not yet implemented, only support Sum pattern
@@ -4376,6 +4475,11 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                     IntrinsicOp::VecAddF32x4,
                     IntrinsicOp::VecZeroF32x4,
                 ),
+                IntrinsicOp::VecLoadWidenI32ToI64x2 => (
+                    IntrinsicOp::VecLoadWidenI32ToI64x2,
+                    IntrinsicOp::VecAddI64x2,
+                    IntrinsicOp::VecZeroI64x2,
+                ),
                 _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
             };
 
@@ -4409,7 +4513,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -4509,6 +4613,12 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                     IntrinsicOp::VecAddF32x4,
                     IntrinsicOp::VecZeroF32x4,
                 ),
+                IntrinsicOp::VecLoadWidenI32ToI64x2 => (
+                    IntrinsicOp::VecLoadWidenI32ToI64x2,
+                    IntrinsicOp::VecMulI64x2,
+                    IntrinsicOp::VecAddI64x2,
+                    IntrinsicOp::VecZeroI64x2,
+                ),
                 _ => {
                     if debug {
                         eprintln!("[VEC-RED] Unsupported SSE2 dot product type: {:?}", load_intrinsic);
@@ -4541,7 +4651,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0))) {
+                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -4807,4 +4917,10 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
         }
     }
     false
+}
+
+/// AArch64 NEON has 128-bit vectors, matching the two-wide F64 transform.
+pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
+    let cfg = CfgAnalysis::build(func);
+    vectorize_with_analysis_mode(func, &cfg, true)
 }

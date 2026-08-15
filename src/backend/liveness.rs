@@ -234,6 +234,23 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 5: Build and sort intervals.
     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
 
+    if let Ok(dbg) = std::env::var("CCC_DEBUG_LIVE") {
+        if let Ok(target) = dbg.parse::<u32>() {
+            if let Some(&dense) = id_to_dense.get(&target) {
+                eprintln!("[LIVE] v{} def={} last_use={}", target, ps.def_points[dense], ps.last_use_points[dense]);
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    let li = live_in[bi].contains(dense);
+                    let lo = live_out[bi].contains(dense);
+                    if li || lo {
+                        eprintln!("[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
+                            bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]);
+                    }
+                }
+                eprintln!("[LIVE]   call_points={:?}", ps.call_points);
+            }
+        }
+    }
+
     LivenessResult {
         intervals,
         call_points: ps.call_points,
@@ -705,7 +722,12 @@ fn extend_gep_base_liveness(
 ) {
     // Phase A: Identify foldable GEPs with non-alloca bases.
     // Same criteria as build_gep_fold_map in generation.rs.
-    let mut gep_info: FxHashMap<u32, (u32, i64)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
+    // Value: (base_id, offset), where offset is Const(i64) or an index Value.
+    enum GepOffset {
+        Const(i64),
+        Index(u32),
+    }
+    let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -728,23 +750,19 @@ fn extend_gep_base_liveness(
                         _ => continue,
                     };
                     if offset_val >= i32::MIN as i64 && offset_val <= i32::MAX as i64 {
-                        gep_info.insert(dest.0, (base.0, offset_val));
+                        gep_info.insert(dest.0, (base.0, GepOffset::Const(offset_val)));
                     }
                 }
-                Instruction::GetElementPtr {
-                    dest,
-                    base,
-                    offset: Operand::Value(_),
-                    ..
-                } => {
-                    // Variable-offset GEP: may be used for SIB indexed addressing.
-                    // The base pointer must stay live until the Load/Store that uses
-                    // this GEP result, otherwise the register allocator may reuse the
-                    // base register before the SIB store/load executes.
+                Instruction::GetElementPtr { dest, base, offset: Operand::Value(off), .. } => {
+                    // Variable-offset GEP: may be used for indexed addressing.
+                    // Both the base pointer AND the index value must stay live
+                    // until the Load/Store that uses this GEP result, otherwise
+                    // the register allocator may reuse either register before
+                    // the indexed load/store executes.
                     if alloca_set.contains(&base.0) {
                         continue;
                     }
-                    gep_info.insert(dest.0, (base.0, 0));
+                    gep_info.insert(dest.0, (base.0, GepOffset::Index(off.0)));
                 }
                 // build_gep_fold_map also recognizes integer Add(base, const).
                 // Mirror it here so the base register stays live through the
@@ -776,7 +794,7 @@ fn extend_gep_base_liveness(
                             None
                         };
                         if let Some(offset) = offset {
-                            gep_info.insert(dest.0, (base.0, offset));
+                            gep_info.insert(dest.0, (base.0, GepOffset::Const(offset)));
                         }
                     }
                 }
@@ -858,56 +876,43 @@ fn extend_gep_base_liveness(
                         Instruction::Store { ptr, .. } => ptr.0,
                         _ => unreachable!("GEP analysis matched non-Load/Store instruction"),
                     };
-                    if let Some(&(base_id, _offset)) = gep_info.get(&ptr_id) {
-                        // Extend base's last_use to this program point.
-                        // Also follow Copy chains: if the base is defined by a
-                        // Copy (from GVN CSE), extend the Copy source's liveness
-                        // too. This prevents the register allocator from reusing
-                        // the source's register before the fold-based load.
-                        let mut extend_id = base_id;
-                        for _ in 0..10 {
-                            // max Copy chain depth
-                            if alloca_set.contains(&extend_id) {
-                                break;
-                            }
-                            let debug_liveness = std::env::var("CCC_DEBUG_LIVENESS").is_ok();
-                            if let Some(&dense) = id_to_dense.get(&extend_id) {
-                                let entry = &mut last_use_points[dense];
-                                if *entry == u32::MAX || block_point > *entry {
-                                    if debug_liveness {
-                                        eprintln!("[LIVENESS] Extending Value({}) last_use from {} to {} (block {})",
-                                            extend_id, *entry, block_point, bi);
+                    if let Some(&(base_id, ref offset)) = gep_info.get(&ptr_id) {
+                        // Extend a value's last_use to this program point,
+                        // following Copy chains (a base/index defined by a Copy
+                        // needs its source kept live too, or the register may
+                        // be reused before the folded load/store executes).
+                        let mut extend_one = |start_id: u32, last_use_points: &mut [u32], block_gen: &mut [BitSet]| {
+                            let mut extend_id = start_id;
+                            for _ in 0..10 { // max Copy chain depth
+                                if alloca_set.contains(&extend_id) { break; }
+                                if let Some(&dense) = id_to_dense.get(&extend_id) {
+                                    let entry = &mut last_use_points[dense];
+                                    if *entry == u32::MAX || block_point > *entry {
+                                        *entry = block_point;
                                     }
-                                    *entry = block_point;
+                                    block_gen[bi].insert(dense);
                                 }
-                                block_gen[bi].insert(dense);
-                            } else if debug_liveness {
-                                eprintln!("[LIVENESS] Value({}) not in dense map!", extend_id);
-                            }
-                            let mut found_copy_src = None;
-                            for b in &func.blocks {
-                                for i in &b.instructions {
-                                    if let Instruction::Copy {
-                                        dest,
-                                        src: Operand::Value(s),
-                                    } = i
-                                    {
-                                        if dest.0 == extend_id {
-                                            found_copy_src = Some(s.0);
+                                let mut found_copy_src = None;
+                                for b in &func.blocks {
+                                    for i in &b.instructions {
+                                        if let Instruction::Copy { dest, src: Operand::Value(s) } = i {
+                                            if dest.0 == extend_id {
+                                                found_copy_src = Some(s.0);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            match found_copy_src {
-                                Some(src) => {
-                                    if debug_liveness {
-                                        eprintln!("[LIVENESS] GEP fold base Value({}) is Copy of Value({}), extending",
-                                            extend_id, src);
-                                    }
-                                    extend_id = src;
+                                match found_copy_src {
+                                    Some(src) => extend_id = src,
+                                    None => break,
                                 }
-                                None => break,
                             }
+                        };
+                        extend_one(base_id, last_use_points, block_gen);
+                        // For variable-offset (indexed) GEPs, the index value is
+                        // consumed by the folded load/store too — keep it live.
+                        if let GepOffset::Index(idx_id) = offset {
+                            extend_one(*idx_id, last_use_points, block_gen);
                         }
                     }
                 }

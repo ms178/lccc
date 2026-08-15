@@ -32,7 +32,8 @@ import textwrap
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-DEFAULT_LCCC = os.path.join(REPO, "target", "release", "lccc-x86")
+DEFAULT_LCCC = os.environ.get(
+    "LCCC_BIN", os.path.join(REPO, "target", "release", "lccc-x86"))
 
 CC = os.environ.get("LINKTEST_CC", "gcc")
 

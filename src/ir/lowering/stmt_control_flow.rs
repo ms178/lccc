@@ -80,7 +80,7 @@ impl Lowerer {
                     self.collect_enum_constants_scoped(&decl.type_spec);
                     self.lower_local_decl(decl);
                 }
-                ForInit::Expr(expr) => { self.lower_expr(expr); },
+                ForInit::Expr(expr) => self.lower_expr_discarded(expr),
             }
         }
 

@@ -233,6 +233,10 @@ pub struct IrFunction {
     /// This prevents infinite recursion when the inline body calls the same symbol
     /// (e.g., glibc's `btowc` inline calling `__btowc_alias` with asm name "btowc").
     pub is_gnu_inline_def: bool,
+    /// F64 phi destinations created by loop-local memory recurrence promotion.
+    /// Backends may give these values dedicated FP registers without enabling
+    /// broad register allocation for every phi-elimination Copy chain.
+    pub loop_promoted_f64_values: Vec<Value>,
 }
 
 /// A function parameter.
@@ -326,6 +330,7 @@ impl IrFunction {
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         }
     }
 

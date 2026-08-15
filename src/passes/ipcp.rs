@@ -287,6 +287,12 @@ fn eval_const_function(
                                 IrType::I32 | IrType::U32 => (value as i32).swap_bytes() as i64,
                                 _ => value.swap_bytes(),
                             },
+                            crate::ir::reexports::IrUnaryOp::BitReverse => match *ty {
+                                IrType::I8 | IrType::U8 => (value as u8).reverse_bits() as i64,
+                                IrType::I16 | IrType::U16 => (value as u16).reverse_bits() as i64,
+                                IrType::I32 | IrType::U32 => (value as u32).reverse_bits() as i64,
+                                _ => (value as u64).reverse_bits() as i64,
+                            },
                             crate::ir::reexports::IrUnaryOp::IsConstant => 1,
                         };
                         values.insert(dest.0, IrConst::from_i64(result, *ty));

@@ -341,7 +341,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .collect();
 
     // Collect values whose types don't fit in a single GPR.
-    let non_gpr_values = collect_non_gpr_values(func, is_32bit);
+    // The AArch64 FP pool (allocator IDs 40+) additionally keeps scalar
+    // float intrinsic results out of GPRs so they can use FP registers.
+    let arm_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 40)
+        && std::env::var("CCC_NO_VECREG").is_err();
+    let non_gpr_values = collect_non_gpr_values(func, is_32bit, arm_fp_pool);
 
     // Helper closure to check if a type is unsuitable for GPR allocation
     let is_non_gpr_type = |ty: &IrType| -> bool {
@@ -474,7 +478,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // accumulator path (%eax) in the codegen, creating a 3rd channel.
     //
     // Pattern: r12, rbx, %eax, r12, rbx, %eax, ...
-    exclude_every_third_mul_temp(func, &mut eligible);
+    //
+    // This is an x86-64-specific trick: on AArch64/RISC-V the accumulator
+    // path is a single register and excluding mul temps from registers only
+    // adds shuffle overhead, so it is gated to the x86-64 register pool.
+    if config.xmm_regs.first().is_some_and(|r| r.0 == 20) {
+        exclude_every_third_mul_temp(func, &mut eligible);
+    }
 
     // --- Phi register coalescing ---
     //
@@ -488,10 +498,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // The backedge source is removed from the eligible set so it doesn't get
     // allocated independently. After allocation, it inherits the phi dest's
     // register assignment.
-    let phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
+    let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness);
+    let mut phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
         Vec::new()
     } else {
-        detect_phi_coalesce_groups(func, &liveness)
+        all_phi_pairs.clone()
     };
     for candidate in &phi_coalesce {
         // Remove the backedge source from independent allocation. If the
@@ -611,6 +622,136 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
     }
+
+    // --- Post-scan rebalance: steal registers for hot loop-carried values ---
+    //
+    // The linear scan processes ranges in start order and never evicts, so
+    // cold function-spanning values (array bases, globals, prologue pointers)
+    // win every callee-saved register simply by starting first, leaving hot
+    // inner-loop-carried phi values (IVs, accumulators, carried pointers)
+    // stack-homed (e.g. fannkuch's flip loop, arith_loop).
+    //
+    // For each hot loop-carried phi dest the scan MISSED, pick the register
+    // whose conflicting holders (live interval overlaps the hot value's) have
+    // the coldest total use count, and fully deallocate those holders back to
+    // the stack. This is safe where eviction inside the scan was not: an
+    // evicted holder is deallocated for its ENTIRE interval — indistinguishable
+    // from never having been assigned, so the default stack path handles all
+    // its uses — and every remaining holder is provably non-overlapping with
+    // the hot value. No live range is ever split, and when the scan already
+    // housed every hot value (e.g. spectral_norm) the rebalance is a no-op.
+    //
+    // AArch64-only: relies on the wide callee-saved GPR pool.
+    // CCC_NO_LOOP_PIN disables; CCC_LOOP_PIN=N caps steals per function (default 2).
+    if std::env::var("CCC_NO_LOOP_PIN").is_err()
+        && config.xmm_regs.first().is_some_and(|r| r.0 == 40)
+        && !all_phi_pairs.is_empty()
+    {
+        let k: usize = std::env::var("CCC_LOOP_PIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        // Values whose register assignment the phi-coalesce propagation below
+        // depends on; stealing from them would defeat coalescing.
+        let phi_pair_values: FxHashSet<u32> = phi_coalesce
+            .iter()
+            .flat_map(|c| [c.phi_dest, c.backedge_src])
+            .collect();
+        // Rank loop-carried phi dests by loop-weighted use count (uses inside
+        // a loop at depth D contribute 10^D, so hot inner-loop values sort first).
+        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
+            .iter()
+            .map(|c| c.phi_dest)
+            .filter(|v| eligible.contains(v))
+            .filter(|v| {
+                liveness
+                    .intervals
+                    .iter()
+                    .any(|iv| iv.value_id == *v && iv.end > iv.start)
+            })
+            .map(|v| (v, use_count.get(&v).copied().unwrap_or(0)))
+            .filter(|&(_, count)| count >= 10) // at least one in-loop use
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        candidates.dedup_by_key(|&mut (v, _)| v);
+
+        // All live-interval segments per value; conflict checks must consider
+        // every segment, not just the first.
+        let mut segs_of: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        for iv in &liveness.intervals {
+            segs_of.entry(iv.value_id).or_default().push((iv.start, iv.end));
+        }
+        let overlaps = |a: u32, b: u32| -> bool {
+            let (Some(sa), Some(sb)) = (segs_of.get(&a), segs_of.get(&b)) else {
+                return false;
+            };
+            sa.iter().any(|&(s1, e1)| sb.iter().any(|&(s2, e2)| s1 < e2 && s2 < e1))
+        };
+        // Current register holders, updated as steals happen.
+        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
+        for (&v, &r) in &assignments {
+            holders_by_reg.entry(r.0).or_default().push(v);
+        }
+
+        let mut steals = 0;
+        for &(vid, hot_count) in &candidates {
+            if steals >= k {
+                break;
+            }
+            if assignments.contains_key(&vid) {
+                continue; // the scan already housed this hot value
+            }
+            if std::env::var("CCC_DEBUG_LOOP_PIN").is_ok() {
+                eprintln!("[LOOP_PIN] func={} candidate v{} (use {}) MISSED by scan", func.name, vid, hot_count);
+            }
+            // Choose the register whose CONFLICTING holders are coldest.
+            // Every holder whose live interval overlaps the hot value must be
+            // fully deallocated back to the stack for the steal to be sound;
+            // non-conflicting holders keep timesharing the register. Registers
+            // holding phi-coalesce participants are left alone so backedge
+            // coalescing stays intact. A steal is only taken when the total
+            // evicted use count is strictly colder than the hot value.
+            let mut best: Option<(u8, Vec<u32>, u64)> = None;
+            for (&reg_id, holders) in &holders_by_reg {
+                if holders.iter().any(|h| phi_pair_values.contains(h)) {
+                    continue;
+                }
+                let evict: Vec<u32> = holders
+                    .iter()
+                    .copied()
+                    .filter(|&h| overlaps(h, vid))
+                    .collect();
+                let cost: u64 = evict
+                    .iter()
+                    .map(|h| use_count.get(h).copied().unwrap_or(0))
+                    .sum();
+                if cost >= hot_count {
+                    continue; // not profitable
+                }
+                if best.as_ref().map_or(true, |&(_, _, c)| cost < c) {
+                    best = Some((reg_id, evict, cost));
+                }
+            }
+            if let Some((reg_id, evict, cost)) = best {
+                if std::env::var("CCC_DEBUG_LOOP_PIN").is_ok() {
+                    eprintln!(
+                        "[LOOP_PIN] func={} v{} (use {}) takes reg {}, evicting {:?} (use {})",
+                        func.name, vid, hot_count, reg_id, evict, cost
+                    );
+                }
+                for v in &evict {
+                    assignments.remove(v);
+                    if let Some(h) = holders_by_reg.get_mut(&reg_id) {
+                        h.retain(|x| x != v);
+                    }
+                }
+                assignments.insert(vid, PhysReg(reg_id));
+                holders_by_reg.entry(reg_id).or_default().push(vid);
+                steals += 1;
+            }
+        }
+    }
+
     // `used_regs_set` is deliberately the ABI callee-saved set. It feeds the
     // x86 prologue/epilogue save list, so caller-saved allocations must never
     // enter it. Keep a separate exclusion set for Phase 2b instead.
@@ -618,6 +759,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     for &reg in assignments.values() {
         used_regs_set.insert(reg.0);
     }
+    // Caller-saved registers allocated in Phase 2. These do NOT belong in
+    // used_regs_set (no prologue save), but Phase 2b must not reallocate them.
     let mut caller_used_regs_set: FxHashSet<u8> = FxHashSet::default();
 
     // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
@@ -810,12 +953,64 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Phase 3: XMM register allocation for scalar FP (F64/F32) values that
-    // don't span calls. These values were excluded from GPR allocation but can
-    // use XMM registers.
+    // AArch64 (allocator IDs 40..47 → v16..v23) additionally allocates
+    // 128-bit vector values and copy-form F64 values (loop accumulators)
+    // to FP/SIMD registers; other targets keep those stack-homed because
+    // their emitters are not register-aware for them.
+    let (vector_values, f64_value_set) = if arm_fp_pool {
+        (collect_vector_values(func), collect_f64_values(func))
+    } else {
+        (FxHashSet::default(), FxHashSet::default())
+    };
+
+    // Phase 3: XMM/FP register allocation for scalar FP (F64/F32) values
+    // that don't span calls. These values were excluded from GPR allocation
+    // but can use XMM (x86) / v-register (AArch64) homes.
     if !config.xmm_regs.is_empty() {
-        // Collect scalar-FP values: values in non_gpr_values that are F64/F32
-        // typed, haven't been assigned a GPR, and don't span calls.
+        // Values actually consumed by a real (non-Copy) instruction.  SSA copy
+        // webs can carry a value across loop boundaries without it ever being
+        // used in a computation; such values would otherwise win FP registers
+        // with their huge intervals and starve the real accumulators.
+        // A copy source feeding (transitively) a real use still qualifies —
+        // e.g. an fmadd result copied into a loop accumulator.
+        let mut real_use: FxHashSet<u32> = FxHashSet::default();
+        if arm_fp_pool {
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if matches!(inst, Instruction::Copy { .. }) {
+                        continue;
+                    }
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            real_use.insert(v.0);
+                        }
+                    });
+                }
+                for_each_operand_in_terminator(&block.terminator, |op| {
+                    if let Operand::Value(v) = op {
+                        real_use.insert(v.0);
+                    }
+                });
+            }
+            loop {
+                let mut changed = false;
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                            if real_use.contains(&dest.0) && !real_use.contains(&src_val.0) {
+                                real_use.insert(src_val.0);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        // Collect F64 values: values in non_gpr_values that are F64 typed,
+        // haven't been assigned a GPR, and don't span calls.
         let f64_intervals: Vec<LiveInterval> = liveness
             .intervals
             .iter()
@@ -823,48 +1018,86 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !spans_any_call(iv, call_points))
+            // Skip values that are only ever copied (never feed a computation):
+            // they don't need a register and would starve values that do.
+            .filter(|iv| !arm_fp_pool || real_use.contains(&iv.value_id))
             // Only include values that are actually scalar F64/F32 (not i128,
-            // not long double, etc.)
+            // not long double, etc.) — plus (AArch64) 128-bit vector values
+            // and copy-form F64 values.
             .filter(|iv| {
-                // Check if this value is produced by an F64/F32-typed
-                // instruction (or a scalar FP intrinsic such as sqrt/fabs).
-                func.blocks.iter().any(|block| {
-                    block.instructions.iter().any(|inst| match inst {
-                        Instruction::BinOp { dest, ty, .. }
-                        | Instruction::UnaryOp { dest, ty, .. }
-                            if *ty == IrType::F64 || *ty == IrType::F32 =>
-                        {
-                            dest.0 == iv.value_id
-                        }
-                        Instruction::Load { dest, ty, .. }
-                            if *ty == IrType::F64 || *ty == IrType::F32 =>
-                        {
-                            dest.0 == iv.value_id
-                        }
-                        Instruction::ParamRef { dest, ty, .. }
-                            if *ty == IrType::F64 || *ty == IrType::F32 =>
-                        {
-                            dest.0 == iv.value_id
-                        }
-                        Instruction::Cast { dest, to_ty, .. }
-                            if *to_ty == IrType::F64 || *to_ty == IrType::F32 =>
-                        {
-                            dest.0 == iv.value_id
-                        }
-                        Instruction::Intrinsic { dest: Some(d), op, .. } => {
-                            use crate::ir::intrinsics::IntrinsicOp as O;
-                            d.0 == iv.value_id
-                                && matches!(
-                                    op,
-                                    O::SqrtF64 | O::FabsF64 | O::SqrtF32 | O::FabsF32
-                                )
-                        }
-                        _ => false,
+                vector_values.contains(&iv.value_id) || f64_value_set.contains(&iv.value_id) || {
+                    if arm_fp_pool {
+                        return false;
+                    }
+                    // x86: check if this value is produced by an F64/F32-typed
+                    // instruction (or a scalar FP intrinsic such as sqrt/fabs).
+                    func.blocks.iter().any(|block| {
+                        block.instructions.iter().any(|inst| match inst {
+                            Instruction::BinOp { dest, ty, .. }
+                            | Instruction::UnaryOp { dest, ty, .. }
+                                if *ty == IrType::F64 || *ty == IrType::F32 =>
+                            {
+                                dest.0 == iv.value_id
+                            }
+                            Instruction::Load { dest, ty, .. }
+                                if *ty == IrType::F64 || *ty == IrType::F32 =>
+                            {
+                                dest.0 == iv.value_id
+                            }
+                            Instruction::ParamRef { dest, ty, .. }
+                                if *ty == IrType::F64 || *ty == IrType::F32 =>
+                            {
+                                dest.0 == iv.value_id
+                            }
+                            Instruction::Cast { dest, to_ty, .. }
+                                if *to_ty == IrType::F64 || *to_ty == IrType::F32 =>
+                            {
+                                dest.0 == iv.value_id
+                            }
+                            Instruction::Intrinsic { dest: Some(d), op, .. } => {
+                                use crate::ir::intrinsics::IntrinsicOp as O;
+                                d.0 == iv.value_id
+                                    && matches!(
+                                        op,
+                                        O::SqrtF64 | O::FabsF64 | O::SqrtF32 | O::FabsF32
+                                    )
+                            }
+                            _ => false,
+                        })
                     })
-                })
+                }
             })
             .copied()
             .collect();
+
+        if std::env::var("CCC_DEBUG_VECREG").is_ok() {
+            eprintln!("[VECREG] func={} vector_values={:?}", func.name, vector_values);
+            for &vid in &vector_values {
+                let iv = liveness.intervals.iter().find(|iv| iv.value_id == vid);
+                eprintln!("[VECREG]   v{}: interval={:?} non_gpr={} assigned={} spans_call={}",
+                    vid, iv.map(|i| (i.start, i.end)), non_gpr_values.contains(&vid),
+                    assignments.contains_key(&vid),
+                    iv.is_some_and(|i| spans_any_call(i, call_points)));
+            }
+        }
+        if std::env::var("CCC_DEBUG_FPREG").is_ok() {
+            eprintln!("[FPREG] func={} f64_count={} intervals_in={}", func.name, f64_value_set.len(), f64_intervals.len());
+            for iv in &f64_intervals {
+                eprintln!("[FPREG]   cand v{} [{}, {}]", iv.value_id, iv.start, iv.end);
+            }
+            for &vid in &f64_value_set {
+                if liveness.intervals.iter().all(|iv| iv.value_id != vid) {
+                    eprintln!("[FPREG]   v{}: NO INTERVAL", vid);
+                }
+            }
+            for iv in &liveness.intervals {
+                if f64_value_set.contains(&iv.value_id) && f64_intervals.iter().all(|c| c.value_id != iv.value_id) {
+                    eprintln!("[FPREG]   excluded v{} [{}, {}] non_gpr={} assigned={} spans_call={}",
+                        iv.value_id, iv.start, iv.end, non_gpr_values.contains(&iv.value_id),
+                        assignments.contains_key(&iv.value_id), spans_any_call(iv, call_points));
+                }
+            }
+        }
 
         if std::env::var("CCC_DEBUG_XMM").is_ok() {
             eprintln!(
@@ -891,6 +1124,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 );
             }
 
+            for (vid, reg) in &xmm_allocator.assignments {
+                if std::env::var("CCC_DEBUG_VECREG").is_ok() && vector_values.contains(vid) {
+                    eprintln!("[VECREG]   assigned v{} -> reg {}", vid, reg.0);
+                }
+                if std::env::var("CCC_DEBUG_FPREG").is_ok() {
+                    eprintln!("[FPREG]   assigned v{} -> reg {} (pool size {})", vid, reg.0, config.xmm_regs.len());
+                }
+            }
             for (vid, reg) in xmm_allocator.assignments {
                 assignments.insert(vid, reg);
                 // XMM regs (20+) are caller-saved, no prologue save needed
@@ -946,6 +1187,54 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // AArch64 reserves allocator IDs 48..55 for explicitly marked loop-carried
+    // F64 values (d24..d31). They are caller-saved and disjoint from the generic
+    // d16..d23 pool, so reductions do not reduce temporary-register capacity.
+    if config.xmm_regs.first().is_some_and(|r| r.0 == 40) {
+        for (index, value) in func.loop_promoted_f64_values.iter().take(8).enumerate() {
+            assignments.insert(value.0, PhysReg(48 + index as u8));
+        }
+    }
+
+    // AArch64 FP phi coalescing: give the value copied into a loop-carried
+    // F64/vector accumulator at the backedge the accumulator's own register,
+    // eliminating the backedge fmov/mov from the loop's serial dependency
+    // chain (e.g. `fmadd d16, .., d16` instead of fmadd into a temp + fmov).
+    if arm_fp_pool {
+        for candidate in &all_phi_pairs {
+            let phi_dest = candidate.phi_dest;
+            let backedge_src = candidate.backedge_src;
+            let d_reg = assignments.get(&phi_dest).copied().filter(|r| (40..=55).contains(&r.0));
+            let s_reg = assignments.get(&backedge_src).copied().filter(|r| (40..=55).contains(&r.0));
+            let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
+            if d == s {
+                continue;
+            }
+            if !f64_value_set.contains(&phi_dest) && !vector_values.contains(&phi_dest) {
+                continue;
+            }
+            // Conflict check: no other value assigned d may overlap the src
+            // interval (the phi dest itself is expected to overlap — that is
+            // precisely what coalescing resolves).
+            if let Some(src_iv) = liveness.intervals.iter().find(|iv| iv.value_id == backedge_src) {
+                let conflict = liveness.intervals.iter().any(|iv| {
+                    if iv.value_id == backedge_src || iv.value_id == phi_dest {
+                        return false;
+                    }
+                    assignments
+                        .get(&iv.value_id)
+                        .is_some_and(|&o| o.0 == d.0 && iv.start < src_iv.end && src_iv.start < iv.end)
+                });
+                if std::env::var("CCC_DEBUG_FPCOAL").is_ok() {
+                    eprintln!("[FPCOAL] phi={} (d{}) src={} (d{}) conflict={}", phi_dest, d.0, backedge_src, s.0, conflict);
+                }
+                if !conflict {
+                    assignments.insert(backedge_src, d);
+                }
+            }
+        }
+    }
+
     // Phase 2b: Caller-saved registers for call-spanning values with
     // per-call selective save/restore. Unlike Phase 2 (non-call-spanning only),
     // Phase 2b allows call-spanning values in caller-saved registers by
@@ -961,6 +1250,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // to a register already owned by the Phase 2 non-spanning scan.
             // This is an allocation-conflict guard, not a prologue-save rule.
             .filter(|r| !caller_used_regs_set.contains(&r.0))
+            // Defensive: never hand out a register the prologue already
+            // treats as callee-saved (cannot happen for a well-formed config
+            // where the pools are disjoint, but harmless and cheap to check).
+            .filter(|r| !used_regs_set.contains(&r.0))
             .copied()
             .collect();
 
@@ -1381,7 +1674,7 @@ fn synthetic_vec_intervals(
 /// Collect values whose types don't fit in a single GPR (floats, i128, and
 /// on 32-bit targets: i64/u64). Copy instructions that chain from these
 /// values must also be excluded via fixpoint propagation.
-fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
+fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool, arm_fp_pool: bool) -> FxHashSet<u32> {
     let is_non_gpr_type = |ty: &IrType| -> bool {
         ty.is_float()
             || ty.is_long_double()
@@ -1449,43 +1742,19 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                     dest: Some(d), op, ..
                 } => {
                     // Scalar FP intrinsics (sqrt/fabs) produce F64/F32 values
-                    // that must live in XMM, never GPRs. Vector intrinsics
-                    // produce 128/256-bit values that also cannot be stored in
-                    // scalar GPRs — exclude both from GPR allocation.
+                    // that must live in XMM/FP registers, never GPRs. Vector
+                    // intrinsics produce 128/256-bit values that also cannot
+                    // be stored in scalar GPRs — exclude both from GPR
+                    // allocation. produces_vector_value() is the single
+                    // source of truth for the vector set (covers x86 Vec*
+                    // and the AArch64 I64x2 widening family).
                     use crate::ir::intrinsics::IntrinsicOp;
                     if matches!(
                         op,
                         IntrinsicOp::SqrtF64 | IntrinsicOp::SqrtF32
                             | IntrinsicOp::FabsF64 | IntrinsicOp::FabsF32
-                    ) {
-                        non_gpr_values.insert(d.0);
-                    }
-                    let is_vector = matches!(
-                        op,
-                        IntrinsicOp::VecZeroF64x4
-                            | IntrinsicOp::VecZeroF64x2
-                            | IntrinsicOp::VecZeroI32x8
-                            | IntrinsicOp::VecZeroI32x4
-                            | IntrinsicOp::VecZeroF32x8
-                            | IntrinsicOp::VecZeroF32x4
-                            | IntrinsicOp::VecLoadF64x4
-                            | IntrinsicOp::VecLoadF64x2
-                            | IntrinsicOp::VecLoadI32x8
-                            | IntrinsicOp::VecLoadI32x4
-                            | IntrinsicOp::VecLoadF32x8
-                            | IntrinsicOp::VecLoadF32x4
-                            | IntrinsicOp::VecAddF64x4
-                            | IntrinsicOp::VecAddF64x2
-                            | IntrinsicOp::VecAddI32x8
-                            | IntrinsicOp::VecAddI32x4
-                            | IntrinsicOp::VecAddF32x8
-                            | IntrinsicOp::VecAddF32x4
-                            | IntrinsicOp::VecMulF64x4
-                            | IntrinsicOp::VecMulF64x2
-                            | IntrinsicOp::VecMulF32x8
-                            | IntrinsicOp::VecMulF32x4
-                    );
-                    if is_vector {
+                    ) || op.produces_vector_value()
+                    {
                         non_gpr_values.insert(d.0);
                     }
                 }
@@ -1527,6 +1796,91 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
     }
 
     non_gpr_values
+}
+
+/// Collect SSA values that hold 128/256-bit vector data: destinations of
+/// vector-producing intrinsics plus any Copy destinations whose source is a
+/// vector value (iterated to fixpoint, mirroring the non-GPR propagation).
+/// Used on AArch64 to allocate NEON registers to vector values (the Phase 3
+/// FP/vector pool maps allocator IDs 40..47 to v16..v23).
+fn collect_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut vector_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+                if op.produces_vector_value() {
+                    vector_values.insert(d.0);
+                }
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    if !vector_values.contains(&dest.0) && vector_values.contains(&src_val.0) {
+                        vector_values.insert(dest.0);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    vector_values
+}
+
+/// Collect SSA values that hold scalar F64 data: destinations of F64-typed
+/// instructions (BinOp/UnaryOp/Load/Cast), F64-returning intrinsics, and
+/// F64 constants — plus, iteratively, any Copy whose source is F64.  The copy
+/// propagation is what makes loop-carried F64 accumulators (lowered to Copy
+/// form after phi elimination) visible to the Phase 3 FP register scan.
+fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut f64_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
+                    f64_values.insert(dest.0);
+                }
+                Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
+                    f64_values.insert(dest.0);
+                }
+                Instruction::Copy { dest, src: Operand::Const(IrConst::F64(_)) } => {
+                    f64_values.insert(dest.0);
+                }
+                Instruction::Intrinsic { dest: Some(d), op, .. }
+                    if matches!(op, crate::ir::intrinsics::IntrinsicOp::SqrtF64
+                        | crate::ir::intrinsics::IntrinsicOp::FabsF64) =>
+                {
+                    f64_values.insert(d.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    if !f64_values.contains(&dest.0) && f64_values.contains(&src_val.0) {
+                        f64_values.insert(dest.0);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    f64_values
 }
 
 /// Remove values from the eligible set that are used as operands in instructions
@@ -1846,7 +2200,10 @@ struct PhiCoalesceCandidate {
 /// defined in an earlier block, an intervening successor can still read the old
 /// phi value (SQLite deleteTable); checking only the source and Copy blocks
 /// cannot prove otherwise.
-fn detect_phi_coalesce_groups(
+///
+/// Also used by stack-layout copy coalescing: the same proof (phi dest not used
+/// after the backedge source is defined) makes sharing a *stack slot* safe.
+pub(crate) fn detect_phi_coalesce_groups(
     func: &IrFunction,
     liveness: &LivenessResult,
 ) -> Vec<PhiCoalesceCandidate> {
