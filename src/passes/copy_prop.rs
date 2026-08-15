@@ -27,8 +27,10 @@ pub fn run(module: &mut IrModule) -> usize {
 
 /// Forward a purely intermediate memcpy source:
 ///
+/// ```text
 ///     memcpy tmp, src
 ///     memcpy dst, tmp
+/// ```
 ///
 /// becomes `memcpy dst, src` when `tmp` has no other use. This is a local
 /// copy-chain rewrite; unlike general aggregate forwarding it does not remove

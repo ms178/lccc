@@ -1178,11 +1178,13 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
 /// instruction and only when the temporary dies at that single use. Vectorized
 /// inner loops break both assumptions at once. matmul's kernel is
 ///
+/// ```text
 ///     leaq (%r8,%r10), %r11
 ///     leaq (%rsi,%r10), %r13          <- next insn is another LEA
 ///     vmovupd (%r13), %ymm0           <- %r13 used here ...
 ///     vfmadd231pd (%r11), %ymm1, %ymm0
 ///     vmovupd %ymm0, (%r13)           <- ... and again here
+/// ```
 ///
 /// so neither LEA folds and the loop pays two address computations plus two
 /// registers per iteration. x86 addresses the whole thing for free in the SIB

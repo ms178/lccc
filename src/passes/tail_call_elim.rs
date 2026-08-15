@@ -52,8 +52,10 @@ use crate::ir::reexports::{
 ///
 /// The source pattern is:
 ///
+/// ```text
 ///     if (n <= 0) return acc;
 ///     return sum(n - 1, acc + n);
+/// ```
 ///
 /// After TCE this is a two-phi loop. For the lowered `int`/`long` ABI,
 /// `n*(n+1)` is bounded by roughly 2^62, so the product is representable in
