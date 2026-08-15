@@ -499,11 +499,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // allocated independently. After allocation, it inherits the phi dest's
     // register assignment.
     let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness);
-    let mut phi_coalesce = if std::env::var("CCC_NO_PHI_COALESCE").is_ok() {
-        Vec::new()
-    } else {
-        all_phi_pairs.clone()
-    };
+    // GP register coalescing takes only the FIRST pair per phi dest. The
+    // detector may return several (loop-entry copy + true backedge copy, or
+    // multiple latches); removing EVERY backedge source from `eligible` makes
+    // them all compete for the single dest register — the losers end up with
+    // no register at all and their loop-carried update round-trips through a
+    // stack slot (sieve marking loop: 0.21s -> 0.32s, +52%). The multi-pair
+    // consumers that actually profit from ALL pairs — the ARM FP coalesce
+    // pass below and the slot-alias coalescing in stack_layout — read
+    // `all_phi_pairs` / run their own detection and are unaffected.
+    let mut phi_coalesce: Vec<PhiCoalesceCandidate> = Vec::new();
+    if std::env::var("CCC_NO_PHI_COALESCE").is_err() {
+        let mut seen_dest: FxHashSet<u32> = FxHashSet::default();
+        for cand in &all_phi_pairs {
+            if seen_dest.insert(cand.phi_dest) {
+                phi_coalesce.push(*cand);
+            }
+        }
+    }
     for candidate in &phi_coalesce {
         // Remove the backedge source from independent allocation. If the
         // candidate survives final conflict checks it inherits the phi

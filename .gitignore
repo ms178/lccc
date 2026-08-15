@@ -1,5 +1,9 @@
 # Rust build artifacts
 /target/
+
+# Literal @PROFDIR@ dir dropped by PGO tests run outside the x86 driver
+# (once polluted a format-patch with .gcda binary blobs)
+@PROFDIR@/
 /target-sroa/
 **/*.rs.bk
 
