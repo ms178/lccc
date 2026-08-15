@@ -302,6 +302,8 @@ pub fn link_shared(
     let mut pending_version_script = false; // for -Wl,--version-script -Wl,path
     let mut version_script: Option<String> = None;
     let mut whole_archive = false;
+    let mut no_undefined = false; // -z defs / --no-undefined
+    let mut bsymbolic = false;    // -Bsymbolic / -Bsymbolic-functions
 
     // Ordered list of items to load: (path_or_lib, is_lib, whole_archive_state)
     // is_lib=true means resolve via -l; is_lib=false means bare file path
@@ -370,6 +372,13 @@ pub fn link_shared(
                     whole_archive = true;
                 } else if part == "--no-whole-archive" {
                     whole_archive = false;
+                } else if part == "--no-undefined" {
+                    no_undefined = true;
+                } else if part == "-z" && j + 1 < parts.len() && parts[j + 1] == "defs" {
+                    j += 1;
+                    no_undefined = true;
+                } else if part == "-Bsymbolic" || part == "-Bsymbolic-functions" {
+                    bsymbolic = true;
                 }
                 j += 1;
             }
@@ -460,6 +469,14 @@ pub fn link_shared(
         &mut globals, &mut needed_sonames, &all_lib_paths, &default_libs,
     )?;
 
+    // -z defs / --no-undefined: shared libraries normally tolerate
+    // undefined symbols (resolved at load time), but with this flag every
+    // reference must be satisfied at LINK time - the standard CMake/Qt
+    // hardening switch to catch missing DT_NEEDED deps early.
+    if no_undefined {
+        linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
+    }
+
     // Merge sections (no gc-sections for shared libraries)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
@@ -472,6 +489,6 @@ pub fn link_shared(
     emit_shared_library(
         &objects, &mut globals, &mut output_sections, &section_map,
         &needed_sonames, output_path, soname, &rpath_entries, use_runpath,
-        version_script.as_deref(),
+        version_script.as_deref(), bsymbolic,
     )
 }

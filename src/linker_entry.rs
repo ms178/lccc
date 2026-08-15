@@ -11,6 +11,34 @@ pub fn load_inputs_x86(
     crate::backend::x86::linker::load_inputs_for_ld(inputs, objects)
 }
 
+/// Append a synthetic object carrying an empty `.note.gnu.build-id`
+/// section (36 bytes for SHA-1). The script engine places it via the usual
+/// `*(.note.*)` input patterns and patches the digest after layout.
+pub fn append_build_id_object(objects: &mut Vec<Elf64Object>) {
+    use crate::backend::linker_common::{Elf64Section};
+    let sections = vec![
+        Elf64Section {
+            name_idx: 0, name: String::new(), sh_type: 0, flags: 0, addr: 0,
+            offset: 0, size: 0, link: 0, info: 0, addralign: 0, entsize: 0,
+        },
+        Elf64Section {
+            name_idx: 0, name: ".note.gnu.build-id".into(), sh_type: 7 /* SHT_NOTE */,
+            flags: 0x2 /* SHF_ALLOC */, addr: 0, offset: 0,
+            size: crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE,
+            link: 0, info: 0, addralign: 4, entsize: 0,
+        },
+    ];
+    let section_data = vec![
+        Vec::new(),
+        vec![0u8; crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE as usize],
+    ];
+    objects.push(Elf64Object {
+        sections, symbols: Vec::new(), section_data,
+        relocations: vec![Vec::new(); 2],
+        source_name: "<build-id>".into(),
+    });
+}
+
 /// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
 pub fn link_relocatable_x86(
     objects: &[Elf64Object],
@@ -25,7 +53,8 @@ pub fn link_with_script_x86(
     script_src: &str,
     output: &str,
     emit_symtab: bool,
+    is_pie: bool,
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script(
-        objects, script_src, output, emit_symtab)
+        objects, script_src, output, emit_symtab, is_pie)
 }

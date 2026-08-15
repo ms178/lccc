@@ -1168,6 +1168,79 @@ SCRIPT_TESTS = [
     ("script_kernel_style", KERNEL_STYLE_SCRIPT, SCRIPT_TEST_C, "2\n"),
 ]
 
+# PIE script link (kernel-decompressor style): base-0 ET_DYN with all
+# dynamic sections discarded and only PC-relative relocations. Verified
+# structurally (GNU ld's output for this pattern cannot be executed as a
+# userspace binary either - the stub relocates itself).
+PIE_SCRIPT = r"""
+ENTRY(my_start)
+SECTIONS
+{
+ . = 0;
+ .head.text : { _head = .; *(.head.text) _ehead = .; }
+ .text : { _text = .; *(.text .text.*) _etext = .; }
+ .rodata : { _rodata = .; *(.rodata .rodata.*) _erodata = .; }
+ .data : ALIGN(0x1000) { _data = .; *(.data .data.*) _edata = .; }
+ .bss : { _bss = .; *(.bss .bss.*) *(COMMON) . = ALIGN(8); _ebss = .; }
+ /DISCARD/ : { *(.dynamic) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash)
+               *(.note.*) *(.comment) *(.eh_frame) }
+}
+"""
+
+PIE_TEST_C = r"""
+__attribute__((section(".head.text"), used))
+void my_start(void){ }
+int a_var = 5;
+const int r_var = 7;
+int compute(int x){ return x + a_var + r_var; }
+"""
+
+def _pie_script_test(args, oracles):
+    name = "script_pie_base0"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(PIE_TEST_C)
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write(PIE_SCRIPT)
+        r = sh([CC, "-c", "-O1", "-fno-pic", "-fno-asynchronous-unwind-tables",
+                "-fno-stack-protector", "t.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-pie", "--no-dynamic-linker", "-T", "t.lds",
+                "t.o", "-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld -pie failed: {r.stderr.decode()[:300]}")
+        r2 = sh(["ld", "-pie", "--no-dynamic-linker", "-T", "t.lds",
+                 "t.o", "-o", "out.ld"], cwd=td)
+        if r2.returncode != 0:
+            return Result(name, "SKIP", "GNU ld -pie failed")
+        # structural comparison: e_type, entry, key symbol addresses
+        def props(binp):
+            rh = sh(["readelf", "-h", binp], cwd=td).stdout.decode()
+            etype = [l for l in rh.splitlines() if "Type:" in l][0].split()[1]
+            nm_out = sh(["nm", binp], cwd=td).stdout.decode()
+            syms = {}
+            for l in nm_out.splitlines():
+                parts = l.split()
+                if len(parts) == 3 and parts[2] in (
+                    "_head", "_text", "_etext", "_rodata", "_data", "my_start"):
+                    syms[parts[2]] = parts[0]
+            return etype, syms
+        et_a, sy_a = props("out.lccc")
+        et_b, sy_b = props("out.ld")
+        if et_a != "DYN":
+            return Result(name, "FAIL", f"expected ET_DYN, got {et_a}")
+        if et_a != et_b or sy_a != sy_b:
+            return Result(name, "FAIL",
+                f"structure mismatch: lccc ({et_a},{sy_a}) vs ld ({et_b},{sy_b})")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 # ============================================================================
 # 11. RELOCATABLE LINKING (ld -r) — differential against GNU ld -r
 # ============================================================================
@@ -1247,6 +1320,73 @@ int main(){
     return 0;
 }
 """
+
+INTERPOSE_LIB = r"""
+int get_answer(void){ return 42; }
+int call_get(void){ return get_answer() + 1; }
+"""
+INTERPOSE_MAIN = r"""
+#include <stdio.h>
+int get_answer(void){ return 100; }   /* interposer in the executable */
+extern int call_get(void);
+int main(void){ printf("%d\n", call_get()); return 0; }
+"""
+
+def _interpose_test(args, oracles, name, extra_so_flags, expect):
+    """Shared-library symbol interposition semantics vs GNU reference."""
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "lib.c"), "w") as f:
+            f.write(INTERPOSE_LIB)
+        with open(os.path.join(td, "main.c"), "w") as f:
+            f.write(INTERPOSE_MAIN)
+        r = sh([CC, "-c", "-fpic", "-O1", "lib.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        r = sh([args.lccc, "-shared", "lib.o"] + extra_so_flags
+               + ["-o", "libt.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc -shared failed: {r.stderr.decode()[:200]}")
+        r = sh([CC, "main.c", "./libt.so", "-Wl,-rpath,$ORIGIN", "-o", "m"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"main link failed: {r.stderr.decode()[:200]}")
+        code, out = run_bin(os.path.join(td, "m"), [], td)
+        # GNU reference
+        r2 = sh([CC, "-shared", "lib.o"] + extra_so_flags + ["-o", "libr.so"], cwd=td)
+        ref = None
+        if r2.returncode == 0:
+            r3 = sh([CC, "main.c", "./libr.so", "-Wl,-rpath,$ORIGIN", "-o", "mr"], cwd=td)
+            if r3.returncode == 0:
+                _, ref = run_bin(os.path.join(td, "mr"), [], td)
+        if out != expect or code != 0:
+            return Result(name, "FAIL", f"got {(code, out)!r}, want {expect!r} (ref={ref!r})")
+        if ref is not None and out != ref:
+            return Result(name, "FAIL", f"mismatch vs GNU ref: {out!r} != {ref!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+def _zdefs_test(args, oracles):
+    """-z defs: undefined symbol in a .so must fail the link."""
+    name = "so_z_defs_rejects_undefined"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "u.c"), "w") as f:
+            f.write("extern int nowhere(void);\nint f(void){ return nowhere(); }\n")
+        sh([CC, "-c", "-fpic", "u.c"], cwd=td)
+        r1 = sh([args.lccc, "-shared", "u.o", "-o", "a.so"], cwd=td)
+        r2 = sh([args.lccc, "-shared", "u.o", "-Wl,-z,defs", "-o", "b.so"], cwd=td)
+        if r1.returncode != 0:
+            return Result(name, "FAIL", "default .so link should tolerate undefined")
+        if r2.returncode == 0:
+            return Result(name, "FAIL", "-z defs should reject undefined symbol")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 def _cxx_eh_test(args, oracles):
     name = "cxx_exceptions_unwind"
@@ -1411,6 +1551,16 @@ def main():
 
     if (not args.filter or "cxx" in args.filter) and (not args.tag or args.tag == "ehframe"):
         results.append(_cxx_eh_test(args, oracles))
+
+    if (not args.filter or "pie" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_pie_script_test(args, oracles))
+
+    if (not args.filter or "so_" in args.filter) and not args.tag:
+        results.append(_interpose_test(args, oracles,
+            "so_default_interposable", [], "101\n"))
+        results.append(_interpose_test(args, oracles,
+            "so_bsymbolic_binds_local", ["-Wl,-Bsymbolic"], "43\n"))
+        results.append(_zdefs_test(args, oracles))
 
     npass = sum(1 for r in results if r.status == "PASS")
     nfail = sum(1 for r in results if r.status == "FAIL")

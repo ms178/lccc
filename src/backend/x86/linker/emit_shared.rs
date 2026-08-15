@@ -157,7 +157,7 @@ pub(super) fn emit_shared_library(
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     needed_sonames: &[String], output_path: &str,
     soname: Option<String>, rpath_entries: &[String], use_runpath: bool,
-    version_script_path: Option<&str>,
+    version_script_path: Option<&str>, bsymbolic: bool,
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
 
@@ -189,11 +189,24 @@ pub(super) fn emit_shared_library(
                 match rela.rela_type {
                     R_X86_64_PLT32 | R_X86_64_PC32 => {
                         if let Some(gsym) = globals.get(&sym.name) {
-                            // Need PLT for: dynamic symbols from shared libs,
-                            // or undefined symbols not defined in any loaded object
-                            let needs_plt = gsym.is_dynamic
+                            let locally_defined = gsym.defined_in.is_some() && !gsym.is_dynamic;
+                            // External references always need a stub.
+                            let external = gsym.is_dynamic
                                 || (gsym.defined_in.is_none() && gsym.section_idx == SHN_UNDEF);
-                            if needs_plt && plt_seen.insert(sym.name.clone()) {
+                            // GNU semantics: calls to our own EXPORTED functions
+                            // also route through the PLT so LD_PRELOAD /
+                            // earlier-DSO interposition works. Direct binding
+                            // only for hidden/protected visibility (not
+                            // exported), version-script-locals, or -Bsymbolic.
+                            let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
+                            let version_local = version_script.as_ref().is_some_and(|vs|
+                                vs.local_star && !vs.matches_global(&sym.name));
+                            let is_func = (gsym.info & 0xf) == STT_FUNC
+                                || sym.sym_type() == STT_FUNC
+                                || rela.rela_type == R_X86_64_PLT32;
+                            let interposable = locally_defined && is_func
+                                && !hidden && !version_local && !bsymbolic;
+                            if (external || interposable) && plt_seen.insert(sym.name.clone()) {
                                 plt_names.push(sym.name.clone());
                             }
                         }
@@ -550,6 +563,7 @@ pub(super) fn emit_shared_library(
     if has_fini_array { dyn_count += 2; }
     if !plt_names.is_empty() { dyn_count += 4; } // DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL, DT_JMPREL
     if rpath_string.is_some() { dyn_count += 1; } // DT_RUNPATH or DT_RPATH
+    if bsymbolic { dyn_count += 2; } // DT_SYMBOLIC + DT_FLAGS(DF_SYMBOLIC)
     if verdef_count > 0 { dyn_count += 3; } // DT_VERSYM, DT_VERDEF, DT_VERDEFNUM
     let dynamic_size = dyn_count * 16;
 
@@ -1179,10 +1193,14 @@ pub(super) fn emit_shared_library(
                         // Section symbols and local symbols use R_X86_64_RELATIVE.
                         let is_version_local = version_script.as_ref().is_some_and(|vs|
                             vs.local_star && !vs.matches_global(&sym.name));
+                        let locally_defined = globals_snap.get(&sym.name)
+                            .map(|g| g.defined_in.is_some() && !g.is_dynamic)
+                            .unwrap_or(false);
                         let is_named_global = !sym.name.is_empty()
                             && !sym.is_local()
                             && sym.sym_type() != STT_SECTION
-                            && !is_version_local;
+                            && !is_version_local
+                            && !(bsymbolic && locally_defined);
                         if is_named_global {
                             abs64_entries.push((p, sym.name.clone(), a));
                         } else if s != 0 {
@@ -1389,6 +1407,12 @@ pub(super) fn emit_shared_library(
         // DT_TEXTREL not needed since we use PIC
     ] {
         w64(&mut out, dd, tag as u64); w64(&mut out, dd+8, val); dd += 16;
+    }
+    if bsymbolic {
+        // DT_SYMBOLIC (legacy) + DT_FLAGS:DF_SYMBOLIC (modern): search the
+        // library itself before the global scope at run time.
+        w64(&mut out, dd, 16u64); w64(&mut out, dd+8, 0); dd += 16; // DT_SYMBOLIC
+        w64(&mut out, dd, DT_FLAGS as u64); w64(&mut out, dd+8, 0x2); dd += 16; // DF_SYMBOLIC
     }
     if verdef_count > 0 {
         w64(&mut out, dd, DT_VERSYM as u64); w64(&mut out, dd+8, versym_addr); dd += 16;

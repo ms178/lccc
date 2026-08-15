@@ -32,6 +32,8 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut whole_archive = false;
     let mut emit_symtab = true;
     let mut relocatable = false;
+    let mut is_pie = false;
+    let mut build_id = false;
     let mut entry_override: Option<String> = None;
 
     let mut i = 0;
@@ -46,6 +48,9 @@ fn run(args: &[String]) -> Result<(), String> {
                 script_path = Some(args.get(i).cloned().ok_or("-T needs an argument")?);
             }
             "-r" | "--relocatable" | "-i" => relocatable = true,
+            "-pie" | "--pic-executable" => is_pie = true,
+            "-no-pie" => is_pie = false,
+            "--no-dynamic-linker" | "--no-ld-generated-unwind-info" => {}
             "--whole-archive" => whole_archive = true,
             "--no-whole-archive" => whole_archive = false,
             "--start-group" | "--end-group" | "-(" | "-)" => {}
@@ -73,7 +78,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     entry_override = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("-Map=") {
                     let _ = v;
-                } else if a.starts_with("--orphan-handling") || a.starts_with("--build-id")
+                } else if a.starts_with("--build-id") {
+                    build_id = !a.ends_with("=none");
+                } else if a.starts_with("--orphan-handling")
                     || a == "--no-warn-rwx-segments" || a.starts_with("-z")
                     || a.starts_with("--hash-style") || a == "--as-needed"
                     || a == "--no-as-needed" || a == "--eh-frame-hdr"
@@ -100,6 +107,9 @@ fn run(args: &[String]) -> Result<(), String> {
     // Load all inputs.
     let mut objects = Vec::new();
     lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+    if build_id && !relocatable {
+        lccc::linker_entry::append_build_id_object(&mut objects);
+    }
 
     if relocatable {
         if script_path.is_some() {
@@ -119,5 +129,5 @@ fn run(args: &[String]) -> Result<(), String> {
         script_src = format!("ENTRY({})\n{}", e, script_src);
     }
 
-    lccc::linker_entry::link_with_script_x86(&objects, &script_src, &output, emit_symtab)
+    lccc::linker_entry::link_with_script_x86(&objects, &script_src, &output, emit_symtab, is_pie)
 }
