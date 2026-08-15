@@ -22,6 +22,7 @@ pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod fp_const_hoist;
+pub(crate) mod int_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
@@ -1054,6 +1055,19 @@ macro_rules! preloop_dump {
     // otherwise sit in the loop's dependency path every iteration).
     if !disabled.contains("fpconst") {
         module.for_each_function(fp_const_hoist::run);
+    }
+
+    // Hoist large integer constants (not encodable as cmp/add immediates) out
+    // of loop bodies for the same reason — sieve's loop bound cost movz+movk
+    // per iteration before this.
+    //
+    // AArch64-ONLY: the pass models A64 immediate encodings (imm12/cmn).
+    // x86-64 encodes any imm32 directly in cmp/add, so hoisting there only
+    // burns a register and pessimizes the loop (measured on sieve: the
+    // hoisted bound turned `cmpq $10000000, %r11` into a register compare
+    // plus an extra callee-saved push in the prologue).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("intconst") {
+        module.for_each_function(int_const_hoist::run);
     }
 
     // Phase 11: Dead static function elimination.
