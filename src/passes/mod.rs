@@ -127,6 +127,7 @@ fn run_gvn_licm_ivsr_shared(
     run_gvn: bool,
     run_licm: bool,
     run_ivsr: bool,
+    run_univsr: bool,
     time_passes: bool,
     iter: usize,
 ) -> (usize, usize, usize) {
@@ -233,6 +234,26 @@ fn run_gvn_licm_ivsr_shared(
                 ivsr_total += n;
                 if i < changed.len() {
                     changed[i] = true;
+                }
+            }
+        }
+
+        // Un-IVSR (x86-64 only): revert IVSR pointer IVs to indexed form so
+        // the backend can use SIB addressing (base + index*scale + disp).
+        // Runs directly after IVSR while the CFG analysis is still valid;
+        // the pass rewrites instructions in place and never edits the CFG.
+        if run_univsr {
+            let n = univsr::run_univsr(func);
+            if n > 0 {
+                ivsr_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+                if time_passes {
+                    eprintln!(
+                        "[PASS] iter={} univsr (func {}): {} pointer IVs reverted",
+                        iter, func.name, n
+                    );
                 }
             }
         }
@@ -761,6 +782,12 @@ macro_rules! preloop_dump {
             let run_ivsr = iter == 0
                 && std::env::var("CCC_NO_IVSR").is_err()
                 && !disabled.contains("ivsr");
+            // Un-IVSR only pays off on targets with scaled-index addressing
+            // (x86-64 SIB). Gated for diagnostics like the other loop passes.
+            let run_univsr = run_ivsr
+                && matches!(target, crate::backend::Target::X86_64)
+                && std::env::var("CCC_NO_UNIVSR").is_err()
+                && !disabled.contains("univsr");
 
             if run_gvn || run_licm || run_ivsr {
                 let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
@@ -770,6 +797,7 @@ macro_rules! preloop_dump {
                     run_gvn,
                     run_licm,
                     run_ivsr,
+                    run_univsr,
                     time_passes,
                     iter,
                 );

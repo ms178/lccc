@@ -69,7 +69,7 @@ pub struct BasicBlock {
 /// This struct consolidates the fields that are common to `Instruction::Call` and
 /// `Instruction::CallIndirect`, avoiding duplication across match arms and making
 /// it easier to add new call-related fields in the future.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CallInfo {
     /// Destination value for the return, or None for void calls.
     pub dest: Option<Value>,

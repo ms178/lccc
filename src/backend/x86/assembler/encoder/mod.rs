@@ -1104,7 +1104,7 @@ impl InstructionEncoder {
             "pinsrw" => self.encode_sse_insert(ops, &[0x66, 0x0F, 0xC4], false),
             // Legacy pextrw (66 0F C5): GP reg is in the ModRM "reg" field,
             // XMM src is in the "r/m" field. This is inverted vs SSE4.1 extracts.
-            // TODO: pextrw with memory dest needs SSE4.1 opcode 66 0F 3A 15, not legacy 66 0F C5
+            // Memory-destination form auto-switches to SSE4.1 66 0F 3A 15 in encode_sse_extract.
             "pextrw" => self.encode_sse_extract(ops, &[0x66, 0x0F, 0xC5], false, true),
             "pinsrd" => self.encode_sse_insert(ops, &[0x66, 0x0F, 0x3A, 0x22], false),
             "pextrd" => self.encode_sse_extract(ops, &[0x66, 0x0F, 0x3A, 0x16], false, false),

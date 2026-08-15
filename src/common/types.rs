@@ -1582,8 +1582,32 @@ impl CType {
         } else if r_unsigned && r_rank >= l_rank {
             r
         } else {
-            // The signed type has higher rank and can represent all values
-            if l_unsigned { r } else { l }
+            // The signed type has higher rank (C11 6.3.1.8p1). Two sub-cases:
+            //  - If the signed type can represent ALL values of the unsigned
+            //    type (strictly wider, e.g. long long vs unsigned int on
+            //    LP64), the result is the signed type.
+            //  - Otherwise (same width, e.g. long long vs unsigned long on
+            //    LP64, or long vs unsigned int on ILP32), the result is the
+            //    UNSIGNED type corresponding to the signed type.
+            let (signed_ty, unsigned_ty) = if l_unsigned { (r, l) } else { (l, r) };
+            if signed_ty.size() > unsigned_ty.size() {
+                signed_ty
+            } else {
+                signed_ty.to_unsigned_version()
+            }
+        }
+    }
+
+    /// The unsigned type corresponding to a signed integer type (C11 6.3.1.8).
+    fn to_unsigned_version(self) -> CType {
+        match self {
+            CType::Char => CType::UChar,
+            CType::Short => CType::UShort,
+            CType::Int => CType::UInt,
+            CType::Long => CType::ULong,
+            CType::LongLong => CType::ULongLong,
+            CType::Int128 => CType::UInt128,
+            other => other,
         }
     }
 
@@ -1718,7 +1742,7 @@ impl CType {
 /// IR-level types (simpler than C types).
 /// Signed and unsigned variants are tracked separately so that the backend
 /// can choose sign-extension vs zero-extension appropriately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum IrType {
     I8,
     I16,
@@ -1737,6 +1761,7 @@ pub enum IrType {
     /// ABI handling (16-byte storage, proper variadic argument passing, va_arg).
     F128,
     Ptr,
+    #[default]
     Void,
 }
 

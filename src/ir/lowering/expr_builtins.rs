@@ -373,15 +373,33 @@ impl Lowerer {
                 for arg in args {
                     self.lower_expr(arg);
                 }
-                // Raptor Lake: enable all AVX2-class features for gzip PCLMUL
-                // Return 1 for pclmul/aes/avx etc, 0 for avx512
-                let mut ret = 1;
+                // Compile-time fold against the project's compile target
+                // (x86-64 Raptor Lake). The old behavior returned 1 for EVERY
+                // feature except avx512* - including features Raptor Lake
+                // does not have (AMX, XOP, SSE4A, ...), which turned runtime
+                // dispatch into guaranteed SIGILL paths. Fold from an exact
+                // allowlist instead; UNKNOWN features fold to 0 (the safe
+                // direction for dispatchers: they fall back to generic code).
+                let mut ret = 0;
                 if !args.is_empty() {
                     if let crate::frontend::parser::ast::Expr::StringLiteral(s, _) = &args[0] {
                         let feat = s.to_ascii_lowercase();
-                        if feat.contains("avx512") {
-                            ret = 0;
+                        // Features present on Raptor Lake (and the x86-64-v3
+                        // baseline this project targets).
+                        const PRESENT: &[&str] = &[
+                            "cmov", "mmx", "sse", "sse2", "sse3", "ssse3",
+                            "sse4.1", "sse4.2", "popcnt", "avx", "avx2",
+                            "fma", "bmi", "bmi2", "lzcnt", "movbe", "f16c",
+                            "aes", "pclmul", "pclmulqdq", "rdrnd", "rdrand",
+                            "rdseed", "sha", "adx", "fsgsbase", "xsave",
+                            "xsaveopt", "xsavec", "avxvnni", "vaes",
+                            "vpclmulqdq", "gfni", "cx16", "fxsr", "osxsave",
+                        ];
+                        if PRESENT.contains(&feat.as_str()) {
+                            ret = 1;
                         }
+                        // Everything else (avx512*, amx*, xop, sse4a, fma4,
+                        // tbm, prefetchwt1, ...) folds to 0.
                     }
                 }
                 Some(Operand::Const(IrConst::I32(ret)))
