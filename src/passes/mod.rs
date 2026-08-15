@@ -13,18 +13,24 @@
 
 pub(crate) mod aggregate_sroa;
 pub(crate) mod cfg_simplify;
+pub(crate) mod bit_idioms;
+pub(crate) mod aggregate_copy_forward;
+pub(crate) mod block_layout;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
+pub(crate) mod fp_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
+pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
@@ -229,7 +235,16 @@ fn run_gvn_licm_ivsr_shared(
         // reduces redundant induction casts in disjoint array loops. Keep
         // CCC_NO_IVSR=1 as a targeted diagnostic escape hatch.
         if run_ivsr {
-            let n = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+            // One transformation can expose another independent pointer IV in
+            // the same loop (notably the two source/destination GEPs created
+            // by vectorization). Iterate locally; IVSR changes instructions
+            // and phis but not CFG edges, so the shared analysis stays valid.
+            let mut n = 0;
+            for _ in 0..4 {
+                let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+                n += round;
+                if round == 0 { break; }
+            }
             if n > 0 {
                 ivsr_total += n;
                 if i < changed.len() {
@@ -405,6 +420,31 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     iphase_dump!("cleanup-fold1");
     if !std::env::var("CCC_NO_CLEANUP_CP1").is_ok() { copy_prop::run(module); }
     iphase_dump!("cleanup-copyprop1");
+    // Copy forwarding can expose another temporary in a copy chain
+    // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
+    if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        for _ in 0..8 {
+            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+        }
+    }
+    iphase_dump!("cleanup-agg-copy-forward");
+    // Promote loop-carried memory locations (struct fields / array cells with
+    // invariant addresses) into SSA values across the loop body.
+    if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
+        module.for_each_function(loop_memory_promote::run);
+    }
+    iphase_dump!("cleanup-loop-memory-promote");
+    // Resolve constant branches exposed by inlining before the bounded
+    // constant-call evaluator in ipcp examines the surviving call sites.
+    if !std::env::var("CCC_NO_CLEANUP_CFGSIMP").is_ok() {
+        for _ in 0..3 {
+            let n = module.for_each_function(cfg_simplify::run_function);
+            constant_fold::run(module);
+            copy_prop::run(module);
+            if n == 0 { break; }
+        }
+    }
+    iphase_dump!("cleanup-cfg-simplify");
     if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() { simplify::run(module); }
     iphase_dump!("cleanup-simplify");
     if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() { constant_fold::run(module); }
@@ -706,13 +746,28 @@ macro_rules! preloop_dump {
             total_changes_excl_dce += n;
         }
 
-        // Phase 2b-vec: SSE2 vectorization — iter 0 only, EARLY in pipeline.
+        // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
         // Run before GVN/LICM/etc to catch IR in simpler state.
+        // The vectorizer currently emits Vec* intrinsics backed by XMM/YMM
+        // registers. Other backends deliberately reject those intrinsics, so
+        // running this pass for them turns ordinary scalar loops into a compiler
+        // panic instead of preserving the valid scalar program.
         // Pass name for CCC_DISABLE_PASSES: "vectorize"
-        if iter == 0 && !optimize_for_size && !disabled.contains("vectorize") {
+        // Vectorize: x86-64 gets the full SSE/AVX-shaped pass; AArch64 gets
+        // the 128-bit (2-wide F64 / 4-wide I32) NEON variant. -Os/-Oz skip
+        // vectorization entirely (code size).
+        if iter == 0 && !optimize_for_size
+            && matches!(target, crate::backend::Target::X86_64 | crate::backend::Target::Aarch64)
+            && !disabled.contains("vectorize")
+        {
+            let vectorize_fn = if target == crate::backend::Target::Aarch64 {
+                vectorize::vectorize_function_two_wide
+            } else {
+                vectorize::vectorize_function
+            };
             let n = timed_pass!(
                 "vectorize",
-                run_on_visited(module, &dirty, &mut changed, vectorize::vectorize_function)
+                run_on_visited(module, &dirty, &mut changed, vectorize_fn)
             );
             total_changes += n;
             total_changes_excl_dce += n;
@@ -738,6 +793,13 @@ macro_rules! preloop_dump {
                 run_on_visited(module, &dirty, &mut changed, simplify::simplify_function)
             );
             cur_pass_changes[3] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+
+            let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let n = timed_pass!("bit_idioms", run_on_visited(module, &dirty, &mut changed,
+                |func| bit_idioms::recognize_function(func, enable_bit_reverse)));
+            cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
         }
@@ -821,6 +883,10 @@ macro_rules! preloop_dump {
         // the skipped block, so branches are usually smaller (and often faster
         // on the short branch path); GCC makes the same trade-off at -Os.
         if !dis.ifconv && !optimize_for_size && should_run!(7, 0, 4) {
+            // Forward redundant reloads first: removing a load from a
+            // conditional arm makes the arm side-effect-free so
+            // if-conversion can fire.
+            module.for_each_function(load_forward::run);
             let n = timed_pass!(
                 "if_convert",
                 run_on_visited(
@@ -963,6 +1029,25 @@ macro_rules! preloop_dump {
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // DCE can remove aggregate-copy consumers that previously made forwarding
+    // unsafe (for example a full returned struct whose only surviving use is
+    // one field load). Re-run forwarding before final loop promotion.
+    for _ in 0..8 {
+        if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+    }
+    module.for_each_function(dce::eliminate_dead_code);
+    // Run memory-recurrence promotion again after CFG and copy cleanup have
+    // exposed canonical natural loops.
+    module.for_each_function(loop_memory_promote::run);
+    module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+
+    // Hoist FP constants used in loop bodies into preheader Copies so they can
+    // stay in FP registers across the loop (AArch64 constant-pool literal loads
+    // otherwise sit in the loop's dependency path every iteration).
+    if !disabled.contains("fpconst") {
+        module.for_each_function(fp_const_hoist::run);
     }
 
     // Phase 11: Dead static function elimination.

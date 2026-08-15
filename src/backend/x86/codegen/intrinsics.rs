@@ -33,26 +33,11 @@ impl X86Codegen {
         match op {
             Operand::Const(c) => {
                 match c {
-                    IrConst::F64(v) => {
-                        let bits = v.to_bits() as i64;
-                        if bits == 0 {
-                            self.state.emit("    xorpd %xmm0, %xmm0");
-                        } else if bits >= i32::MIN as i64 && bits <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", bits, "rax");
-                            self.state.emit("    movq %rax, %xmm0");
-                        } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", bits, "rax");
-                            self.state.emit("    movq %rax, %xmm0");
-                        }
+                    IrConst::F64(_) => {
+                        self.emit_fp_operand_to_xmm(op, IrType::F64, "xmm0");
                     }
-                    IrConst::F32(v) => {
-                        let bits = v.to_bits() as i32;
-                        if bits == 0 {
-                            self.state.emit("    xorps %xmm0, %xmm0");
-                        } else {
-                            self.state.out.emit_instr_imm_reg("    movl", bits as i64, "eax");
-                            self.state.emit("    movd %eax, %xmm0");
-                        }
+                    IrConst::F32(_) => {
+                        self.emit_fp_operand_to_xmm(op, IrType::F32, "xmm0");
                     }
                     _ => {
                         // Integer or other constants - load to rax and move to xmm
@@ -1923,6 +1908,9 @@ impl X86Codegen {
                     self.state.reg_cache.invalidate_all();
                 }
             }
+            IntrinsicOp::FmaF64x2Hoisted => {
+                // Emitted only by the AArch64 two-wide vectorizer.
+            }
             IntrinsicOp::FmaF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
@@ -2535,6 +2523,9 @@ impl X86Codegen {
                     }
                 }
             }
+            // AArch64-only intrinsics must never reach the x86 emitter; fall
+            // through to the loud "unhandled" diagnostic below rather than
+            // silently no-opping (which would miscompile).
             // Generic SIMD family (512-bit + FP): emitted by intrinsics_simd.rs.
             _ => {
                 if !self.emit_simd_op(dest, op, dest_ptr, args) {

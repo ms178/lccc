@@ -1439,6 +1439,20 @@ impl Driver {
                     }
                 }
             }
+            // Loop-transparent splitting (spill values live across a hot loop
+            // but unused inside it). NOTE: measured as a net loss on the
+            // benchmark suite — the store/reload round-trips cost more than the
+            // freed registers save, because the values competing for registers
+            // in hot loops are the in-loop ones (bases/IVs), which can't be
+            // transparent-split. Kept opt-in for reference.
+            if std::env::var("CCC_LOOP_SPLIT").is_ok() {
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(func, max_splits);
+                        if n > 0 { did_split = true; }
+                    }
+                }
+            }
             // Run cleanup passes on split IR: copy propagation + DCE
             // to eliminate redundant Store/Load → Copy chains from mem2reg
             if did_split {
@@ -1493,6 +1507,20 @@ impl Driver {
             for func in &mut module.functions {
                 if !func.is_declaration {
                     crate::backend::split_ranges::place_edge_copy_blocks(func);
+                }
+            }
+        }
+
+        // Final block layout: optimization passes and phi elimination append
+        // new blocks (vector bodies, trampolines, exit blocks) at the end of
+        // `func.blocks`, which scrambles the linearized order the backend's
+        // liveness/regalloc relies on. Re-layout in reverse post-order so loop
+        // bodies and their exit blocks stay contiguous and loop-carried values
+        // don't falsely span calls.
+        if std::env::var("CCC_NO_BLOCK_RELAYOUT").is_err() {
+            for func in &mut module.functions {
+                if !func.is_declaration {
+                    crate::passes::block_layout::relayout_blocks_rpo(func);
                 }
             }
         }
@@ -1622,6 +1650,20 @@ impl Driver {
                     func.name,
                     func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
                 );
+            }
+        }
+        // TEMP: full IR dump
+        if std::env::var("LCCC_DUMP_IR").is_ok() {
+            for func in &module.functions {
+                if func.is_declaration { continue; }
+                eprintln!("=== IR {} ===", func.name);
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    eprintln!("  block {} (label {}):", bi, b.label.0);
+                    for inst in &b.instructions {
+                        eprintln!("    {:?}", inst);
+                    }
+                    eprintln!("    term: {:?}", b.terminator);
+                }
             }
         }
 

@@ -1201,6 +1201,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         };
 
         let mut module = IrModule {
@@ -1281,7 +1282,9 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,};
+        ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        };
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1349,7 +1352,9 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,};
+        ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        };
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1423,7 +1428,9 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,};
+        ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        };
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1501,7 +1508,9 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,};
+        ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        };
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1579,7 +1588,9 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,};
+        ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        };
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1682,7 +1693,9 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,};
+        ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        };
 
         let mut module = IrModule {
             functions: vec![func],
@@ -1747,6 +1760,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
         }
     }
 

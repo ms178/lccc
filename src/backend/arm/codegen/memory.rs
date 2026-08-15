@@ -3,15 +3,165 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
-use super::emit::{ArmCodegen, callee_saved_name};
+use crate::backend::traits::ArchCodegen;
+use super::emit::{ArmCodegen, arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys};
 
 impl ArmCodegen {
+    // ---- Indexed (register+register) addressing for folded GEPs ----
+
+    /// Compute the `[base, index]` / `[base, index, lsl #shift]` operand string
+    /// and resolve the base/index registers. Returns None when either value is
+    /// not in a GP register or the shift is unusable for the access size.
+    fn indexed_addr(&mut self, base: &Value, index: &Value, shift: u8, ty: IrType) -> Option<String> {
+        let bp = self.get_phys_reg_for_value(base.0).filter(|r| !is_arm_fp_phys(*r))?;
+        let ip = self.get_phys_reg_for_value(index.0).filter(|r| !is_arm_fp_phys(*r))?;
+        // Sub-word loads/stores have no shifted register-offset form.
+        let sub_word = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
+        if sub_word && shift != 0 {
+            return None;
+        }
+        if shift > 3 {
+            return None;
+        }
+        let b = callee_saved_name(bp);
+        let i = callee_saved_name(ip);
+        if shift == 0 {
+            Some(format!("[{}, {}]", b, i))
+        } else {
+            Some(format!("[{}, {}, lsl #{}]", b, i, shift))
+        }
+    }
+
+    pub(super) fn emit_load_indexed_impl(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
+        let Some(addr) = self.indexed_addr(base, index, shift, ty) else { return false };
+        // FP dest with an FP register assignment: load straight into it.
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Some(&dphys) = self.reg_assignments.get(&dest.0) {
+                if is_arm_fp_phys(dphys) {
+                    let fp = arm_fp_name(dphys, ty);
+                    self.state.emit_fmt(format_args!("    ldr {}, {}", fp, addr));
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+            // Unassigned FP dest: load into d0/s0, then store via the FP path.
+            let scratch = if ty == IrType::F32 { "s0" } else { "d0" };
+            self.state.emit_fmt(format_args!("    ldr {}, {}", scratch, addr));
+            self.store_float_reg(dest, ty, scratch);
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Integer dest with a GP register assignment: load straight into it.
+        if let Some(dphys) = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r)) {
+            let wide = !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
+            let dname = if wide { callee_saved_name(dphys) } else { callee_saved_name_32(dphys) };
+            let instr = match ty {
+                IrType::I8 => "ldrsb",
+                IrType::U8 => "ldrb",
+                IrType::I16 => "ldrsh",
+                IrType::U16 => "ldrh",
+                IrType::I32 => "ldrsw",
+                _ => "ldr",
+            };
+            self.state.emit_fmt(format_args!("    {} {}, {}", instr, dname, addr));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Unassigned integer dest: load into the accumulator, then store.
+        let (instr, reg) = match ty {
+            IrType::I8 => ("ldrsb", "w0"),
+            IrType::U8 => ("ldrb", "w0"),
+            IrType::I16 => ("ldrsh", "w0"),
+            IrType::U16 => ("ldrh", "w0"),
+            IrType::I32 => ("ldrsw", "x0"),
+            IrType::U32 => ("ldr", "w0"),
+            _ => ("ldr", "x0"),
+        };
+        self.state.emit_fmt(format_args!("    {} {}, {}", instr, reg, addr));
+        self.store_x0_to(dest);
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    pub(super) fn emit_store_indexed_impl(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool {
+        let Some(addr) = self.indexed_addr(base, index, shift, ty) else { return false };
+        // FP value with an FP register assignment: store it directly.
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Operand::Value(v) = val {
+                if let Some(&sphys) = self.reg_assignments.get(&v.0) {
+                    if is_arm_fp_phys(sphys) {
+                        let fp = arm_fp_name(sphys, ty);
+                        self.state.emit_fmt(format_args!("    str {}, {}", fp, addr));
+                        self.state.reg_cache.invalidate_acc();
+                        return true;
+                    }
+                }
+            }
+        }
+        // Integer value with a GP register assignment: store it directly.
+        if let Operand::Value(v) = val {
+            if let Some(sphys) = self.get_phys_reg_for_value(v.0).filter(|r| !is_arm_fp_phys(*r)) {
+                let wide = !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
+                let sname = if wide { callee_saved_name(sphys) } else { callee_saved_name_32(sphys) };
+                let instr = match ty {
+                    IrType::I8 | IrType::U8 => "strb",
+                    IrType::I16 | IrType::U16 => "strh",
+                    _ => "str",
+                };
+                self.state.emit_fmt(format_args!("    {} {}, {}", instr, sname, addr));
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+        // General path: materialize the value, then store.
+        self.operand_to_x0(val);
+        match ty {
+            IrType::F32 => {
+                self.state.emit("    fmov s0, w0");
+                self.state.emit_fmt(format_args!("    str s0, {}", addr));
+            }
+            IrType::F64 => {
+                self.state.emit("    fmov d0, x0");
+                self.state.emit_fmt(format_args!("    str d0, {}", addr));
+            }
+            IrType::I8 | IrType::U8 => self.state.emit_fmt(format_args!("    strb w0, {}", addr)),
+            IrType::I16 | IrType::U16 => self.state.emit_fmt(format_args!("    strh w0, {}", addr)),
+            IrType::I32 | IrType::U32 => self.state.emit_fmt(format_args!("    str w0, {}", addr)),
+            _ => self.state.emit_fmt(format_args!("    str x0, {}", addr)),
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_store(self, val, ptr);
             return;
+        }
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Operand::Value(v) = val {
+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    if is_arm_fp_phys(phys) {
+                        let fp = arm_fp_name(phys, ty);
+                        if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                            match addr {
+                                SlotAddr::OverAligned(slot, id) => {
+                                    self.emit_alloca_aligned_addr_impl(slot, id);
+                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                }
+                                SlotAddr::Direct(slot) => self.emit_store_to_sp(&fp, slot.0, "str"),
+                                SlotAddr::Indirect(slot) => {
+                                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
         }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
@@ -21,6 +171,27 @@ impl ArmCodegen {
             crate::backend::f128_softfloat::f128_emit_load(self, dest, ptr);
             return;
         }
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                if is_arm_fp_phys(phys) {
+                    let fp = arm_fp_name(phys, ty);
+                    if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                        match addr {
+                            SlotAddr::OverAligned(slot, id) => {
+                                self.emit_alloca_aligned_addr_impl(slot, id);
+                                self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
+                            }
+                            SlotAddr::Direct(slot) => self.emit_load_from_sp(&fp, slot.0, "ldr"),
+                            SlotAddr::Indirect(slot) => {
+                                self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                                self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
 
@@ -28,6 +199,46 @@ impl ArmCodegen {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_store_with_offset(self, val, base, offset);
             return;
+        }
+        // FP value with a register assignment: store the d/s register directly,
+        // folding the constant offset into the addressing mode when encodable.
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let Operand::Value(v) = val {
+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    if is_arm_fp_phys(phys) {
+                        let fp = arm_fp_name(phys, ty);
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        if let Some(addr) = addr {
+                            let scale: i64 = if ty == IrType::F32 { 4 } else { 8 };
+                            match addr {
+                                SlotAddr::OverAligned(slot, id) => {
+                                    self.emit_alloca_aligned_addr_impl(slot, id);
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                }
+                                SlotAddr::Direct(slot) => {
+                                    let folded_slot = StackSlot(slot.0 + offset);
+                                    self.emit_store_to_sp(&fp, folded_slot.0, "str");
+                                }
+                                SlotAddr::Indirect(slot) => {
+                                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                                    if offset > 0 && offset % scale == 0 && offset / scale <= 4095 {
+                                        self.state.emit_fmt(format_args!("    str {}, [x9, #{}]", fp, offset));
+                                    } else if (-256..=255).contains(&offset) {
+                                        self.state.emit_fmt(format_args!("    stur {}, [x9, #{}]", fp, offset));
+                                    } else {
+                                        if offset != 0 {
+                                            self.emit_add_offset_to_addr_reg_impl(offset);
+                                        }
+                                        self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
         }
         self.operand_to_x0(val);
         let addr = self.state.resolve_slot_addr(base.0);
@@ -63,6 +274,29 @@ impl ArmCodegen {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_load_with_offset(self, dest, base, offset);
             return;
+        }
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            if let (Some(&dest_phys), Some(&base_phys)) =
+                (self.reg_assignments.get(&dest.0), self.reg_assignments.get(&base.0))
+            {
+                if is_arm_fp_phys(dest_phys) && !is_arm_fp_phys(base_phys) {
+                    let fp = arm_fp_name(dest_phys, ty);
+                    let base_reg = callee_saved_name(base_phys);
+                    let scale = if ty == IrType::F32 { 4 } else { 8 };
+                    if offset == 0 {
+                        self.state.emit_fmt(format_args!("    ldr {}, [{}]", fp, base_reg));
+                    } else if offset > 0 && offset % scale == 0 && offset / scale <= 4095 {
+                        self.state.emit_fmt(format_args!("    ldr {}, [{}, #{}]", fp, base_reg, offset));
+                    } else if (-256..=255).contains(&offset) {
+                        self.state.emit_fmt(format_args!("    ldur {}, [{}, #{}]", fp, base_reg, offset));
+                    } else {
+                        self.state.emit_fmt(format_args!("    mov x9, {}", base_reg));
+                        self.emit_add_offset_to_addr_reg_impl(offset);
+                        self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
+                    }
+                    return;
+                }
+            }
         }
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
@@ -112,7 +346,10 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
-        let reg = Self::reg_for_type("x1", ty);
+        // emit_store_default loads the pointer into x9 first and the value into
+        // the accumulator (x0) second.  Using x1 here stores an unrelated value
+        // for globals, heap fields, and all other indirect destinations.
+        let reg = Self::reg_for_type("x0", ty);
         self.state.emit_fmt(format_args!("    {} {}, [x9]", instr, reg));
     }
 
@@ -237,6 +474,40 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+        // Struct assignments are overwhelmingly small fixed-size copies.  A
+        // byte-at-a-time runtime loop is especially costly when the copy sits
+        // in a hot loop, so use AArch64 pair transfers for sizes that can be
+        // unrolled without excessive code growth.  x9 is the destination and
+        // x10 the source; x12/x13 are reserved codegen scratch registers.
+        if size <= 256 {
+            let mut offset = 0usize;
+            while offset + 16 <= size {
+                self.state.emit_fmt(format_args!("    ldp x12, x13, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    stp x12, x13, [x9, #{}]", offset));
+                offset += 16;
+            }
+            if offset + 8 <= size {
+                self.state.emit_fmt(format_args!("    ldr x12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    str x12, [x9, #{}]", offset));
+                offset += 8;
+            }
+            if offset + 4 <= size {
+                self.state.emit_fmt(format_args!("    ldr w12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    str w12, [x9, #{}]", offset));
+                offset += 4;
+            }
+            if offset + 2 <= size {
+                self.state.emit_fmt(format_args!("    ldrh w12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    strh w12, [x9, #{}]", offset));
+                offset += 2;
+            }
+            if offset < size {
+                self.state.emit_fmt(format_args!("    ldrb w12, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    strb w12, [x9, #{}]", offset));
+            }
+            return;
+        }
+
         let label_id = self.state.next_label_id();
         let loop_label = format!(".Lmemcpy_loop_{}", label_id);
         let done_label = format!(".Lmemcpy_done_{}", label_id);

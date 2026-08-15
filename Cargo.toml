@@ -53,3 +53,26 @@ gcc_m16 = []
 #   opt-level via CARGO_PROFILE_RELEASE_OPT_LEVEL=1 per project policy.
 [profile.release]
 lto = "thin"
+
+# Fast-iteration profile for development / research loops (`cargo build
+# --profile fastbuild`). The release profile's thin LTO quadruples rebuild
+# times on small machines because LTO disables incremental compilation and
+# serializes all codegen behind the cross-unit link step. This profile keeps
+# the optimizer at the project-policy -O1 level (same codegen quality class
+# as the research builds) while restoring the fast edit-compile-test cycle:
+#
+# * lto = "off":            no cross-unit link step, parallel codegen.
+# * incremental = true:     only re-optimize dirty CGUs on rebuilds.
+# * codegen-units = 256:    maximum intra-crate codegen parallelism.
+# * debug = "line-tables-only": usable panic backtraces / gdb line info at
+#                           a fraction of full debuginfo cost.
+#
+# Binaries land in target/fastbuild/. Use scripts/build_lccc_fast.sh.
+# Ship-quality binaries still come from the release profile.
+[profile.fastbuild]
+inherits = "release"
+opt-level = 1
+lto = "off"
+incremental = true
+codegen-units = 256
+debug = "line-tables-only"

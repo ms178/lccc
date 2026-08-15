@@ -291,6 +291,25 @@ pub trait ArchCodegen {
     /// splats to .rodata. No-op by default; x86 emits the actual entries.
     fn emit_vector_const_rodata(&mut self) {}
 
+    /// Whether this backend supports indexed (register+register) addressing
+    /// for folded value-offset GEPs: `ldr/str [base_reg, idx_reg, lsl #shift]`.
+    /// Returns false by default; AArch64 returns true.
+    fn supports_indexed_addr(&self) -> bool {
+        false
+    }
+
+    /// Emit a load using indexed addressing: dest = [base + (index << shift)].
+    /// Returns false if it cannot be emitted (caller falls back to unfolding).
+    fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Emit a store using indexed addressing: [base + (index << shift)] = val.
+    /// Returns false if it cannot be emitted (caller falls back to unfolding).
+    fn emit_store_indexed(&mut self, _val: &Operand, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
     /// (or appropriate variant). Default: panics.
@@ -426,6 +445,23 @@ pub trait ArchCodegen {
             &Operand::Value(Value(_mul_dest.0)),
             ty,
         );
+    }
+
+    fn supports_fused_float_mul_add(&self) -> bool { false }
+
+    /// Whether the target can encode a shifted register directly as the second
+    /// operand of an integer logical instruction (for example AArch64's
+    /// `orr w0, w1, w2, lsr #5`).
+    fn supports_shifted_logical(&self) -> bool { false }
+
+    /// Emit `dest = other logical_op (shift_lhs shift_op shift_amount)`.
+    /// Called only for an adjacent, single-use shift/logical pair.
+    fn emit_shifted_logical(&mut self, shift_dest: &Value, shift_op: IrBinOp,
+                            shift_lhs: &Operand, shift_amount: &Operand,
+                            logical_op: IrBinOp, other: &Operand,
+                            dest: &Value, ty: IrType) {
+        self.emit_int_binop(shift_dest, shift_op, shift_lhs, shift_amount, ty);
+        self.emit_int_binop(dest, logical_op, other, &Operand::Value(*shift_dest), ty);
     }
 
     /// Emit a float binary operation (add/sub/mul/div).
@@ -1386,6 +1422,9 @@ pub trait ArchCodegen {
     fn emit_int_clz(&mut self, ty: IrType);
     fn emit_int_ctz(&mut self, ty: IrType);
     fn emit_int_bswap(&mut self, ty: IrType);
+    fn emit_int_bitreverse(&mut self, _ty: IrType) {
+        panic!("bit-reverse IR reached a backend without native lowering")
+    }
     fn emit_int_popcount(&mut self, ty: IrType);
 
     // --- Control flow primitives ---
@@ -2150,6 +2189,7 @@ pub fn emit_unaryop_default(
             IrUnaryOp::Clz => cg.emit_int_clz(ty),
             IrUnaryOp::Ctz => cg.emit_int_ctz(ty),
             IrUnaryOp::Bswap => cg.emit_int_bswap(ty),
+            IrUnaryOp::BitReverse => cg.emit_int_bitreverse(ty),
             IrUnaryOp::Popcount => cg.emit_int_popcount(ty),
             IrUnaryOp::IsConstant => unreachable!("IsConstant handled above"),
         }

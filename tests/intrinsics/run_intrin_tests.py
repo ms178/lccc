@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent.parent
-LCCC = REPO / "target" / "release" / "lccc"
+LCCC = Path(os.environ.get("LCCC_BIN", REPO / "target" / "release" / "lccc"))
 LCCC_INC = REPO / "include"
 GCC = os.environ.get("CC", "gcc")
 GCC_INC = subprocess.check_output([GCC, "-print-file-name=include"], text=True).strip()

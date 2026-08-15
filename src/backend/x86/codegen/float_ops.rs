@@ -447,7 +447,9 @@ impl X86Codegen {
     }
 
     /// Load an FP operand directly into an XMM register, using the constant pool
-    /// for FP literal constants instead of going through a GPR.
+    /// for FP literal constants instead of going through a GPR. Value operands
+    /// allocated to an XMM register or a stack slot are loaded directly with
+    /// `movsd`/`movss`; the GPR path is only a last-resort fallback.
     pub(super) fn emit_fp_operand_to_xmm(&mut self, op: &Operand, ty: IrType, xmm: &str) {
         match op {
             Operand::Const(IrConst::F64(v)) => {
@@ -547,5 +549,20 @@ impl X86Codegen {
                 }
             }
         }
+    }
+
+    /// Stage an FP store value in an XMM register: returns the value's own
+    /// XMM register when it has one, otherwise loads it into %xmm0 and
+    /// returns "xmm0". Never clobbers %rcx (safe after address setup).
+    pub(super) fn fp_store_value_xmm(&mut self, val: &Operand, ty: IrType) -> &'static str {
+        if let Operand::Value(v) = val {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    return phys_reg_name(reg);
+                }
+            }
+        }
+        self.emit_fp_operand_to_xmm(val, ty, "xmm0");
+        "xmm0"
     }
 }
