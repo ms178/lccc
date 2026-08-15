@@ -37,7 +37,13 @@ for src in "$dir"/*.c; do
   # symbol values, or cannot even compile the construct) — the test still runs
   # under lccc and must pass, but the invalid GCC comparison is skipped.
   LCCC_NO_COMPARE=0
+  # Per-test env vars must not LEAK into later tests (set -a exports persist
+  # across loop iterations: vectorize_f32_sum_sse2.env's LCCC_FORCE_SSE2=1
+  # silently switched every alphabetically-later test to the SSE2 path).
+  # Track and unset them after the test runs.
+  _envfile_vars=""
   if [ -f "$dir/$name.env" ]; then
+    _envfile_vars=$(sed -n 's/^\([A-Za-z_][A-Za-z_0-9]*\)=.*/\1/p' "$dir/$name.env")
     set -a
     # shellcheck disable=SC1090
     . "$dir/$name.env"
@@ -58,6 +64,8 @@ for src in "$dir"/*.c; do
       else echo "PASS  $name${LCCC_NO_COMPARE:+ (lccc-only)}"; pass=$((pass+1)); fi
     else echo "FAIL  $name (run rc=$rc) out=[$(cat /tmp/ccc_out.txt)]"; fail=$((fail+1)); fi
   else echo "FAIL  $name compile: $(tail -1 /tmp/ccc_err.txt)"; fail=$((fail+1)); fi
+  # Undo this test's env file so it cannot affect subsequent tests.
+  for _v in $_envfile_vars; do unset "$_v"; done
 done
 echo "=== Regression: $pass passed, $fail failed ==="
 [ $fail -eq 0 ]

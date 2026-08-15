@@ -1261,7 +1261,6 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             // valid only if we fold nothing after this point).
             let writes = get_dest_reg(&infos[n]);
             if writes == base_family || writes == index_family { break; }
-
             if infos[n].reg_refs & dst_mask != 0 {
                 // A bare `(%tmp)` operand is rewritable. Anything else that
                 // mentions the register (displacement form, plain read, or a
@@ -1269,20 +1268,26 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
                 let bare = t.match_indices(&addr_pat).any(|(pos, _)| {
                     pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
                 });
-                let mentions = t.contains(&format!("%{}", dst64))
-                    || t.contains(&format!("%{}", dst32));
+                // REG_NAMES entries already include the '%' prefix; the old
+                // format!("%{}", ..) built "%%rdx", which never matched, so a
+                // redefinition of the destination register was INVISIBLE to
+                // this scan. The first LEA then folded uses belonging to a
+                // second LEA into the same register (vectorize_float_matmul:
+                // C[0][0] += ... executed against A's address).
+                let mentions = t.contains(dst64) || t.contains(dst32);
                 if bare {
                     // Reject a line that ALSO uses %tmp in a non-bare position.
                     let stripped = t.replace(&addr_pat, "");
-                    if stripped.contains(&format!("%{}", dst64))
-                        || stripped.contains(&format!("%{}", dst32))
-                    { ok = false; break; }
+                    if stripped.contains(dst64) || stripped.contains(dst32) {
+                        ok = false; break;
+                    }
                     uses.push(n);
                 } else if mentions {
                     // A pure redefinition of %tmp ends its live range cleanly:
                     // everything after belongs to a different value.
-                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())]
-                        .contains(&format!("%{}", dst64)) { break; }
+                    if writes == dst_family
+                        && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
+                    { break; }
                     ok = false; break;
                 }
             }
@@ -4460,4 +4465,74 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod lea_all_uses_tests {
+    #[test]
+    fn second_lea_redef_same_dst_not_cross_folded() {
+        // Two LEAs into the SAME destination register within one block.
+        // The first LEA's scan must stop at the second LEA (redefinition);
+        // the second LEA's two uses must fold to ITS base/index, never the
+        // first's. Regression: vectorize_float_matmul (C[0][0] wrote to A).
+        let asm = "\
+.LBB12:
+    movq %rsi, %r11
+    shlq $2, %r11
+    leaq (%r15, %r11), %rdx
+    movss (%rdx), %xmm3
+    movss %xmm2, %xmm4
+    mulss %xmm3, %xmm4
+    movq %rsi, %r10
+    shlq $2, %r10
+    leaq (%r8, %r10), %rdx
+    movss (%rdx), %xmm5
+    addss %xmm4, %xmm5
+    movss %xmm5, (%rdx)
+    addl $1, %esi
+    movslq %esi, %rsi
+jmp .LBB11
+";
+        let out = super::super::peephole_optimize(asm.to_string());
+        // The load feeding xmm5 and the store of xmm5 must NEVER use the
+        // first LEA's (%r15,%r11) address.
+        for line in out.lines() {
+            if line.contains("xmm5") && line.contains("(%r15,%r11)") {
+                panic!("second LEA's uses folded to the FIRST LEA's address:\n{}", out);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lea_scan_debug {
+    use super::*;
+    use crate::backend::x86::codegen::peephole::types::*;
+    #[test]
+    fn debug_second_lea_classification() {
+        let line = "    leaq (%r8, %r10), %rdx";
+        let info = classify_line(line);
+        assert_eq!(get_dest_reg(&info), 2);
+        assert!(info.reg_refs & (1 << 2) != 0);
+    }
+    #[test]
+    fn debug_direct_pass_call() {
+        let asm = "\
+    leaq (%r15, %r11), %rdx
+    movss (%rdx), %xmm3
+    movq %rsi, %r10
+    leaq (%r8, %r10), %rdx
+    movss (%rdx), %xmm5
+    movss %xmm5, (%rdx)
+";
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_lea_all_uses_in_block(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
+        eprintln!("changed={} out=\n{}", changed, out.join("\n"));
+        for line in &out {
+            assert!(!(line.contains("xmm5") && line.contains("(%r15,%r11)")),
+                "cross-fold! {}", line);
+        }
+    }
 }

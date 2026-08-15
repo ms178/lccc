@@ -123,6 +123,34 @@ impl X86Codegen {
     /// optimization — no semantic change.
     pub(super) fn sse_load_arg(&mut self, arg: &Operand, xmm: &'static str) {
         if let Operand::Value(v) = arg {
+            // Register-allocated vector value (Phase 3b vecreg): its CONTENT
+            // lives in the assigned XMM register across blocks. This check
+            // must come first — the fallback path below would hand the value
+            // to operand_to_reg, which consults the same assignment and emits
+            // `movq %xmmN, %rax; movdqu (%rax), ...`, reinterpreting the
+            // vector's low 64 bits as an ADDRESS (simd_movnt SIGSEGV: the
+            // loop-carried accumulator held in xmm6 was dereferenced).
+            // vec_live_regs only tracks within a block; reg_assignments is
+            // the source of truth at block boundaries.
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    // A pending deferred store to this value flowed through
+                    // the register; anything else must be flushed before we
+                    // potentially clobber xmm0/xmm1 scratch.
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    } else {
+                        self.flush_pending_vec_store_impl();
+                    }
+                    if name != xmm {
+                        self.state
+                            .emit_fmt(format_args!("    movdqa %{}, %{}", name, xmm));
+                    }
+                    self.state.sse_last_store_reg = false;
+                    return;
+                }
+            }
             // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
                 if held != xmm {

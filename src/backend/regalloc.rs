@@ -2183,12 +2183,12 @@ fn count_value_uses_in_loop(func: &IrFunction, block_loop_depth: &[u32]) -> FxHa
 /// Keeping these exact sites makes the destructive update proof explicit and
 /// lets assignment propagation revalidate it without whole-function searches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PhiCoalesceCandidate {
-    phi_dest: u32,
-    backedge_src: u32,
-    block_idx: usize,
-    source_def_idx: usize,
-    copy_idx: usize,
+pub(crate) struct PhiCoalesceCandidate {
+    pub(crate) phi_dest: u32,
+    pub(crate) backedge_src: u32,
+    pub(crate) block_idx: usize,
+    pub(crate) source_def_idx: usize,
+    pub(crate) copy_idx: usize,
 }
 
 /// Detect safe phi coalesce candidates for loop-carried variables.

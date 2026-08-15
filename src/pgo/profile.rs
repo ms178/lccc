@@ -682,7 +682,7 @@ mod tests {
             is_variadic:false,is_declaration:false,is_static:false,is_inline:false,is_always_inline:false,
             is_noinline:false,next_value_id:0,next_label:0,section:None,visibility:None,is_weak:false,is_used:false,
             has_inlined_calls:false,param_alloca_values:vec![],uses_sret:false,is_fastcall:false,is_naked:false,
-            global_init_label_blocks:vec![],ret_eightbyte_classes:vec![],ret_is_f128_sse:false,is_gnu_inline_def:false,
+            global_init_label_blocks:vec![],ret_eightbyte_classes:vec![],ret_is_f128_sse:false,is_gnu_inline_def:false,loop_promoted_f64_values:vec![],
         }
     }
 

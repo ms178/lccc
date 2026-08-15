@@ -1250,10 +1250,13 @@ mod tests {
     }
 
     #[test]
-    fn test_no_unroll_iv_indexed_gep() {
-        // A body that GEPs directly by the narrow (I32) IV must NOT be unrolled
-        // on 64-bit targets: the unroller's intermediate IV values stay narrow
-        // and would corrupt 64-bit pointer arithmetic after copy propagation.
+    fn test_unroll_iv_indexed_gep_is_legal() {
+        // A body that GEPs directly by the narrow (I32) IV IS unrollable:
+        // do_unroll clones the GEP through the per-clone value map, so each
+        // clone indexes by its own IV copy. (The historical blanket rejection
+        // was removed after differential validation against GCC; only
+        // Cast(I32->I64/Ptr) widening of the IV remains a hazard, covered by
+        // test_no_unroll_iv_widening_cast below.)
         let mut func = make_counting_loop(100);
         for inst in &mut func.blocks[2].instructions {
             if let Instruction::GetElementPtr { offset, .. } = inst {
@@ -1261,11 +1264,27 @@ mod tests {
             }
         }
         let n = unroll_loops(&mut func);
+        assert_eq!(n, 1, "IV-indexed GEP loop should be unrolled (per-clone remap)");
+    }
+
+    #[test]
+    fn test_no_unroll_iv_widening_cast() {
+        // A body that widens the narrow IV via Cast(I32->I64) must NOT be
+        // unrolled on 64-bit targets: the unroller's intermediate IV values
+        // stay narrow and the widened uses can interact incorrectly with
+        // later passes (observed in the SQLite amalgamation).
+        let mut func = make_counting_loop(100);
+        func.blocks[2].instructions.insert(0, Instruction::Cast {
+            dest: Value(90),
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        let n = unroll_loops(&mut func);
         if crate::common::types::target_is_32bit() {
             assert_eq!(n, 1, "32-bit targets have no widening hazard");
         } else {
-            assert_eq!(n, 0, "IV-indexed GEP loop should not be unrolled");
-            assert_eq!(func.blocks.len(), 5, "block count should be unchanged");
+            assert_eq!(n, 0, "IV-widening-cast loop should not be unrolled");
         }
     }
 
