@@ -33,10 +33,7 @@ exclude:
   - a.out
   - DESIGN_DOC.md
   - LICENSING.md
-  - NEXT_STEPS.md
-  - PHASE_7A_COMPLETE.md
-  - VECTORIZATION_SUCCESS.md
-  - results.md
+  - docs/history/
 
 defaults:
   - scope:

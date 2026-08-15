@@ -274,16 +274,19 @@ impl ArmCodegen {
         let func_name = match (from_signed, to_ty) {
             (true, IrType::F64)  => "__floattidf",
             (true, IrType::F32)  => "__floattisf",
+            (true, IrType::F128) => "__floattitf",
             (false, IrType::F64) => "__floatuntidf",
             (false, IrType::F32) => "__floatuntisf",
+            (false, IrType::F128) => "__floatuntitf",
             _ => panic!("unsupported i128-to-float conversion: {:?}", to_ty),
         };
         self.state.emit_fmt(format_args!("    bl {}", func_name));
         self.state.reg_cache.invalidate_all();
-        if to_ty == IrType::F32 {
-            self.state.emit("    fmov w0, s0");
-        } else {
-            self.state.emit("    fmov x0, d0");
+        match to_ty {
+            IrType::F32 => self.state.emit("    fmov w0, s0"),
+            // F128: result stays in q0; emit_store_f128_q0 stores it.
+            IrType::F128 => {}
+            _ => self.state.emit("    fmov x0, d0"),
         }
     }
 

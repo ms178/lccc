@@ -4,6 +4,33 @@ use crate::backend::arm::assembler::parser::Operand;
 // ── NEON/SIMD ────────────────────────────────────────────────────────────
 
 /// Helper to extract register number from a RegArrangement operand
+
+/// Validate that a NEON register list is consecutive modulo 32 (ARM ISA
+/// requirement for ld1/st1/ld2/... multi-register forms). Only the first
+/// register is encoded; hardware derives the rest, so a non-consecutive
+/// list would silently access DIFFERENT registers.
+pub(crate) fn validate_consecutive_reglist(regs: &[Operand], rt: u32) -> Result<(), String> {
+    for (k, r) in regs.iter().enumerate().skip(1) {
+        let rk = match r {
+            Operand::RegArrangement { reg, .. } => {
+                parse_reg_num(reg).ok_or("invalid register in list")?
+            }
+            Operand::Reg(name) => {
+                parse_reg_num(name).ok_or("invalid register in list")?
+            }
+            _ => return Err("expected register with arrangement in list".to_string()),
+        };
+        let expected = (rt + k as u32) % 32;
+        if rk != expected {
+            return Err(format!(
+                "register list must be consecutive: expected v{}, got v{}",
+                expected, rk
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn get_neon_reg(operands: &[Operand], idx: usize) -> Result<(u32, String), String> {
     match operands.get(idx) {
         Some(Operand::RegArrangement { reg, arrangement }) => {
@@ -783,6 +810,7 @@ pub(crate) fn encode_neon_tbl(operands: &[Operand]) -> Result<EncodeResult, Stri
                 Operand::Reg(name) => parse_reg_num(name).ok_or("invalid reg")?,
                 _ => return Err("tbl: expected register in list".to_string()),
             };
+            validate_consecutive_reglist(regs, first_reg)?;
             (first_reg, regs.len() as u32)
         }
         _ => return Err("tbl: expected register list as second operand".to_string()),
@@ -814,6 +842,7 @@ pub(crate) fn encode_neon_tbx(operands: &[Operand]) -> Result<EncodeResult, Stri
                 Operand::Reg(name) => parse_reg_num(name).ok_or("invalid reg")?,
                 _ => return Err("tbx: expected register in list".to_string()),
             };
+            validate_consecutive_reglist(regs, first_reg)?;
             (first_reg, regs.len() as u32)
         }
         _ => return Err("tbx: expected register list as second operand".to_string()),
@@ -914,7 +943,6 @@ pub(crate) fn encode_neon_ld_st_single(operands: &[Operand], is_load: bool, num_
     if regs.len() as u32 != num_structs {
         return Err(format!("expected {} registers in list, got {}", num_structs, regs.len()));
     }
-    // TODO: validate that registers in the list are consecutive (ARM ISA requirement)
 
     // Get element size and first register from the list
     let (rt, elem_size) = match &regs[0] {
@@ -923,6 +951,26 @@ pub(crate) fn encode_neon_ld_st_single(operands: &[Operand], is_load: bool, num_
         }
         _ => return Err("expected register with arrangement in list".to_string()),
     };
+
+    // ARM ISA: multi-register ld/st lists must be CONSECUTIVE (modulo 32,
+    // i.e. {v31, v0} wraps legally). Only Rt is encoded; the hardware
+    // derives the rest, so a non-consecutive list would silently encode a
+    // DIFFERENT register set (GLM audit BUG-5). Reject like GNU as does.
+    for (k, r) in regs.iter().enumerate().skip(1) {
+        let rk = match r {
+            Operand::RegArrangement { reg, .. } => {
+                parse_reg_num(reg).ok_or("invalid register in list")?
+            }
+            _ => return Err("expected register with arrangement in list".to_string()),
+        };
+        let expected = (rt + k as u32) % 32;
+        if rk != expected {
+            return Err(format!(
+                "register list must be consecutive: expected v{}, got v{}",
+                expected, rk
+            ));
+        }
+    }
 
     // Get base register and check for post-index
     let (rn, post_index) = match &operands[1] {
@@ -1019,6 +1067,7 @@ pub(crate) fn encode_neon_ld_st_multi(operands: &[Operand], is_load: bool, num_s
                 }
                 _ => return Err(format!("ld{}/st{}: expected RegArrangement in list", num_structs, num_structs)),
             };
+            validate_consecutive_reglist(regs, first_reg)?;
             (first_reg, arrangement, regs.len() as u32)
         }
         _ => return Err(format!("ld{}/st{}: expected register list", num_structs, num_structs)),
@@ -1534,6 +1583,7 @@ pub(crate) fn encode_neon_ldnr(operands: &[Operand], num_structs: u32) -> Result
                     (parse_reg_num(reg).ok_or("invalid reg")?, arrangement.clone()),
                 _ => return Err("expected RegArrangement in list".to_string()),
             };
+            validate_consecutive_reglist(regs, first_reg)?;
             (first_reg, arrangement, regs.len() as u32)
         }
         _ => return Err("expected register list".to_string()),

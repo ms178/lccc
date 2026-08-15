@@ -1703,6 +1703,16 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // General `symbol +/- const-expr [+/- const-expr ...]` chain, e.g. the
+        // kernel's `level1_fixmap_pgt + (2 << 12) - 8 + 16`. The " - " split
+        // below would break at the FIRST minus and treat everything left of
+        // it (including arithmetic) as a symbol name, emitting a relocation
+        // against a nonexistent symbol. Fold the whole constant tail first.
+        if let Some(val) = parse_symbol_expr_chain(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
         // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
         if let Some(minus_pos) = trimmed.find(" - ") {
             let lhs = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
@@ -1961,6 +1971,46 @@ fn try_parse_sym_diff(s: &str) -> Option<DataValue> {
 /// Parse symbol+offset or symbol-offset expressions (e.g., GD_struct+128).
 /// Also handles offset+symbol (e.g., 0x9b000000 + pa_real_mode_base).
 /// Returns a DataValue::SymbolOffset if the string matches this pattern.
+/// Parse `SYMBOL op expr op expr ...` where every `expr` after the symbol is
+/// a compile-time integer expression and ops are +/-. Returns the folded
+/// SymbolOffset. Bails (None) if the tail references any other symbol - a
+/// symbol difference must be handled by the dedicated paths.
+fn parse_symbol_expr_chain(s: &str) -> Option<DataValue> {
+    let t = s.trim();
+    // Find the leading symbol: longest prefix that is label-like.
+    let mut sym_end = 0;
+    for (i, c) in t.char_indices() {
+        if i == 0 {
+            if !(c.is_ascii_alphabetic() || c == '_' || c == '.') {
+                return None;
+            }
+        } else if !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$') {
+            break;
+        }
+        sym_end = i + c.len_utf8();
+    }
+    if sym_end == 0 {
+        return None;
+    }
+    let sym = &t[..sym_end];
+    if !is_label_like(sym) {
+        return None;
+    }
+    let tail = t[sym_end..].trim();
+    if tail.is_empty() {
+        return None; // plain symbol: let the standard path handle it
+    }
+    // Tail must start with + or - and consist purely of constant arithmetic.
+    if !(tail.starts_with('+') || tail.starts_with('-')) {
+        return None;
+    }
+    // The whole tail must evaluate as one integer expression: "+ (2<<12) - 8 + 16".
+    match parse_integer_expr(tail) {
+        Ok(v) => Some(DataValue::SymbolOffset(sym.to_string(), v)),
+        Err(_) => None,
+    }
+}
+
 fn parse_symbol_offset(s: &str) -> Option<DataValue> {
     // Look for + or - that separates symbol from offset
     // Don't match the leading character (could be .-prefixed label)

@@ -336,7 +336,7 @@ On the canonical benchmark suite and workload-derived kernels, LCCC is within
 ~1.0–1.5× of GCC -O2 on most workloads, and **ahead** of GCC on several
 (fib/tail-recursion via TCE, reduction vectorization, several vectorized
 kernels). The A/B methodology, raw numbers, and per-kernel ratios live in
-`tests/benchmark/` and `BENCHMARK_ANALYSIS.md`; the PGO-specific A/B is
+`tests/benchmark/` and `docs/history/2026-06-benchmark-analysis.md`; the PGO-specific A/B is
 `tests/benchmark/run_pgo_ab.py`.
 
 | Source | Gap | Addressable? |
