@@ -5,98 +5,189 @@
 //! Keeping them wastes code size and may cause linker errors if they reference
 //! symbols that don't exist in this translation unit.
 //!
-//! Uses BFS reachability analysis from roots (non-static symbols) to find all
-//! live symbols, then removes unreachable static functions and globals.
+//! Algorithm: assign a dense ID to every function and global (not to names),
+//! build the intra-module reference graph, then run worklist reachability from
+//! roots (externally visible / explicitly used symbols, aliases, ctors/dtors,
+//! toplevel-asm mentions, and address-taken static always_inline functions).
+//! Unreachable static definitions are removed; `symbol_attrs` is filtered to
+//! surviving / still-referenced names so leftover visibility directives cannot
+//! break the assembler or linker.
+//!
+//! Invariant: analysis borrows `module` immutably. All borrowed maps are
+//! dropped before the module is mutated.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{GlobalInit, Instruction, IrModule};
+use crate::ir::reexports::{Instruction, IrModule};
 
 /// Remove internal-linkage (static) functions and globals that are unreachable.
-///
-/// Uses reachability analysis from roots (non-static symbols) to find all live symbols,
-/// then removes unreachable static functions and globals.
 pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
-    // Phase 1: Build name-to-index mapping for all symbols.
-    let (mut name_to_id, mut next_id, id_func_idx, id_global_idx, func_id, global_id) =
-        build_symbol_index(module);
+    let n_funcs = module.functions.len();
 
-    // Phase 2: Build reference lists per function and global (using symbol IDs).
-    let func_refs = build_func_refs(module, &mut name_to_id, &mut next_id);
-    let global_refs_lists = build_global_refs(module, &mut name_to_id, &mut next_id);
+    // Phases 1–4 borrow module strings; the block ends that borrow before we
+    // mutate `module` in phases 5–6.
+    let (reachable, address_taken) = {
+        let name_to_ids = build_name_index(module);
+        let nsyms = n_funcs + module.globals.len();
+        let (func_refs, global_refs, address_taken) =
+            build_refs_and_address_taken(module, &name_to_ids, nsyms);
+        let reachable = compute_reachability(
+            module,
+            n_funcs,
+            nsyms,
+            &func_refs,
+            &global_refs,
+            &address_taken,
+            &name_to_ids,
+        );
+        (reachable, address_taken)
+    };
 
-    // Phase 3: Build address_taken set (moved before BFS so we can use it as roots).
-    let address_taken = build_address_taken(module, &name_to_id, next_id as usize);
-
-    // Phase 4: Reachability BFS from roots, including address-taken functions.
-    let reachable = compute_reachability(
-        module, &func_id, &global_id, &id_func_idx, &id_global_idx,
-        &func_refs, &global_refs_lists, &address_taken,
-        &mut name_to_id, &mut next_id,
-    );
-
-    // Drop the borrow on module strings so we can mutate module below.
-    drop(name_to_id);
-
-    // Phase 5: Remove unreachable symbols.
-    remove_unreachable(module, &func_id, &global_id, &reachable, &address_taken);
-
-    // Phase 6: Filter symbol_attrs for surviving symbols only.
+    remove_unreachable(module, n_funcs, &reachable, &address_taken);
     filter_symbol_attrs(module);
 }
 
-/// Phase 1: Assign compact integer IDs to all function and global names.
-/// Returns (name_to_id, next_id, id_func_idx, id_global_idx, func_id, global_id).
-fn build_symbol_index(module: &IrModule) -> (
-    FxHashMap<&str, u32>, u32,
-    Vec<Option<usize>>, Vec<Option<usize>>,
-    Vec<u32>, Vec<u32>,
-) {
-    let mut name_to_id: FxHashMap<&str, u32> = FxHashMap::default();
-    let mut next_id: u32 = 0;
-    let mut id_func_idx: Vec<Option<usize>> = Vec::new();
-    let mut id_global_idx: Vec<Option<usize>> = Vec::new();
+/// Phase 1: map each symbol *instance* to a dense ID.
+///
+/// * function `i`  →  id `i`
+/// * global   `j`  →  id `n_funcs + j`
+///
+/// Names are *not* identities. Two symbols that share a name (duplicate IR
+/// names, empty names, function + global) each get their own node; a reference
+/// to that name marks every matching node. Collapsing them onto one ID used to
+/// drop outgoing edges of all but the last occupant — a miscompilation hazard.
+fn build_name_index(module: &IrModule) -> FxHashMap<&str, Vec<usize>> {
+    let mut name_to_ids: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    name_to_ids.reserve(module.functions.len() + module.globals.len());
 
-    let mut func_id: Vec<u32> = Vec::with_capacity(module.functions.len());
     for (i, func) in module.functions.iter().enumerate() {
-        let id = *name_to_id.entry(func.name.as_str()).or_insert_with(|| {
-            let id = next_id;
-            next_id += 1;
-            id_func_idx.push(None);
-            id_global_idx.push(None);
-            id
-        });
-        id_func_idx[id as usize] = Some(i);
-        func_id.push(id);
+        name_to_ids.entry(func.name.as_str()).or_default().push(i);
     }
-
-    let mut global_id: Vec<u32> = Vec::with_capacity(module.globals.len());
-    for (i, global) in module.globals.iter().enumerate() {
-        let id = *name_to_id.entry(global.name.as_str()).or_insert_with(|| {
-            let id = next_id;
-            next_id += 1;
-            id_func_idx.push(None);
-            id_global_idx.push(None);
-            id
-        });
-        id_global_idx[id as usize] = Some(i);
-        global_id.push(id);
+    let n_funcs = module.functions.len();
+    for (j, global) in module.globals.iter().enumerate() {
+        name_to_ids
+            .entry(global.name.as_str())
+            .or_default()
+            .push(n_funcs + j);
     }
-
-    (name_to_id, next_id, id_func_idx, id_global_idx, func_id, global_id)
+    name_to_ids
 }
 
-/// Look up or create an ID for a name that may not already exist.
-fn get_or_create_id<'a>(name: &'a str, name_to_id: &mut FxHashMap<&'a str, u32>, next_id: &mut u32) -> u32 {
-    *name_to_id.entry(name).or_insert_with(|| {
-        let id = *next_id;
-        *next_id += 1;
-        id
-    })
+#[inline]
+fn ids_for_name<'a>(name_to_ids: &'a FxHashMap<&str, Vec<usize>>, name: &str) -> &'a [usize] {
+    match name_to_ids.get(name) {
+        Some(ids) => ids.as_slice(),
+        None => &[],
+    }
 }
 
-/// Phase 2a: Build per-function reference lists using symbol IDs.
-fn build_func_refs<'a>(module: &'a IrModule, name_to_id: &mut FxHashMap<&'a str, u32>, next_id: &mut u32) -> Vec<Vec<u32>> {
-    let mut func_refs: Vec<Vec<u32>> = Vec::with_capacity(module.functions.len());
+/// Extract the base symbol from an inline-asm operand (`foo+8`, `foo-4`,
+/// `foo@GOTPCREL`, `*foo`, `$foo`).
+fn asm_symbol_base(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() && !is_asm_ident_start(bytes[start]) {
+        start += 1;
+    }
+    let mut end = start;
+    while end < bytes.len() && is_asm_ident_char(bytes[end]) {
+        end += 1;
+    }
+    if start < end {
+        &s[start..end]
+    } else {
+        s
+    }
+}
+
+#[inline]
+fn is_asm_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c == b'.'
+}
+
+#[inline]
+fn is_asm_ident_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$'
+}
+
+/// True iff `name` occurs in `asm` as its own token, not as a substring of a
+/// longer identifier (`log` must not match `logarithm`; `foo` must not match
+/// `foobar`). Names that themselves contain `@`/`+` still match exactly.
+fn asm_mentions_symbol(asm: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = asm.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = asm[search_from..].find(name) {
+        let abs = search_from + rel;
+        let before_ok = abs == 0 || !is_asm_ident_char(bytes[abs - 1]);
+        let after = abs + name.len();
+        let after_ok = after == bytes.len() || !is_asm_ident_char(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        // `name` is a valid UTF-8 substring of `asm`, so this stays on a
+        // character boundary (unlike `abs + 1`).
+        search_from = abs + name.len();
+    }
+    false
+}
+
+fn toplevel_asm_mentions<S: AsRef<str>>(blobs: &[S], name: &str) -> bool {
+    blobs.iter().any(|s| asm_mentions_symbol(s.as_ref(), name))
+}
+
+/// Visit every symbol name an instruction can reference.
+///
+/// The `bool` is `true` when the reference takes the symbol's address
+/// (`GlobalAddr`, inline-asm operand) rather than calling it directly.
+///
+/// Any new `Instruction` variant that can name a function or global **must**
+/// be added here; both the reference graph and `symbol_attrs` filtering go
+/// through this helper.
+fn for_each_instruction_symbol<'a>(inst: &'a Instruction, mut visit: impl FnMut(&'a str, bool)) {
+    match inst {
+        Instruction::Call { func: callee, .. } => visit(callee.as_str(), false),
+        Instruction::GlobalAddr { name, .. } => visit(name.as_str(), true),
+        Instruction::InlineAsm { input_symbols, .. } => {
+            for s in input_symbols.iter().flatten() {
+                visit(asm_symbol_base(s), true);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Append every module symbol named `name` to `refs`. External names are
+/// ignored — they are not candidates for intra-module DCE, and inventing IDs
+/// for them previously produced unregistered orphans.
+fn push_named_refs(name: &str, name_to_ids: &FxHashMap<&str, Vec<usize>>, refs: &mut Vec<usize>) {
+    refs.extend_from_slice(ids_for_name(name_to_ids, name));
+}
+
+fn mark_address_taken(name: &str, name_to_ids: &FxHashMap<&str, Vec<usize>>, address_taken: &mut [bool]) {
+    for &id in ids_for_name(name_to_ids, name) {
+        if let Some(slot) = address_taken.get_mut(id) {
+            *slot = true;
+        }
+    }
+}
+
+fn finalize_refs(refs: &mut Vec<usize>) {
+    refs.sort_unstable();
+    refs.dedup();
+}
+
+/// Phases 2–3: per-function / per-global reference lists and the address-taken
+/// bitvector, in a single instruction walk.
+fn build_refs_and_address_taken(
+    module: &IrModule,
+    name_to_ids: &FxHashMap<&str, Vec<usize>>,
+    nsyms: usize,
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<bool>) {
+    let mut address_taken = vec![false; nsyms];
+
+    let mut func_refs = Vec::with_capacity(module.functions.len());
     for func in &module.functions {
         if func.is_declaration {
             func_refs.push(Vec::new());
@@ -105,161 +196,163 @@ fn build_func_refs<'a>(module: &'a IrModule, name_to_id: &mut FxHashMap<&'a str,
         let mut refs = Vec::new();
         for block in &func.blocks {
             for inst in &block.instructions {
-                collect_instruction_symbol_refs(inst, name_to_id, next_id, &mut refs);
+                for_each_instruction_symbol(inst, |name, takes_address| {
+                    push_named_refs(name, name_to_ids, &mut refs);
+                    if takes_address {
+                        mark_address_taken(name, name_to_ids, &mut address_taken);
+                    }
+                });
             }
         }
+        finalize_refs(&mut refs);
         func_refs.push(refs);
     }
-    func_refs
-}
 
-/// Phase 2b: Build per-global reference lists from initializers.
-fn build_global_refs(module: &IrModule, name_to_id: &mut FxHashMap<&str, u32>, next_id: &mut u32) -> Vec<Vec<u32>> {
-    let mut global_refs_lists: Vec<Vec<u32>> = Vec::with_capacity(module.globals.len());
+    let mut global_refs = Vec::with_capacity(module.globals.len());
     for global in &module.globals {
-        let mut id_refs = Vec::new();
+        let mut refs = Vec::new();
         global.init.for_each_ref(&mut |name| {
-            // Use inline lookup since for_each_ref's callback lifetime is too short for get_or_create_id.
-            let id = if let Some(&id) = name_to_id.get(name) {
-                id
-            } else {
-                let id = *next_id;
-                *next_id += 1;
-                id
-            };
-            id_refs.push(id);
+            push_named_refs(name, name_to_ids, &mut refs);
+            // An initializer that names a symbol takes its address
+            // (function pointer, object address, label difference, …).
+            mark_address_taken(name, name_to_ids, &mut address_taken);
         });
-        global_refs_lists.push(id_refs);
+        finalize_refs(&mut refs);
+        global_refs.push(refs);
     }
-    global_refs_lists
+
+    (func_refs, global_refs, address_taken)
 }
 
-/// Mark a symbol ID as reachable if not already, growing the reachable vec as needed.
-fn mark_reachable(id: u32, reachable: &mut Vec<bool>, worklist: &mut Vec<u32>, next_id: u32) {
-    let idx = id as usize;
-    if idx >= reachable.len() { reachable.resize(next_id as usize, false); }
-    if !reachable[idx] {
-        reachable[idx] = true;
-        worklist.push(id);
+#[inline]
+fn is_marked(bits: &[bool], id: usize) -> bool {
+    bits.get(id).copied().unwrap_or(false)
+}
+
+/// Mark `id` reachable and enqueue it. Out-of-range IDs are ignored; we never
+/// invent IDs after the bitvectors are sized, so a resize/panic path is gone.
+fn mark_reachable(id: usize, reachable: &mut [bool], worklist: &mut Vec<usize>) {
+    if let Some(slot) = reachable.get_mut(id) {
+        if !*slot {
+            *slot = true;
+            worklist.push(id);
+        }
     }
 }
 
-/// Phase 4: Compute reachability from roots via BFS.
+fn mark_named(
+    name: &str,
+    name_to_ids: &FxHashMap<&str, Vec<usize>>,
+    reachable: &mut [bool],
+    worklist: &mut Vec<usize>,
+) {
+    for &id in ids_for_name(name_to_ids, name) {
+        mark_reachable(id, reachable, worklist);
+    }
+}
+
+/// Phase 4: worklist reachability from roots.
 ///
-/// Roots include: non-static functions, non-static globals, aliases, constructors,
-/// destructors, toplevel asm references, and address-taken static always_inline functions
-/// (which survive dead elimination because they're used as function pointers).
-fn compute_reachability<'a>(
-    module: &'a IrModule,
-    func_id: &[u32], global_id: &[u32],
-    id_func_idx: &[Option<usize>], id_global_idx: &[Option<usize>],
-    func_refs: &[Vec<u32>], global_refs_lists: &[Vec<u32>],
+/// Roots:
+/// * non-static function definitions, or anything with `is_used`
+/// * non-static / common / `used` globals (extern declarations are skipped;
+///   they have no initializer edges and are always retained later)
+/// * aliases (alias name **and** target)
+/// * constructors and destructors
+/// * address-taken static `always_inline` definitions (function-pointer
+///   identity; their callees must survive too)
+/// * static symbols whose names appear as tokens in toplevel asm
+///
+/// Propagation order is LIFO (DFS). For a pure reachability fixpoint this is
+/// equivalent to BFS; each ID is enqueued at most once.
+fn compute_reachability(
+    module: &IrModule,
+    n_funcs: usize,
+    nsyms: usize,
+    func_refs: &[Vec<usize>],
+    global_refs: &[Vec<usize>],
     address_taken: &[bool],
-    name_to_id: &mut FxHashMap<&'a str, u32>, next_id: &mut u32,
+    name_to_ids: &FxHashMap<&str, Vec<usize>>,
 ) -> Vec<bool> {
-    let mut reachable = vec![false; *next_id as usize];
-    let mut worklist: Vec<u32> = Vec::new();
+    let mut reachable = vec![false; nsyms];
+    let mut worklist = Vec::with_capacity(nsyms.min(64));
 
-    // Roots: non-static functions
     for (i, func) in module.functions.iter().enumerate() {
-        if func.is_declaration { continue; }
+        if func.is_declaration {
+            continue;
+        }
         if !func.is_static || func.is_used {
-            mark_reachable(func_id[i], &mut reachable, &mut worklist, *next_id);
+            mark_reachable(i, &mut reachable, &mut worklist);
         }
     }
 
-    // Roots: non-static globals
-    for (i, global) in module.globals.iter().enumerate() {
-        if global.is_extern { continue; }
+    for (j, global) in module.globals.iter().enumerate() {
+        if global.is_extern {
+            continue;
+        }
         if !global.is_static || global.is_common || global.is_used {
-            mark_reachable(global_id[i], &mut reachable, &mut worklist, *next_id);
+            mark_reachable(n_funcs + j, &mut reachable, &mut worklist);
         }
     }
 
-    // Roots: aliases (both the alias name and its target are reachable)
     for (alias_name, target, _) in &module.aliases {
-        let tid = get_or_create_id(target, name_to_id, next_id);
-        mark_reachable(tid, &mut reachable, &mut worklist, *next_id);
-        let aid = get_or_create_id(alias_name, name_to_id, next_id);
-        mark_reachable(aid, &mut reachable, &mut worklist, *next_id);
+        mark_named(alias_name.as_ref(), name_to_ids, &mut reachable, &mut worklist);
+        mark_named(target.as_ref(), name_to_ids, &mut reachable, &mut worklist);
     }
 
-    // Roots: constructors and destructors
     for ctor in &module.constructors {
-        let id = get_or_create_id(ctor, name_to_id, next_id);
-        mark_reachable(id, &mut reachable, &mut worklist, *next_id);
+        mark_named(ctor.as_ref(), name_to_ids, &mut reachable, &mut worklist);
     }
     for dtor in &module.destructors {
-        let id = get_or_create_id(dtor, name_to_id, next_id);
-        mark_reachable(id, &mut reachable, &mut worklist, *next_id);
+        mark_named(dtor.as_ref(), name_to_ids, &mut reachable, &mut worklist);
     }
 
-    if reachable.len() < *next_id as usize {
-        reachable.resize(*next_id as usize, false);
-    }
-
-    // Roots: address-taken static always_inline functions.
-    // These survive dead elimination (Phase 5) because their address is used as a
-    // function pointer, so their referenced globals/functions must also survive.
+    // Conservatively keep address-taken static always_inline functions even
+    // when the taking site itself is dead. Their bodies may still be emitted
+    // as function-pointer identities, so everything they reference must live.
+    // (A live GlobalAddr/InlineAsm already creates a graph edge; this covers
+    // the residual case and keeps dependent symbols consistent with Phase 5.)
     for (i, func) in module.functions.iter().enumerate() {
-        if func.is_declaration { continue; }
-        if func.is_static && func.is_always_inline {
-            let fid = func_id[i] as usize;
-            if fid < address_taken.len() && address_taken[fid] {
-                mark_reachable(func_id[i], &mut reachable, &mut worklist, *next_id);
-            }
+        if func.is_declaration {
+            continue;
+        }
+        if func.is_static && func.is_always_inline && is_marked(address_taken, i) {
+            mark_reachable(i, &mut reachable, &mut worklist);
         }
     }
 
-    // Toplevel asm: conservatively mark static symbols whose names appear in asm
     if !module.toplevel_asm.is_empty() {
         for (i, func) in module.functions.iter().enumerate() {
-            if func.is_static && !func.is_declaration {
-                let fid = func_id[i] as usize;
-                if !reachable[fid] && module.toplevel_asm.iter().any(|s| s.contains(func.name.as_str())) {
-                    reachable[fid] = true;
-                    worklist.push(fid as u32);
-                }
+            if func.is_static
+                && !func.is_declaration
+                && !is_marked(&reachable, i)
+                && toplevel_asm_mentions(&module.toplevel_asm, func.name.as_str())
+            {
+                mark_reachable(i, &mut reachable, &mut worklist);
             }
         }
-        for (i, global) in module.globals.iter().enumerate() {
-            if global.is_static && !global.is_extern {
-                let gid = global_id[i] as usize;
-                if !reachable[gid] && module.toplevel_asm.iter().any(|s| s.contains(global.name.as_str())) {
-                    reachable[gid] = true;
-                    worklist.push(gid as u32);
-                }
+        for (j, global) in module.globals.iter().enumerate() {
+            let id = n_funcs + j;
+            if global.is_static
+                && !global.is_extern
+                && !is_marked(&reachable, id)
+                && toplevel_asm_mentions(&module.toplevel_asm, global.name.as_str())
+            {
+                mark_reachable(id, &mut reachable, &mut worklist);
             }
         }
     }
 
-    // BFS: propagate reachability through function and global references.
-    while let Some(sym_id) = worklist.pop() {
-        let sid = sym_id as usize;
-        if sid < id_func_idx.len() {
-            if let Some(fi) = id_func_idx[sid] {
-                if fi < func_refs.len() {
-                    for &ref_id in &func_refs[fi] {
-                        let rid = ref_id as usize;
-                        if rid < reachable.len() && !reachable[rid] {
-                            reachable[rid] = true;
-                            worklist.push(ref_id);
-                        }
-                    }
+    while let Some(sid) = worklist.pop() {
+        if sid < n_funcs {
+            if let Some(refs) = func_refs.get(sid) {
+                for &ref_id in refs {
+                    mark_reachable(ref_id, &mut reachable, &mut worklist);
                 }
             }
-        }
-        if sid < id_global_idx.len() {
-            if let Some(gi) = id_global_idx[sid] {
-                if gi < global_refs_lists.len() {
-                    for &ref_id in &global_refs_lists[gi] {
-                        let rid = ref_id as usize;
-                        if rid < reachable.len() && !reachable[rid] {
-                            reachable[rid] = true;
-                            worklist.push(ref_id);
-                        }
-                    }
-                }
+        } else if let Some(refs) = global_refs.get(sid - n_funcs) {
+            for &ref_id in refs {
+                mark_reachable(ref_id, &mut reachable, &mut worklist);
             }
         }
     }
@@ -267,169 +360,103 @@ fn compute_reachability<'a>(
     reachable
 }
 
-/// Phase 3: Build address_taken bitvector from GlobalAddr and InlineAsm instructions.
-fn build_address_taken<'a>(module: &'a IrModule, name_to_id: &FxHashMap<&'a str, u32>, len: usize) -> Vec<bool> {
-    let mut address_taken = vec![false; len];
-
-    for func in &module.functions {
-        if func.is_declaration { continue; }
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::GlobalAddr { name, .. } => {
-                        if let Some(&id) = name_to_id.get(name.as_str()) {
-                            if (id as usize) < address_taken.len() {
-                                address_taken[id as usize] = true;
-                            }
-                        }
-                    }
-                    Instruction::InlineAsm { input_symbols, .. } => {
-                        for s in input_symbols.iter().flatten() {
-                            let base = s.split('+').next().unwrap_or(s);
-                            if let Some(&id) = name_to_id.get(base) {
-                                if (id as usize) < address_taken.len() {
-                                    address_taken[id as usize] = true;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    for global in &module.globals {
-        global.init.for_each_ref(&mut |name| {
-            if let Some(&id) = name_to_id.get(name) {
-                if (id as usize) < address_taken.len() {
-                    address_taken[id as usize] = true;
-                }
-            }
-        });
-    }
-
-    address_taken
-}
-
-/// Phase 5: Remove unreachable static functions and globals.
-fn remove_unreachable(module: &mut IrModule, func_id: &[u32], global_id: &[u32], reachable: &[bool], address_taken: &[bool]) {
+/// Phase 5: drop unreachable static definitions.
+///
+/// Declarations, non-static symbols, externs and common globals are retained
+/// unconditionally (they either generate no code or have linkage obligations
+/// outside this TU).
+fn remove_unreachable(
+    module: &mut IrModule,
+    n_funcs: usize,
+    reachable: &[bool],
+    address_taken: &[bool],
+) {
     let mut func_pos = 0usize;
     module.functions.retain(|func| {
         let pos = func_pos;
         func_pos += 1;
-        if func.is_declaration { return true; }
-        let id = func_id[pos] as usize;
-        if func.is_static && func.is_always_inline {
-            return (id < address_taken.len() && address_taken[id])
-                || (id < reachable.len() && reachable[id]);
+        if func.is_declaration {
+            return true;
         }
-        if !func.is_static { return true; }
-        id < reachable.len() && reachable[id]
+        if func.is_static && func.is_always_inline {
+            return is_marked(address_taken, pos) || is_marked(reachable, pos);
+        }
+        if !func.is_static {
+            return true;
+        }
+        is_marked(reachable, pos)
     });
 
     let mut global_pos = 0usize;
     module.globals.retain(|global| {
         let pos = global_pos;
         global_pos += 1;
-        if global.is_extern { return true; }
-        if !global.is_static { return true; }
-        if global.is_common { return true; }
-        let id = global_id[pos] as usize;
-        id < reachable.len() && reachable[id]
+        if global.is_extern || !global.is_static || global.is_common {
+            return true;
+        }
+        is_marked(reachable, n_funcs + pos)
     });
 }
 
-/// Phase 6: Filter symbol_attrs to only keep directives for referenced symbols.
-/// Visibility directives for unreferenced symbols cause assembler/linker errors.
+/// Phase 6: keep `symbol_attrs` only for names that still exist or are still
+/// referenced. Visibility directives for deleted symbols become assembler /
+/// linker errors (`.hidden foo` with no `foo`).
+///
+/// Weak-only directives (no visibility) are kept: they may apply to symbols
+/// defined in another TU and must remain weak-undefined rather than strong.
 fn filter_symbol_attrs(module: &mut IrModule) {
-    let mut referenced_symbols: FxHashSet<&str> = FxHashSet::default();
+    // `GlobalInit::for_each_ref` only yields a callback-scoped `&str`, so
+    // initializer names that we want in the long-lived set have to be owned.
+    // Instruction / symbol names can be borrowed directly from the module.
+    let mut init_names: Vec<String> = Vec::new();
+    for global in &module.globals {
+        global.init.for_each_ref(&mut |name| {
+            init_names.push(String::from(name));
+        });
+    }
+
+    let mut referenced: FxHashSet<&str> = FxHashSet::default();
+    for n in &init_names {
+        referenced.insert(n.as_str());
+    }
+
     for func in &module.functions {
-        if func.is_declaration { continue; }
+        referenced.insert(func.name.as_str());
+        if func.is_declaration {
+            continue;
+        }
         for block in &func.blocks {
             for inst in &block.instructions {
-                match inst {
-                    Instruction::Call { func: callee, .. } => {
-                        referenced_symbols.insert(callee.as_str());
-                    }
-                    Instruction::GlobalAddr { name, .. } => {
-                        referenced_symbols.insert(name.as_str());
-                    }
-                    Instruction::InlineAsm { input_symbols, .. } => {
-                        for s in input_symbols.iter().flatten() {
-                            let base = s.split('+').next().unwrap_or(s);
-                            referenced_symbols.insert(base);
-                        }
-                    }
-                    _ => {}
-                }
+                for_each_instruction_symbol(inst, |name, _takes_address| {
+                    referenced.insert(name);
+                });
             }
         }
     }
     for global in &module.globals {
-        collect_global_init_refs_set(&global.init, &mut referenced_symbols);
+        referenced.insert(global.name.as_str());
     }
-    for func in &module.functions {
-        referenced_symbols.insert(func.name.as_str());
+    for (alias_name, target, _) in &module.aliases {
+        referenced.insert(alias_name.as_ref());
+        referenced.insert(target.as_ref());
     }
-    for global in &module.globals {
-        referenced_symbols.insert(global.name.as_str());
+    for ctor in &module.constructors {
+        referenced.insert(ctor.as_ref());
     }
+    for dtor in &module.destructors {
+        referenced.insert(dtor.as_ref());
+    }
+
+    let has_toplevel_asm = !module.toplevel_asm.is_empty();
 
     module.symbol_attrs.retain(|(name, is_weak, visibility)| {
         if *is_weak && visibility.is_none() {
             return true;
         }
-        referenced_symbols.contains(name.as_str())
+        let n = name.as_str();
+        if referenced.contains(n) {
+            return true;
+        }
+        has_toplevel_asm && toplevel_asm_mentions(&module.toplevel_asm, n)
     });
-}
-
-/// Extract symbol references from a single instruction into the ID list.
-///
-/// Shared by the reference-collection phase to avoid repeating the same
-/// `match inst { Call | GlobalAddr | InlineAsm }` pattern.
-fn collect_instruction_symbol_refs<'a>(
-    inst: &'a Instruction,
-    name_to_id: &mut FxHashMap<&'a str, u32>,
-    next_id: &mut u32,
-    refs: &mut Vec<u32>,
-) {
-    match inst {
-        Instruction::Call { func: callee, .. } => {
-            refs.push(get_or_create_id(callee, name_to_id, next_id));
-        }
-        Instruction::GlobalAddr { name, .. } => {
-            refs.push(get_or_create_id(name, name_to_id, next_id));
-        }
-        Instruction::InlineAsm { input_symbols, .. } => {
-            for s in input_symbols.iter().flatten() {
-                let base = s.split('+').next().unwrap_or(s);
-                refs.push(get_or_create_id(base, name_to_id, next_id));
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collect symbol references from a global initializer into a HashSet of borrowed strings.
-///
-/// This requires an explicit lifetime annotation since the borrowed `&str` references come
-/// from the `GlobalInit`'s owned String fields, which is what `GlobalInit::for_each_ref`
-/// cannot express through its closure-based API.
-fn collect_global_init_refs_set<'a>(init: &'a GlobalInit, refs: &mut FxHashSet<&'a str>) {
-    match init {
-        GlobalInit::GlobalAddr(name) | GlobalInit::GlobalAddrOffset(name, _) => {
-            refs.insert(name.as_str());
-        }
-        GlobalInit::GlobalLabelDiff(label1, label2, _) => {
-            refs.insert(label1.as_str());
-            refs.insert(label2.as_str());
-        }
-        GlobalInit::Compound(fields) => {
-            for field in fields {
-                collect_global_init_refs_set(field, refs);
-            }
-        }
-        _ => {}
-    }
 }
