@@ -609,13 +609,24 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), Operand::Memory(mem)) => {
+                // Memory destination. The legacy pextrw form (66 0F C5) is
+                // REGISTER-ONLY per the Intel SDM; a memory destination
+                // requires the SSE4.1 encoding 66 0F 3A 15 /r ib. Emitting
+                // the legacy bytes with a mem ModRM silently produced a
+                // different instruction. Swap opcodes transparently.
+                let (mem_opcode, mem_prefix_len): (&[u8], usize) =
+                    if swap_reg_rm && opcode == [0x66, 0x0F, 0xC5] {
+                        (&[0x66, 0x0F, 0x3A, 0x15], 1)
+                    } else {
+                        (opcode, prefix_len)
+                    };
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                for &b in &opcode[..prefix_len] {
+                for &b in &mem_opcode[..mem_prefix_len] {
                     self.bytes.push(b);
                 }
                 let size = if rex_w { 8 } else { 0 };
                 self.emit_rex_rm(size, &src.name, mem);
-                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.extend_from_slice(&mem_opcode[mem_prefix_len..]);
                 let rc = self.relocations.len();
                 self.encode_modrm_mem(src_num, mem)?;
                 self.bytes.push(*imm as u8);

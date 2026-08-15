@@ -40,3 +40,16 @@ gcc_assembler = []
 # Allow GCC passthrough for -m16 mode (16-bit real-mode boot code).
 # When enabled and GCC is used, a prominent warning is printed.
 gcc_m16 = []
+
+# Release profile for shipped compiler binaries.
+#
+# * thin LTO: most of fat-LTO's cross-crate inlining benefit at a fraction
+#   of the link time (the compiler is a single crate + std, so the delta
+#   between thin and fat is small here anyway).
+# * NOT panic = "abort": compiler_main() catches worker-thread panics via
+#   join() + downcast to print a proper "internal error" diagnostic instead
+#   of a raw abort; panic=abort would kill that reporting path.
+# * The research build script (scripts/build_lccc_o1_j2.sh) still overrides
+#   opt-level via CARGO_PROFILE_RELEASE_OPT_LEVEL=1 per project policy.
+[profile.release]
+lto = "thin"

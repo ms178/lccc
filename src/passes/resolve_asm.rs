@@ -302,73 +302,75 @@ fn try_resolve_global_with_offset<'a>(
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
-// Upstream PR #59 shipped this test module referencing types that do
-// not exist (IrType/Span re-exports, FlatAdj fields) - it never
-// compiled. Disabled until the tests are rewritten against the real
-// IR API; the pass itself is exercised by tests/regression.
-#[cfg(any())]
+// ─── Tests ─────────────────────────────────────────────────────────────────
+//
+// Rewritten against the real IR API (PR #59's version used a non-existent
+// IrFunction/IrBlock shape). Each test builds a minimal function around an
+// InlineAsm with an "i"-constraint input and checks the resolved symbol.
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::reexports::{IrBlock, IrConst, IrType};
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
 
     fn make_test_func() -> IrFunction {
-        IrFunction {
-            name: "test_fn".to_string(),
-            params: Vec::new(),
-            return_ty: IrType::Void,
-            blocks: vec![IrBlock {
-                id: 0,
-                instructions: Vec::new(),
-                source_spans: Vec::new(),
-            }],
-            next_value_id: 1,
-            is_declaration: false,
-            attributes: Default::default(),
+        let mut f = IrFunction::new("test_fn".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        f
+    }
+
+    fn make_asm(constraint: &str, operand: Operand) -> Instruction {
+        Instruction::InlineAsm {
+            template: "test $0".to_string(),
+            outputs: Vec::new(),
+            inputs: vec![(constraint.to_string(), operand, None)],
+            clobbers: Vec::new(),
+            operand_types: vec![IrType::I64],
+            goto_labels: Vec::new(),
+            input_symbols: vec![None],
+            seg_overrides: vec![AddressSpace::Default],
+        }
+    }
+
+    fn get_symbol(func: &IrFunction, block: usize, inst: usize) -> Option<String> {
+        if let Instruction::InlineAsm { input_symbols, .. } =
+            &func.blocks[block].instructions[inst] {
+            input_symbols[0].clone()
+        } else {
+            panic!("expected InlineAsm at block {} inst {}", block, inst);
         }
     }
 
     #[test]
-    fn test_resolve_gep_chain() {
+    fn resolve_gep_chain() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "boot_cpu_data".to_string(),
-            },
+            Instruction::GlobalAddr { dest: Value(1), name: "boot_cpu_data".to_string() },
             Instruction::GetElementPtr {
                 dest: Value(2),
                 base: Value(1),
                 offset: Operand::Const(IrConst::I64(74)),
-                elem_ty: IrType::I8,
+                ty: IrType::I8,
             },
-            Instruction::InlineAsm {
-                template: "test $0".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("i".to_string(), Operand::Value(Value(2)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
-            },
+            make_asm("i", Operand::Value(Value(2))),
         ];
         func.next_value_id = 3;
 
         resolve_in_function(&mut func);
-
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[2] {
-            assert_eq!(input_symbols[0], Some("boot_cpu_data+74".to_string()));
-        } else {
-            panic!("Expected InlineAsm instruction");
-        }
+        assert_eq!(get_symbol(&func, 0, 2), Some("boot_cpu_data+74".to_string()));
     }
 
     #[test]
-    fn test_resolve_add_sub_cast_chain() {
+    fn resolve_add_sub_cast_chain() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "kernel_table".to_string(),
-            },
+            Instruction::GlobalAddr { dest: Value(1), name: "kernel_table".to_string() },
             Instruction::Cast {
                 dest: Value(2),
                 src: Operand::Value(Value(1)),
@@ -389,34 +391,19 @@ mod tests {
                 rhs: Operand::Const(IrConst::I64(15)),
                 ty: IrType::I64,
             },
-            Instruction::InlineAsm {
-                template: "mov $0".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("i".to_string(), Operand::Value(Value(4)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
-            },
+            make_asm("i", Operand::Value(Value(4))),
         ];
         func.next_value_id = 5;
 
         resolve_in_function(&mut func);
-
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[4] {
-            assert_eq!(input_symbols[0], Some("kernel_table+85".to_string()));
-        } else {
-            panic!("Expected InlineAsm instruction");
-        }
+        assert_eq!(get_symbol(&func, 0, 4), Some("kernel_table+85".to_string()));
     }
 
     #[test]
-    fn test_resolve_commuted_add() {
+    fn resolve_commuted_add() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "commuted_sym".to_string(),
-            },
+            Instruction::GlobalAddr { dest: Value(1), name: "commuted_sym".to_string() },
             Instruction::BinOp {
                 dest: Value(2),
                 op: IrBinOp::Add,
@@ -424,34 +411,19 @@ mod tests {
                 rhs: Operand::Value(Value(1)),
                 ty: IrType::I64,
             },
-            Instruction::InlineAsm {
-                template: "lea $0".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("i".to_string(), Operand::Value(Value(2)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
-            },
+            make_asm("i", Operand::Value(Value(2))),
         ];
         func.next_value_id = 3;
 
         resolve_in_function(&mut func);
-
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[2] {
-            assert_eq!(input_symbols[0], Some("commuted_sym+48".to_string()));
-        } else {
-            panic!("Expected InlineAsm instruction");
-        }
+        assert_eq!(get_symbol(&func, 0, 2), Some("commuted_sym+48".to_string()));
     }
 
     #[test]
-    fn test_resolve_negative_offset() {
+    fn resolve_negative_offset() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "data_block".to_string(),
-            },
+            Instruction::GlobalAddr { dest: Value(1), name: "data_block".to_string() },
             Instruction::BinOp {
                 dest: Value(2),
                 op: IrBinOp::Sub,
@@ -459,72 +431,39 @@ mod tests {
                 rhs: Operand::Const(IrConst::I64(8)),
                 ty: IrType::I64,
             },
-            Instruction::InlineAsm {
-                template: "sub $0".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("i".to_string(), Operand::Value(Value(2)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
-            },
+            make_asm("i", Operand::Value(Value(2))),
         ];
         func.next_value_id = 3;
 
         resolve_in_function(&mut func);
-
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[2] {
-            assert_eq!(input_symbols[0], Some("data_block-8".to_string()));
-        } else {
-            panic!("Expected InlineAsm instruction");
-        }
+        assert_eq!(get_symbol(&func, 0, 2), Some("data_block-8".to_string()));
     }
 
     #[test]
-    fn test_resolve_zero_offset() {
+    fn resolve_zero_offset_bare_symbol() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "base_sym".to_string(),
-            },
+            Instruction::GlobalAddr { dest: Value(1), name: "base_sym".to_string() },
             Instruction::GetElementPtr {
                 dest: Value(2),
                 base: Value(1),
                 offset: Operand::Const(IrConst::I64(0)),
-                elem_ty: IrType::I8,
+                ty: IrType::I8,
             },
-            Instruction::InlineAsm {
-                template: "nop $0".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("i".to_string(), Operand::Value(Value(2)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
-            },
+            make_asm("i", Operand::Value(Value(2))),
         ];
         func.next_value_id = 3;
 
         resolve_in_function(&mut func);
-
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[2] {
-            assert_eq!(input_symbols[0], Some("base_sym".to_string()));
-        } else {
-            panic!("Expected InlineAsm instruction");
-        }
+        assert_eq!(get_symbol(&func, 0, 2), Some("base_sym".to_string()));
     }
 
     #[test]
-    fn test_resolve_value_constant_operand() {
+    fn resolve_value_constant_operand() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "table_sym".to_string(),
-            },
-            Instruction::Copy {
-                dest: Value(2),
-                src: Operand::Const(IrConst::I64(32)),
-            },
+            Instruction::GlobalAddr { dest: Value(1), name: "table_sym".to_string() },
+            Instruction::Copy { dest: Value(2), src: Operand::Const(IrConst::I64(32)) },
             Instruction::BinOp {
                 dest: Value(3),
                 op: IrBinOp::Add,
@@ -532,51 +471,112 @@ mod tests {
                 rhs: Operand::Value(Value(2)),
                 ty: IrType::I64,
             },
-            Instruction::InlineAsm {
-                template: "lea $0".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("i".to_string(), Operand::Value(Value(3)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
-            },
+            make_asm("i", Operand::Value(Value(3))),
         ];
         func.next_value_id = 4;
 
         resolve_in_function(&mut func);
-
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[3] {
-            assert_eq!(input_symbols[0], Some("table_sym+32".to_string()));
-        } else {
-            panic!("Expected InlineAsm instruction");
-        }
+        assert_eq!(get_symbol(&func, 0, 3), Some("table_sym+32".to_string()));
     }
 
     #[test]
-    fn test_ignore_non_immediate_constraint() {
+    fn resolve_shl_scaled_offset() {
+        // GEP(base, idx << 3) with constant idx: offset = 5 << 3 = 40
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr {
-                dest: Value(1),
-                name: "data_sym".to_string(),
+            Instruction::GlobalAddr { dest: Value(1), name: "arr8".to_string() },
+            Instruction::Copy { dest: Value(2), src: Operand::Const(IrConst::I64(5)) },
+            Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I64(3)),
+                ty: IrType::I64,
             },
-            Instruction::InlineAsm {
-                template: "mov $0, %rax".to_string(),
-                outputs: Vec::new(),
-                inputs: vec![("r".to_string(), Operand::Value(Value(1)), IrType::I64)],
-                clobbers: Vec::new(),
-                options: Default::default(),
-                input_symbols: vec![None],
+            Instruction::GetElementPtr {
+                dest: Value(4),
+                base: Value(1),
+                offset: Operand::Value(Value(3)),
+                ty: IrType::I8,
             },
+            make_asm("i", Operand::Value(Value(4))),
+        ];
+        func.next_value_id = 5;
+
+        resolve_in_function(&mut func);
+        assert_eq!(get_symbol(&func, 0, 4), Some("arr8+40".to_string()));
+    }
+
+    #[test]
+    fn ignore_non_immediate_constraint() {
+        let mut func = make_test_func();
+        func.blocks[0].instructions = vec![
+            Instruction::GlobalAddr { dest: Value(1), name: "data_sym".to_string() },
+            make_asm("r", Operand::Value(Value(1))),
         ];
         func.next_value_id = 2;
 
         resolve_in_function(&mut func);
+        assert_eq!(get_symbol(&func, 0, 1), None,
+            "register constraints must not be symbol-resolved");
+    }
 
-        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[0].instructions[1] {
-            assert_eq!(input_symbols[0], None);
-        } else {
-            panic!("Expected InlineAsm instruction");
+    #[test]
+    fn preserves_existing_symbols() {
+        // Already-resolved slots must not be overwritten.
+        let mut func = make_test_func();
+        let mut asm = make_asm("i", Operand::Value(Value(1)));
+        if let Instruction::InlineAsm { input_symbols, .. } = &mut asm {
+            input_symbols[0] = Some("preset".to_string());
         }
+        func.blocks[0].instructions = vec![
+            Instruction::GlobalAddr { dest: Value(1), name: "other_sym".to_string() },
+            asm,
+        ];
+        func.next_value_id = 2;
+
+        resolve_in_function(&mut func);
+        assert_eq!(get_symbol(&func, 0, 1), Some("preset".to_string()));
+    }
+
+    #[test]
+    fn cross_block_resolution() {
+        // Def chain in block 0, asm in block 1: the flat def table spans blocks.
+        let mut func = make_test_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.blocks[0].instructions = vec![
+            Instruction::GlobalAddr { dest: Value(1), name: "xsym".to_string() },
+            Instruction::GetElementPtr {
+                dest: Value(2),
+                base: Value(1),
+                offset: Operand::Const(IrConst::I64(16)),
+                ty: IrType::I8,
+            },
+        ];
+        func.blocks[1].instructions = vec![make_asm("i", Operand::Value(Value(2)))];
+        func.next_value_id = 3;
+
+        resolve_in_function(&mut func);
+        assert_eq!(get_symbol(&func, 1, 0), Some("xsym+16".to_string()));
+    }
+
+    #[test]
+    fn no_asm_fast_path_is_noop() {
+        // Functions without InlineAsm must be untouched (fast path).
+        let mut func = make_test_func();
+        func.blocks[0].instructions = vec![
+            Instruction::GlobalAddr { dest: Value(1), name: "g".to_string() },
+            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
+        ];
+        func.next_value_id = 3;
+        let before = format!("{:?}", func.blocks[0].instructions);
+        resolve_in_function(&mut func);
+        let after = format!("{:?}", func.blocks[0].instructions);
+        assert_eq!(before, after);
     }
 }

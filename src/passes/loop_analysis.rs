@@ -859,45 +859,19 @@ impl LoopNest {
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
-// Upstream PR #59 shipped this test module referencing types that do
-// not exist (IrType/Span re-exports, FlatAdj fields) - it never
-// compiled. Disabled until the tests are rewritten against the real
-// IR API; the pass itself is exercised by tests/regression.
-#[cfg(any())]
+// ─── Tests ─────────────────────────────────────────────────────────────────
+//
+// Rewritten against the real APIs (PR #59 shipped a version referencing
+// non-existent FlatAdj fields). `FlatAdj::from_vecs_usize` is the canonical
+// #[cfg(test)] constructor from ir::analysis.
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test helper for building mock FlatAdj structures.
-    struct MockAdj {
-        rows: Vec<Vec<u32>>,
-    }
-
-    impl MockAdj {
-        fn new(adj: Vec<Vec<u32>>) -> Self {
-            Self { rows: adj }
-        }
-
-        fn as_flat(&self) -> analysis::FlatAdj {
-            let num_rows = self.rows.len();
-            let mut row_offsets = Vec::with_capacity(num_rows + 1);
-            let mut storage = Vec::new();
-
-            for row in &self.rows {
-                row_offsets.push(storage.len() as u32);
-                storage.extend_from_slice(row);
-            }
-            row_offsets.push(storage.len() as u32);
-
-            analysis::FlatAdj {
-                num_rows,
-                row_offsets,
-                storage,
-            }
-        }
-    }
+    use crate::ir::analysis::FlatAdj;
 
     #[test]
-    fn test_block_bitset_comprehensive() {
+    fn block_bitset_comprehensive() {
         let mut bs1 = BlockBitSet::new(130);
         assert_eq!(bs1.count(), 0);
         assert!(!bs1.contains(0));
@@ -909,7 +883,7 @@ mod tests {
         assert!(bs1.insert(63));
         assert!(bs1.insert(64));
         assert!(bs1.insert(129));
-        assert!(!bs1.insert(0)); // Duplicate
+        assert!(!bs1.insert(0)); // duplicate insert reports false
         assert_eq!(bs1.count(), 4);
 
         assert!(bs1.contains(0));
@@ -929,12 +903,24 @@ mod tests {
         assert!(bs1.remove(64));
         assert!(!bs1.contains(64));
         assert_eq!(bs1.count(), 3);
+
+        // union_with across word boundaries
+        let mut bs3 = BlockBitSet::new(130);
+        bs3.insert(1);
+        bs3.union_with(&bs1);
+        assert!(bs3.contains(0) && bs3.contains(1) && bs3.contains(63) && bs3.contains(129));
+        assert_eq!(bs3.count(), 4);
+
+        // to_hash_set round trip
+        let hs = bs1.to_hash_set();
+        assert_eq!(hs.len(), 3);
+        assert!(hs.contains(&0) && hs.contains(&63) && hs.contains(&129));
     }
 
     #[test]
-    fn test_dominance_checker_basic_and_strict() {
-        // CFG: 0 -> 1 -> 2 -> 3
-        let idom = vec![0, 0, 1, 2];
+    fn dominance_checker_basic_and_strict() {
+        // Linear chain: 0 -> 1 -> 2 -> 3 (idom[i] = i-1, root marks itself)
+        let idom = vec![0usize, 0, 1, 2];
         let dom = DominanceChecker::new(4, &idom);
 
         assert!(dom.dominates(0, 0));
@@ -948,41 +934,57 @@ mod tests {
 
         assert!(dom.strictly_dominates(0, 1));
         assert!(!dom.strictly_dominates(0, 0));
-        assert!(!dom.dominates(99, 1)); // Out of bounds safety
+        assert!(!dom.dominates(99, 1)); // out-of-bounds must be safely false
+        assert!(!dom.dominates(1, 99));
     }
 
     #[test]
-    fn test_self_loop() {
-        // CFG: 0 -> 1 -> 1 (self loop), 1 -> 2
-        let succs = MockAdj::new(vec![vec![1], vec![1, 2], vec![]]).as_flat();
-        let preds = MockAdj::new(vec![vec![], vec![0, 1], vec![1]]).as_flat();
-        let idom = vec![0, 0, 1];
+    fn dominance_checker_diamond_and_disconnected() {
+        // Diamond: 0 -> {1,2} -> 3; idom[3] = 0 (neither arm dominates the join).
+        let idom = vec![0usize, 0, 0, 0];
+        let dom = DominanceChecker::new(4, &idom);
+        assert!(dom.dominates(0, 3));
+        assert!(!dom.dominates(1, 3));
+        assert!(!dom.dominates(2, 3));
+
+        // Disconnected component marked with usize::MAX root sentinel.
+        let idom2 = vec![0usize, 0, usize::MAX, 2];
+        let dom2 = DominanceChecker::new(4, &idom2);
+        assert!(dom2.dominates(0, 1));
+        assert!(dom2.dominates(2, 3));
+        assert!(!dom2.dominates(0, 3)); // different components never dominate
+        assert!(!dom2.dominates(2, 1));
+    }
+
+    #[test]
+    fn self_loop_detection() {
+        // CFG: 0 -> 1, 1 -> 1 (self loop), 1 -> 2
+        let succs = FlatAdj::from_vecs_usize(&[vec![1], vec![1, 2], vec![]]);
+        let preds = FlatAdj::from_vecs_usize(&[vec![], vec![0, 1], vec![1]]);
+        let idom = vec![0usize, 0, 1];
 
         let loops = find_natural_loops(3, &preds, &succs, &idom);
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].header, 1);
         assert!(loops[0].is_self_loop());
-        assert_eq!(loops[0].body, [1].into_iter().collect());
+        assert_eq!(loops[0].body, [1usize].into_iter().collect());
         assert_eq!(loops[0].single_latch(&preds), Some(1));
     }
 
     #[test]
-    fn test_single_loop_and_preheader() {
+    fn single_loop_preheader_latch_exits() {
         // 0 -> 1 -> 2 -> 1 (backedge), 2 -> 3 (exit)
-        let succs = MockAdj::new(vec![vec![1], vec![2], vec![1, 3], vec![]]).as_flat();
-        let preds = MockAdj::new(vec![vec![], vec![0, 2], vec![1], vec![2]]).as_flat();
-        let idom = vec![0, 0, 1, 2];
+        let succs = FlatAdj::from_vecs_usize(&[vec![1], vec![2], vec![1, 3], vec![]]);
+        let preds = FlatAdj::from_vecs_usize(&[vec![], vec![0, 2], vec![1], vec![2]]);
+        let idom = vec![0usize, 0, 1, 2];
 
         let loops = find_natural_loops(4, &preds, &succs, &idom);
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].header, 1);
-        assert_eq!(loops[0].body, [1, 2].into_iter().collect());
+        assert_eq!(loops[0].body, [1usize, 2].into_iter().collect());
 
         assert_eq!(find_preheader(1, &loops[0].body, &preds), Some(0));
-        assert_eq!(
-            find_dedicated_preheader(1, &loops[0].body, &preds, &succs),
-            Some(0)
-        );
+        assert_eq!(find_dedicated_preheader(1, &loops[0].body, &preds, &succs), Some(0));
 
         assert_eq!(loops[0].latches(&preds), vec![2]);
         assert_eq!(loops[0].single_latch(&preds), Some(2));
@@ -990,14 +992,31 @@ mod tests {
         assert_eq!(loops[0].exit_blocks(&succs), vec![3]);
         assert_eq!(loops[0].exit_edges(&succs), vec![(2, 3)]);
         assert!(loops[0].is_canonical(&preds, &succs));
+        assert!(!loops[0].is_empty());
+        assert_eq!(loops[0].len(), 2);
     }
 
     #[test]
-    fn test_multi_latch_loop_merging() {
-        // 0 -> 1, 1 -> 2, 1 -> 3, 2 -> 1 (backedge 1), 3 -> 1 (backedge 2), 1 -> 4
-        let succs = MockAdj::new(vec![vec![1], vec![2, 3, 4], vec![1], vec![1], vec![]]).as_flat();
-        let preds = MockAdj::new(vec![vec![], vec![0, 2, 3], vec![1], vec![1], vec![1]]).as_flat();
-        let idom = vec![0, 0, 1, 1, 1];
+    fn non_dedicated_preheader_rejected() {
+        // 0 -> {1, 3}: block 0 branches both into the loop header and
+        // elsewhere, so it is a preheader but NOT a dedicated one.
+        let succs = FlatAdj::from_vecs_usize(&[vec![1, 3], vec![2], vec![1, 3], vec![]]);
+        let preds = FlatAdj::from_vecs_usize(&[vec![], vec![0, 2], vec![1], vec![0, 2]]);
+        let idom = vec![0usize, 0, 1, 0];
+
+        let loops = find_natural_loops(4, &preds, &succs, &idom);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].find_preheader(&preds), Some(0));
+        assert_eq!(loops[0].find_dedicated_preheader(&preds, &succs), None);
+        assert!(!loops[0].is_canonical(&preds, &succs));
+    }
+
+    #[test]
+    fn multi_latch_loop_merging() {
+        // 0 -> 1, 1 -> {2, 3, 4}, 2 -> 1, 3 -> 1 (two backedges into one header)
+        let succs = FlatAdj::from_vecs_usize(&[vec![1], vec![2, 3, 4], vec![1], vec![1], vec![]]);
+        let preds = FlatAdj::from_vecs_usize(&[vec![], vec![0, 2, 3], vec![1], vec![1], vec![1]]);
+        let idom = vec![0usize, 0, 1, 1, 1];
 
         let unmerged = find_natural_loops(5, &preds, &succs, &idom);
         assert_eq!(unmerged.len(), 2);
@@ -1005,29 +1024,46 @@ mod tests {
         let merged = merge_loops_by_header(unmerged);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].header, 1);
-        assert_eq!(merged[0].body, [1, 2, 3].into_iter().collect());
+        assert_eq!(merged[0].body, [1usize, 2, 3].into_iter().collect());
 
+        // single-pass helper must agree with the two-step pipeline
         let single_pass = find_merged_natural_loops(5, &preds, &succs, &idom);
         assert_eq!(single_pass, merged);
+
+        // two latches -> no single latch
+        assert_eq!(merged[0].single_latch(&preds), None);
+        assert_eq!(merged[0].latches(&preds), vec![2, 3]);
     }
 
     #[test]
-    fn test_nested_and_sibling_loops_hierarchy() {
-        // CFG:
-        // 0 -> 1 -> 2 (Outer A header) -> 3 (Inner A header) -> 4 -> 3 (Inner A backedge)
-        // 4 -> 2 (Outer A backedge), 2 -> 5 (Exit A) -> 6 (Loop B header) -> 7 -> 6 (Loop B backedge), 7 -> 8 (Exit B)
-        let l_outer_a = NaturalLoop {
-            header: 2,
-            body: [2, 3, 4].into_iter().collect(),
-        };
-        let l_inner_a = NaturalLoop {
-            header: 3,
-            body: [3, 4].into_iter().collect(),
-        };
-        let l_loop_b = NaturalLoop {
-            header: 6,
-            body: [6, 7].into_iter().collect(),
-        };
+    fn nested_loop_body_and_subloop() {
+        // 0 -> 1(outer hdr) -> 2(inner hdr) -> 3 -> 2 (inner backedge),
+        // 3 -> 4, 4 -> 1 (outer backedge), 4 -> 5 (exit)
+        let succs = FlatAdj::from_vecs_usize(&[
+            vec![1], vec![2], vec![3], vec![2, 4], vec![1, 5], vec![],
+        ]);
+        let preds = FlatAdj::from_vecs_usize(&[
+            vec![], vec![0, 4], vec![1, 3], vec![2], vec![3], vec![4],
+        ]);
+        let idom = vec![0usize, 0, 1, 2, 3, 4];
+
+        let loops = find_merged_natural_loops(6, &preds, &succs, &idom);
+        assert_eq!(loops.len(), 2);
+
+        let outer = loops.iter().find(|l| l.header == 1).expect("outer loop");
+        let inner = loops.iter().find(|l| l.header == 2).expect("inner loop");
+        assert_eq!(outer.body, [1usize, 2, 3, 4].into_iter().collect());
+        assert_eq!(inner.body, [2usize, 3].into_iter().collect());
+        assert!(inner.is_subloop_of(outer));
+        assert!(!outer.is_subloop_of(inner));
+    }
+
+    #[test]
+    fn loop_nest_hierarchy() {
+        // Synthetic loop set: outer A {2,3,4} > inner A {3,4}; sibling B {6,7}.
+        let l_outer_a = NaturalLoop { header: 2, body: [2usize, 3, 4].into_iter().collect() };
+        let l_inner_a = NaturalLoop { header: 3, body: [3usize, 4].into_iter().collect() };
+        let l_loop_b = NaturalLoop { header: 6, body: [6usize, 7].into_iter().collect() };
 
         let loops = vec![l_outer_a, l_inner_a, l_loop_b];
         let nest = LoopNest::analyze(9, &loops);
@@ -1048,43 +1084,58 @@ mod tests {
         assert!(nest.is_outermost(0));
         assert!(nest.is_outermost(2));
         assert!(!nest.is_outermost(1));
+
+        // block_to_loop: innermost loop wins for shared blocks
+        assert_eq!(nest.block_to_loop[3], Some(1));
+        assert_eq!(nest.block_to_loop[2], Some(0));
+        assert_eq!(nest.block_to_loop[0], None);
+        assert_eq!(nest.loop_depth(4), 2);
+        assert_eq!(nest.loop_depth(8), 0);
+        assert_eq!(nest.loop_for_block(6).map(|l| l.header), Some(6));
     }
 
     #[test]
-    fn test_loop_rpo_traversal() {
-        // Loop with internal diamond:
-        // 0 -> 1 -> (2, 3) -> 4 -> 1 (backedge), 4 -> 5 (exit)
-        let succs = MockAdj::new(vec![
-            vec![1],
-            vec![2, 3],
-            vec![4],
-            vec![4],
-            vec![1, 5],
-            vec![],
-        ])
-        .as_flat();
+    fn loop_rpo_traversal() {
+        // Loop with internal diamond: 1 -> {2,3} -> 4 -> 1, exit 4 -> 5
+        let succs = FlatAdj::from_vecs_usize(&[
+            vec![1], vec![2, 3], vec![4], vec![4], vec![1, 5], vec![],
+        ]);
 
-        let l = NaturalLoop {
-            header: 1,
-            body: [1, 2, 3, 4].into_iter().collect(),
-        };
-
+        let l = NaturalLoop { header: 1, body: [1usize, 2, 3, 4].into_iter().collect() };
         let rpo = l.blocks_in_rpo(&succs);
-        assert_eq!(rpo[0], 1); // Header must be first
-        assert_eq!(rpo[3], 4); // Latch must be last
+        assert_eq!(rpo.len(), 4);
+        assert_eq!(rpo[0], 1, "header must come first in RPO");
+        assert_eq!(rpo[3], 4, "latch/join must come last in RPO");
         assert!(rpo.contains(&2));
         assert!(rpo.contains(&3));
+        // RPO property: every block appears exactly once
+        let unique: FxHashSet<usize> = rpo.iter().copied().collect();
+        assert_eq!(unique.len(), 4);
     }
 
     #[test]
-    fn test_empty_and_unreachable_cfg() {
-        let empty_preds = MockAdj::new(vec![]).as_flat();
-        let empty_succs = MockAdj::new(vec![]).as_flat();
-        let loops = find_natural_loops(0, &empty_preds, &empty_succs, &[]);
+    fn empty_and_degenerate_cfgs() {
+        let empty = FlatAdj::from_vecs_usize(&[]);
+        let loops = find_natural_loops(0, &empty, &empty, &[]);
         assert!(loops.is_empty());
 
         let nest = LoopNest::analyze(0, &[]);
         assert!(nest.loops.is_empty());
         assert!(nest.innermost_first().is_empty());
+        assert!(nest.outermost_first().is_empty());
+
+        // Single block, no edges: no loops.
+        let one = FlatAdj::from_vecs_usize(&[vec![]]);
+        let loops1 = find_natural_loops(1, &one, &one, &[0]);
+        assert!(loops1.is_empty());
+
+        // Irreducible-ish edge (1 -> 0 where 0 doesn't dominate 1 as header
+        // check): 0 -> {1,2}, 2 -> 1, 1 -> 2. Neither 1 nor 2 dominates the
+        // other, so the 1<->2 cycle is NOT a natural loop.
+        let succs = FlatAdj::from_vecs_usize(&[vec![1, 2], vec![2], vec![1]]);
+        let preds = FlatAdj::from_vecs_usize(&[vec![], vec![0, 2], vec![0, 1]]);
+        let idom = vec![0usize, 0, 0];
+        let loops2 = find_natural_loops(3, &preds, &succs, &idom);
+        assert!(loops2.is_empty(), "irreducible cycles must not be reported as natural loops");
     }
 }
