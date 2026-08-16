@@ -118,6 +118,77 @@ impl ArmCodegen {
         }
     }
 
+    /// Materialize the effective address `args[base_idx] + args[base_idx+1]`
+    /// into a register and return its name.
+    ///
+    /// EVERY register-based Vec* load/store intrinsic carries a (base,
+    /// byte-offset) pair — the byte-IV reduction rewrite passes the loop's
+    /// marching offset as args[1]. The original ARM lowerings read only
+    /// args[0]: the vector loop then loads the SAME lanes every iteration
+    /// (sum of 512 i32s returned 512*(a[0]+a[1]) — found via the map-vec
+    /// backport's differential test, present in every prior ARM build).
+    /// x86's lowering honors the offset; this helper is the ARM equivalent.
+    ///
+    /// A constant 0 offset keeps the fast path (base register used as-is).
+    fn vec_addr_from_args(&mut self, base: &Operand, offset: Option<&Operand>) -> String {
+        use crate::ir::reexports::IrConst;
+        let zero_off = match offset {
+            None => true,
+            Some(Operand::Const(c)) => c.to_i64() == Some(0),
+            _ => false,
+        };
+        let base_phys = self.operand_reg(base).filter(|r| !is_arm_fp_phys(*r));
+        if zero_off {
+            if let Some(r) = base_phys {
+                return callee_saved_name(r).to_string();
+            }
+            self.operand_to_x0(base);
+            self.state.emit("    mov x10, x0");
+            return "x10".to_string();
+        }
+        // Non-zero offset: x10 = base + offset. x10 is the designated
+        // scratch for address formation in this backend (never allocated).
+        let off = offset.expect("checked above");
+        match (base_phys, self.operand_reg(off).filter(|r| !is_arm_fp_phys(*r))) {
+            (Some(b), Some(o)) => {
+                self.state.emit_fmt(format_args!(
+                    "    add x10, {}, {}",
+                    callee_saved_name(b),
+                    callee_saved_name(o)
+                ));
+            }
+            (Some(b), None) => {
+                if let Operand::Const(c) = off {
+                    let k = c.to_i64().unwrap_or(0);
+                    if (0..=4095).contains(&k) {
+                        self.state.emit_fmt(format_args!(
+                            "    add x10, {}, #{}",
+                            callee_saved_name(b),
+                            k
+                        ));
+                        return "x10".to_string();
+                    }
+                }
+                self.operand_to_x0(off);
+                self.state.emit_fmt(format_args!(
+                    "    add x10, {}, x0",
+                    callee_saved_name(b)
+                ));
+            }
+            (None, _) => {
+                // Base not register-resident: build base in x10 first, then
+                // add the offset through x0 (operand_to_x0 may clobber x0
+                // only — x10 survives).
+                self.operand_to_x0(base);
+                self.state.emit("    mov x10, x0");
+                self.operand_to_x0(off);
+                self.state.emit("    add x10, x10, x0");
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+        "x10".to_string()
+    }
+
     pub(super) fn emit_intrinsic_arm(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         match op {
             IntrinsicOp::Lfence | IntrinsicOp::Mfence => {
@@ -402,12 +473,7 @@ impl ArmCodegen {
 
             IntrinsicOp::VecLoadWidenI32ToI64x2 => {
                 if let Some(d) = dest {
-                    let base_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
-                    let addr = base_phys.map(callee_saved_name).unwrap_or("x10");
-                    if base_phys.is_none() {
-                        self.operand_to_x0(&args[0]);
-                        self.state.emit("    mov x10, x0");
-                    }
+                    let addr = self.vec_addr_from_args(&args[0], args.get(1));
                     self.state.emit_fmt(format_args!("    ldr d0, [{}]", addr));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
@@ -445,17 +511,14 @@ impl ArmCodegen {
             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
             IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x4 => {
                 if let Some(d) = dest {
-                    let base_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
-                    let addr = base_phys.map(callee_saved_name).unwrap_or("x10");
-                    if base_phys.is_none() {
-                        self.operand_to_x0(&args[0]);
-                        self.state.emit("    mov x10, x0");
-                    }
-                    self.state.emit_fmt(format_args!("    ldr q0, [{}]", addr));
+                    let addr = self.vec_addr_from_args(&args[0], args.get(1));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
+                        // Load directly into the assigned register (no copy).
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    mov {}.16b, v0.16b", name));
+                        let qname = name.replacen('v', "q", 1);
+                        self.state.emit_fmt(format_args!("    ldr {}, [{}]", qname, addr));
                     } else {
+                        self.state.emit_fmt(format_args!("    ldr q0, [{}]", addr));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
