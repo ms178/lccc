@@ -1054,6 +1054,19 @@ macro_rules! preloop_dump {
         }
     }
     module.for_each_function(dce::eliminate_dead_code);
+    if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration { continue; }
+            eprintln!("=== IR(pre-promote) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
     // Run memory-recurrence promotion again after CFG and copy cleanup have
     // exposed canonical natural loops.
     if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
