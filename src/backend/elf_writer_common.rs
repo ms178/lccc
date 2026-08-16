@@ -76,6 +76,15 @@ pub trait X86Arch {
     /// Optional: PC8 internal relocation type for loop/jrcxz instructions.
     /// Only x86-64 has this; i686 returns None.
     fn reloc_pc8_internal() -> Option<u32> { None }
+    /// 16-bit PC-relative type (R_386_PC16 / R_X86_64_PC16) for rel16
+    /// branch fields in real-mode (.code16) code. None = never emitted.
+    fn reloc_pc16() -> Option<u32> { None }
+    /// Real 8-bit PC-relative ELF type (R_X86_64_PC8=15 / R_386_PC8=23) for
+    /// cross-section `.byte a - b` (header.S short-jump displacement).
+    fn reloc_pc8() -> Option<u32> { None }
+    /// Patch width for a relocation type: 16-bit reloc types own 2-byte
+    /// fields; writing 4 bytes would clobber the neighbors.
+    fn reloc_patch_size(_reloc_type: u32) -> u8 { 4 }
 
     /// Optional: absolute 32-bit relocation for local symbol references.
     /// Only x86-64 uses R_X86_64_32 this way; i686 returns None since
@@ -460,6 +469,16 @@ pub struct ElfWriterCore<A: X86Arch> {
     pending_protected: Vec<String>,
     pending_internal: Vec<String>,
     aliases: FxHashMap<String, String>,
+    /// `.set NAME, expr` where expr evaluates to a CONSTANT (possibly using
+    /// `.` and same-section labels, e.g. header.S
+    /// `.set section_count, (. - section_table) / 40`). Relocations against
+    /// these names patch the constant value directly -- GAS gives such
+    /// symbols an absolute value; they never become undefined references.
+    set_values: FxHashMap<String, i64>,
+    /// Position-dependent `.set` expressions with forward label refs:
+    /// (alias, expr with `.` already substituted, sec_idx). Re-evaluated
+    /// after all labels are placed.
+    pending_set_exprs: Vec<(String, String, usize)>,
     /// `.symver real, name@VER` where `real` is NOT defined in this object:
     /// GNU-as semantics — every reference to `real` becomes a versioned
     /// reference `name@VER` (glibc compat_symbol_reference; needed because
@@ -506,6 +525,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
             pending_protected: Vec::new(),
             pending_internal: Vec::new(),
             aliases: FxHashMap::default(),
+            set_values: FxHashMap::default(),
+            pending_set_exprs: Vec::new(),
             symver_refs: FxHashMap::default(),
             section_stack: Vec::new(),
             deferred_skips: Vec::new(),
@@ -796,7 +817,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.symbol_map.insert(name.clone(), sym_idx);
             }
             AsmItem::Set(alias, target) => {
-                self.aliases.insert(alias.clone(), target.clone());
+                // ONLY expressions with actual arithmetic are folded to
+                // constants; a bare symbol target (`.set foo_alias, bar_fn`,
+                // the alias-attribute lowering) must stay a symbolic alias —
+                // folding it to a section offset redirects calls to an
+                // absolute address (asm_label_alias regression, SIGSEGV).
+                let is_arithmetic = target.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'));
+                if is_arithmetic {
+                    if let Some((sec_idx, substituted)) = self.substitute_dot(target) {
+                        match self.eval_label_expr(&substituted, sec_idx) {
+                            Some(val) => { self.set_values.insert(alias.clone(), val); }
+                            None => {
+                                // Forward label refs: retry after layout.
+                                self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
+                                self.aliases.insert(alias.clone(), target.clone());
+                            }
+                        }
+                    } else {
+                        self.aliases.insert(alias.clone(), target.clone());
+                    }
+                } else if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(target) {
+                    // Pure integer constant (`.set salign, 0x1000`).
+                    self.set_values.insert(alias.clone(), val);
+                } else {
+                    self.aliases.insert(alias.clone(), target.clone());
+                }
             }
             AsmItem::Symver(name, ver_string) => {
                 // GNU as semantics (verified against binutils 2.47):
@@ -1248,7 +1293,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 reloc_type: reloc.reloc_type,
                 addend: reloc.addend,
                 diff_symbol: reloc.diff_symbol,
-                patch_size: 4,
+                patch_size: A::reloc_patch_size(reloc.reloc_type),
             });
         }
 
@@ -1467,6 +1512,26 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let (pos_a, pos_b) = (&pos_a, &pos_b);
 
             if pos_a.0 != pos_b.0 {
+                // Cross-section byte diff (header.S: `.byte start_of_setup-1f`,
+                // start_of_setup in .entrytext, 1f in .header). GAS emits a
+                // PC8 relocation: S + A - P with P = the byte's own offset,
+                // so A = addend + byte_off - b_off computes a - b when the
+                // subtrahend is in the byte's OWN section (its distance to
+                // the byte is a link-time constant).
+                if *size == 1 && pos_b.0 == *sec_idx {
+                    if let Some(pc8) = A::reloc_pc8() {
+                        let addend = *addend + (*offset as i64) - (pos_b.1 as i64);
+                        self.sections[*sec_idx].relocations.push(ElfRelocation {
+                            offset: *offset as u64,
+                            symbol: sym_a.clone(),
+                            reloc_type: pc8,
+                            addend,
+                            diff_symbol: None,
+                            patch_size: 1,
+                        });
+                        continue;
+                    }
+                }
                 return Err(format!("cross-section .byte diff: {} - {}", sym_a, sym_b));
             }
 
@@ -1799,6 +1864,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         // Scaled symbol differences: same reasoning.
         self.resolve_scaled_diffs()?;
+
+        // Absolute .set constants (incl. forward `.`-position expressions)
+        // fold before internal relocation resolution: relocs against them
+        // patch constants and never reach the symbol table.
+        self.resolve_set_constants();
 
         // Resolve internal relocations
         self.resolve_internal_relocations();
@@ -2477,6 +2547,106 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Internal relocation resolution ───────────────────────────────
 
+    /// Substitute a standalone `.` (current position) in a .set expression
+    /// with the current section offset. None when no section is active.
+    fn substitute_dot(&self, expr: &str) -> Option<(usize, String)> {
+        let sec_idx = self.current_section?;
+        let offset = self.sections[sec_idx].data.len() as u64;
+        let bytes = expr.as_bytes();
+        let mut out = String::with_capacity(expr.len() + 8);
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'.' {
+                let prev_ok = i == 0 || !(bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_' || bytes[i-1] == b'.');
+                let next_ok = i + 1 >= bytes.len() || !(bytes[i+1].is_ascii_alphanumeric() || bytes[i+1] == b'_' || bytes[i+1] == b'.');
+                if prev_ok && next_ok {
+                    out.push_str(&offset.to_string());
+                    continue;
+                }
+            }
+            out.push(b as char);
+        }
+        Some((sec_idx, out))
+    }
+
+    /// Evaluate an integer expression that may reference SAME-SECTION labels
+    /// (label -> section offset) and previously-evaluated .set constants.
+    /// None if any symbol is unknown or cross-section.
+    fn eval_label_expr(&self, expr: &str, sec_idx: usize) -> Option<i64> {
+        let bytes = expr.as_bytes();
+        let mut out = String::with_capacity(expr.len() + 16);
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            // NUMBER tokens first: `0x100` must not become `0` + ident `x100`.
+            if b.is_ascii_digit() {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                out.push_str(&expr[start..i]);
+                continue;
+            }
+            if b.is_ascii_alphabetic() || b == b'_' || b == b'.' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.' || bytes[i] == b'$') {
+                    i += 1;
+                }
+                let ident = &expr[start..i];
+                if let Some(&(lsec, loff)) = self.label_positions.get(ident) {
+                    if lsec != sec_idx {
+                        return None;
+                    }
+                    out.push_str(&loff.to_string());
+                } else if let Some(&v) = self.set_values.get(ident) {
+                    out.push_str(&v.to_string());
+                } else {
+                    return None;
+                }
+            } else {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+        crate::backend::asm_expr::parse_integer_expr(&out).ok()
+    }
+
+    /// Late resolution: pending `.`-position .set expressions, then convert
+    /// relocations against constant .set names into direct data patches.
+    fn resolve_set_constants(&mut self) {
+        let pending = std::mem::take(&mut self.pending_set_exprs);
+        for (alias, expr, sec_idx) in pending {
+            if let Some(val) = self.eval_label_expr(&expr, sec_idx) {
+                self.set_values.insert(alias.clone(), val);
+                self.aliases.remove(&alias);
+            }
+        }
+        if self.set_values.is_empty() {
+            return;
+        }
+        for sec_idx in 0..self.sections.len() {
+            let mut remaining = Vec::new();
+            let relocs = std::mem::take(&mut self.sections[sec_idx].relocations);
+            for reloc in relocs {
+                if reloc.diff_symbol.is_none() {
+                    if let Some(&val) = self.set_values.get(&reloc.symbol) {
+                        let v = val + reloc.addend;
+                        let off = reloc.offset as usize;
+                        let data = &mut self.sections[sec_idx].data;
+                        match reloc.patch_size {
+                            1 => { data[off] = v as u8; }
+                            2 => { data[off..off+2].copy_from_slice(&(v as i16).to_le_bytes()); }
+                            8 => { data[off..off+8].copy_from_slice(&v.to_le_bytes()); }
+                            _ => { data[off..off+4].copy_from_slice(&(v as i32).to_le_bytes()); }
+                        }
+                        continue;
+                    }
+                }
+                remaining.push(reloc);
+            }
+            self.sections[sec_idx].relocations = remaining;
+        }
+    }
+
     fn resolve_internal_relocations(&mut self) {
         for sec_idx in 0..self.sections.len() {
             let mut resolved: Vec<(usize, i64, usize)> = Vec::new(); // (offset, value, patch_size)
@@ -2531,6 +2701,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
                 if let Some((target_sec, target_off)) = label_pos {
                     let is_local = self.is_local_symbol(&reloc.symbol);
+
+                    // Same-section rel16 branches (.code16): patch the
+                    // 2-byte field directly — GAS never emits a reloc for
+                    // a local 16-bit branch.
+                    if let Some(pc16) = A::reloc_pc16() {
+                        if reloc.reloc_type == pc16 && target_sec == sec_idx && is_local {
+                            let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
+                            resolved.push((reloc.offset as usize, rel, 2));
+                            continue;
+                        }
+                    }
 
                     // Handle PC8 internal relocations (x86-64 loop/jrcxz)
                     if let Some(pc8_type) = A::reloc_pc8_internal() {
