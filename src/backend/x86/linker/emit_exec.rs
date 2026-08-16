@@ -36,6 +36,10 @@ pub(super) fn emit_executable(
     entry_symbol: Option<&str>,
     z_now: bool, z_relro: bool,
 ) -> Result<(), String> {
+    let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
+    let mut t_zone = std::time::Instant::now();
+    macro_rules! zone { ($name:expr) => { if ld_time { eprintln!("[ldtime]   emit/{:<18} {:>7.1} ms", $name, t_zone.elapsed().as_secs_f64()*1e3); t_zone = std::time::Instant::now(); } } }
+
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
     let rpath_string = if rpath_entries.is_empty() { None } else {
@@ -354,6 +358,7 @@ pub(super) fn emit_executable(
     if has_relro { phdr_count += 1; }
     let phdr_total_size = phdr_count * 56;
 
+    zone!("pre-layout");
     // === Layout ===
     let mut offset = 64 + phdr_total_size;
     let interp_offset = offset;
@@ -684,6 +689,7 @@ pub(super) fn emit_executable(
         .or_else(|| globals.get("_start").map(|s| s.value))
         .unwrap_or(text_page_addr);
 
+    zone!("layout");
     // === .symtab / .strtab (debug symbol table) ===
     // ms178: previously the executable emitted ONLY .dynsym, so nm/gdb/perf
     // saw no symbol table at all. Every defined global symbol (function or
@@ -692,8 +698,13 @@ pub(super) fn emit_executable(
     // mapped to the OUTPUT section header order (mirrors the write loop
     // below). Symbols that resolve to linker-provided addresses (or common/
     // absolute) use SHN_ABS/SHN_COMMON as appropriate.
-    let mut symtab_entries: Vec<[u8; 24]> = Vec::new();
-    let mut symtab_names: Vec<u8> = vec![0u8]; // strtab with leading NUL
+    // Pre-size: every defined global plus locals lands here; growth doubling
+    // copies 24-byte entries repeatedly (measured 8.8 ms of a 60 ms link in
+    // this zone for a 40k-symbol object).
+    let est_syms: usize = globals.len() + objects.iter().map(|o| o.symbols.len()).sum::<usize>() / 4 + 2;
+    let mut symtab_entries: Vec<[u8; 24]> = Vec::with_capacity(est_syms);
+    let mut symtab_names: Vec<u8> = Vec::with_capacity(est_syms * 12);
+    symtab_names.push(0u8); // strtab with leading NUL
     symtab_entries.push([0u8; 24]); // NULL symbol at index 0
 
     // Map output_sections index → section-header index, in write order.
@@ -826,7 +837,7 @@ pub(super) fn emit_executable(
                 .map(move |sym| (obj_idx, sym))
         })
         .collect();
-    locals.sort_by(|(oa, a), (ob, b)| {
+    locals.sort_unstable_by(|(oa, a), (ob, b)| {
         oa.cmp(ob)
             .then_with(|| a.value.cmp(&b.value))
             .then_with(|| a.name.cmp(&b.name))
@@ -853,7 +864,26 @@ pub(super) fn emit_executable(
         .iter()
         .filter(|(_, g)| g.defined_in.is_some() && !g.is_dynamic)
         .collect();
-    sym_names.sort_by(|a, b| a.0.cmp(b.0));
+    // Sort by a cached big-endian 8-byte prefix first: for symbol-heavy
+    // objects the names share long prefixes ("F1", "F12", ...), so plain
+    // byte-wise cmp walks the common prefix on every comparison. The u64
+    // prefix decides almost every comparison in one instruction; ties fall
+    // back to the full byte compare (total order preserved, identical
+    // resulting symtab order).
+    let mut keyed: Vec<(u64, &String, &GlobalSymbol)> = sym_names
+        .iter()
+        .map(|(n, g)| {
+            let b = n.as_bytes();
+            let mut p = [0u8; 8];
+            let l = b.len().min(8);
+            p[..l].copy_from_slice(&b[..l]);
+            (u64::from_be_bytes(p), *n, *g)
+        })
+        .collect();
+    keyed.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+    });
+    let sym_names: Vec<(&String, &GlobalSymbol)> = keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
     for (name, gsym) in &sym_names {
         let off = symtab_names.len() as u32;
         symtab_names.extend_from_slice(name.as_bytes());
@@ -879,6 +909,7 @@ pub(super) fn emit_executable(
         e[16..24].copy_from_slice(&gsym.size.to_le_bytes());
         symtab_entries.push(e);
     }
+    zone!("symtab");
     // === Build output buffer ===
     let file_size = offset as usize;
     let mut out = vec![0u8; file_size];
@@ -1195,9 +1226,13 @@ pub(super) fn emit_executable(
         }
     }
 
+    zone!("buffer");
     // === Apply relocations ===
-    // Snapshot globals to avoid borrow issues
-    let globals_snap: FxHashMap<String, GlobalSymbol> = globals.clone();
+    // `globals` is never touched again after this point, so a plain reborrow
+    // suffices. The old `.clone()` deep-copied the entire map — 40k String
+    // keys + values — on EVERY link (several ms and a peak-RSS spike on
+    // symbol-heavy inputs) for no semantic benefit.
+    let globals_snap: &FxHashMap<String, GlobalSymbol> = globals;
 
     // Precomputed ordinal of each non-PLT GOT entry (index into the .got
     // section). Replaces per-relocation prefix scans that were O(GOT^2).
@@ -1238,7 +1273,7 @@ pub(super) fn emit_executable(
                 // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
                 // rewrite (the __tls_get_addr call no longer exists).
                 if tls_consumed.iter().any(|&(cs, ce)| fp >= cs && fp < ce) { continue; }
-                let s = resolve_sym(obj_idx, sym, &globals_snap, section_map, output_sections,
+                let s = resolve_sym(obj_idx, sym, globals_snap, section_map, output_sections,
                                     plt_addr);
 
                 match rela.rela_type {
@@ -1495,6 +1530,7 @@ pub(super) fn emit_executable(
         }
     }
 
+    zone!("relocs");
     // === Append section headers ===
     // Build .shstrtab string table
     let mut shstrtab = vec![0u8]; // null byte at offset 0
@@ -1737,6 +1773,7 @@ pub(super) fn emit_executable(
     // e_shstrndx at offset 62 (2 bytes)
     out[62..64].copy_from_slice(&shstrtab_shidx.to_le_bytes());
 
+    zone!("headers");
     std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
     #[cfg(unix)]
     {

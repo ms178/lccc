@@ -25,6 +25,10 @@ pub fn link_builtin(
     crt_objects_after: &[&str],
 ) -> Result<(), String> {
     let is_static = user_args.iter().any(|a| a == "-static");
+    let t_all = std::time::Instant::now();
+    let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
+    let mut t_phase = std::time::Instant::now();
+    macro_rules! phase { ($name:expr) => { if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", $name, t_phase.elapsed().as_secs_f64()*1e3); t_phase = std::time::Instant::now(); } } }
     let mut objects: Vec<ElfObject> = Vec::new();
     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
     let mut needed_sonames: Vec<String> = Vec::new();
@@ -42,6 +46,7 @@ pub fn link_builtin(
         load_file(path, &mut objects, &mut globals, &mut needed_sonames, &lib_path_strings, false)?;
     }
 
+    phase!("load-inputs");
     // Parse user args using shared infrastructure
     let parsed_args = linker_common::parse_linker_args(user_args);
     let extra_lib_paths = parsed_args.extra_lib_paths;
@@ -228,6 +233,7 @@ pub fn link_builtin(
     // Check for truly undefined (non-weak, non-dynamic, non-linker-defined) symbols
     linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
 
+    phase!("resolve+gc");
     // SHF_MERGE string/constant deduplication (.rodata.str1.1, .rodata.cst8):
     // build pools across all objects, rewrite relocations to pool symbols,
     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
@@ -249,28 +255,36 @@ pub fn link_builtin(
         }
     }
 
+    phase!("strmerge");
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
 
+    phase!("merge-sections");
     // Allocate COMMON symbols
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
 
+    phase!("common");
     // Create PLT/GOT
     let (plt_names, got_entries) = create_plt_got(&objects, &mut globals);
 
+    phase!("plt-got");
     // Collect IFUNC symbols for static linking
     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
 
+    phase!("ifunc");
     // Emit executable
-    emit_executable(
+    let r = emit_executable(
         &objects, &mut globals, &mut output_sections, &section_map,
         &plt_names, &got_entries, &needed_sonames, output_path,
         export_dynamic, &rpath_entries, use_runpath, is_static,
         &ifunc_symbols, entry_symbol.as_deref(),
         parsed_args.z_now, parsed_args.z_relro,
-    )
+    );
+    phase!("emit-exec");
+    if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", "TOTAL", t_all.elapsed().as_secs_f64()*1e3); }
+    r
 }
 
 /// Create a shared library (.so) from object files.
