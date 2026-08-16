@@ -109,6 +109,50 @@ impl X86Arch for I686Arch {
     /// This is needed for kernel realmode trampoline code (trampoline_64.S)
     /// which is compiled with -m16 but has .code64 sections containing
     /// 64-bit instructions like jmpq, lidt with RIP-relative addressing, etc.
+    /// `.code16`: real-mode encoding.
+    ///
+    /// Sets the encoder's 16-bit flag, which switches the ModR/M table to the
+    /// 16-bit form (no SIB, disp16) and inverts the 0x66/0x67 override logic,
+    /// since the default operand and address size in real mode is 16 bits.
+    /// The kernel's arch/x86/boot/header.S depends on this exact behaviour.
+    fn encode_instruction_code16(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        let mut encoder = InstructionEncoder::new();
+        encoder.offset = section_data_len;
+        encoder.code16 = true;
+        encoder.encode(instr)?;
+
+        let instr_len = encoder.bytes.len();
+        let jump = {
+            let mnem = &instr.mnemonic;
+            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+            if is_jump && instr.operands.len() == 1 {
+                if let Operand::Label(_) = &instr.operands[0] {
+                    let is_conditional = mnem != "jmp";
+                    // In 16-bit mode a near jump carries a 16-bit
+                    // displacement, so the long forms are one byte shorter
+                    // than in 32-bit mode.
+                    let expected_len = if is_conditional { 4 } else { 3 };
+                    if instr_len == expected_len {
+                        Some(JumpDetection { is_conditional, already_short: false })
+                    } else { None }
+                } else { None }
+            } else { None }
+        };
+
+        let relocations = encoder.relocations.into_iter().map(|r| EncoderReloc {
+            offset: r.offset,
+            symbol: r.symbol,
+            reloc_type: r.reloc_type,
+            addend: r.addend,
+            diff_symbol: None,
+        }).collect();
+
+        Ok(EncodeResult { bytes: encoder.bytes, relocations, jump })
+    }
+
     fn encode_instruction_code64(
         instr: &Instruction,
         _section_data_len: u64,

@@ -35,7 +35,10 @@ struct alt_len {
 
 extern struct alt_len alt_a, alt_b, alt_c;
 extern unsigned short jmp_field_off;
-extern unsigned int region_a_len, region_b_len;
+extern unsigned int region_a_len, region_b_len, region_scaled;
+extern unsigned int named_addend, named_scaled;
+extern int neg_plain, neg_addend, neg_scaled;
+extern unsigned int rep_last;
 
 /* --- Case 1+2: a jump inside the measured region that relaxation shrinks.
  * The original is padded up to the replacement's length. orig_len must equal
@@ -98,9 +101,11 @@ extern void aligned_after_skip(void);
  * plus the left-side-addend form (`label + 1 - base`) used by the kernel's
  * la57 trampoline to locate the immediate field inside a far jump. */
 asm(".text\n"
+    "760:\n"
     ".Lmark_a:\n"
     "  jmp 2f\n"                 /* relaxes */
     "  nop;nop;nop;nop\n"
+    "770:\n"
     ".Lmark_b:\n"
     "  jmp 2f\n"                 /* relaxes */
     "  nop;nop\n"
@@ -114,13 +119,61 @@ asm(".text\n"
      * it to locate the immediate field inside a far jump. NAMED labels: this
      * is the form the kernel actually uses (SYM_* macros expand to named
      * local labels), and it is what must not regress. */
-    "  .word .Lmark_b + 1 - .Lmark_a\n"
+    /* Numeric-label form, exactly as arch/x86/boot/startup/la57toggle.S
+     * writes it. Numeric labels are renamed to `.Lnum_N_K` before the ELF
+     * writer sees them; the ADDEND and SCALED difference forms were not being
+     * renamed with them, so the reference kept the raw `770b` and the
+     * assembler aborted (scaled form: silently emitted ZERO). */
+    "  .word 770b + 1 - 760b\n"
     "  .globl region_a_len\n"
     "region_a_len:\n"
-    "  .long .Lmark_b - .Lmark_a\n"
+    "  .long 770b - 760b\n"
     "  .globl region_b_len\n"
     "region_b_len:\n"
-    "  .long .Lmark_end - .Lmark_b\n"
+    "  .long 2b - 770b\n"
+    /* Scaled difference `(a-b)*k + c`: no ELF relocation can express it, so it
+     * must be folded to a constant. Parenthesised, which also pins down that
+     * the `" - "` split does not tear the expression apart. */
+    "  .globl region_scaled\n"
+    "region_scaled:\n"
+    "  .long (2b - 760b) * 4 + 3\n"
+    /* The same two shapes with NAMED labels: both paths must agree exactly. */
+    "  .globl named_addend\n"
+    "named_addend:\n"
+    "  .long .Lmark_b + 1 - .Lmark_a\n"
+    "  .globl named_scaled\n"
+    "named_scaled:\n"
+    "  .long (.Lmark_end - .Lmark_a) * 4 + 3\n"
+    /* NEGATIVE differences, in all three shapes. A fold that only handled the
+     * positive direction, or that widened through an unsigned type, would
+     * turn these into huge values instead of small negatives. */
+    "  .globl neg_plain\n"
+    "neg_plain:\n"
+    "  .long 760b - 770b\n"
+    "  .globl neg_addend\n"
+    "neg_addend:\n"
+    "  .long 760b - 770b + 5\n"
+    "  .globl neg_scaled\n"
+    "neg_scaled:\n"
+    "  .long (760b - 770b) * 2\n"
+    "  .popsection\n");
+
+/* REPEATED numeric labels: GAS allows a number to be defined many times, and
+ * `Nb`/`Nf` must bind to the nearest definition in the right direction. A
+ * resolver that just takes the first or last entry silently measures the wrong
+ * region. */
+asm(".text\n"
+    "1:\n"
+    "  nop\n"
+    "1:\n"
+    "  nop;nop\n"
+    "1:\n"
+    "  ret\n"
+    "  .pushsection .data\n"
+    "  .globl rep_last\n"
+    "rep_last:\n"
+    /* distance from the LAST `1:` before here, back to the one before it */
+    "  .long 1b - 1b\n"
     "  .popsection\n");
 
 int main(void)
@@ -171,6 +224,43 @@ int main(void)
                       region_b_len);
                fail = 1;
        }
+	/* Scaled fold: (region_a + region_b) * 4 + 3 = (6+4)*4+3 = 43. */
+	if (region_scaled != (region_a_len + region_b_len) * 4 + 3) {
+		printf("FAIL region_scaled=%u expected %u\n",
+		       region_scaled, (region_a_len + region_b_len) * 4 + 3);
+		fail = 1;
+	}
+	/* Named-label forms must agree with the numeric ones exactly. */
+	if (named_addend != jmp_field_off) {
+		printf("FAIL named_addend=%u != numeric %u\n",
+		       named_addend, jmp_field_off);
+		fail = 1;
+	}
+	if (named_scaled != region_scaled) {
+		printf("FAIL named_scaled=%u != numeric %u\n",
+		       named_scaled, region_scaled);
+		fail = 1;
+	}
+	/* Negative differences must stay negative in all three shapes. */
+	if (neg_plain != -(int)region_a_len) {
+		printf("FAIL neg_plain=%d expected %d\n", neg_plain, -(int)region_a_len);
+		fail = 1;
+	}
+	if (neg_addend != -(int)region_a_len + 5) {
+		printf("FAIL neg_addend=%d expected %d\n",
+		       neg_addend, -(int)region_a_len + 5);
+		fail = 1;
+	}
+	if (neg_scaled != -(int)region_a_len * 2) {
+		printf("FAIL neg_scaled=%d expected %d\n",
+		       neg_scaled, -(int)region_a_len * 2);
+		fail = 1;
+	}
+	/* `1b - 1b` binds both refs to the SAME nearest definition => 0. */
+	if (rep_last != 0) {
+		printf("FAIL rep_last=%u expected 0\n", rep_last);
+		fail = 1;
+	}
 
        if (fail)
                return 1;

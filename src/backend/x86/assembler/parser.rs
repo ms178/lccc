@@ -1852,6 +1852,20 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // A PARENTHESIZED symbol difference with arithmetic around it must be
+        // folded before the plain `" - "` split below, which would otherwise
+        // tear `(.Lb - .La) * 4` into the nonsense pair `(.Lb` / `.La) * 4`.
+        // `strip_sym_parens` then produced a symbol name that matches nothing,
+        // and the field was silently emitted as ZERO -- no diagnostic, wrong
+        // data. (The same probe exists further down, but only after the split
+        // has already destroyed the expression.)
+        if trimmed.starts_with('(') {
+            if let Some(val) = try_parse_sym_diff_expr(trimmed) {
+                vals.push(val);
+                continue;
+            }
+        }
+
         // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
         if let Some(minus_pos) = trimmed.find(" - ") {
             let lhs_raw = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();

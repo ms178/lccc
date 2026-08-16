@@ -109,6 +109,17 @@ pub trait X86Arch {
     /// kernel's EFI mixed-mode and realmode entry code is 32-bit assembly
     /// living inside a 64-bit object; without this the 64-bit encoder rejects
     /// legal `pushl %ecx` / `popl %ecx`.
+    /// Encode an instruction in 16-bit (real) mode.
+    ///
+    /// Only the i686 backend implements this; the default keeps the normal
+    /// encoder so other architectures are unaffected.
+    fn encode_instruction_code16(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        Self::encode_instruction(instr, section_data_len)
+    }
+
     fn encode_instruction_code32(
         instr: &Instruction,
         section_data_len: u64,
@@ -1181,6 +1192,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
             A::encode_instruction_code64(instr, base_offset)?
         } else if self.code_mode == 32 && A::default_code_mode() == 64 {
             A::encode_instruction_code32(instr, base_offset)?
+        } else if self.code_mode == 16 && A::default_code_mode() != 64 {
+            if std::env::var("LCCC_DBG16").is_ok() {
+                eprintln!("[C16] dispatch code16 for {}", instr.mnemonic);
+            }
+            A::encode_instruction_code16(instr, base_offset)?
         } else if self.code_mode == 16 && A::default_code_mode() == 64 {
             // .code16 inside a 64-bit TU: real-mode code must be assembled via
             // the -m16 (i686) path where operand-size semantics are modeled.
