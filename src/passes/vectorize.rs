@@ -2156,6 +2156,54 @@ fn reduction_element_size(ty: IrType) -> Option<u32> {
 /// canonical `shl/mul(iv_cast, elem_size)` shape, so the caller can fall back
 /// to the element-index scheme (scaled GEP offsets + `iv * vec_width`
 /// remainder start).
+/// Is `offset_val` exactly `some_index * elem_size` (as `shl` by log2 or an
+/// explicit `mul`)?
+///
+/// Contiguity precondition for the element-index vectorization scheme, which
+/// scales this offset by the vector width. That is sound only when successive
+/// elements are ADJACENT. An array-of-structs access steps `sizeof(struct)`
+/// instead -- `sum += arr[i].i` over `struct S { int i, j, k; }` has a 12-byte
+/// stride, so eight vector lanes are not eight consecutive `.i` fields.
+/// Scaling it produced `i * 12 * 8` and silently returned the wrong sum
+/// (6 instead of 12 for a 3-element array).
+fn offset_is_index_times(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    offset_val: Value,
+    elem_size: u32,
+) -> bool {
+    if elem_size == 0 {
+        return false;
+    }
+    let log2 = elem_size.trailing_zeros();
+    let pow2 = elem_size.is_power_of_two();
+    for &block_idx in loop_blocks {
+        for inst in &func.blocks[block_idx].instructions {
+            let dest = match inst.dest() {
+                Some(d) => d,
+                None => continue,
+            };
+            if dest != offset_val {
+                continue;
+            }
+            return match inst {
+                Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(c), .. } => {
+                    pow2 && c.to_i64() == Some(log2 as i64)
+                }
+                Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. } => {
+                    let k = match (lhs, rhs) {
+                        (Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64(),
+                        _ => None,
+                    };
+                    k == Some(elem_size as i64)
+                }
+                _ => false,
+            };
+        }
+    }
+    false
+}
+
 fn find_reduction_byte_iv(
     func: &IrFunction,
     loop_blocks: &FxHashSet<usize>,
@@ -3969,6 +4017,36 @@ fn insert_reduction_remainder_loop(
 
 /// Transform reduction loop to use AVX2 256-bit vectorization (4×F64, 8×I32, etc.).
 fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -> usize {
+    // CONTIGUITY PRECONDITION -- checked BEFORE any IR is touched.
+    //
+    // The element-index scheme scales each GEP's byte offset by the vector
+    // width, which is correct only when successive elements are ADJACENT, i.e.
+    // the offset is `index * elem_size`. An array-of-structs access steps
+    // `sizeof(struct)`: `sum += arr[i].i` over `struct S { int i, j, k; }` has
+    // a 12-byte stride, so eight lanes are not eight consecutive `.i` fields.
+    // Scaling produced `i * 12 * 8` and silently returned 6 instead of 12.
+    //
+    // This must be a precondition rather than a bail-out inside the rewrite:
+    // aborting midway leaves the loop half-transformed, which is worse than
+    // either outcome.
+    {
+        let elem_size = reduction_element_size(pattern.element_type).unwrap_or(0) as u32;
+        for &block_idx in &pattern.loop_blocks {
+            for inst in &func.blocks[block_idx].instructions {
+                if let Instruction::GetElementPtr { dest, offset, .. } = inst {
+                    if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                        if let Operand::Value(offset_val) = offset {
+                            if !offset_is_index_times(func, &pattern.loop_blocks,
+                                                      *offset_val, elem_size) {
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 

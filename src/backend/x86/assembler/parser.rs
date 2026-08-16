@@ -2135,6 +2135,22 @@ struct GasMacro {
     body: Vec<String>,
 }
 
+/// GAS `\@` pseudo-variable: the total number of macro expansions performed
+/// so far. Every expansion gets a distinct value — that is what makes
+/// `.Lhere_\@:` a unique label per invocation. Leaving `\@` unsubstituted
+/// collapsed every use onto ONE label: the kernel's ANNOTATE macro then
+/// pointed all `.discard.annotate_insn` entries at the same address instead
+/// of at the instruction each one annotates, and objtool rejected the object
+/// ("intra_function_call not a direct call").
+///
+/// The counter is process-global (AtomicU64), not per-expansion-pass: GAS
+/// draws nested and recursive expansions from one sequence, and a file-local
+/// counter would recycle values when expand_gas_macros_with_state recurses.
+/// Distinctness is the only contract — the concrete numbers may differ from
+/// GAS's, which no correct assembly can observe.
+static MACRO_INVOCATION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Expand GAS macro directives: .macro/.endm, .purgem, .irp/.endr, .ifc/.endif, .if/.endif, .set
 ///
 /// This runs as a text-level expansion pass before instruction parsing.
@@ -2167,12 +2183,24 @@ fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
             if let Some(comma) = rest.find(',') {
                 let name = rest[..comma].trim();
                 let target = rest[comma + 1..].trim();
-                if target.starts_with('%')
-                    && !name.is_empty()
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
-                {
+                let name_ok = !name.is_empty()
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+                if target.starts_with('%') && name_ok {
                     reg_aliases.insert(name.to_string(), target.to_string());
                     continue; // drop the .set line
+                }
+                // Transitive alias: `.set CONSTS, V7` where V7 is itself a
+                // register alias (kernel crc-pclmul-template.S builds a
+                // two-level chain `CONSTS -> V7 -> %xmm7` via .irp). Resolve
+                // through the existing map at DEFINITION time — GAS evaluates
+                // .set eagerly, so later redefinitions of V7 must not change
+                // an already-taken snapshot.
+                if name_ok {
+                    if let Some(resolved) = reg_aliases.get(target) {
+                        let resolved = resolved.clone();
+                        reg_aliases.insert(name.to_string(), resolved);
+                        continue; // drop the .set line
+                    }
                 }
             }
         }
@@ -2551,7 +2579,12 @@ fn expand_gas_macros_with_state(
             macro_name_candidate
         };
 
-        if macros.contains_key(macro_name) {
+        // A directive is NEVER a macro invocation: GAS resolves `.type`,
+        // `.size`, ... as directives even when a macro of the same bare name
+        // exists. Without the guard, a macro whose name collides with a
+        // directive word (the kernel defines macros around `type`) could
+        // capture the directive line and rewrite it into garbage.
+        if macros.contains_key(macro_name) && !macro_name.starts_with('.') {
             let mac = macros[macro_name].clone();
             let args_str = if first_word.ends_with(':') {
                 // Label before macro
@@ -2569,10 +2602,18 @@ fn expand_gas_macros_with_state(
             let mut sorted_args: Vec<(String, String)> = args.clone();
             sorted_args.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
             // Substitute parameters in body
+            // One `\@` value per invocation, fetched before body substitution
+            // so every line of this expansion sees the same number.
+            let invocation = MACRO_INVOCATION_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_string();
             let mut expanded_body: Vec<String> = mac.body.iter().map(|line| {
                 let mut l = line.clone();
                 for (pname, pval) in &sorted_args {
                     l = asm_preprocess::replace_macro_param(&l, &format!("\\{}", pname), pval);
+                }
+                if l.contains("\\@") {
+                    l = l.replace("\\@", &invocation);
                 }
                 // Strip GAS macro argument delimiters: \() resolves to empty string.
                 // Used to separate parameter names from adjacent text,
@@ -2872,16 +2913,52 @@ fn resolve_set_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<Stri
     // symbols stayed STT_NOTYPE and objtool rejected the object with
     // "unexpected relocation symbol type in .rela.discard...: 0".
     //
-    // Split the leading directive token off, resolve only the operands, and
-    // re-attach the mnemonic verbatim.
+    // This function is called in two DIFFERENT contexts and the guard is
+    // only correct in one of them:
+    //  * whole LINES (the regular-line pass): the first token may be a
+    //    directive mnemonic and must be protected;
+    //  * bare EXPRESSIONS (the .set value, `sym = expr`): there is no
+    //    mnemonic, and an expression naturally starts with '.' whenever it
+    //    references a `.L` local symbol.
+    // The first version applied the guard unconditionally AND recursed into
+    // itself for the operand text, so `.Lfound+1` — no whitespace — was
+    // consumed whole as a "mnemonic" and never substituted:
+    // `.set .Lfound, .Lfound+1` silently kept 0 and the kernel's
+    // extable_type_reg register scan (.irp + .ifc counting into .Lfound)
+    // died with "extable_type_reg: bad register argument" on every uaccess
+    // object. Distinguish the contexts: a leading '.' token is a directive
+    // only if it is FOLLOWED BY MORE TEXT (directives never end the line
+    // they start — they have operands or none, but a bare `.Lsym+1`
+    // expression is not a directive); `.Lfound` / `.Lfound+1` contain
+    // expression characters (+,-,digits after the identifier) or ARE the
+    // whole text, which no directive mnemonic is.
     let lead = expr.len() - expr.trim_start().len();
     let body = &expr[lead..];
     if body.starts_with('.') {
         let end = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
-        let (mnemonic, rest) = body.split_at(end);
-        return format!("{}{}{}", &expr[..lead], mnemonic, resolve_set_expr(rest, symbols));
+        let (first_tok, rest) = body.split_at(end);
+        // Directive mnemonics are pure `.` + identifier tokens (`.type`,
+        // `.long`, `.size`, `.text`, ...). Two things are NOT mnemonics:
+        //  * tokens containing expression operators (`.Lfound+1` — the whole
+        //    .set value arrives here as one token with no whitespace);
+        //  * `.L`-prefixed tokens — GAS's local-symbol namespace, which no
+        //    directive name inhabits (`.Lfound` alone is an expression).
+        // Operand-less directives (`.text` with empty rest) ARE mnemonics
+        // and stay protected: a user symbol named `text` must not turn
+        // `.text` into `.3`.
+        let is_mnemonic = first_tok[1..].bytes().all(is_ident_char)
+            && !first_tok.starts_with(".L");
+        if is_mnemonic {
+            return format!("{}{}{}", &expr[..lead], first_tok,
+                           substitute_set_symbols(rest, symbols));
+        }
     }
-    let mut result = expr.to_string();
+    substitute_set_symbols(expr, symbols)
+}
+
+/// Plain whole-word .set-symbol substitution, no directive-mnemonic logic.
+fn substitute_set_symbols(text: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> String {
+    let mut result = text.to_string();
     // Sort by length (longest first) to avoid partial replacements
     let mut sym_list: Vec<_> = symbols.iter().collect();
     sym_list.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -2955,6 +3032,184 @@ fn eval_if_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GAS `\@` must be substituted with a DISTINCT value per macro
+    /// expansion (kernel ANNOTATE emits `.Lhere_\@:` once per use; a shared
+    /// value collapses every annotation onto one label).
+    #[test]
+    fn test_macro_at_counter_distinct_per_invocation() {
+        let lines: Vec<String> = vec![
+            ".macro ANN".into(),
+            ".Lhere_\\@:".into(),
+            ".long .Lhere_\\@ - .".into(),
+            ".endm".into(),
+            "ANN".into(),
+            "ANN".into(),
+            "ANN".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let labels: Vec<&String> = out.iter()
+            .filter(|l| l.trim_end().ends_with(':') && l.contains(".Lhere_"))
+            .collect();
+        assert_eq!(labels.len(), 3, "three expansions, three label defs: {:?}", out);
+        // All three labels must be pairwise distinct.
+        assert_ne!(labels[0], labels[1]);
+        assert_ne!(labels[1], labels[2]);
+        assert_ne!(labels[0], labels[2]);
+        // No `\@` may survive expansion.
+        assert!(out.iter().all(|l| !l.contains("\\@")), "unsubstituted \\@: {:?}", out);
+        // Each reference must use ITS invocation's label.
+        for (def, reference) in labels.iter().zip(
+            out.iter().filter(|l| l.contains(".long .Lhere_"))) {
+            let def_name = def.trim().trim_end_matches(':');
+            assert!(reference.contains(def_name),
+                "reference {:?} does not match definition {:?}", reference, def);
+        }
+    }
+
+    /// .macro parameter defaults containing parens/spaces/commas must
+    /// survive as ONE value (kernel FILL_RETURN_BUFFER's
+    /// `ftr2=(((1 << 0) << 16) | (( 3*32+21)))`), and `:req` qualifiers
+    /// must not become part of the parameter name.
+    #[test]
+    fn test_macro_paren_default_and_req_qualifier() {
+        let lines: Vec<String> = vec![
+            ".macro FRB reg:req nr:req ftr2=(((1 << 0) << 16) | (( 3*32+21)))".into(),
+            "mov $\\nr, \\reg".into(),
+            ".long \\ftr2".into(),
+            ".endm".into(),
+            "FRB %rax, 32".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("mov $32, %rax"),
+            ":req parameter did not bind: {:?}", out);
+        assert!(joined.contains(".long (((1 << 0) << 16) | (( 3*32+21)))"),
+            "parenthesized default was shredded: {:?}", out);
+    }
+
+    /// A directive is never a macro invocation: a macro named `type` must
+    /// not capture `.type` lines (kernel objtool.h defines such macros; a
+    /// capture rewrote `.type f STT_FUNC` into garbage and left the symbol
+    /// STT_NOTYPE).
+    #[test]
+    fn test_directive_not_captured_by_same_name_macro() {
+        let lines: Vec<String> = vec![
+            ".macro type arg".into(),
+            ".long \\arg".into(),
+            ".endm".into(),
+            ".type myfn, @function".into(),
+            "type 7".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains(".type myfn, @function"),
+            ".type directive was rewritten: {:?}", out);
+        assert!(joined.contains(".long 7"),
+            "bare `type` invocation must still expand: {:?}", out);
+    }
+
+    /// `.set alias, %reg` register aliases substitute into operands with
+    /// word-boundary matching, including transitive chains
+    /// (crc-pclmul-template.S: CONSTS -> V7 -> %xmm7). Resolution is
+    /// eager: redefining the middle link later must not change earlier
+    /// snapshots.
+    #[test]
+    fn test_set_register_alias_transitive_and_eager() {
+        let lines: Vec<String> = vec![
+            ".set V7, %xmm7".into(),
+            ".set CONSTS, V7".into(),
+            "movdqa -32(%rcx), CONSTS".into(),
+            ".set V7, %xmm2".into(),
+            "movdqa (%rdx), V7".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains("movdqa -32(%rcx), %xmm7"),
+            "transitive alias failed: {:?}", out);
+        assert!(joined.contains("movdqa (%rdx), %xmm2"),
+            "redefinition not honored for later uses: {:?}", out);
+        assert!(!joined.contains("CONSTS"), "alias leaked: {:?}", out);
+    }
+
+    /// `.set` numeric symbols must never rewrite a DIRECTIVE mnemonic:
+    /// after `.set type, 3`, the directive `.type` must stay `.type`
+    /// (unwind_hints.h does exactly this and 26 kernel symbols went
+    /// STT_NOTYPE when `.type` became `.3`).
+    #[test]
+    fn test_set_symbol_does_not_rewrite_directives() {
+        let lines: Vec<String> = vec![
+            ".set type, 3".into(),
+            ".long type".into(),
+            ".type f, @function".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(joined.contains(".long 3"), ".set value not applied: {:?}", out);
+        assert!(joined.contains(".type f, @function"),
+            ".type directive corrupted: {:?}", out);
+    }
+
+    /// The directive-mnemonic guard must NOT swallow `.L` local symbols:
+    /// the .set VALUE expression arrives as a bare token (`.Lfound+1`, no
+    /// whitespace), and treating it as a "mnemonic" skipped substitution
+    /// entirely. `.set .Lfound, .Lfound+1` then silently kept the old
+    /// value, and the kernel's extable_type_reg register scan
+    /// (.irp + .ifc incrementing .Lfound) failed on EVERY uaccess object
+    /// with "extable_type_reg: bad register argument".
+    #[test]
+    fn test_set_local_symbol_increment_and_ifc_counting() {
+        // Direct increment.
+        let lines: Vec<String> = vec![
+            ".set .Lfound, 0".into(),
+            ".set .Lfound, .Lfound+1".into(),
+            ".long .Lfound".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        assert!(out.join("\n").contains(".long 1"),
+            ".Lfound increment lost: {:?}", out);
+
+        // The full kernel shape: .irp register scan with .ifc counting.
+        let lines2: Vec<String> = vec![
+            ".macro tm reg:req".into(),
+            ".set .Lfound, 0".into(),
+            ".irp rs,rax,rcx,rdi".into(),
+            ".ifc \\reg, %\\rs".into(),
+            ".set .Lfound, .Lfound+1".into(),
+            ".endif".into(),
+            ".endr".into(),
+            ".if (.Lfound != 1)".into(),
+            ".error \"bad reg\"".into(),
+            ".endif".into(),
+            ".endm".into(),
+            "tm reg=%rdi".into(),
+        ];
+        let out2 = expand_gas_macros(&lines2);
+        assert!(out2.is_ok(), "extable_type_reg shape failed: {:?}", out2);
+    }
+
+    /// Spaceless label arithmetic in data directives (vdso32 sigreturn.S):
+    /// `label-N-.` and `a-b+N` must parse as symbol diffs with addends,
+    /// not fall through to "unsupported data expression".
+    #[test]
+    fn test_spaceless_label_diff_addend_forms() {
+        match parse_label_diff(".LSTART_sigreturn-1-.") {
+            Some(DataValue::SymbolDiffAddend(a, b, n)) => {
+                assert_eq!(a, ".LSTART_sigreturn");
+                assert_eq!(b, ".");
+                assert_eq!(n, -1);
+            }
+            other => panic!("label-N-. misparsed: {:?}", other),
+        }
+        match parse_label_diff(".LEND_sigreturn-.LSTART_sigreturn+1") {
+            Some(DataValue::SymbolDiffAddend(a, b, n)) => {
+                assert_eq!(a, ".LEND_sigreturn");
+                assert_eq!(b, ".LSTART_sigreturn");
+                assert_eq!(n, 1);
+            }
+            other => panic!("a-b+N misparsed: {:?}", other),
+        }
+    }
 
     #[test]
     fn test_parse_simple() {

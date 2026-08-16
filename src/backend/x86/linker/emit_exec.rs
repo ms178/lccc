@@ -1396,7 +1396,30 @@ pub(super) fn emit_executable(
                                 }
                             }
                         }
-                        w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                        // No GOT slot exists for this symbol (typically a
+                        // LOCAL asm label reached via sym@GOTPCREL). The
+                        // instruction still DEREFERENCES its memory operand
+                        // (`movq sym@GOTPCREL(%rip), %reg` loads the slot's
+                        // CONTENTS), so pointing it straight at the symbol
+                        // loads the bytes AT the symbol instead of its
+                        // address — silent wrong code (an asm label's first
+                        // instruction bytes masqueraded as a pointer). Do
+                        // what GNU ld does: relax mov -> lea so the operand
+                        // becomes an address computation. Any other opcode
+                        // shape with a slotless GOT reference cannot be
+                        // fixed up locally — fail loudly rather than emit a
+                        // silently corrupt binary.
+                        if fp >= 2 && fp < out.len() && out[fp-2] == 0x8b {
+                            out[fp-2] = 0x8d;
+                            w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                        } else {
+                            return Err(format!(
+                                "GOTPCREL against '{}' has no GOT entry and the \
+                                 instruction is not a relaxable mov (opcode 0x{:02x}); \
+                                 refusing to emit a load of the symbol's bytes",
+                                sym.name,
+                                if fp >= 2 { out[fp-2] } else { 0 }));
+                        }
                     }
                     R_X86_64_PC64 => { w64(&mut out, fp, (s as i64 + a - p as i64) as u64); }
                     R_X86_64_TPOFF32 => {

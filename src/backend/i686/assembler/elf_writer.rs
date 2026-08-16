@@ -85,8 +85,15 @@ impl X86Arch for I686Arch {
     fn elf_class() -> u8 { ELFCLASS32 }
 
     fn reloc_abs(size: usize) -> u32 {
-        let _ = size; // i686 always uses R_386_32 for absolute
-        R_386_32
+        // `.word sym` must carry R_386_16, not R_386_32: a 32-bit patch of a
+        // 2-byte slot would overwrite the neighboring field, and the kernel's
+        // relocs tool special-cases R_386_16 against 16-bit segment symbols
+        // (`.word (to), real_mode_seg` in realmode.h LJMPW_RM) while rejecting
+        // R_386_32 against them as "Invalid absolute relocation".
+        match size {
+            2 => R_386_16,
+            _ => R_386_32,
+        }
     }
     fn reloc_abs64() -> u32 { R_386_32 } // i686 doesn't have 64-bit relocs
     fn reloc_pc32() -> u32 { R_386_PC32 }

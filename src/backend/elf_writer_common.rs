@@ -1031,6 +1031,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn emit_symbol_diff(&mut self, sec_idx: usize, a: &str, b: &str, size: usize, addend: i64) -> Result<(), String> {
+        /// `123b` / `7f` -- a GAS numeric local-label reference. Unlike a
+        /// named symbol, this never becomes an ELF symbol table entry, so a
+        /// relocation naming it can never be resolved by anything downstream
+        /// (linker or otherwise). It must be folded to a constant here,
+        /// which is sound because a same-object label difference is a
+        /// link-time invariant once this object's own layout is final.
+        fn is_numeric_label(s: &str) -> bool {
+            let n = s.len();
+            n >= 2
+                && matches!(s.as_bytes()[n - 1], b'b' | b'f')
+                && s[..n - 1].bytes().all(|c| c.is_ascii_digit())
+        }
+
         let offset = self.sections[sec_idx].data.len() as u64;
         let a_resolved = self.aliases.get(a).cloned().unwrap_or_else(|| a.to_string());
         let b_resolved = self.aliases.get(b).cloned().unwrap_or_else(|| b.to_string());
@@ -1050,6 +1063,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 diff_symbol: None,
                 patch_size: size as u8,
             });
+            let section = &mut self.sections[sec_idx];
+            section.data.extend(std::iter::repeat_n(0, size));
+        } else if is_numeric_label(&a_resolved) || is_numeric_label(&b_resolved) {
+            // A numeric label on EITHER side forces the deferred/positional
+            // path regardless of `size`: the `size <= 2` branch below only
+            // covers byte/word diffs, but the kernel's la57 trampoline uses
+            // exactly this shape at 4-byte width --
+            //     .pushsection .data ; .long 770b + 1 - 760b ; .popsection
+            // -- to record the offset of the immediate field inside a far
+            // jump. Falling through to the final `else` would try to build
+            // an ELF relocation with symbol name "770", which was never
+            // written to the symbol table and can never be resolved: the
+            // .long field silently stayed zero. Resolution happens later,
+            // after jump relaxation and `.skip` sizing have settled the
+            // final layout, exactly like the existing `size <= 2` path.
+            let offset_usize = self.sections[sec_idx].data.len();
+            self.deferred_byte_diffs.push((sec_idx, offset_usize, a_resolved, b_resolved, size, addend));
             let section = &mut self.sections[sec_idx];
             section.data.extend(std::iter::repeat_n(0, size));
         } else if size <= 2 && A::supports_deferred_skips() {
@@ -1359,10 +1389,55 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // difference, leaving zeros in the data — which is exactly what
         // `.byte b-a` and `.word b-a` produced before this fix.
         for (sec_idx, offset, sym_a, sym_b, size, addend) in &diffs {
-            let pos_a = self.label_positions.get(sym_a)
+            // NUMERIC labels (`770b`, `1f`) must go through the direction-
+            // aware resolver: `label_positions` only holds NAMED labels, and
+            // a numeric one is ambiguous without a reference point (the same
+            // digits can be reused many times in one file). A plain lookup
+            // failed outright on
+            //     .word 770b + 1 - 760b
+            // -- the shape the kernel's la57 trampoline uses to locate the
+            // immediate field inside a far jump ("undefined label in .byte
+            // diff: 770b"). `resolve_numeric_label` handles the common,
+            // same-section case; the loop below is the fallback for a
+            // numeric label defined in a DIFFERENT section than the one
+            // holding the diff directive itself -- `.pushsection .data`
+            // puts the `.word` in `.data` while `770b`/`760b` stay back in
+            // `.text`. There is no positional reference to compare against
+            // across sections, so this prefers the LAST definition for a
+            // `b`-suffixed reference and the FIRST for an `f`-suffixed one,
+            // on the assumption (true for every kernel shape seen so far)
+            // that a `.pushsection` data block referencing back into `.text`
+            // is emitted lexically after the code it describes.
+            let resolve = |me: &Self, sym: &String| -> Option<(usize, u64)> {
+                if let Some(p) = me.label_positions.get(sym).copied() {
+                    return Some(p);
+                }
+                if let Some(p) = me.resolve_numeric_label(sym, *offset as u64, *sec_idx) {
+                    return Some(p);
+                }
+                let len = sym.len();
+                if len >= 2 {
+                    let suffix = sym.as_bytes()[len - 1];
+                    let num = &sym[..len - 1];
+                    if (suffix == b'b' || suffix == b'f')
+                        && num.bytes().all(|c| c.is_ascii_digit())
+                    {
+                        if let Some(list) = me.numeric_label_positions.get(num) {
+                            return if suffix == b'b' {
+                                list.iter().copied().max_by_key(|&(_, off)| off)
+                            } else {
+                                list.iter().copied().min_by_key(|&(_, off)| off)
+                            };
+                        }
+                    }
+                }
+                None
+            };
+            let pos_a = resolve(self, sym_a)
                 .ok_or_else(|| format!("undefined label in .byte diff: {}", sym_a))?;
-            let pos_b = self.label_positions.get(sym_b)
+            let pos_b = resolve(self, sym_b)
                 .ok_or_else(|| format!("undefined label in .byte diff: {}", sym_b))?;
+            let (pos_a, pos_b) = (&pos_a, &pos_b);
 
             if pos_a.0 != pos_b.0 {
                 return Err(format!("cross-section .byte diff: {} - {}", sym_a, sym_b));
@@ -1612,24 +1687,46 @@ impl<A: X86Arch> ElfWriterCore<A> {
     // ─── ELF emission ─────────────────────────────────────────────────
 
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
-        // Deferred `.skip` expressions MUST be resolved before jump relaxation.
+        // `.skip` sizing and jump relaxation are MUTUALLY dependent, and the
+        // fixed-point they reach depends on the order. Two real kernel shapes
+        // pull in opposite directions:
         //
-        // A `.skip` whose length is a label expression is emitted as a
-        // placeholder and only sized once labels are known. Relaxing jumps
-        // first computes every displacement against the placeholder layout;
-        // resizing the skip afterwards then moves the targets out from under
-        // the already-patched displacements, and nothing recomputes them.
+        //  (a) sev.o: a `jmp` walks OVER two ALTERNATIVE paddings. If jumps
+        //      are relaxed against the placeholder layout and the skips are
+        //      sized afterwards, the already-patched displacement is stale
+        //      and the branch lands mid-instruction (objtool: "can't find
+        //      jump dest instruction").
+        //  (b) retpoline.S FILL_RETURN_BUFFER: the padded region ITSELF
+        //      contains a relaxable `jmp`. Sizing the skip first measures the
+        //      long form, over-pads by a byte, and the recorded
+        //      `origlen = 742b-740b` describes code that no longer exists
+        //      (objtool: "weirdly overlapping alternative! 33 != 35").
         //
-        // The kernel's ALTERNATIVE macros are exactly this shape:
-        //     .skip -(((775f-774f)-(772b-771b)) > 0) * ((775f-774f)-(772b-771b)),0x90
-        // pads the original instruction to the replacement's length. In
-        // sev_es_ghcb_handle_msr two such paddings sat between a `jmp` and its
-        // target, so the branch landed 3 bytes early -- in the MIDDLE of an
-        // instruction. objtool caught it as "can't find jump dest instruction";
-        // at runtime it would have executed garbage.
+        // GNU as reaches the SMALLEST fixed point: relax first — while no
+        // padding exists, every branch picks its shortest encoding — then
+        // size the skips against that layout, re-fix alignment, and relax
+        // again so any branch crossing the new padding is re-patched. Both
+        // shapes are byte-identical to GAS under this order (regression:
+        // alt_skip_relax_order.s covers (b), the sev shape is covered by the
+        // second relax pass below).
         //
-        // Resolving skips first makes the layout final before any displacement
-        // is computed, which is also the order GNU as uses.
+        // This first relax/fixup pass runs unconditionally, not gated on
+        // `A::supports_deferred_skips()`: it is answering a question
+        // ("what is the smallest fixed point for jump encodings before any
+        // `.skip` padding exists?") that has nothing to do with whether this
+        // architecture defers `.skip` sizing. The *second* relax_jumps()
+        // call below (needed regardless, to re-patch displacements after
+        // skips/alignment change layout) has always run unconditionally;
+        // gating only the first call on the trait method was an
+        // inconsistency, not a deliberate distinction — both concrete
+        // X86Arch impls (i686, x86-64) return `true` here today, so the two
+        // placements produce identical output for every currently-existing
+        // backend, but the unconditional form is the one that stays correct
+        // if a future arch ever overrides the default `false`.
+        self.relax_jumps();
+        for sec_idx in 0..self.sections.len() {
+            self.fixup_alignment_markers(sec_idx);
+        }
         if A::supports_deferred_skips() {
             self.resolve_deferred_skips()?;
         }
@@ -1705,10 +1802,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 }
 
-                // For REL format (i686): patch addend into section data
+                // For REL format (i686): patch addend into section data.
+                // The patch width must match the relocation width: R_386_16
+                // (`.word sym` — kernel realmode segment words) owns a 2-byte
+                // slot, and a 4-byte write would clobber the field after it.
                 if A::uses_rel_format() {
                     let off = reloc.offset as usize;
-                    if off + 4 <= data.len() {
+                    let patch16 = reloc.patch_size == 2;
+                    if patch16 && off + 2 <= data.len() {
+                        let existing = i16::from_le_bytes([data[off], data[off+1]]);
+                        let patched = existing.wrapping_add(addend as i16);
+                        data[off..off+2].copy_from_slice(&patched.to_le_bytes());
+                    } else if !patch16 && off + 4 <= data.len() {
                         let existing = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
                         let patched = existing.wrapping_add(addend as i32);
                         data[off..off+4].copy_from_slice(&patched.to_le_bytes());
