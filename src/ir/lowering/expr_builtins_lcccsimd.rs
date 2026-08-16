@@ -422,11 +422,18 @@ impl Lowerer {
         match class {
             LcccSimdClass::Vec128 | LcccSimdClass::Vec256 | LcccSimdClass::Vec512 => {
                 let result_alloca = self.fresh_value();
+                // Natural alignment for the vector width (Raptor Lake prefers
+                // aligned vmovdqa / store-forwarding on 16/32-byte slots).
+                let align = match width {
+                    64 => 64usize,
+                    32 => 32usize,
+                    _ => 16usize,
+                };
                 self.emit(Instruction::Alloca {
                     dest: result_alloca,
                     ty: IrType::Ptr,
                     size: width,
-                    align: 0,
+                    align,
                     volatile: false,
                     semantic_volatile: false,
                 });
