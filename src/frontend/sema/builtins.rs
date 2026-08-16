@@ -38,6 +38,13 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_strchr", BuiltinInfo::simple("strchr"));
     m.insert("__builtin_strrchr", BuiltinInfo::simple("strrchr"));
     m.insert("__builtin_strstr", BuiltinInfo::simple("strstr"));
+    // Used by the Linux kernel's include/linux/fortify-string.h.
+    m.insert("__builtin_strncat", BuiltinInfo::simple("strncat"));
+    m.insert("__builtin_memchr", BuiltinInfo::simple("memchr"));
+    m.insert("__builtin_strspn", BuiltinInfo::simple("strspn"));
+    m.insert("__builtin_strcspn", BuiltinInfo::simple("strcspn"));
+    m.insert("__builtin_strpbrk", BuiltinInfo::simple("strpbrk"));
+    m.insert("__builtin_stpncpy", BuiltinInfo::simple("stpncpy"));
 
     // Math functions
     m.insert("__builtin_abs", BuiltinInfo::simple("abs"));

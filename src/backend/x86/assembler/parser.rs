@@ -432,7 +432,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
     // Parse the remaining content as a directive or instruction
     if rest.starts_with('.') {
         items.push(parse_directive(rest)?);
-    } else if rest.starts_with("lock ") || rest.starts_with("rep ") || rest.starts_with("repz ") || rest.starts_with("repe ") || rest.starts_with("repnz ") || rest.starts_with("repne ") || rest.starts_with("notrack ") {
+    } else if is_prefixed_instruction(rest) {
         items.push(parse_prefixed_instruction(rest)?);
     } else {
         items.push(parse_instruction(rest, None)?);
@@ -930,6 +930,26 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
         parts[0].trim().to_string(),
         parts[1].trim().to_string(),
     ))
+}
+
+/// Does this line start with an instruction prefix followed by a mnemonic?
+///
+/// The separator is matched as "any whitespace", not a literal space:
+/// hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl` in
+/// arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the whole
+/// line as a single mnemonic `rep` with `stosl` parsed as a label operand.
+fn is_prefixed_instruction(rest: &str) -> bool {
+    // Segment-override names are legal instruction prefixes in their own right:
+    // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
+    // byte that ALTERNATIVE can later patch into a different encoding.
+    const PREFIXES: [&str; 13] = [
+        "lock", "rep", "repz", "repe", "repnz", "repne", "notrack",
+        "cs", "ds", "es", "ss", "fs", "gs",
+    ];
+    match rest.split_once(|c: char| c.is_whitespace()) {
+        Some((head, tail)) => PREFIXES.contains(&head) && !tail.trim().is_empty(),
+        None => false,
+    }
 }
 
 /// Parse a prefix instruction like "lock cmpxchgq ..." or "rep movsb".
@@ -1581,6 +1601,35 @@ fn parse_label_diff(s: &str) -> Option<DataValue> {
                 && is_label_like(lhs) && is_label_like(rhs) {
                 return Some(DataValue::SymbolDiff(lhs.to_string(), rhs.to_string()));
             }
+            // `label-N-.` (kernel vDSO sigreturn: `.long .LSTART_sigreturn-1-.`,
+            // the DWARF CFA "initial location minus one" idiom): LHS label,
+            // integer addend, then a PC-relative subtraction. Parse as
+            // SymbolDiffAddend(label, ".", -N).
+            if !lhs.is_empty() && is_label_like(lhs) && rhs.ends_with("-.") {
+                let mid = &rhs[..rhs.len() - 2];
+                if let Ok(n) = parse_integer_expr(mid) {
+                    return Some(DataValue::SymbolDiffAddend(
+                        lhs.to_string(), ".".to_string(), -n));
+                }
+            }
+            // `a-b+N` / `a-b-N` without spaces (same file:
+            // `.long .LEND_sigreturn-.LSTART_sigreturn+1`). The plain
+            // SymbolDiff arm above already rejected rhs because of the
+            // trailing addend; split it off and fold into the diff.
+            if !lhs.is_empty() && is_label_like(lhs) {
+                for (j, cj) in rhs.char_indices().skip(1) {
+                    if cj == '+' || cj == '-' {
+                        let rhs_sym = &rhs[..j];
+                        let addend_str = &rhs[j..];
+                        if is_label_like(rhs_sym) {
+                            if let Ok(n) = parse_integer_expr(addend_str) {
+                                return Some(DataValue::SymbolDiffAddend(
+                                    lhs.to_string(), rhs_sym.to_string(), n));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     None
@@ -1715,15 +1764,31 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
 
         // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
         if let Some(minus_pos) = trimmed.find(" - ") {
-            let lhs = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
+            let lhs_raw = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
             let rhs_full = trimmed[minus_pos + 3..].trim();
+            // The LEFT side may carry a constant addend:
+            //   .word .Ljmp + 1 - trampoline_32bit_src
+            // (arch/x86/boot/startup/la57toggle.S computes the offset of the
+            // immediate field inside a far jump this way). Splitting only on
+            // the first " - " left `lhs` as the literal string ".Ljmp + 1",
+            // which is not a symbol. Peel the addend off and fold it in.
+            let (lhs, lhs_addend) = match lhs_raw.rfind(" + ") {
+                Some(p) => {
+                    let sym = strip_sym_parens(lhs_raw[..p].trim());
+                    match (is_label_like(sym), parse_integer_expr(lhs_raw[p + 3..].trim())) {
+                        (true, Ok(a)) => (sym.to_string(), a),
+                        _ => (lhs_raw.clone(), 0),
+                    }
+                }
+                None => (lhs_raw.clone(), 0),
+            };
             // Check if rhs has an addend: "sym - N" or "sym + N"
             if let Some(rhs_minus) = rhs_full.rfind(" - ") {
                 let rhs_sym = strip_sym_parens(rhs_full[..rhs_minus].trim());
                 let rhs_add = rhs_full[rhs_minus + 3..].trim();
                 if is_label_like(rhs_sym) {
                     if let Ok(addend) = parse_integer_expr(rhs_add) {
-                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), -addend));
+                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), lhs_addend - addend));
                         continue;
                     }
                 }
@@ -1733,12 +1798,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
                 let rhs_add = rhs_full[rhs_plus + 3..].trim();
                 if is_label_like(rhs_sym) {
                     if let Ok(addend) = parse_integer_expr(rhs_add) {
-                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), addend));
+                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), lhs_addend + addend));
                         continue;
                     }
                 }
             }
-            vals.push(DataValue::SymbolDiff(lhs, strip_sym_parens(rhs_full).to_string()));
+            if lhs_addend != 0 {
+                vals.push(DataValue::SymbolDiffAddend(
+                    lhs, strip_sym_parens(rhs_full).to_string(), lhs_addend));
+            } else {
+                vals.push(DataValue::SymbolDiff(lhs, strip_sym_parens(rhs_full).to_string()));
+            }
             continue;
         }
 
@@ -2059,7 +2129,88 @@ struct GasMacro {
 fn expand_gas_macros(lines: &[String]) -> Result<Vec<String>, String> {
     let mut macros = crate::common::fx_hash::FxHashMap::default();
     let mut symbols = crate::common::fx_hash::FxHashMap::default();
-    expand_gas_macros_with_state(lines, &mut macros, &mut symbols)
+    let expanded = expand_gas_macros_with_state(lines, &mut macros, &mut symbols)?;
+    Ok(substitute_register_aliases(expanded))
+}
+
+/// Substitute `.set alias, %reg` register aliases into instruction operands.
+///
+/// GAS allows a symbol to alias a REGISTER (`.set state0, %xmm1`) and then
+/// uses the bare symbol as an operand (`movdqa copy0,state0`). The kernel
+/// vDSO ChaCha implementation (arch/x86/entry/vdso/vgetrandom-chacha.S) is
+/// written entirely in this style. Numeric .set symbols are handled by the
+/// integer-expression path; register aliases must instead be textually
+/// substituted before operand parsing, with word-boundary matching so an
+/// alias `i` never fires inside an identifier or directive. Aliases take
+/// effect only on lines AFTER their definition (GAS semantics); the .set
+/// line itself is dropped since the alias has no ELF-symbol meaning.
+fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
+    use crate::common::fx_hash::FxHashMap;
+    let mut reg_aliases: FxHashMap<String, String> = FxHashMap::default();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(".set ").or_else(|| trimmed.strip_prefix(".set\t")) {
+            if let Some(comma) = rest.find(',') {
+                let name = rest[..comma].trim();
+                let target = rest[comma + 1..].trim();
+                if target.starts_with('%')
+                    && !name.is_empty()
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                {
+                    reg_aliases.insert(name.to_string(), target.to_string());
+                    continue; // drop the .set line
+                }
+            }
+        }
+        if reg_aliases.is_empty() || trimmed.starts_with('.') || trimmed.ends_with(':') {
+            out.push(line);
+            continue;
+        }
+        // Replace whole-word occurrences of any alias in the operand text.
+        let bytes = line.as_bytes();
+        let mut replaced = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_alphabetic() || c == b'_' || c == b'.' {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+                {
+                    i += 1;
+                }
+                let word = &line[start..i];
+                // Never substitute the mnemonic (first word): an alias named
+                // like an instruction must not clobber it. Operands start
+                // after the first whitespace.
+                let is_mnemonic_pos = replaced.trim().is_empty();
+                if !is_mnemonic_pos {
+                    if let Some(reg) = reg_aliases.get(word) {
+                        replaced.push_str(reg);
+                        continue;
+                    }
+                }
+                replaced.push_str(word);
+            } else if c == b'%' {
+                // Skip register names wholesale so an alias equal to a
+                // register suffix cannot fire inside one.
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                replaced.push_str(&line[start..i]);
+            } else {
+                replaced.push(c as char);
+                i += 1;
+            }
+        }
+        out.push(replaced);
+    }
+    out
 }
 
 fn expand_gas_macros_with_state(
@@ -2416,15 +2567,48 @@ fn expand_gas_macros_with_state(
                 l = l.replace("\\()", "");
                 l
             }).collect();
+            // Substituting a parameter can splice several statements into ONE
+            // body line (a quoted ALTERNATIVE argument such as
+            // "nop;ANNOTATE type=7; call 772f"). Break those apart before the
+            // recursive pass so a macro invocation that ended up after a `;`
+            // is still recognised as the first word of a statement.
+            let mut split_body: Vec<String> = Vec::with_capacity(expanded_body.len());
+            for line in expanded_body {
+                if line.contains(';') {
+                    for part in crate::backend::asm_preprocess::split_on_semicolons(&line) {
+                        let p = part.trim();
+                        if !p.is_empty() {
+                            split_body.push(p.to_string());
+                        }
+                    }
+                } else {
+                    split_body.push(line);
+                }
+            }
+            expanded_body = split_body;
             // Recursively expand the body (handles nested .irp, .set, .if, etc.)
             expanded_body = expand_gas_macros_with_state(&expanded_body, macros, symbols)?;
             result.extend(expanded_body);
-            // Emit remaining semicolon-separated parts as separate lines
-            for sp in &semi_parts[1..] {
-                let sp = sp.trim();
-                if !sp.is_empty() {
-                    result.push(sp.to_string());
-                }
+            // Emit remaining semicolon-separated parts as separate lines.
+            //
+            // They must be re-expanded, not pushed raw: a macro invocation can
+            // follow another statement on the same line, and after a macro
+            // argument is substituted the resulting text frequently contains
+            // one. The kernel's FILL_RETURN_BUFFER passes
+            //     "nop;ANNOTATE type=7; call 772f; ..."
+            // as a quoted ALTERNATIVE_2 argument, so `ANNOTATE` only ever
+            // appears after a `;` once the outer macro has expanded. Pushing it
+            // verbatim left it to the instruction encoder, which reported
+            // "unhandled instruction: annotate [Label(\"type=7\")]".
+            let rest_parts: Vec<String> = semi_parts[1..]
+                .iter()
+                .map(|sp| sp.trim().to_string())
+                .filter(|sp| !sp.is_empty())
+                .collect();
+            if !rest_parts.is_empty() {
+                let expanded_rest =
+                    expand_gas_macros_with_state(&rest_parts, macros, symbols)?;
+                result.extend(expanded_rest);
             }
             i += 1;
             continue;
@@ -2445,25 +2629,61 @@ fn expand_gas_macros_with_state(
 
 /// Parse a .macro definition header: "name param1:req param2:req ..."
 fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>), String> {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
+    // Tokenize the parameter list at PAREN DEPTH 0 only.
+    //
+    // Splitting on raw whitespace shreds a default value that contains spaces:
+    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
+    // whose default expands to `(((1 << 0) << 16) | ((3*32+21)))`. The spaces
+    // inside it became parameter separators, inventing parameters named `<<`
+    // and `0)`, and `\ftr2` expanded to the fragment `(((1` -- which surfaced
+    // as "unsupported data expression: (((1" on the `.4byte` in
+    // altinstr_entry (arch/x86/entry/entry.S).
+    //
+    // Commas are equally valid separators in GAS, so both are honoured, but
+    // only outside parentheses and quotes.
+    fn split_params(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut depth = 0i32;
+        let mut in_quote = false;
+        for c in s.chars() {
+            if in_quote {
+                cur.push(c);
+                if c == '"' { in_quote = false; }
+                continue;
+            }
+            match c {
+                '"' => { in_quote = true; cur.push(c); }
+                '(' => { depth += 1; cur.push(c); }
+                ')' => { depth -= 1; cur.push(c); }
+                _ if depth == 0 && (c.is_whitespace() || c == ',') => {
+                    if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                }
+                _ => cur.push(c),
+            }
+        }
+        if !cur.is_empty() { out.push(cur); }
+        out
+    }
+
+    let parts = split_params(rest);
     if parts.is_empty() {
         return Err(".macro: missing name".to_string());
     }
-    let name = parts[0].to_string();
+    let name = parts[0].clone();
     let mut params = Vec::new();
-    for &part in &parts[1..] {
-        // Handle param:req, param=default, or just param
-        let part = part.trim_end_matches(',');
-        if part.contains(':') {
-            let pname = part.split(':').next().unwrap().to_string();
-            params.push((pname, None));
-        } else if part.contains('=') {
-            let mut split = part.splitn(2, '=');
-            let pname = split.next().unwrap().to_string();
-            let default = split.next().map(|s| s.to_string());
-            params.push((pname, default));
+    for part in &parts[1..] {
+        // `param=default` wins over `param:req`: a default may itself contain
+        // a colon, and the qualifier is not part of the parameter NAME.
+        if let Some(eq) = part.find('=') {
+            let pname = part[..eq].trim();
+            let pname = pname.split(':').next().unwrap_or(pname).to_string();
+            let default = part[eq + 1..].to_string();
+            params.push((pname, Some(default)));
+        } else if let Some(colon) = part.find(':') {
+            params.push((part[..colon].to_string(), None));
         } else {
-            params.push((part.to_string(), None));
+            params.push((part.clone(), None));
         }
     }
     Ok((name, params))

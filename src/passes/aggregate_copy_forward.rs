@@ -471,10 +471,21 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         return reverse_changes + if std::env::var("CCC_NO_AGG_DEAD_STORES").is_ok() { 0 } else { eliminate_dead_aggregate_field_stores(func) };
     }
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    // `CfgAnalysis::idom` uses usize::MAX as the sentinel for blocks that are
+    // unreachable from entry, so the walk must bounds-check before indexing.
+    // Unreachable code does occur in real input (the kernel's BUG()/unreachable()
+    // paths leave blocks with no predecessors), and indexing with the sentinel
+    // panicked with "index out of bounds: the len is 154 but the index is
+    // 18446744073709551615" while compiling kernel/signal.c.
+    //
+    // An unreachable block is dominated by nothing, so returning false is both
+    // safe and correct: the caller then declines the transform.
     let dominates = |a: usize, mut b: usize| {
         if a == b { return true; }
         for _ in 0..cfg.idom.len() {
+            if b >= cfg.idom.len() { return false; }
             let parent = cfg.idom[b];
+            if parent == usize::MAX { return false; }
             if parent == b { break; }
             if parent == a { return true; }
             b = parent;

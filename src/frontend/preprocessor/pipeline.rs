@@ -359,7 +359,8 @@ impl Preprocessor {
                         // pending tokens to output first. The included content must appear
                         // after the preceding tokens, not before them.
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-                        output.push_str(&expanded);
+                        let expanded = self.resolve_has_macros_in_code(&expanded);
+                    output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..pending_newlines {
                             output.push('\n');
@@ -447,7 +448,8 @@ impl Preprocessor {
         // Flush any remaining pending line
         if !pending_line.is_empty() {
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-            output.push_str(&expanded);
+            let expanded = self.resolve_has_macros_in_code(&expanded);
+                    output.push_str(&expanded);
             output.push('\n');
             // Collect macro expansion info for the flushed line
             if !is_include {
@@ -519,6 +521,7 @@ impl Preprocessor {
                     *pending_line = line.to_string();
                     *pending_newlines = 1;
                 } else {
+                    let expanded = self.resolve_has_macros_in_code(&expanded);
                     output.push_str(&expanded);
                     output.push('\n');
                 }
@@ -540,7 +543,8 @@ impl Preprocessor {
                     if self.ends_with_funclike_macro(&expanded) && *pending_newlines <= MAX_PENDING_NEWLINES {
                         // Don't clear pending_line - keep accumulating
                     } else {
-                        output.push_str(&expanded);
+                        let expanded = self.resolve_has_macros_in_code(&expanded);
+                    output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..*pending_newlines {
                             output.push('\n');
@@ -563,7 +567,8 @@ impl Preprocessor {
                     if self.ends_with_funclike_macro(&expanded) && *pending_newlines <= MAX_PENDING_NEWLINES {
                         // Don't clear pending_line - keep accumulating
                     } else {
-                        output.push_str(&expanded);
+                        let expanded = self.resolve_has_macros_in_code(&expanded);
+                    output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..*pending_newlines {
                             output.push('\n');

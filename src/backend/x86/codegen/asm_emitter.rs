@@ -26,6 +26,15 @@ const X86_XMM_SCRATCH: &[&str] = &[
 impl InlineAsmEmitter for X86Codegen {
     fn asm_state(&mut self) -> &mut CodegenState { &mut self.state }
 
+    // Bracket inline-asm bodies with #APP/#NO_APP (GCC/Clang convention).
+    // The x86 peephole treats the region as opaque: user-authored assembly
+    // (kernel ALTERNATIVE()/jump-label templates) must reach the assembler
+    // byte-for-byte. `#` starts a comment in AT&T syntax, so the markers are
+    // invisible to GAS and to lccc's integrated assembler alike.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
     // TODO: ARM and RISC-V backends should also support multi-alternative constraint
     // parsing (e.g., "rm", "ri") similar to the x86 implementation below. Currently
     // they only recognize single-alternative constraints.
@@ -422,11 +431,7 @@ impl InlineAsmEmitter for X86Codegen {
                         // Use type-appropriate load to avoid reading garbage from
                         // stack slots of smaller-than-8-byte variables.
                         let load_instr = Self::mov_load_for_type(ty);
-                        let dest_reg_str = if matches!(ty, IrType::U32 | IrType::F32) {
-                            format!("%{}", Self::reg_to_32(reg))
-                        } else {
-                            format!("%{}", reg)
-                        };
+                        let dest_reg_str = Self::asm_load_dest_reg(load_instr, reg);
                         { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg_str)); }
                     }
                 }
@@ -471,10 +476,7 @@ impl InlineAsmEmitter for X86Codegen {
                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg)); }
                 } else {
                     let load_instr = Self::mov_load_for_type(ty);
-                    let dest_reg = match ty {
-                        IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
-                        _ => format!("%{}", reg),
-                    };
+                    let dest_reg = Self::asm_load_dest_reg(load_instr, reg);
                     { let sr = self.slot_ref(slot.0); self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, dest_reg)); }
                 }
             } else {
@@ -493,10 +495,7 @@ impl InlineAsmEmitter for X86Codegen {
                 } else {
                     self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
                     let load_instr = Self::mov_load_for_type(ty);
-                    let dest_reg = match ty {
-                        IrType::U32 | IrType::F32 => format!("%{}", Self::reg_to_32(reg)),
-                        _ => format!("%{}", reg),
-                    };
+                    let dest_reg = Self::asm_load_dest_reg(load_instr, reg);
                     self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, reg, dest_reg));
                 }
             }

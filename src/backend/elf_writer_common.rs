@@ -55,6 +55,16 @@ pub trait X86Arch {
     fn reloc_abs64() -> u32;
     /// PC-relative relocation type (R_X86_64_PC32 or R_386_PC32).
     fn reloc_pc32() -> u32;
+
+    /// 64-bit PC-relative relocation type (S + A - P, 8-byte patch).
+    /// GAS emits this for `.quad sym - .`; the kernel's __jump_table and
+    /// static_call sites rely on the full-width delta: patching an 8-byte
+    /// slot with a 4-byte PC32 leaves the upper half zero instead of
+    /// sign-extending, corrupting the address whenever the delta is negative.
+    /// Architectures without a PC64 type (ELF32) fall back to PC32.
+    fn reloc_pc64() -> u32 {
+        Self::reloc_pc32()
+    }
     /// PLT relocation type (R_X86_64_PLT32 or R_386_PLT32).
     fn reloc_plt32() -> u32;
 
@@ -94,6 +104,17 @@ pub trait X86Arch {
         Self::encode_instruction(instr, section_data_len)
     }
 
+    /// Encode an instruction in 32-bit mode. Used by the x86-64 assembler when
+    /// it encounters `.code32` (mirror of `encode_instruction_code64`). The
+    /// kernel's EFI mixed-mode and realmode entry code is 32-bit assembly
+    /// living inside a 64-bit object; without this the 64-bit encoder rejects
+    /// legal `pushl %ecx` / `popl %ecx`.
+    fn encode_instruction_code32(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        Self::encode_instruction(instr, section_data_len)
+    }
 }
 
 /// Result of encoding a single instruction.
@@ -521,7 +542,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
             section_type,
             flags,
             data: Vec::new(),
-            alignment: if flags & SHF_EXECINSTR != 0 && name != ".init" && name != ".fini" { 16 } else { 1 },
+            // Section alignment starts at 1 and is raised by the `.p2align` /
+            // `.align` directives the section actually contains (see the
+            // AsmItem::Align arm), mirroring GNU as exactly.
+            //
+            // Forcing 16 for every executable section was wrong: sections made
+            // with `.pushsection ...,"ax"` that carry no alignment directive
+            // must stay at 1. The kernel's alternatives machinery depends on
+            // it -- `.altinstr_replacement` entries are addressed by exact byte
+            // offsets recorded in `.altinstructions`, so padding the section
+            // start to 16 shifts every later replacement away from the offset
+            // its entry points at.
+            alignment: 1,
             relocations: Vec::new(),
             jumps: Vec::new(),
             align_markers: Vec::new(),
@@ -1004,11 +1036,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let b_resolved = self.aliases.get(b).cloned().unwrap_or_else(|| b.to_string());
 
         if b_resolved == "." {
-            // `sym - .` means PC-relative
+            // `sym - .` means PC-relative. The relocation WIDTH must match
+            // the data directive width: `.quad sym - .` is an 8-byte slot,
+            // and patching it with a 4-byte PC32 leaves the upper half zero
+            // AND overflows silently once the delta exceeds ±2 GiB. GAS
+            // emits R_X86_64_PC64 here; the kernel's __jump_table
+            // (`.quad key - .`) and static_call sites depend on it.
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset,
                 symbol: a_resolved,
-                reloc_type: A::reloc_pc32(),
+                reloc_type: if size == 8 { A::reloc_pc64() } else { A::reloc_pc32() },
                 addend,
                 diff_symbol: None,
                 patch_size: size as u8,
@@ -1101,6 +1138,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // the x86-64 encoder for 64-bit instruction encoding.
         let result = if self.code_mode == 64 && A::default_code_mode() != 64 {
             A::encode_instruction_code64(instr, base_offset)?
+        } else if self.code_mode == 32 && A::default_code_mode() == 64 {
+            A::encode_instruction_code32(instr, base_offset)?
+        } else if self.code_mode == 16 && A::default_code_mode() == 64 {
+            // .code16 inside a 64-bit TU: real-mode code must be assembled via
+            // the -m16 (i686) path where operand-size semantics are modeled.
+            // Encoding it with the 64-bit encoder would silently produce wrong
+            // machine code, so reject loudly instead.
+            return Err(format!(
+                ".code16 in 64-bit assembly is not supported; compile real-mode \
+                 code with -m16 (instruction: {})", instr.mnemonic));
         } else {
             A::encode_instruction(instr, base_offset)?
         };
@@ -1206,6 +1253,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
             for jump in self.sections[*sec_idx].jumps.iter_mut() {
                 if jump.offset >= *offset {
                     jump.offset += count;
+                }
+            }
+            // Alignment/org markers move with everything else. Omitting them
+            // left each `.p2align` after a resolved `.skip` recorded at its
+            // pre-insertion offset, so the padding was computed for the wrong
+            // position: the kernel's `vc_do_mmio` landed at 0x2043 where GAS
+            // puts it at 0x2050, and objtool rejected the object with
+            // "can't find starting instruction".
+            for marker in self.sections[*sec_idx].align_markers.iter_mut() {
+                if marker.offset >= *offset {
+                    marker.offset += count;
                 }
             }
             for (bsec, boff, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
@@ -1554,18 +1612,51 @@ impl<A: X86Arch> ElfWriterCore<A> {
     // ─── ELF emission ─────────────────────────────────────────────────
 
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
-        // Relax long jumps to short form where possible.
-        self.relax_jumps();
-
-        // Resolve deferred .skip expressions (x86-64 and i686)
+        // Deferred `.skip` expressions MUST be resolved before jump relaxation.
+        //
+        // A `.skip` whose length is a label expression is emitted as a
+        // placeholder and only sized once labels are known. Relaxing jumps
+        // first computes every displacement against the placeholder layout;
+        // resizing the skip afterwards then moves the targets out from under
+        // the already-patched displacements, and nothing recomputes them.
+        //
+        // The kernel's ALTERNATIVE macros are exactly this shape:
+        //     .skip -(((775f-774f)-(772b-771b)) > 0) * ((775f-774f)-(772b-771b)),0x90
+        // pads the original instruction to the replacement's length. In
+        // sev_es_ghcb_handle_msr two such paddings sat between a `jmp` and its
+        // target, so the branch landed 3 bytes early -- in the MIDDLE of an
+        // instruction. objtool caught it as "can't find jump dest instruction";
+        // at runtime it would have executed garbage.
+        //
+        // Resolving skips first makes the layout final before any displacement
+        // is computed, which is also the order GNU as uses.
         if A::supports_deferred_skips() {
             self.resolve_deferred_skips()?;
             self.resolve_deferred_byte_diffs()?;
         }
 
-        // Fix alignment/org markers for EVERY section (the jump-relaxation
-        // path only does this for sections with jumps; .eh_frame never had
-        // its `.align` padding fixed up otherwise).
+        // Apply `.p2align` / `.org` padding BEFORE relaxing jumps.
+        //
+        // `relax_jumps` re-runs `fixup_alignment_markers` after each size
+        // change, but only for sections that contain jumps, and only once it
+        // has already started moving things. Resolving the deferred `.skip`s
+        // above changed section sizes, so any alignment marker after a skip is
+        // stale at this point. Leaving it stale placed a function symbol at an
+        // unaligned address (`vc_do_mmio` at 0x2043 where GAS puts 0x2050) and
+        // objtool rejected the object with "can't find starting instruction".
+        //
+        // Running the fixup for every section first makes the pre-relaxation
+        // layout correct; `relax_jumps` then keeps it correct as it shrinks.
+        for sec_idx in 0..self.sections.len() {
+            self.fixup_alignment_markers(sec_idx);
+        }
+
+        // Relax long jumps to short form where possible.
+        self.relax_jumps();
+
+        // Fix alignment/org markers for EVERY section again: relaxation only
+        // maintains them for sections that actually contain jumps
+        // (.eh_frame never had its `.align` padding fixed up otherwise).
         for sec_idx in 0..self.sections.len() {
             self.fixup_alignment_markers(sec_idx);
         }
@@ -2274,7 +2365,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
 
                     if target_sec == sec_idx && is_local
-                        && (reloc.reloc_type == A::reloc_pc32() || reloc.reloc_type == A::reloc_plt32())
+                        && (reloc.reloc_type == A::reloc_pc32() || reloc.reloc_type == A::reloc_plt32()
+                            || (reloc.reloc_type == A::reloc_pc64() && reloc.patch_size == 8))
                     {
                         let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
                         resolved.push((reloc.offset as usize, rel, reloc.patch_size as usize));

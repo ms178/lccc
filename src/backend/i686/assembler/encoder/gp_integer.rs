@@ -413,6 +413,35 @@ impl super::InstructionEncoder {
             return Err("pushw requires 1 operand".to_string());
         }
         match &ops[0] {
+            // `pushw %cx` -- 16-bit register push (0x66 prefix + 0x50+rd).
+            // Segment registers keep their own one-byte opcodes and take no
+            // prefix. Mirrors `encode_pop16`, which already supported all of
+            // these; only the push side was immediate-only, so the kernel's
+            // `pushw %cx` in arch/x86/boot/startup/efi-mixed.S failed.
+            Operand::Register(reg) => {
+                if is_segment_reg(&reg.name) {
+                    match reg.name.as_str() {
+                        "es" => { self.bytes.push(0x06); Ok(()) }
+                        "cs" => { self.bytes.push(0x0E); Ok(()) }
+                        "ss" => { self.bytes.push(0x16); Ok(()) }
+                        "ds" => { self.bytes.push(0x1E); Ok(()) }
+                        "fs" => { self.bytes.extend_from_slice(&[0x0F, 0xA0]); Ok(()) }
+                        "gs" => { self.bytes.extend_from_slice(&[0x0F, 0xA8]); Ok(()) }
+                        _ => Err(format!("cannot push {}", reg.name)),
+                    }
+                } else {
+                    let num = reg_num(&reg.name).ok_or("bad register")?;
+                    self.bytes.push(0x66);
+                    self.bytes.push(0x50 + num);
+                    Ok(())
+                }
+            }
+            // `pushw mem` -- 0x66 FF /6.
+            Operand::Memory(mem) => {
+                self.bytes.push(0x66);
+                self.bytes.push(0xFF);
+                self.encode_modrm_mem(6, mem)
+            }
             Operand::Immediate(ImmediateValue::Integer(val)) => {
                 self.bytes.push(0x66);
                 if *val >= -128 && *val <= 127 {
@@ -1201,6 +1230,55 @@ impl super::InstructionEncoder {
     }
 
     /// Encode far jump (ljmpl/ljmp): direct or indirect
+    /// Encode LCALL (far call): 9A cp (direct) or FF /3 (indirect memory).
+    /// Mirror of `encode_ljmp` with ModRM extension /3 and direct opcode 0x9A.
+    pub(super) fn encode_lcall(&mut self, ops: &[Operand]) -> Result<(), String> {
+        match ops.len() {
+            1 => {
+                match &ops[0] {
+                    Operand::Indirect(inner) => match inner.as_ref() {
+                        Operand::Memory(mem) => {
+                            self.emit_segment_prefix(mem);
+                            self.bytes.push(0xFF);
+                            self.encode_modrm_mem(3, mem)
+                        }
+                        Operand::Label(label) => {
+                            self.bytes.push(0xFF);
+                            self.bytes.push(self.modrm(0, 3, 5));
+                            self.add_relocation_for_label(label, R_386_32);
+                            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                            Ok(())
+                        }
+                        _ => Err("lcall indirect requires memory or label operand".to_string()),
+                    },
+                    Operand::Memory(mem) => {
+                        self.emit_segment_prefix(mem);
+                        self.bytes.push(0xFF);
+                        self.encode_modrm_mem(3, mem)
+                    }
+                    _ => Err("lcall requires indirect memory or segment:offset operands".to_string()),
+                }
+            }
+            2 => match (&ops[0], &ops[1]) {
+                (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
+                    self.bytes.push(0x9A);
+                    self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
+                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                    Ok(())
+                }
+                (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) => {
+                    self.bytes.push(0x9A);
+                    self.add_relocation(sym, R_386_32, 0);
+                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                    Ok(())
+                }
+                _ => Err("lcall requires $segment, $offset operands".to_string()),
+            },
+            _ => Err("lcall requires 1 or 2 operands".to_string()),
+        }
+    }
+
     pub(super) fn encode_ljmp(&mut self, ops: &[Operand]) -> Result<(), String> {
         match ops.len() {
             // ljmpl *mem - indirect far jump through memory (FF /5)

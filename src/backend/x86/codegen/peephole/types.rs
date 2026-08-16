@@ -83,6 +83,14 @@ pub(super) enum LineKind {
     /// `dest_reg` is the pre-parsed destination register family (REG_NONE if unknown).
     /// This allows fast register-modification checks without re-parsing.
     Other { dest_reg: RegId },
+
+    /// A line inside a `#APP`/`#NO_APP` inline-asm region. User-authored
+    /// assembly is OPAQUE: it may be a deliberate length template (kernel
+    /// ALTERNATIVE()), a patch site (jump labels, static_call), or have any
+    /// side effect. No pass may remove, rewrite, or reason about it. Marked
+    /// pinned with all reg_refs set and has_indirect_mem=true so every
+    /// conservative fallback path treats it as clobbering everything.
+    InlineAsm,
 }
 
 /// Pre-parsed classification of what kind of extension/operation an instruction performs.

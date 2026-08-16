@@ -1544,6 +1544,20 @@ fn generate_function(
     }
 
     let type_dir = cg.function_type_directive();
+
+    // Align function entries to 16 bytes, as GCC/Clang do at -O1 and above.
+    //
+    // Emitted as a real `.p2align` directive rather than forced onto the
+    // section: section alignment must be derived from the directives a section
+    // actually contains (GNU as semantics). Hard-coding 16 for every executable
+    // section also padded `.pushsection ...,"ax"` sections such as the kernel's
+    // `.altinstr_replacement`, whose contents are addressed by exact byte
+    // offsets from `.altinstructions` -- objtool then rejected the object with
+    // "special: can't find new instruction".
+    if let Some(log2) = cg.function_alignment_log2() {
+        cg.state().emit_fmt(format_args!(".p2align {}", log2));
+    }
+
     cg.state()
         .emit_linkage(&func.name, func.is_static, func.is_weak);
     cg.state().emit_visibility(&func.name, &func.visibility);

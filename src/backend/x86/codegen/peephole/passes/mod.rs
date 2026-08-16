@@ -111,6 +111,45 @@ fn direct_stack_slot_in_line(line: &str) -> Option<(u8, i32)> {
 ///      WRITES its destination, and rax_is_zero must observe that.  Only the
 ///      stack-specialized classification (StoreRbp/LoadRbp) is removed, which
 ///      is what blocks slot-based forwarding/folding passes.
+/// Reclassify every line between `#APP` and `#NO_APP` as `LineKind::InlineAsm`
+/// and pin it. Inline-asm text is user-authored and must reach the assembler
+/// byte-for-byte:
+///   * kernel ALTERNATIVE() templates use deliberate "redundant" instructions
+///     (`movq %rax, %rax`) purely as length placeholders — removing one made
+///     .altinstructions record orig_len=0 ("empty alternative entry", objtool);
+///   * jump-label/static_call sites are patched at RUNTIME at the recorded
+///     offset — any byte moved or removed corrupts the patch;
+///   * label arithmetic (742b-740b) inside .pushsection depends on exact
+///     instruction extents.
+/// Every conservative fallback treats InlineAsm as clobbering everything:
+/// reg_refs = all set, has_indirect_mem = true, pinned = true. The markers
+/// themselves are comments and pass through to the assembler harmlessly.
+fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
+    let mut in_asm = false;
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        if trimmed == "#APP" {
+            in_asm = true;
+            continue;
+        }
+        if trimmed == "#NO_APP" {
+            in_asm = false;
+            continue;
+        }
+        if in_asm {
+            infos[i] = LineInfo {
+                kind: LineKind::InlineAsm,
+                ext_kind: ExtKind::None,
+                trim_start: infos[i].trim_start,
+                has_indirect_mem: true,
+                rbp_offset: RBP_OFFSET_NONE,
+                reg_refs: u16::MAX,
+                pinned: true,
+            };
+        }
+    }
+}
+
 fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
     for i in 0..store.len() {
@@ -248,6 +287,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     let mut store = LineStore::new(asm);
     let line_count = store.len();
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
+    pin_inline_asm_regions(&store, &mut infos);
     pin_volatile_stack_slots(&store, &mut infos);
     pin_address_taken_stack_slots(&store, &mut infos);
 

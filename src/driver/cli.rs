@@ -697,6 +697,18 @@ impl Driver {
                 // Machine/target flags
                 "-mfunction-return=thunk-extern" => self.function_return_thunk = true,
                 "-mindirect-branch=thunk-extern" => self.indirect_branch_thunk = true,
+                // thunk-inline: full retpoline expanded at each indirect
+                // branch site. The kernel vDSO needs this — it is userspace
+                // code that cannot reference kernel-internal thunk symbols.
+                "-mindirect-branch=thunk-inline" => self.indirect_branch_thunk_inline = true,
+                // -mindirect-branch-register: indirect branches only through
+                // registers, never memory. Vacuous for lccc: the only
+                // indirect-branch patterns emitted are `call *%reg`/`jmp *%reg`.
+                "-mindirect-branch-register" => {}
+                // -mindirect-branch-cs-prefix: CS segment prefix before
+                // indirect-thunk calls so objtool can patch the 6-byte site.
+                // Recorded; only meaningful with thunk-extern which we honor.
+                "-mindirect-branch-cs-prefix" => self.indirect_branch_cs_prefix = true,
                 "-m16" => {
                     // -m16 generates i386 code with .code16gcc prepended so the
                     // GNU assembler adds operand/address-size override prefixes
@@ -722,6 +734,33 @@ impl Driver {
                 }
                 "-mno-sse" | "-mno-sse2" => self.no_sse = true,
                 "-mno-mmx" | "-mno-3dnow" => {}
+                // ── Kernel -m flags with per-flag semantic justification ──
+                // (The blanket -mno-* fallback below covers pure ISA-disable
+                // probes; flags listed here need MORE than "we never emit it".)
+                //
+                // -mno-red-zone: forbid writes below %rsp. lccc NEVER uses the
+                // red zone by construction: locals live at non-negative offsets
+                // from a frame established by sub-rsp in the prologue, and leaf
+                // functions still allocate their frame explicitly.
+                "-mno-red-zone" => {}
+                // -mno-80387 / -mno-fp-ret-in-387: no x87 instructions, no x87
+                // FP returns. NOT vacuous — lccc's long-double path emits x87.
+                // Record it so FP codegen can reject long-double operations
+                // instead of silently emitting x87 in kernel objects.
+                "-mno-80387" | "-msoft-float" | "-mno-fp-ret-in-387" => self.no_x87 = true,
+                // -malign-data=abi|compat|cacheline: data alignment policy.
+                // lccc aligns to natural ABI alignment which satisfies abi and
+                // compat; cacheline only ever OVER-aligns (a performance
+                // preference, not a semantic contract), so accepting is sound.
+                s if s.starts_with("-malign-data=") => {}
+                // -mharden-sls: straight-line-speculation hardening (INT3
+                // after RET/indirect JMP). Not implemented; silently ignoring
+                // would strip a requested mitigation.
+                s if s.starts_with("-mharden-sls=") && s != "-mharden-sls=none" => {
+                    return Err("ccc: error: -mharden-sls straight-line-speculation hardening \
+                                not supported; disable CONFIG_MITIGATION_SLS".to_string());
+                }
+                "-mharden-sls=none" => {}
                 "-mno-avx2" => { self.enable_avx2=false; self.enable_avxvnni=false; self.enable_avxvnniint8=false; self.enable_avxvnniint16=false; }
                 "-mno-avx" => { self.enable_avx=false; self.enable_avx2=false; self.enable_avxvnni=false; self.enable_vaes=false; self.enable_vpclmulqdq=false; }
                 "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => { self.enable_sse3=false; self.enable_ssse3=false; self.enable_sse4_1=false; self.enable_sse4_2=false; self.enable_avx=false; self.enable_avx2=false; }
@@ -851,6 +890,21 @@ impl Driver {
                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
                         Target::X86_64 | Target::I686 => match march {
                             "x86-64" | "x86-64-v1" | "generic" => {}
+                            // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
+                            // pass `-march=i386 -m16`). The i686 backend's
+                            // baseline output uses no instruction newer than
+                            // the 486 except CMOV in explicit-asm paths; the
+                            // kernel pairs this with -mno-sse/-mno-80387 which
+                            // are honored independently. Real-mode setup code
+                            // executes on the boot CPU — a physical x86-64
+                            // machine — so the i686 baseline is sound there.
+                            "i386" | "i486" | "i586" | "i686"
+                            | "pentium" | "pentiumpro" | "pentium-mmx" => {
+                                if self.target != Target::I686 {
+                                    return Err(format!(
+                                        "-march={} is only valid with -m32/-m16 (i686 target)", march));
+                                }
+                            }
                             "nehalem" => self.enable_x86_nehalem_profile(),
                             "westmere" => self.enable_x86_westmere_profile(),
                             "sandybridge" => self.enable_x86_sandybridge_profile(),
@@ -902,10 +956,66 @@ impl Driver {
                         self.target = Target::Aarch64;
                     }
                 }
+                // GCC's -mskip-rax-setup: omit the `xorl %eax,%eax` that tells
+                // a variadic callee how many SSE argument registers are live.
+                // Legal exactly when no SSE argument register can ever be used,
+                // which the kernel guarantees by also passing -mno-sse
+                // (arch/x86/Makefile enables both). Honoured only in that
+                // combination: dropping the setup while floats can still be
+                // passed would leave the callee's register save area undefined.
+                "-mskip-rax-setup" => self.skip_rax_setup = true,
                 "-mno-relax" => self.riscv_no_relax = true,
                 arg if arg.starts_with("-mregparm=") => {
                     let n: u8 = arg["-mregparm=".len()..].parse().unwrap_or(0);
                     self.regparm = n.min(3);
+                }
+                // `-mpreferred-stack-boundary=N` (GCC) / `-mstack-alignment=N`
+                // (Clang): request a stack alignment of 2^N / N bytes.
+                //
+                // LCCC always keeps %rsp 16-byte aligned at call sites, as the
+                // SysV ABI requires. A request for a SMALLER boundary is a
+                // permission to align less, not an obligation, so accept it:
+                // the kernel passes `-mpreferred-stack-boundary=3` for its
+                // realmode and 32-bit entry paths (arch/x86/Makefile). A LARGER
+                // boundary is an obligation LCCC cannot meet (no dynamic stack
+                // realignment) and must stay an error rather than silently
+                // miscompile.
+                arg if arg.starts_with("-mpreferred-stack-boundary=")
+                    || arg.starts_with("-mstack-alignment=") =>
+                {
+                    let (val, log2) = if let Some(v) = arg.strip_prefix("-mpreferred-stack-boundary=") {
+                        (v, true)
+                    } else {
+                        (&arg["-mstack-alignment=".len()..], false)
+                    };
+                    let n: u32 = val.parse().map_err(|_| format!("invalid argument to {}", arg))?;
+                    let bytes = if log2 {
+                        1u32.checked_shl(n).ok_or_else(|| format!("invalid argument to {}", arg))?
+                    } else {
+                        n
+                    };
+                    if bytes > 16 {
+                        return Err(format!(
+                            "{}: LCCC guarantees 16-byte stack alignment and cannot realign the stack to {} bytes",
+                            arg, bytes));
+                    }
+                }
+                // `-mno-<feature>` for an ISA extension LCCC never emits.
+                //
+                // Rejecting these is wrong in principle: the flag asks the
+                // compiler NOT to use a feature, and a compiler that cannot
+                // generate it already complies. The strict policy below exists
+                // to catch *enabling* flags whose codegen is unimplemented --
+                // silently ignoring those would miscompile. A disable flag has
+                // no such hazard. The kernel probes with `-mno-sse4a` and
+                // friends (arch/x86/Makefile); a hard error aborted the build
+                // at scripts/mod/empty.o before any kernel object compiled.
+                // Features LCCC *can* emit keep their explicit arms above.
+                arg if arg.starts_with("-mno-") => {
+                    if std::env::var("LCCC_STRICT_MFLAGS").is_ok() {
+                        return Err(format!(
+                            "unsupported machine option {}; LCCC_STRICT_MFLAGS is set", arg));
+                    }
                 }
                 arg if arg.starts_with("-m") => {
                     return Err(format!("unsupported machine option {}; LCCC refuses to silently ignore target-affecting -m flags", arg));
@@ -994,6 +1104,34 @@ impl Driver {
                         self.color_mode = mode;
                     }
                     // Unknown values silently ignored (matching GCC)
+                }
+                // Function instrumentation for tracers/profilers. LCCC emits no
+                // `call __fentry__` / `call mcount` at function entry, so
+                // accepting these silently yields a kernel whose ftrace
+                // infrastructure exists but is never called -- a silently dead
+                // tracer. Refuse; the kernel then needs CONFIG_FUNCTION_TRACER=n.
+                a @ ("-pg" | "-mfentry" | "-mrecord-mcount" | "-mnop-mcount") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement function-entry instrumentation \
+                         (no __fentry__/mcount call is emitted)", a));
+                }
+                // Stack-protector request. LCCC does NOT emit canaries, so
+                // silently accepting these would hand the caller a binary it
+                // believes is hardened but is not -- the worst failure mode for
+                // a security feature. `-fno-stack-protector` is what LCCC
+                // already does and stays accepted.
+                a @ ("-fstack-protector"
+                | "-fstack-protector-all"
+                | "-fstack-protector-strong"
+                | "-fstack-protector-explicit") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement stack-protector canaries; \
+                         build with -fno-stack-protector", a));
+                }
+                arg if arg.starts_with("-mstack-protector-guard") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement stack-protector canaries; \
+                         build with -fno-stack-protector", arg));
                 }
                 arg if arg.starts_with("-f") => {}
 

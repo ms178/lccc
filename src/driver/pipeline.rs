@@ -106,6 +106,17 @@ pub struct Driver {
     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
     pub(super) no_sse: bool,
+    pub(super) skip_rax_setup: bool,
+    /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
+    /// Recorded so FP codegen can fail closed on long-double paths.
+    #[allow(dead_code)]
+    pub(super) no_x87: bool,
+    /// -mindirect-branch=thunk-inline: expand the full retpoline at each
+    /// indirect branch site (kernel vDSO: userspace code, no kernel thunks).
+    pub(super) indirect_branch_thunk_inline: bool,
+    /// -mindirect-branch-cs-prefix: CS prefix before thunk calls.
+    #[allow(dead_code)]
+    pub(super) indirect_branch_cs_prefix: bool,
     /// Explicit SIMD feature flags from -msse3, -msse4.1, -mavx, -mavx2, etc.
     /// When set, the corresponding __SSE3__, __AVX__, __AVX2__ macros are defined.
     /// These flags enable projects like blosc to compile SIMD-optimized code paths.
@@ -340,6 +351,10 @@ impl Driver {
             patchable_function_entry: None,
             cf_protection_branch: false,
             no_sse: false,
+            skip_rax_setup: false,
+            no_x87: false,
+            indirect_branch_thunk_inline: false,
+            indirect_branch_cs_prefix: false,
             enable_sse3: false,
             enable_ssse3: false,
             enable_sse4_1: false,
@@ -1570,6 +1585,54 @@ impl Driver {
                     block.label = label_map[&block.label];
                 }
 
+                // Renumber label references held INSIDE instructions.
+                //
+                // Terminators are not the only place a BlockId appears:
+                //
+                //  * `InlineAsm::goto_labels` -- `asm goto` targets. Missing
+                //    this left the asm template pointing at a pre-renumber id,
+                //    so `%l[l_yes]` expanded to `.LBB6` while the block was
+                //    emitted as `.LBB2`. The label was referenced but never
+                //    defined; the assembler then produced a relocation against
+                //    a null symbol and objtool rejected the object
+                //    ("special: can't find new instruction"). Every kernel
+                //    static-branch site (`__jump_table`) hits this.
+                //  * `Phi::incoming` -- the predecessor label of each value.
+                //  * `LabelAddr` -- `&&label` computed-goto addresses.
+                //  * `global_init_label_blocks` -- `&&label` in static data.
+                for block in &mut func.blocks {
+                    use crate::ir::reexports::Instruction;
+                    for inst in &mut block.instructions {
+                        match inst {
+                            Instruction::InlineAsm { goto_labels, .. } => {
+                                for (_, target) in goto_labels.iter_mut() {
+                                    if let Some(&new) = label_map.get(target) {
+                                        *target = new;
+                                    }
+                                }
+                            }
+                            Instruction::Phi { incoming, .. } => {
+                                for (_, pred) in incoming.iter_mut() {
+                                    if let Some(&new) = label_map.get(pred) {
+                                        *pred = new;
+                                    }
+                                }
+                            }
+                            Instruction::LabelAddr { label, .. } => {
+                                if let Some(&new) = label_map.get(label) {
+                                    *label = new;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for target in &mut func.global_init_label_blocks {
+                    if let Some(&new) = label_map.get(target) {
+                        *target = new;
+                    }
+                }
+
                 // Renumber all terminator targets
                 for block in &mut func.blocks {
                     use crate::ir::reexports::Terminator;
@@ -1694,8 +1757,14 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,
+            indirect_branch_thunk_inline: self.indirect_branch_thunk_inline,
             patchable_function_entry: self.patchable_function_entry,
             cf_protection_branch: self.cf_protection_branch,
+            // GCC/Clang align function entries to 16 bytes at -O1..-O3 and
+            // leave them unaligned at -Os/-Oz. Emitted as a real `.p2align` so
+            // section alignment keeps following GNU as semantics.
+            function_alignment: if self.opt_level >= 1 && self.opt_level <= 3 { 16 } else { 0 },
+            skip_rax_setup: self.skip_rax_setup,
             no_sse: self.no_sse,
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,

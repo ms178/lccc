@@ -42,6 +42,10 @@ pub(crate) struct CodegenOptions {
     pub(crate) function_return_thunk: bool,
     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern)
     pub(crate) indirect_branch_thunk: bool,
+    /// Whether to expand the full retpoline inline at each indirect branch
+    /// site (-mindirect-branch=thunk-inline). Kernel vDSO objects use this:
+    /// they run in userspace and cannot reference kernel thunk symbols.
+    pub(crate) indirect_branch_thunk_inline: bool,
     /// Patchable function entry: (total_nops, nops_before_entry).
     /// -fpatchable-function-entry=N[,M] emits NOP padding around function entry points
     /// and records them in __patchable_function_entries for runtime patching (ftrace).
@@ -55,6 +59,13 @@ pub(crate) struct CodegenOptions {
     /// TODO: Full -mno-sse support would also need to avoid SSE in float
     /// operations, casts, and other FP codegen paths. Currently only the
     /// variadic ABI path is gated, which is sufficient for the Linux kernel.
+    /// Byte alignment for function entry labels (`.p2align log2`). 0 = none.
+    /// GCC/Clang use 16 at -O1..-O3 and none at -Os/-Oz.
+    pub(crate) function_alignment: u32,
+    /// -mskip-rax-setup: omit the `xorl %eax,%eax` / `movb $n,%al` reporting the
+    /// number of live SSE argument registers to a variadic callee. Only honoured
+    /// together with `no_sse`, where no such register can be in use.
+    pub(crate) skip_rax_setup: bool,
     pub(crate) no_sse: bool,
     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
     /// On AArch64, this prevents FP/SIMD register usage in variadic function

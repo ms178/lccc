@@ -98,6 +98,76 @@ impl Preprocessor {
     /// Replace `defined(X)`, `defined X`, `__has_builtin(X)`, `__has_attribute(X)`,
     /// `__has_feature(X)`, `__has_extension(X)`, `__has_include(X)`, and
     /// `__has_include_next(X)` with 0 or 1 in a #if expression.
+    /// Replace `__has_builtin(X)`, `__has_attribute(X)`, `__has_feature(X)`
+    /// and `__has_extension(X)` with 0/1 in an ORDINARY code line.
+    ///
+    /// GCC and Clang implement these as preprocessor built-in macros, so they
+    /// expand EVERYWHERE — not just inside #if. The kernel relies on that:
+    /// kernel/trace/trace.c computes `10*1000 + 4*100 + __has_attribute(
+    /// btf_type_tag)` in a plain C expression. Note `defined` and
+    /// `__has_include` are NOT handled here: `defined` is only an operator
+    /// inside #if/#elif (a code-line `defined` is an ordinary identifier),
+    /// and __has_include's argument grammar (<...>) is directive-only.
+    pub(super) fn resolve_has_macros_in_code(&self, line: &str) -> String {
+        // Fast path: the overwhelming majority of lines have no __has_ token.
+        if !line.contains("__has_") {
+            return line.to_string();
+        }
+        let mut result = String::new();
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            // Skip string and char literals verbatim: `"__has_attribute"` in
+            // a string must not be rewritten.
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                let quote = bytes[i];
+                result.push(bytes[i] as char);
+                i += 1;
+                while i < len && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < len {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+            if is_ident_start_byte(bytes[i]) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+                match ident {
+                    "__has_builtin" => {
+                        let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
+                        result.push_str(val);
+                    }
+                    "__has_attribute" => {
+                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i);
+                        result.push_str(val);
+                    }
+                    "__has_feature" | "__has_extension" => {
+                        self.skip_paren_arg_bytes(bytes, &mut i);
+                        result.push('0');
+                    }
+                    _ => result.push_str(ident),
+                }
+                continue;
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
+    }
+
     pub(super) fn resolve_defined_in_expr(&mut self, expr: &str) -> String {
         let mut result = String::new();
         let bytes = expr.as_bytes();

@@ -362,6 +362,10 @@ impl Lowerer {
             | "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" => Some(IrType::I32),
             // Memory/string comparison builtins return int
             "__builtin_memcmp" | "__builtin_strcmp" | "__builtin_strncmp" => Some(IrType::I32),
+            // Pointer-returning string/memory builtins (kernel fortify-string.h).
+            "__builtin_memchr" | "__builtin_strpbrk" | "__builtin_strncat"
+            | "__builtin_stpncpy" => Some(IrType::Ptr),
+            "__builtin_strspn" | "__builtin_strcspn" => Some(IrType::U64),
             // I/O builtins return int
             "__builtin_printf" | "__builtin_fprintf" | "__builtin_sprintf"
             | "__builtin_snprintf" | "__builtin_puts" | "__builtin_putchar" => Some(IrType::I32),

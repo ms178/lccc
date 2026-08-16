@@ -443,6 +443,49 @@ pub(crate) struct MacroDef {
     body: Vec<String>,
 }
 
+/// Index of the first `=` that separates a parameter name from its default.
+///
+/// Ignores `=` inside parentheses and skips the comparison operators `==`,
+/// `!=`, `<=` and `>=` so an expression default is never split mid-operator.
+fn find_toplevel_eq(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'=' if depth == 0 => {
+                let prev = if i > 0 { b[i - 1] } else { 0 };
+                let next = if i + 1 < b.len() { b[i + 1] } else { 0 };
+                let is_cmp = matches!(prev, b'!' | b'<' | b'>' | b'=') || next == b'=';
+                if !is_cmp {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip GAS parameter qualifiers from a `.macro` parameter name.
+///
+/// GAS allows `name:req` (argument is mandatory) and `name:vararg` (argument
+/// swallows the rest of the line). The qualifier is not part of the parameter
+/// NAME: the body refers to `\ftr`, not `\ftr:req`. Keeping the qualifier in
+/// the name meant substitution never fired, and the kernel's
+/// `.macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=...` left every
+/// `\ftr` unexpanded in the macro body.
+fn strip_param_qualifiers(name: &str) -> String {
+    match name.split_once(':') {
+        Some((base, qual))
+            if matches!(qual, "req" | "vararg") && !base.is_empty() => base.to_string(),
+        _ => name.to_string(),
+    }
+}
+
 /// Parse macro parameter list, handling `param = default_value` syntax.
 ///
 /// GAS allows parameters like `enable = 1` where `1` is the default value
@@ -455,14 +498,30 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
     let mut params = Vec::new();
     let mut defaults = Vec::new();
 
-    // Split on commas first (primary separator), then handle whitespace within each part
-    for part in params_str.split(',') {
+    // Split on TOP-LEVEL commas only: a parameter default may itself contain
+    // commas inside parentheses. The kernel's
+    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
+    // expands ALT_NOT() to `((... << 16) | ((3*32+21)))`, and a naive
+    // `split(',')` tore that default apart, leaving a bogus parameter whose
+    // value later reached `.4byte` as the unparsable fragment `(((1`.
+    for part in split_on_commas_raw(params_str) {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        // Check for `param = default_value` syntax
-        if let Some(eq_pos) = part.find('=') {
+        // Check for `param = default_value` syntax.
+        //
+        // Only the FIRST `=` at paren depth 0 separates the name from the
+        // default; everything after it belongs to the default, spaces included.
+        // The tokens before it are additional parameters (GAS allows
+        // whitespace as a separator), but the default itself must never be
+        // whitespace-split: the kernel writes
+        //     .macro FILL_RETURN_BUFFER ... ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
+        // whose default expands to `(((1 << 0) << 16) | ((3*32+21)))`. Treating
+        // the spaces inside it as parameter separators invented parameters
+        // named `<<` and `0)` and left `\ftr2` expanding to the fragment
+        // `(((1`, which then reached `.4byte` as an unparsable expression.
+        if let Some(eq_pos) = find_toplevel_eq(part) {
             let param_name = part[..eq_pos].trim();
             let default_val = part[eq_pos + 1..].trim();
             // The param name might contain spaces (e.g., "enable = 1")
@@ -472,13 +531,13 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
             if tokens.len() > 1 {
                 // Everything before the last token are separate params with no default
                 for t in &tokens[..tokens.len() - 1] {
-                    params.push(t.to_string());
+                    params.push(strip_param_qualifiers(t));
                     defaults.push(None);
                 }
             }
             if let Some(last) = tokens.last() {
                 if !last.is_empty() {
-                    params.push(last.to_string());
+                    params.push(strip_param_qualifiers(last));
                     defaults.push(Some(default_val.to_string()));
                 }
             }
@@ -486,7 +545,7 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
             // No default value - may contain space-separated params
             for token in part.split_whitespace() {
                 if !token.is_empty() {
-                    params.push(token.to_string());
+                    params.push(strip_param_qualifiers(token));
                     defaults.push(None);
                 }
             }
