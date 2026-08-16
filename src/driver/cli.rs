@@ -1290,6 +1290,91 @@ mod cli_tests {
     use super::cmp_version;
     use crate::driver::pipeline::Driver;
 
+    /// Parse one flag against a fresh Driver, returning the error text if any.
+    fn try_flag(flag: &str) -> Result<(), String> {
+        let mut d = Driver::new();
+        // args[0] is argv[0] (used for target detection from the binary name).
+        let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
+        d.parse_cli_args(&args).map(|_| ())
+    }
+
+    /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
+    /// emits. A compiler that cannot generate a feature already complies with
+    /// a request not to use it, and the Linux kernel probes the compiler with
+    /// these before a single object is built (arch/x86/Makefile). Rejecting
+    /// them aborted the build at scripts/mod/empty.o.
+    #[test]
+    fn mno_feature_flags_are_accepted() {
+        for f in [
+            "-mno-sse4a", "-mno-3dnowa", "-mno-avx512vbmi2", "-mno-tbm",
+            "-mno-xop", "-mno-fma4", "-mno-rtm", "-mno-hle",
+        ] {
+            assert!(try_flag(f).is_ok(), "{} must be accepted", f);
+        }
+    }
+
+    /// An ENABLING flag whose codegen is unimplemented must still be rejected:
+    /// silently ignoring it would miscompile.
+    #[test]
+    fn unimplemented_enable_flags_still_rejected() {
+        assert!(try_flag("-msse4a").is_err(), "-msse4a must be rejected");
+    }
+
+    /// Stack alignment: a request for <= 16 bytes is permission to align less
+    /// (LCCC always keeps %rsp 16-byte aligned, so it already conforms); a
+    /// request for MORE is an obligation LCCC cannot meet and must be an
+    /// error rather than a silent miscompile. The kernel passes
+    /// `-mpreferred-stack-boundary=3` for realmode/32-bit entry code.
+    #[test]
+    fn stack_boundary_accepts_smaller_rejects_larger() {
+        for f in [
+            "-mpreferred-stack-boundary=2",
+            "-mpreferred-stack-boundary=3",
+            "-mpreferred-stack-boundary=4",
+            "-mstack-alignment=8",
+            "-mstack-alignment=16",
+        ] {
+            assert!(try_flag(f).is_ok(), "{} must be accepted", f);
+        }
+        for f in ["-mpreferred-stack-boundary=5", "-mstack-alignment=32"] {
+            assert!(try_flag(f).is_err(), "{} must be rejected", f);
+        }
+    }
+
+    /// LCCC emits no stack-protector canary and no function-entry
+    /// instrumentation. Accepting these silently would hand the caller a
+    /// binary it believes is hardened / traceable but is not -- the worst
+    /// failure mode for a security or observability feature. The kernel then
+    /// needs CONFIG_STACKPROTECTOR=n / CONFIG_FUNCTION_TRACER=n, which is a
+    /// decision the build system can only make if we say so.
+    #[test]
+    fn unimplemented_hardening_is_refused_not_ignored() {
+        for f in [
+            "-fstack-protector", "-fstack-protector-all",
+            "-fstack-protector-strong", "-fstack-protector-explicit",
+            "-mstack-protector-guard=global",
+            "-mstack-protector-guard-reg=gs",
+            "-mstack-protector-guard-symbol=__ref_stack_chk_guard",
+            "-pg", "-mfentry", "-mrecord-mcount", "-mnop-mcount",
+        ] {
+            assert!(try_flag(f).is_err(),
+                    "{} must be refused, not silently ignored", f);
+        }
+        // The opposite request is exactly what LCCC already does.
+        assert!(try_flag("-fno-stack-protector").is_ok());
+    }
+
+    /// `-mskip-rax-setup` is honoured only together with `-mno-sse`, where no
+    /// SSE argument register can be live. Both must parse.
+    #[test]
+    fn skip_rax_setup_parses() {
+        assert!(try_flag("-mskip-rax-setup").is_ok());
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mskip-rax-setup", "-mno-sse", "x.c"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+    }
+
     #[test]
     fn version_compare_is_numeric() {
         // Lexical sort would order "9.5.0" after "16.1.1"; numeric must not.

@@ -61,6 +61,11 @@ pub const R_386_32: u32 = 1;
 pub const R_386_PC32: u32 = 2;
 pub const R_386_GOT32: u32 = 3;
 pub const R_386_PLT32: u32 = 4;
+/// 16-bit absolute (word16). Kernel realmode code stores 16-bit segment
+/// values (`.word (to), real_mode_seg` in realmode.h LJMPW_RM); the kernel's
+/// relocs tool distinguishes R_386_16-against-segment-symbol (legal, recorded
+/// in relocs16) from R_386_32 (rejected as "Invalid absolute relocation").
+pub const R_386_16: u32 = 20;
 pub const R_386_GOTOFF: u32 = 9;
 pub const R_386_GOTPC: u32 = 10;
 pub const R_386_TLS_LE_32: u32 = 37;
@@ -712,6 +717,15 @@ impl InstructionEncoder {
             "lahf" => { self.bytes.push(0x9F); Ok(()) }
             "pushf" | "pushfl" => { self.bytes.push(0x9C); Ok(()) }
             "popf" | "popfl" => { self.bytes.push(0x9D); Ok(()) }
+            // PUSHA/POPA (60/61): push/pop all eight GP registers. 32-bit
+            // only (invalid in 64-bit mode — correctly absent from the x86-64
+            // encoder). Kernel realmode BIOS trampolines save the full
+            // register file around INT calls (arch/x86/boot/bioscall.S).
+            // `pushaw`/`popaw` are the 16-bit-operand forms (0x66 prefix).
+            "pusha" | "pushal" => { self.bytes.push(0x60); Ok(()) }
+            "popa" | "popal" => { self.bytes.push(0x61); Ok(()) }
+            "pushaw" => { self.bytes.extend_from_slice(&[0x66, 0x60]); Ok(()) }
+            "popaw" => { self.bytes.extend_from_slice(&[0x66, 0x61]); Ok(()) }
 
             // Leave (stack frame teardown)
             "leave" => { self.bytes.push(0xC9); Ok(()) }

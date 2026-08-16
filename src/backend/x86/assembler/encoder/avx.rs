@@ -2038,6 +2038,26 @@ impl super::InstructionEncoder {
                 self.bytes.push((mask_full & 0xF) << 4);
                 Ok(())
             }
+            // AT&T: %mask, mem, %vvvv, %dst — the rm operand is a memory
+            // reference (VEX /is4 allows m128/m256 in the ModRM.rm slot).
+            // Kernel crc-pclmul-template.S:
+            //   vpblendvb %xmm3, -16(BUF,LEN), %xmm1, %xmm1
+            // blends the final partial vector straight from memory.
+            (Operand::Register(mask), Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let mask_num = reg_num(&mask.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
+                self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)?;
+                let mask_full = mask_num | (if needs_vex_ext(&mask.name) { 8 } else { 0 });
+                self.bytes.push((mask_full & 0xF) << 4);
+                Ok(())
+            }
             _ => Err("unsupported AVX 4-op operands".to_string()),
         }
     }

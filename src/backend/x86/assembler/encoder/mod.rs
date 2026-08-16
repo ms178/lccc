@@ -1166,6 +1166,19 @@ impl InstructionEncoder {
             "crc32w" => self.encode_crc32(ops, 2),
             "crc32l" => self.encode_crc32(ops, 4),
             "crc32q" => self.encode_crc32(ops, 8),
+            // Suffix-less crc32: source register width decides the form
+            // (kernel crc32c-3way.S writes `crc32 %rax, %rdi`).
+            "crc32" => {
+                let size = match ops.first() {
+                    Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                    _ => 8,
+                };
+                self.encode_crc32(ops, size)
+            }
+            // AMD MONITORX/MWAITX (kernel delay_mwaitx; implicit operands):
+            // 0F 01 FA / 0F 01 FB.
+            "monitorx" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFA]); Ok(()) }
+            "mwaitx" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFB]); Ok(()) }
 
             // x87 FPU
             "fldt" => self.encode_x87_mem(ops, &[0xDB], 5),
