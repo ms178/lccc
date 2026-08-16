@@ -434,6 +434,27 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
+            // Absolute address given as a bare label: `movzwl sym, %eax`.
+            // The parser yields Operand::Label rather than a MemoryOperand, so
+            // without this arm the instruction was rejected outright. Reuse the
+            // existing synthesize-a-MemoryOperand idiom (same as `mov`) so the
+            // RIP-relative / absolute decision stays in one place.
+            (Operand::Label(label), Operand::Register(dst)) => {
+                let mem = MemoryOperand {
+                    segment: None,
+                    displacement: Displacement::Symbol(label.clone()),
+                    base: None,
+                    index: None,
+                    scale: None,
+                    mask: None,
+                    zeroing: false,
+                };
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                if dst_size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_rm(rex_size, &dst.name, &mem);
+                self.bytes.extend_from_slice(&opcode);
+                self.encode_modrm_mem(dst_num, &mem)?;
+            }
             _ => return Err("unsupported movzx operands".to_string()),
         }
         Ok(())

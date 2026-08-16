@@ -46,7 +46,8 @@ impl super::InstructionEncoder {
 
         // Handle zero-operand form (implicit operands)
         if ops.is_empty() {
-            if size == 2 { self.bytes.push(0x66); }
+            if size == 2 || size == 4 { self.sized_op = true; }
+        if size == 2 { self.bytes.push(0x66); }
             self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
             return Ok(());
         }
@@ -57,12 +58,14 @@ impl super::InstructionEncoder {
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(_src), Operand::Register(_dst)) => {
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 { self.sized_op = true; }
+        if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
                 Ok(())
             }
             (Operand::Register(_src), Operand::Immediate(ImmediateValue::Integer(val))) => {
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 { self.sized_op = true; }
+        if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xE6 } else { 0xE7 });
                 self.bytes.push(*val as u8);
                 Ok(())
@@ -81,7 +84,8 @@ impl super::InstructionEncoder {
         };
 
         if ops.is_empty() {
-            if size == 2 { self.bytes.push(0x66); }
+            if size == 2 || size == 4 { self.sized_op = true; }
+        if size == 2 { self.bytes.push(0x66); }
             self.bytes.push(if size == 1 { 0xEC } else { 0xED });
             return Ok(());
         }
@@ -92,12 +96,14 @@ impl super::InstructionEncoder {
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(_src), Operand::Register(_dst)) => {
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 { self.sized_op = true; }
+        if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xEC } else { 0xED });
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_dst)) => {
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 { self.sized_op = true; }
+        if size == 2 { self.bytes.push(0x66); }
                 self.bytes.push(if size == 1 { 0xE4 } else { 0xE5 });
                 self.bytes.push(*val as u8);
                 Ok(())
@@ -151,7 +157,7 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let is_16 = matches!(src.name.as_str(), "ax"|"bx"|"cx"|"dx"|"si"|"di"|"sp"|"bp");
                 if is_16 {
-                    self.bytes.push(0x66);
+                    self.sized_op = true; self.bytes.push(0x66);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x03]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -199,6 +205,12 @@ impl super::InstructionEncoder {
             "lidt" => 3,
             _ => return Err(format!("unknown system table instruction: {}", mnemonic)),
         };
+        // `lgdtl`/`lidtl` load the 32-bit descriptor form; `lgdtw`/`lgdt`
+        // the 16-bit one. In .code16 the 32-bit form needs 0x66, which the
+        // prefix inversion supplies once the size choice is recorded.
+        if mnemonic.ends_with('l') {
+            self.sized_op = true;
+        }
         match &ops[0] {
             Operand::Memory(mem) => {
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
@@ -208,9 +220,7 @@ impl super::InstructionEncoder {
             Operand::Label(label) => {
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 // mod=00, rm=101 for disp32 (no base register)
-                self.bytes.push(self.modrm(0, reg_ext, 5));
-                self.add_relocation_for_label(label, R_386_32);
-                self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                self.encode_abs_addr_modrm(reg_ext, label)?;
                 Ok(())
             }
             _ => Err(format!("{} requires memory operand", mnemonic)),
@@ -251,7 +261,7 @@ impl super::InstructionEncoder {
                 // 16-bit register form needs operand size prefix
                 let is_16 = matches!(reg.name.as_str(), "ax"|"bx"|"cx"|"dx"|"si"|"di"|"sp"|"bp");
                 if is_16 {
-                    self.bytes.push(0x66);
+                    self.sized_op = true; self.bytes.push(0x66);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.bytes.push(self.modrm(3, 4, rm));
@@ -359,7 +369,7 @@ impl super::InstructionEncoder {
                     }
                 } else {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
-                    self.bytes.push(0x66);
+                    self.sized_op = true; self.bytes.push(0x66);
                     self.bytes.push(0x58 + num);
                     Ok(())
                 }
@@ -378,7 +388,7 @@ impl super::InstructionEncoder {
             "bsfw" => [0x0F, 0xBC],
             _ => return Err(format!("unknown bit scan: {}", mnemonic)),
         };
-        self.bytes.push(0x66); // 16-bit operand size prefix
+        self.sized_op = true; self.bytes.push(0x66); // 16-bit operand size prefix
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;

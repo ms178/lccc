@@ -90,6 +90,21 @@ pub struct InstructionEncoder {
     /// this field is infrastructure for future per-instruction operand size overrides.
     #[allow(dead_code)]
     pub code16gcc: bool,
+    /// True while assembling a `.code16` region (real mode).
+    ///
+    /// In 16-bit mode the DEFAULT operand and address size is 16, so the
+    /// meaning of the 0x66/0x67 override prefixes is exactly inverted relative
+    /// to 32-bit mode: a 16-bit operation needs NO prefix and a 32-bit
+    /// operation needs 0x66. Addressing likewise switches to the 16-bit
+    /// ModR/M table with disp16 and no SIB byte.
+    pub code16: bool,
+    /// Set by `encode_modrm_mem` when a `.code16` operand had to fall back to
+    /// 32-bit addressing and therefore needs a 0x67 override.
+    pub(super) pending_addr32: bool,
+    /// Set by an encoder that chose an operand WIDTH for this instruction
+    /// (i.e. one where 16- vs 32-bit operands are distinguishable). Only such
+    /// instructions take part in the `.code16` operand-size inversion.
+    pub(super) sized_op: bool,
 }
 
 impl InstructionEncoder {
@@ -99,6 +114,9 @@ impl InstructionEncoder {
             relocations: Vec::new(),
             offset: 0,
             code16gcc: false,
+            code16: false,
+            pending_addr32: false,
+            sized_op: false,
         }
     }
 
@@ -118,11 +136,99 @@ impl InstructionEncoder {
 
         let result = self.encode_mnemonic(instr);
 
+        // `.code16`: invert the operand-size prefix.
+        //
+        // Every encoder below is written for 32-bit mode, where the default
+        // operand size is 32 and a 16-bit operation is marked with 0x66. In
+        // real mode the default is 16, so the SAME instruction needs the
+        // opposite marking: 16-bit gets no prefix, 32-bit gets 0x66. Rewriting
+        // it once here keeps the ~30 individual emit sites free of mode
+        // knowledge and impossible to get individually wrong.
+        //
+        // The address-size prefix follows the same inversion and is added by
+        // `encode_modrm_mem`, which falls back to the 32-bit ModR/M table when
+        // an operand is not expressible in 16-bit form. GAS orders the pair as
+        // 0x67 before 0x66 (verified against binutils 2.47:
+        // `movl %eax,(%eax)` in .code16 assembles to `67 66 89 00`).
+        if result.is_ok() && self.code16 {
+            let addr32 = std::mem::take(&mut self.pending_addr32);
+            self.fixup_code16_prefixes(start_len, addr32);
+        } else {
+            self.pending_addr32 = false;
+        }
+        self.sized_op = false;
+
         if result.is_ok() {
             self.offset += (self.bytes.len() - start_len) as u64;
         }
 
         result
+    }
+
+    /// Rewrite the operand/address-size prefixes of the instruction that
+    /// starts at `start` for 16-bit mode.
+    fn fixup_code16_prefixes(&mut self, start: usize, addr32: bool) {
+        // Locate the legacy-prefix run: group-1 (lock/rep), segment overrides,
+        // and the size overrides may appear in any order before the opcode.
+        let mut i = start;
+        let mut had_66 = false;
+        let mut had_67 = false;
+        let mut keep: Vec<u8> = Vec::new();
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                0x66 => { had_66 = true; i += 1; }
+                0x67 => { had_67 = true; i += 1; }
+                b @ (0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) => {
+                    keep.push(b);
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        let body: Vec<u8> = self.bytes[i..].to_vec();
+
+        // Invert -- but ONLY for instructions that actually have an
+        // operand-size variant.
+        //
+        // A 0x66 emitted by the 32-bit encoders meant "16-bit operand", which
+        // is the default in real mode, so it disappears. Its ABSENCE meant
+        // "32-bit operand" and therefore needs the prefix added -- but that
+        // inference is only valid if the encoder made a size choice at all.
+        // `ret`, `nop`, `cli`, `int`, `leave`, `iret`, the string primitives
+        // and friends have exactly one encoding; blanket-adding 0x66 turned
+        // `ret` (c3) into `retl` (66 c3), silently changing the instruction.
+        //
+        // `sized_op` is set by the encoders that genuinely selected an operand
+        // width, so the inversion applies exactly where it is meaningful.
+        let want_66 = if self.sized_op { !had_66 } else { had_66 };
+        let want_67 = had_67 || addr32;
+
+        let mut out = Vec::with_capacity(self.bytes.len() - start + 2);
+        // GAS byte order: address-size override precedes operand-size override.
+        if want_67 { out.push(0x67); }
+        if want_66 { out.push(0x66); }
+        out.extend_from_slice(&keep);
+        out.extend_from_slice(&body);
+
+        // Adding or removing a prefix MOVES every byte after it, so any
+        // relocation already recorded for this instruction must move with it.
+        // Missing this left the displacement relocation pointing one byte past
+        // its field (offset 3 where GAS says 2), so the linker patched the
+        // instruction's own bytes instead of the address.
+        let old_len = self.bytes.len() - start;
+        let new_len = out.len();
+        if new_len != old_len {
+            let delta = new_len as i64 - old_len as i64;
+            let start64 = start as u64;
+            for r in self.relocations.iter_mut() {
+                if r.offset >= start64 {
+                    r.offset = (r.offset as i64 + delta) as u64;
+                }
+            }
+        }
+
+        self.bytes.truncate(start);
+        self.bytes.extend_from_slice(&out);
     }
 
     /// Main mnemonic dispatch.
@@ -292,7 +398,7 @@ impl InstructionEncoder {
             // `retl` = explicit 32-bit near return (same C3 byte in 32-bit
             // mode); `retw` = 16-bit near return (66 C3).
             "ret" | "retl" | "retw" => {
-                if mnemonic == "retw" { self.bytes.push(0x66); }
+                if mnemonic == "retw" { self.sized_op = true; self.bytes.push(0x66); }
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
@@ -314,21 +420,62 @@ impl InstructionEncoder {
                 match ops.as_slice() {
                     [Operand::Immediate(ImmediateValue::Integer(seg)),
                      Operand::Immediate(ImmediateValue::Integer(off))] => {
-                        self.bytes.push(0x66);
+                        self.sized_op = true; self.bytes.push(0x66);
                         self.bytes.push(0x9A);
                         self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())
                     }
                     _ => {
-                        self.bytes.push(0x66);
+                        self.sized_op = true; self.bytes.push(0x66);
                         self.encode_lcall(ops)
                     }
                 }
             }
             "lcalll" | "lcall" => self.encode_lcall(ops),
             // Far return
+            // IRET / IRETD. Real-mode boot code returns from BIOS interrupts
+            // with these (arch/x86/boot/*.S). `iretw` is the explicit 16-bit
+            // spelling and equals the default in .code16; `iretl` forces the
+            // 32-bit form, which in 16-bit mode needs the 0x66 override --
+            // supplied by the `.code16` prefix inversion, so only the size
+            // choice is recorded here.
+            "iret" | "iretw" => {
+                if !ops.is_empty() {
+                    return Err("iret takes no operands".to_string());
+                }
+                self.sized_op = true;
+                self.bytes.push(0x66); // "16-bit operand" in 32-bit terms
+                self.bytes.push(0xCF);
+                Ok(())
+            }
+            "iretl" | "iretd" => {
+                if !ops.is_empty() {
+                    return Err("iretl takes no operands".to_string());
+                }
+                self.sized_op = true;
+                self.bytes.push(0xCF);
+                Ok(())
+            }
+            "lretw" => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                if ops.is_empty() {
+                    self.bytes.push(0xCB);
+                } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
+                    self.bytes.push(0xCA);
+                    self.bytes.extend_from_slice(&(*val as u16).to_le_bytes());
+                } else {
+                    return Err("unsupported lretw operand".to_string());
+                }
+                Ok(())
+            }
             "lret" | "lretl" => {
+                // `lret` follows the current mode's default width, `lretl`
+                // forces 32-bit; both are the no-prefix form in 32-bit terms.
+                if mnemonic == "lretl" {
+                    self.sized_op = true;
+                }
                 if ops.is_empty() {
                     self.bytes.push(0xCB);
                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
@@ -852,10 +999,10 @@ impl InstructionEncoder {
 
             // Additional multiply/divide sizes
             "mulb" => self.encode_unary_rm(ops, 4, 1),
-            "mulw" => { self.bytes.push(0x66); self.encode_unary_rm(ops, 4, 2) }
-            "divw" => { self.bytes.push(0x66); self.encode_unary_rm(ops, 6, 2) }
+            "mulw" => { self.sized_op = true; self.bytes.push(0x66); self.encode_unary_rm(ops, 4, 2) }
+            "divw" => { self.sized_op = true; self.bytes.push(0x66); self.encode_unary_rm(ops, 6, 2) }
             "divb" => self.encode_unary_rm(ops, 6, 1),
-            "idivw" => { self.bytes.push(0x66); self.encode_unary_rm(ops, 7, 2) }
+            "idivw" => { self.sized_op = true; self.bytes.push(0x66); self.encode_unary_rm(ops, 7, 2) }
             "idivb" => self.encode_unary_rm(ops, 7, 1),
             "imulw" => self.encode_imul(ops, 2),
 

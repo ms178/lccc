@@ -203,7 +203,34 @@ fn resolve_numeric_data_values(
                     val.clone()
                 }
             }
-            _ => val.clone(),
+            // A numeric label reference is equally valid in the ADDEND and
+            // SCALED forms. Leaving them in the catch-all below meant a
+            // difference such as
+            //     .long 770b + 1 - 760b        (SymbolDiffAddend)
+            //     .long (770b - 760b) * 4      (SymbolDiffScaled)
+            // kept the raw names `770b`/`760b`, while the DEFINITIONS had
+            // already been renamed to `.Lnum_770_0`/`.Lnum_760_0`. Nothing
+            // downstream could ever match them, so the assembler aborted with
+            // "undefined label in .byte diff: 770b". The plain `SymbolDiff`
+            // form worked only because it is listed above -- which is exactly
+            // why this must be an exhaustive match rather than a catch-all.
+            DataValue::SymbolDiffAddend(lhs, rhs, addend) => {
+                let new_lhs = resolve_numeric_name(lhs, current_idx, defs)
+                    .unwrap_or_else(|| lhs.clone());
+                let new_rhs = resolve_numeric_name(rhs, current_idx, defs)
+                    .unwrap_or_else(|| rhs.clone());
+                DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
+            }
+            DataValue::SymbolDiffScaled(lhs, rhs, scale, addend) => {
+                let new_lhs = resolve_numeric_name(lhs, current_idx, defs)
+                    .unwrap_or_else(|| lhs.clone());
+                let new_rhs = resolve_numeric_name(rhs, current_idx, defs)
+                    .unwrap_or_else(|| rhs.clone());
+                DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *addend)
+            }
+            // Exhaustive on purpose: every future DataValue variant that can
+            // carry a symbol name must be considered here explicitly.
+            DataValue::Integer(_) => val.clone(),
         }
     }).collect()
 }
