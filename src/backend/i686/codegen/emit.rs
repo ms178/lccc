@@ -55,6 +55,12 @@ pub struct I686Codegen {
     pub(super) fastcall_stack_cleanup: usize,
     /// For fastcall functions, how many leading params are passed in registers (0, 1, or 2).
     pub(super) fastcall_reg_param_count: usize,
+    /// Whether %ebx holds the PIC GOT base for the function being emitted.
+    ///
+    /// Set per function by `function_needs_got`. When false the GOT setup is
+    /// skipped entirely and %ebx stays a general allocatable register, which
+    /// is what keeps leaf functions small in the 32 KiB kernel setup binary.
+    pub(super) pic_got_live: bool,
     /// Whether the __x86.get_pc_thunk.bx helper needs to be emitted.
     pub(super) needs_pc_thunk_bx: bool,
     /// Number of integer arguments to pass in registers (-mregparm=N).
@@ -126,6 +132,7 @@ impl I686Codegen {
             is_fastcall: false,
             fastcall_stack_cleanup: 0,
             fastcall_reg_param_count: 0,
+            pic_got_live: false,
             needs_pc_thunk_bx: false,
             regparm: 0,
             omit_frame_pointer: false,
