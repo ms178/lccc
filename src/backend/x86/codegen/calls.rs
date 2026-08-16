@@ -429,11 +429,17 @@ impl X86Codegen {
         }
         if float_count > 0 {
             self.state.out.emit_instr_imm_reg("    movb", float_count as i64, "al");
-        } else if !(self.skip_rax_setup && self.no_sse) {
+        } else if self.state.call_is_variadic && !(self.skip_rax_setup && self.no_sse) {
             // %al reports the number of live SSE argument registers to a
-            // variadic callee (SysV AMD64 3.5.7). -mskip-rax-setup omits it,
-            // sound only when no SSE argument register can be live -- which
-            // -mno-sse guarantees. A real float argument always wins.
+            // VARIADIC callee (SysV AMD64 3.5.7). It is meaningless for a
+            // prototyped non-variadic callee, and GCC emits nothing there --
+            // lccc used to zero %eax before every indirect call, costing an
+            // instruction and a false dependency on %rax at each site.
+            //
+            // -mskip-rax-setup additionally drops it for variadic callees,
+            // sound only when no SSE argument register can be live, which
+            // -mno-sse guarantees. A real float argument always wins (the
+            // `float_count > 0` arm above).
             self.state.emit("    xorl %eax, %eax");
         }
         self.state.reg_cache.invalidate_all();

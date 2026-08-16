@@ -257,6 +257,13 @@ pub struct CodegenState {
     /// __x86_indirect_thunk_REG. The kernel vDSO needs this: it is userspace
     /// code that cannot reference kernel-internal thunk symbols.
     pub indirect_branch_thunk_inline: bool,
+    /// Is the call currently being emitted a call to a VARIADIC callee?
+    ///
+    /// Set by the generic `emit_call` before argument setup. SysV AMD64 3.5.7
+    /// only requires %al to carry the number of live SSE argument registers
+    /// when the callee is variadic; for a prototyped non-variadic callee the
+    /// `xorl %eax,%eax` is pure waste. GCC omits it there.
+    pub call_is_variadic: bool,
     /// Patchable function entry: (total_nops, nops_before_entry).
     /// When set, emits NOP padding around function entry points and records
     /// them in __patchable_function_entries for runtime patching (ftrace).
@@ -412,6 +419,7 @@ impl CodegenState {
             function_return_thunk: false,
             indirect_branch_thunk: false,
             indirect_branch_thunk_inline: false,
+            call_is_variadic: false,
             patchable_function_entry: None,
             cf_protection_branch: false,
             current_program_point: 0,

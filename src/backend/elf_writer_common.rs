@@ -1632,7 +1632,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // is computed, which is also the order GNU as uses.
         if A::supports_deferred_skips() {
             self.resolve_deferred_skips()?;
-            self.resolve_deferred_byte_diffs()?;
         }
 
         // Apply `.p2align` / `.org` padding BEFORE relaxing jumps.
@@ -1661,8 +1660,20 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.fixup_alignment_markers(sec_idx);
         }
 
-        // Fold scaled symbol differences last: alignment fixups above can
-        // still move labels, so the arithmetic must see final positions.
+        // Fold symbol differences LAST, once the layout is frozen.
+        //
+        // `.byte`/`.word` label differences MEASURE code that jump relaxation
+        // and alignment padding can still resize. Resolving them earlier
+        // records pre-shrink sizes: the kernel's ALTERNATIVE entry stored
+        // `origlen = 773b-771b = 35` for a region relaxation had shortened to
+        // 31, and objtool rejected the object with
+        // "weirdly overlapping alternative! 33 != 35". GNU as likewise emits
+        // these only after the section layout is final.
+        if A::supports_deferred_skips() {
+            self.resolve_deferred_byte_diffs()?;
+        }
+
+        // Scaled symbol differences: same reasoning.
         self.resolve_scaled_diffs()?;
 
         // Resolve internal relocations

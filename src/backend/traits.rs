@@ -695,6 +695,9 @@ pub trait ArchCodegen {
         self.state().reg_cache.invalidate_acc();
 
         // Phase 3: Load register args (GP, FP, i128, struct-by-val, F128).
+        // Publish the callee's variadic-ness so the argument emitter knows
+        // whether the %al SSE-count setup is architecturally required.
+        self.state().call_is_variadic = is_variadic;
         self.emit_call_reg_args(
             args,
             &arg_classes,
