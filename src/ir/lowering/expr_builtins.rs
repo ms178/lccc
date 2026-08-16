@@ -452,6 +452,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pabsw128 | BuiltinIntrinsic::X86Pabsd128
             | BuiltinIntrinsic::X86Palignr128 | BuiltinIntrinsic::X86Pmaxub128
             | BuiltinIntrinsic::X86Pminub128 | BuiltinIntrinsic::X86Pblendvb128
+            | BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128
             | BuiltinIntrinsic::X86Pblendw128
             | BuiltinIntrinsic::X86Pmovzxbw128 | BuiltinIntrinsic::X86Pmovzxwd128
             | BuiltinIntrinsic::X86Psllw128 | BuiltinIntrinsic::X86Psrlw128
@@ -868,6 +869,41 @@ impl Lowerer {
                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
                 Some(Operand::Value(result_alloca))
             }
+            X86IntrinsicKind::Vec128Value => {
+                // GCC's __builtin_ia32_* return the vector BY VALUE — unlike
+                // the _mm_* wrappers, whose bundled-header definition routes
+                // through __lccc_simd* and dereferences the returned pointer
+                // itself (__CCC_M128_FROM_BUILTIN = *(__m128*)(e)). A caller
+                // of the raw builtin has no such deref: handing back the
+                // alloca POINTER made the function return `lea slot(%rsp)`
+                // + cqto — an address and sign-extension garbage instead of
+                // the 16 data bytes (kernel NAP governor's v4sf clamp
+                // produced -3e+34). Materialize the I128 value: two I64
+                // halves loaded from the result slot, widened and packed —
+                // the same representation ordinary v4sf loads lower to.
+                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let result_alloca = self.fresh_value();
+                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+                let dest_val = self.fresh_value();
+                self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
+                // lo half
+                let lo = self.fresh_value();
+                self.emit(Instruction::Load { dest: lo, ptr: result_alloca, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
+                // hi half: result_alloca + 8
+                let hi_ptr = self.fresh_value();
+                self.emit(Instruction::BinOp { dest: hi_ptr, op: IrBinOp::Add, lhs: Operand::Value(result_alloca), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+                let hi = self.fresh_value();
+                self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
+                let lo128 = self.fresh_value();
+                self.emit(Instruction::Cast { dest: lo128, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
+                let hi128 = self.fresh_value();
+                self.emit(Instruction::Cast { dest: hi128, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
+                let shifted = self.fresh_value();
+                self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi128), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+                let packed = self.fresh_value();
+                self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo128), ty: IrType::I128 });
+                Some(Operand::Value(packed))
+            }
             X86IntrinsicKind::Scalar => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest_val = self.fresh_value();
@@ -897,6 +933,9 @@ enum X86IntrinsicKind {
     PtrStore,
     /// 128-bit vector result allocated on stack, returns pointer.
     Vec128,
+    /// 128-bit vector returned BY VALUE as packed I128 (raw GCC
+    /// __builtin_ia32_* semantics — no header wrapper dereferences it).
+    Vec128Value,
     /// 256-bit vector result allocated on stack.
     Vec256,
     /// Scalar result in a dest register.
@@ -976,6 +1015,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Phaddw256 | BuiltinIntrinsic::X86Phaddd256
         | BuiltinIntrinsic::X86Pabsd256 | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
+        // Raw GCC vector builtins (no _mm_ wrapper): value semantics.
+        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128Value,
         _ => X86IntrinsicKind::Vec128,
     }
 }
@@ -1092,6 +1133,8 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Palignr128 => IntrinsicOp::Palignr128,
         BuiltinIntrinsic::X86Pmaxub128 => IntrinsicOp::Pmaxub128,
         BuiltinIntrinsic::X86Pminub128 => IntrinsicOp::Pminub128,
+        BuiltinIntrinsic::X86MaxPs128 => IntrinsicOp::MaxPs128,
+        BuiltinIntrinsic::X86MinPs128 => IntrinsicOp::MinPs128,
         BuiltinIntrinsic::X86Pblendvb128 => IntrinsicOp::Pblendvb128,
         BuiltinIntrinsic::X86Pblendw128 => IntrinsicOp::Pblendw128,
         BuiltinIntrinsic::X86Pmovzxbw128 => IntrinsicOp::Pmovzxbw128,

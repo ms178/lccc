@@ -2178,29 +2178,48 @@ fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
     let mut reg_aliases: FxHashMap<String, String> = FxHashMap::default();
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(".set ").or_else(|| trimmed.strip_prefix(".set\t")) {
-            if let Some(comma) = rest.find(',') {
-                let name = rest[..comma].trim();
-                let target = rest[comma + 1..].trim();
-                let name_ok = !name.is_empty()
+        // Comments must go BEFORE alias parsing: the kernel writes
+        // `CTX\t= %rdi\t# 1st arg` (sha256-avx2-asm.S), and keeping the
+        // comment glued the target into "%rdi\t# 1st arg" — a register name
+        // that matches nothing, so the alias silently never resolved.
+        let trimmed = strip_comment(&line).trim();
+        // Both alias spellings define register aliases:
+        //   .set NAME, TARGET      (vgetrandom-chacha.S)
+        //   NAME = TARGET          (sha256-avx2-asm.S: `X0 = %ymm4`, and
+        //                           rotate_Xs rotates them via `X_ = X0`)
+        // TARGET may be a %register or ANOTHER alias (transitive; kernel
+        // crc-pclmul builds CONSTS -> V7 -> %xmm7, sha256-avx2's rotate_Xs
+        // permutes X0..X3 through X_). GAS evaluates eagerly: the alias
+        // snapshots the target's CURRENT value, so later redefinition of
+        // the target must not rewrite history — exactly what resolving
+        // through the map at definition time gives us.
+        let alias_def: Option<(&str, &str)> =
+            if let Some(rest) = trimmed.strip_prefix(".set ").or_else(|| trimmed.strip_prefix(".set\t")) {
+                rest.find(',').map(|comma| (rest[..comma].trim(), rest[comma + 1..].trim()))
+            } else if let Some(eq) = trimmed.find('=') {
+                // Plain `NAME = TARGET` (not ==, and NAME must be a bare
+                // identifier — labels and expressions are not alias defs).
+                let name = trimmed[..eq].trim();
+                let target = trimmed[eq + 1..].trim();
+                let name_is_ident = !name.is_empty()
+                    && !target.starts_with('=')
                     && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
-                if target.starts_with('%') && name_ok {
+                if name_is_ident { Some((name, target)) } else { None }
+            } else {
+                None
+            };
+        if let Some((name, target)) = alias_def {
+            let name_ok = !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+            if name_ok {
+                if target.starts_with('%') {
                     reg_aliases.insert(name.to_string(), target.to_string());
-                    continue; // drop the .set line
+                    continue; // drop the alias-definition line
                 }
-                // Transitive alias: `.set CONSTS, V7` where V7 is itself a
-                // register alias (kernel crc-pclmul-template.S builds a
-                // two-level chain `CONSTS -> V7 -> %xmm7` via .irp). Resolve
-                // through the existing map at DEFINITION time — GAS evaluates
-                // .set eagerly, so later redefinitions of V7 must not change
-                // an already-taken snapshot.
-                if name_ok {
-                    if let Some(resolved) = reg_aliases.get(target) {
-                        let resolved = resolved.clone();
-                        reg_aliases.insert(name.to_string(), resolved);
-                        continue; // drop the .set line
-                    }
+                if let Some(resolved) = reg_aliases.get(target) {
+                    let resolved = resolved.clone();
+                    reg_aliases.insert(name.to_string(), resolved);
+                    continue; // drop the alias-definition line
                 }
             }
         }
@@ -2354,6 +2373,18 @@ fn expand_gas_macros_with_state(
                         // Emit as .set so the parser can also handle it
                         let resolved_line = format!(".set {}, {}", before, resolved);
                         result.push(resolved_line);
+                        i += 1;
+                        continue;
+                    }
+                    // `NAME = %reg` — the `=` spelling of a REGISTER alias
+                    // (kernel sha256-avx2-asm.S: `NUM_BLKS = %rdx`). Not a
+                    // numeric symbol; normalize to `.set NAME, %reg` so the
+                    // register-alias substitution pass picks it up exactly
+                    // like the .set spelling. Without this the line passed
+                    // through verbatim and every use of the alias died in
+                    // the encoder ("unsupported shlq operands").
+                    if expr_str.starts_with('%') {
+                        result.push(format!(".set {}, {}", before, expr_str));
                         i += 1;
                         continue;
                     }
@@ -2561,10 +2592,39 @@ fn expand_gas_macros_with_state(
         let semi_parts = crate::backend::asm_preprocess::split_on_semicolons(&trimmed);
         let first_part = semi_parts[0].trim();
         let first_word = first_part.split_whitespace().next().unwrap_or("");
-        // Strip label prefix if present (e.g., "label: macroname args")
-        let macro_name_candidate = if first_word.ends_with(':') {
-            // There might be a macro after the label
-            first_part[first_word.len()..].split_whitespace().next().unwrap_or("")
+        // Strip label prefixes if present (e.g., "label: macroname args").
+        // MULTIPLE labels can pile up before the invocation: the kernel's
+        // ALTERNATIVE_2 body puts `740: 740: \oldinstr` on one line (each
+        // nested alternative contributes its own numeric label), and
+        // stripping only ONE left `740: RETPOLINE rax` unrecognized — the
+        // encoder then saw a bogus `retpoline` instruction.
+        let mut label_prefix_end = 0usize;
+        {
+            let bytes = first_part.as_bytes();
+            let mut pos = 0usize;
+            loop {
+                // Skip whitespace.
+                while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+                    pos += 1;
+                }
+                let tok_start = pos;
+                while pos < bytes.len() && bytes[pos] != b' ' && bytes[pos] != b'\t' {
+                    pos += 1;
+                }
+                if pos > tok_start && bytes[pos - 1] == b':'
+                    && first_part[tok_start..pos - 1].chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                    && !first_part[tok_start..pos - 1].is_empty()
+                {
+                    label_prefix_end = pos;
+                } else {
+                    break;
+                }
+            }
+        }
+        let after_labels = first_part[label_prefix_end..].trim();
+        let macro_name_candidate = if label_prefix_end > 0 {
+            after_labels.split_whitespace().next().unwrap_or("")
         } else {
             first_word
         };
@@ -2586,13 +2646,13 @@ fn expand_gas_macros_with_state(
         // capture the directive line and rewrite it into garbage.
         if macros.contains_key(macro_name) && !macro_name.starts_with('.') {
             let mac = macros[macro_name].clone();
-            let args_str = if first_word.ends_with(':') {
-                // Label before macro
-                let after_label = first_part[first_word.len()..].trim();
-                let after_name = after_label[macro_name.len()..].trim();
-                // Emit label first
-                result.push(first_word.to_string());
-                after_name
+            let args_str = if label_prefix_end > 0 {
+                // Emit every stacked label first, each on its own line
+                // (they are separate statements in GAS).
+                for lab in first_part[..label_prefix_end].split_whitespace() {
+                    result.push(lab.to_string());
+                }
+                after_labels[macro_name.len()..].trim()
             } else {
                 first_part[macro_name.len()..].trim()
             };

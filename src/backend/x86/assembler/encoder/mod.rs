@@ -1143,6 +1143,27 @@ impl InstructionEncoder {
             "pextrq" => self.encode_sse_extract(ops, &[0x66, 0x0F, 0x3A, 0x16], true, false),
 
             // AES-NI
+            // SHA-NI (kernel lib/crypto/x86/sha{1,256}-ni-asm.S). All NP
+            // encodings — NO 0x66 prefix, unlike most 0F38/0F3A SSE ops.
+            // sha1rnds4 additionally carries an imm8 round selector.
+            "sha1rnds4" => self.encode_sse_op_imm8(ops, &[0x0F, 0x3A, 0xCC]),
+            "sha1nexte" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xC8]),
+            "sha1msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xC9]),
+            "sha1msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCA]),
+            // sha256rnds2 has an IMPLICIT third operand (%xmm0); GAS accepts
+            // both the 2-op spelling and an explicit leading %xmm0.
+            "sha256rnds2" => {
+                let ops_norm: &[Operand] = if ops.len() == 3 {
+                    match &ops[0] {
+                        Operand::Register(r) if r.name == "xmm0" => &ops[1..],
+                        _ => return Err(
+                            "sha256rnds2: explicit first operand must be %xmm0".to_string()),
+                    }
+                } else { ops };
+                self.encode_sse_op(ops_norm, &[0x0F, 0x38, 0xCB])
+            }
+            "sha256msg1" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCC]),
+            "sha256msg2" => self.encode_sse_op(ops, &[0x0F, 0x38, 0xCD]),
             "aesenc" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDC]),
             "aesenclast" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDD]),
             "aesdec" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDE]),

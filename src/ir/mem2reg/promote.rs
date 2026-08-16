@@ -39,6 +39,18 @@ const MAX_PROMOTABLE_ALLOCA_SIZE: usize = 8;
 /// This is the initial mem2reg pass that runs before inlining.
 /// Parameter allocas are not promoted here because the inliner assumes
 /// they exist for argument passing.
+/// Span lookup that tolerates a spans vector SHORTER than the instruction
+/// list. Earlier passes may append instructions without extending
+/// source_spans (the invariant is "empty or same length" but several passes
+/// only uphold "empty or prefix"); indexing blindly panicked with
+/// "index out of bounds: the len is 2 but the index is 2" while compiling
+/// the kernel's sound/core/seq/seq_timer.c. Debug info degrades to a dummy
+/// span for the appended tail — never a crash.
+#[inline]
+fn span_at(spans: &[crate::common::source::Span], idx: usize) -> crate::common::source::Span {
+    spans.get(idx).copied().unwrap_or_else(crate::common::source::Span::dummy)
+}
+
 pub fn promote_allocas(module: &mut IrModule) {
     for func in &mut module.functions {
         if func.is_declaration || func.blocks.is_empty() {
@@ -541,10 +553,10 @@ fn rename_block(
                         dest,
                         src: current_val,
                     });
-                    if has_spans { new_spans.push(old_spans[inst_idx]); }
+                    if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
                 } else {
                     new_instructions.push(Instruction::Load { dest, ptr, ty, seg_override });
-                    if has_spans { new_spans.push(old_spans[inst_idx]); }
+                    if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
                 }
             }
             Instruction::Store { val, ptr, ty, seg_override } => {
@@ -566,7 +578,7 @@ fn rename_block(
                     // (span is dropped along with the instruction)
                 } else {
                     new_instructions.push(Instruction::Store { val, ptr, ty, seg_override });
-                    if has_spans { new_spans.push(old_spans[inst_idx]); }
+                    if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
                 }
             }
             Instruction::InlineAsm {
@@ -601,11 +613,11 @@ fn rename_block(
                     template, outputs, inputs, clobbers,
                     operand_types, goto_labels, input_symbols, seg_overrides,
                 });
-                if has_spans { new_spans.push(old_spans[inst_idx]); }
+                if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
             }
             other => {
                 new_instructions.push(other);
-                if has_spans { new_spans.push(old_spans[inst_idx]); }
+                if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
             }
         }
     }

@@ -453,6 +453,21 @@ impl Preprocessor {
     /// Must be called after set_target() since it checks which arch is active.
     pub fn set_sse_macros(&mut self, no_sse: bool) {
         if no_sse {
+            // The baseline macros are pre-defined in PREDEFINED_OBJECT_MACROS
+            // (most translation units never pass -mno-sse and the fast path
+            // avoids re-defining them here), so -mno-sse must actively UNDEFINE
+            // them — an early return left __SSE2__ visible and the kernel's
+            // NAP governor compiled its `#ifdef __SSE2__` vector-extension
+            // code in a translation unit built with FPU_KILL_FLAGS, i.e. SSE
+            // codegen was both requested-off and semantically unavailable
+            // (idle context, no kernel_fpu_begin()). GCC: -mno-sse undefines
+            // __SSE__/__SSE2__/__SSE_MATH__/__SSE2_MATH__ (verified with
+            // gcc -mno-sse -mno-sse2 -dM -E).
+            self.macros.undefine("__SSE__");
+            self.macros.undefine("__SSE2__");
+            self.macros.undefine("__SSE_MATH__");
+            self.macros.undefine("__SSE2_MATH__");
+            self.macros.undefine("__MMX_WITH_SSE__");
             return;
         }
         // Only define SSE macros for x86 targets (x86_64 and i686).
