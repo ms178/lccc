@@ -544,6 +544,19 @@ impl super::InstructionEncoder {
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())
                     }
+                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff))) => {
+                        // la57toggle.S: `ljmpl $__KERNEL_CS, $(.Lret -
+                        // trampoline_32bit_src)` — the offset is a
+                        // same-section label difference that resolves to a
+                        // constant after layout (GAS: `ea 08000000 1000`).
+                        // Record a diff relocation on the imm32; the writer
+                        // patches the folded value in place.
+                        self.bytes.push(0xEA);
+                        self.add_diff_relocation(sym, diff, R_X86_64_32, 0);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                        Ok(())
+                    }
                     _ => Err("ljmp requires $segment, $offset operands".to_string()),
                 }
             }

@@ -182,7 +182,29 @@ impl super::InstructionEncoder {
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 }
             }
-            ImmediateValue::SymbolMod(_, _) | ImmediateValue::SymbolDiff(_, _) => {
+            ImmediateValue::SymbolDiff(sym_a, sym_b) => {
+                // head_64.S (compressed boot): `movl $(_bss - startup_32),
+                // %ecx` — a label difference as a mov immediate. Both labels
+                // live in the SAME object (startup_32 in the .code32 part,
+                // _bss at the end), so the difference folds to a constant
+                // after layout via the diff-reloc path. GAS emits
+                // `b9 <imm32>` with the folded value; the 8-byte movabs
+                // form never appears for these (kernel-image offsets are
+                // far below 4 GiB).
+                if size == 4 {
+                    let b = needs_rex_ext(&dst.name);
+                    if b {
+                        self.bytes.push(self.rex(false, false, false, true));
+                    }
+                    self.bytes.push(0xB8 + (dst_num & 7));
+                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
+                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    return Err(format!(
+                        "symbol-difference mov immediate only supported at 32-bit width (got size {})", size));
+                }
+            }
+            ImmediateValue::SymbolMod(_, _) => {
                 Err("unsupported immediate type for mov".to_string())?
             }
         }
@@ -686,6 +708,29 @@ impl super::InstructionEncoder {
                 self.bytes.push(self.modrm(3, alu_op, dst_num));
                 // Use instruction-relative offset; elf_writer_common adds section base.
                 self.add_relocation(sym, R_X86_64_32S, addend);
+                self.bytes.extend_from_slice(&[0; 4]);
+                Ok(())
+            }
+            (Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff)), Operand::Register(dst)) => {
+                // `addq $identity_mapped - 0b, %rsi` (relocate_kernel_64.S):
+                // GAS reserves imm32 for a forward-referenced difference and
+                // resolves it after layout. Same-section pairs become a plain
+                // constant; when `sym` stays external the writer converts to
+                // R_X86_64_PC32 against `sym` with the addend adjusted by the
+                // local label's position (value = S - addr(diff)) — exactly
+                // the reloc GAS emits for this shape.
+                //
+                // Deviation note: for a BACKWARD-defined same-section pair
+                // GAS folds at parse time and may pick the shorter imm8 form;
+                // we always emit imm32. Semantically identical, one byte
+                // larger — acceptable because the kernel's uses are forward
+                // references where GAS also emits imm32.
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if size == 2 { self.bytes.push(0x66); }
+                self.emit_rex_unary(size, &dst.name);
+                self.bytes.push(0x81);
+                self.bytes.push(self.modrm(3, alu_op, dst_num));
+                self.add_diff_relocation(sym, diff, R_X86_64_PC32, 0);
                 self.bytes.extend_from_slice(&[0; 4]);
                 Ok(())
             }

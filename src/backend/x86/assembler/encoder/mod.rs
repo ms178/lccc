@@ -27,6 +27,12 @@ pub struct Relocation {
     pub reloc_type: u32,
     /// Addend for the relocation.
     pub addend: i64,
+    /// Symbol-difference immediates (`addq $identity_mapped - 0b, %rsi` in
+    /// relocate_kernel_64.S): the patched value is `symbol - diff_symbol +
+    /// addend`. Same-section pairs resolve to a constant after layout;
+    /// an external `symbol` degrades to a PC32 against it with the addend
+    /// adjusted by the label position — both identical to GAS.
+    pub diff_symbol: Option<String>,
 }
 
 // ELF x86-64 relocation types (standard constants; not all emitted by assembler yet)

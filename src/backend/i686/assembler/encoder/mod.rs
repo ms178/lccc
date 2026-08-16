@@ -235,7 +235,10 @@ impl InstructionEncoder {
             | "cmovo" | "cmovno" | "cmovc" | "cmovnc" => self.encode_cmovcc(ops, mnemonic),
 
             // Jumps
-            "jmp" => self.encode_jmp(ops),
+            // `jmpl` is the explicit 32-bit-operand spelling; in 32-bit
+            // mode it is the SAME encoding as `jmp` (pmjump.S: `jmpl *%eax`
+            // = ff e0). GAS accepts both spellings interchangeably here.
+            "jmp" | "jmpl" => self.encode_jmp(ops),
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
             | "jc" | "jnc" => {
@@ -384,6 +387,13 @@ impl InstructionEncoder {
             "verw" => self.encode_verw(ops),
             "lsl" => self.encode_lsl(ops),
             "sgdt" | "sgdtl" | "sidt" | "sidtl" | "lgdt" | "lgdtl" | "lidt" | "lidtl" => self.encode_system_table(ops, mnemonic),
+            // 0F 00 /r group: descriptor-table register loads/stores with an
+            // r/m16 operand. head_64.S runs `lldt %ax` / `ltr %ax` in its
+            // .code32 startup path (clearing LDT, loading the boot TSS).
+            "sldt" => self.encode_system_reg16(ops, 0),
+            "lldt" => self.encode_system_reg16(ops, 2),
+            "ltr" => self.encode_system_reg16(ops, 3),
+            "str" if ops.len() == 1 && matches!(&ops[0], Operand::Register(_)) => self.encode_system_reg16(ops, 1),
             "lmsw" => self.encode_lmsw(ops),
             "smsw" => self.encode_smsw(ops),
 

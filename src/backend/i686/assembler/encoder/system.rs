@@ -167,6 +167,25 @@ impl super::InstructionEncoder {
     }
 
     /// Encode SGDT/SIDT/LGDT/LIDT: 0F 01 /N (memory operand)
+    /// 0F 00 /r group (sldt/lldt/ltr/str): register form only, r/m16.
+    /// GAS encodes `lldt %ax` as `0f 00 d0` — no operand-size prefix; the
+    /// operand is architecturally 16-bit regardless of spelling.
+    pub(super) fn encode_system_reg16(&mut self, ops: &[Operand], reg_ext: u8) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("system segment instruction requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let rm = reg_num(&reg.name)
+                    .ok_or_else(|| format!("bad register for system segment instruction: {}", reg.name))?;
+                self.bytes.extend_from_slice(&[0x0F, 0x00]);
+                self.bytes.push(self.modrm(3, reg_ext, rm));
+                Ok(())
+            }
+            _ => Err("system segment instruction requires a register operand".to_string()),
+        }
+    }
+
     pub(super) fn encode_system_table(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 operand", mnemonic));

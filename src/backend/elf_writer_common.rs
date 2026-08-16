@@ -625,7 +625,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
             AsmItem::Global(name) => {
-                self.pending_globals.push(name.clone());
+                // `.globl a, b` declares EVERY comma-separated name global
+                // (GAS semantics). mkpiggy emits `.globl input_data,
+                // input_data_end`; storing the whole string as one symbol
+                // name silently made BOTH stay local and the compressed
+                // vmlinux link failed with "hidden symbol `input_data'
+                // isn't defined".
+                for part in name.split(',') {
+                    let sym = part.trim();
+                    if !sym.is_empty() {
+                        self.pending_globals.push(sym.to_string());
+                    }
+                }
             }
             AsmItem::Weak(name) => {
                 self.pending_weaks.push(name.clone());
@@ -2460,14 +2471,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // Handle SymbolDiff relocations
                 if reloc.diff_symbol.is_some() {
                     if let Some(ref diff_sym) = reloc.diff_symbol {
-                        if let (Some(&(a_sec, a_off)), Some(&(b_sec, b_off))) = (
-                            self.label_positions.get(&reloc.symbol),
-                            self.label_positions.get(diff_sym),
-                        ) {
+                        // Either side may be a NUMERIC local label (`0b` in
+                        // relocate_kernel_64.S `$identity_mapped - 0b`);
+                        // label_positions only holds named labels.
+                        let a_pos = self.label_positions.get(&reloc.symbol).copied()
+                            .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
+                        let b_pos = self.label_positions.get(diff_sym).copied()
+                            .or_else(|| self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx));
+                        if let (Some((a_sec, a_off)), Some((b_sec, b_off))) = (a_pos, b_pos) {
                             if a_sec == b_sec {
                                 let val = a_off as i64 - b_off as i64 + reloc.addend;
                                 resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
                                 continue;
+                            }
+                        }
+                        // `$sym - 0b` where sym is EXTERNAL (or in another
+                        // section) but the subtrahend is a local label in
+                        // THIS section: GAS emits R_X86_64_PC32 against sym
+                        // with addend = reloc_offset - addr(0b), so the link
+                        // computes S + (P - addr(0b)) - P = S - addr(0b).
+                        // relocate_kernel_64.S relies on this for computing
+                        // `identity_mapped - 0b` where identity_mapped lives
+                        // in a different section of the same object.
+                        if a_pos.is_none() || a_pos.map(|(s, _)| s) != Some(sec_idx) {
+                            if let Some((b_sec, b_off)) = b_pos {
+                                if b_sec == sec_idx && reloc.patch_size == 4 {
+                                    let mut conv = reloc.clone();
+                                    conv.reloc_type = A::reloc_pc32();
+                                    conv.addend += reloc.offset as i64 - b_off as i64;
+                                    conv.diff_symbol = None;
+                                    unresolved.push(conv);
+                                    continue;
+                                }
                             }
                         }
                     }

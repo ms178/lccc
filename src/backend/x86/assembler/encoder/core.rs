@@ -199,6 +199,11 @@ impl super::InstructionEncoder {
                     Displacement::Integer(val) => {
                         self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
                     }
+                    Displacement::SymbolDiff(a, b)
+                    | Displacement::SymbolDiffAddend(a, b, _) => {
+                        return Err(format!(
+                            "symbol-difference displacement `{} - {}` is not valid with RIP-relative addressing", a, b));
+                    }
                     Displacement::None => {
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                     }
@@ -210,6 +215,7 @@ impl super::InstructionEncoder {
         // Handle symbol displacements that need relocations.
         // We defer emitting the relocation until after the ModR/M and SIB bytes
         // so the relocation offset correctly points to the displacement bytes.
+        let mut diff_sym: Option<String> = None;
         let (disp_val, has_symbol, deferred_reloc) = match &mem.displacement {
             Displacement::None => (0i64, false, None),
             Displacement::Integer(v) => (*v, false, None),
@@ -221,6 +227,17 @@ impl super::InstructionEncoder {
             }
             Displacement::SymbolPlusOffset(sym, offset) => {
                 (0i64, true, Some((sym.clone(), R_X86_64_32S, *offset)))
+            }
+            Displacement::SymbolDiff(sym, diff) => {
+                // head_64.S rva(): `((gdt) - startup_32)(%ebp)`. Recorded as
+                // a diff relocation; same-section pairs fold to a constant
+                // after layout, so no reloc reaches the object file.
+                diff_sym = Some(diff.clone());
+                (0i64, true, Some((sym.clone(), R_X86_64_32, 0i64)))
+            }
+            Displacement::SymbolDiffAddend(sym, diff, addend) => {
+                diff_sym = Some(diff.clone());
+                (0i64, true, Some((sym.clone(), R_X86_64_32, *addend)))
             }
             Displacement::SymbolMod(sym, modifier) => {
                 let reloc_type = match modifier.to_ascii_lowercase().as_str() {
@@ -239,7 +256,10 @@ impl super::InstructionEncoder {
             self.bytes.push(self.modrm(0, reg_field, 4));
             self.bytes.push(self.sib(1, 4, 5)); // index=100 (none), base=101 (disp32)
             if let Some((sym, reloc_type, addend)) = deferred_reloc {
-                self.add_relocation(&sym, reloc_type, addend);
+                match &diff_sym {
+                    Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                    None => self.add_relocation(&sym, reloc_type, addend),
+                }
             }
             self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
             return Ok(());
@@ -275,14 +295,20 @@ impl super::InstructionEncoder {
                 self.bytes.push(self.modrm(0, reg_field, 4));
                 self.bytes.push(self.sib(scale, idx_num, 5));
                 if let Some((sym, reloc_type, addend)) = deferred_reloc {
-                    self.add_relocation(&sym, reloc_type, addend);
+                    match &diff_sym {
+                        Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                        None => self.add_relocation(&sym, reloc_type, addend),
+                    }
                 }
                 self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
             } else {
                 self.bytes.push(self.modrm(mod_bits, reg_field, 4));
                 self.bytes.push(self.sib(scale, idx_num, base_num));
                 if let Some((sym, reloc_type, addend)) = deferred_reloc {
-                    self.add_relocation(&sym, reloc_type, addend);
+                    match &diff_sym {
+                        Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                        None => self.add_relocation(&sym, reloc_type, addend),
+                    }
                 }
                 match disp_size {
                     0 => {}
@@ -294,7 +320,10 @@ impl super::InstructionEncoder {
         } else {
             self.bytes.push(self.modrm(mod_bits, reg_field, base_num));
             if let Some((sym, reloc_type, addend)) = deferred_reloc {
-                self.add_relocation(&sym, reloc_type, addend);
+                match &diff_sym {
+                    Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                    None => self.add_relocation(&sym, reloc_type, addend),
+                }
             }
             match disp_size {
                 0 => {}
@@ -322,6 +351,22 @@ impl super::InstructionEncoder {
             symbol: sym.to_string(),
             reloc_type: rtype,
             addend,
+            diff_symbol: None,
+        });
+    }
+
+    /// Add a symbol-difference relocation for an immediate (`$a - b`).
+    /// Resolution happens after layout: same-section pairs patch the
+    /// constant `a - b + addend`; otherwise the writer converts to a
+    /// PC-relative reloc against `a` with the addend adjusted by `b`'s
+    /// position (GAS semantics for `$sym - 0b`).
+    pub(crate) fn add_diff_relocation(&mut self, symbol: &str, diff: &str, reloc_type: u32, addend: i64) {
+        self.relocations.push(Relocation {
+            offset: self.bytes.len() as u64,
+            symbol: symbol.to_string(),
+            reloc_type,
+            addend,
+            diff_symbol: Some(diff.to_string()),
         });
     }
 

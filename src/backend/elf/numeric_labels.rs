@@ -252,6 +252,35 @@ fn resolve_numeric_displacement(
             resolve_numeric_name(name, current_idx, defs)
                 .map(|n| Displacement::SymbolPlusOffset(n, *offset))
         }
+        // Label differences as displacements (efi-mixed.S:
+        // `leal (_bss - 1b)(%ecx), %edi`): EITHER side may be a numeric
+        // label reference. Returning Some whenever at least one side
+        // resolved keeps the other side's name unchanged.
+        Displacement::SymbolDiff(lhs, rhs) => {
+            let new_lhs = resolve_numeric_name(lhs, current_idx, defs);
+            let new_rhs = resolve_numeric_name(rhs, current_idx, defs);
+            if new_lhs.is_none() && new_rhs.is_none() {
+                None
+            } else {
+                Some(Displacement::SymbolDiff(
+                    new_lhs.unwrap_or_else(|| lhs.clone()),
+                    new_rhs.unwrap_or_else(|| rhs.clone()),
+                ))
+            }
+        }
+        Displacement::SymbolDiffAddend(lhs, rhs, addend) => {
+            let new_lhs = resolve_numeric_name(lhs, current_idx, defs);
+            let new_rhs = resolve_numeric_name(rhs, current_idx, defs);
+            if new_lhs.is_none() && new_rhs.is_none() {
+                None
+            } else {
+                Some(Displacement::SymbolDiffAddend(
+                    new_lhs.unwrap_or_else(|| lhs.clone()),
+                    new_rhs.unwrap_or_else(|| rhs.clone()),
+                    *addend,
+                ))
+            }
+        }
         _ => None,
     }
 }

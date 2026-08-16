@@ -40,6 +40,24 @@ impl Lowerer {
         // resolves to the true global, not a same-named static local
         self.shadow_static_for_scope(&declarator.name);
 
+        // Propagate __attribute__((weak)) / visibility from ANY block-scope
+        // extern declaration — including `extern typeof(f) f
+        // __attribute__((weak, visibility("hidden")))`, where typeof supplies
+        // the function type and `derived` is empty so the function-declaration
+        // handler below never sees it. The kernel's !CONFIG_MODULES
+        // symbol_get() expands to exactly that shape (module.h:835); dropping
+        // the attributes left ips_link_to_i915_driver a STB_GLOBAL undef and
+        // the vmlinux link failed instead of resolving it to NULL.
+        if !declarator.name.is_empty()
+            && (declarator.attrs.is_weak() || declarator.attrs.visibility.is_some())
+        {
+            self.module.symbol_attrs.push((
+                declarator.name.clone(),
+                declarator.attrs.is_weak(),
+                declarator.attrs.visibility.clone(),
+            ));
+        }
+
         // Check if this is a function declaration (extern int f(int))
         let is_func_decl = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
         if is_func_decl {
