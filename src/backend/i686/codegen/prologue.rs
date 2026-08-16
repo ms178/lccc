@@ -16,6 +16,46 @@ use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 
 impl I686Codegen {
+    /// Does this function need the PIC GOT base in %ebx?
+    ///
+    /// Exactly the constructs that expand to a `@GOT`/`@GOTOFF` reference:
+    ///   * `GlobalAddr`  -> `movl sym@GOT(%ebx)` / `leal sym@GOTOFF(%ebx)`
+    ///   * `LabelAddr`   -> `leal L@GOTOFF(%ebx)`   (computed goto, `&&label`)
+    ///   * TLS addresses -> `movl sym@GOTNTPOFF(%ebx)`
+    ///   * a `Switch` lowered to a jump table -> `leal jt@GOTOFF(%ebx)`
+    ///   * inline asm, which may name any symbol in text we do not parse
+    ///
+    /// Deliberately an ALLOWLIST with a conservative default: anything not
+    /// recognised here keeps the GOT. Getting this wrong in the permissive
+    /// direction produces a wild %ebx dereference, so the failure mode must be
+    /// "one wasted register", never "wrong address".
+    fn function_needs_got(func: &IrFunction, pic: bool) -> bool {
+        use crate::ir::reexports::{Instruction, Terminator};
+        if !pic {
+            return false;
+        }
+        for block in &func.blocks {
+            // A Switch may be lowered to a GOTOFF-relative jump table. The
+            // decision happens later in emit_switch_jump_table, so assume the
+            // table form whenever a Switch is present.
+            if matches!(block.terminator, Terminator::Switch { .. }) {
+                return true;
+            }
+            if matches!(block.terminator, Terminator::IndirectBranch { .. }) {
+                return true;
+            }
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GlobalAddr { .. }
+                    | Instruction::LabelAddr { .. }
+                    | Instruction::InlineAsm { .. } => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
     // ---- calculate_stack_space ----
 
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -57,8 +97,19 @@ impl I686Codegen {
             i686_clobber_to_phys,
             callee_saved_set,
         );
-        // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer.
-        if self.state.pic_mode && !asm_clobbered_regs.contains(&PhysReg(0)) {
+        // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer --
+        // but ONLY for functions that actually reference the GOT.
+        //
+        // Unconditionally reserving it cost every leaf function 12 bytes it
+        // could not use: `push %ebx` + `call __x86.get_pc_thunk.bx` +
+        // `addl $_GLOBAL_OFFSET_TABLE_,%ebx` + `pop %ebx`, plus the loss of a
+        // register that then forced spills elsewhere. On the 32 KiB-limited
+        // kernel setup binary that is pure waste, because the overwhelming
+        // majority of those functions never form a global address at all.
+        // GCC makes the same call: it materializes the GOT base lazily.
+        let needs_got = Self::function_needs_got(func, self.state.pic_mode);
+        self.pic_got_live = needs_got;
+        if needs_got && !asm_clobbered_regs.contains(&PhysReg(0)) {
             asm_clobbered_regs.push(PhysReg(0));
         }
         let available_regs = filter_available_regs(callee_saved_set, &asm_clobbered_regs);
@@ -71,8 +122,8 @@ impl I686Codegen {
             false,
         );
 
-        // In PIC mode, %ebx must be saved/restored as a callee-saved register.
-        if self.state.pic_mode && !self.used_callee_saved.contains(&PhysReg(0)) {
+        // %ebx must be saved/restored only when it really holds the GOT base.
+        if needs_got && !self.used_callee_saved.contains(&PhysReg(0)) {
             self.used_callee_saved.insert(0, PhysReg(0));
         }
 
@@ -154,9 +205,9 @@ impl I686Codegen {
             emit!(self.state, "    pushl %{}", name);
         }
 
-        if self.state.pic_mode {
+        if self.pic_got_live {
             debug_assert!(self.used_callee_saved.contains(&PhysReg(0)),
-                "PIC mode requires ebx in used_callee_saved");
+                "GOT-using function requires ebx in used_callee_saved");
             self.state.emit("    call __x86.get_pc_thunk.bx");
             self.state.emit("    addl $_GLOBAL_OFFSET_TABLE_, %ebx");
             self.needs_pc_thunk_bx = true;

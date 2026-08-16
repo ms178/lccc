@@ -1103,10 +1103,228 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
 // ── Pass: Dead register move elimination ─────────────────────────────────────
 
 /// Remove register moves where the destination is overwritten before being read.
+/// Substitute `old_reg` -> `new_reg` in the SOURCE operands of an AT&T
+/// instruction, leaving the destination untouched.
+///
+/// AT&T puts the destination LAST (`orl %ecx, %eax` writes %eax), which is the
+/// opposite of Intel syntax. `peephole_common::replace_source_reg_in_instruction`
+/// rewrites everything after the first comma -- correct for Intel, and exactly
+/// wrong here: it rewrote the destination and turned `orl %ecx,%eax` into
+/// `orl %ecx,%edi`, silently computing into the wrong register.
+///
+/// Rules implemented:
+///   * 2+ operands: every operand EXCEPT the last is a source.
+///   * 1 operand: it is read-modify-write (`incl %eax`, `negl %eax`) or a
+///     jump/call target -- never a pure source, so nothing is rewritten.
+///   * Memory operands among the sources are rewritten too: the registers in
+///     `disp(%base,%index,scale)` are read, not written.
+///   * A destination that is a MEMORY operand (`movl %eax, (%ebx)`) still
+///     only reads %ebx, so its registers may be substituted as well.
+fn replace_att_source_reg(line: &str, old_reg: &str, new_reg: &str) -> Option<String> {
+    use crate::backend::peephole_common::{has_whole_word, replace_whole_word};
+
+    let leading = line.len() - line.trim_start().len();
+    let (ws, body) = line.split_at(leading);
+    let body = body.trim_end();
+    if body.is_empty() {
+        return None;
+    }
+    // Split mnemonic from operand list.
+    let sp = body.find(|c: char| c.is_whitespace())?;
+    let (mnemonic, rest) = body.split_at(sp);
+    let operands = rest.trim_start();
+    if operands.is_empty() {
+        return None;
+    }
+
+    // Split the operand list on TOP-LEVEL commas: a memory operand contains
+    // commas of its own (`4(%eax,%ebx,2)`).
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in operands.chars() {
+        match ch {
+            '(' => { depth += 1; cur.push(ch); }
+            ')' => { depth -= 1; cur.push(ch); }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    parts.push(cur);
+
+    // A single operand is read-modify-write or a branch target: not a source.
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let last = parts.len() - 1;
+    let mut hit = false;
+    for (idx, part) in parts.iter_mut().enumerate() {
+        let is_dest = idx == last;
+        // The destination may still be a MEMORY reference, whose registers are
+        // read. A bare register destination must not be touched.
+        let dest_is_memory = is_dest && part.contains('(');
+        if is_dest && !dest_is_memory {
+            continue;
+        }
+        if has_whole_word(part, old_reg) {
+            *part = replace_whole_word(part, old_reg, new_reg);
+            hit = true;
+        }
+    }
+    if !hit {
+        return None;
+    }
+    Some(format!("{}{} {}", ws, mnemonic, parts.join(",")))
+}
+
+/// Copy propagation over register-to-register moves.
+///
+/// `movl %eax, %ebx` makes %ebx an alias of %eax. Every later reader of %ebx
+/// can read %eax instead, as long as NEITHER register has been redefined in
+/// between. Rewriting the readers usually makes the copy itself dead, and
+/// `eliminate_dead_reg_moves` (which runs after this) then deletes it.
+///
+/// Why this matters so much on i686: the register allocator hands out a fresh
+/// register for every SSA value, so a simple expression turns into a chain
+///     movl 32(%esp),%eax ; movl %eax,%ebx ; movl %ebx,%ecx ; movzbl (%ecx),%eax
+/// Four registers for one address. That is what forced `read_word` to save
+/// ebx/esi/edi/ebp and cost 73 bytes where GCC needs 11. Breaking the chains
+/// removes both the moves AND the register pressure that produced the
+/// callee-save prologue -- which is the dominant cost in the 32 KiB kernel
+/// setup binary.
+///
+/// SOUNDNESS. The rewrite is applied only while both registers are provably
+/// unchanged, and the scan stops at anything that could invalidate that:
+///   * any write to src or dst (including implicit ones via `Other.dest_reg`,
+///     `SetCC`, `Pop`, `LoadEbp`, `Call` clobbers);
+///   * any barrier -- label, jump, call, ret -- because this is a LOCAL
+///     analysis with no CFG;
+///   * `%esp`/`%ebp`, which addressing depends on;
+///   * a partial-register read of dst (`%bl`, `%bx`) -- `line_references_reg`
+///     matches those spellings, and substituting a 32-bit name for them would
+///     change the operand width.
+/// The substitution itself only touches SOURCE operands
+/// (`replace_source_reg_in_instruction` refuses to rewrite a destination), so
+/// a reader that also writes dst is never corrupted.
+fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = infos.len();
+    let mut changed = false;
+    // Bounded like the other local passes: copies live only a few
+    // instructions in practice, and this keeps the pass linear.
+    const WINDOW: usize = 24;
+
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let (dst_reg, src_reg) = match infos[i].kind {
+            LineKind::Move { dst, src } => (dst, src),
+            _ => continue,
+        };
+        // Never rewrite through the stack or frame pointer.
+        if dst_reg == REG_ESP || dst_reg == REG_EBP
+            || src_reg == REG_ESP || src_reg == REG_EBP
+        {
+            continue;
+        }
+        if dst_reg == src_reg {
+            continue;
+        }
+
+        let mut j = i + 1;
+        let mut count = 0;
+        while j < len && count < WINDOW {
+            if infos[j].is_nop() {
+                j += 1;
+                continue;
+            }
+            // No CFG here: anything that can transfer control ends the region
+            // in which the alias is known to hold.
+            if infos[j].is_barrier() {
+                break;
+            }
+
+            let line = trimmed(store, &infos[j], j);
+
+            // A write to the SOURCE breaks the alias immediately -- readers
+            // after this point must keep using dst.
+            let writes_src = match infos[j].kind {
+                LineKind::Move { dst, .. } => dst == src_reg,
+                LineKind::LoadEbp { reg, .. } => reg == src_reg,
+                LineKind::Pop { reg } => reg == src_reg,
+                LineKind::SetCC { reg } => reg == src_reg,
+                LineKind::Other { dest_reg } => dest_reg == src_reg,
+                _ => false,
+            };
+            if writes_src {
+                break;
+            }
+
+            // Rewrite this reader to use the source register.
+            if line_references_reg(line, dst_reg) {
+                // Only the plain 32-bit spelling is safe to substitute: a
+                // partial read (`%bl`/`%bx`) would need the matching sub-name
+                // of src, and getting that wrong silently changes the width.
+                let dst_name = reg32_name(dst_reg);
+                let src_name = reg32_name(src_reg);
+                if let Some(new_line) = replace_att_source_reg(store.get(j), dst_name, src_name) {
+                    store.replace(j, new_line);
+                    let re = classify_line(store.get(j));
+                    infos[j] = LineInfo { trim_start: infos[j].trim_start, ..re };
+                    changed = true;
+                }
+            }
+
+            // A write to the DESTINATION ends the alias (after any rewrite of
+            // this same instruction's sources, which is why this comes last).
+            let writes_dst = match infos[j].kind {
+                LineKind::Move { dst, .. } => dst == dst_reg,
+                LineKind::LoadEbp { reg, .. } => reg == dst_reg,
+                LineKind::Pop { reg } => reg == dst_reg,
+                LineKind::SetCC { reg } => reg == dst_reg,
+                LineKind::Other { dest_reg } => dest_reg == dst_reg,
+                _ => false,
+            };
+            if writes_dst {
+                break;
+            }
+
+            j += 1;
+            count += 1;
+        }
+    }
+
+    changed
+}
+
+/// Is `reg` callee-saved in the i386 SysV ABI?
+///
+/// %ebx, %esi, %edi and %ebp are preserved across calls, which means a write
+/// to one of them that is never read before `ret` is dead: the epilogue's
+/// `pop` overwrites it, and no caller can observe the value. %eax/%edx are
+/// return-value registers and %esp/%ecx are not callee-saved.
+fn is_callee_saved_reg(reg: RegId) -> bool {
+    matches!(reg, REG_EBX | REG_ESI | REG_EDI | REG_EBP)
+}
+
 fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
     const WINDOW: usize = 16;
+
+    // Detect a real frame pointer: `movl %esp, %ebp` in the prologue, or any
+    // %ebp-relative addressing. Either means %ebp is load-bearing and must not
+    // be treated as a dataflow register. Scanning once per call keeps this
+    // O(n) and cannot be fooled by a function that only *pushes* %ebp as a
+    // callee-saved register without establishing a frame.
+    let frame_pointer_in_use = (0..len).any(|k| {
+        if infos[k].is_nop() {
+            return false;
+        }
+        let l = trimmed(store, &infos[k], k);
+        l.contains("(%ebp)") || l == "movl %esp, %ebp" || l.starts_with("movl %esp, %ebp")
+    });
 
     for i in 0..len {
         if infos[i].is_nop() { continue; }
@@ -1114,14 +1332,37 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
             LineKind::Move { dst, .. } => dst,
             _ => continue,
         };
-        // Don't eliminate moves to esp/ebp
-        if dst_reg == REG_ESP || dst_reg == REG_EBP { continue; }
+        // %esp is never a dataflow register. %ebp is only off-limits while it
+        // serves as the FRAME POINTER; under -fomit-frame-pointer (which the
+        // kernel's 32 KiB setup code is built with) it is an ordinary
+        // allocatable register, and refusing to touch it kept every dead write
+        // to it alive -- together with the push/pop pair the prologue emits
+        // because the allocator claimed it.
+        if dst_reg == REG_ESP { continue; }
+        if dst_reg == REG_EBP && frame_pointer_in_use { continue; }
 
         // Look ahead: if dst is overwritten before being read, this move is dead
         let mut j = i + 1;
         let mut count = 0;
         while j < len && count < WINDOW {
             if infos[j].is_nop() { j += 1; continue; }
+            // A `ret` is not an opaque barrier for a callee-saved register: by
+            // the ABI the caller does not observe it, and the epilogue's `pop`
+            // restores it anyway. Treating `ret` like a label kept every dead
+            // write to %ebx/%esi/%edi/%ebp alive, and since the prologue saves
+            // exactly the registers the allocator claims, each one cost a
+            // push+pop pair on top of the dead move itself.
+            //
+            // %eax/%edx carry the return value, so they must stay live to the
+            // `ret`; the pops between here and it are handled by the Pop arm
+            // below, which sees the register being redefined.
+            if matches!(infos[j].kind, LineKind::Ret) {
+                if is_callee_saved_reg(dst_reg) {
+                    infos[i].kind = LineKind::Nop;
+                    changed = true;
+                }
+                break;
+            }
             if infos[j].is_barrier() { break; }
 
             // Check if dst is read by this instruction
@@ -1129,6 +1370,23 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
             match infos[j].kind {
                 LineKind::StoreEbp { reg, .. } if reg == dst_reg => {
                     // dst is read (stored to stack) - move is alive
+                    break;
+                }
+                // `popl %reg` OVERWRITES the register -- it does not read it.
+                // Without this arm the epilogue's pops fell into the catch-all
+                // below, which sees the register mentioned and concludes it is
+                // live. Every dead write to a callee-saved register therefore
+                // survived, e.g. the final `movl %eax,%ebp` immediately before
+                // `popl %ebp`.
+                LineKind::Pop { reg } => {
+                    if reg == dst_reg {
+                        infos[i].kind = LineKind::Nop;
+                        changed = true;
+                    }
+                    break;
+                }
+                // `pushl %reg` READS it: the move that produced it is alive.
+                LineKind::Push { reg } if reg == dst_reg => {
                     break;
                 }
                 LineKind::Move { src, dst } => {
@@ -1684,7 +1942,10 @@ pub fn peephole_optimize(asm: String) -> String {
     }
 
     // Phase 2: Global passes (run once)
-    let global_changed = eliminate_dead_reg_moves(&store, &mut infos);
+    // Copy propagation first: it turns chained moves into dead moves, which
+    // the very next pass then removes.
+    let global_changed = propagate_reg_copies(&mut store, &mut infos);
+    let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
@@ -1696,6 +1957,7 @@ pub fn peephole_optimize(asm: String) -> String {
         while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
             changed2 = false;
             changed2 |= combined_local_pass(&mut store, &mut infos);
+            changed2 |= propagate_reg_copies(&mut store, &mut infos);
             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= eliminate_dead_stores(&store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
