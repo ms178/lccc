@@ -314,10 +314,6 @@ impl Lowerer {
             // For types 2 and 3: return 0 when size is unknown
             // We conservatively return "unknown" since we don't do points-to analysis.
             BuiltinIntrinsic::ObjectSize => {
-                // Evaluate args for side effects
-                for arg in args {
-                    self.lower_expr(arg);
-                }
                 let obj_type = if args.len() >= 2 {
                     match self.eval_const_expr(&args[1]) {
                         Some(IrConst::I64(v)) => v,
@@ -327,6 +323,22 @@ impl Lowerer {
                 } else {
                     0
                 };
+                // Fast path: string literal. Size is strlen+1 (NUL included).
+                // Highest-ROI object_size case for fortify; every serious C
+                // compiler folds this without full points-to analysis.
+                if let Some(arg0) = args.first() {
+                    if let Expr::StringLiteral(s, _) = arg0 {
+                        let sz = (s.len() + 1) as i64;
+                        if args.len() >= 2 {
+                            let _ = self.lower_expr(&args[1]);
+                        }
+                        return Some(Operand::Const(IrConst::I64(sz)));
+                    }
+                }
+                // Conservative unknown: evaluate args for side effects.
+                for arg in args {
+                    let _ = self.lower_expr(arg);
+                }
                 // Types 0 and 1: maximum estimate -> -1 (unknown)
                 // Types 2 and 3: minimum estimate -> 0 (unknown)
                 let result = if obj_type == 2 || obj_type == 3 { 0i64 } else { -1i64 };
@@ -831,7 +843,7 @@ impl Lowerer {
             (IrType::F64, 16usize, 8usize)
         };
         let alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 16, volatile: false, semantic_volatile: false });
         self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
         let imag_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
@@ -866,7 +878,7 @@ impl Lowerer {
         }
         // By-value packed I128 (nested raw builtin): spill to a slot.
         let slot = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
         let val = self.operand_to_value(op);
         self.emit(Instruction::Store { val: Operand::Value(val), ptr: slot, ty: IrType::I128, seg_override: AddressSpace::Default });
         Operand::Value(slot)
@@ -879,7 +891,12 @@ impl Lowerer {
         let lo = self.fresh_value();
         self.emit(Instruction::Load { dest: lo, ptr: slot, ty: IrType::I64, seg_override: AddressSpace::Default });
         let hi_ptr = self.fresh_value();
-        self.emit(Instruction::BinOp { dest: hi_ptr, op: IrBinOp::Add, lhs: Operand::Value(slot), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+        self.emit(Instruction::GetElementPtr {
+            dest: hi_ptr,
+            base: slot,
+            offset: Operand::Const(IrConst::I64(8)),
+            ty: IrType::I8,
+        });
         let hi = self.fresh_value();
         self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: AddressSpace::Default });
         let lo128 = self.fresh_value();
@@ -908,7 +925,7 @@ impl Lowerer {
         let v1p = self.operand_to_value(v1);
         let v2p = self.operand_to_value(v2);
         let result = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
         for lane in 0..4usize {
             let idx = match self.eval_const_expr(&args[2 + lane]) {
                 Some(IrConst::I64(v)) => v,
@@ -958,16 +975,29 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::PtrStore => {
+                // Defensive: never panic the compiler on a short argument list.
+                if args.len() < 2 {
+                    for a in args {
+                        let _ = self.lower_expr(a);
+                    }
+                    return Some(Operand::Const(IrConst::I64(0)));
+                }
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let ptr_val = self.operand_to_value(arg_ops[0]);
-                self.emit(Instruction::Intrinsic { dest: None, op, dest_ptr: Some(ptr_val), args: vec![arg_ops[1]] });
+                let ptr_val = self.operand_to_value(arg_ops[0].clone());
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: Some(ptr_val),
+                    args: vec![arg_ops[1].clone()],
+                });
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let result_size = match x86_intrinsic_kind(intrinsic) { X86IntrinsicKind::Vec128 => 16, X86IntrinsicKind::Vec256 => 32, _ => unreachable!() };
                 let result_alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: result_size, align: 0, volatile: false, semantic_volatile: false });
+                let align = match result_size { 32 => 32usize, _ => 16usize };
+                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: result_size, align, volatile: false, semantic_volatile: false });
                 let dest_val = self.fresh_value();
                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
                 Some(Operand::Value(result_alloca))
@@ -994,15 +1024,20 @@ impl Lowerer {
                 }).collect();
 
                 let result_alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
                 let dest_val = self.fresh_value();
                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
                 // lo half
                 let lo = self.fresh_value();
                 self.emit(Instruction::Load { dest: lo, ptr: result_alloca, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
-                // hi half: result_alloca + 8
+                // hi half: result_alloca + 8 (GEP so analyses see a proper derived pointer)
                 let hi_ptr = self.fresh_value();
-                self.emit(Instruction::BinOp { dest: hi_ptr, op: IrBinOp::Add, lhs: Operand::Value(result_alloca), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+                self.emit(Instruction::GetElementPtr {
+                    dest: hi_ptr,
+                    base: result_alloca,
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I8,
+                });
                 let hi = self.fresh_value();
                 self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
                 let lo128 = self.fresh_value();
