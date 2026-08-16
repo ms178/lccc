@@ -97,6 +97,15 @@ impl X86Arch for I686Arch {
     }
     fn reloc_abs64() -> u32 { R_386_32 } // i686 doesn't have 64-bit relocs
     fn reloc_pc32() -> u32 { R_386_PC32 }
+    fn reloc_pc16() -> Option<u32> { Some(R_386_PC16) }
+    fn reloc_pc8() -> Option<u32> { Some(23) } // R_386_PC8
+    fn reloc_patch_size(reloc_type: u32) -> u8 {
+        match reloc_type {
+            // R_386_16 / R_386_PC16: 2-byte fields (real-mode disp16/rel16).
+            20 | 21 => 2,
+            _ => 4,
+        }
+    }
     fn reloc_plt32() -> u32 { R_386_PLT32 }
 
     fn uses_rel_format() -> bool { true }

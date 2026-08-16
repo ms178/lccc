@@ -42,6 +42,41 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Absolute-address ModR/M for a bare-label memory operand
+    /// (`movw heap_end_ptr, %dx`, `lgdtl tr_gdt`, `testb $x, loadflags`).
+    ///
+    /// PR#82 unified eleven emit sites onto this helper but the helper
+    /// itself was lost in the merge; this is the missing definition.
+    ///
+    /// 32-bit mode: mod=00 rm=101 + disp32 + R_386_32 — the classic form.
+    /// .code16:     mod=00 rm=110 + disp16 + R_386_16 (GAS: `8b 16 <d16>`
+    /// for `movw sym, %dx`). A 16-bit reloc field also means the addend
+    /// must fit 16 bits, which holds for all real-mode setup symbols.
+    pub(super) fn encode_abs_addr_modrm(&mut self, reg_field: u8, label: &str) -> Result<(), String> {
+        // Numeric literal labels are absolute addresses with no relocation.
+        if let Ok(addr) = label.parse::<i64>() {
+            if self.code16 {
+                self.bytes.push(self.modrm(0, reg_field, 6));
+                self.bytes.extend_from_slice(&(addr as i16).to_le_bytes());
+            } else {
+                self.bytes.push(self.modrm(0, reg_field, 5));
+                self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
+            }
+            return Ok(());
+        }
+        let (sym, addend) = split_label_offset(label);
+        if self.code16 {
+            self.bytes.push(self.modrm(0, reg_field, 6)); // rm=110: disp16
+            self.add_relocation(sym, R_386_16, addend);
+            self.bytes.extend_from_slice(&[0, 0]);
+        } else {
+            self.bytes.push(self.modrm(0, reg_field, 5)); // rm=101: disp32
+            self.add_relocation(sym, R_386_32, addend);
+            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        Ok(())
+    }
+
     pub(super) fn encode_modrm_mem(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
@@ -77,6 +112,65 @@ impl super::InstructionEncoder {
                 (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
             }
         };
+
+        // ── .code16: 16-bit ModR/M table ─────────────────────────────
+        // Real mode defaults to 16-bit addressing: absolute operands use
+        // mod=00 rm=110 + disp16 (+ R_386_16 for symbols); the classic
+        // register bases (%bx/%bp/%si/%di) use the 16-bit table; 32-bit
+        // register bases fall back to the 32-bit table below with a 0x67
+        // override requested via pending_addr32 (GAS order 67-before-66 is
+        // restored by fixup_code16_prefixes).
+        if self.code16 {
+            if base.is_none() && index.is_none() {
+                self.bytes.push(self.modrm(0, reg_field, 6)); // rm=110: disp16
+                if let Some((sym, _rt, addend)) = pending_reloc {
+                    if diff_sym.is_some() {
+                        return Err(format!(
+                            "symbol-difference displacement in .code16 absolute operand: {}", sym));
+                    }
+                    self.add_relocation(&sym, R_386_16, addend);
+                }
+                self.bytes.extend_from_slice(&(disp_val as i16).to_le_bytes());
+                return Ok(());
+            }
+            let is_16bit_base = matches!(
+                (base.map(|r| r.name.as_str()), index.map(|r| r.name.as_str())),
+                (Some("bx"), Some("si")) | (Some("bx"), Some("di"))
+                | (Some("bp"), Some("si")) | (Some("bp"), Some("di"))
+                | (Some("si"), None) | (Some("di"), None)
+                | (Some("bp"), None) | (Some("bx"), None)
+            );
+            if is_16bit_base {
+                let rm = match (base.map(|r| r.name.as_str()), index.map(|r| r.name.as_str())) {
+                    (Some("bx"), Some("si")) => 0u8,
+                    (Some("bx"), Some("di")) => 1,
+                    (Some("bp"), Some("si")) => 2,
+                    (Some("bp"), Some("di")) => 3,
+                    (Some("si"), None) => 4,
+                    (Some("di"), None) => 5,
+                    (Some("bp"), None) => 6,
+                    (Some("bx"), None) => 7,
+                    _ => unreachable!(),
+                };
+                if has_symbol {
+                    return Err("symbolic displacement with 16-bit register base is unsupported".to_string());
+                }
+                // %bp at mod=00 rm=110 means ABSOLUTE; it needs at least disp8.
+                if disp_val == 0 && rm != 6 {
+                    self.bytes.push(self.modrm(0, reg_field, rm));
+                } else if (-128..=127).contains(&disp_val) {
+                    self.bytes.push(self.modrm(1, reg_field, rm));
+                    self.bytes.push(disp_val as u8);
+                } else {
+                    self.bytes.push(self.modrm(2, reg_field, rm));
+                    self.bytes.extend_from_slice(&(disp_val as i16).to_le_bytes());
+                }
+                return Ok(());
+            }
+            // 32-bit register base inside .code16: request the 0x67 prefix
+            // and use the normal 32-bit encoding below.
+            self.pending_addr32 = true;
+        }
 
         // No base register - need SIB with no-base encoding or direct displacement
         if base.is_none() && index.is_none() {

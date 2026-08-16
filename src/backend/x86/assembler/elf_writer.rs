@@ -160,6 +160,7 @@ impl X86Arch for X86_64Arch {
     fn uses_rel_format() -> bool { false }
 
     fn reloc_pc8_internal() -> Option<u32> { Some(R_X86_64_PC8_INTERNAL) }
+    fn reloc_pc8() -> Option<u32> { Some(15) } // R_X86_64_PC8
     fn reloc_abs32_for_internal() -> Option<u32> { Some(R_X86_64_32) }
     fn supports_deferred_skips() -> bool { true }
     fn resolve_set_aliases_in_data() -> bool { true }

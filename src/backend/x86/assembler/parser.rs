@@ -1842,6 +1842,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // PURE constant expressions first: `.quad ((0x1000000) + (0x200000
+        // - 1)) & ~(0x200000 - 1)` (header.S pref_address/LOAD_PHYSICAL_ADDR).
+        // The " - " diff split below would break the expression at its first
+        // minus and emit a relocation against the literal left-half string.
+        // parse_integer_expr fails on any symbol reference, so this probe
+        // can never swallow a legitimate symbol diff.
+        if let Ok(val) = parse_integer_expr(trimmed) {
+            vals.push(DataValue::Integer(val));
+            continue;
+        }
+
         // General `symbol +/- const-expr [+/- const-expr ...]` chain, e.g. the
         // kernel's `level1_fixmap_pgt + (2 << 12) - 8 + 16`. The " - " split
         // below would break at the FIRST minus and treat everything left of

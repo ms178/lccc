@@ -133,7 +133,12 @@ impl super::InstructionEncoder {
             ImmediateValue::Integer(val) => {
                 let val = *val;
                 if size == 4 {
-                    // movl $imm32, %reg - use compact B8+rd encoding
+                    // movl $imm32, %reg - compact B8+rd id. sized_op MUST be
+                    // set: in .code16 the 32-bit form is 66 B8+rd id (GAS:
+                    // `66 b8 78 56 34 12`); without the marker the prefix
+                    // inversion skipped it and the imm32 was decoded as
+                    // imm16 + stray bytes (silent wrong code).
+                    self.sized_op = true;
                     self.bytes.push(0xB8 + dst_num);
                     self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
                 } else if size == 2 {
@@ -149,6 +154,7 @@ impl super::InstructionEncoder {
             ImmediateValue::Symbol(sym) | ImmediateValue::SymbolPlusOffset(sym, _) => {
                 let addend = if let ImmediateValue::SymbolPlusOffset(_, a) = imm { *a } else { 0 };
                 if size == 4 {
+                    self.sized_op = true;
                     self.bytes.push(0xB8 + dst_num);
                     self.add_relocation(sym, R_386_32, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
@@ -487,6 +493,20 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x68);
                     self.bytes.extend_from_slice(&(*val as i16).to_le_bytes());
                 }
+                Ok(())
+            }
+            // `pushw $sym` (header.S: `pushw $6f` lretw trampoline):
+            // 68 imm16 + R_386_16 in .code16. No valid GAS form outside
+            // 16-bit mode, so reject loudly there.
+            Operand::Immediate(ImmediateValue::Symbol(sym)) |
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)) => {
+                let addend = if let Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) = &ops[0] { *a } else { 0 };
+                if !self.code16 {
+                    return Err("pushw $symbol is only supported in .code16 mode".to_string());
+                }
+                self.bytes.push(0x68);
+                self.add_relocation(sym, R_386_16, addend);
+                self.bytes.extend_from_slice(&[0, 0]);
                 Ok(())
             }
             _ => Err("unsupported pushw operand".to_string()),
@@ -1263,10 +1283,21 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
+                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
+                if self.code16 {
+                    // .code16 near jmp: E9 rel16 + R_386_PC16 (GAS emits
+                    // `e9 00 00` + PC16 for forward targets; short local
+                    // targets get relaxed to EB rel8 by GAS — lccc's fixed
+                    // rel16 form is semantically identical and local
+                    // targets fold to constants in the writer).
+                    self.bytes.push(0xE9);
+                    self.add_relocation(sym, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
                 self.bytes.push(0xE9);
                 // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
                 // R_386_PC32 is rejected by ld for PIE executables calling shared lib functions.
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
                 let reloc_type = R_386_PLT32;
                 self.add_relocation(sym, reloc_type, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
@@ -1378,15 +1409,31 @@ impl super::InstructionEncoder {
             2 => {
                 match (&ops[0], &ops[1]) {
                     (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
-                        self.bytes.push(0xEA);
-                        self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
+                        // .code16: offset width follows the suffix — ljmpl
+                        // marks sized_op (66-prefixed via the inversion) and
+                        // keeps imm32; ljmp/ljmpw emit imm16. .code32: imm32.
+                        if self.code16 && !self.ljmp_wide {
+                            self.bytes.push(0xEA);
+                            self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
+                        } else {
+                            if self.code16 { self.sized_op = true; }
+                            self.bytes.push(0xEA);
+                            self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
+                        }
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())
                     }
                     (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) => {
-                        self.bytes.push(0xEA);
-                        self.add_relocation(sym, R_386_32, 0);
-                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                        if self.code16 && !self.ljmp_wide {
+                            self.bytes.push(0xEA);
+                            self.add_relocation(sym, R_386_16, 0);
+                            self.bytes.extend_from_slice(&[0, 0]);
+                        } else {
+                            if self.code16 { self.sized_op = true; }
+                            self.bytes.push(0xEA);
+                            self.add_relocation(sym, R_386_32, 0);
+                            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                        }
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())
                     }
@@ -1419,9 +1466,20 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
+                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
+                if self.code16 {
+                    // .code16 Jcc: 0F 8x rel16 + R_386_PC16. GAS relaxes
+                    // same-section short targets to 7x rel8; lccc emits the
+                    // fixed rel16 form (identical semantics, always in
+                    // range for real-mode blobs; local targets resolve to
+                    // constants via the writer's PC16 path).
+                    self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
+                    self.add_relocation(sym, R_386_PC16, -2);
+                    self.bytes.extend_from_slice(&[0, 0]);
+                    return Ok(());
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x80 + cc]);
                 // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
                 let reloc_type = R_386_PLT32;
                 self.add_relocation(sym, reloc_type, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
@@ -1438,10 +1496,27 @@ impl super::InstructionEncoder {
 
         match &ops[0] {
             Operand::Label(label) => {
+                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
+                if self.code16 {
+                    // .code16 near call: E8 rel16 + R_386_PC16 (GAS:
+                    // `e8 00 00` + PC16 ext_fn-0x2). The explicit 32-bit
+                    // spelling `calll` is 66-prefixed rel32 (PC32) — GAS
+                    // `66 e8 00 00 00 00` + PC32 ext_fn-0x4 — selected by
+                    // the sized_op the dispatch sets for "calll".
+                    if self.sized_op {
+                        self.bytes.push(0xE8);
+                        self.add_relocation(sym, R_386_PC32, -4);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    } else {
+                        self.bytes.push(0xE8);
+                        self.add_relocation(sym, R_386_PC16, -2);
+                        self.bytes.extend_from_slice(&[0, 0]);
+                    }
+                    return Ok(());
+                }
                 self.bytes.push(0xE8);
                 // Always use R_386_PLT32 for branch targets, matching modern GCC/binutils.
                 let reloc_type = R_386_PLT32;
-                let sym = label.strip_suffix("@PLT").unwrap_or(label.as_str());
                 self.add_relocation(sym, reloc_type, -4);
                 self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                 Ok(())

@@ -17,7 +17,7 @@ use crate::backend::x86::assembler::parser::*;
 
 /// Split a label string like `"pa_tr_efer + 4"` or `"symbol-8"` into (symbol, addend).
 /// Returns the original string with addend 0 if no offset is found.
-fn split_label_offset(label: &str) -> (&str, i64) {
+pub(super) fn split_label_offset(label: &str) -> (&str, i64) {
     // Scan for '+' or '-' that separates the symbol from the offset.
     // Skip the first character to avoid splitting on leading sign/dot.
     for (i, c) in label.char_indices().skip(1) {
@@ -66,6 +66,8 @@ pub const R_386_PLT32: u32 = 4;
 /// relocs tool distinguishes R_386_16-against-segment-symbol (legal, recorded
 /// in relocs16) from R_386_32 (rejected as "Invalid absolute relocation").
 pub const R_386_16: u32 = 20;
+/// 16-bit PC-relative (rel16 branch fields in real-mode code).
+pub const R_386_PC16: u32 = 21;
 pub const R_386_GOTOFF: u32 = 9;
 pub const R_386_GOTPC: u32 = 10;
 pub const R_386_TLS_LE_32: u32 = 37;
@@ -105,6 +107,8 @@ pub struct InstructionEncoder {
     /// (i.e. one where 16- vs 32-bit operands are distinguishable). Only such
     /// instructions take part in the `.code16` operand-size inversion.
     pub(super) sized_op: bool,
+    /// Current far jump uses the explicit 32-bit-offset spelling (`ljmpl`).
+    pub(super) ljmp_wide: bool,
 }
 
 impl InstructionEncoder {
@@ -117,6 +121,7 @@ impl InstructionEncoder {
             code16: false,
             pending_addr32: false,
             sized_op: false,
+            ljmp_wide: false,
         }
     }
 
@@ -394,11 +399,23 @@ impl InstructionEncoder {
             // 32-bit mode it is the plain CALL encoding (kernel realmode
             // wakeup_asm.S/copy.S use it from .code16 files to force a
             // 4-byte return address).
-            "call" | "calll" => self.encode_call(ops),
+            "call" | "calll" => {
+                // `calll` in .code16 selects the 32-bit form: 66 E8 rel32
+                // (wakeup_asm.S uses it to force a 4-byte return address).
+                // Plain `call` is the mode-default width (rel16 in .code16).
+                // sized_op routes both through the prefix inversion; the
+                // rel width is chosen inside encode_call.
+                if mnemonic == "calll" { self.sized_op = true; }
+                self.encode_call(ops)
+            }
             // `retl` = explicit 32-bit near return (same C3 byte in 32-bit
             // mode); `retw` = 16-bit near return (66 C3).
             "ret" | "retl" | "retw" => {
+                // Width follows the suffix. .code32: retw = 66 C3, ret/retl
+                // = C3. .code16 (via the prefix inversion): retl marks
+                // sized_op -> 66 C3 (retl); ret/retw stay C3. GAS verified.
                 if mnemonic == "retw" { self.sized_op = true; self.bytes.push(0x66); }
+                if mnemonic == "retl" { self.sized_op = true; }
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
@@ -411,7 +428,16 @@ impl InstructionEncoder {
                 Ok(())
             }
             // Far jump
-            "ljmpl" | "ljmpw" | "ljmp" => self.encode_ljmp(ops),
+            "ljmpl" | "ljmpw" | "ljmp" => {
+                // Far-jump offset width follows the suffix. In .code16:
+                // ljmpl = 66 EA imm32 seg16, ljmp/ljmpw = EA imm16 seg16
+                // (GAS: `66 ea 00 10 00 00 10 00` / `ea 00 00 ff ff`).
+                // In .code32 both spellings take imm32.
+                self.ljmp_wide = mnemonic == "ljmpl";
+                let r = self.encode_ljmp(ops);
+                self.ljmp_wide = false;
+                r
+            }
             // `lcallw` forces 16-bit operand size: 0x66 prefix AND an imm16
             // offset in the direct form (realmode wakemain.c BIOS video call
             // `lcallw $0xc000, $3` — without this the offset would be encoded
@@ -872,15 +898,30 @@ impl InstructionEncoder {
             "sti" => { self.bytes.push(0xFB); Ok(()) }
             "sahf" => { self.bytes.push(0x9E); Ok(()) }
             "lahf" => { self.bytes.push(0x9F); Ok(()) }
-            "pushf" | "pushfl" => { self.bytes.push(0x9C); Ok(()) }
-            "popf" | "popfl" => { self.bytes.push(0x9D); Ok(()) }
+            "pushf" | "pushfl" => {
+                // The 'l' spelling selects the 32-bit form — a real size
+                // choice, so it participates in the .code16 inversion
+                // (wakeup_asm.S pushfl = 66 9c in real mode).
+                if mnemonic == "pushfl" { self.sized_op = true; }
+                self.bytes.push(0x9C); Ok(())
+            }
+            "popf" | "popfl" => {
+                if mnemonic == "popfl" { self.sized_op = true; }
+                self.bytes.push(0x9D); Ok(())
+            }
             // PUSHA/POPA (60/61): push/pop all eight GP registers. 32-bit
             // only (invalid in 64-bit mode — correctly absent from the x86-64
             // encoder). Kernel realmode BIOS trampolines save the full
             // register file around INT calls (arch/x86/boot/bioscall.S).
             // `pushaw`/`popaw` are the 16-bit-operand forms (0x66 prefix).
-            "pusha" | "pushal" => { self.bytes.push(0x60); Ok(()) }
-            "popa" | "popal" => { self.bytes.push(0x61); Ok(()) }
+            "pusha" | "pushal" => {
+                if mnemonic == "pushal" { self.sized_op = true; }
+                self.bytes.push(0x60); Ok(())
+            }
+            "popa" | "popal" => {
+                if mnemonic == "popal" { self.sized_op = true; }
+                self.bytes.push(0x61); Ok(())
+            }
             "pushaw" => { self.bytes.extend_from_slice(&[0x66, 0x60]); Ok(()) }
             "popaw" => { self.bytes.extend_from_slice(&[0x66, 0x61]); Ok(()) }
 
