@@ -2553,7 +2553,9 @@ impl X86Codegen {
             }
             // AArch64-only intrinsics must never reach the x86 emitter; fall
             // through to the loud "unhandled" diagnostic below rather than
-            // silently no-opping (which would miscompile).
+            // silently no-opping (which would miscompile). This covers
+            // Lev's VecSadalp/VecSmlal* widening reductions too — the sadalp
+            // transform is gated to the AArch64 pipeline entry.
             // Generic SIMD family (512-bit + FP): emitted by intrinsics_simd.rs.
             _ => {
                 if !self.emit_simd_op(dest, op, dest_ptr, args) {
