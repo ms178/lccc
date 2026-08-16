@@ -151,6 +151,10 @@ fn is_tail_call_candidate(
 
     let mut found_frame_teardown = false;
     let mut found_pop_rbp = false;
+    // Index and immediate of a frameless `addq $N, %rsp`, when that is the
+    // teardown form. The caller must keep it BEFORE the jump.
+    let mut frame_release: Option<(usize, String)> = None;
+    let _ = &frame_release;
     let mut j = call_idx + 1;
 
     while j < limit {
@@ -182,6 +186,26 @@ fn is_tail_call_candidate(
                     found_frame_teardown = true;
                     j += 1;
                     continue;
+                }
+                // Frameless epilogue: `addq $N, %rsp` releases the frame
+                // without a %rbp chain. lccc emits this shape whenever the
+                // function has no dynamic alloca, which is the common case --
+                // requiring the %rbp pair meant an indirect tail call was
+                // never converted:
+                //     call *%r10 ; addq $24,%rsp ; ret     (9 insns total)
+                // where GCC emits a single `jmp *%rdi`. Restoring the stack
+                // BEFORE the jump is exactly what makes the tail call legal,
+                // so accept it as the teardown.
+                if let Some(rest) = trimmed.strip_prefix("addq $") {
+                    if let Some((imm, reg)) = rest.split_once(", ") {
+                        if reg == "%rsp" && imm.bytes().all(|b| b.is_ascii_digit()) {
+                            found_frame_teardown = true;
+                            found_pop_rbp = true; // no %rbp was pushed
+                            frame_release = Some((j, imm.to_string()));
+                            j += 1;
+                            continue;
+                        }
+                    }
                 }
                 // Any other instruction that writes a register - check if it's rax
                 if dest_reg == 0 {

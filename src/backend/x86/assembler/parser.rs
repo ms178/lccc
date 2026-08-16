@@ -198,8 +198,21 @@ pub struct Register {
 }
 
 impl Register {
+    /// Build a register from its bare name (no `%` sigil).
+    ///
+    /// The name is trimmed and any leftover `%` is stripped. GNU as tolerates
+    /// whitespace between the sigil and the register name, and the kernel
+    /// relies on it: `__ASM_REGPFX` splices `(% rip)` and `(% rsp)` into
+    /// `arch/x86/include/asm/asm.h`'s `_ASM_RIP()`. Callers used to strip only
+    /// the `%`, leaving a name of `" rip"` that matched no register and
+    /// silently defaulted to `%rax` in the encoder -- turning
+    /// `movl x86_pred_cmd(%rip), %eax` into `mov 0x0(%rax), %eax`, a wrong-code
+    /// bug with no diagnostic. Normalizing at the single construction point
+    /// covers every parse path at once.
     pub fn new(name: &str) -> Self {
-        Register { name: name.to_string(), mask: None, zeroing: false }
+        let n = name.trim();
+        let n = n.strip_prefix('%').map(str::trim_start).unwrap_or(n);
+        Register { name: n.to_string(), mask: None, zeroing: false }
     }
 }
 
@@ -2849,6 +2862,25 @@ fn eval_ifc(rest: &str) -> bool {
 /// Uses whole-word matching to avoid replacing substrings inside identifiers,
 /// register names, or instruction mnemonics (e.g., replacing `i` inside `rip`).
 fn resolve_set_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> String {
+    // NEVER substitute inside the directive mnemonic.
+    //
+    // Substitution is whole-word and `.` counts as a word boundary, so a
+    // symbol named `type` rewrote the directive `.type` into `.3`. The kernel
+    // hits this hard: arch/x86/include/asm/unwind_hints.h does `.set type, 3`
+    // inside UNWIND_HINT, and every later `.type foo STT_FUNC` produced by
+    // SYM_FUNC_END silently became `.3 foo STT_FUNC`. All 26 affected function
+    // symbols stayed STT_NOTYPE and objtool rejected the object with
+    // "unexpected relocation symbol type in .rela.discard...: 0".
+    //
+    // Split the leading directive token off, resolve only the operands, and
+    // re-attach the mnemonic verbatim.
+    let lead = expr.len() - expr.trim_start().len();
+    let body = &expr[lead..];
+    if body.starts_with('.') {
+        let end = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
+        let (mnemonic, rest) = body.split_at(end);
+        return format!("{}{}{}", &expr[..lead], mnemonic, resolve_set_expr(rest, symbols));
+    }
     let mut result = expr.to_string();
     // Sort by length (longest first) to avoid partial replacements
     let mut sym_list: Vec<_> = symbols.iter().collect();

@@ -144,7 +144,18 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         // --- Pattern: movzbl %AL, %EAX (redundant re-zero-extend) ---
         if t.starts_with("movzbl ") || t.starts_with("movzbq ") {
             if let Some(comma) = t.find(',') {
+                // Guard the operand slice.
+                //
+                // `so` is derived from the first space; slicing `t[so..comma]`
+                // panics ("byte range starts at 11 but ends at 9") whenever the
+                // first comma appears BEFORE that space -- e.g. a memory
+                // operand written without a space after the comma. Observed
+                // while compiling kernel/exit.c. `continue` (not an early
+                // return) so the remaining lines are still processed.
                 let mut so = t.find(' ').unwrap_or(0) + 1;
+                if so > comma || comma >= t.len() {
+                    continue;
+                }
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                     so += 1;
                 }
@@ -193,7 +204,18 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             // reg-reg form only (memory sources are handled by the flag
             // update below: movzwl mem,%eax already zero-extends).
             if let Some(comma) = t.find(',') {
+                // Guard the operand slice.
+                //
+                // `so` is derived from the first space; slicing `t[so..comma]`
+                // panics ("byte range starts at 11 but ends at 9") whenever the
+                // first comma appears BEFORE that space -- e.g. a memory
+                // operand written without a space after the comma. Observed
+                // while compiling kernel/exit.c. `continue` (not an early
+                // return) so the remaining lines are still processed.
                 let mut so = t.find(' ').unwrap_or(0) + 1;
+                if so > comma || comma >= t.len() {
+                    continue;
+                }
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                     so += 1;
                 }

@@ -50,7 +50,16 @@ int main(void)
 	 * is exercised via a top-level asm block, which is verbatim text -- the
 	 * same path a .S file takes. */
 	long moved = 0;
-	asm volatile("call get_sp_plus_8" : "=a"(moved) : : "memory");
+	/* A `call` inside inline asm clobbers every caller-saved register, so
+	 * they must all be listed. Omitting them is an ABI violation that
+	 * happens to survive under some register allocations and crashes under
+	 * others -- it is not something the compiler can be expected to
+	 * tolerate. */
+	asm volatile("call get_sp_plus_8"
+		     : "=a"(moved)
+		     :
+		     : "memory", "rcx", "rdx", "rsi", "rdi",
+		       "r8", "r9", "r10", "r11");
 
 	if (got != 0x1234) {
 		printf("FAIL rip-relative got=0x%x\n", got);
