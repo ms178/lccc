@@ -558,6 +558,12 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("_mm_sll_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psllw128));
     m.insert("_mm_srl_epi16", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psrlw128));
     // __builtin_ia32_* names for new ops
+    // GCC vector-extension FP min/max: used by kernel code that cannot
+    // include userspace intrin headers (the NAP cpuidle governor's
+    // kernel_fpu_begin() translation units operate on
+    // `float __attribute__((vector_size(16)))` directly).
+    m.insert("__builtin_ia32_maxps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaxPs128));
+    m.insert("__builtin_ia32_minps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MinPs128));
     m.insert("__builtin_ia32_paddb128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddb128));
     m.insert("__builtin_ia32_psubb128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubb128));
     m.insert("__builtin_ia32_psubusw128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubusw128));
@@ -1086,6 +1092,8 @@ pub enum BuiltinIntrinsic {
     X86Palignr128,     // _mm_alignr_epi8 (PALIGNR, SSSE3)
     X86Pmaxub128,      // _mm_max_epu8 (PMAXUB)
     X86Pminub128,      // _mm_min_epu8 (PMINUB)
+    X86MaxPs128,       // __builtin_ia32_maxps (MAXPS) — GCC vector-extension builtin
+    X86MinPs128,       // __builtin_ia32_minps (MINPS)
     X86Pblendvb128,    // _mm_blendv_epi8 (PBLENDVB, SSE4.1)
     X86Pblendw128,     // _mm_blend_epi16 (PBLENDW, SSE4.1)
     X86Pmovzxbw128,    // _mm_cvtepu8_epi16 (PMOVZXBW, SSE4.1)

@@ -748,6 +748,14 @@ impl Driver {
                 // Record it so FP codegen can reject long-double operations
                 // instead of silently emitting x87 in kernel objects.
                 "-mno-80387" | "-msoft-float" | "-mno-fp-ret-in-387" => self.no_x87 = true,
+                // -mhard-float: RE-ENABLE hardware FP after a global
+                // -msoft-float (kernel CC_FLAGS_FPU for kernel_fpu_begin()
+                // translation units, e.g. the NAP governor's nap_fpu.o).
+                // lccc's default codegen already uses SSE hardware FP, so
+                // this both clears the soft-float latch and is otherwise a
+                // no-op. Order matters: kbuild appends it AFTER the kill
+                // flags, and later-flag-wins is exactly GCC's semantics.
+                "-mhard-float" => self.no_x87 = false,
                 // -malign-data=abi|compat|cacheline: data alignment policy.
                 // lccc aligns to natural ABI alignment which satisfies abi and
                 // compat; cacheline only ever OVER-aligns (a performance
