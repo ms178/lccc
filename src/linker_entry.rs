@@ -58,3 +58,34 @@ pub fn link_with_script_x86(
     crate::backend::x86::linker::emit_script::link_with_script(
         objects, script_src, output, emit_symtab, is_pie)
 }
+
+/// Standard userspace executable link for the standalone `lccc-ld` driver.
+///
+/// Exactly the compiler driver's pipeline (`link_builtin`): symbol
+/// resolution with archive group semantics, PLT/GOT, RELRO, eh_frame_hdr,
+/// gc-sections, --wrap/-u/--defsym. CRT objects are expected as positional
+/// inputs (the gcc-style ld invocation lists crt1/crti/crtn explicitly), so
+/// no CRT injection happens here; the crt slots stay empty and `user_args`
+/// carries -L/-l/-z/... in GNU spelling for `parse_linker_args`.
+pub fn link_builtin_x86(
+    object_files: &[&str],
+    output: &str,
+    user_args: &[String],
+) -> Result<(), String> {
+    crate::backend::x86::linker::link_builtin(
+        object_files, output, user_args,
+        &[], // lib paths come from -L in user_args
+        &[], // no implicit libs: the caller lists -lc etc. explicitly
+        &[], // CRT before: positional
+        &[], // CRT after: positional
+    )
+}
+
+/// Shared-library link for the standalone `lccc-ld -shared` driver.
+pub fn link_shared_x86(
+    object_files: &[&str],
+    output: &str,
+    user_args: &[String],
+) -> Result<(), String> {
+    crate::backend::x86::linker::link_shared(object_files, output, user_args, &[], &[])
+}
