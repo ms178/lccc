@@ -146,7 +146,9 @@ pub enum DataValue {
     /// `(a - b) * scale + addend` — a symbol difference folded through an
     /// arithmetic expression (e.g. `.long (end-start)*2`). Same-section label
     /// differences are absolute, so this always resolves to a constant.
-    SymbolDiffScaled(String, String, i64, i64),
+    /// `(a - b) * scale / div + addend`. div=1 for plain scaling; header.S
+    /// PE metadata divides: `.long (section_table - .) / 8`.
+    SymbolDiffScaled(String, String, i64, i64, i64),
 }
 
 /// CFI directives (call frame information).
@@ -2074,10 +2076,18 @@ fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
         scale = scale.checked_mul(parse_integer_expr(f).ok()?)?;
     }
 
+    let mut div: i64 = 1;
     let mut rest = after;
     if let Some(r) = rest.strip_prefix('*') {
         let (num, tail) = split_leading_int(r.trim())?;
         scale = scale.checked_mul(num)?;
+        rest = tail.trim();
+    }
+    // Division: `(a - b) / 8` (header.S NumberOfRvaAndSizes).
+    if let Some(r) = rest.strip_prefix('/') {
+        let (num, tail) = split_leading_int(r.trim())?;
+        if num == 0 { return None; }
+        div = num;
         rest = tail.trim();
     }
     if !rest.is_empty() {
@@ -2094,7 +2104,7 @@ fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
     if !rest.is_empty() {
         return None;
     }
-    Some(DataValue::SymbolDiffScaled(a, b, scale, addend))
+    Some(DataValue::SymbolDiffScaled(a, b, scale, div, addend))
 }
 
 /// Split `A-B` into its two label operands, or `None` when the text is not a

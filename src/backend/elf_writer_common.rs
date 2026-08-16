@@ -206,6 +206,8 @@ struct ScaledDiff {
     a: String,
     b: String,
     scale: i64,
+    /// Divisor applied after scaling (div >= 1).
+    div: i64,
     addend: i64,
     size: usize,
 }
@@ -825,12 +827,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let is_arithmetic = target.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'));
                 if is_arithmetic {
                     if let Some((sec_idx, substituted)) = self.substitute_dot(target) {
-                        match self.eval_label_expr(&substituted, sec_idx) {
-                            Some(val) => { self.set_values.insert(alias.clone(), val); }
-                            None => {
-                                // Forward label refs: retry after layout.
-                                self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
-                                self.aliases.insert(alias.clone(), target.clone());
+                        if substituted.contains(".Ldotpos_") {
+                            // `.`-relative: MUST defer to post-layout eval;
+                            // jump relaxation moves everything after this
+                            // point (SYM_FUNC_END sizes were 66 bytes too
+                            // large when evaluated eagerly).
+                            self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
+                            self.aliases.insert(alias.clone(), target.clone());
+                        } else {
+                            match self.eval_label_expr(&substituted, sec_idx) {
+                                Some(val) => { self.set_values.insert(alias.clone(), val); }
+                                None => {
+                                    // Forward label refs: retry after layout.
+                                    self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
+                                    self.aliases.insert(alias.clone(), target.clone());
+                                }
                             }
                         }
                     } else {
@@ -1075,17 +1086,35 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 DataValue::SymbolDiffAddend(a, b, addend) => {
                     self.emit_symbol_diff(sec_idx, a, b, size, *addend)?;
                 }
-                DataValue::SymbolDiffScaled(a, b, scale, addend) => {
+                DataValue::SymbolDiffScaled(a, b, scale, div, addend) => {
                     // `(a-b)*scale + addend`. A scaled difference cannot be
                     // expressed by any ELF relocation, so it must be folded to
                     // a constant here; that is sound precisely because a
                     // same-section label difference is link-time invariant.
+                    // `.` as either operand is THIS directive's position: register a
+                    // synthetic label at the current offset so the post-layout
+                    // fold resolves it (header.S: `.long (section_table - .) / 8`).
+                    let here = self.sections[sec_idx].data.len() as u64;
+                    let dot_name = format!(".Ldot_{}_{}", sec_idx, here);
+                    let a_res = if a == "." {
+                        self.label_positions.insert(dot_name.clone(), (sec_idx, here));
+                        dot_name.clone()
+                    } else {
+                        self.aliases.get(a).cloned().unwrap_or_else(|| a.clone())
+                    };
+                    let b_res = if b == "." {
+                        self.label_positions.insert(dot_name.clone(), (sec_idx, here));
+                        dot_name.clone()
+                    } else {
+                        self.aliases.get(b).cloned().unwrap_or_else(|| b.clone())
+                    };
                     self.deferred_scaled_diffs.push(ScaledDiff {
                         sec_idx,
                         offset: self.sections[sec_idx].data.len(),
-                        a: self.aliases.get(a).cloned().unwrap_or_else(|| a.clone()),
-                        b: self.aliases.get(b).cloned().unwrap_or_else(|| b.clone()),
+                        a: a_res,
+                        b: b_res,
                         scale: *scale,
+                        div: *div,
                         addend: *addend,
                         size,
                     });
@@ -1764,6 +1793,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             let value = (pa.1 as i64 - pb.1 as i64)
                 .checked_mul(d.scale)
+                .map(|v| v / d.div)
                 .and_then(|v| v.checked_add(d.addend))
                 .ok_or_else(|| format!("overflow folding ({} - {})", d.a, d.b))?;
             let bytes = value.to_le_bytes();
@@ -2000,6 +2030,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         end_off.wrapping_sub(start_off)
                     }
                     SizeExpr::SymbolRef(sym_ref) => {
+                        // The kernel's SYM_FUNC_END expands to
+                        //   .set .L__sym_size_X, .-X ; .size X, .L__sym_size_X
+                        // The new absolute-.set fold evaluates that .set to a
+                        // CONSTANT in set_values (the `.` position is the
+                        // set-directive's own offset — exactly GAS
+                        // semantics), so consult it FIRST; without this the
+                        // sizes silently became 0 and objtool mis-decoded
+                        // retpoline.o ("can't find jump dest instruction").
+                        if let Some(&v) = self.set_values.get(sym_ref) {
+                            return (name.clone(), v as u64);
+                        }
                         if let Some(alias_target) = self.aliases.get(sym_ref) {
                             let normalized = alias_target.replace(' ', "");
                             if let Some(rest) = normalized.strip_prefix(".-") {
@@ -2548,18 +2589,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
     // ─── Internal relocation resolution ───────────────────────────────
 
     /// Substitute a standalone `.` (current position) in a .set expression
-    /// with the current section offset. None when no section is active.
-    fn substitute_dot(&self, expr: &str) -> Option<(usize, String)> {
+    /// with a SYNTHETIC LABEL registered at the current offset. A frozen
+    /// integer would be wrong: jump relaxation shrinks code AFTER this
+    /// directive is seen, and GAS treats `.` as a label-valued expression
+    /// that moves with the layout (verify_cpu measured 315 pre-relaxation
+    /// vs GAS's 249 -- objtool then rejected head_64.o). Labels are kept
+    /// consistent by relax_jumps/fixup_alignment_markers, so evaluating
+    /// after layout yields the exact GAS value.
+    fn substitute_dot(&mut self, expr: &str) -> Option<(usize, String)> {
         let sec_idx = self.current_section?;
         let offset = self.sections[sec_idx].data.len() as u64;
         let bytes = expr.as_bytes();
-        let mut out = String::with_capacity(expr.len() + 8);
+        let mut out = String::with_capacity(expr.len() + 24);
+        let mut label_made = false;
+        let mut label_name = String::new();
         for (i, &b) in bytes.iter().enumerate() {
             if b == b'.' {
                 let prev_ok = i == 0 || !(bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_' || bytes[i-1] == b'.');
                 let next_ok = i + 1 >= bytes.len() || !(bytes[i+1].is_ascii_alphanumeric() || bytes[i+1] == b'_' || bytes[i+1] == b'.');
                 if prev_ok && next_ok {
-                    out.push_str(&offset.to_string());
+                    if !label_made {
+                        label_name = format!(".Ldotpos_{}_{}", sec_idx, offset);
+                        self.label_positions.insert(label_name.clone(), (sec_idx, offset));
+                        label_made = true;
+                    }
+                    out.push_str(&label_name);
                     continue;
                 }
             }
@@ -2612,6 +2666,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     /// Late resolution: pending `.`-position .set expressions, then convert
     /// relocations against constant .set names into direct data patches.
+    /// GAS semantics for `.set NAME, <constant>`: NAME becomes an ABSOLUTE
+    /// symbol (st_shndx = SHN_ABS) with the constant as its value. It stays
+    /// in the symbol table -- mkpiggy's `z_input_len = N` plus `.globl
+    /// z_input_len` is scraped by the boot Makefile's ZOFFSET rule via nm,
+    /// which broke when the constant fold swallowed the symbol entirely
+    /// ("undefined reference to ZO_z_input_len" in header.S).
+    /// The writer consumes abs_symbols in build_symbol_table.
     fn resolve_set_constants(&mut self) {
         let pending = std::mem::take(&mut self.pending_set_exprs);
         for (alias, expr, sec_idx) in pending {
@@ -2644,6 +2705,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 remaining.push(reloc);
             }
             self.sections[sec_idx].relocations = remaining;
+        }
+
+        // GAS keeps `.set NAME, <constant>` in the symbol table as an
+        // SHN_ABS symbol. Re-export every folded constant as a decimal
+        // alias so the symbol-table builder's integer-alias branch emits
+        // it; mkpiggy's `z_input_len = N` + `.globl z_input_len` is
+        // scraped from nm output by the boot Makefile's ZOFFSET rule, and
+        // swallowing it produced "undefined reference to ZO_z_input_len"
+        // in header.S.
+        for (name, val) in self.set_values.clone() {
+            self.aliases.entry(name).or_insert_with(|| val.to_string());
         }
     }
 
