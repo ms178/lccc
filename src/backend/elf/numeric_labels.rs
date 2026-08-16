@@ -221,12 +221,12 @@ fn resolve_numeric_data_values(
                     .unwrap_or_else(|| rhs.clone());
                 DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
             }
-            DataValue::SymbolDiffScaled(lhs, rhs, scale, addend) => {
+            DataValue::SymbolDiffScaled(lhs, rhs, scale, div, addend) => {
                 let new_lhs = resolve_numeric_name(lhs, current_idx, defs)
                     .unwrap_or_else(|| lhs.clone());
                 let new_rhs = resolve_numeric_name(rhs, current_idx, defs)
                     .unwrap_or_else(|| rhs.clone());
-                DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *addend)
+                DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *div, *addend)
             }
             // Exhaustive on purpose: every future DataValue variant that can
             // carry a symbol name must be considered here explicitly.

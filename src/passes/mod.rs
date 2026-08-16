@@ -884,7 +884,13 @@ macro_rules! preloop_dump {
         // -Os/-Oz: skip if-conversion. `cmov` is 4-6 bytes vs a 2-byte jcc +
         // the skipped block, so branches are usually smaller (and often faster
         // on the short branch path); GCC makes the same trade-off at -Os.
-        if !dis.ifconv && !optimize_for_size && should_run!(7, 0, 4) {
+        // if_convert also RUNS at -Os: measured on the kernel's real-mode
+        // number()/printf.c reproducer, -Os WITHOUT if-conversion is LARGER
+        // than -O2 WITH it (1156 vs 955 bytes i686 .text) -- the branchy
+        // select lowering produces two arms full of slot round-trips, which
+        // is strictly bigger than the setcc/cmov form. GCC if-converts at
+        // -Os for the same reason.
+        if !dis.ifconv && should_run!(7, 0, 4) {
             // Forward redundant reloads first: removing a load from a
             // conditional arm makes the arm side-effect-free so
             // if-conversion can fire.

@@ -109,7 +109,13 @@ impl LineInfo {
     fn is_barrier(self) -> bool {
         matches!(self.kind,
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive)
+            LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
+            // ESP changes renumber every (%esp) slot: push/pop and explicit
+            // %esp arithmetic fence all slot windows now that ESP-relative
+            // slots participate in the peepholes. Pushes/pops only appear
+            // in prologue/epilogue and around calls, so the cost is nil.
+            LineKind::Push { .. } | LineKind::Pop { .. })
+            || matches!(self.kind, LineKind::Other { dest_reg } if dest_reg == REG_ESP)
     }
 }
 
@@ -175,10 +181,21 @@ fn parse_store_to_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
     let comma = rest.find(',')?;
     let reg = &rest[..comma];
     let mem = rest[comma + 1..].trim();
-    if !mem.ends_with("(%ebp)") { return None; }
-    // Reject indirect memory (pointer dereference, not stack slot)
-    if mem.contains("(%e") && !mem.ends_with("(%ebp)") { return None; }
-    let offset_str = &mem[..mem.len() - 6]; // strip "(%ebp)"
+    // Accept BOTH frame-pointer and stack-pointer slots. With
+    // -fomit-frame-pointer (implied by -Os and the kernel's realmode
+    // Makefile) every local lives at N(%esp); matching only (%ebp) made
+    // all slot peepholes dead letters -- the real-mode printf.o carried
+    // ~100 store/reload round-trips GCC folds away, overflowing the
+    // 64-sector setup limit. ESP-relative offsets are stable between ESP
+    // adjustments; push/pop/%esp-writes are barriers (see is_barrier), so
+    // a slot tracked within a window can never be renumbered mid-window.
+    let is_ebp = mem.ends_with("(%ebp)");
+    let is_esp = mem.ends_with("(%esp)");
+    if !is_ebp && !is_esp { return None; }
+    // Reject indexed forms like 4(%esp,%eax,4): only plain offset(base).
+    let paren = mem.find('(').unwrap_or(0);
+    if mem[paren..].contains(',') { return None; }
+    let offset_str = &mem[..mem.len() - 6]; // strip "(%ebp)"/"(%esp)"
     Some((reg.trim(), offset_str, size))
 }
 
@@ -202,10 +219,15 @@ fn parse_load_from_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
         return None;
     };
     let rest = rest.trim();
-    // Must start with an offset or directly with (%ebp)
-    if !rest.contains("(%ebp)") { return None; }
-    let paren_start = rest.find("(%ebp)")?;
+    // Accept both frame-pointer and stack-pointer slots (see
+    // parse_store_to_ebp for the -fomit-frame-pointer rationale).
+    let paren_start = match rest.find("(%ebp)") {
+        Some(p) => p,
+        None => rest.find("(%esp)")?,
+    };
     let offset_str = &rest[..paren_start];
+    // Reject scaled/indexed forms like 4(%esp,%eax,4).
+    if offset_str.contains('(') { return None; }
     let after = rest[paren_start + 6..].trim();
     if !after.starts_with(',') { return None; }
     let reg = after[1..].trim();
@@ -257,19 +279,35 @@ fn has_indirect_memory_access(s: &str) -> bool {
 }
 
 /// Parse the %ebp offset from a line, or return EBP_OFFSET_NONE.
+/// Namespace bias for %esp-relative slots: keeps them disjoint from
+/// %ebp-relative offsets inside the same LineKind (an (%esp) slot and an
+/// (%ebp) slot with equal displacement are DIFFERENT memory).
+const ESP_SLOT_BIAS: i32 = 1 << 24;
+
+#[inline]
+fn slot_bias(s: &str) -> i32 {
+    if s.contains("(%esp)") { ESP_SLOT_BIAS } else { 0 }
+}
+
 fn parse_ebp_offset_in_line(s: &str) -> i32 {
-    if let Some(pos) = s.find("(%ebp)") {
-        let before = &s[..pos];
-        // Find the start of the offset number
-        let offset_start = before.rfind(|c: char| !c.is_ascii_digit() && c != '-').map(|p| p + 1).unwrap_or(0);
-        let offset_str = &before[offset_start..];
-        if offset_str.is_empty() {
-            0
-        } else {
-            offset_str.parse::<i32>().unwrap_or(EBP_OFFSET_NONE)
-        }
+    let (pos, bias) = if let Some(p) = s.find("(%ebp)") {
+        (p, 0)
+    } else if let Some(p) = s.find("(%esp)") {
+        (p, ESP_SLOT_BIAS)
     } else {
-        EBP_OFFSET_NONE
+        return EBP_OFFSET_NONE;
+    };
+    let before = &s[..pos];
+    // Find the start of the offset number
+    let offset_start = before.rfind(|c: char| !c.is_ascii_digit() && c != '-').map(|p| p + 1).unwrap_or(0);
+    let offset_str = &before[offset_start..];
+    if offset_str.is_empty() {
+        bias
+    } else {
+        match offset_str.parse::<i32>() {
+            Ok(v) => v + bias,
+            Err(_) => EBP_OFFSET_NONE,
+        }
     }
 }
 
@@ -428,14 +466,14 @@ fn classify_line(raw: &str) -> LineInfo {
         if let Some((reg_str, offset_str, size)) = parse_store_to_ebp(s) {
             let reg = register_family(reg_str);
             if reg <= REG_GP_MAX {
-                let offset = parse_offset(offset_str);
+                let offset = parse_offset(offset_str) + slot_bias(s);
                 return line_info(LineKind::StoreEbp { reg, offset, size }, ts);
             }
         }
         if let Some((offset_str, reg_str, size)) = parse_load_from_ebp(s) {
             let reg = register_family(reg_str);
             if reg <= REG_GP_MAX {
-                let offset = parse_offset(offset_str);
+                let offset = parse_offset(offset_str) + slot_bias(s);
                 return line_info(LineKind::LoadEbp { reg, offset, size }, ts);
             }
         }
@@ -750,6 +788,213 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         while j < len && infos[j].is_nop() { j += 1; }
         if j >= len { i += 1; continue; }
 
+        // Pattern 2w: immediate-to-scratch feeding a comparison --
+        //   movl $IMM, %C ; cmpl %C, %R  ->  cmpl $IMM, %R
+        // AT&T semantics match exactly: `cmpl %C, %R` computes R - C and
+        // `cmpl $IMM, %R` computes R - IMM. Fires only when %C is dead
+        // after the cmp (bounded written-before-read scan). GCC always
+        // emits the immediate form; the scratch turnaround costs 5 bytes
+        // and a register per comparison.
+        if let LineKind::Other { dest_reg: c_reg } = infos[i].kind {
+            if c_reg <= REG_GP_MAX && c_reg != REG_ESP && c_reg != REG_EBP
+                && infos[j].kind == LineKind::Cmp {
+                let s0 = trimmed(store, &infos[i], i).to_string();
+                if s0.starts_with("movl $") && !s0.contains('(') {
+                    let cn = reg32_name(c_reg);
+                    if s0.ends_with(cn) {
+                        let imm = s0[5..].split(',').next().unwrap_or("").trim().to_string();
+                        let s1 = trimmed(store, &infos[j], j).to_string();
+                        let pref = format!("cmpl {}, ", cn);
+                        if let Some(rhs) = s1.strip_prefix(&pref) {
+                            let rhs = rhs.trim();
+                            if rhs.starts_with('%') && !rhs.contains('(')
+                                && register_family(rhs) != c_reg {
+                                // deadness of %C after the cmp
+                                let mut k = j + 1;
+                                let mut cnt = 0;
+                                let mut dead = false;
+                                while k < len && cnt < 24 {
+                                    if infos[k].is_nop() { k += 1; continue; }
+                                    if infos[k].is_barrier() { break; }
+                                    let s2 = trimmed(store, &infos[k], k);
+                                    let written = match infos[k].kind {
+                                        LineKind::Other { dest_reg } => dest_reg == c_reg,
+                                        LineKind::Move { dst, .. } => dst == c_reg,
+                                        LineKind::LoadEbp { reg, .. } => reg == c_reg,
+                                        LineKind::SetCC { reg } => reg == c_reg,
+                                        _ => false,
+                                    };
+                                    if written && !line_reads_dest_source(s2, c_reg) { dead = true; break; }
+                                    if line_references_reg(s2, c_reg) || line_writes_reg_implicitly(s2, c_reg) { break; }
+                                    k += 1;
+                                    cnt += 1;
+                                }
+                                if dead {
+                                    store.replace(j, format!("    cmpl {}, {}", imm, rhs));
+                                    infos[j] = classify_line(store.get(j));
+                                    infos[i].kind = LineKind::Nop;
+                                    changed = true;
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2z: Copy propagation through a scratch register --
+        //   `movl %SRC, %T; <op reading %T once>` where %T is dead after.
+        // The i686 codegen funnels almost everything through %eax:
+        //   movl %esi, %eax; movl %eax, 108(%esp)  ->  movl %esi, 108(%esp)
+        //   movl %esi, %eax; movl %eax, %edi       ->  movl %esi, %edi
+        //   movl %esi, %eax; decl %eax; movl %eax, %edi
+        //        -> (first pair fuses when %eax dead after the store/move)
+        // GCC/ICX -Os never materialize the scratch copy. Soundness: %T must
+        // be WRITTEN before any other read after the consuming instruction
+        // (bounded scan, conservative at barriers), and the consumer must
+        // read %T exactly as a whole-register source.
+        if let LineKind::Move { dst: t_reg, src: s_reg } = infos[i].kind {
+            if t_reg <= REG_GP_MAX && s_reg <= REG_GP_MAX && t_reg != s_reg
+                && t_reg != REG_ESP && t_reg != REG_EBP {
+                // The consumer is the next non-nop instruction j.
+                let consumed = match infos[j].kind {
+                    // movl %T, X(%esp)  (store)
+                    LineKind::StoreEbp { reg, .. } if reg == t_reg => Some(1u8),
+                    // movl %T, %R
+                    LineKind::Move { src, dst } if src == t_reg && dst != t_reg => Some(2u8),
+                    // testl %T, %T / cmpl $i, %T -- flag-setting reads.
+                    // `movl %R,%eax; testl %eax,%eax; jcc` is the single
+                    // most common surviving triple; GCC emits
+                    // `testl %R,%R` directly.
+                    LineKind::Cmp => {
+                        let s2 = trimmed(store, &infos[j], j);
+                        let rn = reg32_name(t_reg);
+                        let both = format!("testl {}, {}", rn, rn);
+                        let is_test_self = s2 == both;
+                        let is_cmp_imm = s2.starts_with("cmpl $") && s2.ends_with(rn)
+                            && !s2[..s2.len()-rn.len()].contains('%');
+                        if is_test_self || is_cmp_imm { Some(3u8) } else { None }
+                    }
+                    _ => None,
+                };
+                if let Some(kind2) = consumed {
+                    // %T must be dead after j: written before any read.
+                    let mut k = j + 1;
+                    let mut cnt = 0;
+                    let mut dead = false;
+                    while k < len && cnt < 24 {
+                        if infos[k].is_nop() { k += 1; continue; }
+                        if infos[k].is_barrier() { break; }
+                        let s2 = trimmed(store, &infos[k], k);
+                        let written = match infos[k].kind {
+                            LineKind::Other { dest_reg } => dest_reg == t_reg,
+                            LineKind::Move { dst, .. } => dst == t_reg,
+                            LineKind::LoadEbp { reg, .. } => reg == t_reg,
+                            LineKind::SetCC { reg } => reg == t_reg,
+                            _ => false,
+                        };
+                        if written && !line_reads_dest_source(s2, t_reg) {
+                            dead = true;
+                            break;
+                        }
+                        if line_references_reg(s2, t_reg) || line_writes_reg_implicitly(s2, t_reg) {
+                            break;
+                        }
+                        k += 1;
+                        cnt += 1;
+                    }
+                    if dead {
+                        // Also: %SRC must not be MODIFIED between i and j
+                        // (j is the immediate next instruction, so no gap).
+                        // Rewrite the consumer to read %SRC directly and
+                        // drop the copy.
+                        let consumer = trimmed(store, &infos[j], j).to_string();
+                        let old_reg = reg32_name(t_reg);
+                        let new_reg = reg32_name(s_reg);
+                        // Only whole-register 32-bit forms are rewritten;
+                        // the classifier guarantees the consumer is movl.
+                        if kind2 == 1 || kind2 == 2 {
+                            let rewritten = consumer.replacen(old_reg, new_reg, 1);
+                            if rewritten != consumer {
+                                store.replace(j, format!("    {}", rewritten));
+                                infos[j] = classify_line(store.get(j));
+                                infos[i].kind = LineKind::Nop;
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        } else if kind2 == 3 {
+                            // test/cmp: replace every %T occurrence.
+                            let rewritten = consumer.replace(old_reg, new_reg);
+                            if rewritten != consumer {
+                                store.replace(j, format!("    {}", rewritten));
+                                infos[j] = classify_line(store.get(j));
+                                infos[i].kind = LineKind::Nop;
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2a: Load+move fusion -- `movl SLOT, %eax; movl %eax, %REG`
+        // becomes `movl SLOT, %REG` when %eax is provably dead after the
+        // move (written before any read, checked by a bounded forward scan
+        // that stops conservatively at barriers). The i686 codegen emits
+        // this shape for nearly every slot reload (everything goes through
+        // %eax first), so this is the single highest-value size peephole:
+        // ICX/GCC -Os never materialize the intermediate register.
+        if let LineKind::LoadEbp { reg: lreg, offset: _loff, size: _lsize } = infos[i].kind {
+            if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
+                if msrc == lreg && mdst != lreg && mdst <= REG_GP_MAX {
+                    // Is lreg written before any read after j?
+                    let mut k = j + 1;
+                    let mut cnt = 0;
+                    let mut dead = false;
+                    while k < len && cnt < 24 {
+                        if infos[k].is_nop() { k += 1; continue; }
+                        if infos[k].is_barrier() { break; }
+                        let s = trimmed(store, &infos[k], k);
+                        let written = match infos[k].kind {
+                            LineKind::Other { dest_reg } => dest_reg == lreg,
+                            LineKind::Move { dst, .. } => dst == lreg,
+                            LineKind::LoadEbp { reg, .. } => reg == lreg,
+                            LineKind::SetCC { reg } => reg == lreg,
+                            _ => false,
+                        };
+                        if written && !line_reads_dest_source(s, lreg) {
+                            dead = true;
+                            break;
+                        }
+                        if line_references_reg(s, lreg) || line_writes_reg_implicitly(s, lreg) {
+                            break;
+                        }
+                        k += 1;
+                        cnt += 1;
+                    }
+                    if dead {
+                        // Rebuild using the ORIGINAL memory operand text.
+                        let orig = trimmed(store, &infos[i], i).to_string();
+                        if let Some(comma) = orig.find(',') {
+                            let memop = &orig[..comma]; // e.g. "movl 84(%esp)"
+                            let fused = format!("    {}, {}", memop, reg32_name(mdst));
+                            store.replace(i, fused);
+                            infos[i] = classify_line(store.get(i));
+                            infos[j].kind = LineKind::Nop;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         // Pattern 2: Adjacent store/load with same offset
         if let LineKind::StoreEbp { reg: store_reg, offset: store_off, size: store_size } = infos[i].kind {
             if let LineKind::LoadEbp { reg: load_reg, offset: load_off, size: load_size } = infos[j].kind {
@@ -1032,6 +1277,122 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 // ── Pass: Dead store elimination ─────────────────────────────────────────────
 
 /// Remove stores to stack slots that are immediately overwritten.
+/// Store-to-load forwarding for stack slots: after `movl %R, N(%esp)`, a
+/// later `movl N(%esp), %R2` in the same window (slot and %R untouched)
+/// becomes `movl %R, %R2` -- 2 bytes instead of 4-7 -- and once every load
+/// of a slot is forwarded, eliminate_never_read_stores deletes the store.
+/// This is the pass that shrinks -fomit-frame-pointer code: the i686
+/// codegen round-trips most IR values through slots, and the real-mode
+/// setup.elf overflowed its 64-sector limit on exactly that bloat
+/// (GCC -Os: 312 bytes for number(); lccc before: 1048).
+///
+/// Soundness: the scan stops at barriers (labels/branches/calls/push/pop/
+/// %esp-writes -- see is_barrier), at any write to %R, at any overlapping
+/// store to the slot, and at any indirect memory access (a taken slot
+/// address could alias). Forwarding into %R itself just NOPs the reload.
+fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = infos.len();
+    let mut changed = false;
+    const WINDOW: usize = 48;
+
+    for i in 0..len {
+        if infos[i].is_nop() { continue; }
+        let LineKind::StoreEbp { reg: src_reg, offset: slot, size } = infos[i].kind else { continue; };
+        if src_reg > REG_GP_MAX { continue; }
+        let store_bytes = size.byte_size();
+
+        let mut j = i + 1;
+        let mut count = 0;
+        while j < len && count < WINDOW {
+            if infos[j].is_nop() { j += 1; continue; }
+            if infos[j].is_barrier() { break; }
+
+            match infos[j].kind {
+                LineKind::LoadEbp { reg: dst_reg, offset, size: lsize }
+                    if offset == slot && lsize == size =>
+                {
+                    if dst_reg == src_reg {
+                        // Exact reload into the same register: pure no-op.
+                        infos[j].kind = LineKind::Nop;
+                        changed = true;
+                        j += 1;
+                        count += 1;
+                        continue;
+                    } else if dst_reg <= REG_GP_MAX {
+                        let text = format!("    movl {}, {}", reg32_name(src_reg), reg32_name(dst_reg));
+                        store.replace(j, text);
+                        infos[j] = classify_line(store.get(j));
+                        changed = true;
+                        j += 1;
+                        count += 1;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                LineKind::LoadEbp { offset, size: lsize, .. }
+                    if ranges_overlap(slot, store_bytes, offset, lsize.byte_size()) =>
+                {
+                    // Partial-overlap read: store live, no forwarding.
+                    break;
+                }
+                LineKind::StoreEbp { offset, size: ssize, .. }
+                    if ranges_overlap(slot, store_bytes, offset, ssize.byte_size()) => break,
+                LineKind::Other { dest_reg } if dest_reg == src_reg => break,
+                LineKind::Move { dst, .. } if dst == src_reg => break,
+                LineKind::SetCC { reg } if reg == src_reg => break,
+                LineKind::LoadEbp { reg, .. } if reg == src_reg => break,
+                _ => {}
+            }
+            if infos[j].has_indirect_mem { break; }
+            // A folded-operand access of the slot: reads keep the store
+            // live; a WRITE through a folded operand is indistinguishable
+            // here, so stop conservatively either way.
+            if infos[j].ebp_offset == slot { break; }
+            // Implicit register writes the generic parser misses.
+            {
+                let s = trimmed(store, &infos[j], j);
+                if line_writes_reg_implicitly(s, src_reg) { break; }
+            }
+            j += 1;
+            count += 1;
+        }
+    }
+    changed
+}
+
+/// Instructions with IMPLICIT register writes that parse_dest_reg misses
+/// (one-operand mul/div families, cltd, string ops, xchg).
+/// Does this line READ `reg` as a source rather than only writing it?
+/// `movl X, %reg` reads reg only if X mentions it; `addl $1, %reg` is a
+/// read-modify-write. Used by the load+move fusion deadness check.
+fn line_reads_dest_source(s: &str, reg: RegId) -> bool {
+    let mn = s.split_whitespace().next().unwrap_or("");
+    if mn.starts_with("mov") || mn.starts_with("lea") || mn.starts_with("set") {
+        if let Some(comma) = s.rfind(',') {
+            return line_references_reg(&s[..comma], reg);
+        }
+        return false;
+    }
+    // Everything else: conservatively a read.
+    line_references_reg(s, reg)
+}
+
+fn line_writes_reg_implicitly(s: &str, reg: RegId) -> bool {
+    let mn = s.split_whitespace().next().unwrap_or("");
+    match mn {
+        "mull" | "imull" if !s.contains(',') => reg == REG_EAX || reg == REG_EDX,
+        "divl" | "idivl" => reg == REG_EAX || reg == REG_EDX,
+        "cltd" | "cdq" => reg == REG_EDX,
+        "xchgl" | "xchgw" | "xchgb" => line_references_reg(s, reg),
+        _ if mn.starts_with("rep") || mn.starts_with("movs")
+            || mn.starts_with("stos") || mn.starts_with("lods")
+            || mn.starts_with("scas") || mn.starts_with("cmps") =>
+            matches!(reg, REG_ECX | REG_ESI | REG_EDI | REG_EAX),
+        _ => false,
+    }
+}
+
 fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
@@ -1689,11 +2050,21 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSize) -> Option<String> {
     let reg_name = reg32_name(load_reg);
 
+    // The offset carries the slot-namespace bias: decode it back into the
+    // real displacement and its base register. Emitting the BIASED number
+    // with a hard-coded (%ebp) produced silent wrong code once ESP slots
+    // joined the peepholes (`cmpl 16777244(%ebp), %eax`).
+    let (disp, base) = if offset >= ESP_SLOT_BIAS / 2 {
+        (offset - ESP_SLOT_BIAS, "%esp")
+    } else {
+        (offset, "%ebp")
+    };
+
     // Try patterns: `OPCODE %load_reg, %other_reg`
     for op in &["addl", "subl", "andl", "orl", "xorl", "cmpl", "testl", "imull"] {
         if let Some(rest) = s.strip_prefix(op) {
             let rest = rest.trim();
-            // Pattern: `%load_reg, %dst` → `OPCODE offset(%ebp), %dst`
+            // Pattern: `%load_reg, %dst` -> `OPCODE disp(base), %dst`
             if let Some(after) = rest.strip_prefix(reg_name) {
                 let after = after.trim();
                 if let Some(after_comma) = after.strip_prefix(',') {
@@ -1701,7 +2072,7 @@ fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSiz
                     if dst.starts_with('%') && !dst.contains('(') {
                         // Don't fold if dst is the same as load_reg (would be read after free)
                         if register_family(dst) != load_reg {
-                            return Some(format!("{} {}(%ebp), {}", op, offset, dst));
+                            return Some(format!("{} {}({}), {}", op, disp, base, dst));
                         }
                     }
                 }
@@ -1943,8 +2314,10 @@ pub fn peephole_optimize(asm: String) -> String {
 
     // Phase 2: Global passes (run once)
     // Copy propagation first: it turns chained moves into dead moves, which
-    // the very next pass then removes.
+    // the very next pass then removes. Slot-load forwarding runs right after,
+    // so freshly exposed store/load pairs are folded in the same phase.
     let global_changed = propagate_reg_copies(&mut store, &mut infos);
+    let global_changed = global_changed | forward_slot_loads(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
@@ -1958,6 +2331,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 = false;
             changed2 |= combined_local_pass(&mut store, &mut infos);
             changed2 |= propagate_reg_copies(&mut store, &mut infos);
+            changed2 |= forward_slot_loads(&mut store, &mut infos);
             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= eliminate_dead_stores(&store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
