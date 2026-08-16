@@ -453,6 +453,9 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Palignr128 | BuiltinIntrinsic::X86Pmaxub128
             | BuiltinIntrinsic::X86Pminub128 | BuiltinIntrinsic::X86Pblendvb128
             | BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128
+            | BuiltinIntrinsic::X86ShufPsValue | BuiltinIntrinsic::X86Vextractf128V
+            | BuiltinIntrinsic::X86MaxPs256V | BuiltinIntrinsic::X86MinPs256V
+            | BuiltinIntrinsic::X86AndPs256V | BuiltinIntrinsic::X86CmpPs256V
             | BuiltinIntrinsic::X86Pblendw128
             | BuiltinIntrinsic::X86Pmovzxbw128 | BuiltinIntrinsic::X86Pmovzxwd128
             | BuiltinIntrinsic::X86Psllw128 | BuiltinIntrinsic::X86Psrlw128
@@ -544,6 +547,11 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pcmpgtb256
             | BuiltinIntrinsic::X86CastReinterpret => {
                 self.lower_x86_intrinsic(intrinsic, args)
+            }
+            // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
+            // lane gather with constant indices (Clang/GCC generic shuffle).
+            BuiltinIntrinsic::ShuffleVector => {
+                self.lower_shufflevector(args)
             }
             // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
             BuiltinIntrinsic::LcccSimd => {
@@ -835,6 +843,101 @@ impl Lowerer {
         Some(Operand::Value(alloca))
     }
 
+    /// Lower a 128-bit vector ARGUMENT expression to a pointer at its
+    /// 16 data bytes. Vector lvalues already lower to their alloca POINTER;
+    /// a nested raw builtin (Vec128Value) yields a packed I128 VALUE, which
+    /// must be spilled to a fresh slot first. Distinguishing via the C type
+    /// (is_vector => pointer convention) is the load-bearing check: spilling
+    /// a pointer, or passing an I128 through unspilled, both corrupt lanes.
+    fn vec128_arg_ptr(&mut self, arg: &Expr) -> Operand {
+        // By-value producers are exactly the raw 128-bit builtins (they have
+        // no vector CType on purpose — see expr_types.rs). Everything else
+        // with 16-byte vector shape lowers to an alloca POINTER.
+        let is_by_value = matches!(arg,
+            Expr::FunctionCall(callee, _, _)
+                if matches!(&**callee, Expr::Identifier(n, _)
+                    if matches!(n.as_str(),
+                        "__builtin_ia32_maxps" | "__builtin_ia32_minps"
+                        | "__builtin_ia32_shufps" | "__builtin_shufflevector"
+                        | "__builtin_ia32_vextractf128_ps256")));
+        let op = self.lower_expr(arg);
+        if !is_by_value {
+            return op; // alloca pointer convention
+        }
+        // By-value packed I128 (nested raw builtin): spill to a slot.
+        let slot = self.fresh_value();
+        self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+        let val = self.operand_to_value(op);
+        self.emit(Instruction::Store { val: Operand::Value(val), ptr: slot, ty: IrType::I128, seg_override: AddressSpace::Default });
+        Operand::Value(slot)
+    }
+
+    /// Load the 16 bytes at `slot` and pack them into a by-value I128
+    /// (lo | hi << 64) — the value representation every 16-byte vector
+    /// expression uses in lccc.
+    fn pack_vec128_from_slot(&mut self, slot: crate::ir::reexports::Value) -> Operand {
+        let lo = self.fresh_value();
+        self.emit(Instruction::Load { dest: lo, ptr: slot, ty: IrType::I64, seg_override: AddressSpace::Default });
+        let hi_ptr = self.fresh_value();
+        self.emit(Instruction::BinOp { dest: hi_ptr, op: IrBinOp::Add, lhs: Operand::Value(slot), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
+        let hi = self.fresh_value();
+        self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: AddressSpace::Default });
+        let lo128 = self.fresh_value();
+        self.emit(Instruction::Cast { dest: lo128, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
+        let hi128 = self.fresh_value();
+        self.emit(Instruction::Cast { dest: hi128, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
+        let shifted = self.fresh_value();
+        self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi128), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+        let packed = self.fresh_value();
+        self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo128), ty: IrType::I128 });
+        Operand::Value(packed)
+    }
+
+    /// __builtin_shufflevector(v1, v2, i0, i1, i2, i3) for 4-lane 32-bit
+    /// vectors: gather each result lane from the concatenation v1||v2
+    /// (idx 0-3 = v1 lane idx, 4-7 = v2 lane idx-4; negative = don\'t-care,
+    /// we pick v1 lane 0). Indices must be integer constant expressions —
+    /// matching the C builtin\'s contract. Scalar 4x32 gather through slots:
+    /// correctness-first (a later peephole can fuse the shufps pattern).
+    fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
+        if args.len() != 6 {
+            panic!("__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 indices) is supported, got {} args", args.len());
+        }
+        let v1 = self.vec128_arg_ptr(&args[0]);
+        let v2 = self.vec128_arg_ptr(&args[1]);
+        let v1p = self.operand_to_value(v1);
+        let v2p = self.operand_to_value(v2);
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+        for lane in 0..4usize {
+            let idx = match self.eval_const_expr(&args[2 + lane]) {
+                Some(IrConst::I64(v)) => v,
+                Some(IrConst::I32(v)) => v as i64,
+                Some(IrConst::I8(v)) => v as i64,
+                Some(IrConst::I16(v)) => v as i64,
+                other => panic!("__builtin_shufflevector: lane index {} is not an integer constant ({:?})", lane, other),
+            };
+            let (src, off) = if idx < 0 {
+                (v1p, 0i64)
+            } else if idx < 4 {
+                (v1p, idx * 4)
+            } else if idx < 8 {
+                (v2p, (idx - 4) * 4)
+            } else {
+                panic!("__builtin_shufflevector: lane index {} out of range for 4-lane vectors", idx);
+            };
+            let src_ptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr { dest: src_ptr, base: src, offset: Operand::Const(IrConst::I64(off)), ty: IrType::I8 });
+            let lane_val = self.fresh_value();
+            self.emit(Instruction::Load { dest: lane_val, ptr: src_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
+            let dst_ptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr { dest: dst_ptr, base: result, offset: Operand::Const(IrConst::I64((lane * 4) as i64)), ty: IrType::I8 });
+            self.emit(Instruction::Store { val: Operand::Value(lane_val), ptr: dst_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
+        }
+        // Raw builtin: return the vector BY VALUE (packed I128).
+        Some(self.pack_vec128_from_slot(result))
+    }
+
     /// Lower an X86 SSE/AES/CRC intrinsic to IR.
     ///
     /// Classifies the intrinsic into one of four emission patterns:
@@ -881,7 +984,15 @@ impl Lowerer {
                 // produced -3e+34). Materialize the I128 value: two I64
                 // halves loaded from the result slot, widened and packed —
                 // the same representation ordinary v4sf loads lower to.
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                // Vector args go through vec128_arg_ptr: vector lvalues are
+                // already alloca pointers, nested raw-builtin results are
+                // packed I128 values that must be spilled to a slot first.
+                // Integer args (the imm8 of shufps/vextractf128) pass through.
+                let arg_ops: Vec<Operand> = args.iter().map(|a| {
+                    let is_int = self.get_expr_ctype(a).map(|ct| ct.is_integer()).unwrap_or(false);
+                    if is_int { self.lower_expr(a) } else { self.vec128_arg_ptr(a) }
+                }).collect();
+
                 let result_alloca = self.fresh_value();
                 self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
                 let dest_val = self.fresh_value();
@@ -1017,6 +1128,16 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         // Raw GCC vector builtins (no _mm_ wrapper): value semantics.
         BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128Value,
+        // __builtin_ia32_shufps returns BY VALUE (raw GCC builtin, no wrapper
+        // deref); the imm8 rides as the last argument, which is exactly the
+        // (a, b, imm) shape the ShufPs128 backend op consumes.
+        BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128Value,
+        // vextractf128_ps256 returns a 16-byte vector BY VALUE from a ymm arg.
+        BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128Value,
+        // 256-bit raw builtins: v8sf is pointer/sret convention everywhere,
+        // so the Vec256 pointer-returning arm is already value-correct.
+        BuiltinIntrinsic::X86MaxPs256V | BuiltinIntrinsic::X86MinPs256V
+        | BuiltinIntrinsic::X86AndPs256V | BuiltinIntrinsic::X86CmpPs256V => X86IntrinsicKind::Vec256,
         _ => X86IntrinsicKind::Vec128,
     }
 }
@@ -1031,6 +1152,13 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Sfence => IntrinsicOp::Sfence,
         BuiltinIntrinsic::X86Pause => IntrinsicOp::Pause,
         BuiltinIntrinsic::X86Vzeroupper => IntrinsicOp::Vzeroupper,
+        BuiltinIntrinsic::X86ShufPsValue => IntrinsicOp::ShufPs128,
+        BuiltinIntrinsic::X86Vextractf128V => IntrinsicOp::Vextractf128,
+        BuiltinIntrinsic::X86MaxPs256V => IntrinsicOp::MaxPs256,
+        BuiltinIntrinsic::X86MinPs256V => IntrinsicOp::MinPs256,
+        // andps is pure bitwise: pand256 is bit-identical on any lane type.
+        BuiltinIntrinsic::X86AndPs256V => IntrinsicOp::Pand256,
+        BuiltinIntrinsic::X86CmpPs256V => IntrinsicOp::CmpPs256,
         BuiltinIntrinsic::X86Clflush => IntrinsicOp::Clflush,
         BuiltinIntrinsic::X86Movnti => IntrinsicOp::Movnti,
         BuiltinIntrinsic::X86Movnti64 => IntrinsicOp::Movnti64,

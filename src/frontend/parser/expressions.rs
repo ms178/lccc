@@ -613,6 +613,18 @@ impl Parser {
                 let name = name.clone();
                 let span = self.peek_span();
                 self.advance();
+                // __builtin_convertvector(expr, TYPE): the second argument is
+                // a type name, which the generic call-argument parser cannot
+                // handle — intercept here (same pattern as __builtin_va_arg).
+                if name == "__builtin_convertvector" && matches!(self.peek(), TokenKind::LParen) {
+                    let open = self.peek_span();
+                    self.advance();
+                    let src_expr = self.parse_assignment_expr();
+                    self.expect_context(&TokenKind::Comma, "between '__builtin_convertvector' arguments");
+                    let type_spec = self.parse_va_arg_type();
+                    self.expect_closing(&TokenKind::RParen, open);
+                    return Expr::ConvertVector(Box::new(src_expr), type_spec, span);
+                }
                 Expr::Identifier(name, span)
             }
             TokenKind::LParen => {

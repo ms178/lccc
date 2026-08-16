@@ -1051,8 +1051,30 @@ fn split_operands(s: &str) -> Vec<String> {
     let mut current = String::new();
     let mut paren_depth = 0;
 
-    for c in s.chars() {
-        if c == '(' {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // GAS character literal: 'x or 'x' — the next char is data, even
+            // a comma or paren (`movb $',', %bl` in relocate_kernel_64.S
+            // print_reg). Copy the literal through without interpreting it.
+            current.push('\'');
+            if i + 1 < chars.len() {
+                if chars[i + 1] == '\\' && i + 2 < chars.len() {
+                    current.push('\\');
+                    current.push(chars[i + 2]);
+                    i += 2;
+                } else {
+                    current.push(chars[i + 1]);
+                    i += 1;
+                }
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    current.push('\'');
+                    i += 1;
+                }
+            }
+        } else if c == '(' {
             paren_depth += 1;
             current.push(c);
         } else if c == ')' {
@@ -1064,6 +1086,7 @@ fn split_operands(s: &str) -> Vec<String> {
         } else {
             current.push(c);
         }
+        i += 1;
     }
     if !current.is_empty() {
         parts.push(current);
@@ -1785,15 +1808,28 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             // immediate field inside a far jump this way). Splitting only on
             // the first " - " left `lhs` as the literal string ".Ljmp + 1",
             // which is not a symbol. Peel the addend off and fold it in.
-            let (lhs, lhs_addend) = match lhs_raw.rfind(" + ") {
-                Some(p) => {
-                    let sym = strip_sym_parens(lhs_raw[..p].trim());
-                    match (is_label_like(sym), parse_integer_expr(lhs_raw[p + 3..].trim())) {
-                        (true, Ok(a)) => (sym.to_string(), a),
-                        _ => (lhs_raw.clone(), 0),
+            // The LHS may be a whole constant CHAIN: kernel jump-label keys
+            // expand to `.quad __tracepoint_read_msr+8 + 0 + 2 - .` (%c0
+            // prints "sym+8" and the JUMP_TABLE_ENTRY macro appends
+            // ` + 0 + 2`). Peeling only ONE ` + N` term left the literal
+            // string "__tracepoint_read_msr+8 + 0" as the symbol name and the
+            // link failed with "undefined reference to `sym+8 + 0 + 2'".
+            // Fold the full chain first; fall back to the single-term peel.
+            let (lhs, lhs_addend) = if let Some(DataValue::SymbolOffset(sym, a)) =
+                parse_symbol_expr_chain(&lhs_raw)
+            {
+                (sym, a)
+            } else {
+                match lhs_raw.rfind(" + ") {
+                    Some(p) => {
+                        let sym = strip_sym_parens(lhs_raw[..p].trim());
+                        match (is_label_like(sym), parse_integer_expr(lhs_raw[p + 3..].trim())) {
+                            (true, Ok(a)) => (sym.to_string(), a),
+                            _ => (lhs_raw.clone(), 0),
+                        }
                     }
+                    None => (lhs_raw.clone(), 0),
                 }
-                None => (lhs_raw.clone(), 0),
             };
             // Check if rhs has an addend: "sym - N" or "sym + N"
             if let Some(rhs_minus) = rhs_full.rfind(" - ") {
@@ -2885,6 +2921,27 @@ fn split_macro_args(s: &str) -> Vec<String> {
             '"' => {
                 in_quotes = !in_quotes;
                 current.push(ch);
+            }
+            '\'' if !in_quotes => {
+                // GAS character literal: 'x (optionally closed 'x'). The byte
+                // after the quote is data — even a space, comma, or paren
+                // (relocate_kernel_64.S: `pr 'r', '8', ' ', ':', %r8`).
+                // Copy the literal verbatim so it never splits an argument.
+                current.push('\'');
+                if i + 1 < bytes.len() {
+                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
+                        current.push('\\');
+                        current.push(bytes[i + 2] as char);
+                        i += 2;
+                    } else {
+                        current.push(bytes[i + 1] as char);
+                        i += 1;
+                    }
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        current.push('\'');
+                        i += 1;
+                    }
+                }
             }
             '(' if !in_quotes => { depth += 1; current.push(ch); }
             ')' if !in_quotes => { depth -= 1; current.push(ch); }

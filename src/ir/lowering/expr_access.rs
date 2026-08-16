@@ -1065,6 +1065,39 @@ impl Lowerer {
     // va_arg
     // -----------------------------------------------------------------------
 
+    /// __builtin_convertvector(expr, TYPE): element-wise conversion between
+    /// 4-lane 32-bit vectors (v4si <-> v4sf), the only combination kernel
+    /// code uses (NAP governor fast_log2f_sse). int->float = cvtdq2ps,
+    /// float->int = cvttps2dq (C cast semantics = truncation). The result is
+    /// returned as the ALLOCA POINTER, matching every other vector
+    /// expression convention (a raw-builtin caller then loads through it).
+    pub(super) fn lower_convertvector(&mut self, src_expr: &Expr, type_spec: &TypeSpecifier) -> Operand {
+        use crate::ir::intrinsics::IntrinsicOp;
+        let dst_ct = self.type_spec_to_ctype(type_spec);
+        let src_ct = self.expr_ctype(src_expr);
+        let (src_is_float, dst_is_float) = (
+            matches!(&src_ct, CType::Vector(elem, _) if elem.is_floating()),
+            matches!(&dst_ct, CType::Vector(elem, _) if elem.is_floating()),
+        );
+        let src_size = match &src_ct { CType::Vector(_, s) => *s, _ => 16 };
+        let dst_size = match &dst_ct { CType::Vector(_, s) => *s, _ => 16 };
+        if src_size != 16 || dst_size != 16 {
+            panic!("__builtin_convertvector: only 16-byte vectors are supported (got {} -> {})", src_size, dst_size);
+        }
+        let src_ptr_op = self.lower_expr(src_expr);
+        let src_ptr = self.operand_to_value(src_ptr_op);
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+        let op = match (src_is_float, dst_is_float) {
+            (false, true) => IntrinsicOp::CvtEp32ToPs128,   // cvtdq2ps
+            (true, false) => IntrinsicOp::CvttPs2Ep32_128,  // cvttps2dq (truncate)
+            other => panic!("__builtin_convertvector: unsupported lane conversion {:?} (only int<->float 32-bit lanes)", other),
+        };
+        let dest_val = self.fresh_value();
+        self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result), args: vec![Operand::Value(src_ptr)] });
+        Operand::Value(result)
+    }
+
     pub(super) fn lower_va_arg(&mut self, ap_expr: &Expr, type_spec: &TypeSpecifier) -> Operand {
         // VaArg instruction expects a pointer to the va_list "object" so it can
         // both read from and advance the va_list state.

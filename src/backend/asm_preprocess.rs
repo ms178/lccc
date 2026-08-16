@@ -622,6 +622,27 @@ fn split_on_commas_raw(s: &str) -> Vec<String> {
                 in_quote = true;
                 current.push('"');
             }
+            b'\'' => {
+                // GAS character literal: 'x (optionally closed: 'x'). The
+                // byte after the quote is data, even a space or comma
+                // (`movb $' ', %bl` in relocate_kernel_64.S). Copy the whole
+                // literal through verbatim so it never splits the token.
+                current.push('\'');
+                if i + 1 < bytes.len() {
+                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
+                        current.push('\\');
+                        current.push(bytes[i + 2] as char);
+                        i += 2;
+                    } else {
+                        current.push(bytes[i + 1] as char);
+                        i += 1;
+                    }
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        current.push('\'');
+                        i += 1;
+                    }
+                }
+            }
             b'(' => {
                 paren_depth += 1;
                 current.push('(');
@@ -676,6 +697,27 @@ fn split_field_on_whitespace(s: &str) -> Vec<String> {
                     i += 1;
                 }
                 // Skip closing quote
+            }
+            b'\'' => {
+                // GAS character literal: 'x (optionally closed: 'x'). The
+                // byte after the quote is data, even a space or comma
+                // (`movb $' ', %bl` in relocate_kernel_64.S). Copy the whole
+                // literal through verbatim so it never splits the token.
+                current.push('\'');
+                if i + 1 < bytes.len() {
+                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
+                        current.push('\\');
+                        current.push(bytes[i + 2] as char);
+                        i += 2;
+                    } else {
+                        current.push(bytes[i + 1] as char);
+                        i += 1;
+                    }
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        current.push('\'');
+                        i += 1;
+                    }
+                }
             }
             b' ' | b'\t' if paren_depth == 0 => {
                 let trimmed = current.trim().to_string();
