@@ -276,8 +276,15 @@ impl InstructionEncoder {
             }
 
             // Call/return
-            "call" => self.encode_call(ops),
-            "ret" => {
+            // `calll` is the explicit 32-bit-operand-size spelling; in
+            // 32-bit mode it is the plain CALL encoding (kernel realmode
+            // wakeup_asm.S/copy.S use it from .code16 files to force a
+            // 4-byte return address).
+            "call" | "calll" => self.encode_call(ops),
+            // `retl` = explicit 32-bit near return (same C3 byte in 32-bit
+            // mode); `retw` = 16-bit near return (66 C3).
+            "ret" | "retl" | "retw" => {
+                if mnemonic == "retw" { self.bytes.push(0x66); }
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
@@ -291,6 +298,27 @@ impl InstructionEncoder {
             }
             // Far jump
             "ljmpl" | "ljmpw" | "ljmp" => self.encode_ljmp(ops),
+            // `lcallw` forces 16-bit operand size: 0x66 prefix AND an imm16
+            // offset in the direct form (realmode wakemain.c BIOS video call
+            // `lcallw $0xc000, $3` — without this the offset would be encoded
+            // as imm32 and the following bytes misinterpreted as code).
+            "lcallw" => {
+                match ops.as_slice() {
+                    [Operand::Immediate(ImmediateValue::Integer(seg)),
+                     Operand::Immediate(ImmediateValue::Integer(off))] => {
+                        self.bytes.push(0x66);
+                        self.bytes.push(0x9A);
+                        self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
+                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                        Ok(())
+                    }
+                    _ => {
+                        self.bytes.push(0x66);
+                        self.encode_lcall(ops)
+                    }
+                }
+            }
+            "lcalll" | "lcall" => self.encode_lcall(ops),
             // Far return
             "lret" | "lretl" => {
                 if ops.is_empty() {
@@ -323,6 +351,20 @@ impl InstructionEncoder {
             "cpuid" => { self.bytes.extend_from_slice(&[0x0F, 0xA2]); Ok(()) }
             "rdtsc" => { self.bytes.extend_from_slice(&[0x0F, 0x31]); Ok(()) }
             "rdtscp" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xF9]); Ok(()) }
+            // RDPID: F3 0F C7 /7 — operand is r32 in 32-bit mode (kernel
+            // vdso32 vgetcpu uses `rdpid %ecx`).
+            "rdpid" => {
+                match ops.as_slice() {
+                    [Operand::Register(r)] => {
+                        let num = reg_num(&r.name).ok_or("rdpid: bad register")?;
+                        self.bytes.push(0xF3);
+                        self.bytes.extend_from_slice(&[0x0F, 0xC7]);
+                        self.bytes.push(0xC0 | (7 << 3) | num);
+                        Ok(())
+                    }
+                    _ => Err("rdpid requires one register operand".to_string()),
+                }
+            }
             "xgetbv" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD0]); Ok(()) }
             "syscall" => { self.bytes.extend_from_slice(&[0x0F, 0x05]); Ok(()) }
             "sysenter" => { self.bytes.extend_from_slice(&[0x0F, 0x34]); Ok(()) }

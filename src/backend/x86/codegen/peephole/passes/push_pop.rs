@@ -102,6 +102,8 @@ fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
         LineKind::SetCC { reg } => reg_id == reg, // setCC writes to the byte register's family
         LineKind::Call => matches!(reg_id, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11),
         LineKind::Ret => false,
+        // Inline asm is opaque: assume it modifies every register.
+        LineKind::InlineAsm => true,
         LineKind::Other { dest_reg } => {
             if dest_reg == reg_id {
                 return true;

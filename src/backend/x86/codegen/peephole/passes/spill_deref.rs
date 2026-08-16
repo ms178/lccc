@@ -245,7 +245,7 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
 fn is_barrier_kind(kind: LineKind) -> bool {
     matches!(kind, LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
         | LineKind::CondJmp | LineKind::Call | LineKind::Ret | LineKind::Directive
-        | LineKind::Push { .. } | LineKind::Pop { .. })
+        | LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::InlineAsm)
 }
 
 /// Does the instruction at index `idx` write the GP register family `reg`?
@@ -259,6 +259,8 @@ fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> boo
         | LineKind::JmpIndirect | LineKind::CondJmp | LineKind::Call | LineKind::Ret
         | LineKind::Directive | LineKind::Empty | LineKind::Nop => false,
         LineKind::SelfMove => false,
+        // Inline asm is opaque: assume it writes every register.
+        LineKind::InlineAsm => true,
         LineKind::Other { dest_reg } => dest_reg == reg,
     }
 }

@@ -123,6 +123,27 @@ impl X86Codegen {
     }
 
     /// Convert 64-bit register name to 32-bit variant.
+    /// Destination register spelling for an inline-asm operand load.
+    ///
+    /// The mnemonic decides the width, not the source type: `mov_load_for_type`
+    /// deliberately returns `movzbl`/`movzwl`/`movl` for U8/U16/U32 because a
+    /// 32-bit destination zero-extends to 64 bits implicitly and saves a REX
+    /// byte. Pairing those mnemonics with a 64-bit register produces
+    /// `movzbl 16(%rsp), %rax`, which GNU as rejects outright
+    /// ("incorrect register `%rax' used with `l' suffix"). Only the sign- and
+    /// 64-bit-extending forms take a 64-bit destination.
+    ///
+    /// Selecting on the mnemonic keeps this correct automatically if
+    /// `mov_load_for_type` ever changes which types it narrows.
+    pub(super) fn asm_load_dest_reg(load_instr: &str, reg: &str) -> String {
+        let narrow = matches!(load_instr, "movzbl" | "movzwl" | "movl");
+        if narrow {
+            format!("%{}", Self::reg_to_32(reg))
+        } else {
+            format!("%{}", reg)
+        }
+    }
+
     pub(super) fn reg_to_32<'a>(reg: &'a str) -> Cow<'a, str> {
         x86_common::reg_to_32(reg)
     }

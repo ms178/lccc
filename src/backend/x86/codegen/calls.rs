@@ -429,7 +429,11 @@ impl X86Codegen {
         }
         if float_count > 0 {
             self.state.out.emit_instr_imm_reg("    movb", float_count as i64, "al");
-        } else {
+        } else if !(self.skip_rax_setup && self.no_sse) {
+            // %al reports the number of live SSE argument registers to a
+            // variadic callee (SysV AMD64 3.5.7). -mskip-rax-setup omits it,
+            // sound only when no SSE argument register can be live -- which
+            // -mno-sse guarantees. A real float argument always wins.
             self.state.emit("    xorl %eax, %eax");
         }
         self.state.reg_cache.invalidate_all();
@@ -460,11 +464,7 @@ impl X86Codegen {
             // emit_call_spill_fptr_impl before stack arguments are pushed.  Do
             // not reload the Operand here: stack argument setup changes %rsp,
             // so RSP-relative slots would be addressed incorrectly.
-            if self.state.indirect_branch_thunk {
-                self.state.emit("    call __x86_indirect_thunk_r10");
-            } else {
-                self.state.emit("    call *%r10");
-            }
+            self.emit_retpoline_call("r10");
         }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();

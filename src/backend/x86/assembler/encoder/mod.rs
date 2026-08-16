@@ -34,6 +34,10 @@ pub struct Relocation {
 pub const R_X86_64_NONE: u32 = 0;
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_PC32: u32 = 2;
+/// 64-bit PC-relative (S + A - P, 8-byte patch). GAS emits this for
+/// `.quad sym - .`; the kernel's __jump_table and static_call sites rely
+/// on the full-width delta (no ±2 GiB truncation like PC32).
+pub const R_X86_64_PC64: u32 = 24;
 #[allow(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_GOT32: u32 = 3;
 pub const R_X86_64_PLT32: u32 = 4;
@@ -95,6 +99,15 @@ impl InstructionEncoder {
             Some("rep") | Some("repz") | Some("repe") => Some(0xF3),
             Some("repnz") | Some("repne") => Some(0xF2),
             Some("notrack") => Some(0x3E),
+            // Segment overrides used as standalone prefixes. `notrack` is the
+            // same 0x3E byte; the kernel's `ds wrmsr` relies on it being
+            // emitted so an ALTERNATIVE can patch the instruction in place.
+            Some("cs") => Some(0x2E),
+            Some("ss") => Some(0x36),
+            Some("ds") => Some(0x3E),
+            Some("es") => Some(0x26),
+            Some("fs") => Some(0x64),
+            Some("gs") => Some(0x65),
             Some(p) => return Err(format!("unknown prefix: {}", p)),
         };
 
@@ -668,6 +681,21 @@ impl InstructionEncoder {
             | "popcntl" | "popcntq" | "popcntw" => {
                 self.encode_bit_count(ops, mnemonic)
             }
+            // Suffix-less spellings. GCC and hand-written kernel assembly write
+            // `tzcnt %rcx,%rax` (arch/x86/include/asm/bitops.h); the operand
+            // size is implied by the registers, exactly as for `bsf`/`bswap`.
+            "tzcnt" | "lzcnt" | "popcnt" => {
+                let size = ops.iter().find_map(|o| match o {
+                    Operand::Register(r) => Some(infer_reg_size(&r.name)),
+                    _ => None,
+                }).unwrap_or(8);
+                let suffixed = match (mnemonic, size) {
+                    (m, 2) => format!("{}w", m),
+                    (m, 4) => format!("{}l", m),
+                    (m, _) => format!("{}q", m),
+                };
+                self.encode_bit_count(ops, &suffixed)
+            }
             "bsfl" | "bsfq" | "bsrl" | "bsrq" => self.encode_bsf_bsr(ops, mnemonic),
             "btq" | "btl" | "btsq" | "btsl" | "btrq" | "btrl" | "btcq" | "btcl" => {
                 self.encode_bt(ops, mnemonic)
@@ -691,6 +719,7 @@ impl InstructionEncoder {
             // Jumps (jmpq is a common AT&T alias for jmp on x86-64)
             "jmp" | "jmpq" => self.encode_jmp(ops),
             "ljmpl" | "ljmpq" | "ljmp" | "ljmpw" => self.encode_ljmp(ops, mnemonic),
+            "lcalll" | "lcallq" | "lcall" | "lcallw" => self.encode_lcall(ops, mnemonic),
             "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
             | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
             | "jc" | "jnc" => {
@@ -1169,6 +1198,24 @@ impl InstructionEncoder {
                 self.encode_x87_st_reg(ops, "fst", 0xDD, 0xD0),
 
             // ---- Flag manipulation ----
+            // SMAP (Supervisor Mode Access Prevention). The kernel wraps every
+            // user-memory access in stac/clac via ALTERNATIVE, so essentially
+            // no uaccess-using object assembles without them.
+            "stac" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xCB]); Ok(()) }
+            "clac" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xCA]); Ok(()) }
+            // User interrupts (UINTR).
+            "clui" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xEE]); Ok(()) }
+            "stui" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xEF]); Ok(()) }
+            // Architectural serialization (SERIALIZE, Ice Lake+).
+            "serialize" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xE8]); Ok(()) }
+            // Protection keys.
+            "rdpkru" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xEE]); Ok(()) }
+            "wrpkru" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xEF]); Ok(()) }
+            // MONITOR/MWAIT (implicit operands rax/ecx/edx, eax/ecx).
+            "monitor" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC8]); Ok(()) }
+            "mwait" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC9]); Ok(()) }
+            // Cache maintenance.
+            "wbnoinvd" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x09]); Ok(()) }
             "clc" => { self.bytes.push(0xF8); Ok(()) }
             "stc" => { self.bytes.push(0xF9); Ok(()) }
             "cli" => { self.bytes.push(0xFA); Ok(()) }
@@ -2261,6 +2308,24 @@ impl InstructionEncoder {
             "prefetchw" => self.encode_sse_mem_only(ops, &[0x0F, 0x0D], 1),
 
             // RDRAND/RDSEED
+            // RDPID (read processor ID from IA32_TSC_AUX): F3 0F C7 /7.
+            // In 64-bit mode the operand is always r64 — no REX.W needed
+            // (kernel vDSO vgetcpu uses `rdpid %rcx`).
+            "rdpid" => {
+                match ops.as_slice() {
+                    [Operand::Register(r)] => {
+                        let num = reg_num(&r.name).ok_or("rdpid: bad register")?;
+                        self.bytes.push(0xF3);
+                        if needs_rex_ext(&r.name) {
+                            self.bytes.push(self.rex(false, false, false, true));
+                        }
+                        self.bytes.extend_from_slice(&[0x0F, 0xC7]);
+                        self.bytes.push(self.modrm(3, 7, num));
+                        Ok(())
+                    }
+                    _ => Err("rdpid requires one register operand".to_string()),
+                }
+            }
             "rdrand" | "rdrandl" | "rdrandq" => self.encode_rdrand(ops, mnemonic, 0xC7, 6),
             "rdseed" | "rdseedl" | "rdseedq" => self.encode_rdrand(ops, mnemonic, 0xC7, 7),
 

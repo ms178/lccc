@@ -326,6 +326,8 @@ pub struct X86Codegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
     /// XMM saves and va_start sets fp_offset to overflow immediately.
+    pub(super) function_alignment: u32,
+    pub(super) skip_rax_setup: bool,
     pub(super) no_sse: bool,
     /// Per-function vector-constant pool: (value, byte_width) -> label.
     /// _mm256_set1_* with a constant argument lowers to a single
@@ -491,6 +493,65 @@ pub(super) struct IvsrPointerInfo {
 }
 
 impl X86Codegen {
+    /// Emit a retpoline-protected indirect CALL through `reg`.
+    ///
+    /// thunk-inline (kernel vDSO: userspace code that cannot reference the
+    /// kernel's __x86_indirect_thunk_* symbols) expands the full retpoline
+    /// at the call site — byte-equivalent to GCC's
+    /// -mindirect-branch=thunk-inline output (verified against gcc -O2 on
+    /// the fp-call reproducer):
+    ///     jmp .Louter
+    ///   .Linner: call .Lset
+    ///   .Lspec:  pause; lfence; jmp .Lspec   ; speculation trap
+    ///   .Lset:   mov %reg,(%rsp); ret        ; RSB-safe dispatch
+    ///   .Louter: call .Linner                ; pushes the REAL return addr
+    /// thunk-extern emits `call __x86_indirect_thunk_<reg>` (kernel proper,
+    /// resolved at link time and patchable by objtool --retpoline).
+    pub(super) fn emit_retpoline_call(&mut self, reg: &str) {
+        if self.state.indirect_branch_thunk_inline {
+            let id = self.state.next_label_id();
+            self.state.emit_fmt(format_args!("    jmp .Lrpl_outer_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_inner_{}:", id));
+            self.state.emit_fmt(format_args!("    call .Lrpl_set_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_spec_{}:", id));
+            self.state.emit("    pause");
+            self.state.emit("    lfence");
+            self.state.emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_set_{}:", id));
+            self.state.emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
+            self.state.emit("    ret");
+            self.state.emit_fmt(format_args!(".Lrpl_outer_{}:", id));
+            self.state.emit_fmt(format_args!("    call .Lrpl_inner_{}", id));
+        } else if self.state.indirect_branch_thunk {
+            self.state.emit_fmt(format_args!("    call __x86_indirect_thunk_{}", reg));
+        } else {
+            self.state.emit_fmt(format_args!("    call *%{}", reg));
+        }
+    }
+
+    /// Emit a retpoline-protected indirect JMP through `reg` (tail calls,
+    /// computed goto, switch tables). GCC's jump form:
+    ///     call .Lset          ; pushes .Lspec as the "return" address
+    ///   .Lspec: pause; lfence; jmp .Lspec
+    ///   .Lset:  mov %reg,(%rsp); ret   ; ret consumes the rewritten slot
+    pub(super) fn emit_retpoline_jump(&mut self, reg: &str) {
+        if self.state.indirect_branch_thunk_inline {
+            let id = self.state.next_label_id();
+            self.state.emit_fmt(format_args!("    call .Lrpl_set_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_spec_{}:", id));
+            self.state.emit("    pause");
+            self.state.emit("    lfence");
+            self.state.emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_set_{}:", id));
+            self.state.emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
+            self.state.emit("    ret");
+        } else if self.state.indirect_branch_thunk {
+            self.state.emit_fmt(format_args!("    jmp __x86_indirect_thunk_{}", reg));
+        } else {
+            self.state.emit_fmt(format_args!("    jmpq *%{}", reg));
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             state: CodegenState::new(),
@@ -508,6 +569,8 @@ impl X86Codegen {
             asm_xmm_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
+            function_alignment: 0,
+            skip_rax_setup: false,
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
@@ -552,6 +615,11 @@ impl X86Codegen {
         self.state.indirect_branch_thunk = enabled;
     }
 
+    /// Enable inline retpoline expansion (-mindirect-branch=thunk-inline).
+    pub fn set_indirect_branch_thunk_inline(&mut self, enabled: bool) {
+        self.state.indirect_branch_thunk_inline = enabled;
+    }
+
     /// Set patchable function entry configuration (-fpatchable-function-entry=N,M).
     pub fn set_patchable_function_entry(&mut self, entry: Option<(u32, u32)>) {
         self.state.patchable_function_entry = entry;
@@ -584,8 +652,11 @@ impl X86Codegen {
         self.set_pic(opts.pic);
         self.set_function_return_thunk(opts.function_return_thunk);
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
+        self.set_indirect_branch_thunk_inline(opts.indirect_branch_thunk_inline);
         self.set_patchable_function_entry(opts.patchable_function_entry);
         self.set_cf_protection_branch(opts.cf_protection_branch);
+        self.function_alignment = opts.function_alignment;
+        self.skip_rax_setup = opts.skip_rax_setup;
         self.set_no_sse(opts.no_sse);
         self.set_code_model_kernel(opts.code_model_kernel);
         self.set_no_jump_tables(opts.no_jump_tables);
@@ -3514,11 +3585,7 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_jump_indirect(&mut self) {
-        if self.state.indirect_branch_thunk {
-            self.state.emit("    jmp __x86_indirect_thunk_rax");
-        } else {
-            self.state.emit("    jmpq *%rax");
-        }
+        self.emit_retpoline_jump("rax");
     }
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
@@ -3608,7 +3675,10 @@ impl ArchCodegen for X86Codegen {
             .emit_instr_sym_base_reg("    leaq", &table_label, "rip", "rcx");
         self.state.emit("    movslq (%rcx,%rax,4), %rdx");
         self.state.emit("    addq %rcx, %rdx");
-        self.state.emit("    jmp *%rdx");
+        // Switch-table dispatch is an indirect branch: it needs the same
+        // retpoline protection as calls (Spectre v2 via the BTB applies to
+        // any indirect JMP; kernel objtool flags naked ones in vDSO too).
+        self.emit_retpoline_jump("rdx");
 
         self.state.emit(".section .rodata");
         self.state.emit(".align 4");
@@ -3874,6 +3944,13 @@ impl ArchCodegen for X86Codegen {
         // loads (e.g. movemask right after a compare). It is cleared by every
         // actual load, call, inline asm, atomic, memcpy, and block boundary.
         self.state.reg_cache.invalidate_all();
+    }
+
+    fn function_alignment_log2(&self) -> Option<u32> {
+        match self.function_alignment {
+            0 | 1 => None,
+            n => Some(n.trailing_zeros()),
+        }
     }
 
     // All remaining methods delegate to self.method_name_impl(args...)

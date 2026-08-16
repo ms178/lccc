@@ -76,9 +76,16 @@ impl X86Codegen {
         if let Some(d_reg) = self.dest_reg(dest) {
             if !is_xmm_reg(d_reg) {
                 let load_instr = Self::mov_load_for_type(ty);
-                let d_name = match ty {
-                    IrType::U32 | IrType::F32 => phys_reg_name_32(d_reg),
-                    _ => phys_reg_name(d_reg),
+                // The MNEMONIC decides the destination width, not the source
+                // type. `mov_load_for_type` returns movzbl/movzwl/movl for
+                // U8/U16/U32 (a 32-bit destination zero-extends to 64 bits for
+                // free and saves a REX byte); pairing those with a 64-bit
+                // register emits `movzbl sym(%rip), %rdi`, which GNU as rejects
+                // ("incorrect register `%rdi' used with `l' suffix").
+                let d_name = if matches!(load_instr, "movzbl" | "movzwl" | "movl") {
+                    phys_reg_name_32(d_reg)
+                } else {
+                    phys_reg_name(d_reg)
                 };
                 self.state.emit_fmt(format_args!("    {} {}(%rip), %{}", load_instr, sym, d_name));
                 self.state.reg_cache.invalidate_acc();

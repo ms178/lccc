@@ -439,6 +439,14 @@ impl TokenKind {
             "_Thread_local" | "__thread" => Some(TokenKind::ThreadLocal),
             "typeof" if gnu_extensions => Some(TokenKind::Typeof),
             "__typeof__" | "__typeof" => Some(TokenKind::Typeof),
+            // C23 typeof_unqual: like typeof but with top-level qualifiers
+            // (const/volatile/_Atomic) removed. LCCC's `typeof` already yields
+            // an unqualified type, so both spellings map to the same token.
+            // Required by the kernel: arch/x86/include/asm/percpu.h uses
+            // TYPEOF_UNQUAL() in every per-CPU accessor, so without it nothing
+            // including <asm/current.h> or <asm/preempt.h> parses.
+            "typeof_unqual" if gnu_extensions => Some(TokenKind::Typeof),
+            "__typeof_unqual__" | "__typeof_unqual" => Some(TokenKind::Typeof),
             "asm" if gnu_extensions => Some(TokenKind::Asm),
             "__asm__" | "__asm" => Some(TokenKind::Asm),
             "__attribute__" | "__attribute" => Some(TokenKind::Attribute),

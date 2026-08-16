@@ -270,9 +270,22 @@ fn self_update(
     // register flags.)
     if op == "movq" && t.contains('%') {
         if let Some(comma) = t.find(',') {
-            let mut so = t.find(' ').unwrap_or(0) + 1;
-            while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
+            // Split "movq <src>, <dst>" at the FIRST comma that separates the
+            // operands -- but only when the mnemonic really ends before it.
+            //
+            // `so` was derived from the first space and then sliced as
+            // `t[so..comma]`, which panics ("byte range starts at 11 but ends
+            // at 9") whenever the first comma appears before that space, e.g.
+            // for a memory operand written without a space after the comma.
+            // Deriving the operand text from the already-tokenized mnemonic
+            // and guarding the range makes the slice impossible to invert.
+            let so = op.len();
+            let mut so = so.min(t.len());
+            while so < t.len() && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
                 so += 1;
+            }
+            if so > comma || comma >= t.len() {
+                return;
             }
             let src = t[so..comma].trim();
             let dst = t[comma + 1..].trim();

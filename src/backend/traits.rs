@@ -1743,6 +1743,10 @@ pub trait ArchCodegen {
     fn emit_set_return_f128_second(&mut self, src: &Operand);
 
     /// Emit the function directive for the function type attribute.
+    /// log2 of the function-entry alignment, or None for no alignment.
+    /// Default none; the x86 backend overrides it from CodegenOptions.
+    fn function_alignment_log2(&self) -> Option<u32> { None }
+
     fn function_type_directive(&self) -> &'static str {
         "@function"
     }

@@ -448,6 +448,58 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode LCALL (far call): 9A cp (direct) or FF /3 (indirect memory).
+    ///
+    /// Same shapes as LJMP but ModRM extension /3 and direct opcode 0x9A. The
+    /// kernel's EFI mixed-mode thunk uses `lcalll *efi32_call(%rip)` to drop
+    /// from 64-bit into a 32-bit EFI service and return.
+    pub(crate) fn encode_lcall(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        match ops.len() {
+            1 => {
+                let mem = match &ops[0] {
+                    Operand::Indirect(inner) => match inner.as_ref() {
+                        Operand::Memory(mem) => mem,
+                        _ => return Err("lcall indirect requires memory operand".to_string()),
+                    },
+                    Operand::Memory(mem) => mem,
+                    _ => return Err("lcall requires indirect memory or segment:offset operands".to_string()),
+                };
+                // `lcalll *mem` keeps the default 32-bit operand size
+                // (m16:32 far pointer) — the form the kernel's EFI mixed-mode
+                // thunk uses to drop from long mode into protected mode.
+                // `lcallq *mem` is the m16:64 form and needs REX.W.
+                if mnemonic == "lcallq" {
+                    self.emit_rex_rm(8, "", mem);
+                } else {
+                    self.emit_rex_rm(0, "", mem);
+                }
+                self.bytes.push(0xFF);
+                self.encode_modrm_mem(3, mem)
+            }
+            2 => {
+                match (&ops[0], &ops[1]) {
+                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
+                        self.bytes.push(0x9A);
+                        self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
+                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                        Ok(())
+                    }
+                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) |
+                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _))) => {
+                        let addend = match &ops[1] { Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a, _ => 0 };
+                        self.bytes.push(0x9A);
+                        self.add_relocation(sym, R_X86_64_32, addend);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                        Ok(())
+                    }
+                    _ => Err("lcall requires $segment, $offset operands".to_string()),
+                }
+            }
+            _ => Err("lcall requires 1 or 2 operands".to_string()),
+        }
+    }
+
     /// Encode LJMP (far jump): EA cp (direct) or FF /5 (indirect memory)
     pub(crate) fn encode_ljmp(&mut self, ops: &[Operand], _mnemonic: &str) -> Result<(), String> {
         match ops.len() {

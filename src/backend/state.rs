@@ -252,6 +252,11 @@ pub struct CodegenState {
     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern).
     /// Used by the Linux kernel for Spectre v2 (retpoline) mitigation.
     pub indirect_branch_thunk: bool,
+    /// -mindirect-branch=thunk-inline: emit the full retpoline sequence at
+    /// every indirect call/jump site instead of calling an external
+    /// __x86_indirect_thunk_REG. The kernel vDSO needs this: it is userspace
+    /// code that cannot reference kernel-internal thunk symbols.
+    pub indirect_branch_thunk_inline: bool,
     /// Patchable function entry: (total_nops, nops_before_entry).
     /// When set, emits NOP padding around function entry points and records
     /// them in __patchable_function_entries for runtime patching (ftrace).
@@ -406,6 +411,7 @@ impl CodegenState {
             block_use_counts: FxHashMap::default(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
+            indirect_branch_thunk_inline: false,
             patchable_function_entry: None,
             cf_protection_branch: false,
             current_program_point: 0,

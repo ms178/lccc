@@ -231,10 +231,14 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         // `rdrand`/`rdseed` end in `d`, and `movbe`/`lddqu` in `e`/`u`; none of
         // those letters is an AT&T size suffix.  Without an entry here the
         // width check below compares a bogus suffix against the real register.
-        | "rdrand" | "rdseed" | "movbe" | "lddqu" | "vlddqu" | "bswap"
+        | "rdrand" | "rdseed" | "rdpid" | "movbe" | "lddqu" | "vlddqu" | "bswap"
         | "endbr64" | "pause" | "mfence" | "lfence" | "sfence" | "clflush"
         | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp" | "rdpmc"
         | "clc" | "stc" | "cli" | "sti" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "finit" | "fwait" | "wait" | "fnstcw" | "fstcw"
+        // SMAP / UINTR / SERIALIZE / PKRU / MONITOR-MWAIT / cache maintenance:
+        // zero-operand system instructions (kernel uaccess, idle, PKU paths).
+        | "stac" | "clac" | "clui" | "stui" | "serialize"
+        | "rdpkru" | "wrpkru" | "monitor" | "mwait" | "wbnoinvd"
         | "fld1" | "fldl2e" | "fldlg2" | "fldln2" | "fldz" | "fldpi" | "fldl2t"
         | "fabs" | "fsqrt" | "frndint" | "f2xm1" | "fscale" | "fpatan" | "fprem" | "fprem1"
         | "fyl2x" | "fyl2xp1" | "fptan" | "fsin" | "fcos" | "fsincos" | "fxtract" | "fnclex" | "fclex" | "fxch"
@@ -528,6 +532,8 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
             | "cltq" | "cqto" | "cltd" | "cwtd" | "endbr64" | "endbr32"
             | "cbtw" | "cbw" | "cwde" | "cdqe" | "cwd"
             | "lfence" | "sfence" | "mfence" | "rdtsc" | "rdtscp" | "cdq" | "cqo"
+            | "stac" | "clac" | "clui" | "stui" | "serialize"
+            | "rdpkru" | "wrpkru" | "wbnoinvd"
     ) && !ops.is_empty()
     {
         return Err(format!("`{}` takes no operands", mnemonic));
