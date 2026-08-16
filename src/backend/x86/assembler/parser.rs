@@ -263,6 +263,13 @@ pub enum Displacement {
     SymbolMod(String, String),
     /// Symbol plus integer offset: symbol+N or symbol-N
     SymbolPlusOffset(String, i64),
+    /// Symbol difference: `rva(gdt)(%ebp)` in the compressed-boot head_64.S
+    /// expands to `((gdt) - startup_32)(%ebp)` — a label difference as a
+    /// displacement. Same-section pairs fold to a constant after layout.
+    SymbolDiff(String, String),
+    /// Symbol difference with a constant addend on the minuend:
+    /// `rva(pgtable + 0)` -> `((pgtable + 0) - startup_32)`.
+    SymbolDiffAddend(String, String, i64),
 }
 
 /// Comment style for x86 AT&T GAS: `#` only.
@@ -310,7 +317,13 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
-        } else if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t") {
+        } else if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t")
+            || trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
+            // .irpc must be tracked exactly like .irp here: this pre-pass
+            // only expands .rept, and treating .irpc's .endr as a stray
+            // DELETED it, so the later .irpc expansion ran off the end of
+            // the block (efi-mixed.S page-table unroll emitted a stray
+            // `ret` per iteration).
             irp_depth += 1;
             result.push(lines[i].to_string());
         } else if trimmed == ".endr" {
@@ -1304,8 +1317,15 @@ fn parse_immediate_label_diff(s: &str) -> Option<ImmediateValue> {
     // is a negation, not a difference.
     for (i, c) in s.char_indices().skip(1) {
         if c == '-' {
-            let lhs = &s[..i];
-            let rhs = &s[i + 1..];
+            // Trim both sides: `$identity_mapped - 0b` (relocate_kernel_64.S)
+            // carries spaces around the minus; without trimming the strings
+            // failed is_label_like and the WHOLE expression fell through to a
+            // plain symbol named "identity_mapped - 0b", which the linker
+            // reported as an undefined reference. Also strip grouping parens:
+            // head_64.S's rva() macro expands `$ rva(1b)` to `$((1b) -
+            // startup_32)` — the inner label arrives as `(1b)`.
+            let lhs = strip_sym_parens(s[..i].trim());
+            let rhs = strip_sym_parens(s[i + 1..].trim());
             if !lhs.is_empty() && !rhs.is_empty()
                 && is_label_like(lhs) && is_label_like(rhs)
             {
@@ -1522,6 +1542,28 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
         return Ok(offset_disp);
     }
 
+    // Symbol difference: `(gdt) - startup_32` (head_64.S rva() macro as a
+    // displacement). Either side may be paren-wrapped or a numeric label,
+    // and the LHS may carry a constant addend: `rva(pgtable + 0)` expands
+    // to `((pgtable + 0) - startup_32)`. Scan minus positions left to
+    // right; at each, try to interpret LHS as `sym [+ const-chain]`.
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '-' {
+            let lhs_raw = strip_sym_parens(s[..i].trim());
+            let rhs = strip_sym_parens(s[i + 1..].trim());
+            if lhs_raw.is_empty() || rhs.is_empty() || !is_label_like(rhs) {
+                continue;
+            }
+            if is_label_like(lhs_raw) {
+                return Ok(Displacement::SymbolDiff(lhs_raw.to_string(), rhs.to_string()));
+            }
+            // LHS with folded constant tail: `pgtable + 0`, `sym + (1<<4) - 8`.
+            if let Some(DataValue::SymbolOffset(sym, add)) = parse_symbol_expr_chain(lhs_raw) {
+                return Ok(Displacement::SymbolDiffAddend(sym, rhs.to_string(), add));
+            }
+        }
+    }
+
     // Plain symbol
     Ok(Displacement::Symbol(s.to_string()))
 }
@@ -1569,7 +1611,19 @@ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
 /// This handles cases like `init_top_pgt - 0xffffffff80000000` where the expression
 /// mixes a symbol with a large integer constant.
 fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
+    // A parenthesized symbol `(name)` is the same symbol — GAS grouping.
+    // The kernel emits `$(srso_safe_ret)+5` via __HANDLE_INTR_SAFERET;
+    // rejecting the parens made the whole expression a literal symbol
+    // name and the vmlinux link failed on `(srso_safe_ret)+5`.
+    fn strip_parens(s: &str) -> &str {
+        if s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    }
     let is_valid_sym = |s: &str| -> bool {
+        let s = strip_parens(s);
         !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
     };
 
@@ -1585,7 +1639,7 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
             // Case 1: symbol+/-offset (e.g. "init_top_pgt - 0xffffffff80000000")
             if let Ok(offset) = parse_integer_expr(right_with_sign) {
                 if is_valid_sym(left) {
-                    return Some(ImmediateValue::SymbolPlusOffset(left.to_string(), offset));
+                    return Some(ImmediateValue::SymbolPlusOffset(strip_parens(left).to_string(), offset));
                 }
             }
 
@@ -1594,7 +1648,7 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
                 if let Ok(offset) = parse_integer_expr(left) {
                     let sym = right_with_sign[1..].trim();
                     if is_valid_sym(sym) {
-                        return Some(ImmediateValue::SymbolPlusOffset(sym.to_string(), offset));
+                        return Some(ImmediateValue::SymbolPlusOffset(strip_parens(sym).to_string(), offset));
                     }
                 }
             }
@@ -2426,6 +2480,51 @@ fn expand_gas_macros_with_state(
                     }
                 }
             }
+        }
+
+        // .irpc var, string  /  .endr -- GAS character iteration: the body
+        // expands once per CHARACTER of the string. efi-mixed.S uses
+        // `.irpc l, 0123` to unroll four page-table-entry stores with
+        // `\l * 8(%eax)` displacements; without this the raw `\l` leaked
+        // into the object as a relocation symbol named "\l * 8".
+        if trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
+            let rest = trimmed[".irpc".len()..].trim();
+            let comma = rest.find(',').ok_or(".irpc: missing comma after variable")?;
+            let var = rest[..comma].trim().to_string();
+            let chars_str = rest[comma + 1..].trim();
+            // GAS allows the string to be quoted; strip one layer.
+            let chars_str = chars_str.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(chars_str);
+            let mut body = Vec::new();
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(&lines[i]).trim().to_string();
+                if inner.starts_with(".irp ") || inner.starts_with(".irp\t")
+                    || inner.starts_with(".irpc ") || inner.starts_with(".irpc\t")
+                    || inner.starts_with(".rept ") || inner.starts_with(".rept\t") {
+                    depth += 1;
+                } else if inner == ".endr" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                body.push(lines[i].clone());
+                i += 1;
+            }
+            let mut all_expanded = Vec::new();
+            for ch in chars_str.chars() {
+                let item = ch.to_string();
+                for bline in &body {
+                    let mut expanded = asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
+                    expanded = expanded.replace("\\()", "");
+                    all_expanded.push(expanded);
+                }
+            }
+            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols)?;
+            result.extend(processed);
+            i += 1;
+            continue;
         }
 
         // .irp var, item1, item2, ...  /  .endr

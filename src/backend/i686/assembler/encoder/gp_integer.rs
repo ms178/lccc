@@ -165,11 +165,36 @@ impl super::InstructionEncoder {
                     self.bytes.push(0xB8 + dst_num);
                     self.add_relocation(sym, R_386_32, addend);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else if size == 2 {
+                    // Real-mode boot code (header.S with .code16 semantics):
+                    // `movw $_end, %dx` — a 16-bit absolute symbol immediate.
+                    // GAS emits B8+rd iw with R_386_16 / R_X86_64_16 on the
+                    // 2-byte field; the kernel's build-time relocs tool
+                    // whitelists 16-bit relocs in the realmode blob.
+                    // (The caller has already emitted the 0x66 prefix in
+                    // 32-bit code mode when needed.)
+                    self.bytes.push(0xB8 + dst_num);
+                    self.add_relocation(sym, R_386_16, addend);
+                    self.bytes.extend_from_slice(&[0, 0]);
                 } else {
-                    return Err("symbol immediate only supported for 32-bit mov".to_string());
+                    return Err("symbol immediate only supported for 16/32-bit mov".to_string());
                 }
             }
-            ImmediateValue::SymbolMod(_, _) | ImmediateValue::SymbolDiff(_, _) => {
+            ImmediateValue::SymbolDiff(sym_a, sym_b) => {
+                // head_64.S (compressed boot, .code32): `movl $(_bss -
+                // startup_32), %ecx` and the rva(X) macro produce label
+                // differences as mov immediates. Same-section pairs fold to
+                // a constant after layout via the diff-reloc path — GAS
+                // emits `b9 <imm32>` with the folded value.
+                if size == 4 {
+                    self.bytes.push(0xB8 + dst_num);
+                    self.add_relocation_with_diff(sym_a, R_386_32, 0, sym_b);
+                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    return Err("symbol-difference immediate only supported for 32-bit mov".to_string());
+                }
+            }
+            ImmediateValue::SymbolMod(_, _) => {
                 return Err("unsupported immediate type for mov".to_string());
             }
         }
@@ -762,6 +787,18 @@ impl super::InstructionEncoder {
                 }
                 Ok(())
             }
+            (Operand::Immediate(imm), Operand::Label(label)) => {
+                // `testb $CAN_USE_HEAP, loadflags` (header.S): a bare symbol
+                // as the memory operand — absolute addressing through a
+                // relocation, same shape GAS emits (F6 /0 disp16/32 + reloc).
+                let mem = MemoryOperand {
+                    segment: None,
+                    displacement: Displacement::Symbol(label.clone()),
+                    base: None, index: None, scale: None,
+                    mask: None, zeroing: false,
+                };
+                self.encode_test(&[Operand::Immediate(imm.clone()), Operand::Memory(mem)], mnemonic)
+            }
             _ => Err("unsupported test operands".to_string()),
         }
     }
@@ -1323,6 +1360,19 @@ impl super::InstructionEncoder {
                     (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) => {
                         self.bytes.push(0xEA);
                         self.add_relocation(sym, R_386_32, 0);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                        Ok(())
+                    }
+                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff))) => {
+                        // la57toggle.S (compiled as .code32 inside a 64-bit
+                        // kernel object): `ljmpl $__KERNEL_CS, $(.Lret -
+                        // trampoline_32bit_src)`. The offset is a
+                        // same-section label difference; GAS folds it to a
+                        // constant after layout (`ea 08000000 1000`). Record
+                        // a diff relocation on the imm32 field.
+                        self.bytes.push(0xEA);
+                        self.add_relocation_with_diff(sym, R_386_32, 0, diff);
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())

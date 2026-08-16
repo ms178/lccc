@@ -55,7 +55,7 @@ impl X86Arch for X86_64Arch {
                 symbol: r.symbol,
                 reloc_type: r.reloc_type,
                 addend: r.addend,
-                diff_symbol: None,
+                diff_symbol: r.diff_symbol,
             }
         }).collect();
 

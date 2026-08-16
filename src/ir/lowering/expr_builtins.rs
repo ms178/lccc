@@ -65,6 +65,58 @@ impl Lowerer {
             }
         }
 
+        // Compile-time folding of string-literal strcmp/strncmp/memcmp.
+        // GCC folds these at -O0 already; the kernel RELIES on the fold for
+        // its "unknown operator throws linker error" idiom (fair.c
+        // vruntime_cmp uses __builtin_strcmp(OP, "<") in an if/else ladder
+        // whose dead branch calls the undefined __BUILD_BUG_vruntime_cmp).
+        // Without folding, the branch survives into codegen and vmlinux
+        // fails to link. Fold only when BOTH arguments are string literals —
+        // everything else lowers normally.
+        if matches!(name, "__builtin_strcmp" | "__builtin_strncmp" | "__builtin_memcmp") {
+            fn literal_of(e: &Expr) -> Option<&str> {
+                match e {
+                    Expr::StringLiteral(s, _) => Some(s.as_str()),
+                    _ => None,
+                }
+            }
+            if args.len() >= 2 {
+                if let (Some(a), Some(b)) = (literal_of(&args[0]), literal_of(&args[1])) {
+                    let n = if name == "__builtin_strcmp" {
+                        Some(usize::MAX)
+                    } else {
+                        match args.get(2).and_then(|e| self.eval_const_expr(e)) {
+                            Some(IrConst::I64(n)) if n >= 0 => Some(n as usize),
+                            Some(IrConst::I32(n)) if n >= 0 => Some(n as usize),
+                            // strncmp/memcmp with non-constant length: no fold.
+                            _ => None,
+                        }
+                    };
+                    if let Some(n) = n {
+                        let ab = a.as_bytes();
+                        let bb = b.as_bytes();
+                        // Compare including the NUL terminator (strcmp stops
+                        // there; memcmp of literal arrays sees the NUL too).
+                        let mut result: i64 = 0;
+                        let mut i = 0usize;
+                        while i < n {
+                            let ca = if i < ab.len() { ab[i] } else { 0 };
+                            let cb = if i < bb.len() { bb[i] } else { 0 };
+                            if ca != cb {
+                                result = ca as i64 - cb as i64;
+                                break;
+                            }
+                            // For strcmp/strncmp: stop at NUL.
+                            if name != "__builtin_memcmp" && ca == 0 { break; }
+                            if i >= ab.len() && i >= bb.len() { break; }
+                            i += 1;
+                        }
+                        return Some(Operand::Const(IrConst::I32(result.signum() as i32)));
+                    }
+                }
+            }
+        }
+
         // Handle __builtin_choose_expr(const_expr, expr1, expr2)
         // This is a compile-time selection: if const_expr is nonzero, returns expr1, else expr2.
         if name == "__builtin_choose_expr" {
