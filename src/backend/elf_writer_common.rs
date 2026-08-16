@@ -1785,12 +1785,24 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let mut relocs = Vec::new();
 
             for reloc in &sec.relocations {
-                let (sym_name, mut addend) = if reloc.symbol.starts_with('.') {
-                    if let Some(&(target_sec, target_off)) = self.label_positions.get(&reloc.symbol) {
-                        (section_names[target_sec].clone(), reloc.addend + target_off as i64)
-                    } else {
-                        (reloc.symbol.clone(), reloc.addend)
-                    }
+                // GAS converts a relocation against ANY local defined symbol
+                // into section-symbol + offset — not only `.L` labels. The
+                // kernel relies on this: objtool reads
+                // .rela.discard.func_stack_frame_non_standard and accepts
+                // STT_SECTION or STT_FUNC reloc symbols, but a local label
+                // like optprobe_template_func stays STT_NOTYPE in our output
+                // and objtool fails with "unexpected relocation symbol type".
+                // Match GAS: fold every local defined label into its section.
+                // Exception: symbols with an explicit .type directive keep
+                // their own symbol table entry ONLY if the reloc is
+                // PC-relative to a different section (identical to section+
+                // offset anyway), so folding is always safe here.
+                let is_foldable_local = self.label_positions.contains_key(&reloc.symbol)
+                    && !self.pending_globals.contains(&reloc.symbol)
+                    && !self.pending_weaks.contains(&reloc.symbol);
+                let (sym_name, mut addend) = if is_foldable_local {
+                    let &(target_sec, target_off) = self.label_positions.get(&reloc.symbol).unwrap();
+                    (section_names[target_sec].clone(), reloc.addend + target_off as i64)
                 } else {
                     (reloc.symbol.clone(), reloc.addend)
                 };

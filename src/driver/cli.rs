@@ -937,7 +937,36 @@ impl Driver {
                             "knl" => self.enable_x86_knl_profile(),
                             "knm" => { self.enable_x86_knl_profile(); self.enable_avx512vpopcntdq=true; }
                             "novalake" | "diamondrapids" => return Err(format!("-march={} requires unimplemented AVX10/APX lowering", march)),
-                            "native" => return Err("-march=native is rejected; pass an explicit profile".to_string()),
+                            "native" => {
+                                // Detect the HOST CPU's features. Only
+                                // meaningful when the compiler itself runs on
+                                // x86-64 (cross builds must pass an explicit
+                                // profile — matching GCC, whose native probe
+                                // also reads the host CPUID).
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    self.no_sse = false;
+                                    if std::arch::is_x86_feature_detected!("sse3") { self.enable_sse3 = true; }
+                                    if std::arch::is_x86_feature_detected!("ssse3") { self.enable_ssse3 = true; }
+                                    if std::arch::is_x86_feature_detected!("sse4.1") { self.enable_sse4_1 = true; }
+                                    if std::arch::is_x86_feature_detected!("sse4.2") { self.enable_sse4_2 = true; }
+                                    if std::arch::is_x86_feature_detected!("avx") { self.enable_avx = true; }
+                                    if std::arch::is_x86_feature_detected!("avx2") { self.enable_avx2 = true; }
+                                    if std::arch::is_x86_feature_detected!("fma") { self.enable_fma = true; }
+                                    if std::arch::is_x86_feature_detected!("bmi1") { self.enable_bmi = true; }
+                                    if std::arch::is_x86_feature_detected!("bmi2") { self.enable_bmi2 = true; }
+                                    if std::arch::is_x86_feature_detected!("lzcnt") { self.enable_lzcnt = true; }
+                                    if std::arch::is_x86_feature_detected!("movbe") { self.enable_movbe = true; }
+                                    if std::arch::is_x86_feature_detected!("aes") { self.enable_aes = true; }
+                                    if std::arch::is_x86_feature_detected!("pclmulqdq") { self.enable_pclmul = true; }
+                                    if std::arch::is_x86_feature_detected!("f16c") { self.enable_f16c = true; }
+                                    if std::arch::is_x86_feature_detected!("avx512f") { self.enable_x86_avx512_profile(); }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    return Err("-march=native requires an x86-64 host; pass an explicit profile".to_string());
+                                }
+                            }
                             _ => return Err(format!("unsupported x86 -march={}", march)),
                         },
                         _ => return Err(format!("-march={} is not implemented for target {}", march, self.target.triple())),

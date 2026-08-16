@@ -110,6 +110,26 @@ impl Lowerer {
     /// by-value ABI convention as structs (small vectors packed into registers,
     /// large vectors via sret).
     pub(super) fn struct_value_size(&self, expr: &Expr) -> Option<usize> {
+        // Raw GCC vector builtins: the generic FunctionCall arm below resolves
+        // types via get_expr_ctype, which has no entry for these names.
+        if let Expr::FunctionCall(callee, _, _) = expr {
+            if let Expr::Identifier(name, _) = &**callee {
+                match name.as_str() {
+                    // ONLY the 256-bit builtins: v8sf results live behind a
+                    // pointer (sret convention). The 128-bit raw builtins
+                    // return packed I128 BY VALUE — reporting a size here
+                    // (or falling through to the generic arm, which now sees
+                    // their Vector CType) makes the return/assign path
+                    // dereference the packed value as a struct pointer.
+                    "__builtin_ia32_maxps256" | "__builtin_ia32_minps256"
+                    | "__builtin_ia32_andps256" | "__builtin_ia32_cmpps256" => return Some(32),
+                    "__builtin_ia32_maxps" | "__builtin_ia32_minps"
+                    | "__builtin_ia32_shufps" | "__builtin_shufflevector"
+                    | "__builtin_ia32_vextractf128_ps256" => return None,
+                    _ => {}
+                }
+            }
+        }
         match expr {
             Expr::Identifier(name, _) => {
                 if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
@@ -371,7 +391,13 @@ impl Lowerer {
             // Without this the result defaulted to I64 and the RETURN path
             // sign-extended half the vector away (cqto), zeroing lanes 2-3
             // and corrupting lane 1 (kernel NAP governor v4sf clamp).
-            "__builtin_ia32_maxps" | "__builtin_ia32_minps" => Some(IrType::I128),
+            "__builtin_ia32_maxps" | "__builtin_ia32_minps"
+            | "__builtin_ia32_shufps" | "__builtin_shufflevector"
+            | "__builtin_ia32_vextractf128_ps256" => Some(IrType::I128),
+            // 256-bit raw builtins return v8sf, which lccc represents as a
+            // POINTER to the 32-byte result slot everywhere (sret convention).
+            "__builtin_ia32_maxps256" | "__builtin_ia32_minps256"
+            | "__builtin_ia32_andps256" | "__builtin_ia32_cmpps256" => Some(IrType::Ptr),
             // I/O builtins return int
             "__builtin_printf" | "__builtin_fprintf" | "__builtin_sprintf"
             | "__builtin_snprintf" | "__builtin_puts" | "__builtin_putchar" => Some(IrType::I32),
@@ -861,6 +887,9 @@ impl Lowerer {
                 self.get_call_return_type(func)
             }
             Expr::VaArg(_, type_spec, _) => self.resolve_va_arg_type(type_spec),
+            // ConvertVector lowers to the result ALLOCA pointer (vector
+            // expression convention).
+            Expr::ConvertVector(_, _, _) => IrType::Ptr,
             Expr::Identifier(name, _) => {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
                     return IrType::Ptr;
@@ -1340,6 +1369,20 @@ impl Lowerer {
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
                         return self.get_expr_ctype(self.resolve_builtin_choose_expr(args));
                     }
+                    // Raw GCC 256-bit vector builtins have no declared
+                    // signature; report the vector CType (v8sf pointer/sret
+                    // convention everywhere, so downstream paths that treat
+                    // the operand as a pointer to 32 bytes are correct).
+                    // The 128-bit by-value builtins are deliberately NOT
+                    // listed: reporting a vector CType for them made the
+                    // return path treat the packed I128 VALUE as a pointer
+                    // and reload garbage lanes.
+                    match name.as_str() {
+                        "__builtin_ia32_maxps256" | "__builtin_ia32_minps256"
+                        | "__builtin_ia32_andps256" | "__builtin_ia32_cmpps256" =>
+                            return Some(CType::Vector(Box::new(CType::Float), 32)),
+                        _ => {}
+                    }
                     if Self::is_polymorphic_atomic_builtin(name) {
                         if let Some(first_arg) = args.first() {
                             if let Some(CType::Pointer(inner, _)) = self.get_expr_ctype(first_arg) {
@@ -1380,7 +1423,8 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::VaArg(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _) => {
+            Expr::VaArg(_, type_spec, _) | Expr::ConvertVector(_, type_spec, _)
+            | Expr::CompoundLiteral(type_spec, _, _) => {
                 Some(self.type_spec_to_ctype(type_spec))
             }
             Expr::GenericSelection(controlling, associations, _) => {

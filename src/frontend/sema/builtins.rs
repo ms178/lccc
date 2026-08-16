@@ -564,6 +564,15 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     // `float __attribute__((vector_size(16)))` directly).
     m.insert("__builtin_ia32_maxps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaxPs128));
     m.insert("__builtin_ia32_minps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MinPs128));
+    // Raw GCC builtins used by the NAP governor's SSE2/AVX2 NN kernels.
+    m.insert("__builtin_ia32_shufps", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86ShufPsValue));
+    m.insert("__builtin_shufflevector", BuiltinInfo::intrinsic(BuiltinIntrinsic::ShuffleVector));
+    m.insert("__builtin_ia32_maxps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaxPs256V));
+    m.insert("__builtin_ia32_minps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MinPs256V));
+    m.insert("__builtin_ia32_andps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndPs256V));
+    m.insert("__builtin_ia32_cmpps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86CmpPs256V));
+    m.insert("__builtin_ia32_vextractf128_ps256", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vextractf128V));
+    m.insert("__builtin_ia32_vzeroupper", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Vzeroupper));
     m.insert("__builtin_ia32_paddb128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Paddb128));
     m.insert("__builtin_ia32_psubb128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubb128));
     m.insert("__builtin_ia32_psubusw128", BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psubusw128));
@@ -1094,6 +1103,13 @@ pub enum BuiltinIntrinsic {
     X86Pminub128,      // _mm_min_epu8 (PMINUB)
     X86MaxPs128,       // __builtin_ia32_maxps (MAXPS) — GCC vector-extension builtin
     X86MinPs128,       // __builtin_ia32_minps (MINPS)
+    X86ShufPsValue,    // __builtin_ia32_shufps (SHUFPS imm8) — by-value raw builtin
+    ShuffleVector,     // __builtin_shufflevector (4-lane 32-bit shuffles)
+    X86MaxPs256V,      // __builtin_ia32_maxps256 (VMAXPS ymm)
+    X86MinPs256V,      // __builtin_ia32_minps256 (VMINPS ymm)
+    X86AndPs256V,      // __builtin_ia32_andps256 (VANDPS ymm, bitwise)
+    X86CmpPs256V,      // __builtin_ia32_cmpps256 (VCMPPS ymm, imm8)
+    X86Vextractf128V,  // __builtin_ia32_vextractf128_ps256 (VEXTRACTF128)
     X86Pblendvb128,    // _mm_blendv_epi8 (PBLENDVB, SSE4.1)
     X86Pblendw128,     // _mm_blend_epi16 (PBLENDW, SSE4.1)
     X86Pmovzxbw128,    // _mm_cvtepu8_epi16 (PMOVZXBW, SSE4.1)

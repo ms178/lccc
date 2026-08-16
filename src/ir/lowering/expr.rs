@@ -286,6 +286,7 @@ impl Lowerer {
             }
             Expr::StmtExpr(compound, _) => self.lower_stmt_expr(compound),
             Expr::VaArg(ap_expr, type_spec, _) => self.lower_va_arg(ap_expr, type_spec),
+            Expr::ConvertVector(src_expr, type_spec, _) => self.lower_convertvector(src_expr, type_spec),
             Expr::GenericSelection(controlling, associations, _) => {
                 self.lower_generic_selection(controlling, associations)
             }

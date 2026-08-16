@@ -308,7 +308,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // VaArg and CompoundLiteral: type from type specifier
-            Expr::VaArg(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _) => {
+            Expr::VaArg(_, type_spec, _) | Expr::ConvertVector(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _) => {
                 Some(self.resolve_type_spec(type_spec))
             }
 

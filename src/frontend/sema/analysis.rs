@@ -1487,6 +1487,9 @@ impl SemanticAnalyzer {
             Expr::VaArg(ap_expr, _, _) => {
                 self.analyze_expr(ap_expr);
             }
+            Expr::ConvertVector(src_expr, _, _) => {
+                self.analyze_expr(src_expr);
+            }
             Expr::GenericSelection(controlling, associations, _) => {
                 self.analyze_expr(controlling);
                 for assoc in associations {

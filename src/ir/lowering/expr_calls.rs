@@ -491,7 +491,33 @@ impl Lowerer {
         let mut complex_converted_to_scalar: Vec<bool> = vec![false; args.len()];
         let arg_vals: Vec<Operand> = args.iter().enumerate().map(|(i, a)| {
             let mut val = self.lower_expr(a);
-            let arg_ty = self.get_expr_type(a);
+            let mut arg_ty = self.get_expr_type(a);
+
+            // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,
+            // __builtin_shufflevector, ...) yields its vector BY VALUE as a
+            // packed I128; the struct/vector argument-passing path below
+            // expects a POINTER to the 16 data bytes (like any vector lvalue
+            // argument). Spill to a slot and continue as a pointer arg —
+            // without the type override, the param-cast path saw I128 and
+            // emitted __floattisf on the POINTER (r4.c repro segfault).
+            if arg_ty == IrType::I128 {
+                if let Expr::FunctionCall(callee, _, _) = a {
+                    if let Expr::Identifier(bn, _) = &**callee {
+                        if matches!(bn.as_str(),
+                            "__builtin_ia32_maxps" | "__builtin_ia32_minps"
+                            | "__builtin_ia32_shufps" | "__builtin_shufflevector"
+                            | "__builtin_ia32_vextractf128_ps256")
+                        {
+                            let slot = self.fresh_value();
+                            self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+                            let v = self.operand_to_value(val);
+                            self.emit(Instruction::Store { val: Operand::Value(v), ptr: slot, ty: IrType::I128, seg_override: crate::common::types::AddressSpace::Default });
+                            val = Operand::Value(slot);
+                            arg_ty = IrType::Ptr;
+                        }
+                    }
+                }
+            }
 
             // Convert complex arguments to the declared parameter complex type if they differ
             if let Some(ref pctypes) = param_ctypes {

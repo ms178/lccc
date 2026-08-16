@@ -344,6 +344,11 @@ impl Lowerer {
     /// For struct globals, we emit GlobalAddr.
     pub(super) fn get_struct_base_addr(&mut self, expr: &Expr) -> Value {
         match expr {
+            Expr::ConvertVector(_, _, _) => {
+                // Lowering returns the 16-byte result alloca pointer.
+                let op = self.lower_expr(expr);
+                return self.operand_to_value(op);
+            }
             Expr::Identifier(name, _) => {
                 // Static local variables: resolve via mangled global name
                 if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
