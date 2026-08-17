@@ -29,9 +29,9 @@ impl I686Codegen {
     /// recognised here keeps the GOT. Getting this wrong in the permissive
     /// direction produces a wild %ebx dereference, so the failure mode must be
     /// "one wasted register", never "wrong address".
-    fn function_needs_got(func: &IrFunction, pic: bool) -> bool {
+    fn function_needs_got(&self, func: &IrFunction) -> bool {
         use crate::ir::reexports::{Instruction, Terminator};
-        if !pic {
+        if !self.state.pic_mode {
             return false;
         }
         for block in &func.blocks {
@@ -49,6 +49,36 @@ impl I686Codegen {
                     Instruction::GlobalAddr { .. }
                     | Instruction::LabelAddr { .. }
                     | Instruction::InlineAsm { .. } => return true,
+                    // A `call sym@PLT` is the i386 PSABI's OTHER consumer of
+                    // %ebx: the lazy-binding PLT stub is
+                    //     jmp *name@GOT(%ebx); push $reloc; jmp .plt0
+                    // and .plt0 itself does `push 4(%ebx); jmp *8(%ebx)`.
+                    // Without the GOT base at the call site the very first
+                    // call through the stub jumps through garbage. This is
+                    // why GCC sets up the thunk even in functions whose only
+                    // PIC-relevant construct is an external call (verified:
+                    // gcc -m32 -fPIC on `return helper(x)+1;` emits
+                    // get_pc_thunk.bx + call helper@PLT).
+                    Instruction::Call { func: callee, .. }
+                        if self.state.needs_plt(callee) =>
+                    {
+                        return true;
+                    }
+                    // 64-bit div/mod lowers to __{u}divdi3/__{u}moddi3 calls
+                    // behind the backend's back (emit_i128_divmod). Those are
+                    // PLT calls under the same rule when the weak stubs end
+                    // up resolved externally, so keep the GOT alive for them.
+                    Instruction::BinOp { op, ty, .. }
+                        if matches!(
+                            op,
+                            crate::ir::reexports::IrBinOp::SDiv
+                                | crate::ir::reexports::IrBinOp::UDiv
+                                | crate::ir::reexports::IrBinOp::SRem
+                                | crate::ir::reexports::IrBinOp::URem
+                        ) && matches!(ty, IrType::I64 | IrType::U64) =>
+                    {
+                        return true;
+                    }
                     _ => {}
                 }
             }
@@ -107,7 +137,7 @@ impl I686Codegen {
         // kernel setup binary that is pure waste, because the overwhelming
         // majority of those functions never form a global address at all.
         // GCC makes the same call: it materializes the GOT base lazily.
-        let needs_got = Self::function_needs_got(func, self.state.pic_mode);
+        let needs_got = self.function_needs_got(func);
         self.pic_got_live = needs_got;
         if needs_got && !asm_clobbered_regs.contains(&PhysReg(0)) {
             asm_clobbered_regs.push(PhysReg(0));
