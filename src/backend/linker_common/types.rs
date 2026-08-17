@@ -3,6 +3,7 @@
 //! These types are used by x86, ARM, and RISC-V linkers. The i686 linker uses
 //! its own ELF32 types since field widths differ (u32 vs u64).
 
+use super::symstr::SymStr;
 use crate::backend::elf::SHN_UNDEF;
 use crate::backend::elf::{STB_GLOBAL, STB_LOCAL, STB_WEAK};
 
@@ -28,7 +29,7 @@ pub struct Elf64Section {
 #[allow(dead_code)] // All fields populated during parsing; not every backend reads every field
 pub struct Elf64Symbol {
     pub name_idx: u32,
-    pub name: String,
+    pub name: SymStr,
     pub info: u8,
     pub other: u8,
     pub shndx: u16,

@@ -9,6 +9,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf::*;
 use super::types::{GlobalSymbol, PAGE_SIZE};
 use super::emit_exec::resolve_sym;
+use crate::backend::linker_common::VersionScript;
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
 
@@ -20,103 +21,6 @@ fn sym_base(name: &str) -> String {
     } else {
         name.to_string()
     }
-}
-
-#[derive(Debug, Clone)]
-struct VersionScript {
-    version_name: String,
-    global_patterns: Vec<String>,
-    local_star: bool,
-}
-
-impl VersionScript {
-    fn parse(path: &str) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        let text = strip_version_script_comments(&text);
-        let open = text.find('{')?;
-        let version_name = text[..open].split_whitespace().next()?.trim().to_string();
-        if version_name.is_empty() { return None; }
-
-        let close = text[open + 1..].find('}')? + open + 1;
-        let body = &text[open + 1..close];
-        let mut global_patterns = Vec::new();
-        let mut local_star = false;
-        let mut mode: Option<&str> = None;
-
-        for segment in body.split(';') {
-            let mut t = segment.trim();
-            if t.is_empty() { continue; }
-
-            if let Some(pos) = t.find("global:") {
-                mode = Some("global");
-                t = t[pos + "global:".len()..].trim();
-            }
-            if let Some(pos) = t.find("local:") {
-                mode = Some("local");
-                t = t[pos + "local:".len()..].trim();
-            }
-            if t.is_empty() { continue; }
-
-            // Version scripts normally list one pattern per semicolon, but allow
-            // whitespace-separated patterns as a robustness improvement.
-            for pat in t.split_whitespace() {
-                let pat = pat.trim().trim_matches(';').trim();
-                if pat.is_empty() { continue; }
-                match mode {
-                    Some("global") => global_patterns.push(pat.to_string()),
-                    Some("local") if pat == "*" => local_star = true,
-                    _ => {}
-                }
-            }
-        }
-
-        Some(Self { version_name, global_patterns, local_star })
-    }
-
-    fn matches_global(&self, name: &str) -> bool {
-        self.global_patterns.iter().any(|pat| wildcard_match(pat, name))
-    }
-}
-
-fn strip_version_script_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(bytes.len());
-        } else if bytes[i] == b'#' {
-            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn wildcard_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" { return true; }
-    if !pattern.contains('*') { return pattern == text; }
-    let mut rest = text;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() { continue; }
-        if first && !pattern.starts_with('*') {
-            if !rest.starts_with(part) { return false; }
-            rest = &rest[part.len()..];
-        } else if let Some(pos) = rest.find(part) {
-            rest = &rest[pos + part.len()..];
-        } else {
-            return false;
-        }
-        first = false;
-    }
-    pattern.ends_with('*') || rest.is_empty()
 }
 
 fn push_verdef_entry(buf: &mut Vec<u8>, index: u16, name: &str, name_off: usize, next: u32) {
@@ -158,8 +62,24 @@ pub(super) fn emit_shared_library(
     needed_sonames: &[String], output_path: &str,
     soname: Option<String>, rpath_entries: &[String], use_runpath: bool,
     version_script_path: Option<&str>, bsymbolic: bool,
+    // `--exclude-libs`: archives whose symbols must not be re-exported.
+    exclude_libs: &[String],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
+
+    // Congruent segment packing — see the extended rationale in
+    // emit_exec.rs. File offsets stay dense; virtual addresses advance one
+    // page per PT_LOAD. The gABI only requires
+    // `p_offset === p_vaddr (mod p_align)`, which holds by construction
+    // because `vaddr_bias` is always a multiple of PAGE_SIZE. Rounding the
+    // *file offset* up at each segment boundary (what this function used to
+    // do) wastes up to a page per segment: measured 19 568 B for a trivial
+    // .so versus 7 792 B from mold and 5 974 B from wild.
+    // Shared with emit_exec.rs via layout_plan::SegmentPacker so the invariant
+    // is stated and tested exactly once (see that type's documentation).
+    let mut packer = super::layout_plan::SegmentPacker::new(base_addr, PAGE_SIZE);
+    macro_rules! vaddr { ($off:expr) => { packer.vaddr($off) } }
+    macro_rules! new_segment { () => { packer.new_segment(); } }
 
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames { dynstr.add(lib); }
@@ -170,6 +90,38 @@ pub(super) fn emit_shared_library(
         Some(s)
     };
     let version_script = version_script_path.and_then(VersionScript::parse);
+
+    // `--exclude-libs`: a symbol that came from one of the named archives is
+    // linked in but must not appear in .dynsym.
+    //
+    // This predicate is used in TWO places and both are load-bearing:
+    //   1. the export filter, which is the visible effect, and
+    //   2. the PLT scan below.
+    // Missing (2) produces a subtly broken library rather than an error: the
+    // symbol keeps its PLT slot and JUMP_SLOT relocation, but the dynsym entry
+    // it referred to is gone, so the relocation ends up pointing at symbol
+    // index 0 and the loader aborts with
+    // `symbol lookup error: ...: undefined symbol: ` (empty name).
+    // An excluded symbol is by definition not interposable, so suppressing the
+    // PLT is also the semantically correct thing to do — the call binds
+    // directly, exactly as for a hidden or version-script-local symbol.
+    // Precomputed as a set rather than a closure over `globals`: the export
+    // filter and the PLT scan run at points where `globals` is mutably
+    // borrowed, and a set lookup is O(1) instead of re-walking objects per
+    // query. Objects are classified once (there are far fewer objects than
+    // symbols).
+    let excluded_syms: FxHashSet<String> = if exclude_libs.is_empty() {
+        FxHashSet::default()
+    } else {
+        let excluded_objs: Vec<bool> = objects.iter()
+            .map(|o| linker_common::exclude_libs_matches(exclude_libs, &o.source_name))
+            .collect();
+        globals.iter()
+            .filter(|(_, g)| g.defined_in
+                .is_some_and(|oi| excluded_objs.get(oi).copied().unwrap_or(false)))
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
 
     // Identify symbols that need PLT entries: any symbol referenced via
     // R_X86_64_PLT32 or R_X86_64_PC32 that is not defined locally.
@@ -188,7 +140,7 @@ pub(super) fn emit_shared_library(
                 if sym.is_local() { continue; }
                 match rela.rela_type {
                     R_X86_64_PLT32 | R_X86_64_PC32 => {
-                        if let Some(gsym) = globals.get(&sym.name) {
+                        if let Some(gsym) = globals.get(sym.name.as_str()) {
                             let locally_defined = gsym.defined_in.is_some() && !gsym.is_dynamic;
                             // External references always need a stub.
                             let external = gsym.is_dynamic
@@ -200,14 +152,15 @@ pub(super) fn emit_shared_library(
                             // exported), version-script-locals, or -Bsymbolic.
                             let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
                             let version_local = version_script.as_ref().is_some_and(|vs|
-                                vs.local_star && !vs.matches_global(&sym.name));
+                                vs.local_star && !vs.matches_global(&sym.name))
+                                || excluded_syms.contains(sym.name.as_str());
                             let is_func = (gsym.info & 0xf) == STT_FUNC
                                 || sym.sym_type() == STT_FUNC
                                 || rela.rela_type == R_X86_64_PLT32;
                             let interposable = locally_defined && is_func
                                 && !hidden && !version_local && !bsymbolic;
-                            if (external || interposable) && plt_seen.insert(sym.name.clone()) {
-                                plt_names.push(sym.name.clone());
+                            if (external || interposable) && plt_seen.insert(sym.name.to_string()) {
+                                plt_names.push(sym.name.to_string());
                             }
                         }
                         // Don't create PLT for symbols not in globals - they are
@@ -265,24 +218,24 @@ pub(super) fn emit_shared_library(
                 if sym.is_local() {
                     // ...but a local symbol referenced via TLSGD still needs a
                     // GOT pair; use the symbol's mangled per-object identity.
-                    if rela.rela_type == R_X86_64_TLSGD && tlsgd_seen.insert(sym.name.clone()) {
-                        tlsgd_names.push(sym.name.clone());
+                    if rela.rela_type == R_X86_64_TLSGD && tlsgd_seen.insert(sym.name.to_string()) {
+                        tlsgd_names.push(sym.name.to_string());
                     }
                     continue;
                 }
                 match rela.rela_type {
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX | R_X86_64_GOTTPOFF => {
-                        if got_needed_seen.insert(sym.name.clone()) {
-                            got_needed_names.push(sym.name.clone());
+                        if got_needed_seen.insert(sym.name.to_string()) {
+                            got_needed_names.push(sym.name.to_string());
                         }
                         // Track TLS symbols for proper dynamic relocation emission
                         if sym.sym_type() == STT_TLS {
-                            tls_got_names.insert(sym.name.clone());
+                            tls_got_names.insert(sym.name.to_string());
                         }
                     }
                     R_X86_64_TLSGD => {
-                        if tlsgd_seen.insert(sym.name.clone()) {
-                            tlsgd_names.push(sym.name.clone());
+                        if tlsgd_seen.insert(sym.name.to_string()) {
+                            tlsgd_names.push(sym.name.to_string());
                         }
                     }
                     _ => {}
@@ -317,7 +270,7 @@ pub(super) fn emit_shared_library(
                     if si >= obj.symbols.len() { continue; }
                     let sym = &obj.symbols[si];
                     if !sym.name.is_empty() && !sym.is_local() && sym.sym_type() != STT_SECTION {
-                        abs64_sym_names.insert(sym.name.clone());
+                        abs64_sym_names.insert(sym.name.to_string());
                     }
                 }
             }
@@ -342,6 +295,16 @@ pub(super) fn emit_shared_library(
                 if vs.local_star && !vs.matches_global(name) {
                     return false;
                 }
+            }
+            // --exclude-libs: symbols pulled in from the named static
+            // archives are linked in but NOT re-exported. This is how a
+            // shared library statically absorbs a helper archive (OpenSSL's
+            // libcrypto.a inside a plugin .so is the canonical case) without
+            // leaking that archive's entire symbol table into its ABI, where
+            // it would collide with a different version loaded elsewhere in
+            // the process.
+            if excluded_syms.contains(name.as_str()) {
+                return false;
             }
             true
         })
@@ -619,24 +582,24 @@ pub(super) fn emit_shared_library(
     let mut offset = 64 + phdr_total_size;
 
     offset = (offset + 7) & !7;
-    let gnu_hash_offset = offset; let gnu_hash_addr = base_addr + offset; offset += gnu_hash_size;
+    let gnu_hash_offset = offset; let gnu_hash_addr = vaddr!(offset); offset += gnu_hash_size;
     offset = (offset + 7) & !7;
-    let dynsym_offset = offset; let dynsym_addr = base_addr + offset; offset += dynsym_size;
-    let dynstr_offset = offset; let dynstr_addr = base_addr + offset; offset += dynstr_size;
+    let dynsym_offset = offset; let dynsym_addr = vaddr!(offset); offset += dynsym_size;
+    let dynstr_offset = offset; let dynstr_addr = vaddr!(offset); offset += dynstr_size;
     offset = (offset + 1) & !1;
-    let versym_offset = offset; let versym_addr = base_addr + offset; offset += versym_size;
+    let versym_offset = offset; let versym_addr = vaddr!(offset); offset += versym_size;
     offset = (offset + 7) & !7;
-    let verdef_offset = offset; let verdef_addr = base_addr + offset; offset += verdef_size;
+    let verdef_offset = offset; let verdef_addr = vaddr!(offset); offset += verdef_size;
 
     // Text segment
-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    new_segment!();
     let text_page_offset = offset;
-    let text_page_addr = base_addr + offset;
+    let text_page_addr = vaddr!(offset);
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset;
+            sec.addr = vaddr!(offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -644,19 +607,19 @@ pub(super) fn emit_shared_library(
     // PLT goes at the end of the text segment
     let (plt_addr, plt_offset) = if plt_size > 0 {
         offset = (offset + 15) & !15;
-        let a = base_addr + offset; let o = offset; offset += plt_size; (a, o)
+        let a = vaddr!(offset); let o = offset; offset += plt_size; (a, o)
     } else { (0u64, 0u64) };
     let text_total_size = offset - text_page_offset;
 
     // Rodata segment - only pure rodata (no absolute relocations)
-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    new_segment!();
     let rodata_page_offset = offset;
-    let rodata_page_addr = base_addr + offset;
+    let rodata_page_addr = vaddr!(offset);
     for (idx, sec) in output_sections.iter_mut().enumerate() {
         if is_pure_rodata(idx, sec) {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset;
+            sec.addr = vaddr!(offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -665,9 +628,9 @@ pub(super) fn emit_shared_library(
 
     // RW segment - includes RELRO sections (rodata with abs relocs), then linker
     // data structures, then actual writable data
-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    new_segment!();
     let rw_page_offset = offset;
-    let rw_page_addr = base_addr + offset;
+    let rw_page_addr = vaddr!(offset);
 
     // First: RELRO sections (rodata that needs dynamic relocations)
     let _relro_start_offset = offset;
@@ -675,7 +638,7 @@ pub(super) fn emit_shared_library(
         if is_relro_rodata(idx, sec) {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset;
+            sec.addr = vaddr!(offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -688,7 +651,7 @@ pub(super) fn emit_shared_library(
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             init_array_addr = sec.addr; init_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
@@ -697,7 +660,7 @@ pub(super) fn emit_shared_library(
         if sec.name == ".fini_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
@@ -709,7 +672,7 @@ pub(super) fn emit_shared_library(
     // Reserve space for .rela.dyn (will be filled later)
     offset = (offset + 7) & !7;
     let rela_dyn_offset = offset;
-    let rela_dyn_addr = base_addr + offset;
+    let rela_dyn_addr = vaddr!(offset);
     // Each R_X86_64_64 reloc in input becomes one R_X86_64_RELATIVE entry.
     let mut max_rela_count: usize = 0;
     for obj in objects.iter() {
@@ -737,32 +700,35 @@ pub(super) fn emit_shared_library(
     // .rela.plt (JMPREL) for PLT GOT entries
     offset = (offset + 7) & !7;
     let rela_plt_offset = offset;
-    let rela_plt_addr = base_addr + offset;
+    let rela_plt_addr = vaddr!(offset);
     offset += rela_plt_size;
 
     offset = (offset + 7) & !7;
-    let dynamic_offset = offset; let dynamic_addr = base_addr + offset; offset += dynamic_size;
+    let dynamic_offset = offset; let dynamic_addr = vaddr!(offset); offset += dynamic_size;
 
     // End of RELRO region (page-aligned up for PT_GNU_RELRO).
     // Everything after this must be on a new page so that mprotect(PROT_READ)
     // on the RELRO region doesn't affect writable data (GOT.PLT, GOT, .data, .bss).
-    let relro_end_offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let relro_end_addr = base_addr + relro_end_offset;
+    // With densely packed file offsets the RELRO end must be aligned in
+    // ADDRESS space: ld.so mprotects page-rounded [vaddr, vaddr+memsz), so
+    // aligning the file offset would leave the boundary mid-page and
+    // write-protect the head of the following section.
+    let relro_end_addr = vaddr!(offset) + packer.padding_to_page(offset);
     if has_relro {
-        offset = relro_end_offset; // advance to page boundary
+        offset += packer.padding_to_page(offset); // advance to page boundary
     }
 
     // .got.plt entries - MUST be after RELRO boundary since dynamic linker
     // needs to write to them during lazy PLT resolution
     offset = (offset + 7) & !7;
     let got_plt_offset = offset;
-    let got_plt_addr = base_addr + offset;
+    let got_plt_addr = vaddr!(offset);
     offset += got_plt_size;
 
     // GOT for locally-resolved symbols, followed by TLS GD pairs and the
     // optional LD pair. Layout:
     //   [got_needed slots][GD pair 0][GD pair 1]...[LD pair]
-    let got_offset = offset; let got_addr = base_addr + offset;
+    let got_offset = offset; let got_addr = vaddr!(offset);
     let tlsgd_got_base = got_needed.len() as u64 * 8; // offset of first GD pair within .got
     let tlsld_got_off = tlsgd_got_base + tlsgd_names.len() as u64 * 16;
     let got_size = tlsld_got_off + if needs_tlsld_slot { 16 } else { 0 };
@@ -774,7 +740,7 @@ pub(super) fn emit_shared_library(
            sec.flags & SHF_TLS == 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
@@ -789,7 +755,7 @@ pub(super) fn emit_shared_library(
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = base_addr + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
@@ -797,7 +763,7 @@ pub(super) fn emit_shared_library(
         }
     }
     if tls_addr == 0 && has_tls_sections {
-        tls_addr = base_addr + offset;
+        tls_addr = vaddr!(offset);
         tls_file_offset = offset;
     }
     for sec in output_sections.iter_mut() {
@@ -812,7 +778,7 @@ pub(super) fn emit_shared_library(
     tls_mem_size = (tls_mem_size + tls_align - 1) & !(tls_align - 1);
     let has_tls = tls_addr != 0;
 
-    let bss_addr = base_addr + offset;
+    let bss_addr = vaddr!(offset);
     let mut bss_size = 0u64;
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
@@ -1193,7 +1159,7 @@ pub(super) fn emit_shared_library(
                         // Section symbols and local symbols use R_X86_64_RELATIVE.
                         let is_version_local = version_script.as_ref().is_some_and(|vs|
                             vs.local_star && !vs.matches_global(&sym.name));
-                        let locally_defined = globals_snap.get(&sym.name)
+                        let locally_defined = globals_snap.get(sym.name.as_str())
                             .map(|g| g.defined_in.is_some() && !g.is_dynamic)
                             .unwrap_or(false);
                         let is_named_global = !sym.name.is_empty()
@@ -1202,7 +1168,7 @@ pub(super) fn emit_shared_library(
                             && !is_version_local
                             && !(bsymbolic && locally_defined);
                         if is_named_global {
-                            abs64_entries.push((p, sym.name.clone(), a));
+                            abs64_entries.push((p, sym.name.to_string(), a));
                         } else if s != 0 {
                             rela_dyn_entries.push((p, val));
                         }
@@ -1210,7 +1176,7 @@ pub(super) fn emit_shared_library(
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
                         // For dynamic symbols, redirect through PLT
                         let t = if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(pi) = g.plt_idx {
                                     plt_addr + 16 + pi as u64 * 16
                                 } else { s }
@@ -1225,12 +1191,12 @@ pub(super) fn emit_shared_library(
                     R_X86_64_32 => { w32(&mut out, fp, (s as i64 + a) as u32); }
                     R_X86_64_32S => { w32(&mut out, fp, (s as i64 + a) as u32); }
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
-                        if let Some(&gea) = got_sym_addrs.get(&sym.name) {
+                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                         } else if (rela.rela_type == R_X86_64_GOTPCRELX || rela.rela_type == R_X86_64_REX_GOTPCRELX)
                                   && !sym.name.is_empty() {
                             // GOT relaxation: convert to LEA
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if g.defined_in.is_some() {
                                     if fp >= 2 && fp < out.len() && out[fp-2] == 0x8b {
                                         out[fp-2] = 0x8d;
@@ -1251,9 +1217,9 @@ pub(super) fn emit_shared_library(
                         // filled with the static TPOFF value above. For external TLS
                         // symbols, the dynamic linker fills the GOT slot at load time
                         // via R_X86_64_TPOFF64.
-                        if let Some(&gea) = got_sym_addrs.get(&sym.name) {
+                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             // Only fill the GOT entry statically for locally-defined symbols
-                            let is_local_tls = if let Some(g) = globals_snap.get(&sym.name) {
+                            let is_local_tls = if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 g.defined_in.is_some() && !g.is_dynamic && g.section_idx != SHN_UNDEF
                             } else { false };
                             if is_local_tls {
@@ -1288,7 +1254,7 @@ pub(super) fn emit_shared_library(
                     }
                     R_X86_64_TLSGD => {
                         // Point the lea at the (DTPMOD64, DTPOFF64) GOT pair.
-                        if let Some(&slot) = tlsgd_slot_addr.get(&sym.name) {
+                        if let Some(&slot) = tlsgd_slot_addr.get(sym.name.as_str()) {
                             w32(&mut out, fp, (slot as i64 + a - p as i64) as u32);
                         } else {
                             eprintln!("warning: TLSGD without GOT pair for '{}'", sym.name);

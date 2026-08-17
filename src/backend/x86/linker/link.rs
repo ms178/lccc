@@ -4,6 +4,7 @@
 //! orchestrate the linking pipeline: load inputs, resolve symbols, merge sections,
 //! build PLT/GOT, and dispatch to the appropriate ELF emission path.
 
+use crate::backend::linker_common::SymStr;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
@@ -67,7 +68,7 @@ pub fn link_builtin(
     for sym_name in &undefined_symbols {
         if !globals.contains_key(sym_name) {
             let fake = linker_common::Elf64Symbol {
-                name_idx: 0, name: sym_name.clone(),
+                name_idx: 0, name: SymStr::new(&sym_name),
                 info: 1 << 4, // STB_GLOBAL, STT_NOTYPE
                 other: 0, shndx: 0, value: 0, size: 0,
             };
@@ -171,11 +172,11 @@ pub fn link_builtin(
         for obj in objects.iter_mut() {
             for sym in obj.symbols.iter_mut() {
                 if sym.shndx == 0 && !sym.name.is_empty() {
-                    if wrap_symbols.contains(&sym.name) {
-                        sym.name = format!("__wrap_{}", sym.name);
+                    if wrap_symbols.iter().any(|w| w == sym.name.as_str()) {
+                        sym.name = SymStr::new(&format!("__wrap_{}", sym.name));
                     } else if let Some(real) = sym.name.strip_prefix("__real_") {
                         if wrap_symbols.iter().any(|w| w == real) {
-                            sym.name = real.to_string();
+                            sym.name = SymStr::new(&real.to_string());
                         }
                     }
                 }
@@ -215,7 +216,7 @@ pub fn link_builtin(
                     if (rela.sym_idx as usize) < obj.symbols.len() {
                         let sym = &obj.symbols[rela.sym_idx as usize];
                         if !sym.name.is_empty() {
-                            referenced_from_live.insert(sym.name.clone());
+                            referenced_from_live.insert(sym.name.to_string());
                         }
                     }
                 }
@@ -281,6 +282,8 @@ pub fn link_builtin(
         export_dynamic, &rpath_entries, use_runpath, is_static,
         &ifunc_symbols, entry_symbol.as_deref(),
         parsed_args.z_now, parsed_args.z_relro,
+        parsed_args.map_path.as_deref(),
+        parsed_args.version_script.as_deref(),
     );
     phase!("emit-exec");
     if ld_time { eprintln!("[ldtime] {:<24} {:>7.1} ms", "TOTAL", t_all.elapsed().as_secs_f64()*1e3); }
@@ -318,6 +321,15 @@ pub fn link_shared(
     let mut whole_archive = false;
     let mut no_undefined = false; // -z defs / --no-undefined
     let mut bsymbolic = false;    // -Bsymbolic / -Bsymbolic-functions
+    // --exclude-libs: archives whose symbols are linked in but not exported.
+    //
+    // NOTE (technical debt): this hand-written parser duplicates
+    // linker_common::parse_linker_args and therefore has to re-implement every
+    // flag, including this one. Replacing it with parse_linker_args is tracked
+    // in docs/linker/FOLLOWUP_2026-08-17_SESSION2.md §4.6; it is not done here
+    // because link_shared's parser also drives positional archive handling,
+    // which parse_linker_args does not model yet.
+    let mut exclude_libs: Vec<String> = Vec::new();
 
     // Ordered list of items to load: (path_or_lib, is_lib, whole_archive_state)
     // is_lib=true means resolve via -l; is_lib=false means bare file path
@@ -393,6 +405,15 @@ pub fn link_shared(
                     no_undefined = true;
                 } else if part == "-Bsymbolic" || part == "-Bsymbolic-functions" {
                     bsymbolic = true;
+                } else if let Some(v) = part.strip_prefix("--exclude-libs=") {
+                    exclude_libs.extend(
+                        v.split([',', ':']).filter(|s| !s.is_empty())
+                         .map(str::to_string));
+                } else if part == "--exclude-libs" && j + 1 < parts.len() {
+                    j += 1;
+                    exclude_libs.extend(
+                        parts[j].split([',', ':']).filter(|s| !s.is_empty())
+                                .map(str::to_string));
                 }
                 j += 1;
             }
@@ -504,5 +525,6 @@ pub fn link_shared(
         &objects, &mut globals, &mut output_sections, &section_map,
         &needed_sonames, output_path, soname, &rpath_entries, use_runpath,
         version_script.as_deref(), bsymbolic,
+        &exclude_libs,
     )
 }

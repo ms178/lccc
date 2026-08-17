@@ -20,13 +20,110 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
-        Ok(()) => {}
-        Err(e) => {
+
+    // Last line of defence against a panic on malformed input.
+    //
+    // A linker is routinely fed attacker-influenced or simply corrupt object
+    // files (truncated build artefacts, interrupted writes, bad archives).
+    // GNU ld, mold and wild all answer those with a diagnostic and exit code
+    // 1.  Without this guard a Rust panic escapes as exit code 101 plus a
+    // backtrace note, which build systems report as an internal toolchain
+    // failure and which hides the offending file from the user.
+    //
+    // The panic hook is replaced so the default "thread panicked at ..."
+    // spew is suppressed, and the payload is rendered in GNU style with the
+    // location that failed — enough to file a bug, not a stack dump.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::env::var_os("LCCC_LD_PANIC_TRACE").is_some() {
+            default_hook(info);
+        }
+    }));
+
+    let result = std::panic::catch_unwind(|| run(&args));
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
             eprintln!("lccc-ld: error: {}", e);
             std::process::exit(1);
         }
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            eprintln!("lccc-ld: internal error: {}", msg);
+            eprintln!(
+                "lccc-ld: this is a bug; re-run with LCCC_LD_PANIC_TRACE=1 \
+                 (and RUST_BACKTRACE=1) for details"
+            );
+            // Exit 1, like every other linker rejecting an input, so build
+            // systems surface the file rather than an internal-error code.
+            std::process::exit(1);
+        }
     }
+}
+
+/// Options that a GNU-compatible linker must accept and that provably do not
+/// change the image lccc emits.
+///
+/// These are not "unknown flags we hope are harmless": each one is either
+/// (a) a driver artefact gcc emits on every link, or (b) a diagnostic/
+/// bookkeeping switch with no effect on layout, symbols or relocations.
+/// Warning about them made `gcc -fuse-ld=lccc` print a dozen lines of noise
+/// per invocation, which trains users to ignore lccc's output — the opposite
+/// of what a diagnostic is for.
+///
+/// Anything genuinely unsupported still warns, and anything that could change
+/// semantics (`-plugin`) is handled explicitly rather than listed here.
+/// True when `path` holds GCC or LLVM LTO bytecode rather than a real object.
+///
+/// * GCC slim-LTO objects are ELF files whose sections are `.gnu.lto_*`; the
+///   ELF header parses fine, which is exactly why this needs an explicit
+///   check rather than relying on the parser to fail.
+/// * Clang emits raw LLVM bitcode (`BC\xc0\xde`), optionally wrapped.
+///
+/// Cheap: reads at most the first 4 KiB and never allocates on the hot path.
+fn is_lto_bytecode(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut head = [0u8; 4096];
+    let Ok(n) = f.read(&mut head) else { return false };
+    let head = &head[..n];
+    if head.len() >= 4 {
+        // LLVM bitcode magic, and the bitcode-wrapper magic.
+        if &head[..4] == b"BC\xc0\xde" || &head[..4] == b"\xde\xc0\x17\x0b" {
+            return true;
+        }
+    }
+    // GCC slim LTO: an ELF whose section names begin with .gnu.lto_
+    head.windows(9).any(|w| w == b".gnu.lto_")
+}
+
+fn is_benign_ignorable(a: &str) -> bool {
+    // gcc's driver state stack around --as-needed groups.
+    if a == "--push-state" || a == "--pop-state" {
+        return true;
+    }
+    // Diagnostic / bookkeeping switches with no layout effect.
+    matches!(a,
+        "--eh-frame-hdr"          // we always emit .eh_frame_hdr
+        | "--no-add-needed"
+        | "--no-copy-dt-needed-entries"
+        | "--warn-common"
+        | "--no-warn-mismatch"
+        | "--no-warn-search-mismatch"
+        | "--no-warn-execstack"
+        | "--warn-execstack"
+        | "--fatal-warnings"
+        | "--no-fatal-warnings"
+        | "--disable-linker-version"
+        | "--no-relax"
+        | "-O0" | "-O1" | "-O2" | "-O3"   // ld's own -O is a size/speed hint
+    ) || a.starts_with("--build-id=")
+      || a.starts_with("-plugin-opt=")
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -36,6 +133,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut whole_archive = false;
     let mut emit_symtab = true;
     let mut relocatable = false;
+    let mut emit_relocs = false;
     let mut is_pie = false;
     let mut build_id = false;
     let mut entry_override: Option<String> = None;
@@ -43,6 +141,8 @@ fn run(args: &[String]) -> Result<(), String> {
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
+    // Set when gcc handed us the LTO plugin; see the -plugin arm below.
+    let mut saw_lto_plugin = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -55,6 +155,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 script_path = Some(args.get(i).cloned().ok_or("-T needs an argument")?);
             }
             "-r" | "--relocatable" | "-i" => relocatable = true,
+            // --emit-relocs: keep the applied relocations in the output.
+            // The kernel's arch/x86/tools/relocs pass consumes them to build
+            // the KASLR relocation table; ignoring the flag produced a kernel
+            // that linked cleanly and then failed to boot.
+            "--emit-relocs" | "-q" => emit_relocs = true,
             "-pie" | "--pic-executable" => is_pie = true,
             "-no-pie" => is_pie = false,
             "-shared" | "-Bshareable" => shared = true,
@@ -83,7 +188,14 @@ fn run(args: &[String]) -> Result<(), String> {
                     passthrough.push(format!("--entry={}", e));
                 }
             }
-            "-Map" => { i += 1; }
+            "-Map" => {
+                // Two-argument form: `-Map FILE`. Re-spell as the joined form
+                // so the shared parser handles both identically.
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    passthrough.push(format!("-Map={}", v));
+                }
+            }
             "--dynamic-linker" | "-dynamic-linker" | "-I" => {
                 // The builtin emitter hardwires the standard glibc interp
                 // path; accept and verify rather than silently diverging.
@@ -110,7 +222,16 @@ fn run(args: &[String]) -> Result<(), String> {
             "-Bdynamic" | "-dy" | "-call_shared" => {}
             "--gc-sections" => passthrough.push("-Wl,--gc-sections".to_string()),
             "--no-gc-sections" => {}
-            "--export-dynamic" | "-E" => passthrough.push("-rdynamic".to_string()),
+            // GNU ld accepts BOTH spellings and gcc's driver emits the
+            // single-dash one (`gcc -rdynamic` -> `collect2 ... -export-dynamic`).
+            // Matching only the double-dash form silently dropped the flag, so
+            // `gcc -rdynamic` produced an executable exporting nothing: dlopen'd
+            // plugins could not resolve back into the host, and backtrace_symbols
+            // lost every name. lccc-ld invoked directly worked, which is what
+            // made the bug survive — the test used the direct form.
+            "--export-dynamic" | "-export-dynamic" | "-E"
+                => passthrough.push("-rdynamic".to_string()),
+            "--no-export-dynamic" | "-no-export-dynamic" => {}
             "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
             | "--fix-cortex-a53-843419" | "--no-copy-dt-needed-entries"
             | "--allow-shlib-undefined" | "-X" | "-x" => {}
@@ -122,8 +243,10 @@ fn run(args: &[String]) -> Result<(), String> {
                 } else if let Some(v) = a.strip_prefix("--entry=") {
                     entry_override = Some(v.to_string());
                     passthrough.push(a.to_string());
-                } else if let Some(v) = a.strip_prefix("-Map=") {
-                    let _ = v;
+                } else if a.starts_with("-Map=") {
+                    // Forwarded verbatim; parse_linker_args understands it and
+                    // emit_exec writes the map after address assignment.
+                    passthrough.push(a.to_string());
                 } else if a.starts_with("--dynamic-linker=") {
                     // handled above for the two-arg form; same policy here
                 } else if a.starts_with("-L") {
@@ -178,6 +301,18 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                 } else if a.starts_with("--build-id") {
                     build_id = !a.ends_with("=none");
+                } else if a.starts_with("--exclude-libs") {
+                    // Forward to the shared pipeline, normalising the
+                    // two-argument form to the joined one.
+                    let val = if let Some((_, v)) = a.split_once('=') {
+                        v.to_string()
+                    } else {
+                        i += 1;
+                        args.get(i).cloned().unwrap_or_default()
+                    };
+                    if !val.is_empty() {
+                        passthrough.push(format!("-Wl,--exclude-libs={}", val));
+                    }
                 } else if a.starts_with("--version-script") {
                     let val = if let Some(eq) = a.split_once('=') {
                         eq.1.to_string()
@@ -193,8 +328,29 @@ fn run(args: &[String]) -> Result<(), String> {
                     || a.starts_with("--hash-style")
                     || a.starts_with("--sort-section")
                     || a.starts_with("--print-")
-                    || a.starts_with("--emit-relocs") {
+                    {
                     // accepted, not needed for correctness of the static image
+                } else if is_benign_ignorable(a) {
+                    // Options every GNU-compatible linker accepts and that do
+                    // not change the image we produce. bfd and mold accept
+                    // these silently; warning about them buried real
+                    // diagnostics under a dozen lines of noise on every single
+                    // `gcc -fuse-ld=lccc` invocation, because gcc's driver
+                    // always passes --push-state/--pop-state and the LTO
+                    // plugin triplet.
+                } else if a == "-plugin" || a.starts_with("-plugin-opt") {
+                    // The LTO plugin is deliberately NOT silently ignored.
+                    //
+                    // gcc passes `-plugin liblto_plugin.so` unconditionally,
+                    // but it only *matters* when an input is LTO bytecode
+                    // rather than a real object. Ignoring it is correct for
+                    // ordinary objects and silently wrong for `-flto` builds
+                    // (the link would fail later with confusing "undefined
+                    // symbol" errors, or quietly drop code). So: accept it,
+                    // remember it, and let the object loader complain
+                    // precisely if it ever meets an IR member.
+                    if a == "-plugin" { i += 1; } // skip the plugin path
+                    saw_lto_plugin = true;
                 } else if a.starts_with('-') {
                     // Unknown flag: warn (parity with ld's permissiveness would
                     // be an error, but warn keeps us usable during bring-up).
@@ -223,6 +379,24 @@ fn run(args: &[String]) -> Result<(), String> {
         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
     }
 
+    // GCC/Clang hand every link the LTO plugin. That is harmless for ordinary
+    // objects, but if an input is actually LTO bytecode we cannot link it: the
+    // plugin is what turns IR back into machine code, and lccc does not load
+    // plugins. Detect it here and say so precisely, instead of letting the ELF
+    // parser reject the file with a generic "not an ELF object" or — worse —
+    // letting a `.o` that happens to parse produce a binary with missing code.
+    if saw_lto_plugin {
+        if let Some(bad) = inputs.iter().find_map(|(p, _)| {
+            is_lto_bytecode(p).then(|| p.clone())
+        }) {
+            return Err(format!(
+                "'{}' is LTO bytecode, which requires a linker plugin that \
+                 lccc-ld does not implement; rebuild that input without -flto \
+                 (or link it with the compiler driver)",
+                bad));
+        }
+    }
+
     // ------------------------------------------------------------------
     // Mode 2: script-driven link (kernel-style -T).
     // ------------------------------------------------------------------
@@ -239,7 +413,7 @@ fn run(args: &[String]) -> Result<(), String> {
             script_src = format!("ENTRY({})\n{}", e, script_src);
         }
         return lccc::linker_entry::link_with_script_x86(
-            &objects, &script_src, &output, emit_symtab, is_pie);
+            &objects, &script_src, &output, emit_symtab, is_pie, emit_relocs);
     }
 
     // ------------------------------------------------------------------

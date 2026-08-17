@@ -206,7 +206,7 @@ pub fn resolve_symbol_value(
         }
         0
     } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-        global_syms.get(&sym.name).map(|gs| gs.value).unwrap_or(0)
+        global_syms.get(sym.name.as_str()).map(|gs| gs.value).unwrap_or(0)
     } else {
         local_sym_vaddrs.get(obj_idx)
             .and_then(|v| v.get(sym_idx))
@@ -229,7 +229,7 @@ pub fn got_sym_key(obj_idx: usize, sym: &Symbol, addend: i64) -> (String, bool) 
     } else if sym.binding() == STB_LOCAL {
         (format!("__local_{}_{}_{}", obj_idx, sym.name, addend), true)
     } else {
-        (sym.name.clone(), false)
+        (sym.name.to_string(), false)
     }
 }
 
@@ -339,7 +339,7 @@ fn find_hi20_value_core(
                 // Shared lib path: check got_symbols first, then global_syms.
                 let got_entry_vaddr = if let Some(gpv) = got_plt_vaddr {
                     // Executable path
-                    if let Some(gs) = global_syms.get(&sym.name) {
+                    if let Some(gs) = global_syms.get(sym.name.as_str()) {
                         if let Some(got_off) = gs.got_offset {
                             got_vaddr + got_off
                         } else {
@@ -353,7 +353,7 @@ fn find_hi20_value_core(
                     // Shared lib path: got_symbols first, then global_syms
                     if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
                         got_vaddr + idx as u64 * 8
-                    } else if let Some(gs) = global_syms.get(&sym.name) {
+                    } else if let Some(gs) = global_syms.get(sym.name.as_str()) {
                         if let Some(got_off) = gs.got_offset {
                             got_vaddr + got_off
                         } else { 0 }
@@ -600,19 +600,19 @@ pub fn resolve_archive_members(
                 sym.shndx != SHN_UNDEF
                     && sym.binding() != STB_LOCAL
                     && !sym.name.is_empty()
-                    && undefined_syms.contains(&sym.name)
+                    && undefined_syms.contains(sym.name.as_str())
             });
             if needed {
                 for sym in &obj.symbols {
                     if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-                        defined_syms.insert(sym.name.clone());
-                        undefined_syms.remove(&sym.name);
+                        defined_syms.insert(sym.name.to_string());
+                        undefined_syms.remove(sym.name.as_str());
                     }
                 }
                 for sym in &obj.symbols {
                     if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-                        && !defined_syms.contains(&sym.name) {
-                            undefined_syms.insert(sym.name.clone());
+                        && !defined_syms.contains(sym.name.as_str()) {
+                            undefined_syms.insert(sym.name.to_string());
                         }
                 }
                 input_objs.push((name, obj));

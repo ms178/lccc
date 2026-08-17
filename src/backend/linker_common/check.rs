@@ -78,7 +78,7 @@ pub fn check_undefined_symbols_elf64_verbose<G: GlobalSymbolOps>(
                             && !s.name.is_empty())
                         .max_by_key(|s| s.value)
                         .map(|s| s.name.clone());
-                    site = Some((obj.source_name.clone(), func));
+                    site = Some((obj.source_name.clone(), func.map(|s| s.to_string())));
                     break 'scan;
                 }
             }

@@ -19,6 +19,7 @@
 //! recovered (bias unknown), or when its payload does not cleanly divide into
 //! entries. Correctness always wins over size.
 
+use super::SymStr;
 use crate::common::fx_hash::FxHashMap;
 
 use crate::backend::elf::{
@@ -329,7 +330,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
         });
         section_data.push(pool.data.clone());
         let sym = Elf64Symbol {
-            name_idx: 0, name: pool_sym_name(i),
+            name_idx: 0, name: SymStr::new(&pool_sym_name(i)),
             // LOCAL binding in the DEFINITION keeps the pool symbol out of
             // --export-dynamic / dynsym; lookups still work because they go
             // through the globals map by name.
@@ -356,7 +357,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
             None => {
                 let i = objects[oi].symbols.len() as u32;
                 objects[oi].symbols.push(Elf64Symbol {
-                    name_idx: 0, name: pool_sym_name(pool_idx),
+                    name_idx: 0, name: SymStr::new(&pool_sym_name(pool_idx)),
                     info: (STB_GLOBAL << 4) | STT_OBJECT, other: 0,
                     shndx: 0 /* SHN_UNDEF */, value: 0, size: 0,
                 });

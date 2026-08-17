@@ -10,7 +10,7 @@ use crate::backend::elf::{
     SHN_UNDEF, PT_DYNAMIC,
     DT_NULL, DT_SONAME, DT_SYMTAB, DT_STRTAB, DT_STRSZ,
     DT_GNU_HASH, DT_VERSYM,
-    read_u16, read_u32, read_u64, read_i64, read_cstr,
+    read_u16, read_u32, read_u64, read_i64, read_cstr, slice_at, table_entry,
 };
 use super::types::DynSymbol;
 
@@ -42,10 +42,12 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
     if e_shoff != 0 && e_shnum != 0 {
         let mut sections = Vec::with_capacity(e_shnum);
         for i in 0..e_shnum {
-            let off = e_shoff + i * e_shentsize;
-            if off + e_shentsize > data.len() {
+            // Overflow-safe table indexing (e_shoff is u64, i * e_shentsize
+            // can overflow); a wrapped range must not read out of bounds.
+            if e_shentsize < 64 || table_entry(data, e_shoff, i, e_shentsize).is_none() {
                 break;
             }
+            let off = e_shoff + i * e_shentsize;
             sections.push((
                 read_u32(data, off + 4),  // sh_type
                 read_u64(data, off + 24), // offset
@@ -73,14 +75,15 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                 let (_, s_off, s_sz, _) = sections[vd_link];
                 let s_off = s_off as usize;
                 let s_sz = s_sz as usize;
-                if s_off + s_sz <= data.len() { &data[s_off..s_off + s_sz] } else { &[] as &[u8] }
+                slice_at(data, s_off, s_sz).unwrap_or(&[])
             } else {
                 &[] as &[u8]
             };
 
             let mut pos = vd_off;
-            let end = vd_off + vd_size;
-            while pos < end && pos + 20 <= data.len() {
+            // Saturating: a bogus vd_size near u64::MAX must not wrap `end`.
+            let end = vd_off.saturating_add(vd_size);
+            while pos < end && slice_at(data, pos, 20).is_some() {
                 let vd_ndx = read_u16(data, pos + 4);
                 let vd_cnt = read_u16(data, pos + 6);
                 let vd_aux = read_u32(data, pos + 12) as usize;
@@ -88,8 +91,8 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 
                 // First verdaux entry has the version name
                 if vd_cnt > 0 {
-                    let aux_pos = pos + vd_aux;
-                    if aux_pos + 8 <= data.len() {
+                    let aux_pos = pos.saturating_add(vd_aux);
+                    if slice_at(data, aux_pos, 8).is_some() {
                         let vda_name = read_u32(data, aux_pos) as usize;
                         if vda_name < vd_strtab.len() {
                             let name = read_cstr(vd_strtab, vda_name);
@@ -98,8 +101,10 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                     }
                 }
 
+                // vd_next == 0 terminates the chain; a wrapping add would
+                // otherwise loop forever on malformed input.
                 if vd_next == 0 { break; }
-                pos += vd_next;
+                match pos.checked_add(vd_next) { Some(p) => pos = p, None => break }
             }
         }
 
@@ -112,13 +117,11 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                 let (_, str_off, str_size, _) = sections[strtab_idx];
                 let str_off = str_off as usize;
                 let str_size = str_size as usize;
-                if str_off + str_size > data.len() { continue; }
-                let strtab = &data[str_off..str_off + str_size];
+                let Some(strtab) = slice_at(data, str_off, str_size) else { continue };
 
                 let sym_off = offset as usize;
                 let sym_size = size as usize;
-                if sym_off + sym_size > data.len() { continue; }
-                let sym_data = &data[sym_off..sym_off + sym_size];
+                let Some(sym_data) = slice_at(data, sym_off, sym_size) else { continue };
                 let sym_count = sym_data.len() / 24;
 
                 let mut symbols = Vec::new();
@@ -144,8 +147,8 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 
                     // Look up version for this symbol from .gnu.version table
                     let (version, is_default_ver) = if let Some((vs_off, _vs_size)) = versym_shdr {
-                        let vs_entry = vs_off + j * 2;
-                        if vs_entry + 2 <= data.len() {
+                        let vs_entry = vs_off.saturating_add(j.saturating_mul(2));
+                        if slice_at(data, vs_entry, 2).is_some() {
                             let raw_ver = read_u16(data, vs_entry);
                             let hidden = raw_ver & 0x8000 != 0;
                             let ver_idx = raw_ver & 0x7fff;
@@ -195,8 +198,8 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
     let mut dyn_offset = 0usize;
     let mut dyn_size = 0usize;
     for i in 0..e_phnum {
+        if e_phentsize < 56 || table_entry(data, e_phoff, i, e_phentsize).is_none() { break; }
         let ph = e_phoff + i * e_phentsize;
-        if ph + e_phentsize > data.len() { break; }
         let p_type = read_u32(data, ph);
         if p_type == PT_DYNAMIC {
             dyn_offset = read_u64(data, ph + 8) as usize;
@@ -217,8 +220,8 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
     let mut versym_addr: u64 = 0;
 
     let mut pos = dyn_offset;
-    let dyn_end = dyn_offset + dyn_size;
-    while pos + 16 <= dyn_end && pos + 16 <= data.len() {
+    let dyn_end = dyn_offset.saturating_add(dyn_size);
+    while pos.saturating_add(16) <= dyn_end && slice_at(data, pos, 16).is_some() {
         let tag = read_i64(data, pos);
         let val = read_u64(data, pos + 8);
         match tag {

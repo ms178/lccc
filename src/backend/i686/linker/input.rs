@@ -306,9 +306,9 @@ pub(super) fn resolve_archive_members(inputs: &mut Vec<InputObject>, archive_poo
                 continue;
             }
             if sym.section_index != SHN_UNDEF {
-                defined.insert(sym.name.clone());
+                defined.insert(sym.name.to_string());
             } else {
-                undefined.insert(sym.name.clone());
+                undefined.insert(sym.name.to_string());
             }
         }
     }
@@ -341,10 +341,10 @@ pub(super) fn resolve_archive_members(inputs: &mut Vec<InputObject>, archive_poo
                         continue;
                     }
                     if sym.section_index != SHN_UNDEF {
-                        defined.insert(sym.name.clone());
+                        defined.insert(sym.name.to_string());
                         undefined.remove(&sym.name);
                     } else if !defined.contains(&sym.name) {
-                        undefined.insert(sym.name.clone());
+                        undefined.insert(sym.name.to_string());
                     }
                 }
                 inputs.push(obj);

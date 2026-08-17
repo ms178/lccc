@@ -56,13 +56,13 @@ pub(super) fn emit_shared_library(
                 if sym.name.is_empty() { continue; }
                 match rela.rela_type {
                     R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
-                        let needs_plt = if let Some(g) = globals.get(&sym.name) {
+                        let needs_plt = if let Some(g) = globals.get(sym.name.as_str()) {
                             g.is_dynamic || (g.defined_in.is_none() && g.section_idx == SHN_UNDEF)
                         } else {
                             sym.is_undefined() && !sym.is_local()
                         };
-                        if needs_plt && !so_plt_names.contains(&sym.name) {
-                            so_plt_names.push(sym.name.clone());
+                        if needs_plt && !so_plt_names.contains(&sym.name.to_string()) {
+                            so_plt_names.push(sym.name.to_string());
                         }
                     }
                     _ => {}
@@ -96,13 +96,13 @@ pub(super) fn emit_shared_library(
                     R_AARCH64_ADR_PREL_PG_HI21 | R_AARCH64_ADD_ABS_LO12_NC
                     | R_AARCH64_LDST64_ABS_LO12_NC | R_AARCH64_LDST32_ABS_LO12_NC
                     | R_AARCH64_LDST8_ABS_LO12_NC | R_AARCH64_LDST16_ABS_LO12_NC => {
-                        let sym_needs_got = if let Some(g) = globals.get(&sym.name) {
+                        let sym_needs_got = if let Some(g) = globals.get(sym.name.as_str()) {
                             g.is_dynamic || g.defined_in.is_none()
                         } else {
                             sym.is_undefined() && !sym.is_local()
                         };
-                        if sym_needs_got && !dyn_sym_names.contains(&sym.name) {
-                            dyn_sym_names.push(sym.name.clone());
+                        if sym_needs_got && !dyn_sym_names.contains(&sym.name.to_string()) {
+                            dyn_sym_names.push(sym.name.to_string());
                         }
                     }
                     _ => {}
@@ -366,8 +366,8 @@ pub(super) fn emit_shared_library(
                         }
                         _ => false,
                     };
-                    if needs_got && !got_pre_names.contains(sym_name) {
-                        got_pre_names.push(sym_name.clone());
+                    if needs_got && !got_pre_names.contains(&sym_name.to_string()) {
+                        got_pre_names.push(sym_name.to_string());
                         got_pre_count += 1;
                     }
                 }
@@ -423,20 +423,20 @@ pub(super) fn emit_shared_library(
                 if sym.is_local() { continue; }
                 match rela.rela_type {
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => {
-                        if !got_needed.contains(&sym.name) { got_needed.push(sym.name.clone()); }
+                        if !got_needed.contains(&sym.name.to_string()) { got_needed.push(sym.name.to_string()); }
                     }
                     // In shared libraries, ADRP/ADD for undefined/dynamic symbols must
                     // go through the GOT since the symbol address is only known at runtime.
                     R_AARCH64_ADR_PREL_PG_HI21 | R_AARCH64_ADD_ABS_LO12_NC
                     | R_AARCH64_LDST64_ABS_LO12_NC | R_AARCH64_LDST32_ABS_LO12_NC
                     | R_AARCH64_LDST8_ABS_LO12_NC | R_AARCH64_LDST16_ABS_LO12_NC => {
-                        let sym_needs_got = if let Some(g) = globals.get(&sym.name) {
+                        let sym_needs_got = if let Some(g) = globals.get(sym.name.as_str()) {
                             g.is_dynamic || g.defined_in.is_none()
                         } else {
                             sym.is_undefined() && !sym.is_local()
                         };
-                        if sym_needs_got && !got_needed.contains(&sym.name) {
-                            got_needed.push(sym.name.clone());
+                        if sym_needs_got && !got_needed.contains(&sym.name.to_string()) {
+                            got_needed.push(sym.name.to_string());
                         }
                     }
                     _ => {}
@@ -766,8 +766,8 @@ pub(super) fn emit_shared_library(
                     }
                     R_AARCH64_ADR_PREL_PG_HI21 => {
                         // For undefined/dynamic symbols in shared libs, redirect through GOT
-                        if let Some(&gea) = got_sym_addrs.get(&sym.name) {
-                            if s == 0 || globals_snap.get(&sym.name).is_some_and(|g| g.is_dynamic || g.defined_in.is_none()) {
+                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
+                            if s == 0 || globals_snap.get(sym.name.as_str()).is_some_and(|g| g.is_dynamic || g.defined_in.is_none()) {
                                 let page_g = gea & !0xFFF;
                                 let page_p = p & !0xFFF;
                                 let imm = (page_g as i64 - page_p as i64) >> 12;
@@ -789,8 +789,8 @@ pub(super) fn emit_shared_library(
                     }
                     R_AARCH64_ADD_ABS_LO12_NC => {
                         // For undefined/dynamic symbols in shared libs, convert ADD to LDR from GOT
-                        if let Some(&gea) = got_sym_addrs.get(&sym.name) {
-                            if s == 0 || globals_snap.get(&sym.name).is_some_and(|g| g.is_dynamic || g.defined_in.is_none()) {
+                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
+                            if s == 0 || globals_snap.get(sym.name.as_str()).is_some_and(|g| g.is_dynamic || g.defined_in.is_none()) {
                                 // Convert: ADD Xd, Xn, #imm -> LDR Xd, [Xn, #imm]
                                 // The ADD instruction loaded address = base + lo12
                                 // We need LDR to dereference the GOT entry instead
@@ -817,7 +817,7 @@ pub(super) fn emit_shared_library(
                         let mut target = (s as i64 + a) as u64;
                         // If the symbol has a PLT entry, redirect to it
                         if target == 0 && !sym.name.is_empty() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(pi) = g.plt_idx {
                                     target = so_plt_addr + 32 + pi as u64 * 16;
                                 }
@@ -855,7 +855,7 @@ pub(super) fn emit_shared_library(
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 4);
                     }
                     R_AARCH64_ADR_GOT_PAGE => {
-                        if let Some(&gea) = got_sym_addrs.get(&sym.name) {
+                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             let page_g = gea & !0xFFF;
                             let page_p = p & !0xFFF;
                             let imm = (page_g as i64 - page_p as i64) >> 12;
@@ -869,7 +869,7 @@ pub(super) fn emit_shared_library(
                         }
                     }
                     R_AARCH64_LD64_GOT_LO12_NC => {
-                        if let Some(&gea) = got_sym_addrs.get(&sym.name) {
+                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             reloc::encode_ldst_imm12(&mut out, fp, (gea & 0xFFF) as u32, 3);
                         } else {
                             let sa_val = (s as i64 + a) as u64;

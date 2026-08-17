@@ -205,13 +205,35 @@ impl I686Codegen {
             let end_label = format!(".Lsel_end_{}", label_id);
             self.emit_load_operand(cond);
             self.emit_branch_nonzero(&true_label);
-            self.emit_load_operand(false_val);
-            self.emit_store_result(dest);
+            // When dest is register-allocated, materialize each arm DIRECTLY
+            // into that register (movl slot,%esi) instead of the
+            // load-to-%eax + movl %eax,%esi detour. The peephole cannot fuse
+            // these afterwards because the pair sits right before a label
+            // (deadness unprovable across the barrier), so the win must
+            // happen here. Falls back to the accumulator path per-arm.
+            let dest_phys = self.get_phys_reg_for_value(dest.0);
+            if let Some(d) = dest_phys {
+                if !self.emit_load_direct_to_phys_reg(false_val, d) {
+                    self.emit_load_operand(false_val);
+                    self.emit_store_result(dest);
+                }
+            } else {
+                self.emit_load_operand(false_val);
+                self.emit_store_result(dest);
+            }
             self.emit_branch(&end_label);
             self.state.emit_fmt(format_args!("{}:", true_label));
-            self.emit_load_operand(true_val);
-            self.emit_store_result(dest);
+            if let Some(d) = dest_phys {
+                if !self.emit_load_direct_to_phys_reg(true_val, d) {
+                    self.emit_load_operand(true_val);
+                    self.emit_store_result(dest);
+                }
+            } else {
+                self.emit_load_operand(true_val);
+                self.emit_store_result(dest);
+            }
             self.state.emit_fmt(format_args!("{}:", end_label));
+            self.state.reg_cache.invalidate_acc();
             return;
         }
 

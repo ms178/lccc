@@ -356,7 +356,7 @@ pub(super) fn emit_executable(
                 for &(_, rel_type, sym_idx, _) in &sec.relocations {
                     if rel_type == R_386_32 {
                         if let Some(sym) = obj.symbols.get(sym_idx as usize) {
-                            if let Some(gs) = global_symbols.get(&sym.name) {
+                            if let Some(gs) = global_symbols.get(sym.name.as_str()) {
                                 if gs.uses_textrel { count += 1; }
                             }
                         }

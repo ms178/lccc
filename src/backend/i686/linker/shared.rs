@@ -27,7 +27,7 @@ pub(super) fn resolve_dynamic_symbols_for_shared(
         for sym in &obj.symbols {
             if sym.binding == STB_LOCAL { continue; }
             if sym.section_index == SHN_UNDEF && !sym.name.is_empty()
-                && !global_symbols.get(&sym.name).map(|gs| gs.is_defined).unwrap_or(false)
+                && !global_symbols.get(sym.name.as_str()).map(|gs| gs.is_defined).unwrap_or(false)
                 && !undefined.contains(&sym.name)
             {
                 undefined.push(sym.name.clone());
@@ -113,7 +113,7 @@ pub(super) fn emit_shared_library_32(
                 if sym.name.is_empty() || sym.binding == STB_LOCAL { continue; }
                 match rel_type {
                     R_386_PC32 | R_386_PLT32 => {
-                        if let Some(gs) = global_symbols.get(&sym.name) {
+                        if let Some(gs) = global_symbols.get(sym.name.as_str()) {
                             if !gs.is_defined && !plt_names.contains(&sym.name) {
                                 plt_names.push(sym.name.clone());
                             }
@@ -283,7 +283,7 @@ pub(super) fn emit_shared_library_32(
                             num_relative += 1;
                         }
                     } else if !sym.name.is_empty() {
-                        let is_defined = global_symbols.get(&sym.name)
+                        let is_defined = global_symbols.get(sym.name.as_str())
                             .map(|gs| gs.is_defined).unwrap_or(false);
                         if is_defined {
                             num_relative += 1;
@@ -594,7 +594,7 @@ pub(super) fn emit_shared_library_32(
                             let needs_relative = if sym.sym_type == STT_SECTION {
                                 section_map.contains_key(&(obj_idx, sym.section_index as usize))
                             } else if !sym.name.is_empty() {
-                                global_symbols.get(&sym.name).map(|gs| gs.is_defined).unwrap_or(false)
+                                global_symbols.get(sym.name.as_str()).map(|gs| gs.is_defined).unwrap_or(false)
                             } else {
                                 false
                             };
@@ -604,7 +604,7 @@ pub(super) fn emit_shared_library_32(
                         }
                         R_386_PC32 | R_386_PLT32 => {
                             let target = if !sym.name.is_empty() {
-                                if let Some(gs) = global_symbols.get(&sym.name) {
+                                if let Some(gs) = global_symbols.get(sym.name.as_str()) {
                                     if gs.needs_plt && !gs.is_defined {
                                         gs.address // PLT address
                                     } else {
@@ -1036,7 +1036,7 @@ pub(super) fn resolve_sym_addr_shared(obj_idx: usize, sym: &InputSymbol, ctx: &R
             0
         }
     } else {
-        match ctx.global_symbols.get(&sym.name) {
+        match ctx.global_symbols.get(sym.name.as_str()) {
             Some(gs) => gs.address,
             None => {
                 if sym.section_index != SHN_UNDEF && sym.section_index != SHN_ABS {

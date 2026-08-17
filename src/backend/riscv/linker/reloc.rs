@@ -125,7 +125,7 @@ fn resolve_sym_value(
         }
         0
     } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-        if let Some(gs) = ctx.global_syms.get(&sym.name) {
+        if let Some(gs) = ctx.global_syms.get(sym.name.as_str()) {
             if gs.needs_plt || gs.defined {
                 gs.value
             } else {
@@ -157,7 +157,7 @@ fn lookup_got_entry(
     }
 
     // Check global symbol's got_offset
-    if let Some(gs) = ctx.global_syms.get(&sym.name) {
+    if let Some(gs) = ctx.global_syms.get(sym.name.as_str()) {
         if let Some(got_off) = gs.got_offset {
             return ctx.got_vaddr + got_off;
         }
@@ -257,10 +257,10 @@ fn apply_one_reloc(
             } else {
                 let target = if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
                     // For undefined symbols in shared libs, redirect through PLT stub
-                    if let Some(&plt_addr) = ctx.plt_sym_addrs.get(&sym.name) {
+                    if let Some(&plt_addr) = ctx.plt_sym_addrs.get(sym.name.as_str()) {
                         plt_addr as i64
                     } else {
-                        ctx.global_syms.get(&sym.name)
+                        ctx.global_syms.get(sym.name.as_str())
                             .map(|gs| gs.value as i64)
                             .unwrap_or(s as i64)
                     }

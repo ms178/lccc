@@ -156,9 +156,14 @@ pub trait ArchCodegen {
                 self.state().reg_cache.invalidate_acc();
             }
             (Some(d), None) => {
-                // Dest in register, src on stack/constant: load to acc then move
-                self.emit_load_operand(src);
-                self.emit_acc_to_phys_reg(d);
+                // Dest in register, src on stack/constant. Backends that can
+                // materialize straight into the destination register do so
+                // (movl src,%ecx -- one instruction); the default detours
+                // through the accumulator (load-to-acc + move).
+                if !self.emit_load_direct_to_phys_reg(src, d) {
+                    self.emit_load_operand(src);
+                    self.emit_acc_to_phys_reg(d);
+                }
                 self.state().reg_cache.invalidate_acc();
             }
             _ => {
@@ -167,6 +172,14 @@ pub trait ArchCodegen {
                 self.emit_store_result(dest);
             }
         }
+    }
+
+    /// Load a stack/constant operand DIRECTLY into a physical register,
+    /// bypassing the accumulator. Returns false when the backend cannot (or
+    /// the operand shape is unsupported); the caller then falls back to the
+    /// load-to-acc + move detour. Default: not supported.
+    fn emit_load_direct_to_phys_reg(&mut self, _src: &Operand, _dest: PhysReg) -> bool {
+        false
     }
 
     /// Try to lower an IR instruction to the MachInst pipeline (virtual register ISel).

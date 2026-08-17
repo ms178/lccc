@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1552,6 +1553,1219 @@ REL_TESTS = [
 ]
 
 # ============================================================================
+# ROBUSTNESS: malformed / hostile ELF inputs
+# ============================================================================
+#
+# A linker is routinely handed corrupt objects: interrupted builds, truncated
+# artefacts on a full disk, bad NFS writes, or deliberately hostile input in a
+# distro build service.  The contract is:
+#
+#     reject with a clear diagnostic and a normal error exit  --  never
+#     panic, never abort in the allocator, never read out of bounds, never
+#     loop forever.
+#
+# Every case below is a *surgical* mutation of one field in a real object file
+# (not a random smash), so the test states precisely which invariant is under
+# test.  Cases marked `found_by_fuzzing` are regressions for defects an actual
+# mutation-fuzzing campaign found in this linker.
+#
+# Note on oracles: bfd and mold silently *accept* several of these (mold even
+# segfaults on the truncated-section case, exit 139), so they cannot serve as
+# a pass/fail oracle here.  The invariant is lccc-internal and absolute:
+# a controlled rejection, i.e. exit code 1 with a diagnostic, or a successful
+# link -- but never a crash, an abort, or a hang.
+
+ROBUSTNESS_SRC = r"""
+static char msg[16] = "hi\n";
+static int table[8] = {1,2,3,4,5,6,7,8};
+int helper(int x) { return x * 3 + table[x & 7]; }
+static long wr(long fd, const void *b, long n) {
+    long r; __asm__ volatile("syscall" : "=a"(r) : "a"(1),"D"(fd),"S"(b),"d"(n)
+                             : "rcx","r11","memory"); return r;
+}
+void _start(void) {
+    wr(1, msg, 3);
+    long code = helper(5);
+    __asm__ volatile("syscall" :: "a"(60), "D"(code));
+    __builtin_unreachable();
+}
+"""
+
+def _u16(b, off):  return int.from_bytes(b[off:off+2], "little")
+def _u32(b, off):  return int.from_bytes(b[off:off+4], "little")
+def _u64(b, off):  return int.from_bytes(b[off:off+8], "little")
+def _pu16(b, off, v): b[off:off+2] = (v & 0xffff).to_bytes(2, "little")
+def _pu32(b, off, v): b[off:off+4] = (v & 0xffffffff).to_bytes(4, "little")
+def _pu64(b, off, v): b[off:off+8] = (v & 0xffffffffffffffff).to_bytes(8, "little")
+
+def _shdr(b, i):
+    """Return the file offset of section header `i`."""
+    return _u64(b, 40) + i * _u16(b, 58)
+
+def _find_section(b, name):
+    """Return index of the section whose name is `name`, or None."""
+    shoff, shentsize, shnum = _u64(b, 40), _u16(b, 58), _u16(b, 60)
+    shstrndx = _u16(b, 62)
+    stro = _u64(b, shoff + shstrndx * shentsize + 24)
+    for i in range(shnum):
+        nameo = stro + _u32(b, shoff + i * shentsize)
+        end = b.index(b"\0", nameo)
+        if b[nameo:end].decode() == name:
+            return i
+    return None
+
+# --- the mutations -----------------------------------------------------------
+# Each entry: (case name, mutator(bytearray) -> None, note)
+
+def _m_addralign_not_pow2(b):
+    """sh_addralign = 0xffffffffff violates the ELF gABI (must be 0 or 2^n).
+
+    The layout engine aligns the section address up to that value, demanding a
+    ~1 TiB output buffer; the process then died with
+    'memory allocation of 1099511627796 bytes failed' (SIGABRT), which
+    catch_unwind cannot intercept.  wild rejects this input; bfd and mold
+    silently accept it.  found_by_fuzzing
+    """
+    i = _find_section(b, ".data.msg") or 1
+    _pu64(b, _shdr(b, i) + 48, 0xffffffffff)
+
+def _m_section_offset_wraps(b):
+    """sh_offset near u64::MAX makes the naive check `off + size <= len` wrap.
+
+    The guard then passes and the slice panics with
+    'range start index 18446744073692774483 out of range'.  found_by_fuzzing
+    """
+    i = _find_section(b, ".text._start") or 1
+    _pu64(b, _shdr(b, i) + 24, (1 << 64) - 0x2000)
+    _pu64(b, _shdr(b, i) + 32, 0x4000)
+
+def _m_section_size_huge(b):
+    """sh_size far beyond the file: must be a bounds error, not a huge read."""
+    i = _find_section(b, ".text._start") or 1
+    _pu64(b, _shdr(b, i) + 32, 0xffff_ffff_0000)
+
+def _m_shoff_beyond_eof(b):
+    """e_shoff points past the end of the file."""
+    _pu64(b, 40, len(b) + 0x100000)
+
+def _m_shentsize_zero(b):
+    """e_shentsize = 0 makes every section header alias header 0."""
+    _pu16(b, 58, 0)
+
+def _m_shnum_huge(b):
+    """e_shnum claims 65535 sections in a file that has ~18."""
+    _pu16(b, 60, 0xffff)
+
+def _m_shstrndx_oob(b):
+    """e_shstrndx indexes a section that does not exist."""
+    _pu16(b, 62, 0xfffe)
+
+def _m_symtab_link_oob(b):
+    """.symtab sh_link points at a non-existent string table."""
+    i = _find_section(b, ".symtab")
+    if i is not None:
+        _pu32(b, _shdr(b, i) + 40, 0xfffe)
+
+def _m_sym_name_oob(b):
+    """A symbol's st_name indexes far outside .strtab."""
+    i = _find_section(b, ".symtab")
+    if i is not None:
+        symoff = _u64(b, _shdr(b, i) + 24)
+        _pu32(b, symoff + 24 * 2, 0xffff_fff0)   # symbol #2
+
+def _m_sym_shndx_oob(b):
+    """A symbol claims membership in a section index that does not exist."""
+    i = _find_section(b, ".symtab")
+    if i is not None:
+        symoff = _u64(b, _shdr(b, i) + 24)
+        _pu16(b, symoff + 24 * 2 + 6, 0xfff0)
+
+def _m_reloc_sym_idx_oob(b):
+    """r_info symbol index points past the end of .symtab."""
+    i = _find_section(b, ".rela.text._start")
+    if i is not None:
+        ro = _u64(b, _shdr(b, i) + 24)
+        _pu32(b, ro + 8 + 4, 0xffff)     # high half of r_info = sym index
+
+def _m_reloc_offset_oob(b):
+    """r_offset lies outside the section the relocation applies to."""
+    i = _find_section(b, ".rela.text._start")
+    if i is not None:
+        ro = _u64(b, _shdr(b, i) + 24)
+        _pu64(b, ro, 0xffff_ffff_0000)
+
+def _m_reloc_type_unknown(b):
+    """An x86-64 relocation type the linker does not implement."""
+    i = _find_section(b, ".rela.text._start")
+    if i is not None:
+        ro = _u64(b, _shdr(b, i) + 24)
+        _pu32(b, ro + 8, 250)
+
+def _m_truncated_file(b):
+    """The file ends in the middle of the section header table."""
+    del b[len(b) // 2:]
+
+def _m_rela_info_target_oob(b):
+    """A SHT_RELA section's sh_info names a section that does not exist."""
+    i = _find_section(b, ".rela.text._start")
+    if i is not None:
+        _pu32(b, _shdr(b, i) + 44, 0xfffe)
+
+MALFORMED_CASES = [
+    ("malformed_addralign_not_power_of_two", _m_addralign_not_pow2),
+    ("malformed_section_offset_wraps_u64",   _m_section_offset_wraps),
+    ("malformed_section_size_huge",          _m_section_size_huge),
+    ("malformed_shoff_beyond_eof",           _m_shoff_beyond_eof),
+    ("malformed_shentsize_zero",             _m_shentsize_zero),
+    ("malformed_shnum_huge",                 _m_shnum_huge),
+    ("malformed_shstrndx_out_of_range",      _m_shstrndx_oob),
+    ("malformed_symtab_link_out_of_range",   _m_symtab_link_oob),
+    ("malformed_symbol_name_out_of_range",   _m_sym_name_oob),
+    ("malformed_symbol_shndx_out_of_range",  _m_sym_shndx_oob),
+    ("malformed_reloc_sym_idx_out_of_range", _m_reloc_sym_idx_oob),
+    ("malformed_reloc_offset_out_of_range",  _m_reloc_offset_oob),
+    ("malformed_reloc_type_unknown",         _m_reloc_type_unknown),
+    ("malformed_rela_info_target_oob",       _m_rela_info_target_oob),
+    ("malformed_truncated_file",             _m_truncated_file),
+]
+
+def _robustness_tests(args, _oracles):
+    """Link each mutated object with lccc-ld and assert controlled behaviour."""
+    out = []
+    td = tempfile.mkdtemp(prefix="lnk.robust.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    try:
+        if not os.path.exists(ld):
+            return [Result("robustness", "SKIP", f"{ld} not built")]
+        with open(os.path.join(td, "r.c"), "w") as f:
+            f.write(ROBUSTNESS_SRC)
+        r = sh([CC, "-c", "-O1", "-ffunction-sections", "-fdata-sections",
+                "r.c", "-o", "r.o"], cwd=td)
+        if r.returncode != 0:
+            return [Result("robustness", "SKIP",
+                           f"fixture compile failed: {r.stderr.decode()[:200]}")]
+        pristine = bytearray(open(os.path.join(td, "r.o"), "rb").read())
+
+        # Sanity: the pristine fixture must link and run, otherwise the
+        # mutations would be testing a failure that is not theirs.
+        base = os.path.join(td, "base.out")
+        r = sh([ld, "-o", base, "r.o"], cwd=td)
+        if r.returncode != 0:
+            return [Result("robustness", "SKIP",
+                           f"pristine fixture does not link: {r.stderr.decode()[:200]}")]
+
+        for name, mutate in MALFORMED_CASES:
+            b = bytearray(pristine)
+            try:
+                mutate(b)
+            except Exception as e:
+                out.append(Result(name, "SKIP", f"mutator failed: {e!r}"))
+                continue
+            obj = os.path.join(td, f"{name}.o")
+            with open(obj, "wb") as f:
+                f.write(bytes(b))
+            outp = os.path.join(td, f"{name}.out")
+            try:
+                r = sh([ld, "-o", outp, obj], cwd=td, timeout=25)
+            except subprocess.TimeoutExpired:
+                out.append(Result(name, "FAIL", "linker hung (>25s) on malformed input"))
+                continue
+
+            rc = r.returncode
+            err = (r.stderr.decode(errors="replace") +
+                   r.stdout.decode(errors="replace"))
+
+            if rc < 0:
+                out.append(Result(name, "FAIL",
+                    f"killed by signal {-rc} (must be a clean diagnostic)"))
+                continue
+            if rc == 101:
+                out.append(Result(name, "FAIL", f"rust panic (exit 101): {err[:300]}"))
+                continue
+            for marker in ("panicked at", "memory allocation of",
+                           "index out of bounds", "unreachable",
+                           "capacity overflow", "attempt to subtract with overflow"):
+                if marker in err:
+                    out.append(Result(name, "FAIL",
+                        f"internal failure leaked ({marker!r}): {err[:300]}"))
+                    break
+            else:
+                if rc == 0:
+                    # Accepting the input is legal (bfd does for several of
+                    # these) provided the result is a well-formed file.
+                    if not os.path.exists(outp) or os.path.getsize(outp) == 0:
+                        out.append(Result(name, "FAIL",
+                            "reported success but produced no output"))
+                    else:
+                        out.append(Result(name, "PASS"))
+                elif rc == 1:
+                    if err.strip():
+                        out.append(Result(name, "PASS"))
+                    else:
+                        out.append(Result(name, "FAIL",
+                            "exit 1 with no diagnostic message"))
+                else:
+                    out.append(Result(name, "FAIL",
+                        f"unexpected exit code {rc}: {err[:300]}"))
+        return out
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+# ============================================================================
+# -Map= : link map file
+# ============================================================================
+#
+# The value of a map file is that it is *authoritative*: every address it
+# prints must be the address the linker actually emitted.  A map that is
+# merely plausible is worse than none, because it silently misleads size
+# accounting and post-mortem debugging.
+#
+# The test therefore does not compare text against GNU ld (whose layout
+# differs legitimately).  It checks the two properties that matter:
+#   1. every symbol address in the map equals that symbol's st_value in the
+#      produced ELF (ground truth read back with readelf);
+#   2. the structural GNU format is present, so existing scrapers parse it.
+
+def _map_file_test(args, _oracles):
+    td = tempfile.mkdtemp(prefix="lnk.mapfile.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    try:
+        if not os.path.exists(ld):
+            return Result("map_file_matches_binary", "SKIP", "lccc-ld not built")
+        if not shutil.which("readelf"):
+            return Result("map_file_matches_binary", "SKIP", "readelf not available")
+
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write(ROBUSTNESS_SRC)
+        with open(os.path.join(td, "extra.c"), "w") as f:
+            f.write("int extra_a = 1; int extra_b = 2;\n"
+                    "int extra_fn(int x){ return x + extra_a + extra_b; }\n")
+        r = sh([CC, "-c", "-O1", "-ffunction-sections", "-fdata-sections",
+                "m.c", "extra.c"], cwd=td)
+        if r.returncode != 0:
+            return Result("map_file_matches_binary", "SKIP",
+                          f"fixture compile failed: {r.stderr.decode()[:200]}")
+
+        out = os.path.join(td, "a.out")
+        mp = os.path.join(td, "a.map")
+        r = sh([ld, "-Map=" + mp, "-o", out, "m.o", "extra.o"], cwd=td)
+        if r.returncode != 0:
+            return Result("map_file_matches_binary", "FAIL",
+                          f"link failed: {r.stderr.decode()[:300]}")
+        if not os.path.exists(mp):
+            return Result("map_file_matches_binary", "FAIL",
+                          "-Map= produced no file")
+
+        text = open(mp).read()
+        for needed in ("Memory Configuration", "Linker script and memory map"):
+            if needed not in text:
+                return Result("map_file_matches_binary", "FAIL",
+                              f"map lacks GNU section {needed!r}")
+
+        # map: lines of the form "        0xADDR        name"
+        map_syms = {}
+        for line in text.splitlines():
+            m = re.match(r"\s+0x([0-9a-f]{16})\s+(\S+)\s*$", line)
+            if m:
+                map_syms[m.group(2)] = int(m.group(1), 16)
+        if not map_syms:
+            return Result("map_file_matches_binary", "FAIL",
+                          "map contains no symbol lines")
+
+        # ground truth from the emitted binary
+        rr = sh(["readelf", "-sW", out], cwd=td)
+        elf_syms = {}
+        for line in rr.stdout.decode(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 8 and re.match(r"^\d+:$", parts[0]):
+                try:
+                    elf_syms[parts[7]] = int(parts[1], 16)
+                except ValueError:
+                    pass
+
+        common = set(map_syms) & set(elf_syms)
+        if not common:
+            return Result("map_file_matches_binary", "FAIL",
+                          "no symbols shared between map and binary")
+        bad = [(k, hex(elf_syms[k]), hex(map_syms[k]))
+               for k in common if elf_syms[k] != map_syms[k]]
+        if bad:
+            return Result("map_file_matches_binary", "FAIL",
+                          f"{len(bad)}/{len(common)} map addresses disagree "
+                          f"with the binary, e.g. {bad[:3]}")
+
+        # The binary must also still work.
+        code, sout = run_bin(out, [], td)
+        if sout != "hi\n":
+            return Result("map_file_matches_binary", "FAIL",
+                          f"binary output {sout!r} != 'hi\\n'")
+        return Result("map_file_matches_binary", "PASS")
+    except Exception as e:
+        return Result("map_file_matches_binary", "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _map_file_spellings_test(args, _oracles):
+    """`-Map FILE` (two-arg) must behave exactly like `-Map=FILE`."""
+    td = tempfile.mkdtemp(prefix="lnk.mapspell.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    try:
+        if not os.path.exists(ld):
+            return Result("map_file_two_arg_spelling", "SKIP", "lccc-ld not built")
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write(ROBUSTNESS_SRC)
+        r = sh([CC, "-c", "-O1", "m.c"], cwd=td)
+        if r.returncode != 0:
+            return Result("map_file_two_arg_spelling", "SKIP", "compile failed")
+        r = sh([ld, "-Map", "two.map", "-o", "a.out", "m.o"], cwd=td)
+        if r.returncode != 0:
+            return Result("map_file_two_arg_spelling", "FAIL",
+                          f"link failed: {r.stderr.decode()[:200]}")
+        p = os.path.join(td, "two.map")
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            return Result("map_file_two_arg_spelling", "FAIL",
+                          "-Map FILE produced no map")
+        return Result("map_file_two_arg_spelling", "PASS")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ============================================================================
+# SEGMENT PACKING: congruence + no wasted pages
+# ============================================================================
+#
+# A PT_LOAD segment's file offset does NOT have to be page-aligned; the ELF
+# gABI only requires p_offset === p_vaddr (mod p_align), because mmap maps
+# p_offset rounded down to a page onto p_vaddr rounded down to a page.
+#
+# Rounding the *file offset* up to a page at every segment boundary wastes up
+# to one page per segment.  It cost this linker 12 288 bytes on a small
+# zlib-ng binary (20 640 vs 8 352 after the fix; bfd 16 400, mold 9 808,
+# wild 6 773).
+#
+# These tests lock in both halves of the property:
+#   1. congruence holds for every PT_LOAD (else the loader maps garbage);
+#   2. inter-segment file padding stays small (else the regression is back);
+#   3. RELRO still ends on a page boundary in *address* space, so ld.so's
+#      mprotect cannot spill into the following page.
+
+def _parse_phdrs(binary):
+    r = sh(["readelf", "-lW", binary])
+    out = r.stdout.decode(errors="replace")
+    seg = []
+    for m in re.finditer(
+            r"^\s+(LOAD|GNU_RELRO|DYNAMIC|PHDR|INTERP|TLS)\s+"
+            r"0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x[0-9a-f]+\s+"
+            r"0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+)\s+0x([0-9a-f]+)",
+            out, re.M):
+        t, off, va, fsz, msz, flags, align = m.groups()
+        seg.append({"type": t, "off": int(off, 16), "vaddr": int(va, 16),
+                    "filesz": int(fsz, 16), "memsz": int(msz, 16),
+                    "flags": flags.strip(), "align": int(align, 16)})
+    return seg
+
+
+def _segment_packing_test(args, _oracles):
+    td = tempfile.mkdtemp(prefix="lnk.segpack.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    out = []
+    try:
+        if not shutil.which("readelf"):
+            return [Result("segment_packing", "SKIP", "readelf not available")]
+
+        # A program with distinct RX / R / RW content, linked dynamically so
+        # RELRO and .dynamic are present.
+        with open(os.path.join(td, "s.c"), "w") as f:
+            f.write("""
+                #include <stdio.h>
+                const char rodata_blob[4096] = "ro";
+                char rw_blob[4096] = {1};
+                static char bss_blob[8192];
+                int helper(int x){ return x + rw_blob[0] + rodata_blob[0]; }
+                int main(void){
+                    bss_blob[0] = 3;
+                    printf("%d\\n", helper(1) + bss_blob[0]);
+                    return 0;
+                }
+            """)
+        r = sh([CC, "-c", "-O1", "s.c"], cwd=td)
+        if r.returncode != 0:
+            return [Result("segment_packing", "SKIP", "fixture compile failed")]
+
+        shim = os.path.join(td, "shim")
+        os.makedirs(shim, exist_ok=True)
+        os.symlink(os.path.abspath(ld), os.path.join(shim, "ld"))
+        binp = os.path.join(td, "a.out")
+        r = sh([CC, "-B" + shim, "s.o", "-o", binp,
+                "-Wl,-z,relro", "-Wl,-z,now"], cwd=td)
+        if r.returncode != 0 or not os.path.exists(binp):
+            return [Result("segment_packing", "FAIL",
+                           f"link failed: {r.stderr.decode()[:300]}")]
+
+        # It must still run.
+        code, sout = run_bin(binp, [], td)
+        if code != 0:
+            return [Result("segment_packing", "FAIL",
+                           f"binary exited {code}: {sout!r}")]
+
+        segs = _parse_phdrs(binp)
+        loads = [s for s in segs if s["type"] == "LOAD"]
+        if not loads:
+            return [Result("segment_packing", "FAIL", "no PT_LOAD segments")]
+
+        # (1) congruence
+        bad = [s for s in loads
+               if s["align"] > 1 and (s["off"] % s["align"]) != (s["vaddr"] % s["align"])]
+        out.append(Result("segment_congruence",
+                          "FAIL" if bad else "PASS",
+                          "" if not bad else
+                          f"p_offset !== p_vaddr (mod align) for {bad}"))
+
+        # (2) no page-sized holes between consecutive LOADs
+        loads_sorted = sorted(loads, key=lambda s: s["off"])
+        worst = 0
+        for a, b in zip(loads_sorted, loads_sorted[1:]):
+            gap = b["off"] - (a["off"] + a["filesz"])
+            worst = max(worst, gap)
+        # Allow modest alignment padding, but never a whole page per segment.
+        out.append(Result("segment_no_page_padding",
+                          "PASS" if worst < 4096 else "FAIL",
+                          f"largest inter-LOAD file gap = {worst} bytes"
+                          + ("" if worst < 4096 else " (page padding regressed)")))
+
+        # (3) RELRO ends on a page boundary in ADDRESS space
+        relro = [s for s in segs if s["type"] == "GNU_RELRO"]
+        if relro:
+            r0 = relro[0]
+            end = r0["vaddr"] + r0["memsz"]
+            out.append(Result("relro_ends_on_page_boundary",
+                              "PASS" if end % 4096 == 0 else "FAIL",
+                              f"RELRO end vaddr = 0x{end:x}"))
+        else:
+            out.append(Result("relro_ends_on_page_boundary", "SKIP",
+                              "no PT_GNU_RELRO"))
+
+        # (4b) the same invariants for a SHARED LIBRARY, which goes through
+        # emit_shared.rs — an independent layout implementation that had the
+        # identical page-padding defect (19 568 B -> 7 280 B once fixed).
+        with open(os.path.join(td, "lib.c"), "w") as f:
+            f.write("int gv = 1; static int t[64] = {1};\n"
+                    "int f1(int x){ return x + gv + t[x & 63]; }\n"
+                    "int f2(int x){ return f1(x) * 2; }\n")
+        rl = sh([CC, "-c", "-O2", "-fPIC", "lib.c", "-o", "lib.o"], cwd=td)
+        if rl.returncode == 0:
+            so = os.path.join(td, "liblx.so")
+            rl = sh([CC, "-shared", "-B" + shim, "lib.o", "-o", so,
+                     "-Wl,-z,relro"], cwd=td)
+            if rl.returncode == 0 and os.path.exists(so):
+                sosegs = _parse_phdrs(so)
+                soloads = [x for x in sosegs if x["type"] == "LOAD"]
+                sobad = [x for x in soloads
+                         if x["align"] > 1
+                         and (x["off"] % x["align"]) != (x["vaddr"] % x["align"])]
+                out.append(Result("shared_lib_segment_congruence",
+                                  "FAIL" if sobad else "PASS",
+                                  "" if not sobad else f"non-congruent: {sobad}"))
+                ss = sorted(soloads, key=lambda x: x["off"])
+                sworst = 0
+                for a, b in zip(ss, ss[1:]):
+                    sworst = max(sworst, b["off"] - (a["off"] + a["filesz"]))
+                out.append(Result("shared_lib_no_page_padding",
+                                  "PASS" if sworst < 4096 else "FAIL",
+                                  f"largest inter-LOAD gap = {sworst} bytes"))
+                # It must still be loadable and correct.
+                with open(os.path.join(td, "use.c"), "w") as f:
+                    f.write("#include <stdio.h>\nextern int f2(int);\n"
+                            "int main(void){ printf(\"%d\\n\", f2(5)); return 0; }\n")
+                ru = sh([CC, "use.c", so, "-Wl,-rpath," + td, "-o", "useso"], cwd=td)
+                if ru.returncode == 0:
+                    code, sout = run_bin(os.path.join(td, "useso"), [], td)
+                    out.append(Result("shared_lib_still_loads",
+                                      "PASS" if sout == "12\n" else "FAIL",
+                                      f"output {sout!r} (expected '12')"))
+
+        # (4) not larger than GNU ld on the same input
+        bfd_bin = os.path.join(td, "a.bfd")
+        rb = sh([CC, "-fuse-ld=bfd", "s.o", "-o", bfd_bin,
+                 "-Wl,-z,relro", "-Wl,-z,now"], cwd=td)
+        if rb.returncode == 0 and os.path.exists(bfd_bin):
+            ls, bs = os.path.getsize(binp), os.path.getsize(bfd_bin)
+            out.append(Result("output_not_larger_than_bfd",
+                              "PASS" if ls <= bs * 1.05 else "FAIL",
+                              f"lccc {ls} B vs bfd {bs} B"))
+        return out
+    except Exception as e:
+        return [Result("segment_packing", "FAIL", f"harness exception: {e!r}")]
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ============================================================================
+# DRIVER OPTION HANDLING: silence on benign flags, precision on dangerous ones
+# ============================================================================
+#
+# `gcc -fuse-ld=<linker>` passes a fixed set of driver artefacts on every
+# single link: the LTO plugin triplet (-plugin, -plugin-opt=...) and
+# --push-state/--pop-state around --as-needed groups.  lccc-ld used to print
+# "warning: ignoring unknown option" for each of them -- twelve lines of noise
+# per invocation -- which trains users to ignore lccc's output entirely and
+# buries the diagnostics that do matter.
+#
+# The two halves of correct behaviour are tested separately, because they pull
+# in opposite directions:
+#
+#   * benign driver flags  -> accept SILENTLY (bfd and mold do)
+#   * LTO bytecode input   -> REFUSE LOUDLY with an actionable message
+#
+# The second is the interesting one.  bfd/mold/wild "succeed" on LTO input
+# only because they load the plugin that turns IR back into machine code.
+# lccc has no plugin support, so accepting the file would mean emitting a
+# binary with code silently missing.  Refusing is the correct answer, and the
+# message must name the file and the fix.
+
+def _driver_option_noise_test(args, _oracles):
+    td = tempfile.mkdtemp(prefix="lnk.optnoise.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    out = []
+    try:
+        if not os.path.exists(ld):
+            return [Result("driver_option_noise", "SKIP", "lccc-ld not built")]
+        with open(os.path.join(td, "n.c"), "w") as f:
+            f.write(ROBUSTNESS_SRC)
+        r = sh([CC, "-c", "-O1", "n.c"], cwd=td)
+        if r.returncode != 0:
+            return [Result("driver_option_noise", "SKIP", "compile failed")]
+
+        shim = os.path.join(td, "shim")
+        os.makedirs(shim, exist_ok=True)
+        os.symlink(os.path.abspath(ld), os.path.join(shim, "ld"))
+
+        # --- half 1: a normal gcc-driven link must be silent -----------------
+        r = sh([CC, "-B" + shim, "-nostdlib", "-static", "n.o",
+                "-o", os.path.join(td, "a.out")], cwd=td)
+        noise = [ln for ln in r.stderr.decode(errors="replace").splitlines()
+                 if "ignoring unknown option" in ln]
+        if r.returncode != 0:
+            out.append(Result("driver_option_noise", "FAIL",
+                              f"link failed: {r.stderr.decode()[:250]}"))
+        elif noise:
+            out.append(Result("driver_option_noise", "FAIL",
+                              f"{len(noise)} spurious warning(s), e.g. {noise[0]!r}"))
+        else:
+            out.append(Result("driver_option_noise", "PASS"))
+
+        # Explicitly check the individual flags too, so a future refactor that
+        # drops one of them from the allow-list is caught by name.
+        for flag in ("--push-state", "--pop-state", "--eh-frame-hdr",
+                     "--no-warn-execstack", "-plugin-opt=whatever"):
+            rr = sh([ld, flag, "-o", os.path.join(td, "b.out"), "n.o"], cwd=td)
+            msg = rr.stderr.decode(errors="replace")
+            if "ignoring unknown option" in msg:
+                out.append(Result(f"driver_flag_silent[{flag}]", "FAIL",
+                                  "still warns"))
+            else:
+                out.append(Result(f"driver_flag_silent[{flag}]", "PASS"))
+
+        # --- half 2: LTO bytecode must be refused with a useful message ------
+        rl = sh([CC, "-c", "-O1", "-flto", "n.c", "-o", "nlto.o"], cwd=td)
+        if rl.returncode != 0:
+            out.append(Result("lto_bytecode_refused", "SKIP",
+                              "compiler cannot produce -flto objects"))
+            return out
+        rr = sh([ld, "-plugin", "/nonexistent/liblto_plugin.so",
+                 "-o", os.path.join(td, "c.out"), "nlto.o"], cwd=td)
+        msg = (rr.stderr.decode(errors="replace") +
+               rr.stdout.decode(errors="replace"))
+        if rr.returncode == 0:
+            out.append(Result("lto_bytecode_refused", "FAIL",
+                              "linked LTO bytecode without a plugin — the "
+                              "output would be missing code"))
+        elif "LTO" not in msg or "nlto.o" not in msg:
+            out.append(Result("lto_bytecode_refused", "FAIL",
+                              f"rejected, but message is not actionable: {msg[:200]!r}"))
+        else:
+            out.append(Result("lto_bytecode_refused", "PASS"))
+        return out
+    except Exception as e:
+        return [Result("driver_option_noise", "FAIL", f"harness exception: {e!r}")]
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ============================================================================
+# --exclude-libs
+# ============================================================================
+#
+# `--exclude-libs=ARCHIVE` links an archive's members in but keeps their
+# symbols out of .dynsym.  This is how a shared library statically absorbs a
+# helper archive (OpenSSL's libcrypto.a inside a plugin .so is the canonical
+# case) without leaking that archive's whole symbol table into its ABI, where
+# it would collide with a different copy loaded elsewhere in the process.
+#
+# The test checks three things, and the third is the one that actually bit:
+#
+#   1. without the flag the helper symbols ARE exported (control);
+#   2. with the flag they are NOT, while the real API still is;
+#   3. the library still LOADS AND RUNS.
+#
+# (3) matters because the first implementation passed (1) and (2) and still
+# produced a broken .so: the excluded symbol kept its PLT entry and JUMP_SLOT
+# relocation, but the .dynsym entry that relocation referenced was gone, so it
+# degenerated to symbol index 0 and the loader died with
+# `symbol lookup error: ...: undefined symbol: ` (empty name).  Checking only
+# the symbol table would have shipped that.
+
+def _exclude_libs_test(args, _oracles):
+    td = tempfile.mkdtemp(prefix="lnk.exclibs.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    out = []
+    try:
+        if not os.path.exists(ld):
+            return [Result("exclude_libs", "SKIP", "lccc-ld not built")]
+        if not shutil.which("readelf") or not shutil.which("ar"):
+            return [Result("exclude_libs", "SKIP", "readelf/ar not available")]
+
+        with open(os.path.join(td, "h.c"), "w") as f:
+            f.write("int helper_internal(int x){ return x * 7; }\n"
+                    "int helper_other(int x){ return x + 1; }\n")
+        with open(os.path.join(td, "api.c"), "w") as f:
+            f.write("extern int helper_internal(int);\n"
+                    "int public_api(int x){ return helper_internal(x) + 1; }\n")
+        with open(os.path.join(td, "u.c"), "w") as f:
+            f.write("#include <stdio.h>\nextern int public_api(int);\n"
+                    "int main(void){ printf(\"%d\\n\", public_api(6)); return 0; }\n")
+        r = sh([CC, "-c", "-O2", "-fPIC", "h.c", "api.c"], cwd=td)
+        if r.returncode != 0:
+            return [Result("exclude_libs", "SKIP", "fixture compile failed")]
+        r = sh(["ar", "rcs", "libhelper.a", "h.o"], cwd=td)
+        if r.returncode != 0:
+            return [Result("exclude_libs", "SKIP", "ar failed")]
+
+        shim = os.path.join(td, "shim")
+        os.makedirs(shim, exist_ok=True)
+        os.symlink(os.path.abspath(ld), os.path.join(shim, "ld"))
+
+        def build(name, extra):
+            so = os.path.join(td, name)
+            rr = sh([CC, "-shared", "-B" + shim, "api.o", "libhelper.a"]
+                    + extra + ["-o", so], cwd=td)
+            return (rr, so)
+
+        def dyn_names(so):
+            rr = sh(["readelf", "--dyn-syms", "-W", so], cwd=td)
+            names = set()
+            for line in rr.stdout.decode(errors="replace").splitlines():
+                parts = line.split()
+                if len(parts) >= 8 and re.match(r"^\d+:$", parts[0]):
+                    names.add(parts[7].split("@")[0])
+            return names
+
+        # (1) control: helper symbols exported without the flag
+        rr, so_without = build("lib_without.so", [])
+        if rr.returncode != 0:
+            return [Result("exclude_libs", "FAIL",
+                           f"control link failed: {rr.stderr.decode()[:250]}")]
+        n_without = dyn_names(so_without)
+        if "helper_internal" not in n_without:
+            out.append(Result("exclude_libs_control", "SKIP",
+                              "helper not exported even without the flag"))
+        else:
+            out.append(Result("exclude_libs_control", "PASS"))
+
+        # (2) with the flag: helpers hidden, API still exported
+        rr, so_with = build("lib_with.so", ["-Wl,--exclude-libs=libhelper.a"])
+        if rr.returncode != 0:
+            return out + [Result("exclude_libs_hides_symbols", "FAIL",
+                                 f"link failed: {rr.stderr.decode()[:250]}")]
+        n_with = dyn_names(so_with)
+        leaked = {"helper_internal", "helper_other"} & n_with
+        if leaked:
+            out.append(Result("exclude_libs_hides_symbols", "FAIL",
+                              f"still exported: {sorted(leaked)}"))
+        elif "public_api" not in n_with:
+            out.append(Result("exclude_libs_hides_symbols", "FAIL",
+                              "public_api was hidden too — over-broad exclusion"))
+        else:
+            out.append(Result("exclude_libs_hides_symbols", "PASS"))
+
+        # (3) the .so must still load and produce the right answer
+        rr = sh([CC, "u.c", so_with, "-Wl,-rpath," + td, "-o", "useit"], cwd=td)
+        if rr.returncode != 0:
+            out.append(Result("exclude_libs_lib_still_works", "FAIL",
+                              f"consumer link failed: {rr.stderr.decode()[:250]}"))
+        else:
+            code, sout = run_bin(os.path.join(td, "useit"), [], td)
+            if sout != "43\n":
+                out.append(Result("exclude_libs_lib_still_works", "FAIL",
+                                  f"got {sout!r} (exit {code}), expected '43' — "
+                                  "excluded symbols likely left a dangling "
+                                  "PLT/JUMP_SLOT at symbol index 0"))
+            else:
+                out.append(Result("exclude_libs_lib_still_works", "PASS"))
+
+        # (3b) no relocation may reference the NULL symbol (index 0).
+        #
+        # readelf -r prints "<offset> <info> <type> <value> <name> + <addend>".
+        # The symbol index is the HIGH 32 bits of r_info, not the value column:
+        # an undefined-but-named symbol such as __cxa_finalize legitimately has
+        # value 0, so keying on the value column produces a false positive.
+        rr = sh(["readelf", "-rW", so_with], cwd=td)
+        dangling = []
+        for ln in rr.stdout.decode(errors="replace").splitlines():
+            m = re.match(r"^[0-9a-f]{16}\s+([0-9a-f]{16})\s+(\S+)", ln)
+            if not m:
+                continue
+            sym_idx = int(m.group(1), 16) >> 32
+            if sym_idx == 0 and "JUMP_SLOT" in m.group(2):
+                dangling.append(ln)
+        out.append(Result("exclude_libs_no_null_jumpslot",
+                          "FAIL" if dangling else "PASS",
+                          "" if not dangling else
+                          f"JUMP_SLOT against symbol index 0: {dangling[0][:110]}"))
+
+        # (4) ALL keyword
+        rr, so_all = build("lib_all.so", ["-Wl,--exclude-libs=ALL"])
+        if rr.returncode == 0:
+            n_all = dyn_names(so_all)
+            leaked = {"helper_internal", "helper_other"} & n_all
+            out.append(Result("exclude_libs_ALL",
+                              "FAIL" if leaked else "PASS",
+                              "" if not leaked else f"still exported: {sorted(leaked)}"))
+        else:
+            out.append(Result("exclude_libs_ALL", "FAIL",
+                              f"link failed: {rr.stderr.decode()[:200]}"))
+        return out
+    except Exception as e:
+        return [Result("exclude_libs", "FAIL", f"harness exception: {e!r}")]
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ============================================================================
+# --emit-relocs  (Linux kernel: CONFIG_RELOCATABLE / KASLR)
+# ============================================================================
+#
+# `--emit-relocs` keeps a record of every relocation the linker applied, as
+# .rela.<section> sections in the *linked* image.  The Linux kernel's
+# arch/x86/tools/relocs pass reads them out of vmlinux and turns them into the
+# table the boot code walks to slide the kernel to a random base
+# (CONFIG_RELOCATABLE, CONFIG_RANDOMIZE_BASE).
+#
+# Before this was implemented lccc-ld *accepted the flag and ignored it*.  The
+# link reported success and produced an image with zero .rela sections, so the
+# kernel build would complete and then fail to boot -- the worst possible
+# failure mode, and the reason this ranks above cosmetic feature gaps.
+#
+# What is checked, in increasing order of strength:
+#   1. the sections exist at all, with correct sh_link/sh_info wiring;
+#   2. the *set* of relocations equals GNU ld's, compared SECTION-RELATIVE
+#      (absolute addresses legitimately differ: bfd and lccc are free to lay
+#      the image out differently, and they do);
+#   3. type, target symbol and addend agree entry-for-entry;
+#   4. the flag does not perturb the image otherwise -- the same link without
+#      --emit-relocs must produce identical section contents.
+
+EMIT_RELOCS_SRC = r"""
+int gvar = 42;
+int *gptr = &gvar;                 /* R_X86_64_64 against data      */
+int helper(int x){ return x + gvar; }
+int (*fptr)(int) = helper;         /* R_X86_64_64 against a function */
+static const int table[4] = {1,2,3,4};
+const int *tptr = table;           /* R_X86_64_64 against a local    */
+int use(int i){ return table[i & 3] + helper(i); }
+void _start(void){ }
+"""
+
+EMIT_RELOCS_LDS = """
+ENTRY(_start)
+SECTIONS {
+  . = 0xffffffff81000000;
+  .text : { *(.text .text.*) }
+  .rodata : { *(.rodata .rodata.*) }
+  .data : { *(.data .data.*) }
+  .bss  : { *(.bss) *(COMMON) }
+}
+"""
+
+
+def _read_sections(binary, td):
+    """name -> (index, addr) for every section header."""
+    r = sh(["readelf", "-SW", binary], cwd=td)
+    out = {}
+    for m in re.finditer(
+            r"\[\s*(\d+)\]\s+(\S+)\s+(\S+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)",
+            r.stdout.decode(errors="replace")):
+        idx, name, _t, addr, _off, _size = m.groups()
+        out[name] = (int(idx), int(addr, 16))
+    return out
+
+
+def _read_relocs_relative(binary, td):
+    """{(section, offset_within_section): (type, symbol, addend)}.
+
+    Section-relative so two linkers that chose different base addresses can
+    still be compared.  Section-symbol references print with an empty name in
+    readelf, which is normalised away.
+    """
+    secs = _read_sections(binary, td)
+    r = sh(["readelf", "-rW", binary], cwd=td)
+    cur, out = None, {}
+    for line in r.stdout.decode(errors="replace").splitlines():
+        m = re.match(r"Relocation section '(\S+)'", line)
+        if m:
+            cur = m.group(1).replace(".rela", "", 1)
+            continue
+        m = re.match(r"^([0-9a-f]{16})\s+([0-9a-f]{16})\s+(\S+)"
+                     r"(?:\s+[0-9a-f]{16})?\s*(.*)$", line)
+        if m and cur is not None:
+            off, _info, rtype, rest = m.groups()
+            base = secs.get(cur, (0, 0))[1]
+            rest = (rest or "").strip()
+            # Drop a leading section-symbol name so ".text + 9" and "+ 9"
+            # compare equal; the addend is what carries the information.
+            rest = re.sub(r"^\.[\w.]+", "", rest).replace(" ", "")
+            out[(cur, int(off, 16) - base)] = (rtype, rest)
+    return out
+
+
+def _emit_relocs_test(args, _oracles):
+    td = tempfile.mkdtemp(prefix="lnk.emitrelocs.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    out = []
+    try:
+        if not os.path.exists(ld):
+            return [Result("emit_relocs", "SKIP", "lccc-ld not built")]
+        if not shutil.which("readelf"):
+            return [Result("emit_relocs", "SKIP", "readelf not available")]
+
+        with open(os.path.join(td, "k.c"), "w") as f:
+            f.write(EMIT_RELOCS_SRC)
+        with open(os.path.join(td, "k.lds"), "w") as f:
+            f.write(EMIT_RELOCS_LDS)
+        r = sh([CC, "-c", "-O1", "-fno-pic", "-fno-stack-protector",
+                "k.c", "-o", "k.o"], cwd=td)
+        if r.returncode != 0:
+            return [Result("emit_relocs", "SKIP",
+                           f"fixture compile failed: {r.stderr.decode()[:200]}")]
+
+        # lccc, with and without the flag
+        r = sh([ld, "--emit-relocs", "-T", "k.lds", "k.o", "-o", "k.lccc"], cwd=td)
+        if r.returncode != 0:
+            return [Result("emit_relocs", "FAIL",
+                           f"lccc link failed: {r.stderr.decode()[:300]}")]
+        r = sh([ld, "-T", "k.lds", "k.o", "-o", "k.plain"], cwd=td)
+        if r.returncode != 0:
+            return [Result("emit_relocs", "FAIL",
+                           f"lccc plain link failed: {r.stderr.decode()[:300]}")]
+
+        lccc_rel = _read_relocs_relative(os.path.join(td, "k.lccc"), td)
+
+        # (1) the sections must exist and be non-empty
+        if not lccc_rel:
+            return [Result("emit_relocs_sections_present", "FAIL",
+                           "--emit-relocs produced no .rela sections at all "
+                           "(a KASLR kernel built this way would not boot)")]
+        out.append(Result("emit_relocs_sections_present", "PASS",
+                          f"{len(lccc_rel)} relocations retained"))
+
+        # (1b) sh_link must point at .symtab and sh_info at the target section
+        rs = sh(["readelf", "-SW", os.path.join(td, "k.lccc")], cwd=td)
+        text = rs.stdout.decode(errors="replace")
+        secs = _read_sections(os.path.join(td, "k.lccc"), td)
+        symtab_idx = secs.get(".symtab", (None, 0))[0]
+        bad_link = []
+        # readelf -SW column layout:
+        #   [Nr] Name Type Address Off Size ES Flg Lk Inf Al
+        # `Flg` is EMPTY for SHT_RELA sections, so a positional regex that
+        # assumes it is present silently reads Lk/Inf one column early and
+        # reports a false mismatch. Anchor on the trailing fields instead:
+        # the last three whitespace-separated tokens are always Lk, Inf, Al.
+        for line in text.splitlines():
+            m = re.match(r"\s*\[\s*(\d+)\]\s+(\.rela\S*)\s+RELA\s+(.*)$", line)
+            if not m:
+                continue
+            _i, name, tail = m.groups()
+            fields = tail.split()
+            if len(fields) < 3:
+                continue
+            link, info = fields[-3], fields[-2]
+            target = name.replace(".rela", "", 1)
+            if symtab_idx is not None and int(link) != symtab_idx:
+                bad_link.append(f"{name}: sh_link={link} != .symtab({symtab_idx})")
+            want_info = secs.get(target, (None, 0))[0]
+            if want_info is not None and int(info) != want_info:
+                bad_link.append(f"{name}: sh_info={info} != {target}({want_info})")
+        out.append(Result("emit_relocs_header_wiring",
+                          "FAIL" if bad_link else "PASS",
+                          "; ".join(bad_link[:3])))
+
+        # (2)+(3) differential against GNU ld
+        bfd = shutil.which("ld.bfd") or shutil.which("ld")
+        if bfd:
+            rb = sh([bfd, "--emit-relocs", "-T", "k.lds", "k.o", "-o", "k.bfd"], cwd=td)
+            if rb.returncode == 0:
+                bfd_rel = _read_relocs_relative(os.path.join(td, "k.bfd"), td)
+                keys = set(bfd_rel) | set(lccc_rel)
+                disagree = [(k, bfd_rel.get(k), lccc_rel.get(k))
+                            for k in sorted(keys)
+                            if bfd_rel.get(k) != lccc_rel.get(k)]
+                if disagree:
+                    out.append(Result("emit_relocs_matches_gnu_ld", "FAIL",
+                        f"{len(disagree)}/{len(keys)} differ, e.g. "
+                        f"{disagree[0]}"))
+                else:
+                    out.append(Result("emit_relocs_matches_gnu_ld", "PASS",
+                        f"all {len(keys)} relocations agree with GNU ld"))
+            else:
+                out.append(Result("emit_relocs_matches_gnu_ld", "SKIP",
+                                  "GNU ld rejected the script"))
+
+        # (3b) STRONGEST CHECK: run the *actual* Linux kernel relocs tool.
+        #
+        # arch/x86/tools/relocs is the real consumer of --emit-relocs. If it
+        # accepts lccc's image and derives the same relocation set it derives
+        # from GNU ld's, the KASLR boot path will work. Nothing short of this
+        # proves the feature; the tool is fetched by
+        # tests/linker/setup_kernel_tools.sh and skipped if unavailable.
+        relocs_tool = os.environ.get("LCCC_RELOCS_TOOL",
+                                     "/home/user/tools/bin/relocs")
+        if os.path.exists(relocs_tool) and bfd:
+            def reloc_targets(binary):
+                """Relocation targets as SECTION-RELATIVE strings.
+
+                Absolute addresses legitimately differ between linkers (bfd
+                pads sections differently), so comparing raw addresses would
+                report a false mismatch. What must agree is *which bytes* need
+                relocating.
+                """
+                secs = _read_sections(binary, td)
+                rr = sh([relocs_tool, "--text", binary], cwd=td)
+                if rr.returncode != 0:
+                    return None
+                vals = [int(x, 16) for x in re.findall(
+                    r"\.long (0x[0-9a-f]+)", rr.stdout.decode(errors="replace"))]
+                out_t = []
+                for v in vals:
+                    if not v:
+                        continue
+                    full = 0xffffffff00000000 | v
+                    hit = None
+                    for n, (_i, a) in secs.items():
+                        # size is not in _read_sections; use the next section
+                        # start implicitly by picking the closest lower base.
+                        if a and a <= full and (hit is None or a > hit[1]):
+                            hit = (n, a)
+                    out_t.append(f"{hit[0]}+0x{full - hit[1]:x}" if hit else hex(v))
+                return out_t
+
+            t_lccc = reloc_targets(os.path.join(td, "k.lccc"))
+            t_bfd = reloc_targets(os.path.join(td, "k.bfd"))
+            if t_lccc is None:
+                out.append(Result("emit_relocs_kernel_relocs_tool", "FAIL",
+                                  "kernel relocs tool REJECTED lccc's image"))
+            elif t_bfd is None:
+                out.append(Result("emit_relocs_kernel_relocs_tool", "SKIP",
+                                  "relocs tool rejected the bfd reference too"))
+            elif t_lccc != t_bfd:
+                out.append(Result("emit_relocs_kernel_relocs_tool", "FAIL",
+                                  f"relocation set differs from GNU ld's:\n"
+                                  f"      bfd  = {t_bfd}\n      lccc = {t_lccc}"))
+            else:
+                out.append(Result("emit_relocs_kernel_relocs_tool", "PASS",
+                                  f"kernel relocs tool derives an identical "
+                                  f"set ({len(t_lccc)} entries) from lccc and GNU ld"))
+
+        # (4) the flag must not change the image itself
+        def alloc_contents(binary):
+            got = {}
+            for name in (".text", ".rodata", ".data"):
+                rr = sh(["objcopy", "-O", "binary", "--only-section", name,
+                         binary, f"{binary}{name}.bin"], cwd=td)
+                p = os.path.join(td, f"{binary}{name}.bin")
+                if rr.returncode == 0 and os.path.exists(p):
+                    got[name] = open(p, "rb").read()
+            return got
+        if shutil.which("objcopy"):
+            a = alloc_contents(os.path.join(td, "k.lccc"))
+            b = alloc_contents(os.path.join(td, "k.plain"))
+            changed = [n for n in a if a.get(n) != b.get(n)]
+            out.append(Result("emit_relocs_does_not_perturb_image",
+                              "FAIL" if changed else "PASS",
+                              f"sections differ: {changed}" if changed else ""))
+        return out
+    except Exception as e:
+        return [Result("emit_relocs", "FAIL", f"harness exception: {e!r}")]
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ============================================================================
+# -rdynamic / --export-dynamic on EXECUTABLES  (+ --version-script)
+# ============================================================================
+#
+# `gcc -rdynamic` must put the executable's own global symbols into .dynsym so
+# that a dlopen'd plugin can call back into the host, and so backtrace_symbols
+# can name frames.  This is how every plugin host works (and how the kernel's
+# own userspace tooling, perf/bpftool style, resolves callbacks).
+#
+# The bug this pins down: gcc's driver spells the flag with a SINGLE dash
+# (`gcc -rdynamic` -> `collect2 ... -export-dynamic`), while lccc-ld only
+# matched the double-dash `--export-dynamic`.  The flag therefore fell through
+# to the unknown-option arm and was dropped, so `gcc -rdynamic` produced an
+# executable that exported nothing.
+#
+# It survived because `lccc-ld --export-dynamic ...` invoked DIRECTLY worked
+# perfectly — so any test that drove the linker directly passed.  The test
+# below deliberately goes through `gcc`, which is how real builds invoke it,
+# and finishes with an end-to-end dlopen round trip rather than a symbol-table
+# inspection.
+
+RDYNAMIC_HOST = r"""
+#include <stdio.h>
+#include <dlfcn.h>
+int host_callback(int x){ return x * 10; }
+int main(void){
+    void *h = dlopen("./plug.so", RTLD_NOW);
+    if(!h){ printf("dlopen failed: %s\n", dlerror()); return 1; }
+    int (*run)(int) = (int(*)(int))dlsym(h, "plug_run");
+    if(!run){ printf("dlsym failed\n"); return 1; }
+    printf("%d\n", run(4));
+    return 0;
+}
+"""
+
+RDYNAMIC_PLUG = r"""
+extern int host_callback(int);
+int plug_run(int x){ return host_callback(x) + 1; }
+"""
+
+RDYNAMIC_LIB = r"""
+#include <stdio.h>
+int exported_api(int x){ return x + 1; }
+int internal_helper(int x){ return x * 2; }
+int main(void){ printf("%d\n", exported_api(1) + internal_helper(2)); return 0; }
+"""
+
+
+def _dynsym_names(binary, td):
+    r = sh(["readelf", "--dyn-syms", "-W", binary], cwd=td)
+    names = set()
+    for line in r.stdout.decode(errors="replace").splitlines():
+        p = line.split()
+        if len(p) >= 8 and re.match(r"^\d+:$", p[0]):
+            names.add(p[7].split("@")[0])
+    return names
+
+
+def _export_dynamic_test(args, _oracles):
+    td = tempfile.mkdtemp(prefix="lnk.rdynamic.")
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    out = []
+    try:
+        if not os.path.exists(ld):
+            return [Result("export_dynamic", "SKIP", "lccc-ld not built")]
+        if not shutil.which("readelf"):
+            return [Result("export_dynamic", "SKIP", "readelf not available")]
+
+        shim = os.path.join(td, "shim")
+        os.makedirs(shim, exist_ok=True)
+        os.symlink(os.path.abspath(ld), os.path.join(shim, "ld"))
+
+        for fn, src in (("host.c", RDYNAMIC_HOST), ("plug.c", RDYNAMIC_PLUG),
+                        ("lib.c", RDYNAMIC_LIB)):
+            with open(os.path.join(td, fn), "w") as f:
+                f.write(src)
+        with open(os.path.join(td, "v.map"), "w") as f:
+            f.write("{ global: exported_api; main; local: *; };\n")
+
+        r = sh([CC, "-shared", "-fPIC", "plug.c", "-o", "plug.so"], cwd=td)
+        if r.returncode != 0:
+            return [Result("export_dynamic", "SKIP", "plugin build failed")]
+
+        # --- 1. symbol-table check, driven through gcc (not lccc-ld directly)
+        r = sh([CC, "-Bshim", "-rdynamic", "lib.c", "-o", "app"], cwd=td)
+        if r.returncode != 0:
+            return [Result("export_dynamic_exports_globals", "FAIL",
+                           f"link failed: {r.stderr.decode()[:250]}")]
+        names = _dynsym_names(os.path.join(td, "app"), td)
+        missing = {"exported_api", "main"} - names
+        if missing:
+            out.append(Result("export_dynamic_exports_globals", "FAIL",
+                f"gcc -rdynamic did not export {sorted(missing)}; "
+                f"gcc spells the flag '-export-dynamic' (single dash) — "
+                f"is that spelling handled?"))
+        else:
+            out.append(Result("export_dynamic_exports_globals", "PASS",
+                              f"{len(names)} dynamic symbols"))
+
+        # --- 2. end-to-end: dlopen'd plugin calls back into the host
+        r = sh([CC, "-Bshim", "-rdynamic", "host.c", "-ldl", "-o", "host"], cwd=td)
+        if r.returncode != 0:
+            out.append(Result("export_dynamic_dlopen_callback", "FAIL",
+                              f"host link failed: {r.stderr.decode()[:250]}"))
+        else:
+            code, sout = run_bin(os.path.join(td, "host"), [], td)
+            if sout.strip() != "41":
+                out.append(Result("export_dynamic_dlopen_callback", "FAIL",
+                    f"plugin could not call back into the host: "
+                    f"got {sout!r} (exit {code}), expected '41'"))
+            else:
+                out.append(Result("export_dynamic_dlopen_callback", "PASS"))
+
+        # --- 3. --version-script must still narrow the export set
+        r = sh([CC, "-Bshim", "-rdynamic", "lib.c",
+                "-Wl,--version-script=v.map", "-o", "app_vs"], cwd=td)
+        if r.returncode != 0:
+            out.append(Result("export_dynamic_version_script", "FAIL",
+                              f"link failed: {r.stderr.decode()[:250]}"))
+        else:
+            vnames = _dynsym_names(os.path.join(td, "app_vs"), td)
+            code, sout = run_bin(os.path.join(td, "app_vs"), [], td)
+            if "internal_helper" in vnames:
+                out.append(Result("export_dynamic_version_script", "FAIL",
+                    "version script 'local: *' did not hide internal_helper"))
+            elif "exported_api" not in vnames:
+                out.append(Result("export_dynamic_version_script", "FAIL",
+                    "version script hid exported_api, which is in 'global:'"))
+            elif sout.strip() != "6":
+                out.append(Result("export_dynamic_version_script", "FAIL",
+                    f"binary misbehaved: {sout!r}"))
+            else:
+                out.append(Result("export_dynamic_version_script", "PASS"))
+
+        # --- 4. differential: same export decisions as GNU ld
+        bfd = shutil.which("ld.bfd")
+        if bfd:
+            r = sh([CC, "-fuse-ld=bfd", "-rdynamic", "lib.c", "-o", "app_bfd"], cwd=td)
+            if r.returncode == 0:
+                bnames = _dynsym_names(os.path.join(td, "app_bfd"), td)
+                # Compare only the user's own symbols; CRT/linker-defined
+                # symbols legitimately differ between linkers.
+                user = {"exported_api", "internal_helper", "main"}
+                if (bnames & user) != (names & user):
+                    out.append(Result("export_dynamic_matches_gnu_ld", "FAIL",
+                        f"bfd exports {sorted(bnames & user)}, "
+                        f"lccc exports {sorted(names & user)}"))
+                else:
+                    out.append(Result("export_dynamic_matches_gnu_ld", "PASS",
+                        f"both export {sorted(bnames & user)}"))
+        return out
+    except Exception as e:
+        return [Result("export_dynamic", "FAIL", f"harness exception: {e!r}")]
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+# ============================================================================
 # Runner
 # ============================================================================
 
@@ -1647,6 +2861,37 @@ def main():
         results.append(_interpose_test(args, oracles,
             "so_bsymbolic_binds_local", ["-Wl,-Bsymbolic"], "43\n"))
         results.append(_zdefs_test(args, oracles))
+
+    if not args.tag or args.tag == "exports":
+        if not args.filter or "export_dynamic" in args.filter or "rdynamic" in args.filter:
+            results.extend(_export_dynamic_test(args, oracles))
+
+    if not args.tag or args.tag == "kernel":
+        if not args.filter or "emit_relocs" in args.filter or "kernel" in args.filter:
+            results.extend(_emit_relocs_test(args, oracles))
+
+    if not args.tag or args.tag == "exports":
+        if not args.filter or "exclude" in args.filter:
+            results.extend(_exclude_libs_test(args, oracles))
+
+    if not args.tag or args.tag == "driver":
+        if not args.filter or "driver" in args.filter or "lto" in args.filter:
+            results.extend(_driver_option_noise_test(args, oracles))
+
+    if not args.tag or args.tag == "layout":
+        if not args.filter or "segment" in args.filter or "relro" in args.filter \
+                or "shared_lib" in args.filter \
+                or "output_not" in args.filter:
+            results.extend(_segment_packing_test(args, oracles))
+
+    if not args.tag or args.tag == "map":
+        if not args.filter or "map" in args.filter:
+            results.append(_map_file_test(args, oracles))
+            results.append(_map_file_spellings_test(args, oracles))
+
+    if not args.tag or args.tag == "robustness":
+        if not args.filter or "malformed" in args.filter or "robust" in args.filter:
+            results.extend(_robustness_tests(args, oracles))
 
     npass = sum(1 for r in results if r.status == "PASS")
     nfail = sum(1 for r in results if r.status == "FAIL")

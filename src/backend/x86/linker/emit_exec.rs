@@ -35,6 +35,12 @@ pub(super) fn emit_executable(
     is_static: bool, ifunc_symbols: &[String],
     entry_symbol: Option<&str>,
     z_now: bool, z_relro: bool,
+    // `-Map=FILE`: write a GNU-ld-compatible link map after layout.
+    map_path: Option<&str>,
+    // `--version-script=FILE`: restrict which symbols --export-dynamic puts
+    // into .dynsym. Previously honoured only for shared objects, so a
+    // `local: *;` script silently exported everything from an executable.
+    version_script_path: Option<&str>,
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     let mut t_zone = std::time::Instant::now();
@@ -87,11 +93,25 @@ pub(super) fn emit_executable(
     // dynamic symbol table so shared libraries loaded at runtime (via dlopen)
     // can find symbols from this executable.
     if export_dynamic {
+        // A version script narrows the --export-dynamic set exactly as it does
+        // for shared objects; `{ global: a; b; local: *; }` is the common
+        // spelling used to keep an executable's plugin ABI small.
+        let version_script = version_script_path
+            .and_then(linker_common::VersionScript::parse);
         let mut exported: Vec<String> = globals.iter()
-            .filter(|(_, g)| {
+            .filter(|(name, g)| {
                 // Export defined, non-dynamic (local to this executable) global symbols
-                g.section_idx != SHN_UNDEF && !g.is_dynamic && !g.copy_reloc
-                    && (g.info >> 4) != 0 // not STB_LOCAL
+                if !(g.section_idx != SHN_UNDEF && !g.is_dynamic && !g.copy_reloc
+                    && (g.info >> 4) != 0) // not STB_LOCAL
+                {
+                    return false;
+                }
+                if let Some(ref vs) = version_script {
+                    if vs.local_star && !vs.matches_global(name) {
+                        return false;
+                    }
+                }
+                true
             })
             .map(|(n, _)| n.clone())
             .collect();
@@ -360,45 +380,75 @@ pub(super) fn emit_executable(
 
     zone!("pre-layout");
     // === Layout ===
+    //
+    // Segment packing: file offsets stay *dense*, virtual addresses advance in
+    // whole pages.
+    //
+    // A PT_LOAD segment does not need its file offset page-aligned. The ELF
+    // gABI only requires `p_offset ≡ p_vaddr (mod p_align)`, because mmap maps
+    // `p_offset & ~(pagesize-1)` to `p_vaddr & ~(pagesize-1)`. Rounding the
+    // *file offset* up to a page at every segment boundary — which this
+    // linker used to do, since `addr` was hardwired to `BASE_ADDR + offset` —
+    // inserts up to one page of zero padding per segment.
+    //
+    // Measured on a zlib-ng test binary: lccc 20 640 bytes vs bfd 16 400 and
+    // wild 6 773, with the entire difference being inter-segment padding
+    // (7 568 + 3 504 bytes of holes) rather than content. bfd and wild both
+    // emit congruent, non-page-aligned offsets (e.g. off=0x2d70/vaddr=0x3d70).
+    //
+    // `vaddr_bias` is always a multiple of PAGE_SIZE, so congruence
+    // `(offset + bias) ≡ offset (mod PAGE_SIZE)` holds by construction and
+    // every `p_offset ≡ p_vaddr (mod PAGE_SIZE)` requirement is satisfied
+    // automatically. Bumping the bias by one page at a segment boundary gives
+    // the new segment a fresh page of address space (so permissions never
+    // share a page) while costing zero bytes in the file.
+    // The packing invariant itself lives in `layout_plan::SegmentPacker`, which
+    // is unit-tested independently. It used to be a pair of local macros here
+    // and a second, identical pair in emit_shared.rs — and that duplication is
+    // precisely why the shared-library path stayed broken after the executable
+    // path was fixed.
+    let mut packer = super::layout_plan::SegmentPacker::new(BASE_ADDR, PAGE_SIZE);
+    macro_rules! vaddr { ($off:expr) => { packer.vaddr($off) } }
+    macro_rules! new_segment { () => { packer.new_segment(); } }
     let mut offset = 64 + phdr_total_size;
     let interp_offset = offset;
-    let interp_addr = BASE_ADDR + offset;
+    let interp_addr = vaddr!(offset);
     if !is_static { offset += INTERP.len() as u64; }
 
     offset = (offset + 7) & !7;
-    let gnu_hash_offset = offset; let gnu_hash_addr = BASE_ADDR + offset; offset += gnu_hash_size;
+    let gnu_hash_offset = offset; let gnu_hash_addr = vaddr!(offset); offset += gnu_hash_size;
     offset = (offset + 7) & !7;
-    let dynsym_offset = offset; let dynsym_addr = BASE_ADDR + offset; offset += dynsym_size;
-    let dynstr_offset = offset; let dynstr_addr = BASE_ADDR + offset; offset += dynstr_size;
+    let dynsym_offset = offset; let dynsym_addr = vaddr!(offset); offset += dynsym_size;
+    let dynstr_offset = offset; let dynstr_addr = vaddr!(offset); offset += dynstr_size;
     // .gnu.version (versym) - right after dynstr, aligned to 2
     offset = (offset + 1) & !1;
-    let versym_offset = offset; let versym_addr = BASE_ADDR + offset;
+    let versym_offset = offset; let versym_addr = vaddr!(offset);
     if versym_size > 0 { offset += versym_size; }
     // .gnu.version_r (verneed) - aligned to 4
     offset = (offset + 3) & !3;
-    let verneed_offset = offset; let verneed_addr = BASE_ADDR + offset;
+    let verneed_offset = offset; let verneed_addr = vaddr!(offset);
     if verneed_size > 0 { offset += verneed_size; }
     offset = (offset + 7) & !7;
-    let rela_dyn_offset = offset; let rela_dyn_addr = BASE_ADDR + offset; offset += rela_dyn_size;
+    let rela_dyn_offset = offset; let rela_dyn_addr = vaddr!(offset); offset += rela_dyn_size;
     offset = (offset + 7) & !7;
-    let rela_plt_offset = offset; let rela_plt_addr = BASE_ADDR + offset; offset += rela_plt_size;
+    let rela_plt_offset = offset; let rela_plt_addr = vaddr!(offset); offset += rela_plt_size;
 
     // Text segment
-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    new_segment!();
     let text_page_offset = offset;
-    let text_page_addr = BASE_ADDR + offset;
+    let text_page_addr = vaddr!(offset);
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_EXECINSTR != 0 && sec.flags & SHF_ALLOC != 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = vaddr!(offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
     let (plt_addr, plt_offset) = if plt_size > 0 {
         offset = (offset + 15) & !15;
-        let a = BASE_ADDR + offset; let o = offset; offset += plt_size; (a, o)
+        let a = vaddr!(offset); let o = offset; offset += plt_size; (a, o)
     } else { (0u64, 0u64) };
 
     // .iplt (IFUNC PLT entries for static linking)
@@ -407,18 +457,18 @@ pub(super) fn emit_executable(
     let iplt_total_size = num_ifunc as u64 * iplt_entry_size;
     let (iplt_addr, iplt_offset) = if iplt_total_size > 0 {
         offset = (offset + 15) & !15;
-        let a = BASE_ADDR + offset; let o = offset; offset += iplt_total_size; (a, o)
+        let a = vaddr!(offset); let o = offset; offset += iplt_total_size; (a, o)
     } else { (0u64, 0u64) };
 
     let text_total_size = offset - text_page_offset;
 
     // Rodata segment
-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    new_segment!();
     let rodata_page_offset = offset;
-    let rodata_page_addr = BASE_ADDR + offset;
+    let rodata_page_addr = vaddr!(offset);
     // .eh_frame_hdr leads the rodata segment (data filled after relocation).
     let (eh_frame_hdr_offset, eh_frame_hdr_vaddr) = if eh_frame_hdr_size > 0 {
-        let o = offset; let v = BASE_ADDR + offset;
+        let o = offset; let v = vaddr!(offset);
         offset += eh_frame_hdr_size;
         (o, v)
     } else { (0u64, 0u64) };
@@ -427,7 +477,7 @@ pub(super) fn emit_executable(
            sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset;
+            sec.addr = vaddr!(offset);
             sec.file_offset = offset;
             offset += sec.mem_size;
         }
@@ -435,9 +485,9 @@ pub(super) fn emit_executable(
     let rodata_total_size = offset - rodata_page_offset;
 
     // RW segment
-    offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    new_segment!();
     let rw_page_offset = offset;
-    let rw_page_addr = BASE_ADDR + offset;
+    let rw_page_addr = vaddr!(offset);
 
     let mut init_array_addr = 0u64; let mut init_array_size = 0u64;
     let mut fini_array_addr = 0u64; let mut fini_array_size = 0u64;
@@ -447,7 +497,7 @@ pub(super) fn emit_executable(
         if sec.name == ".preinit_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             preinit_array_addr = sec.addr; preinit_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
@@ -456,7 +506,7 @@ pub(super) fn emit_executable(
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             init_array_addr = sec.addr; init_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
@@ -465,42 +515,49 @@ pub(super) fn emit_executable(
         if sec.name == ".fini_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
             offset += sec.mem_size; break;
         }
     }
 
     offset = (offset + 7) & !7;
-    let dynamic_offset = offset; let dynamic_addr = BASE_ADDR + offset; offset += dynamic_size;
+    let dynamic_offset = offset; let dynamic_addr = vaddr!(offset); offset += dynamic_size;
     offset = (offset + 7) & !7;
-    let got_offset = offset; let got_addr = BASE_ADDR + offset; offset += got_size;
+    let got_offset = offset; let got_addr = vaddr!(offset); offset += got_size;
     // Under -z now the .got.plt is never written after startup, so it can be
     // protected too (Full RELRO). Under lazy binding it must stay writable
     // and is placed after the RELRO page boundary below.
     let (mut got_plt_offset, mut got_plt_addr) = (0u64, 0u64);
     if has_relro && z_now {
         offset = (offset + 7) & !7;
-        got_plt_offset = offset; got_plt_addr = BASE_ADDR + offset;
+        got_plt_offset = offset; got_plt_addr = vaddr!(offset);
         offset += got_plt_size;
     }
     // RELRO boundary: everything before this is mprotect(PROT_READ)ed by
     // ld.so after relocation; the boundary must be page-aligned.
     let relro_start = rw_page_offset;
+    let relro_start_addr = rw_page_addr;
     let mut relro_size = 0u64;
     if has_relro {
-        offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        relro_size = offset - relro_start;
+        // ld.so mprotects [vaddr, vaddr+memsz) rounded out to page bounds, so
+        // it is the *virtual address* that must reach a page boundary, not the
+        // file offset. With file offsets packed densely (vaddr_bias != 0) the
+        // two are no longer the same number: aligning `offset` here would
+        // leave the RELRO end mid-page and let ld.so write-protect the first
+        // bytes of whatever follows.
+        offset += packer.padding_to_page(offset);
+        relro_size = vaddr!(offset) - relro_start_addr;
     }
     if !(has_relro && z_now) {
         offset = (offset + 7) & !7;
-        got_plt_offset = offset; got_plt_addr = BASE_ADDR + offset;
+        got_plt_offset = offset; got_plt_addr = vaddr!(offset);
         offset += got_plt_size;
     }
 
     // IFUNC GOT (8 bytes per entry, stores resolver addresses initially)
     offset = (offset + 7) & !7;
-    let ifunc_got_offset = offset; let ifunc_got_addr = BASE_ADDR + offset;
+    let ifunc_got_offset = offset; let ifunc_got_addr = vaddr!(offset);
     let ifunc_got_size = num_ifunc as u64 * 8;
     offset += ifunc_got_size;
 
@@ -508,7 +565,7 @@ pub(super) fn emit_executable(
     // Only emitted for STATIC executables: dynamic executables put their
     // IRELATIVE entries in .rela.dyn instead (ld.so ignores .rela.iplt).
     offset = (offset + 7) & !7;
-    let rela_iplt_offset = offset; let rela_iplt_addr = BASE_ADDR + offset;
+    let rela_iplt_offset = offset; let rela_iplt_addr = vaddr!(offset);
     let rela_iplt_size = if is_static { num_ifunc as u64 * 24 } else { 0 };
     offset += rela_iplt_size;
 
@@ -518,7 +575,7 @@ pub(super) fn emit_executable(
            sec.flags & SHF_TLS == 0 {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
@@ -533,7 +590,7 @@ pub(super) fn emit_executable(
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = BASE_ADDR + offset; sec.file_offset = offset;
+            sec.addr = vaddr!(offset); sec.file_offset = offset;
             if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
@@ -543,7 +600,7 @@ pub(super) fn emit_executable(
     // If only .tbss (NOBITS TLS) exists with no .tdata, we still need a TLS segment.
     // Set tls_addr/tls_file_offset to the current position so TPOFF calculations work.
     if tls_addr == 0 && has_tls_sections {
-        tls_addr = BASE_ADDR + offset;
+        tls_addr = vaddr!(offset);
         tls_file_offset = offset;
     }
     for sec in output_sections.iter_mut() {
@@ -559,7 +616,7 @@ pub(super) fn emit_executable(
     tls_mem_size = (tls_mem_size + tls_align - 1) & !(tls_align - 1);
     let has_tls = tls_addr != 0;
 
-    let bss_addr = BASE_ADDR + offset;
+    let bss_addr = vaddr!(offset);
     let mut bss_size = 0u64;
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
@@ -870,14 +927,30 @@ pub(super) fn emit_executable(
     // prefix decides almost every comparison in one instruction; ties fall
     // back to the full byte compare (total order preserved, identical
     // resulting symtab order).
-    let mut keyed: Vec<(u64, &String, &GlobalSymbol)> = sym_names
+    //
+    // The prefix is 16 bytes, not 8. Eight bytes is too narrow for real symbol
+    // tables: names routinely share a longer prefix than that (`g_sym_12345`,
+    // `_ZNSt3__1`, `__pthread_`, `nghttp2_session_`), so the u64 key ties and
+    // every comparison falls through to the byte compare. Profiling a
+    // 20k-symbol link showed 7.0% of all instructions in `__memcmp_avx2_movbe`
+    // for exactly that reason. A u128 covers the whole name for the vast
+    // majority of symbols, so the fallback almost never runs; the fallback is
+    // retained so the total order — and therefore the emitted symtab — is
+    // byte-for-byte identical to the previous implementation.
+    //
+    // Measured alternative, rejected: an *index* sort (sort u32 indices into a
+    // separate key array) moves 4 bytes per swap instead of 32, but the double
+    // indirection on every comparison cost more than the wider swap saved:
+    // 57.8M instructions vs 53.7M for this version on the 20k-symbol profile.
+    // Keeping the tuple sort.
+    let mut keyed: Vec<(u128, &String, &GlobalSymbol)> = sym_names
         .iter()
         .map(|(n, g)| {
             let b = n.as_bytes();
-            let mut p = [0u8; 8];
-            let l = b.len().min(8);
+            let mut p = [0u8; 16];
+            let l = b.len().min(16);
             p[..l].copy_from_slice(&b[..l]);
-            (u64::from_be_bytes(p), *n, *g)
+            (u128::from_be_bytes(p), *n, *g)
         })
         .collect();
     keyed.sort_unstable_by(|a, b| {
@@ -912,6 +985,23 @@ pub(super) fn emit_executable(
     zone!("symtab");
     // === Build output buffer ===
     let file_size = offset as usize;
+    // Defence in depth against malformed input driving a gigantic layout.
+    // `parse_elf64_object` already rejects non-power-of-two sh_addralign (the
+    // fuzzer-found path that demanded a 1 TiB buffer), but any future arithmetic
+    // slip here would abort the process inside the allocator, which
+    // `catch_unwind` cannot intercept.  Fail with a diagnostic instead.
+    //
+    // The cap is deliberately far above any real link (the Linux kernel's
+    // vmlinux is ~1 GiB at the extreme) and is a guard, not a policy limit.
+    const MAX_OUTPUT_BYTES: usize = 64 << 30; // 64 GiB
+    if file_size > MAX_OUTPUT_BYTES {
+        return Err(format!(
+            "output would be {} bytes ({:.1} GiB), which exceeds the {} GiB sanity limit; \
+             this usually means an input object has corrupt section offsets or sizes",
+            file_size,
+            file_size as f64 / (1u64 << 30) as f64,
+            MAX_OUTPUT_BYTES >> 30));
+    }
     let mut out = vec![0u8; file_size];
 
     // ELF header
@@ -940,7 +1030,7 @@ pub(super) fn emit_executable(
     }
     if has_relro && relro_size > 0 {
         wphdr(&mut out, ph, PT_GNU_RELRO, PF_R,
-              relro_start, BASE_ADDR + relro_start, relro_size, relro_size, 1);
+              relro_start, relro_start_addr, relro_size, relro_size, 1);
         ph += 56;
     }
     wphdr(&mut out, ph, PT_GNU_STACK, PF_R|PF_W, 0, 0, 0, 0, 0x10); ph += 56;
@@ -1319,7 +1409,7 @@ pub(super) fn emit_executable(
                 match rela.rela_type {
                     R_X86_64_64 => {
                         let t = if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if g.is_dynamic && !g.copy_reloc {
                                     if let Some(pi) = g.plt_idx { plt_addr + 16 + pi as u64 * 16 } else { s }
                                 } else { s }
@@ -1329,7 +1419,7 @@ pub(super) fn emit_executable(
                     }
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
                         let t = if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(pi) = g.plt_idx { plt_addr + 16 + pi as u64 * 16 } else { s }
                             } else { s }
                         } else { s };
@@ -1359,7 +1449,7 @@ pub(super) fn emit_executable(
                         // Initial Exec TLS via GOT: GOT entry contains TPOFF value
                         let mut resolved = false;
                         if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(gi) = g.got_idx {
                                     let entry = &got_entries[gi];
                                     let gea = if entry.1 {
@@ -1409,7 +1499,7 @@ pub(super) fn emit_executable(
                     }
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
                         if !sym.name.is_empty() && !sym.is_local() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(gi) = g.got_idx {
                                     let entry = &got_entries[gi];
                                     let gea = if entry.1 {
@@ -1485,7 +1575,7 @@ pub(super) fn emit_executable(
                                 "TLSGD relaxation failed: unrecognized code sequence for '{}' in {}",
                                 sym.name, objects[obj_idx].source_name));
                         };
-                        let is_dyn_tls = globals_snap.get(&sym.name)
+                        let is_dyn_tls = globals_snap.get(sym.name.as_str())
                             .map(|g| g.is_dynamic).unwrap_or(false);
                         if !is_dyn_tls {
                             // GD -> LE:  mov %fs:0,%rax ; lea tpoff(%rax),%rax
@@ -1497,7 +1587,7 @@ pub(super) fn emit_executable(
                             // GD -> IE:  mov %fs:0,%rax ; add got(%rip),%rax
                             // Requires a GOT slot with an R_X86_64_TPOFF64 dynamic
                             // relocation (created by the got_entries scan).
-                            let gi = globals_snap.get(&sym.name).and_then(|g| g.got_idx);
+                            let gi = globals_snap.get(sym.name.as_str()).and_then(|g| g.got_idx);
                             let Some(gi) = gi else {
                                 return Err(format!(
                                     "TLSGD->IE: no GOT entry for dynamic TLS symbol '{}'",
@@ -1837,6 +1927,40 @@ pub(super) fn emit_executable(
     out[62..64].copy_from_slice(&shstrtab_shidx.to_le_bytes());
 
     zone!("headers");
+
+    // === -Map=FILE ===
+    // Written after layout, so every address in the map is the final one.
+    // Built from the same `output_sections` / `section_map` state the ELF
+    // itself was emitted from, which makes the map authoritative rather than
+    // a reconstruction that can drift from reality.
+    if let Some(mp) = map_path {
+        let object_names: Vec<String> =
+            objects.iter().map(|o| o.source_name.clone()).collect();
+
+        // (name, object_idx, section_idx, offset-within-input-section)
+        let mut map_syms: Vec<(String, usize, usize, u64)> = Vec::new();
+        for (obj_idx, obj) in objects.iter().enumerate() {
+            for sym in &obj.symbols {
+                if sym.name.is_empty() { continue; }
+                let st = sym.sym_type();
+                // STT_SECTION (3) and STT_FILE (4) are bookkeeping entries,
+                // not addresses a map reader cares about.
+                if st == STT_SECTION || st == 4 { continue; }
+                if sym.is_undefined() { continue; }
+                let si = sym.shndx as usize;
+                if section_map.contains_key(&(obj_idx, si)) {
+                    map_syms.push((sym.name.to_string(), obj_idx, si, sym.value));
+                }
+            }
+        }
+
+        let lm = linker_common::build_link_map(
+            output_sections, &object_names, &map_syms,
+            entry_symbol.or(Some("_start")), entry_addr);
+        lm.write_to_path(std::path::Path::new(mp))
+            .map_err(|e| format!("failed to write map file '{}': {}", mp, e))?;
+    }
+
     std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
     #[cfg(unix)]
     {
@@ -1859,7 +1983,7 @@ pub(super) fn resolve_sym(
     // local symbol named e.g. "opts" must not be confused with a global "opts"
     // from another object file.
     if !sym.name.is_empty() && !sym.is_local() {
-        if let Some(g) = globals.get(&sym.name) {
+        if let Some(g) = globals.get(sym.name.as_str()) {
             if g.defined_in.is_some() { return g.value; }
             if g.is_dynamic {
                 return g.plt_idx.map(|pi| plt_addr + 16 + pi as u64 * 16).unwrap_or(0);

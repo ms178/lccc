@@ -696,7 +696,7 @@ pub(super) fn emit_dynamic_executable(
                 match rela.rela_type {
                     R_AARCH64_ABS64 => {
                         let t = if !sym.name.is_empty() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if g.is_dynamic && !g.copy_reloc {
                                     if let Some(pi) = g.plt_idx { plt_addr + 32 + pi as u64 * 16 } else { s }
                                 } else { s }
@@ -757,7 +757,7 @@ pub(super) fn emit_dynamic_executable(
                     R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
                         if fp + 4 > out.len() { continue; }
                         let t = if !sym.name.is_empty() {
-                            if let Some(g) = globals_snap.get(&sym.name) {
+                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(pi) = g.plt_idx { plt_addr + 32 + pi as u64 * 16 } else { s }
                             } else { s }
                         } else { s };
@@ -851,7 +851,7 @@ fn resolve_sym_dynamic(
             .unwrap_or(0);
     }
     if !sym.name.is_empty() && !sym.is_local() {
-        if let Some(g) = globals.get(&sym.name) {
+        if let Some(g) = globals.get(sym.name.as_str()) {
             if g.defined_in.is_some() { return g.value; }
             if g.is_dynamic {
                 if let Some(pi) = g.plt_idx { return plt_addr + 32 + pi as u64 * 16; }

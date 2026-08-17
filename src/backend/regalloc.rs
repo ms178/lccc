@@ -2136,6 +2136,22 @@ fn collect_i686_scratch_hazard_points(
     let mut edx: Vec<u32> = Vec::new();
     let mut point: u32 = 0;
 
+    // Allocas with alignment <= 16 resolve to SlotAddr::Direct: their loads
+    // and stores are pure `movl slot(%esp),%eax` / `movl %eax,slot(%esp)`
+    // with NO pointer staging in %ecx. Over-aligned allocas go through
+    // emit_alloca_aligned_addr (lea+add+and into %ecx) and stay hazards.
+    // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
+    let mut direct_allocas: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, align, .. } = inst {
+                if *align <= 16 {
+                    direct_allocas.insert(dest.0);
+                }
+            }
+        }
+    }
+
     let is_gpr32 = |ty: &IrType| {
         matches!(
             ty,
@@ -2212,14 +2228,29 @@ fn collect_i686_scratch_hazard_points(
                 {
                     (true, true)
                 }
-                // 32-bit loads: direct slot is acc-only, indirect pulls the
-                // pointer through %ecx; can't tell them apart here, so %ecx
-                // is a hazard. No 32-bit load path touches %edx.
-                Instruction::Load { ty, .. } if is_gpr32(ty) => (false, true),
-                // Stores: pointer through %ecx AND the const-offset override
-                // calls emit_save_acc (movl %eax,%edx) on its OverAligned/
-                // Indirect paths -- both registers are hazards.
-                Instruction::Store { .. } => (false, false),
+                // 32-bit loads: a DIRECT-alloca pointer (align <= 16) is
+                // `movl slot,%eax` -- acc-only, both registers clean. Any
+                // other pointer is staged in %ecx. No 32-bit load path
+                // touches %edx.
+                Instruction::Load { ty, ptr, seg_override, .. } if is_gpr32(ty) => {
+                    // %gs:/%fs: loads take a different emitter path -- fail
+                    // closed on any non-default address space.
+                    let clean = direct_allocas.contains(&ptr.0)
+                        && *seg_override == crate::common::types::AddressSpace::Default;
+                    (clean, true)
+                }
+                // Stores: direct-alloca 32-bit stores are `movl %eax,slot`
+                // (emit_typed_store_to_slot, acc-only). All other stores
+                // stage the pointer in %ecx, and the const-offset override
+                // additionally calls emit_save_acc (movl %eax,%edx) on its
+                // OverAligned/Indirect paths -- hazard for both. Wide stores
+                // (I64/F64) materialize %eax:%edx even for direct slots.
+                Instruction::Store { ty, ptr, seg_override, .. } => {
+                    let direct32 = is_gpr32(ty)
+                        && direct_allocas.contains(&ptr.0)
+                        && *seg_override == crate::common::types::AddressSpace::Default;
+                    (direct32, direct32)
+                }
                 // GEP: %ecx is the secondary/address scratch; %edx unused
                 // (emit_gep_direct/indirect_const and leal base+index are
                 // acc-only, general path uses acc+%ecx).

@@ -77,7 +77,7 @@ pub fn resolve_sym(
         // so they are resolved through the standard globals lookup below.
         // Local (STB_LOCAL) symbols must NOT be resolved via globals, since a
         // local symbol named e.g. "write" must not be confused with libc's write().
-        if let Some(g) = globals.get(&sym.name) {
+        if let Some(g) = globals.get(sym.name.as_str()) {
             if g.defined_in.is_some() { return g.value; }
         }
         if sym.is_weak() { return 0; }
@@ -94,7 +94,7 @@ pub fn resolve_sym(
 /// (e.g., `.LANCHOR3` in different objects referring to different TLS vars).
 pub fn got_key(obj_idx: usize, sym: &Symbol) -> String {
     if !sym.name.is_empty() && !sym.is_local() {
-        sym.name.clone()
+        sym.name.to_string()
     } else if !sym.name.is_empty() {
         format!("{}@{}", sym.name, obj_idx)
     } else if sym.sym_type() == STT_SECTION {
