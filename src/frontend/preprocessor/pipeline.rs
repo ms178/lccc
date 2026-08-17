@@ -206,7 +206,7 @@ impl Preprocessor {
         // So we must join continued lines BEFORE stripping comments.
         let source = self.join_continued_lines(source);
         let (source, line_map) = Self::strip_block_comments(&source);
-        let mut output = String::with_capacity(source.len());
+        let mut output = String::with_capacity(source.len() + source.len() / 4);
 
         // For included files, save and reset the conditional stack and line override
         let saved_conditionals = if is_include {

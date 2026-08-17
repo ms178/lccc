@@ -9,7 +9,7 @@ pub struct Lexer {
     file_id: u32,
     gnu_extensions: bool,
     at_line_start: bool,
-    ident_pool: std::collections::HashMap<Vec<u8>, std::sync::Arc<str>>,
+    ident_pool: std::collections::HashMap<Vec<u8>, String>,
     pub diagnostics: Vec<(String, crate::common::source::Span)>,
 }
 
@@ -32,11 +32,11 @@ impl Lexer {
 
     fn intern_ident(&mut self, bytes: &[u8]) -> String {
         if let Some(existing) = self.ident_pool.get(bytes) {
-            return existing.to_string();
+            return existing.clone();
         }
-        let s: std::sync::Arc<str> = std::str::from_utf8(bytes).unwrap_or("").into();
+        let s = std::str::from_utf8(bytes).unwrap_or("").to_string();
         self.ident_pool.insert(bytes.to_vec(), s.clone());
-        s.to_string()
+        s
     }
 
     fn emit_lex_diag(&mut self, msg: impl Into<String>, start: usize, end: usize) {
@@ -275,8 +275,8 @@ impl Lexer {
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
-            let exp_str = std::str::from_utf8(&self.input[exp_start..self.pos]).unwrap_or("0");
-            let e: i64 = exp_str.parse().unwrap_or(0);
+            let (eu, _) = Self::accumulate_digits(&self.input[exp_start..self.pos], 10);
+            let e: i64 = eu as i64;
             if exp_neg { -e } else { e }
         } else {
             0
@@ -699,7 +699,7 @@ impl Lexer {
 
     fn lex_wide_string(&mut self, start: usize) -> Token {
         self.pos += 1; // skip opening "
-        let mut s = String::new();
+        let mut s = String::with_capacity(32);
         while self.pos < self.input.len() && self.input[self.pos] != b'"' {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
@@ -759,7 +759,7 @@ impl Lexer {
     /// pipeline converts each to a u16 value (truncating code points > 0xFFFF).
     fn lex_char16_string(&mut self, start: usize) -> Token {
         self.pos += 1; // skip opening "
-        let mut s = String::new();
+        let mut s = String::with_capacity(32);
         while self.pos < self.input.len() && self.input[self.pos] != b'"' {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;

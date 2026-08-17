@@ -1244,7 +1244,7 @@ impl Parser {
         // Adjacent string literals are concatenated per C standard (translation phase 6).
         // The kernel uses patterns like: "min" "(" "x" ", " "y" ") error"
         let message = if self.consume_if(&TokenKind::Comma) {
-            let mut msg = String::new();
+            let mut msg = String::with_capacity(32);
             let mut found_string = false;
             while let TokenKind::StringLiteral(s) = self.peek() {
                 msg.push_str(s);

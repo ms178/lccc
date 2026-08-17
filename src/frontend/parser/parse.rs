@@ -16,6 +16,7 @@ use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::{Token, TokenKind};
 use super::ast::*;
+use std::sync::OnceLock;
 
 /// GCC __attribute__((mode(...))) integer mode specifier.
 /// Controls the bit-width of an integer type regardless of the base type keyword.
@@ -290,7 +291,7 @@ impl Parser {
         Self {
             tokens,
             pos: 0,
-            typedefs: Self::builtin_typedefs(),
+            typedefs: Self::builtin_typedefs_cached(),
             shadowed_typedefs: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::new(),
@@ -350,6 +351,11 @@ impl Parser {
 
     /// Standard C typedef names commonly provided by system headers.
     /// Since we don't actually include system headers, we pre-seed these.
+    fn builtin_typedefs_cached() -> FxHashSet<String> {
+        static CACHE: OnceLock<FxHashSet<String>> = OnceLock::new();
+        CACHE.get_or_init(Self::builtin_typedefs).clone()
+    }
+
     fn builtin_typedefs() -> FxHashSet<String> {
         [
             // <stddef.h>
@@ -430,6 +436,17 @@ impl Parser {
     pub(super) fn peek(&self) -> &TokenKind {
         if self.pos < self.tokens.len() {
             &self.tokens[self.pos].kind
+        } else {
+            &TokenKind::Eof
+        }
+    }
+
+    /// Look ahead `n` tokens (0 == peek). Returns Eof past the end.
+    #[inline]
+    pub(super) fn peek_nth(&self, n: usize) -> &TokenKind {
+        let i = self.pos + n;
+        if i < self.tokens.len() {
+            &self.tokens[i].kind
         } else {
             &TokenKind::Eof
         }
@@ -568,9 +585,7 @@ impl Parser {
         if let TokenKind::Identifier(name) = self.peek() {
             if self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name) {
                 // Check if next token is ':'
-                if self.pos + 1 < self.tokens.len() {
-                    return matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon);
-                }
+                return matches!(self.peek_nth(1), TokenKind::Colon);
             }
         }
         false
@@ -680,7 +695,7 @@ impl Parser {
             }
             // Two-token lookahead: require `[[` (C23 attribute), not a lone `[`.
             let next_is_lb = self.pos + 1 < self.tokens.len()
-                && matches!(self.tokens[self.pos + 1].kind, TokenKind::LBracket);
+                && matches!(self.peek_nth(1), TokenKind::LBracket);
             if !next_is_lb {
                 break;
             }
