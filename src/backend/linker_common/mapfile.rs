@@ -114,11 +114,27 @@ impl LinkMap {
     }
 
     /// Write the map to a file. Creates parent directories if needed.
+    /// Write the map to `path`.
+    ///
+    /// The single character `-` means standard output, which is how GNU ld
+    /// implements `--print-map` / `-M`. Routing it through the same call keeps
+    /// one code path for both spellings, and means a build system can pipe the
+    /// map without needing a temporary file.
     pub fn write_to_path(&self, path: &Path) -> Result<(), String> {
         let mut s = String::with_capacity(16 * 1024);
         self.write_gnu(&mut s);
+        if path.as_os_str() == "-" {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            return lock.write_all(s.as_bytes())
+                .and_then(|_| lock.flush())
+                .map_err(|e| e.to_string());
+        }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
         }
         std::fs::write(path, s).map_err(|e| e.to_string())
     }

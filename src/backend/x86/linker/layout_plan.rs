@@ -20,6 +20,33 @@ pub struct LayoutPlan {
 }
 
 impl LayoutPlan {
+    /// Generic header-index assignment.
+    ///
+    /// # Status: not used by the x86-64 executable emitter
+    ///
+    /// This models a *simple* layout -- every non-empty output section gets a
+    /// header, then a fixed list of specials. The real `emit_exec` order is
+    /// not that: it interleaves linker-created headers (.interp, .gnu.hash,
+    /// .dynsym, .dynstr, verneed, .rela.dyn, .rela.plt, .plt, .eh_frame_hdr,
+    /// init/fini/preinit arrays, .dynamic, .got, .got.plt, .iplt, .rela.iplt)
+    /// between four ordered *groups* of output sections (alloc PROGBITS, TLS
+    /// PROGBITS, TLS NOBITS, then non-TLS NOBITS), and the exact sequence
+    /// depends on `is_static`, on which of those tables are non-empty, and on
+    /// section flags.
+    ///
+    /// Switching `emit_exec` to this function would silently renumber every
+    /// section header. The duplication this type was created to prevent has
+    /// instead been removed at the source: `emit_exec` now performs ONE walk
+    /// whose running count yields both `out_sec_to_hdr` and the
+    /// `.symtab`/`.strtab` indices, where it previously spelled the same
+    /// ~25-line sequence out twice and relied on the two copies being edited
+    /// together. `section_header_index_consistency` in the differential suite
+    /// pins the invariant.
+    ///
+    /// Kept because the shared `SegmentPacker` below is live and belongs in
+    /// this module, and because a future backend with a simple layout can use
+    /// it. Do not wire it into `emit_exec` without first making the two orders
+    /// provably identical.
     pub fn compute(
         output_sections: &[OutputSection],
         special: &[(&str, bool)],

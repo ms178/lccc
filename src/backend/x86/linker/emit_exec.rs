@@ -121,7 +121,7 @@ pub(super) fn emit_executable(
                     return false;
                 }
                 if let Some(ref vs) = version_script {
-                    if vs.local_star && !vs.matches_global(name) {
+                    if vs.any_local_star() && !vs.matches_global(name) {
                         return false;
                     }
                 }
@@ -787,110 +787,77 @@ pub(super) fn emit_executable(
     symtab_entries.push([0u8; 24]); // NULL symbol at index 0
 
     // Map output_sections index → section-header index, in write order.
+    // Section-header index assignment.
+    //
+    // This walk defines the order in which section headers are written, and
+    // three things must agree exactly: the index recorded for each output
+    // section, the indices of .symtab/.strtab that follow them, and the write
+    // loop further down. It used to be spelled out TWICE -- once assigning
+    // `out_sec_to_hdr`, once re-counting to derive symtab_shidx -- with the
+    // two copies kept in step by hand. That is the duplication that produced
+    // the historical ordering bugs `layout_plan.rs` was created to prevent, so
+    // it is now a single pass whose count is reused.
     let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
+    let symtab_shidx;
+    let strtab_shidx;
     {
+        // Linker-created headers that precede the output sections, in the
+        // order the write loop emits them.
         let mut h = 1usize; // [0] = NULL
         if !is_static {
             h += 4; // .interp .gnu.hash .dynsym .dynstr
         }
-        if !is_static && verneed_size > 0 {
-            h += 2;
-        }
-        if !is_static && rela_dyn_size > 0 {
-            h += 1;
-        }
-        if !is_static && rela_plt_size > 0 {
-            h += 1;
-        }
-        if !is_static && plt_size > 0 {
-            h += 1;
-        }
-        if eh_frame_hdr_size > 0 { h += 1; } // .eh_frame_hdr
-        for (i, sec) in output_sections.iter().enumerate() {
-            if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-                && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array"
-            {
-                out_sec_to_hdr.insert(i, h as u16);
-                h += 1;
-            }
-        }
-        for (i, sec) in output_sections.iter().enumerate() {
-            if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
-                out_sec_to_hdr.insert(i, h as u16);
-                h += 1;
-            }
-        }
-        for (i, sec) in output_sections.iter().enumerate() {
-            if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
-                out_sec_to_hdr.insert(i, h as u16);
-                h += 1;
-            }
-        }
-        if has_init_array {
-            h += 1;
-        }
-        if has_fini_array {
-            h += 1;
-        }
-        if has_preinit_array {
-            h += 1;
-        }
-        if !is_static {
-            h += 1; // .dynamic
-        }
-        if got_size > 0 {
-            h += 1; // .got
-        }
-        if !is_static {
-            h += 1; // .got.plt
-        }
-        if iplt_total_size > 0 {
-            h += 1; // .iplt
-        }
-        if rela_iplt_size > 0 {
-            h += 1; // .rela.iplt
-        }
-        for (i, sec) in output_sections.iter().enumerate() {
-            if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
-                out_sec_to_hdr.insert(i, h as u16);
-                h += 1;
-            }
-        }
-        // .symtab and .strtab come next (before .shstrtab).
-    }
-    // The .symtab/.strtab header indices are computed below precisely from
-    // the same header-order walk used by the write loop.
-    let symtab_shidx;
-    let strtab_shidx;
-    {
-        let mut h = 1usize;
-        if !is_static { h += 4; }
         if !is_static && verneed_size > 0 { h += 2; }
         if !is_static && rela_dyn_size > 0 { h += 1; }
         if !is_static && rela_plt_size > 0 { h += 1; }
         if !is_static && plt_size > 0 { h += 1; }
-        if eh_frame_hdr_size > 0 { h += 1; }
-        for sec in output_sections.iter() {
-            if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-                && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" { h += 1; }
-        }
-        for sec in output_sections.iter() {
-            if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS { h += 1; }
-        }
-        for sec in output_sections.iter() {
-            if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS { h += 1; }
-        }
+        if eh_frame_hdr_size > 0 { h += 1; } // .eh_frame_hdr
+
+        // Output sections, in four ordered groups.
+        let mut assign = |pred: &dyn Fn(&OutputSection) -> bool,
+                          h: &mut usize,
+                          map: &mut FxHashMap<usize, u16>| {
+            for (i, sec) in output_sections.iter().enumerate() {
+                if pred(sec) {
+                    map.insert(i, *h as u16);
+                    *h += 1;
+                }
+            }
+        };
+        // 1. ordinary allocated PROGBITS (init/fini arrays are placed later)
+        assign(&|sec: &OutputSection| {
+            sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS
+                && sec.flags & SHF_TLS == 0
+                && sec.name != ".init_array" && sec.name != ".fini_array"
+                && sec.name != ".preinit_array"
+        }, &mut h, &mut out_sec_to_hdr);
+        // 2. TLS PROGBITS (.tdata)
+        assign(&|sec: &OutputSection| {
+            sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0
+                && sec.sh_type != SHT_NOBITS
+        }, &mut h, &mut out_sec_to_hdr);
+        // 3. TLS NOBITS (.tbss)
+        assign(&|sec: &OutputSection| {
+            sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS
+        }, &mut h, &mut out_sec_to_hdr);
+
+        // Linker-created headers between the alloc sections and .bss.
         if has_init_array { h += 1; }
         if has_fini_array { h += 1; }
         if has_preinit_array { h += 1; }
-        if !is_static { h += 1; }
-        if got_size > 0 { h += 1; }
-        if !is_static { h += 1; }
+        if !is_static { h += 1; }        // .dynamic
+        if got_size > 0 { h += 1; }      // .got
+        if !is_static { h += 1; }        // .got.plt
         if iplt_total_size > 0 { h += 1; }
         if rela_iplt_size > 0 { h += 1; }
-        for sec in output_sections.iter() {
-            if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 { h += 1; }
-        }
+
+        // 4. non-TLS NOBITS (.bss)
+        assign(&|sec: &OutputSection| {
+            sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_TLS == 0
+        }, &mut h, &mut out_sec_to_hdr);
+
+        // .symtab and .strtab follow, then .shstrtab.
         symtab_shidx = h as u16;
         strtab_shidx = h as u16 + 1;
     }

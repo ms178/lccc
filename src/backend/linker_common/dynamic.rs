@@ -127,6 +127,24 @@ pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
     needed_sonames: &mut Vec<String>,
     lib_paths: &[String],
 ) -> Result<(), String> {
+    // Historical default: behave as if --as-needed were in effect.
+    load_shared_library_elf64_as_needed(path, globals, needed_sonames, lib_paths, true)
+}
+
+/// As [`load_shared_library_elf64`], but with explicit `--as-needed` state.
+///
+/// `as_needed == false` (i.e. `--no-as-needed`, which is GNU ld's default)
+/// records `DT_NEEDED` even when the library resolves nothing. That is not a
+/// pessimisation to be optimised away: linking a library purely for the side
+/// effects of its ELF constructors is a real and common pattern, and dropping
+/// the entry silently changes program behaviour.
+pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
+    path: &str,
+    globals: &mut FxHashMap<String, G>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    as_needed: bool,
+) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
 
     // Handle linker scripts (e.g., libc.so is often a text file with GROUP/INPUT)
@@ -159,7 +177,8 @@ pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
                             // are silently skipped during shared lib loading
                             continue;
                         }
-                        load_shared_library_elf64(&resolved, globals, needed_sonames, lib_paths)?;
+                        load_shared_library_elf64_as_needed(
+                            &resolved, globals, needed_sonames, lib_paths, as_needed)?;
                     }
                 }
                 return Ok(());
@@ -177,7 +196,7 @@ pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
     let dyn_syms = parse_shared_library_symbols(&data, path)?;
     let lib_needed = match_shared_library_dynsyms(&dyn_syms, &soname, globals);
 
-    if lib_needed && !needed_sonames.contains(&soname) {
+    if (lib_needed || !as_needed) && !needed_sonames.contains(&soname) {
         needed_sonames.push(soname);
     }
     Ok(())

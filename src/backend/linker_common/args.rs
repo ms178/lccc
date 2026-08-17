@@ -85,6 +85,14 @@ pub struct InputItem {
     /// True when `--whole-archive` was in effect: every member of this archive
     /// is linked in, not just those resolving an undefined symbol.
     pub whole_archive: bool,
+    /// True when `--as-needed` was in effect at this position.
+    ///
+    /// Like `--whole-archive`, this is a *positional* toggle: it applies to the
+    /// inputs that follow it, until `--no-as-needed`. A shared library tagged
+    /// as-needed only gets a `DT_NEEDED` entry when it actually resolves
+    /// something; one tagged no-as-needed is recorded unconditionally, which is
+    /// how a program pulls in a library purely for its ELF constructors.
+    pub as_needed: bool,
 }
 
 /// Parse user linker arguments into a structured `LinkerArgs`.
@@ -99,6 +107,9 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     // Positional state: --whole-archive applies to archives that FOLLOW it,
     // until --no-whole-archive turns it back off.
     let mut whole_archive = false;
+    // GNU ld defaults to --no-as-needed; gcc's driver passes --as-needed
+    // explicitly when it wants it.
+    let mut as_needed = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i];
@@ -114,6 +125,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         } else if arg == "--exclude-libs" && i + 1 < args.len() {
             i += 1;
             result.exclude_libs.extend(split_lib_list(args[i]));
+        } else if arg == "--print-map" || arg == "-M" {
+            result.map_path = Some("-".to_string());
         } else if let Some(v) = arg.strip_prefix("-Map=") {
             // Top-level spelling: lccc-ld and other direct callers pass
             // `-Map=FILE` as its own argument, not inside a `-Wl,` group.
@@ -130,7 +143,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
             result.libs_to_load.push(l.to_string());
             result.inputs.push(InputItem {
-                name: l.to_string(), is_lib: true, whole_archive,
+                name: l.to_string(), is_lib: true, whole_archive, as_needed,
             });
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -164,7 +177,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if let Some(lib) = part.strip_prefix("-l") {
                     result.libs_to_load.push(lib.to_string());
                     result.inputs.push(InputItem {
-                        name: lib.to_string(), is_lib: true, whole_archive,
+                        name: lib.to_string(), is_lib: true, whole_archive, as_needed,
                     });
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     if let Some(eq_pos) = defsym_arg.find('=') {
@@ -192,6 +205,9 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if part == "--exclude-libs" && j + 1 < parts.len() {
                     j += 1;
                     result.exclude_libs.extend(split_lib_list(parts[j]));
+                } else if part == "--print-map" || part == "-M" {
+                    // GNU ld writes the map to stdout; "-" is the sentinel.
+                    result.map_path = Some("-".to_string());
                 } else if let Some(v) = part.strip_prefix("-Map=") {
                     result.map_path = Some(v.to_string());
                 } else if part == "-Map" && j + 1 < parts.len() {
@@ -269,6 +285,10 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     whole_archive = true;
                 } else if part == "--no-whole-archive" {
                     whole_archive = false;
+                } else if part == "--as-needed" {
+                    as_needed = true;
+                } else if part == "--no-as-needed" {
+                    as_needed = false;
                 }
                 j += 1;
             }
@@ -285,10 +305,14 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             whole_archive = true;
         } else if arg == "--no-whole-archive" {
             whole_archive = false;
+        } else if arg == "--as-needed" {
+            as_needed = true;
+        } else if arg == "--no-as-needed" {
+            as_needed = false;
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             result.extra_object_files.push(arg.to_string());
             result.inputs.push(InputItem {
-                name: arg.to_string(), is_lib: false, whole_archive,
+                name: arg.to_string(), is_lib: false, whole_archive, as_needed,
             });
         }
         i += 1;

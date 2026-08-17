@@ -57,7 +57,7 @@ pub mod linker_script;
 pub mod build_id;
 pub mod strmerge;
 mod types;
-mod parse_object;
+pub mod parse_object;
 mod parse_shared;
 mod section_map;
 mod dynstr;
@@ -76,6 +76,8 @@ mod mapfile;
 mod version_script;
 mod symstr;
 mod secdata;
+pub mod filemap;
+pub mod comdat;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -103,7 +105,7 @@ pub use symstr::SymStr;
 pub use secdata::SectionData;
 
 // version_script.rs
-pub use version_script::VersionScript;
+pub use version_script::{VersionScript, VersionNode, wildcard_match_pattern};
 
 // mapfile.rs
 pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_map};
@@ -121,11 +123,13 @@ pub use merge::{merge_sections_elf64, merge_sections_elf64_gc, allocate_common_s
 // dynamic.rs
 pub use dynamic::{
     load_shared_library_elf64,
+    load_shared_library_elf64_as_needed,
     resolve_dynamic_symbols_elf64, register_symbols_elf64,
 };
 
 // archive.rs
-pub use archive::{load_archive_elf64, load_archive_elf64_shared, load_thin_archive_elf64};
+pub use archive::{load_archive_elf64, load_archive_elf64_shared,
+    load_archive_elf64_backed, load_thin_archive_elf64};
 
 // resolve_lib.rs
 pub use resolve_lib::resolve_lib;

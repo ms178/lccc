@@ -152,7 +152,25 @@ fn run(args: &[String]) -> Result<(), String> {
         let a = args[i].as_str();
         match a {
             "-o" => { i += 1; output = args.get(i).cloned().ok_or("-o needs an argument")?; }
-            "-m" => { i += 1; /* emulation: elf_x86_64 assumed */ }
+            "-m" => {
+                // Emulation selects the output class/machine. This driver
+                // emits ELF64 x86-64 only, so accepting `-m elf_i386` and
+                // then producing a 64-bit image (or, as before, failing later
+                // with the opaque "not 64-bit ELF" when the first input is
+                // read) is worse than refusing up front. The kernel's
+                // setup.elf needs a real ELF32 path; until that exists, say so.
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("elf_x86_64") | Some("elf64_x86_64") | None => {}
+                    Some(other) => {
+                        return Err(format!(
+                            "unsupported emulation '-m {other}': this linker emits \
+                             ELF64 x86-64 only. 32-bit output (elf_i386) is not \
+                             implemented; use the i686 backend or GNU ld for it."
+                        ));
+                    }
+                }
+            }
             "-T" | "--script" => {
                 i += 1;
                 script_path = Some(args.get(i).cloned().ok_or("-T needs an argument")?);
@@ -191,6 +209,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     passthrough.push(format!("--entry={}", e));
                 }
             }
+            // GNU ld spells "write the map to stdout" as --print-map / -M.
+            // These were previously swallowed by the ignore list, so the user
+            // got a silent no-op instead of a map.
+            "--print-map" | "-M" => passthrough.push("-Map=-".to_string()),
             "-Map" => {
                 // Two-argument form: `-Map FILE`. Re-spell as the joined form
                 // so the shared parser handles both identically.
@@ -250,7 +272,13 @@ fn run(args: &[String]) -> Result<(), String> {
             "--export-dynamic" | "-export-dynamic" | "-E"
                 => passthrough.push("-rdynamic".to_string()),
             "--no-export-dynamic" | "-no-export-dynamic" => {}
-            "--as-needed" | "--no-as-needed" | "--eh-frame-hdr"
+            // --as-needed / --no-as-needed are POSITIONAL: they scope the
+            // inputs that follow. Forward them so the shared parser can record
+            // the state per input, instead of dropping them here (which made
+            // every library as-needed and silently discarded a DT_NEEDED the
+            // user asked for with --no-as-needed).
+            "--as-needed" | "--no-as-needed" => passthrough.push(a.to_string()),
+            "--eh-frame-hdr"
             | "--fix-cortex-a53-843419" | "--no-copy-dt-needed-entries"
             | "--allow-shlib-undefined" | "-X" | "-x" => {}
             _ => {

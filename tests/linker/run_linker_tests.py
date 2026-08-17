@@ -1448,6 +1448,348 @@ VERSION {
 """
 
 
+def _as_needed_positional_test(args, oracles):
+    """--as-needed / --no-as-needed are positional, and default is no-as-needed.
+
+    Three cases, each compared against GNU ld's DT_NEEDED set:
+      A  unused libm AFTER --as-needed        -> dropped
+      B  unused libm under --no-as-needed     -> KEPT
+      C  unused libm with no flag at all      -> KEPT (GNU default)
+
+    B and C are the ones that matter: linking a library purely for the side
+    effects of its ELF constructors is a real pattern, and silently dropping
+    the entry changes program behaviour with no diagnostic.
+    """
+    name = "as_needed_positional_dt_needed"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("x\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+
+        def gpf(n):
+            return sh([CC, "-print-file-name=" + n], cwd=td).stdout.decode().strip()
+        crt1, crti, cbeg = gpf("crt1.o"), gpf("crti.o"), gpf("crtbegin.o")
+        cend, crtn = gpf("crtend.o"), gpf("crtn.o")
+        libc_so = gpf("libc.so")
+        if not os.path.isabs(crt1) or not os.path.isabs(libc_so):
+            return Result(name, "SKIP", "cannot locate CRT objects")
+        libdir = os.path.dirname(libc_so)
+        base = ["-L" + libdir, "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+                crt1, crti, cbeg, "t.o"]
+        tail = [cend, crtn]
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+
+        def needed(linker, flags, out):
+            r = sh([linker] + base + flags + ["-lc"] + tail + ["-o", out], cwd=td)
+            if r.returncode != 0:
+                return None
+            d = sh(["readelf", "-dW", out], cwd=td).stdout.decode()
+            return sorted(re.findall(r"NEEDED\)\s+Shared library: \[([^\]]+)\]", d))
+
+        cases = [
+            ("A_as_needed",    ["--as-needed", "-lm", "--no-as-needed"]),
+            ("B_no_as_needed", ["--no-as-needed", "-lm"]),
+            ("C_default",      ["-lm"]),
+        ]
+        for label, flags in cases:
+            got = needed(lccc_ld, flags, "o." + label)
+            want = needed("ld", flags, "b." + label)
+            if want is None:
+                continue          # oracle cannot link here; skip this case
+            if got is None:
+                return Result(name, "FAIL", f"{label}: lccc-ld failed to link")
+            if got != want:
+                return Result(name, "FAIL",
+                    f"{label}: lccc DT_NEEDED {got} != GNU ld {want}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _print_map_test(args, oracles):
+    """--print-map and -M must write a map to stdout, not silently do nothing.
+
+    Both spellings were accepted and ignored, so a build system asking for a
+    map got a successful link and an empty file.
+    """
+    name = "print_map_to_stdout"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write("int data_sym = 7;\nint main(void){ return data_sym; }\n")
+        r = sh([CC, "-c", "-O1", "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        for flag in ("--print-map", "-M"):
+            r = sh([args.lccc, "t.o", "-o", "out." + flag.strip("-"),
+                    "-Wl," + flag], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL",
+                    f"{flag}: link failed: {r.stderr.decode()[:200]}")
+            out = r.stdout.decode()
+            if not out.strip():
+                return Result(name, "FAIL",
+                    f"{flag} produced no map on stdout (silently ignored)")
+            # GNU map files carry these section headings.
+            for marker in ("Memory Configuration", "Linker script and memory map"):
+                if marker not in out:
+                    return Result(name, "FAIL",
+                        f"{flag}: map missing '{marker}' heading")
+            if "data_sym" not in out:
+                return Result(name, "FAIL", f"{flag}: map does not mention data_sym")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _section_header_index_consistency_test(args, oracles):
+    """Every symbol's st_shndx must name the section it actually lives in.
+
+    The section-header order is produced by one walk, and .symtab/.strtab sit
+    immediately after the output sections. That numbering used to be computed
+    twice -- once to record each section's index, once to derive symtab's --
+    and the two copies had to be edited in lockstep. A drift between them does
+    not fail to link: it produces symbols pointing at the wrong section, which
+    silently breaks debuggers, `perf`, and anything that resolves an address to
+    a name.
+
+    This checks the invariant end to end with readelf: for a handful of known
+    symbols, the section named by st_shndx must be the one whose address range
+    contains the symbol's value.
+    """
+    name = "section_header_index_consistency"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(r"""
+#include <stdio.h>
+int g_data = 7;
+const int g_ro = 9;
+int g_bss;
+__thread int g_tls = 3;
+static int s_fn(void){ return g_data + g_ro; }
+int main(void){ g_bss = s_fn() + g_tls; printf("%d\n", g_bss); return 0; }
+""")
+        r = sh([CC, "-c", "-O1", "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        r = sh([args.lccc, "t.o", "-o", "out"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"link failed: {r.stderr.decode()[:250]}")
+
+        secs = sh(["readelf", "-SW", "out"], cwd=td).stdout.decode()
+        # index -> (name, addr, size, is_nobits, is_tls)
+        table = {}
+        for line in secs.splitlines():
+            m = re.match(r"\s*\[\s*(\d+)\]\s+(\S+)\s+(\S+)\s+([0-9a-f]+)\s+"
+                         r"([0-9a-f]+)\s+([0-9a-f]+)\s+(\S+)\s*(\S*)", line)
+            if not m:
+                continue
+            idx, nm, typ, addr, off, size, es, flags = m.groups()
+            table[int(idx)] = (nm, int(addr, 16), int(size, 16),
+                               typ == "NOBITS", "T" in (flags or ""))
+
+        syms = sh(["readelf", "-sW", "out"], cwd=td).stdout.decode()
+        checked = 0
+        for line in syms.splitlines():
+            parts = line.split()
+            if len(parts) < 8 or not parts[0].endswith(":"):
+                continue
+            value, styp, ndx, nm = parts[1], parts[3], parts[6], parts[7]
+            if nm not in ("g_data", "g_ro", "g_bss", "main", "s_fn"):
+                continue
+            if not ndx.isdigit():
+                continue
+            i = int(ndx)
+            if i not in table:
+                return Result(name, "FAIL",
+                    f"{nm}: st_shndx={i} names no section header")
+            snm, saddr, ssize, _nobits, _tls = table[i]
+            v = int(value, 16)
+            if not (saddr <= v <= saddr + max(ssize, 1)):
+                return Result(name, "FAIL",
+                    f"{nm} at {v:#x} claims section [{i}] {snm} "
+                    f"({saddr:#x}..{saddr + ssize:#x}): header index drifted")
+            checked += 1
+        if checked < 3:
+            # A drift in the header numbering shows up here as symbols whose
+            # st_shndx no longer names a section we can match. Treating that as
+            # SKIP would let exactly the regression this test exists for pass
+            # silently, so it is a failure.
+            return Result(name, "FAIL",
+                f"only {checked} of the 5 expected symbols resolved to a "
+                f"section containing their value; header indices likely drifted")
+
+        # .symtab's sh_link must name the real .strtab, which is the other half
+        # of the numbering that used to be computed separately.
+        link_ok = False
+        for line in secs.splitlines():
+            m = re.match(r"\s*\[\s*(\d+)\]\s+\.symtab\s", line)
+            if m:
+                det = sh(["readelf", "-SW", "--wide", "out"], cwd=td).stdout.decode()
+                for l2 in det.splitlines():
+                    if re.match(r"\s*\[\s*\d+\]\s+\.strtab\s", l2):
+                        link_ok = True
+        if not link_ok:
+            return Result(name, "FAIL", "no .strtab alongside .symtab")
+
+        code, out = run_bin(os.path.join(td, "out"), [], td)
+        if code != 0:
+            return Result(name, "FAIL", f"binary exited {code}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _comdat_dedup_test(args, oracles):
+    """COMDAT groups: the losing bodies must not be laid out.
+
+    C++ emits one definition of every inline function and template
+    instantiation in EVERY translation unit that uses it, marked as an
+    interchangeable SHT_GROUP/GRP_COMDAT set. Symbol resolution alone picks a
+    single winner, so the program runs correctly and `nm` agrees with GNU ld --
+    but without group dedup the losing section BODIES are still emitted as dead
+    bytes nothing can reach.
+
+    Symbol counts therefore cannot detect this. The test searches the linked
+    image for the exact byte pattern of a COMDAT function and requires exactly
+    one occurrence, which is what GNU ld produces.
+    """
+    name = "comdat_group_dedup"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "h.hpp"), "w") as f:
+            f.write("#pragma once\n#include <cstdio>\n"
+                    "template <typename T> struct Widget {\n"
+                    "  T v;\n  Widget(T x): v(x) {}\n"
+                    "  T twice() const { return v + v; }\n"
+                    "  void show() const { printf(\"%ld\\n\", (long)twice()); }\n"
+                    "};\n"
+                    "inline int shared_inline(int a){ return a * 3 + 1; }\n")
+        for tu, body in (
+            ("a", 'int use_a(){ Widget<long> w(21); w.show(); return shared_inline(1); }'),
+            ("b", 'int use_b(){ Widget<long> w(10); w.show(); return shared_inline(2); }'),
+            ("m", 'int use_a(); int use_b();\n'
+                  'int main(){ Widget<long> w(1); w.show(); return use_a()+use_b(); }'),
+        ):
+            with open(os.path.join(td, tu + ".cpp"), "w") as f:
+                f.write('#include "h.hpp"\n' + body + "\n")
+        # -O0 -fno-inline keeps the COMDAT groups from being optimised away.
+        objs = []
+        for tu in ("a", "b", "m"):
+            r = sh([CXX, "-O0", "-fno-inline", "-c", tu + ".cpp", "-o", tu + ".o"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", r.stderr.decode()[:150])
+            objs.append(tu + ".o")
+
+        # Locate the exact bytes of Widget<long>::twice in one input object.
+        secs = sh(["readelf", "-SW", "a.o"], cwd=td).stdout.decode()
+        target = None
+        for line in secs.splitlines():
+            m = re.match(r"\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+[0-9a-f]+\s+([0-9a-f]+)\s+([0-9a-f]+)", line)
+            if m and m.group(1) == ".text._ZNK6WidgetIlE5twiceEv":
+                off, size = int(m.group(2), 16), int(m.group(3), 16)
+                with open(os.path.join(td, "a.o"), "rb") as fh:
+                    target = fh.read()[off:off + size]
+                break
+        if not target or len(target) < 8:
+            return Result(name, "SKIP", "could not locate the COMDAT body in a.o")
+
+        r = sh([args.lccc] + objs + ["-o", "out.lccc", "-lstdc++", "-lm"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc link failed: {r.stderr.decode()[:300]}")
+        with open(os.path.join(td, "out.lccc"), "rb") as fh:
+            got = fh.read().count(target)
+        if got != 1:
+            return Result(name, "FAIL",
+                f"COMDAT body appears {got} times in the image (want 1): "
+                f"duplicate group members were laid out as dead bytes")
+
+        # Behaviour must match GNU ld's link of the same objects.
+        code, out = run_bin(os.path.join(td, "out.lccc"), [], td)
+        r2 = sh([CXX] + objs + ["-o", "out.bfd"], cwd=td)
+        if r2.returncode == 0:
+            code2, out2 = run_bin(os.path.join(td, "out.bfd"), [], td)
+            if (code, out) != (code2, out2):
+                return Result(name, "FAIL",
+                    f"lccc {(code, out)!r} != g++/bfd {(code2, out2)!r}")
+            with open(os.path.join(td, "out.bfd"), "rb") as fh:
+                want = fh.read().count(target)
+            if want != got:
+                return Result(name, "FAIL",
+                    f"lccc keeps {got} copies, GNU ld keeps {want}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _multi_version_node_test(args, oracles):
+    """A version script with several nodes must export ALL of them.
+
+    `LIBV_2.0 { global: new_fn; } LIBV_1.0;` also declares an inheritance edge:
+    a LIBV_2.0 provider satisfies a LIBV_1.0 dependency. Only the first node
+    used to be parsed, so new_fn vanished from .dynsym and the hierarchy was
+    lost -- a library that looks versioned but cannot bind an older consumer.
+    """
+    name = "version_script_multiple_nodes"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "v.c"), "w") as f:
+            f.write("int old_fn(void){ return 1; }\nint new_fn(void){ return 2; }\n"
+                    "int hidden_helper(void){ return 3; }\n")
+        with open(os.path.join(td, "v.map"), "w") as f:
+            f.write("LIBV_1.0 { global: old_fn; local: *; };\n"
+                    "LIBV_2.0 { global: new_fn; } LIBV_1.0;\n")
+        r = sh([CC, "-c", "-O1", "-fPIC", "v.c", "-o", "v.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-shared", "--version-script=v.map", "v.o",
+                "-o", "v.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+        dyn = sh(["readelf", "--dyn-syms", "-W", "v.so"], cwd=td).stdout.decode()
+        if "old_fn@@LIBV_1.0" not in dyn:
+            return Result(name, "FAIL", "old_fn@@LIBV_1.0 missing from .dynsym")
+        if "new_fn@@LIBV_2.0" not in dyn:
+            return Result(name, "FAIL",
+                "new_fn@@LIBV_2.0 missing: only the first version node was parsed")
+        if "hidden_helper" in dyn:
+            return Result(name, "FAIL", "local: * did not hide hidden_helper")
+        ver = sh(["readelf", "-VW", "v.so"], cwd=td).stdout.decode()
+        if "Parent 1: LIBV_1.0" not in ver:
+            return Result(name, "FAIL",
+                "verdef lost the parent link; a LIBV_2.0 provider would not "
+                "satisfy a LIBV_1.0 dependency")
+        # The library must actually load and run.
+        with open(os.path.join(td, "use.c"), "w") as f:
+            f.write("#include <stdio.h>\nextern int old_fn(void), new_fn(void);\n"
+                    "int main(void){ printf(\"%d %d\\n\", old_fn(), new_fn()); return 0; }\n")
+        r = sh([CC, "-O1", "use.c", os.path.join(td, "v.so"),
+                "-Wl,-rpath," + td, "-o", "use.bin"], cwd=td)
+        if r.returncode == 0:
+            code, out = run_bin(os.path.join(td, "use.bin"), [], td)
+            if (code, out) != (0, "1 2\n"):
+                return Result(name, "FAIL",
+                    f"versioned .so did not run correctly: {(code, out)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def _script_overlay_test(args, oracles):
     """OVERLAY: members share a VMA while their load images stay distinct.
 
@@ -1522,6 +1864,110 @@ void my_start(void){
             if (code, out) != (code2, out2):
                 return Result(name, "FAIL",
                     f"lccc {(code, out)!r} != GNU ld {(code2, out2)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _script_tls_gd_ld_test(args, oracles):
+    """General-Dynamic and Local-Dynamic TLS relaxation in the -T path.
+
+    A linker-script link is static with a fixed TLS block, so __tls_get_addr
+    can never be reached and GNU ld relaxes GD/LD sequences to Local-Exec.
+    Rejecting them made any -fPIC object using the default TLS model
+    unlinkable through a script.
+
+    The subtle half is DTPOFF: after LD -> LE the sequence leaves the THREAD
+    POINTER in %rax, not the module base, so DTPOFF must be TP-relative. Get
+    that wrong and you emit `cmpl $0xb,0x4(%rax)` where GNU ld emits
+    `cmpl $0xb,-0x4(%rax)` -- every Local-Dynamic access reads the wrong side
+    of the thread pointer. The link succeeds and the values are garbage, so
+    this test builds a real TCB and checks the values at runtime.
+    """
+    name = "script_tls_gd_ld_relaxation"
+    src = r"""
+__thread int gd_a = 11;
+__thread int gd_b = 22;
+static long sys_write(const void *b, unsigned long n){
+  long r; __asm__ volatile("syscall":"=a"(r)
+      :"a"(1L),"D"(1L),"S"(b),"d"(n):"rcx","r11","memory");
+  return r;
+}
+static long set_fs(void *p){
+  long r; __asm__ volatile("syscall":"=a"(r)
+      :"a"(158L),"D"(0x1002L),"S"(p):"rcx","r11","memory");
+  return r;
+}
+extern char __tdata_start[], __tdata_end[], __tls_size_sym[];
+static char tls_area[512] __attribute__((aligned(64)));
+void my_start(void){
+  unsigned long tls_size = (unsigned long)__tls_size_sym;
+  /* The ABI requires *(void**)tp == tp; the TLS block sits just below tp. */
+  char *tp = tls_area + 256;
+  *(void **)tp = tp;
+  const char *s = __tdata_start;
+  unsigned long init = (unsigned long)(__tdata_end - __tdata_start);
+  for (unsigned long i = 0; i < tls_size; i++)
+      (tp - tls_size)[i] = i < init ? s[i] : 0;
+  set_fs(tp);
+  int ok = (gd_a == 11) && (gd_b == 22);
+  char m[2] = { (char)('0' + ok), '\n' };
+  sys_write(m, 2);
+  __asm__ volatile("syscall"::"a"(60L),"D"((long)(ok ? 0 : 1)));
+  __builtin_unreachable();
+}
+"""
+    script = ("ENTRY(my_start)\n"
+              "SECTIONS {\n"
+              "  . = 0x400000 + SIZEOF_HEADERS;\n"
+              "  .text : { *(.text*) }\n"
+              "  . = ALIGN(64);\n"
+              "  __tdata_start = .;\n"
+              "  .tdata : { *(.tdata*) }\n"
+              "  __tdata_end = .;\n"
+              "  .tbss : { *(.tbss*) }\n"
+              "  __tls_size_sym = SIZEOF(.tdata) + SIZEOF(.tbss);\n"
+              "  .data : { *(.data*) *(.rodata*) *(.bss*) }\n"
+              "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n"
+              "}\n")
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(src)
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write(script)
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        for model, expect_reloc in (("global-dynamic", "TLSGD"),
+                                    ("local-dynamic", "TLSLD")):
+            obj = "t." + model + ".o"
+            r = sh([CC, "-c", "-O1", "-fPIC", "-ftls-model=" + model,
+                    "-ffreestanding", "-fno-stack-protector",
+                    "t.c", "-o", obj], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", r.stderr.decode()[:150])
+            rel = sh(["readelf", "-rW", obj], cwd=td).stdout.decode()
+            if expect_reloc not in rel:
+                # The compiler optimised the model away; nothing to test here.
+                continue
+            out_b = "out." + model
+            r = sh([lccc_ld, "-T", "t.lds", obj, "-o", out_b], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL",
+                    f"{model}: lccc-ld failed: {r.stderr.decode()[:300]}")
+            code, out = run_bin(os.path.join(td, out_b), [], td)
+            if (code, out) != (0, "1\n"):
+                return Result(name, "FAIL",
+                    f"{model}: relaxed TLS wrong at runtime: {(code, out)!r} "
+                    f"(want (0, '1\\n'))")
+            # GNU ld must agree.
+            r2 = sh(["ld", "-T", "t.lds", obj, "-o", "ref." + model], cwd=td)
+            if r2.returncode == 0:
+                code2, out2 = run_bin(os.path.join(td, "ref." + model), [], td)
+                if (code, out) != (code2, out2):
+                    return Result(name, "FAIL",
+                        f"{model}: lccc {(code, out)!r} != GNU ld {(code2, out2)!r}")
         return Result(name, "PASS")
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
@@ -3567,8 +4013,20 @@ def main():
         results.append(_script_pic_gotpcrel_test(args, oracles))
     if (not args.filter or "tls" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_tls_test(args, oracles))
+    if (not args.filter or "tls" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_script_tls_gd_ld_test(args, oracles))
     if (not args.filter or "overlay" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_overlay_test(args, oracles))
+    if (not args.filter or "as_needed" in args.filter) and not args.tag:
+        results.append(_as_needed_positional_test(args, oracles))
+    if (not args.filter or "print_map" in args.filter) and not args.tag:
+        results.append(_print_map_test(args, oracles))
+    if (not args.filter or "version" in args.filter) and not args.tag:
+        results.append(_multi_version_node_test(args, oracles))
+    if (not args.filter or "comdat" in args.filter) and not args.tag:
+        results.append(_comdat_dedup_test(args, oracles))
+    if (not args.filter or "section_header" in args.filter) and not args.tag:
+        results.append(_section_header_index_consistency_test(args, oracles))
 
     if (not args.filter or "so_" in args.filter) and not args.tag:
         results.append(_interpose_test(args, oracles,

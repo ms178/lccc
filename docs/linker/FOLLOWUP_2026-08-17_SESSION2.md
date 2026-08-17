@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–11)
+# LCCC Linker — Follow-Up Plan (Sessions 2–12)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -1377,3 +1377,210 @@ the leaked symbol's name.
 6. General-Dynamic/Local-Dynamic TLS relaxation in the script path (only
    Initial/Local-Exec is handled; GD/LD would need the `__tls_get_addr`
    sequence rewrites the exe path already has).
+
+---
+
+# Session 12 — §4.4 feature gaps, mmap I/O, COMDAT, GD/LD TLS, grammar fuzzing
+
+**Base:** `ms178/lccc` main @ `1abc5f1a` (PR #107 merged the session-11 sweep).
+**Snapshots:** `S01-as-needed-printmap-versions` (`7c5a07e4`),
+`S02-mmap-input-io` (`aad5e94c`), `S03-comdat-dedup-exe` (`1b9cbe40`),
+`S04-script-tls-gd-ld` (`3488d85f`), `S05-grammar-fuzzer` (`61306c68`),
+`S06-header-numbering-single-pass` (`eff7c8a0`).
+
+**Totals:** 797 unit pass / 0 fail / 6 ignored, 158 differential pass / 0 fail
+(bfd, mold, wild), 18/18 script probes, 400 byte-mutator + ~4,000
+grammar-fuzzer links clean, expat/gzip/zlib-ng differential PASS.
+
+## 12.1 §4.4 — three features that were accepted and ignored
+
+Each of these linked successfully and produced a subtly different binary from
+the one the user asked for, which is the worst failure mode a linker has.
+
+**`--as-needed` / `--no-as-needed` were discarded.** Both were in `lccc_ld.rs`'s
+ignore list, and the loader hardcoded as-needed semantics. GNU ld defaults to
+`--no-as-needed`, so lccc dropped `DT_NEEDED` entries the user had explicitly
+requested — and linking a library purely for its ELF constructors is a normal
+pattern whose behaviour changes silently when the entry disappears.
+
+Like `--whole-archive`, these are **positional**. `InputItem` gained an
+`as_needed` field recorded at parse time and carried to the `DT_NEEDED`
+decision. The last mile was subtle: `x86/linker/input.rs` has its *own*
+GROUP-script handler, separate from the one in `linker_common/dynamic.rs`, and
+its recursion called plain `load_file`, resetting the flag. `libm.so` is
+exactly such a script — `GROUP ( libm.so.6 AS_NEEDED ( libmvec.so.1 ) )` — so
+the flag was correct at every layer except the one that mattered. DT_NEEDED
+sets now match bfd on all three positional cases.
+
+**`--print-map` / `-M` produced nothing.** Also swallowed by the ignore list.
+They now set `map_path` to `"-"`, and `write_to_path` treats `-` as stdout, so
+one code path serves both spellings and the map can be piped.
+
+**Version scripts stopped after the first node.** Given
+`LIBV_2.0 { global: new_fn; } LIBV_1.0;`, `new_fn` was not exported at all and
+the inheritance edge was discarded — a library that looks versioned but cannot
+satisfy an older dependency. Added `VersionNode` with a `parent`, made
+`matches_global` span *all* nodes (export is a property of the script, not of
+its first node), and taught the verdef builder to emit the second
+`Elf64_Verdaux` with a correct `vd_cnt`. `readelf -V` output now matches bfd
+exactly, including `Parent 1: LIBV_1.0`.
+
+## 12.2 mmap input I/O — the last whole-file copy
+
+Session 9 proved no `Vec`-side trick could remove it. mmap can.
+
+`SectionData` already avoided the *second* copy, but `std::fs::read` still
+copied every input into the heap. Callgrind put that at **3.46 M Ir, 6.6 % of
+the gzip link**, essentially all `__memcpy_avx_unaligned_erms`.
+
+`FileMap::open` maps `PROT_READ/MAP_PRIVATE` and hands out a `FileBacking`
+every section clones. No new crate dependency — this repo has none and that is
+worth keeping, so `mmap`/`munmap`/`madvise` are three `extern "C"`
+declarations. Every failure mode falls back to `fs::read`, and `LCCC_NO_MMAP=1`
+forces it for A/B.
+
+| workload | read | mmap | Δ |
+|---|---|---|---|
+| many_syms | 62,197,711 | 60,272,432 | **−3.1 %** |
+| gzip | 52,386,561 | 48,767,354 | **−6.9 %** |
+| expat | 53,685,755 | 49,443,714 | **−7.9 %** |
+
+memcpy share on gzip fell 11.23 % → 4.95 %; output byte-identical on all three
+(`cmp`). Archives benefit twice: members are windows into one mapping, and
+pages belonging to members the linker never pulls in are never faulted in.
+
+Wall clock also moved — lccc now beats bfd on all three workloads
+(gzip 16.2 vs 26.7 ms, zlib-ng 15.9 vs 21.6, expat 20.2 vs 26.9) — though that
+spread is noisy here and the Ir numbers are the ones to trust.
+
+## 12.3 COMDAT dedup in the executable path
+
+`emit_rel.rs` has done this since it was written; the executable path never
+did. **Symbol resolution hid it**: only one definition ever wins, so the
+program behaved correctly and `nm` matched GNU ld exactly, while the losing
+section *bodies* were still laid out as unreachable dead bytes.
+
+Symbol counts therefore cannot detect this. Searching the linked image for the
+literal byte pattern of `Widget<long>::twice` across three TUs:
+
+```
+before   3 occurrences, 780 executable bytes
+ld.bfd   1 occurrence,  579
+after    1 occurrence,  567   (smaller than bfd)
+```
+
+Factored into `linker_common::comdat` so the `-r` and executable paths cannot
+drift. The winner is the first group with a given signature in link order, so
+the result depends only on input order, never on hash iteration. It feeds the
+existing `dead_sections` set and runs **before** ICF: the compiler already
+declared these copies interchangeable, so no content comparison is needed.
+Plain non-`GRP_COMDAT` groups are left alone — discarding one would delete live
+`.debug_*` data.
+
+## 12.4 GD/LD TLS relaxation in the script path
+
+Session 11 left this as known-missing. General-Dynamic is the **default** model
+for `-fPIC`, so any PIC object with a `__thread` variable still failed with
+"unsupported relocation type 19". A `-T` link is static with a fixed TLS block,
+so `__tls_get_addr` is unreachable and GNU ld *relaxes* to Local-Exec.
+Implemented GD→LE, LD→LE, TLSDESC→LE and GOTTPOFF→LE, recording the consumed
+byte ranges so the `__tls_get_addr` call's own PLT32 relocation is not applied
+over the rewritten bytes.
+
+**DTPOFF had to be TP-relative** (bug found by the new test). After LD→LE the
+sequence leaves the *thread pointer* in `%rax`, not the module base. My first
+version used the block-relative offset and produced `cmpl $0xb,0x4(%rax)` where
+bfd emits `cmpl $0xb,-0x4(%rax)` — every Local-Dynamic access reading the wrong
+side of the thread pointer. The link succeeds and the values are garbage, so
+only a runtime check catches it.
+
+**GOTPCREL relaxation generalised.** The TLS test's TCB setup compiles to
+`sub sym@GOTPCREL(%rip),%rsi` (opcode `2b`), and the relaxer handled only `cmp`
+(`3b`). The psABI relaxes the whole `op r64, m64` group to the group-1
+immediate form, so all eight (add/or/adc/sbb/and/sub/xor/cmp) are now handled
+via an explicit opcode → `/ext` table.
+
+## 12.5 §4.5 — grammar-aware ELF fuzzing
+
+`fuzz_ld.py` mutates bytes, so almost every mutant dies at the first validity
+check and the machinery *behind* the parser is rarely reached.
+`fuzz_elf_grammar.py` inverts this: it **builds** a structurally valid ELF64
+relocatable (sections, locals-first symtab, `.rela` with patched `sh_link`,
+string tables) and then makes one semantically hostile choice — a relocation
+past the end of its section, a COMDAT group listing itself, `SHF_STRINGS`
+without a terminator, alignment 2^40, a COMMON symbol of size 2^62, and 13
+more.
+
+Because the file parses, the linker gets far enough for the interesting code to
+run: **every** generated object is accepted by `readelf -h`, and about half the
+links reach the emitter. Inputs rotate across seven modes (exec, shared, `-r`,
+`-T`, `--gc-sections`, `--icf=all`, `--emit-relocs`).
+
+**The fuzzer was validated against a planted bug** — a `panic!` on an
+out-of-range relocation offset — and correctly reported
+`[PANIC] mode=exec / mutation: reloc offset past end of section` with a working
+reproducer. A fuzzer that finds nothing is indistinguishable from one that
+tests nothing; the procedure is documented so it is repeated whenever the
+generator changes. ~4,000 links across six seeds: clean.
+
+## 12.6 Structural: one section-header walk instead of two
+
+The header numbering in `emit_exec.rs` was spelled out **twice** — once to
+record each section's index, once to recount and derive `symtab_shidx`. Drift
+between them does not fail the link; it produces symbols whose `st_shndx` names
+the wrong section, silently breaking debuggers and `perf`. Now one walk whose
+running count yields both. Byte-identical output on gzip, as a pure
+de-duplication should be.
+
+`LayoutPlan::compute` stays unwired and now **says why**: it models a simpler
+layout than reality (fifteen linker-created headers interleaved between four
+ordered groups of output sections, depending on `is_static` and on which tables
+are non-empty), so switching to it would silently renumber every header. A
+plausible-looking function that must never be called is a trap; the doc comment
+now states the constraint and points at the invariant test.
+
+## 12.7 Negative and deferred results
+
+**`SymbolId(u32)` interning: measured, not attempted.** Callgrind attributes
+~7 % of the many_syms link to `String`-keyed hashbrown traffic (insert 1.63 % +
+1.27 %, iteration 1.30 % + 1.19 %, `hash_one` 0.96 %), so the lever is real. It
+is also 25 map declarations and 149 call sites. A rushed conversion risks
+correctness for a single-digit gain, so it is recorded with its measurement
+rather than half-done.
+
+**ELF32 `setup.elf`: diagnosed, not implemented.** `lccc-ld` accepted
+`-m elf_i386` and silently assumed x86-64, failing later with the opaque
+"not 64-bit ELF". A real ELF32 script emitter is a large piece of work; in the
+meantime `-m` is validated and unsupported emulations are refused up front with
+a message naming the alternative. Silently ignoring an option that changes the
+output format is itself a defect, and that part is fixed.
+
+## 12.8 Lessons
+
+1. **A flag can be correct at every layer except the one that matters.**
+   `--as-needed` parsed right, threaded right, and was reset by a second
+   GROUP-script handler nobody remembered existed. Trace the value to the
+   decision, not to the API boundary.
+2. **Symbol-level checks cannot see body-level duplication.** COMDAT dedup was
+   missing for the whole life of the executable path and every symbol tool
+   agreed with GNU ld. The test had to search for raw bytes.
+3. **Relaxation changes what a register holds.** DTPOFF after LD→LE is
+   TP-relative, not block-relative; the wrong choice links cleanly and computes
+   garbage.
+4. **Validate the fuzzer.** Plant a bug and confirm it is found, or "no defects"
+   means nothing.
+5. **Prefer one walk to two copies.** The header numbering had survived
+   duplicated because both copies were always edited together — until they
+   would not have been.
+
+## 12.9 Remaining backlog
+
+1. **§4.2** wire `parallel_reloc.rs` into `emit_exec` — still blocked on this
+   2-vCPU box; measure on the 14700KF.
+2. `SymbolId(u32)` interning (~7 % measured; 149 call sites).
+3. ELF32 output for the kernel's `setup.elf` (now diagnosed rather than
+   silently wrong).
+4. Thin-archive shared buffers — the mmap work covers regular archives; thin
+   archives still read each member separately.
+5. `--icf=safe` currently rejects any address-taken function; mold folds those
+   whose address is only compared, not called through.

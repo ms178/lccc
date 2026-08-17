@@ -10,7 +10,7 @@ use std::path::Path;
 
 use super::elf::*;
 use super::types::GlobalSymbol;
-use super::input::load_file;
+use super::input::{load_file, load_file_as_needed};
 use super::plt_got::{collect_ifunc_symbols, create_plt_got};
 use super::emit_exec::emit_executable;
 use super::icf;
@@ -39,7 +39,8 @@ pub fn link_builtin(
     // Load CRT objects before user objects
     for path in crt_objects_before {
         if Path::new(path).exists() {
-            load_file(path, &mut objects, &mut globals, &mut needed_sonames, &lib_path_strings, false)?;
+            load_file(path, &mut objects, &mut globals, &mut needed_sonames,
+                      &lib_path_strings, false)?;
         }
     }
 
@@ -68,6 +69,35 @@ pub fn link_builtin(
     let entry_symbol = parsed_args.entry_symbol;
     let wrap_symbols = parsed_args.wrap_symbols;
     let undefined_symbols = parsed_args.undefined_symbols;
+
+    // Positional --as-needed state, keyed by the input as it was written on the
+    // command line. The executable path resolves libraries through flat name
+    // lists (`libs_to_load`, `extra_object_files`) rather than the ordered
+    // `inputs` vector, so the per-input flag is carried across in this map.
+    //
+    // Absent from the map means "not mentioned by the user", which covers
+    // driver-supplied and default system libraries; GNU ld's default is
+    // --no-as-needed, but those libraries are only consulted when something is
+    // still undefined, so recording them unconditionally would add DT_NEEDED
+    // entries for libraries that were never asked for. They stay as-needed.
+    let as_needed_of: FxHashMap<String, bool> = parsed_args.inputs.iter()
+        .map(|it| (it.name.clone(), it.as_needed))
+        .collect();
+    // `-lfoo` resolves to some /path/libfoo.so.N; map a resolved path back to
+    // the stem the user wrote so the flag can be recovered.
+    let as_needed_for = |path_or_name: &str| -> bool {
+        if let Some(&v) = as_needed_of.get(path_or_name) {
+            return v;
+        }
+        let base = std::path::Path::new(path_or_name)
+            .file_name().and_then(|n| n.to_str()).unwrap_or(path_or_name);
+        let stem = base.strip_prefix("lib").unwrap_or(base);
+        let stem = stem.split(".so").next().unwrap_or(stem);
+        if let Some(&v) = as_needed_of.get(stem) {
+            return v;
+        }
+        true
+    };
 
     // Force-undefined symbols (-u SYM): enter them into the global table as
     // undefined so the archive group-resolution loop below pulls in defining
@@ -145,7 +175,9 @@ pub fn link_builtin(
             let prev_obj_count = objects.len();
             let prev_dyn_count = needed_sonames.len();
             for lib_path in &lib_paths_resolved {
-                load_file(lib_path, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, false)?;
+                load_file_as_needed(lib_path, &mut objects, &mut globals,
+                                    &mut needed_sonames, &all_lib_paths, false,
+                                    as_needed_for(lib_path))?;
             }
             if objects.len() != prev_obj_count || needed_sonames.len() != prev_dyn_count {
                 changed = true;
@@ -242,10 +274,28 @@ pub fn link_builtin(
     linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
 
     phase!("resolve+gc");
+    // COMDAT (SHT_GROUP/GRP_COMDAT) deduplication.
+    //
+    // C++ emits one definition of every inline function, template
+    // instantiation and vtable in EVERY translation unit that uses it, and
+    // declares the copies interchangeable via a group signature. Symbol
+    // resolution already picked a single winner, so the program behaved
+    // correctly -- but the losing section BODIES were still laid out, as dead
+    // bytes nothing could reach. This runs before ICF because it is cheaper
+    // and needs no content comparison: the compiler already told us these are
+    // the same entity.
+    let comdat_plan = linker_common::comdat::plan_comdat(&objects);
+    if std::env::var("LCCC_DEBUG_COMDAT").is_ok() {
+        eprintln!("[comdat] groups_discarded={} sections={} bytes_saved={}",
+                  comdat_plan.groups_discarded, comdat_plan.dead.len(),
+                  comdat_plan.bytes_saved);
+    }
+
     // SHF_MERGE string/constant deduplication (.rodata.str1.1, .rodata.cst8):
     // build pools across all objects, rewrite relocations to pool symbols,
     // and retire the input sections. Disabled with LCCC_NO_STRING_MERGE=1.
     let mut dead_sections = dead_sections;
+    dead_sections.extend(comdat_plan.dead.iter().copied());
     if std::env::var("LCCC_NO_STRING_MERGE").is_err() {
         if let Some(plan) = linker_common::strmerge::plan_string_merge(
             &objects, &dead_sections, linker_common::map_section_name) {
@@ -370,9 +420,11 @@ pub fn link_shared(
     let bsymbolic = parsed.bsymbolic;
     let exclude_libs: Vec<String> = parsed.exclude_libs.clone();
 
-    // (path_or_lib, is_lib, whole_archive_state), in command-line order.
-    let ordered_items: Vec<(String, bool, bool)> = parsed.inputs.iter()
-        .map(|it| (it.name.clone(), it.is_lib, it.whole_archive))
+    // (path_or_lib, is_lib, whole_archive, as_needed), in command-line order.
+    // Both archive and as-needed state are POSITIONAL, so they have to travel
+    // with the input rather than being read as global flags.
+    let ordered_items: Vec<(String, bool, bool, bool)> = parsed.inputs.iter()
+        .map(|it| (it.name.clone(), it.is_lib, it.whole_archive, it.as_needed))
         .collect();
 
     // Load user object files (from the compiler driver, before user_args)
@@ -384,22 +436,23 @@ pub fn link_shared(
     all_lib_paths.extend(lib_path_strings.iter().cloned());
 
     // Load ordered items (bare files and -l libraries) preserving --whole-archive state
-    let mut libs_to_load_later: Vec<(String, bool)> = Vec::new();
-    for (item, is_lib, wa) in &ordered_items {
+    let mut libs_to_load_later: Vec<(String, bool, bool)> = Vec::new();
+    for (item, is_lib, wa, an) in &ordered_items {
         if *is_lib {
-            libs_to_load_later.push((item.clone(), *wa));
+            libs_to_load_later.push((item.clone(), *wa, *an));
         } else {
-            load_file(item, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, *wa)?;
+            load_file_as_needed(item, &mut objects, &mut globals, &mut needed_sonames,
+                                &all_lib_paths, *wa, *an)?;
         }
     }
 
     // Resolve -l libraries
     if !libs_to_load_later.is_empty() {
-        let mut lib_paths_resolved: Vec<(String, bool)> = Vec::new();
-        for (lib_name, wa) in &libs_to_load_later {
+        let mut lib_paths_resolved: Vec<(String, bool, bool)> = Vec::new();
+        for (lib_name, wa, an) in &libs_to_load_later {
             if let Some(lib_path) = linker_common::resolve_lib(lib_name, &all_lib_paths, false) {
-                if !lib_paths_resolved.iter().any(|(p, _)| p == &lib_path) {
-                    lib_paths_resolved.push((lib_path, *wa));
+                if !lib_paths_resolved.iter().any(|(p, _, _)| p == &lib_path) {
+                    lib_paths_resolved.push((lib_path, *wa, *an));
                 }
             } else {
                 return Err(format!("cannot find -l{}: No such file or directory", lib_name));
@@ -412,11 +465,12 @@ pub fn link_shared(
         while changed {
             changed = false;
             let prev_count = objects.len();
-            for (lib_path, wa) in &lib_paths_resolved {
+            for (lib_path, wa, an) in &lib_paths_resolved {
                 if *wa && whole_archive_loaded.contains(lib_path) {
                     continue; // Already loaded all members
                 }
-                load_file(lib_path, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, *wa)?;
+                load_file_as_needed(lib_path, &mut objects, &mut globals,
+                                    &mut needed_sonames, &all_lib_paths, *wa, *an)?;
                 if *wa {
                     whole_archive_loaded.insert(lib_path.clone());
                 }
