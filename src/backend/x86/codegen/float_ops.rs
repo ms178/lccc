@@ -167,14 +167,14 @@ impl X86Codegen {
                 if let Some(&r) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(r) {
                         let name = phys_reg_name(r);
-                        self.state.emit_fmt(format_args!("    {}{} %{}, %{}", mnemonic, suffix, name, reg));
+                        self.state.emit_fmt(format_args!("    {}{} %{}, %{}, %{}", mnemonic, suffix, name, reg, reg));
                         self.state.reg_cache.invalidate_acc();
                         return true;
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!("    {}{} {}, %{}", mnemonic, suffix, sr, reg));
+                    self.state.emit_fmt(format_args!("    {}{} {}, %{}, %{}", mnemonic, suffix, sr, reg, reg));
                     self.state.reg_cache.invalidate_acc();
                     return true;
                 }
@@ -184,7 +184,7 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
             }
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
@@ -194,7 +194,7 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
@@ -204,7 +204,7 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
             }
             _ => {
                 self.operand_to_rcx(rhs);
@@ -213,7 +213,7 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}", mnemonic, suffix, reg));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
             }
         }
         self.state.reg_cache.invalidate_acc();
@@ -300,7 +300,7 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
@@ -310,7 +310,7 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
             }
             Operand::Value(v) => {
                 // XMM register direct: if RHS is in xmm3-xmm7 (register allocator
@@ -319,14 +319,14 @@ impl X86Codegen {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(reg) {
                         let src_name = phys_reg_name(reg);
-                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0", mnemonic, suffix, src_name));
+                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0, %xmm0", mnemonic, suffix, src_name));
                         self.store_xmm0_fp_dest(dest, ty);
                         return;
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!("    {}{} {}, %xmm0", mnemonic, suffix, sr));
+                    self.state.emit_fmt(format_args!("    {}{} {}, %xmm0, %xmm0", mnemonic, suffix, sr));
                 } else {
                     self.operand_to_rcx(rhs);
                     if ty == IrType::F32 {
@@ -334,7 +334,7 @@ impl X86Codegen {
                     } else {
                         self.state.emit("    movq %rcx, %xmm1");
                     }
-                    self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+                    self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
                 }
             }
             _ => {
@@ -344,7 +344,7 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0", mnemonic, suffix));
+                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
             }
         }
 
@@ -359,10 +359,10 @@ impl X86Codegen {
 
     pub(super) fn emit_float_binop_mnemonic_impl(&self, op: FloatOp) -> &'static str {
         match op {
-            FloatOp::Add => "add",
-            FloatOp::Sub => "sub",
-            FloatOp::Mul => "mul",
-            FloatOp::Div => "div",
+            FloatOp::Add => "vadd",
+            FloatOp::Sub => "vsub",
+            FloatOp::Mul => "vmul",
+            FloatOp::Div => "vdiv",
         }
     }
 
@@ -564,5 +564,59 @@ impl X86Codegen {
         }
         self.emit_fp_operand_to_xmm(val, ty, "xmm0");
         "xmm0"
+    }
+
+    /// `add_dest = acc + mul_lhs * mul_rhs` via vfmadd231sd/ss.
+    /// AT&T: vfmadd231sd src2, src1, dest  with dest holding acc.
+    pub(super) fn emit_scalar_fma231(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        add_dest: &Value,
+        ty: IrType,
+    ) {
+        let fma = if matches!(ty, IrType::F64) { "vfmadd231sd" } else { "vfmadd231ss" };
+        self.load_fp_to_xmm0(acc, ty);
+        self.load_fp_to_reg(mul_lhs, ty, "xmm1");
+        match mul_rhs {
+            Operand::Value(v) => {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(reg) {
+                        let n = phys_reg_name(reg);
+                        // reg form: src2=n, src1=xmm1, dest=xmm0
+                        self.state.emit_fmt(format_args!("    {} %{}, %xmm1, %xmm0", fma, n));
+                        self.store_xmm0_fp_dest(add_dest, ty);
+                        return;
+                    }
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot.0);
+                    // mem form: encoder wants (mem, vvvv, dst) = src2, src1, dest
+                    self.state.emit_fmt(format_args!("    {} {}, %xmm1, %xmm0", fma, sr));
+                    self.store_xmm0_fp_dest(add_dest, ty);
+                    return;
+                }
+                self.load_fp_to_reg(mul_rhs, ty, "xmm2");
+                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+            }
+            Operand::Const(IrConst::F64(v)) => {
+                let bits = v.to_bits();
+                if bits != 0 {
+                    let label = self.state.get_fp_const_label(bits);
+                    self.state.emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                }
+            }
+            Operand::Const(IrConst::F32(v)) => {
+                let bits = v.to_bits() as u64;
+                let label = self.state.get_fp_const_label(bits);
+                self.state.emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+            }
+            _ => {
+                self.load_fp_to_reg(mul_rhs, ty, "xmm2");
+                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+            }
+        }
+        self.store_xmm0_fp_dest(add_dest, ty);
     }
 }

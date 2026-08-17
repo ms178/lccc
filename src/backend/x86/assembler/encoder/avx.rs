@@ -1027,6 +1027,20 @@ impl super::InstructionEncoder {
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
             }
+            // Gas-style AT&T sometimes writes `vfmadd231sd %xmm, mem, %xmm`
+            // (src1, src2/mem, dest). Map to the canonical (mem, vvvv, dst) form
+            // when the middle operand is memory.
+            (Operand::Register(src1), Operand::Memory(mem), Operand::Register(dst)) => {
+                let vvvv_num = reg_num(&src1.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
             _ => Err("unsupported FMA3 3-op operands".to_string()),
         }
     }
@@ -1058,6 +1072,20 @@ impl super::InstructionEncoder {
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
                 self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp); // W=1 for F64
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            // Gas-style AT&T sometimes writes `vfmadd231sd %xmm, mem, %xmm`
+            // (src1, src2/mem, dest). Map to the canonical (mem, vvvv, dst) form
+            // when the middle operand is memory.
+            (Operand::Register(src1), Operand::Memory(mem), Operand::Register(dst)) => {
+                let vvvv_num = reg_num(&src1.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
             }

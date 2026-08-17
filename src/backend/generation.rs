@@ -988,8 +988,8 @@ fn detect_cmp_select_fusion(
 ///
 /// Returns a set of instruction indices that should be skipped because they
 /// will be handled by the preceding Mul's fused emission.
-fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool) -> FxHashSet<usize> {
-    let mut skip_set = FxHashSet::default();
+fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bool) -> FxHashMap<usize, usize> {
+    let mut fusion_map: FxHashMap<usize, usize> = FxHashMap::default();
 
     for (idx, inst) in block.instructions.iter().enumerate() {
         // Look for BinOp::Mul
@@ -1018,22 +1018,30 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
             continue;
         }
 
-        // Next instruction must be a BinOp::Add that uses the multiply result
-        let next_idx = idx + 1;
-        if next_idx >= block.instructions.len() {
-            continue;
+        // Nearby Add using the mul result; allow pure Copy/Cast between.
+        let mut add_idx = None;
+        let mut add_lhs_r = None;
+        let mut add_rhs_r = None;
+        let mut add_ty_r = None;
+        let max_scan = (idx + 6).min(block.instructions.len());
+        for scan in (idx + 1)..max_scan {
+            match &block.instructions[scan] {
+                Instruction::Copy { .. } | Instruction::Cast { .. } => continue,
+                Instruction::BinOp {
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs, rhs, ty, ..
+                } => {
+                    add_idx = Some(scan);
+                    add_lhs_r = Some(lhs);
+                    add_rhs_r = Some(rhs);
+                    add_ty_r = Some(ty);
+                    break;
+                }
+                _ => break,
+            }
         }
-        let next_inst = &block.instructions[next_idx];
-        let (add_lhs, add_rhs, add_ty) = match next_inst {
-            Instruction::BinOp {
-                op: crate::ir::reexports::IrBinOp::Add,
-                lhs,
-                rhs,
-                ty,
-                ..
-            } => (lhs, rhs, ty),
-            _ => continue,
-        };
+        let (Some(next_idx), Some(add_lhs), Some(add_rhs), Some(add_ty)) =
+            (add_idx, add_lhs_r, add_rhs_r, add_ty_r) else { continue };
 
         // The multiply result must be one of the add operands
         let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
@@ -1047,11 +1055,10 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
             continue;
         }
 
-        // Mark the add instruction to be skipped — it will be emitted fused with the mul
-        skip_set.insert(next_idx);
+        fusion_map.insert(idx, next_idx);
     }
 
-    skip_set
+    fusion_map
 }
 
 /// Find adjacent `shift; logical` pairs that AArch64 can encode as one
@@ -1796,6 +1803,7 @@ fn generate_function(
             FxHashSet::default()
         };
         let mut skip_fused_add = false;
+        let mut fused_add_skip: FxHashSet<usize> = FxHashSet::default();
         let mut skip_fused_logical = false;
         let mi_enabled = cg.is_machinst_enabled();
 
@@ -1845,6 +1853,10 @@ fn generate_function(
             }
             // Skip the Add that was already emitted as part of a fused Mul-Add.
             // This flag is set by the Mul handler below when fusion fires.
+            if fused_add_skip.contains(&idx) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
             if skip_fused_add {
                 skip_fused_add = false;
                 cg.state().current_program_point += 1;
@@ -1903,12 +1915,7 @@ fn generate_function(
                 ty,
             } = inst
             {
-                if mul_add_fusions.contains(&(idx + 1)) {
-                    // Only fuse if the multiply temp is NOT register-allocated.
-                    // If it IS registered, the standard register-direct path is better.
-                    // FP mul feeding an add fuses into fmadd even when the
-                    // mul result has its own register (the fused form still
-                    // saves the separate multiply).
+                if let Some(&add_i) = mul_add_fusions.get(&idx) {
                     if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
                         if let Some(Instruction::BinOp {
                             dest: add_dest,
@@ -1916,12 +1923,12 @@ fn generate_function(
                             rhs: add_rhs,
                             ty: add_ty,
                             ..
-                        }) = block.instructions.get(idx + 1)
+                        }) = block.instructions.get(add_i)
                         {
                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
                             cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
-                            skip_fused_add = true;
+                            fused_add_skip.insert(add_i);
                             cg.state().current_program_point += 1;
                             continue;
                         }
