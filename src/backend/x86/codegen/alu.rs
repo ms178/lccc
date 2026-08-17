@@ -290,6 +290,10 @@ impl X86Codegen {
         mul_lhs: &Operand, mul_rhs: &Operand,
         acc: &Operand, add_dest: &Value, ty: IrType,
     ) {
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            self.emit_scalar_fma231(mul_lhs, mul_rhs, acc, add_dest, ty);
+            return;
+        }
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
         // Step 1: Compute mul_lhs * mul_rhs into %eax.

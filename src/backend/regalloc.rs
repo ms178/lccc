@@ -1876,13 +1876,18 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
             match inst {
                 Instruction::BinOp { dest, ty, .. }
                 | Instruction::UnaryOp { dest, ty, .. }
-                | Instruction::Load { dest, ty, .. } if *ty == IrType::F64 => {
+                | Instruction::Load { dest, ty, .. }
+                    if matches!(*ty, IrType::F64 | IrType::F32) =>
+                {
                     f64_values.insert(dest.0);
                 }
-                Instruction::Cast { dest, to_ty, .. } if *to_ty == IrType::F64 => {
+                Instruction::Cast { dest, to_ty, .. }
+                    if matches!(*to_ty, IrType::F64 | IrType::F32) =>
+                {
                     f64_values.insert(dest.0);
                 }
-                Instruction::Copy { dest, src: Operand::Const(IrConst::F64(_)) } => {
+                Instruction::Copy { dest, src: Operand::Const(IrConst::F64(_)) }
+                | Instruction::Copy { dest, src: Operand::Const(IrConst::F32(_)) } => {
                     f64_values.insert(dest.0);
                 }
                 Instruction::Intrinsic { dest: Some(d), op, .. }

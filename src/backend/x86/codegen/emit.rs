@@ -56,13 +56,11 @@ pub(super) const X86_CALLER_SAVED: [PhysReg; 6] = [
 /// x86-64 XMM registers available for F64 allocation.
 /// Caller-saved (SysV ABI), only for values that don't span calls.
 /// xmm0/xmm1 are reserved for the accumulator pattern and FP return values.
-pub(super) const X86_XMM_REGS: [PhysReg; 6] = [
-    PhysReg(20),
-    PhysReg(21),
-    PhysReg(22),
-    PhysReg(23),
-    PhysReg(24),
-    PhysReg(25),
+pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
+    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
+    PhysReg(24), PhysReg(25), PhysReg(26), PhysReg(27),
+    PhysReg(28), PhysReg(29), PhysReg(30), PhysReg(31),
+    PhysReg(32), PhysReg(33),
 ];
 
 /// Convert a 64-bit register name string to its 32-bit sub-register name.
@@ -3202,6 +3200,10 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn supports_inline_memcpy_call(&self) -> bool {
+        true
+    }
+
+    fn supports_fused_float_mul_add(&self) -> bool {
         true
     }
 
