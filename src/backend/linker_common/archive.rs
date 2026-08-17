@@ -93,7 +93,24 @@ pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
     expected_machine: u16, should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
-    let data: &[u8] = buf;
+    load_archive_elf64_backed(
+        &crate::backend::linker_common::filemap::FileBacking::Owned(std::sync::Arc::clone(buf)),
+        archive_path, objects, globals, expected_machine, should_replace_extra,
+        whole_archive)
+}
+
+/// Archive loader over a memory-mapped (or read) archive file.
+///
+/// Members are windows into the single mapping, so nothing is copied: not the
+/// archive, not the members, not their sections. For an archive the linker
+/// only partially consumes, the untouched members are never even faulted in.
+pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
+    buf: &crate::backend::linker_common::filemap::FileBacking, archive_path: &str,
+    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
+    expected_machine: u16, should_replace_extra: fn(&G) -> bool,
+    whole_archive: bool,
+) -> Result<(), String> {
+    let data: &[u8] = buf.as_slice();
     let members = parse_archive_members(data)?;
     let mut member_objects: Vec<Elf64Object> = Vec::new();
     for (name, offset, size) in &members {
@@ -104,7 +121,8 @@ pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
             if e_machine != expected_machine { continue; }
         }
         let full_name = format!("{}({})", archive_path, name);
-        if let Ok(obj) = parse_elf64_object_at(buf, *offset, *size, &full_name, expected_machine) {
+        if let Ok(obj) = crate::backend::linker_common::parse_object::parse_elf64_object_backed(
+                buf, *offset, *size, &full_name, expected_machine) {
             member_objects.push(obj);
         }
     }

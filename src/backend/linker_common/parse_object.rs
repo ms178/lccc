@@ -5,6 +5,7 @@
 //! The only parameter that differed was the expected e_machine value.
 
 use super::secdata::SectionData;
+use super::filemap::FileBacking;
 use super::SymStr;
 use crate::backend::elf::{
     ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL,
@@ -33,10 +34,9 @@ pub fn parse_elf64_object_at(
     source_name: &str,
     expected_machine: u16,
 ) -> Result<Elf64Object, String> {
-    let Some(data) = buf.get(base..base.checked_add(size).unwrap_or(usize::MAX)) else {
-        return Err(format!("{}: object extends past end of buffer", source_name));
-    };
-    parse_elf64_object_inner(data, Some((buf, base)), source_name, expected_machine)
+    parse_elf64_object_backed(
+        &FileBacking::Owned(std::sync::Arc::clone(buf)), base, size,
+        source_name, expected_machine)
 }
 
 /// Parse an ELF64 object from a standalone slice.
@@ -48,9 +48,29 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
     parse_elf64_object_inner(data, None, source_name, expected_machine)
 }
 
+/// Parse an object that lives inside a memory-mapped (or read) input file.
+///
+/// This is the true zero-copy path: section bytes are windows into the
+/// kernel's page cache, so the file is never copied into the linker's heap at
+/// all. `base`/`size` delimit the object within the file, which is what lets a
+/// single mapping serve every member of an archive.
+pub fn parse_elf64_object_backed(
+    backing: &FileBacking,
+    base: usize,
+    size: usize,
+    source_name: &str,
+    expected_machine: u16,
+) -> Result<Elf64Object, String> {
+    let all = backing.as_slice();
+    let Some(data) = all.get(base..base.checked_add(size).unwrap_or(usize::MAX)) else {
+        return Err(format!("{}: object extends past end of buffer", source_name));
+    };
+    parse_elf64_object_inner(data, Some((backing, base)), source_name, expected_machine)
+}
+
 fn parse_elf64_object_inner(
     data: &[u8],
-    shared: Option<(&std::sync::Arc<[u8]>, usize)>,
+    shared: Option<(&FileBacking, usize)>,
     source_name: &str,
     expected_machine: u16,
 ) -> Result<Elf64Object, String> {
@@ -159,13 +179,13 @@ fn parse_elf64_object_inner(
     //
     // Callers that only have a slice fall back to owning a private copy of
     // the whole input once, which is still no worse than per-section copies.
-    let owned_buf: Option<std::sync::Arc<[u8]>> = match shared {
+    let owned_buf: Option<FileBacking> = match shared {
         Some(_) => None,
-        None => Some(std::sync::Arc::from(data)),
+        None => Some(FileBacking::Owned(std::sync::Arc::from(data))),
     };
     let (backing, origin) = match shared {
         Some((buf, base)) => (buf, base),
-        // SAFETY-free: `owned_buf` is Some on this branch by construction.
+        // `owned_buf` is Some on this branch by construction.
         None => (owned_buf.as_ref().unwrap(), 0usize),
     };
 
@@ -183,7 +203,7 @@ fn parse_elf64_object_inner(
             if slice_at(data, start, len).is_none() {
                 return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
             }
-            let Some(sd) = SectionData::slice(backing, origin + start, len) else {
+            let Some(sd) = SectionData::slice_backing(backing, origin + start, len) else {
                 return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
             };
             section_data.push(sd);

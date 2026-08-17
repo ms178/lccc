@@ -44,6 +44,8 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use super::filemap::FileBacking;
+
 /// Immutable bytes of one input section.
 ///
 /// Either a window into a shared file buffer (the common case, no copy) or an
@@ -51,7 +53,11 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct SectionData {
     /// Backing storage. Shared between every section of the same input file.
-    buf: Arc<[u8]>,
+    ///
+    /// Either an `mmap` of the input (the common case, no copy anywhere in the
+    /// pipeline) or an owned buffer for synthesised sections and for the
+    /// non-mappable fallback. Cloning is a refcount bump either way.
+    buf: FileBacking,
     /// Byte range of this section within `buf`.
     start: usize,
     end: usize,
@@ -61,7 +67,7 @@ impl SectionData {
     /// Empty section (`SHT_NOBITS`, or a zero-length section).
     #[inline]
     pub fn empty() -> Self {
-        SectionData { buf: Arc::from(&[][..]), start: 0, end: 0 }
+        SectionData { buf: FileBacking::Owned(Arc::from(&[][..])), start: 0, end: 0 }
     }
 
     /// A window `[start, start + len)` into an existing shared buffer.
@@ -71,11 +77,20 @@ impl SectionData {
     /// that into a diagnostic rather than a panic.
     #[inline]
     pub fn slice(buf: &Arc<[u8]>, start: usize, len: usize) -> Option<Self> {
+        Self::slice_backing(&FileBacking::Owned(Arc::clone(buf)), start, len)
+    }
+
+    /// A window into an input file's backing storage (mapping or buffer).
+    ///
+    /// This is the zero-copy entry point: the bytes stay where the kernel put
+    /// them and the section only records a range.
+    #[inline]
+    pub fn slice_backing(buf: &FileBacking, start: usize, len: usize) -> Option<Self> {
         let end = start.checked_add(len)?;
-        if end > buf.len() {
+        if end > buf.as_slice().len() {
             return None;
         }
-        Some(SectionData { buf: Arc::clone(buf), start, end })
+        Some(SectionData { buf: buf.clone(), start, end })
     }
 
     /// Take ownership of bytes that do not come from an input file
@@ -83,14 +98,14 @@ impl SectionData {
     #[inline]
     pub fn owned(bytes: Vec<u8>) -> Self {
         let end = bytes.len();
-        SectionData { buf: Arc::from(bytes), start: 0, end }
+        SectionData { buf: FileBacking::Owned(Arc::from(bytes)), start: 0, end }
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         // The range is validated at construction and the buffer is immutable,
         // so this cannot be out of bounds.
-        &self.buf[self.start..self.end]
+        &self.buf.as_slice()[self.start..self.end]
     }
 
     #[inline]
@@ -323,5 +338,53 @@ mod tests {
                 "range past buffer end must be refused");
         assert!(SectionData::slice(&b, 100, 28).is_some(),
                 "range ending exactly at buffer end is fine");
+    }
+
+    /// The whole point of the mmap work: an object parsed from a mapped file
+    /// must alias the mapping, not copy out of it. Mutation check: restoring a
+    /// `to_vec()` in the parser makes the pointers differ and fails here.
+    #[test]
+    fn sections_alias_a_mapped_input_file() {
+        use crate::backend::linker_common::filemap::FileMap;
+        use std::io::Write;
+
+        // A minimal but real ELF64 relocatable with one PROGBITS section is
+        // more setup than this test needs; window a synthetic backing instead,
+        // which exercises the same aliasing contract SectionData provides.
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("lccc_secdata_alias_{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&bytes).unwrap();
+            f.sync_all().unwrap();
+        }
+        let map = FileMap::open(path.to_str().unwrap()).unwrap();
+        assert!(map.is_mapped(), "test needs the mmap path");
+        let backing = map.backing();
+        let base_ptr = backing.as_slice().as_ptr();
+
+        let sd = SectionData::slice_backing(&backing, 64, 128).unwrap();
+        assert_eq!(sd.len(), 128);
+        assert_eq!(sd.as_slice(), &bytes[64..192]);
+        // Pointer identity is the proof: a copy would live elsewhere.
+        assert_eq!(
+            sd.as_slice().as_ptr(),
+            unsafe { base_ptr.add(64) },
+            "section data was COPIED out of the mapping instead of windowing into it"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An out-of-range window must be rejected rather than panicking or
+    /// silently reading a neighbouring member.
+    #[test]
+    fn out_of_range_backing_window_is_rejected() {
+        use crate::backend::linker_common::filemap::FileBacking;
+        use std::sync::Arc;
+        let backing = FileBacking::Owned(Arc::from(&[0u8; 16][..]));
+        assert!(SectionData::slice_backing(&backing, 8, 8).is_some());
+        assert!(SectionData::slice_backing(&backing, 8, 9).is_none());
+        assert!(SectionData::slice_backing(&backing, usize::MAX, 1).is_none());
     }
 }

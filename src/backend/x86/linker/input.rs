@@ -16,56 +16,72 @@ pub(super) fn load_file(
     needed_sonames: &mut Vec<String>, lib_paths: &[String],
     whole_archive: bool,
 ) -> Result<(), String> {
+    // Default call sites keep GNU ld's historical behaviour for this linker
+    // (as-needed); positional callers use `load_file_as_needed`.
+    load_file_as_needed(path, objects, globals, needed_sonames, lib_paths,
+                        whole_archive, true)
+}
+
+/// As [`load_file`], but carries the positional `--as-needed` state that was
+/// in effect for this input.
+pub(super) fn load_file_as_needed(
+    path: &str, objects: &mut Vec<ElfObject>, globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>, lib_paths: &[String],
+    whole_archive: bool, as_needed: bool,
+) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("load_file: {}", path);
     }
 
-    // Read the file once into a shared buffer.
+    // Map the file instead of reading it.
     //
-    // Section contents of the parsed object become windows into this
-    // allocation rather than per-section copies (see `secdata.rs`).
+    // `SectionData` already avoided a *second* copy by windowing into the read
+    // buffer (see `secdata.rs`), but the read itself still copied the whole
+    // file. On the gzip workload that copy was 3.46 M instructions, 6.6% of
+    // the entire link, essentially all `__memcpy_avx_unaligned_erms`.
     //
-    // Note: `Vec<u8> -> Arc<[u8]>` *always* copies, and no amount of capacity
-    // trimming avoids it -- an `Arc` stores its refcounts in a header ahead of
-    // the payload, so it can never adopt a plain `Vec`'s allocation. Verified
-    // experimentally; an "exact-size read" attempt here changed nothing and
-    // was reverted. Eliminating this last copy needs `mmap` (tracked in the
-    // follow-up doc), not a smarter read. It is one copy of the file total,
-    // which is what `fs::read` alone already cost before this work.
-    let data: std::sync::Arc<[u8]> = std::fs::read(path)
-        .map_err(|e| format!("failed to read '{}': {}", path, e))?
-        .into();
+    // `mmap(PROT_READ, MAP_PRIVATE)` removes it: sections become windows into
+    // the page cache, and pages the linker never touches are never faulted in
+    // -- which is most of a large archive. `FileMap` falls back to
+    // `std::fs::read` when mapping is unavailable, so correctness never
+    // depends on it (`LCCC_NO_MMAP=1` forces that path for A/B measurement).
+    let file = linker_common::filemap::FileMap::open(path)?;
+    let data = file.as_slice();
+    let backing = file.backing();
 
     // Regular archive
     if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-        return linker_common::load_archive_elf64_shared(&data, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
+        return linker_common::load_archive_elf64_backed(&backing, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
     }
 
     // Thin archive
-    if is_thin_archive(&data) {
-        return linker_common::load_thin_archive_elf64(&data, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
+    if is_thin_archive(data) {
+        return linker_common::load_thin_archive_elf64(data, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
     }
 
     // Not ELF? Try linker script (handles GROUP and INPUT directives)
     if data.len() >= 4 && data[0..4] != ELF_MAGIC {
-        if let Ok(text) = std::str::from_utf8(&data) {
+        if let Ok(text) = std::str::from_utf8(data) {
             if let Some(entries) = parse_linker_script_entries(text) {
                 let script_dir = Path::new(path).parent().map(|p| p.to_string_lossy().to_string());
                 for entry in &entries {
                     match entry {
                         LinkerScriptEntry::Path(lib_path) => {
                             if Path::new(lib_path).exists() {
-                                load_file(lib_path, objects, globals, needed_sonames, lib_paths, whole_archive)?;
+                                load_file_as_needed(lib_path, objects, globals,
+                                    needed_sonames, lib_paths, whole_archive, as_needed)?;
                             } else if let Some(ref dir) = script_dir {
                                 let resolved = format!("{}/{}", dir, lib_path);
                                 if Path::new(&resolved).exists() {
-                                    load_file(&resolved, objects, globals, needed_sonames, lib_paths, whole_archive)?;
+                                    load_file_as_needed(&resolved, objects, globals,
+                                        needed_sonames, lib_paths, whole_archive, as_needed)?;
                                 }
                             }
                         }
                         LinkerScriptEntry::Lib(lib_name) => {
                             if let Some(resolved_path) = linker_common::resolve_lib(lib_name, lib_paths, false) {
-                                load_file(&resolved_path, objects, globals, needed_sonames, lib_paths, whole_archive)?;
+                                load_file_as_needed(&resolved_path, objects, globals,
+                                    needed_sonames, lib_paths, whole_archive, as_needed)?;
                             }
                         }
                     }
@@ -80,12 +96,14 @@ pub(super) fn load_file(
     if data.len() >= 18 {
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type == ET_DYN {
-            return linker_common::load_shared_library_elf64(path, globals, needed_sonames, lib_paths);
+            return linker_common::load_shared_library_elf64_as_needed(
+                path, globals, needed_sonames, lib_paths, as_needed);
         }
     }
 
     // Regular ELF object
-    let obj = parse_object_shared(&data, 0, data.len(), path)?;
+    let obj = linker_common::parse_object::parse_elf64_object_backed(
+        &backing, 0, data.len(), path, EM_X86_64)?;
     let obj_idx = objects.len();
     linker_common::register_symbols_elf64(obj_idx, &obj, globals, x86_should_replace_extra)?;
     objects.push(obj);

@@ -1036,15 +1036,44 @@ pub fn link_with_script(
             return Ok(());
         }
 
-        // cmp r64, m64  ->  cmp r64, imm32   (3b /r -> 81 /7 id)
-        // Only valid when the absolute address fits in a sign-extended imm32,
-        // which is the normal case for a -T image below 2 GiB.
-        if op == 0x3b {
-            let abs = s as i64 + a + 4; // addend is -4 for a rip operand
+        // ALU r64, m64  ->  ALU r64, imm32.
+        //
+        // The x86-64 psABI relaxes the whole `op r64, sym@GOTPCREL(%rip)`
+        // family to the group-1 immediate form `81 /ext id`, where `ext`
+        // selects the operation. Handling only `cmp` here meant an ordinary
+        // `sub`/`add` against a GOT-relative address -- which GCC emits for
+        // pointer arithmetic on an external symbol -- failed the link with an
+        // "instruction form this linker cannot relax" error while GNU ld
+        // accepted it.
+        //
+        //   opcode  operation   group-1 /ext
+        //     03      add            0
+        //     0b      or             1
+        //     13      adc            2
+        //     1b      sbb            3
+        //     23      and            4
+        //     2b      sub            5
+        //     33      xor            6
+        //     3b      cmp            7
+        let alu_ext: Option<u8> = match op {
+            0x03 => Some(0),
+            0x0b => Some(1),
+            0x13 => Some(2),
+            0x1b => Some(3),
+            0x23 => Some(4),
+            0x2b => Some(5),
+            0x33 => Some(6),
+            0x3b => Some(7),
+            _ => None,
+        };
+        if let Some(ext) = alu_ext {
+            // The addend is -4 for a rip-relative operand; undo it to recover
+            // the absolute address the immediate must carry.
+            let abs = s as i64 + a + 4;
             if (i32::MIN as i64..=i32::MAX as i64).contains(&abs) {
                 let reg = (modrm >> 3) & 7;
                 out[fp - 2] = 0x81;
-                out[fp - 1] = 0xf8 | reg; // mod=11, /7 (cmp), rm=reg
+                out[fp - 1] = 0xc0 | (ext << 3) | reg; // mod=11, /ext, rm=reg
                 w32(out, fp, abs as u32);
                 return Ok(());
             }
@@ -1108,6 +1137,13 @@ pub fn link_with_script(
     }
 
     // ── Apply relocations ──
+    //
+    // TLS GD/LD relaxation rewrites a multi-instruction sequence, and the
+    // `__tls_get_addr` call inside it carries its OWN PLT32/GOTPCRELX
+    // relocation. Applying that one afterwards would patch a displacement into
+    // bytes that are no longer a call. Record the consumed byte ranges and
+    // skip any relocation landing inside them.
+    let mut tls_consumed: Vec<(usize, usize)> = Vec::new();
     let mut undefined: Vec<String> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, relas) in obj.relocations.iter().enumerate() {
@@ -1121,6 +1157,12 @@ pub fn link_with_script(
             for rela in relas {
                 let sidx = rela.sym_idx as usize;
                 if sidx >= obj.symbols.len() { continue; }
+                {
+                    let fp_chk = (sec_foff + rela.offset) as usize;
+                    if tls_consumed.iter().any(|&(a, b)| fp_chk >= a && fp_chk < b) {
+                        continue;
+                    }
+                }
                 let sym = &obj.symbols[sidx];
                 let p = sec_vaddr + rela.offset;
                 let fp = (sec_foff + rela.offset) as usize;
@@ -1217,6 +1259,115 @@ pub fn link_with_script(
                     // A -T link is always static with a fixed TLS block, so
                     // the Initial-Exec / Local-Exec forms resolve directly and
                     // no GOT slot or __tls_get_addr call is needed.
+                    // ── General-Dynamic / Local-Dynamic TLS ──
+                    //
+                    // A -T link is static with a fixed TLS block, so there is
+                    // no dynamic module and __tls_get_addr can never be
+                    // reached. GNU ld therefore RELAXES these sequences to
+                    // Local-Exec rather than resolving them. Rejecting them,
+                    // which is what happened before, made any -fPIC C++ or
+                    // pthread-using object unlinkable through a script.
+                    R_X86_64_TLSGD => {
+                        if tls_mem_size == 0 {
+                            return Err(format!(
+                                "script link: TLS relocation against '{}' in {} but the \
+                                 script places no SHF_TLS section (add .tdata/.tbss)",
+                                sym.name, obj.source_name));
+                        }
+                        // Canonical GD sequence, 16 bytes spanning [fp-4, fp+12):
+                        //   66 48 8d 3d <disp32>   data16 lea sym@tlsgd(%rip),%rdi
+                        //   66 66 48 e8 <disp32>   data16 data16 rex.W call __tls_get_addr
+                        let st = fp.checked_sub(4).filter(|&st|
+                            st + 16 <= out.len()
+                            && out[st] == 0x66 && out[st + 1] == 0x48
+                            && out[st + 2] == 0x8d && out[st + 3] == 0x3d
+                            && out[fp + 4] == 0x66 && out[fp + 5] == 0x66
+                            && out[fp + 6] == 0x48 && out[fp + 7] == 0xe8);
+                        let Some(st) = st else {
+                            return Err(format!(
+                                "script link: TLSGD relaxation failed for '{}' in {}: \
+                                 unrecognised code sequence",
+                                sym.name, obj.source_name));
+                        };
+                        // GD -> LE:
+                        //   64 48 8b 04 25 00000000   mov %fs:0,%rax
+                        //   48 8d 80 <tpoff32>        lea tpoff(%rax),%rax
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        if !(i32::MIN as i64..=i32::MAX as i64).contains(&tpoff) {
+                            return Err(reloc_range_err("TLSGD->LE offset", tpoff,
+                                                       &sym.name, &obj.source_name));
+                        }
+                        out[st..st + 9]
+                            .copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+                        out[st + 9] = 0x48;
+                        out[st + 10] = 0x8d;
+                        out[st + 11] = 0x80;
+                        w32(&mut out, st + 12, tpoff as u32);
+                        tls_consumed.push((fp + 4, fp + 12));
+                    }
+                    R_X86_64_TLSLD => {
+                        // LD sequence, 12 bytes spanning [fp-3, fp+9):
+                        //   48 8d 3d <disp32>   lea sym@tlsld(%rip),%rdi
+                        //   e8 <disp32>         call __tls_get_addr
+                        // becomes a 12-byte `mov %fs:0,%rax`, after which the
+                        // accompanying DTPOFF32 values are TP-relative.
+                        let st = fp.checked_sub(3).filter(|&st|
+                            st + 12 <= out.len()
+                            && out[st] == 0x48 && out[st + 1] == 0x8d
+                            && out[st + 2] == 0x3d && out[fp + 4] == 0xe8);
+                        let Some(st) = st else {
+                            return Err(format!(
+                                "script link: TLSLD relaxation failed in {}: \
+                                 unrecognised code sequence",
+                                obj.source_name));
+                        };
+                        out[st..st + 12].copy_from_slice(
+                            &[0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+                        tls_consumed.push((fp + 4, fp + 9));
+                    }
+                    // TLSDESC: `lea sym@tlsdesc(%rip),%rax` -> `mov $tpoff,%rax`,
+                    // and the indirect call through the descriptor becomes a nop.
+                    R_X86_64_GOTPC32_TLSDESC => {
+                        if fp >= 3 && out[fp - 3] == 0x48 && out[fp - 2] == 0x8d
+                            && out[fp - 1] == 0x05
+                        {
+                            let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                            out[fp - 2] = 0xc7;
+                            out[fp - 1] = 0xc0;
+                            w32(&mut out, fp, tpoff as u32);
+                        } else {
+                            return Err(format!(
+                                "script link: TLSDESC relaxation failed for '{}' in {}: \
+                                 unrecognised code sequence",
+                                sym.name, obj.source_name));
+                        }
+                    }
+                    R_X86_64_TLSDESC_CALL => {
+                        // call *(%rax) [ff 10] -> xchg %ax,%ax [66 90]
+                        if fp + 2 <= out.len() && out[fp] == 0xff && out[fp + 1] == 0x10 {
+                            out[fp] = 0x66;
+                            out[fp + 1] = 0x90;
+                        }
+                    }
+                    R_X86_64_GOTTPOFF => {
+                        // Initial-Exec through a GOT slot. With no GOT, relax
+                        //   mov sym@gottpoff(%rip),%reg   48 8b ..
+                        // into
+                        //   mov $tpoff,%reg               48 c7 c0|..
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        if fp >= 3 && out[fp - 2] == 0x8b {
+                            let modrm = out[fp - 1];
+                            let reg = (modrm >> 3) & 7;
+                            out[fp - 2] = 0xc7;
+                            out[fp - 1] = 0xc0 | reg;
+                            w32(&mut out, fp, tpoff as u32);
+                        } else {
+                            return Err(format!(
+                                "script link: GOTTPOFF relaxation failed for '{}' in {}: \
+                                 unrecognised code sequence",
+                                sym.name, obj.source_name));
+                        }
+                    }
                     R_X86_64_TPOFF32 => {
                         if tls_mem_size == 0 {
                             return Err(format!(
@@ -1237,10 +1388,22 @@ pub fn link_with_script(
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                         w64(&mut out, fp, (tpoff + a) as u64);
                     }
-                    // Offset within the TLS block, used by Local-Dynamic
-                    // sequences; measured from the block start, not its end.
-                    R_X86_64_DTPOFF32 => w32(&mut out, fp, (s as i64 - tls_addr as i64 + a) as u32),
-                    R_X86_64_DTPOFF64 => w64(&mut out, fp, (s as i64 - tls_addr as i64 + a) as u64),
+                    // DTPOFF accompanies a Local-Dynamic sequence. Because that
+                    // sequence has just been relaxed to Local-Exec -- %rax now
+                    // holds the thread pointer rather than the module base --
+                    // the offset must be TP-relative, i.e. the same formula as
+                    // TPOFF32. Using the block-relative value instead yields
+                    // `cmpl $0xb,0x4(%rax)` where GNU ld emits
+                    // `cmpl $0xb,-0x4(%rax)`: every Local-Dynamic access reads
+                    // the wrong side of the thread pointer.
+                    R_X86_64_DTPOFF32 => {
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        w32(&mut out, fp, (tpoff + a) as u32)
+                    }
+                    R_X86_64_DTPOFF64 => {
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        w64(&mut out, fp, (tpoff + a) as u64)
+                    }
                     R_X86_64_NONE => {}
                     other => {
                         return Err(format!(

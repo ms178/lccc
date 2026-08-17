@@ -25,15 +25,32 @@ fn sym_base(name: &str) -> String {
 }
 
 fn push_verdef_entry(buf: &mut Vec<u8>, index: u16, name: &str, name_off: usize, next: u32) {
+    push_verdef_entry_with_parent(buf, index, name, name_off, next, None);
+}
+
+/// Emit one `Elf64_Verdef` plus its `Elf64_Verdaux` chain.
+///
+/// `parent` adds a second verdaux naming the inherited version. That chain is
+/// how `LIBV_2.0 { ... } LIBV_1.0;` tells the loader a LIBV_2.0 provider also
+/// satisfies a LIBV_1.0 dependency; without it the hierarchy is lost and an
+/// older consumer fails to bind even though the symbols are present.
+///
+/// `vd_cnt` must count *all* verdaux entries, not just the name, or the loader
+/// stops reading after the first one.
+fn push_verdef_entry_with_parent(
+    buf: &mut Vec<u8>, index: u16, name: &str, name_off: usize, next: u32,
+    parent: Option<(&str, usize)>,
+) {
     let start = buf.len();
     buf.resize(start + 20, 0);
     let name_off32 = name_off as u32;
     debug_assert_eq!(name_off32 as usize, name_off);
+    let cnt: u16 = 1 + u16::from(parent.is_some());
     // Elf64_Verdef: vd_version, vd_flags, vd_ndx, vd_cnt, vd_hash, vd_aux, vd_next
     w16(buf, start, 1);
     w16(buf, start + 2, if index == 1 { 1 } else { 0 }); // VER_FLG_BASE for base
     w16(buf, start + 4, index);
-    w16(buf, start + 6, 1);
+    w16(buf, start + 6, cnt);
     w32(buf, start + 8, elf_hash_name(name));
     w32(buf, start + 12, 20);
     w32(buf, start + 16, next);
@@ -41,7 +58,13 @@ fn push_verdef_entry(buf: &mut Vec<u8>, index: u16, name: &str, name_off: usize,
     buf.resize(aux + 8, 0);
     // Elf64_Verdaux: vda_name, vda_next
     w32(buf, aux, name_off32);
-    w32(buf, aux + 4, 0);
+    w32(buf, aux + 4, if parent.is_some() { 8 } else { 0 });
+    if let Some((_, poff)) = parent {
+        let paux = buf.len();
+        buf.resize(paux + 8, 0);
+        w32(buf, paux, poff as u32);
+        w32(buf, paux + 4, 0);
+    }
 }
 
 fn elf_hash_name(name: &str) -> u32 {
@@ -157,7 +180,7 @@ pub(super) fn emit_shared_library(
                             // exported), version-script-locals, or -Bsymbolic.
                             let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
                             let version_local = version_script.as_ref().is_some_and(|vs|
-                                vs.local_star && !vs.matches_global(&sym.name))
+                                vs.any_local_star() && !vs.matches_global(&sym.name))
                                 || excluded_syms.contains(sym.name.as_str());
                             let is_func = (gsym.info & 0xf) == STT_FUNC
                                 || sym.sym_type() == STT_FUNC
@@ -297,7 +320,7 @@ pub(super) fn emit_shared_library(
             // FFmpeg-style DSOs expose the intended ABI and produce versioned
             // dynamic symbols for consumers like mpv.
             if let Some(ref vs) = version_script {
-                if vs.local_star && !vs.matches_global(name) {
+                if vs.any_local_star() && !vs.matches_global(name) {
                     return false;
                 }
             }
@@ -337,7 +360,7 @@ pub(super) fn emit_shared_library(
     // with RELATIVE relocations below and must not be re-exported here.
     for name in &abs64_sym_names {
         let is_version_local = version_script.as_ref().is_some_and(|vs|
-            vs.local_star && !vs.matches_global(name));
+            vs.any_local_star() && !vs.matches_global(name));
         if !is_version_local && dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
@@ -373,9 +396,21 @@ pub(super) fn emit_shared_library(
     }
     let versioned_name = version_script.as_ref().map(|vs| vs.version_name.clone());
     let base_version_name = soname.clone().unwrap_or_else(|| output_path.rsplit('/').next().unwrap_or(output_path).to_string());
+    // Named nodes from the version script, in declaration order. An anonymous
+    // node ({ global: ...; local: *; }) only restricts visibility and gets no
+    // verdef, so it is filtered out here.
+    let script_nodes: Vec<linker_common::VersionNode> = version_script.as_ref()
+        .map(|vs| vs.nodes.iter().filter(|n| !n.name.is_empty()).cloned().collect())
+        .unwrap_or_default();
     if let Some(ref vn) = versioned_name {
         dynstr.add(&base_version_name);
         dynstr.add(vn);
+    }
+    // Every node name AND every parent name must be in .dynstr before its size
+    // is fixed; a parent may name a node that appears later in the file.
+    for n in &script_nodes {
+        dynstr.add(&n.name);
+        if let Some(ref p) = n.parent { dynstr.add(p); }
     }
 
     let dynsym_count = 1 + dyn_sym_names.len();
@@ -488,6 +523,43 @@ pub(super) fn emit_shared_library(
             push_verdef_entry(&mut verdef, (2 + i) as u16, v, voff, 0);
         }
         (versym, verdef, 1 + version_set.len() as u64)
+    } else if script_nodes.len() > 1 {
+        // Multi-node version script: one verdef per named node, in declaration
+        // order, with the inheritance chain preserved. A defined symbol takes
+        // the index of the FIRST node whose `global:` list matches it, which is
+        // how GNU ld resolves a symbol named in several nodes.
+        let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
+        versym.extend_from_slice(&0u16.to_le_bytes());
+        for name in &dyn_sym_names {
+            let defined = globals.get(name)
+                .is_some_and(|g| g.defined_in.is_some() && g.section_idx != SHN_UNDEF);
+            let idx: u16 = if !defined {
+                1
+            } else {
+                script_nodes.iter()
+                    .position(|n| n.global_patterns.iter()
+                        .any(|p| linker_common::wildcard_match_pattern(p, name)))
+                    .map_or(1, |i| (2 + i) as u16)
+            };
+            versym.extend_from_slice(&idx.to_le_bytes());
+        }
+        let mut verdef = Vec::new();
+        let base_off = dynstr.get_offset(&base_version_name);
+        // vd_next for a parentless node is 28 (20 verdef + 8 verdaux); a node
+        // carrying a parent adds another 8-byte verdaux.
+        let node_span = |n: &linker_common::VersionNode| -> u32 {
+            28 + if n.parent.is_some() { 8 } else { 0 }
+        };
+        push_verdef_entry(&mut verdef, 1, &base_version_name, base_off, 28);
+        for (i, n) in script_nodes.iter().enumerate() {
+            let is_last = i + 1 == script_nodes.len();
+            let next = if is_last { 0 } else { node_span(n) };
+            let noff = dynstr.get_offset(&n.name);
+            let parent = n.parent.as_ref().map(|p| (p.as_str(), dynstr.get_offset(p)));
+            push_verdef_entry_with_parent(
+                &mut verdef, (2 + i) as u16, &n.name, noff, next, parent);
+        }
+        (versym, verdef, 1 + script_nodes.len() as u64)
     } else if let Some(ref vn) = versioned_name {
         let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
         versym.extend_from_slice(&0u16.to_le_bytes());
@@ -1163,7 +1235,7 @@ pub(super) fn emit_shared_library(
                         // (with symbol index) to support symbol interposition.
                         // Section symbols and local symbols use R_X86_64_RELATIVE.
                         let is_version_local = version_script.as_ref().is_some_and(|vs|
-                            vs.local_star && !vs.matches_global(&sym.name));
+                            vs.any_local_star() && !vs.matches_global(&sym.name));
                         let locally_defined = globals_snap.get(sym.name.as_str())
                             .map(|g| g.defined_in.is_some() && !g.is_dynamic)
                             .unwrap_or(false);
