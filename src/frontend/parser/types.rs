@@ -630,7 +630,7 @@ impl Parser {
 
     /// Parse struct or union field declarations inside braces.
     pub(super) fn parse_struct_fields(&mut self) -> Vec<StructFieldDecl> {
-        let mut fields = Vec::new();
+        let mut fields = Vec::with_capacity(8);
         let open = self.peek_span();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {

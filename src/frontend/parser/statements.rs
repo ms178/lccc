@@ -440,7 +440,7 @@ impl Parser {
     /// Parse the goto labels section (fourth colon) of an asm goto statement.
     /// Labels are comma-separated identifiers: `asm goto("..." : : : : label1, label2)`
     fn parse_asm_goto_labels(&mut self) -> Vec<String> {
-        let mut labels = Vec::new();
+        let mut labels = Vec::with_capacity(4);
         if matches!(self.peek(), TokenKind::RParen) {
             return labels;
         }

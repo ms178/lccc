@@ -21,7 +21,7 @@ impl Lexer {
             file_id,
             gnu_extensions: true,
             at_line_start: true,
-            ident_pool: std::collections::HashMap::with_capacity(256),
+            ident_pool: std::collections::HashMap::with_capacity(512),
             diagnostics: Vec::new(),
         }
     }
@@ -45,7 +45,7 @@ impl Lexer {
 
     pub fn tokenize(&mut self) -> Vec<Token> {
         // Estimate ~1 token per 5 bytes of source (typical for C code).
-        let mut tokens = Vec::with_capacity(self.input.len() / 5);
+        let mut tokens = Vec::with_capacity(self.input.len() / 4 + 64);
         loop {
             let tok = self.next_token();
             let is_eof = tok.is_eof();

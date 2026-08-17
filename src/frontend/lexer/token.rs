@@ -374,6 +374,7 @@ impl TokenKind {
     /// Stage 2: reject by first character (only 16 possible first chars).
     /// Most identifiers in typical C code are rejected by these filters
     /// without entering the match statement.
+    #[inline]
     pub fn from_keyword(s: &str, gnu_extensions: bool) -> Option<TokenKind> {
         // Fast reject by length: C/GCC keywords have lengths 2-17 or 28.
         let len = s.len();

@@ -275,7 +275,7 @@ enum ExprToken {
 /// Tokenize a preprocessor expression, operating on byte slices for performance.
 /// Avoids allocating Vec<char>; numbers are parsed directly from byte spans.
 fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
-    let mut tokens = Vec::new();
+    let mut tokens = Vec::with_capacity(16);
     let bytes = expr.as_bytes();
     let len = bytes.len();
     let mut i = 0;
