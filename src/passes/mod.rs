@@ -773,6 +773,18 @@ macro_rules! preloop_dump {
             );
             total_changes += n;
             total_changes_excl_dce += n;
+
+            // Post-vectorize unroll: the matmul/map vector body is often a
+            // single intrinsic — unrolling it 2–4× exposes independent FMA
+            // chains (GCC's multi-accum style) without growing scalar code.
+            if !dis.unroll {
+                let n = timed_pass!(
+                    "loop_unroll_post_vec",
+                    run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops)
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
         }
 
         // Phase 2c: Integer narrowing

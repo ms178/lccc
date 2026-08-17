@@ -25,6 +25,8 @@ mod plt_got;
 mod link;
 mod emit_exec;
 mod emit_shared;
+mod parallel_reloc;
+mod icf;
 
 #[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;
