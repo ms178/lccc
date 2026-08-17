@@ -215,7 +215,7 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern);
             }
-        } else if force_two_wide && std::env::var("CCC_NO_MAP_VEC").is_err() {
+        } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
             // Map pattern — AArch64 entry only until x86 regalloc preserves
             // distinct src/dst bases across the vectorized body (Godbolt gap).
             // Backend now lowers VecMul/Broadcast/Store I32x4 for when enabled.
@@ -223,7 +223,8 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 if debug {
                     eprintln!("[VEC] Map pattern matched! Transforming to NEON 4-wide");
                 }
-                total_changes += transform_map_neon(func, &map_pattern);
+                let avx2 = std::env::var("LCCC_FORCE_MAP_SSE").is_err();
+                total_changes += transform_map_vector(func, &map_pattern, avx2);
             } else {
                 let why = take_reject().unwrap_or("pattern shape not recognized");
                 if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
@@ -5460,10 +5461,16 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
 /// form: broadcast scale/offset once, then per 4 elements emit
 /// load → mul → add → store with 4×I32 vectors. A scalar remainder loop
 /// handles N % 4.
-fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
+fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
-    let vec_width: u64 = 4;
+    let vec_width: u64 = if avx2 { 8 } else { 4 };
+    for inst in &func.blocks[pattern.body_idx].instructions {
+        if let Instruction::Store { ty: IrType::F32, .. } = inst {
+            if debug { eprintln!("[VEC-MAP] F32 map not implemented"); }
+            return 0;
+        }
+    }
     // F32 map needs VecBroadcastF32x4 / VecStoreF32x4 — not yet on x86.
     // Reject here so analysis can still report the pattern while staying correct.
     for inst in &func.blocks[pattern.body_idx].instructions {
@@ -5595,15 +5602,16 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
     next_val_id += 1;
     {
         let preheader = &mut func.blocks[preheader_idx];
+        let bcast = if avx2 { IntrinsicOp::VecBroadcastI32x8 } else { IntrinsicOp::VecBroadcastI32x4 };
         preheader.instructions.push(Instruction::Intrinsic {
             dest: Some(scale_vec),
-            op: IntrinsicOp::VecBroadcastI32x4,
+            op: bcast,
             dest_ptr: None,
             args: vec![pattern.scale.clone()],
         });
         preheader.instructions.push(Instruction::Intrinsic {
             dest: Some(offset_vec),
-            op: IntrinsicOp::VecBroadcastI32x4,
+            op: bcast,
             dest_ptr: None,
             args: vec![pattern.offset.clone()],
         });
@@ -5628,28 +5636,35 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
             if debug { eprintln!("[VEC-MAP]   Store not found at transform time"); }
             return changes;
         };
+        let (load_op, mul_op, add_op, store_op) = if avx2 {
+            (IntrinsicOp::VecLoadI32x8, IntrinsicOp::VecMulI32x8,
+             IntrinsicOp::VecAddI32x8, IntrinsicOp::VecStoreI32x8)
+        } else {
+            (IntrinsicOp::VecLoadI32x4, IntrinsicOp::VecMulI32x4,
+             IntrinsicOp::VecAddI32x4, IntrinsicOp::VecStoreI32x4)
+        };
         let vec_insts = [
             Instruction::Intrinsic {
                 dest: Some(vec_load),
-                op: IntrinsicOp::VecLoadI32x4,
+                op: load_op,
                 dest_ptr: None,
                 args: vec![Operand::Value(pattern.src_gep), Operand::Const(IrConst::I64(0))],
             },
             Instruction::Intrinsic {
                 dest: Some(vec_mul),
-                op: IntrinsicOp::VecMulI32x4,
+                op: mul_op,
                 dest_ptr: None,
                 args: vec![Operand::Value(vec_load), Operand::Value(scale_vec)],
             },
             Instruction::Intrinsic {
                 dest: Some(vec_add),
-                op: IntrinsicOp::VecAddI32x4,
+                op: add_op,
                 dest_ptr: None,
                 args: vec![Operand::Value(vec_mul), Operand::Value(offset_vec)],
             },
             Instruction::Intrinsic {
                 dest: None,
-                op: IntrinsicOp::VecStoreI32x4,
+                op: store_op,
                 dest_ptr: Some(pattern.dst_gep),
                 args: vec![Operand::Value(vec_add)],
             },

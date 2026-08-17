@@ -2317,16 +2317,17 @@ impl X86Codegen {
             }
             IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
-                    // SSE4.1 pmulld, or use pmuludq fallback — target is x86-64-v3.
                     self.emit_sse_binary_128(d, args, "pmulld");
+                }
+            }
+            IntrinsicOp::VecMulI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpmulld", true);
                 }
             }
             IntrinsicOp::VecBroadcastI32x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                // Broadcast scalar i32 in args[0] to all 4 lanes of xmm0.
-                // Load via 64-bit reg then take low 32 bits — avoids size
-                // mismatch when the operand lives in an rN register.
                 self.operand_to_reg(&args[0], "rax");
                 self.state.emit("    movd %eax, %xmm0");
                 self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
@@ -2335,19 +2336,56 @@ impl X86Codegen {
                     self.sse_store_dest(d, "xmm0");
                 }
             }
-            IntrinsicOp::VecStoreI32x4 => {
+            IntrinsicOp::VecBroadcastI32x8 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                // dest_ptr = address; args[0] = vector value
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    movd %eax, %xmm0");
+                self.state.emit("    vpbroadcastd %xmm0, %ymm0");
                 if let Some(d) = dest {
-                    let _ = d;
+                    self.state.vector_values.insert(d.0);
+                    self.avx_store_dest(d);
                 }
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
+            }
+            IntrinsicOp::VecStoreI32x4 => {
+                // Peek register residency BEFORE invalidating the peephole.
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!("    movdqu {}, %xmm0", self.slot_ref(slot.0)));
+                            }
+                        }
+                    }
                 }
+                self.state.invalidate_vec_peephole();
                 if let Some(c_ptr) = dest_ptr {
                     self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
                     self.state.emit("    movdqu %xmm0, (%rax)");
+                }
+            }
+            IntrinsicOp::VecStoreI32x8 => {
+                // Peek register residency BEFORE invalidating the peephole —
+                // otherwise every map/store pair pays a dead vmovdqu round-trip.
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!("    vmovdqu {}, %ymm0", self.slot_ref(slot.0)));
+                            }
+                        }
+                    }
+                }
+                self.state.invalidate_vec_peephole();
+                if let Some(c_ptr) = dest_ptr {
+                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
+                    self.state.emit("    vmovdqu %ymm0, (%rax)");
                 }
             }
             IntrinsicOp::VecHorizontalAddF64x4 => {
