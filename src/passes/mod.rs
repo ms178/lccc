@@ -746,6 +746,13 @@ macro_rules! preloop_dump {
             );
             total_changes += n;
             total_changes_excl_dce += n;
+            if n > 0 && std::env::var("CCC_DISABLE_AGGREGATE_SROA").is_err() {
+                aggregate_sroa::run(module);
+                crate::ir::mem2reg::promote_allocas_with_params(module);
+                constant_fold::run(module);
+                copy_prop::run(module);
+                module.for_each_function(dce::eliminate_dead_code);
+            }
         }
 
         // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.

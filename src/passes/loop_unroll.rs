@@ -108,14 +108,39 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
     // Set of all loop-header block indices (used for nested-loop detection).
     let all_headers: FxHashSet<usize> = loops.iter().map(|l| l.header).collect();
 
+    let mut count = 0;
+
+    // Pass A: complete-unroll 2-block constant-trip loops (header+latch).
+    // Rebuild CFG after each success so block indices stay valid.
+    loop {
+        let cfg = CfgAnalysis::build(func);
+        let raw =
+            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        let loops_now = loop_analysis::merge_loops_by_header(raw);
+        let mut tiny: Vec<_> = loops_now.into_iter().filter(|lp| matches!(lp.body.len(), 2 | 3)).collect();
+        tiny.sort_by_key(|lp| lp.header);
+        let mut did = false;
+        for lp in &tiny {
+            if try_complete_unroll_two_block(func, lp, &cfg) {
+                count += 1;
+                did = true;
+                break;
+            }
+        }
+        if !did || count > 64 {
+            break;
+        }
+    }
+    if count > 0 {
+        return count;
+    }
+
     // Collect and sort candidates by body size (smallest first = innermost first).
     let mut candidates: Vec<UnrollCandidate> = loops
         .iter()
         .filter_map(|lp| analyze_loop(func, lp, &cfg, &all_headers))
         .collect();
     candidates.sort_by_key(|c| c.body_work.len());
-
-    let mut count = 0;
     let pgo_profile = crate::pgo::get_pgo_profile();
     for c in candidates {
         // PGO gating
@@ -370,6 +395,419 @@ fn analyze_loop(
 
 /// Find a basic induction variable in the loop header and its increment in
 /// the latch. Returns `(phi_dest, ty, step, latch_incr_idx)`.
+
+/// Complete-unroll a 2-block loop (header + latch) with a small constant trip
+/// count. Chains loop-carried phis across linearized clones and substitutes the
+/// IV with `init + k*step` (not always `0..trip`).
+
+fn coalesce_linear_chain(func: &mut IrFunction, labels: &[BlockId]) {
+    if labels.len() < 2 {
+        return;
+    }
+    let indices: Vec<Option<usize>> = labels
+        .iter()
+        .map(|l| func.blocks.iter().position(|b| b.label == *l))
+        .collect();
+    if indices.iter().any(|i| i.is_none()) {
+        return;
+    }
+    let indices: Vec<usize> = indices.into_iter().map(|i| i.unwrap()).collect();
+    for i in 0..indices.len() - 1 {
+        match &func.blocks[indices[i]].terminator {
+            Terminator::Branch(tgt) if *tgt == labels[i + 1] => {}
+            _ => return,
+        }
+    }
+    let last_term = func.blocks[indices[indices.len() - 1]].terminator.clone();
+    let mut merged = std::mem::take(&mut func.blocks[indices[0]].instructions);
+    for &bi in &indices[1..] {
+        let insts = std::mem::take(&mut func.blocks[bi].instructions);
+        merged.extend(insts);
+        func.blocks[bi].terminator = Terminator::Branch(labels[0]);
+        func.blocks[bi].instructions.clear();
+    }
+    func.blocks[indices[0]].instructions = merged;
+    func.blocks[indices[0]].terminator = last_term;
+}
+
+fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
+    let mut saw_shift = false;
+    let mut saw_and = false;
+    let mut other_arith = false;
+    for inst in &func.blocks[latch].instructions {
+        match inst {
+            Instruction::BinOp { op, .. } => {
+                use crate::ir::reexports::IrBinOp::*;
+                match op {
+                    AShr | LShr | Shl => saw_shift = true,
+                    And | Or | Xor => saw_and = true,
+                    Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
+                }
+            }
+            Instruction::Store { .. } | Instruction::Load { .. } | Instruction::GetElementPtr { .. } => {
+                other_arith = true;
+            }
+            _ => {}
+        }
+    }
+    saw_shift && saw_and && !other_arith
+}
+
+fn try_complete_unroll_two_block(
+    func: &mut IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> bool {
+    if !matches!(lp.body.len(), 2 | 3) {
+        return false;
+    }
+    let header = lp.header;
+    let back_preds: Vec<usize> = cfg
+        .preds
+        .row(header)
+        .iter()
+        .map(|&p| p as usize)
+        .filter(|p| lp.body.contains(p))
+        .collect();
+    if back_preds.len() != 1 {
+        return false;
+    }
+    let latch = back_preds[0];
+    if latch == header {
+        return false;
+    }
+    let header_label = func.blocks[header].label;
+    let latch_label = func.blocks[latch].label;
+    match &func.blocks[latch].terminator {
+        Terminator::Branch(lbl) if *lbl == header_label => {}
+        _ => return false,
+    }
+    let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
+        find_iv_in_loop(func, header, latch, latch_label)
+    else {
+        return false;
+    };
+    if iv_step != 1 {
+        return false;
+    }
+    let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, exit_cond_positive)) =
+        find_exit_condition(func, header, &lp.body, iv_phi)
+    else {
+        return false;
+    };
+    // work_blocks: instructions to clone each iteration (excluding IV increment).
+    // 2-block: work lives in the latch (body_entry == latch).
+    // 3-block: header -> body_entry (one work block) -> latch (IV incr only) -> header.
+    let work_blocks: Vec<usize> = if body_entry == latch_label {
+        vec![latch]
+    } else {
+        let Some(bi) = func.blocks.iter().position(|b| b.label == body_entry) else { return false; };
+        // body must be in the loop and branch to latch
+        if !lp.body.contains(&bi) {
+            return false;
+        }
+        match &func.blocks[bi].terminator {
+            Terminator::Branch(t) if *t == latch_label => {}
+            _ => return false,
+        }
+        // Only pure linear header->body->latch
+        if lp.body.len() != 3 {
+            return false;
+        }
+        vec![bi, latch]
+    };
+    // Constant IV init from preheader.
+    let mut iv_init: Option<i64> = None;
+    for inst in &func.blocks[header].instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if dest.0 == iv_phi.0 {
+                for (op, lbl) in incoming {
+                    if *lbl != latch_label {
+                        iv_init = match op {
+                            Operand::Const(c) => c.to_i64(),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    let Some(iv_init) = iv_init else {
+        return false;
+    };
+    let limit_n: i64 = match &exit_limit {
+        Operand::Const(c) => match c.to_i64() {
+            Some(n) => n,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let trip: i64 = match cmp_op {
+        IrCmpOp::Slt | IrCmpOp::Ult => {
+            if limit_n <= iv_init {
+                return false;
+            }
+            limit_n - iv_init
+        }
+        IrCmpOp::Sle | IrCmpOp::Ule => {
+            if limit_n < iv_init {
+                return false;
+            }
+            limit_n - iv_init + 1
+        }
+        IrCmpOp::Sgt | IrCmpOp::Ugt => {
+            if iv_init <= limit_n {
+                return false;
+            }
+            iv_init - limit_n
+        }
+        IrCmpOp::Sge | IrCmpOp::Uge => {
+            if iv_init < limit_n {
+                return false;
+            }
+            iv_init - limit_n + 1
+        }
+        _ => return false,
+    };
+    // Powers of two only: residual vectorization remainders (trip 3/5/6/7)
+    // interact badly with the F32 map path. 2/4/8 are the common complete-
+    // unroll targets (struct_copy trip-4, CRC-safe via bit-iteration guard).
+    if !(2..=8).contains(&trip) {
+        return false;
+    }
+    // Reject F32-only residual map loops (vectorizer remainder expects a loop).
+    // F64 (nbody) and integer (struct_copy) non-pow2 trips are allowed.
+    if !matches!(trip, 2 | 4 | 8) {
+        let mut has_f32 = false;
+        let mut has_f64 = false;
+        for &wbi in &work_blocks {
+            for inst in &func.blocks[wbi].instructions {
+                match inst {
+                    Instruction::BinOp { ty: IrType::F32, .. }
+                    | Instruction::Load { ty: IrType::F32, .. }
+                    | Instruction::Store { ty: IrType::F32, .. } => has_f32 = true,
+                    Instruction::BinOp { ty: IrType::F64, .. }
+                    | Instruction::Load { ty: IrType::F64, .. }
+                    | Instruction::Store { ty: IrType::F64, .. } => has_f64 = true,
+                    _ => {}
+                }
+            }
+        }
+        if has_f32 && !has_f64 {
+            return false;
+        }
+    }
+    for &wbi in &work_blocks {
+        for inst in &func.blocks[wbi].instructions {
+            match inst {
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::InlineAsm { .. }
+                | Instruction::DynAlloca { .. }
+                | Instruction::Intrinsic { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+    if latch_is_bit_iteration(func, latch) {
+        return false;
+    }
+
+    // Loop-carried phis (phi_id, init_op, back_value_id in latch). Skip IV phi.
+    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
+    for inst in &func.blocks[header].instructions {
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        if dest.0 == iv_phi.0 {
+            continue;
+        }
+        let mut init: Option<Operand> = None;
+        let mut back: Option<u32> = None;
+        for (op, lbl) in incoming {
+            if *lbl == latch_label {
+                if let Operand::Value(v) = op {
+                    back = Some(v.0);
+                }
+            } else {
+                init = Some(op.clone());
+            }
+        }
+        if let (Some(init_op), Some(back_id)) = (init, back) {
+            let defined_in_latch = func.blocks[latch]
+                .instructions
+                .iter()
+                .any(|li| li.dest().map(|d| d.0 == back_id).unwrap_or(false));
+            if defined_in_latch {
+                carried.push((dest.0, init_op, back_id));
+            }
+        }
+    }
+
+    let mut next_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
+    let mut next_val = func.next_value_id;
+    let labels: Vec<BlockId> = (0..trip)
+        .map(|_| {
+            let l = BlockId(next_label);
+            next_label += 1;
+            l
+        })
+        .collect();
+
+    let mut prev_back: Vec<Option<u32>> = vec![None; carried.len()];
+    let mut final_carried: Vec<(u32, u32)> = Vec::new();
+    let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(trip as usize);
+
+    for t_idx in 0..trip {
+        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t_idx * iv_step, iv_ty));
+        let mut vmap: FxHashMap<u32, u32> = FxHashMap::default();
+        for &wbi in &work_blocks {
+            for (idx, inst) in func.blocks[wbi].instructions.iter().enumerate() {
+                if wbi == latch && idx == latch_iv_incr_idx {
+                    continue;
+                }
+                if let Some(d) = inst.dest() {
+                    vmap.insert(d.0, next_val);
+                    next_val += 1;
+                }
+            }
+        }
+        let mut new_insts = Vec::new();
+        for &wbi in &work_blocks {
+            for (idx, inst) in func.blocks[wbi].instructions.iter().enumerate() {
+                if wbi == latch && idx == latch_iv_incr_idx {
+                    continue;
+                }
+                let mut cloned = inst.clone();
+                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
+                for (ci, (phi_id, init_op, _)) in carried.iter().enumerate() {
+                    match prev_back[ci] {
+                        None => subst_value_with_operand(&mut cloned, *phi_id, init_op),
+                        Some(prev_id) => subst_value_with_operand(
+                            &mut cloned,
+                            *phi_id,
+                            &Operand::Value(Value(prev_id)),
+                        ),
+                    }
+                }
+                replace_values_in_inst(&mut cloned, &vmap);
+                rename_inst_dest(&mut cloned, &vmap);
+                new_insts.push(cloned);
+            }
+        }
+        for (ci, (_, _, back_id)) in carried.iter().enumerate() {
+            if let Some(&new_id) = vmap.get(back_id) {
+                prev_back[ci] = Some(new_id);
+                if t_idx + 1 == trip {
+                    final_carried.push((carried[ci].0, new_id));
+                }
+            }
+        }
+        let term = if t_idx + 1 < trip {
+            Terminator::Branch(labels[(t_idx + 1) as usize])
+        } else {
+            Terminator::Branch(exit_target)
+        };
+        new_blocks.push(BasicBlock {
+            label: labels[t_idx as usize],
+            instructions: new_insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        });
+    }
+    func.next_value_id = next_val;
+
+    func.blocks[header].terminator = Terminator::Branch(labels[0]);
+    func.blocks[latch].terminator = Terminator::Branch(exit_target);
+    let _ = (body_entry, exit_cond_positive);
+
+    let final_map: FxHashMap<u32, u32> = final_carried.iter().copied().collect();
+    func.blocks.extend(new_blocks);
+
+    for (phi_id, final_id) in final_map.iter() {
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Instruction::Phi { dest, .. } = inst {
+                    if dest.0 == *phi_id {
+                        *inst = Instruction::Copy {
+                            dest: Value(*phi_id),
+                            src: Operand::Value(Value(*final_id)),
+                        };
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
+    let rep = |op: &mut Operand| {
+        if let Operand::Value(v) = op {
+            if v.0 == old_id {
+                *op = new_op.clone();
+            }
+        }
+    };
+    match inst {
+        Instruction::BinOp { lhs, rhs, .. } => {
+            rep(lhs);
+            rep(rhs);
+        }
+        Instruction::UnaryOp { src, .. }
+        | Instruction::Cast { src, .. }
+        | Instruction::Copy { src, .. } => rep(src),
+        Instruction::Store { val, .. } => rep(val),
+        Instruction::GetElementPtr { offset, .. } => rep(offset),
+        Instruction::Cmp { lhs, rhs, .. } => {
+            rep(lhs);
+            rep(rhs);
+        }
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
+            rep(cond);
+            rep(true_val);
+            rep(false_val);
+        }
+        Instruction::Intrinsic { args, .. } => {
+            for a in args.iter_mut() {
+                rep(a);
+            }
+        }
+        _ => {}
+    }
+    match inst {
+        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+            if ptr.0 == old_id {
+                if let Operand::Value(v) = new_op {
+                    *ptr = *v;
+                }
+            }
+        }
+        Instruction::GetElementPtr { base, .. } => {
+            if base.0 == old_id {
+                if let Operand::Value(v) = new_op {
+                    *base = *v;
+                }
+            }
+        }
+        Instruction::Intrinsic {
+            dest_ptr: Some(dp), ..
+        } => {
+            if dp.0 == old_id {
+                if let Operand::Value(v) = new_op {
+                    *dp = *v;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn find_iv_in_loop(
     func: &IrFunction,
     header: usize,

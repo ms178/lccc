@@ -1542,6 +1542,9 @@ impl InstructionEncoder {
             "vpgatherqq" => self.encode_avx_gather(ops, 0x91, 1),
             "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
+            // Scalar sqrt (VEX.LIG.F2/F3.0F 51): nbody/ICX use vsqrtsd.
+            "vsqrtsd" => self.encode_avx_2op_0f(ops, 0x51, 3), // F2
+            "vsqrtss" => self.encode_avx_2op_0f(ops, 0x51, 2), // F3
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
             "vmulps" => self.encode_avx_3op_np(ops, 0x59),

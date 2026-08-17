@@ -791,12 +791,12 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::SqrtF64 => {
-                // sqrtsd, honoring an XMM-allocated destination (was a GPR
-                // round-trip in the middle of every FP chain: nbody's sqrt(d2)).
-                self.emit_fp_scalar_unary(dest, &args[0], IrType::F64, "sqrtsd");
+                // Prefer VEX scalar sqrt (ICX/GCC on x86-64-v3). Avoids the
+                // legacy SSE encoding and matches the vmul/vadd path.
+                self.emit_fp_scalar_unary(dest, &args[0], IrType::F64, "vsqrtsd");
             }
             IntrinsicOp::SqrtF32 => {
-                self.emit_fp_scalar_unary(dest, &args[0], IrType::F32, "sqrtss");
+                self.emit_fp_scalar_unary(dest, &args[0], IrType::F32, "vsqrtss");
             }
             IntrinsicOp::FabsF64 => {
                 // single andpd against a rodata mask, honoring the
