@@ -72,6 +72,14 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or_else(|| format!("bad register: {}", dst.name))?;
                 if size == 2 || size == 4 { self.sized_op = true; }
         if size == 2 { self.bytes.push(0x66); }
+                // GAS uses the accumulator moffs shortform: A0 (byte) / A1
+                // (word/dword) followed by the bare address -- one byte
+                // shorter than the ModRM form. Match it exactly (asm-diff
+                // oracle: `movl sym, %eax` == a1 <disp32>).
+                if dst_num == 0 {
+                    self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
+                    return self.encode_abs_addr_disp_only(label);
+                }
                 self.bytes.push(if size == 1 { 0x8A } else { 0x8B });
                 self.encode_abs_addr_modrm(dst_num, label)
             }
@@ -80,6 +88,11 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or_else(|| format!("bad register: {}", src.name))?;
                 if size == 2 || size == 4 { self.sized_op = true; }
         if size == 2 { self.bytes.push(0x66); }
+                // Accumulator shortform: A2 (byte) / A3 (word/dword).
+                if src_num == 0 {
+                    self.bytes.push(if size == 1 { 0xA2 } else { 0xA3 });
+                    return self.encode_abs_addr_disp_only(label);
+                }
                 self.bytes.push(if size == 1 { 0x88 } else { 0x89 });
                 self.encode_abs_addr_modrm(src_num, label)
             }
@@ -313,7 +326,12 @@ impl super::InstructionEncoder {
             return Err("movsx requires 2 operands".to_string());
         }
 
-        if dst_size == 2 { self.sized_op = true; self.bytes.push(0x66); }
+        // movsx/movzx ALWAYS pick a destination width; sized_op must be set
+        // for BOTH forms so the .code16 inversion adds 66 to the 32-bit form
+        // (GAS: 66 0f b6 in .code32-for-16bit-dst, 0f b6 bare in .code16 for
+        // 16-bit dst, 66 0f b6 in .code16 for 32-bit dst).
+        self.sized_op = true;
+        if dst_size == 2 { self.bytes.push(0x66); }
 
         let opcode = match src_size {
             1 => vec![0x0F, 0xBE],
@@ -350,7 +368,12 @@ impl super::InstructionEncoder {
             return Err("movzx requires 2 operands".to_string());
         }
 
-        if dst_size == 2 { self.sized_op = true; self.bytes.push(0x66); }
+        // movsx/movzx ALWAYS pick a destination width; sized_op must be set
+        // for BOTH forms so the .code16 inversion adds 66 to the 32-bit form
+        // (GAS: 66 0f b6 in .code32-for-16bit-dst, 0f b6 bare in .code16 for
+        // 16-bit dst, 66 0f b6 in .code16 for 32-bit dst).
+        self.sized_op = true;
+        if dst_size == 2 { self.bytes.push(0x66); }
 
         let opcode = match src_size {
             1 => vec![0x0F, 0xB6],
@@ -847,6 +870,9 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_imul(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        // imul with 2/3 operands always has an operand width; the 1-operand
+        // form routes through encode_unary_rm which handles sized_op itself.
+        if ops.len() >= 2 { self.sized_op = true; }
         match ops.len() {
             1 => self.encode_unary_rm(ops, 5, size),
             2 => {
@@ -950,7 +976,12 @@ impl super::InstructionEncoder {
             Operand::Register(reg) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 if size == 4 {
-                    // Use compact single-byte encoding: 0x40+reg (inc) or 0x48+reg (dec)
+                    // Compact single-byte encoding: 0x40+reg (inc) or 0x48+reg
+                    // (dec). This IS width-dependent: in .code16 the bare
+                    // opcode means the 16-bit register, so sized_op must be
+                    // set for the inversion to add 0x66 (incl %eax in real
+                    // mode = 66 40; we emitted 40 = incw %ax).
+                    self.sized_op = true;
                     let base = if op_ext == 0 { 0x40 } else { 0x48 };
                     self.bytes.push(base + num);
                 } else if size == 2 {
@@ -1063,6 +1094,9 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_double_shift(&mut self, ops: &[Operand], opcode: u8, _size: u8) -> Result<(), String> {
+        // Operand-width instruction: mark sized_op so the .code16 prefix
+        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
+        self.sized_op = true;
         if ops.len() != 3 {
             return Err("double shift requires 3 operands".to_string());
         }
@@ -1088,6 +1122,9 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_bswap(&mut self, ops: &[Operand]) -> Result<(), String> {
+        // Operand-width instruction: mark sized_op so the .code16 prefix
+        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
+        self.sized_op = true;
         if ops.len() != 1 {
             return Err("bswap requires 1 operand".to_string());
         }
@@ -1102,6 +1139,9 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_bit_count(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        // Operand-width instruction: mark sized_op so the .code16 prefix
+        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
+        self.sized_op = true;
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
@@ -1127,6 +1167,9 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_bsr_bsf(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        // Operand-width instruction: mark sized_op so the .code16 prefix
+        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
+        self.sized_op = true;
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
@@ -1155,6 +1198,9 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_bt(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        // Operand-width instruction: mark sized_op so the .code16 prefix
+        // inversion emits/strips 0x66 correctly (GAS oracle c16all.s).
+        self.sized_op = true;
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
@@ -1261,14 +1307,22 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                if is_16bit { self.sized_op = true; self.bytes.push(0x66); }
+                // cmov ALWAYS selects an operand width (w or l): mark sized_op
+                // unconditionally so the .code16 prefix inversion works both
+                // ways. Setting it only for the 16-bit form left `cmovel` in
+                // real mode WITHOUT the 66 prefix -- decoded as a 16-bit
+                // cmov, silently writing half the register (GAS emits
+                // 66 0f 44 c1; we emitted 0f 44 c1).
+                self.sized_op = true;
+                if is_16bit { self.bytes.push(0x66); }
                 self.bytes.extend_from_slice(&[0x0F, 0x40 + cc]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                if is_16bit { self.sized_op = true; self.bytes.push(0x66); }
+                self.sized_op = true;
+                if is_16bit { self.bytes.push(0x66); }
                 self.bytes.extend_from_slice(&[0x0F, 0x40 + cc]);
                 self.encode_modrm_mem(dst_num, mem)
             }
