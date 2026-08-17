@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–6)
+# LCCC Linker — Follow-Up Plan (Sessions 2–7)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -557,6 +557,54 @@ install. Both bugs fixed in this session were invisible to `cargo test --lib`.
 Adding a CI job that runs `tests/linker/setup_oracles.sh` and then the
 differential suite would be high-value; it is deliberately *not* attempted here
 because workflow files cannot currently be merged through the integration.
+
+## 2e. DONE in session 7 (byte-level hot paths: −15.0% Ir)
+
+Rebased onto **`3a88d08`**; the v4 series (S01–S03) is merged upstream
+(verified by `git apply --reverse --check`). One theme this session: the
+linker's innermost byte-handling primitives were written in the obvious way,
+and the obvious way costs a call or a bounds check per byte.
+
+| Snapshot | Change | Ir | Δ |
+|---|---|---:|---:|
+| — | v5 baseline on `3a88d08` | 74,962,782 | — |
+| **S01** | single-copy string-table append | 74,624,929 | −0.45% |
+| **S02** | single-slice LE reads | 68,579,185 | −8.1% |
+| **S03** | delete `eh_frame`'s private LE readers | 65,980,569 | −3.8% |
+| **S04** | ASCII fast path in `read_cstr_ref` | 65,046,237 | −1.4% |
+| **S05** | `Elf64_Sym` entries without slice copies | **63,757,288** | −2.0% |
+| | **cumulative** | | **−15.0%** |
+
+Every step verified **byte-identical** against the pre-change linker on the
+20 000-symbol link, with 751 unit + 137 differential (bfd/mold/wild) + 15 real
+workloads green, plus fuzzing and Valgrind on the steps that add `unsafe`.
+
+**What the wins actually were.** `read_u64` and friends built their arrays by
+indexing each byte — eight bounds checks and eight loads per 64-bit read, 80 150
+calls just in `parse_elf64_object` (S02, the single biggest win). `eh_frame.rs`
+then carried its *own* private copies of the same helpers, un-`#[inline]`d, so
+deleting them in favour of the shared ones was a net **code removal** worth
+−3.8% (S03). Symbol entries were assembled with four `copy_from_slice` calls
+each — 200 256 calls, 5.94% of the link (S05). `read_cstr_ref` re-walked every
+name through the general UTF-8 validator after `memchr0` had already scanned it
+(S04).
+
+Wall clock on `many_syms`, best-of-9: lccc **15.2 ms**, mold 12.2, wild 5.5,
+bfd 21.8. lccc now clearly beats bfd on this benchmark; mold and wild remain
+ahead and the remaining gap is structural (below), not micro-optimisable.
+
+**Rejected experiment (measured, reverted, do not retry):** writing
+`push_strtab_name` as the tidy safe `extend(name.iter().copied().chain(once(0)))`
+is **79.30 M Ir — 5.8 % *worse* than the baseline it replaced**, because the
+byte-at-a-time iterator defeats the vectorised copy. Only the explicit
+`copy_nonoverlapping` version is faster, which is the sole reason that function
+carries `unsafe`. This is a good illustration of why every one of these
+"obviously faster" rewrites was measured rather than assumed.
+
+**Where the remaining time goes** (post-S05 profile): `memcpy` 10.9%, `malloc`
+4.4%, `emit_executable` 3.7%, symtab quicksort ~6%. The `memcpy` is no longer
+the per-symbol traffic — it is now dominated by 16 large `to_vec()` calls, i.e.
+the whole-section copies of §4.1b. That remains the top structural item.
 
 ## 3. Current scoreboard
 

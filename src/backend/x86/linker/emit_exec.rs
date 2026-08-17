@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use crate::common::fx_hash::FxHashMap;
 
+use crate::backend::elf::{push_strtab_name, elf64_sym_entry};
 use super::elf::*;
 use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
@@ -923,18 +924,10 @@ pub(super) fn emit_executable(
     for (obj_idx, sym) in locals {
         let (oi, sec_off) = section_map[&(obj_idx, sym.shndx as usize)];
         let Some(&shndx) = out_sec_to_hdr.get(&oi) else { continue };
-        let off = symtab_names.len() as u32;
-        symtab_names.extend_from_slice(sym.name.as_bytes());
-        symtab_names.push(0);
-        let mut e = [0u8; 24];
-        e[0..4].copy_from_slice(&off.to_le_bytes());
-        e[4] = sym.info;
-        e[5] = sym.other;
-        e[6..8].copy_from_slice(&shndx.to_le_bytes());
+        let off = push_strtab_name(&mut symtab_names, sym.name.as_bytes());
         let value = output_sections[oi].addr + sec_off + sym.value;
-        e[8..16].copy_from_slice(&value.to_le_bytes());
-        e[16..24].copy_from_slice(&sym.size.to_le_bytes());
-        symtab_entries.push(e);
+        symtab_entries.push(elf64_sym_entry(
+            off, sym.info, sym.other, shndx, value, sym.size));
     }
     let n_local = symtab_entries.len();
 
@@ -979,9 +972,7 @@ pub(super) fn emit_executable(
     });
     let sym_names: Vec<(&String, &GlobalSymbol)> = keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
     for (name, gsym) in &sym_names {
-        let off = symtab_names.len() as u32;
-        symtab_names.extend_from_slice(name.as_bytes());
-        symtab_names.push(0);
+        let off = push_strtab_name(&mut symtab_names, name.as_bytes());
         let shndx: u16 = if gsym.defined_in == Some(usize::MAX) || gsym.section_idx == SHN_ABS {
             SHN_ABS
         } else if gsym.section_idx == SHN_COMMON {
@@ -994,14 +985,8 @@ pub(super) fn emit_executable(
         } else {
             SHN_ABS
         };
-        let mut e = [0u8; 24];
-        e[0..4].copy_from_slice(&off.to_le_bytes());
-        e[4] = gsym.info;
-        e[5] = 0; // st_other
-        e[6..8].copy_from_slice(&shndx.to_le_bytes());
-        e[8..16].copy_from_slice(&gsym.value.to_le_bytes());
-        e[16..24].copy_from_slice(&gsym.size.to_le_bytes());
-        symtab_entries.push(e);
+        symtab_entries.push(elf64_sym_entry(
+            off, gsym.info, 0 /* st_other */, shndx, gsym.value, gsym.size));
     }
     zone!("symtab");
     // === Build output buffer ===

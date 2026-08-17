@@ -3,6 +3,7 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs,
 //! `.dynamic` section, and GNU hash tables.
 
+use crate::backend::elf::push_strtab_name;
 use std::collections::BTreeSet;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -1510,9 +1511,7 @@ pub(super) fn emit_shared_library(
     for (obj_idx, sym) in locals {
         let (oi, sec_off) = section_map[&(obj_idx, sym.shndx as usize)];
         let Some(&shndx) = out_sec_to_hdr.get(&oi) else { continue };
-        let name_off = symtab_names.len() as u32;
-        symtab_names.extend_from_slice(sym.name.as_bytes());
-        symtab_names.push(0);
+        let name_off = push_strtab_name(&mut symtab_names, sym.name.as_bytes());
         let mut entry = [0u8; 24];
         entry[0..4].copy_from_slice(&name_off.to_le_bytes());
         entry[4] = sym.info;
@@ -1530,9 +1529,7 @@ pub(super) fn emit_shared_library(
         .collect();
     global_names.sort_by(|a, b| a.0.cmp(b.0));
     for (name, sym) in global_names {
-        let name_off = symtab_names.len() as u32;
-        symtab_names.extend_from_slice(name.as_bytes());
-        symtab_names.push(0);
+        let name_off = push_strtab_name(&mut symtab_names, name.as_bytes());
         let shndx = if sym.section_idx == SHN_ABS {
             SHN_ABS
         } else if sym.section_idx == SHN_COMMON {
