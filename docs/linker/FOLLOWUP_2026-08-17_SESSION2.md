@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2, 3, 4 & 5)
+# LCCC Linker — Follow-Up Plan (Sessions 2–6)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -461,6 +461,102 @@ variant, and the mutation-verified `to_string_allocates_exactly_once`.
 New tooling: `scripts/symstr_migrate.py`, a span-driven mass-migration helper
 built on rustc's JSON diagnostics — see §4.1 for the two correctness guards it
 needs, which apply directly to the interning work.
+
+## 2d. DONE in session 6 (upstream rebase, .eh_frame, C++ EH correctness)
+
+Rebased onto **`04c1432`** (ms178/lccc main). The whole v3 series (S01–S23) is
+merged upstream; verified by `git apply --reverse --check`, which succeeds
+against `04c1432`, and by `git diff 1706984b..04c1432 --stat` matching the v3
+deliverable exactly (55 files, +5813/−450). Old snapshots retired to
+`artifacts/merged-2026-08-17.tar.gz`; the v4 series restarts at S01.
+
+### S01 — `.eh_frame_hdr` construction, −10.9% Ir
+
+| Step | Ir | Δ |
+|---|---:|---:|
+| v4 baseline on `04c1432` | 84,023,409 | — |
+| drop the `.eh_frame` `to_vec()` | 83,491,193 | −0.63% |
+| memoise CIE encodings | **74,891,960** | **−10.9%** |
+
+1. `parse_eh_frame_fdes` called `parse_cie_fde_encoding` **once per FDE**.
+   Real inputs share a handful of CIEs, so a 20 000-function link re-parsed
+   the same CIE 20 000 times; `build_eh_frame_hdr` was **5.38%** of the entire
+   link. A linear-scan cache keyed on `cie_pos` removes it (a `Vec` beats a
+   `HashMap`: the distinct-CIE count is single digits).
+2. `emit_exec` copied the whole relocated `.eh_frame` (400 KB here) with
+   `to_vec()` only to satisfy the borrow checker before a later `write_bytes`.
+   NLL ends the borrow at the call, so the copy was pure waste.
+
+Output byte-identical. `eh_frame.rs` had **no tests at all**; it now has five,
+including `distinct_cies_keep_distinct_encodings`, which decodes every FDE
+against its own CIE using an independent in-test oracle.
+
+**Rejected experiment (do not retry):** pre-sizing the FDE `Vec` with
+`count_eh_frame_fdes` costs a second full scan of the section and made the link
+**1.7% slower** (85.5M Ir). The incremental growth allocations are cheaper than
+one extra pass. Measured, reverted.
+
+**Testing lesson, learned the hard way here.** The first version of the CIE-cache
+test asserted only that the decoded FDE locations were *distinct*, and it
+**survived** a mutation that made the cache ignore its key — a wrong encoding
+still produces distinct-but-wrong numbers. It only became a real test once it
+compared against an independent decode of each FDE via its own CIE. A test that
+"passes under the bug it was written for" is worse than no test, because it
+buys false confidence. Always mutate a new test before trusting it, and if the
+mutation survives, the *assertion* is wrong, not the mutation.
+
+### S02 — C++ exceptions: SIGSEGV throwing any locally-defined class type
+
+**Every C++ program that throws a user-defined exception class crashed**, after
+printing the correct output. Reduced to three lines: `struct E{int v;};` plus
+`throw E{1}` across one frame.
+
+A user-defined exception type makes the compiler emit a typeinfo object
+(`_ZTI1E`) into `.data.rel.ro`. Its first word is an absolute 64-bit reference
+to `_ZTVN10__cxxabiv117__class_type_infoE + 0x10` — a vtable **inside
+libstdc++**. In an ET_EXEC link that address is unknowable until `ld.so` maps
+the library, so GNU ld emits a **dynamic `R_X86_64_64`** and leaves the storage
+zero. lccc routed the symbol to a GOT slot — useless, because the storage being
+initialised *is* the typeinfo object, not a GOT entry — and statically wrote
+only the addend. `__gxx_personality_v0` then dereferenced `0x10` while matching
+the LSDA type table.
+
+Fix: `create_plt_got` now returns the absolute-64 sites against dynamic **data**
+symbols (`AbsDynReloc`); `emit_exec` adds their targets to `.dynsym`, sizes
+`.rela.dyn` for them, emits one `R_X86_64_64` each, and leaves the storage zero.
+Copy-relocated symbols are excluded — `R_X86_64_COPY` already fills a local BSS
+copy, and a second relocation would double-apply. Byte-compared against
+`ld.bfd -no-pie`: identical relocation type, symbol and addend, identical
+zeroed slot.
+
+**Why the existing C++ EH test missed it.** `cxx_exceptions_unwind` throws
+`std::runtime_error`, whose typeinfo lives in libstdc++ — so no local typeinfo
+object is ever emitted and the broken path is never taken. The new
+`cxx_exceptions_local_typeinfo` throws two *locally defined* class types, and
+checks the **exit code** as well as stdout, because the failure printed the
+right answer and *then* died. Mutation-verified: reverting the fix yields exit
+`-11`.
+
+Two generalisable lessons: **a differential test that only compares stdout will
+miss any crash that happens after the last write** — always compare exit codes;
+and **testing with library types instead of user-defined ones exercises a
+different linker path entirely**.
+
+### CI coverage gap (workflow files could not be merged)
+
+The v3 patch touched **no** `.github/` files, so nothing was lost in the failed
+workflow merge. But it is worth stating what upstream CI does *not* cover, since
+none of this session's work would have been caught by it:
+
+`ci.yml` runs `cargo build --release` and **`cargo test --lib`** only. That
+means the 745 unit tests run in CI, but the entire linker differential suite
+(`tests/linker/run_linker_tests.py`, 137 cases against bfd/mold/wild), the real
+workloads (15 checks), and the fuzzer are **never run by CI** — they need
+`ld.bfd`/`mold`/`wild` and the workload tarballs, which the workflow does not
+install. Both bugs fixed in this session were invisible to `cargo test --lib`.
+Adding a CI job that runs `tests/linker/setup_oracles.sh` and then the
+differential suite would be high-value; it is deliberately *not* attempted here
+because workflow files cannot currently be merged through the integration.
 
 ## 3. Current scoreboard
 

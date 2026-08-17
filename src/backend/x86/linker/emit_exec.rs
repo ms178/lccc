@@ -30,6 +30,9 @@ pub(super) fn emit_executable(
     output_sections: &mut [OutputSection],
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     plt_names: &[String], got_entries: &[(String, bool)],
+    // Absolute 64-bit relocations against dynamic data symbols; each becomes a
+    // dynamic R_X86_64_64 in .rela.dyn (see AbsDynReloc).
+    abs_dyn_relocs: &[super::plt_got::AbsDynReloc],
     needed_sonames: &[String], output_path: &str,
     export_dynamic: bool, rpath_entries: &[String], use_runpath: bool,
     is_static: bool, ifunc_symbols: &[String],
@@ -86,6 +89,16 @@ pub(super) fn emit_executable(
     for (name, _) in &copy_reloc_syms {
         if dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
+        }
+    }
+
+    // Symbols targeted by an absolute dynamic relocation must appear in
+    // .dynsym: the R_X86_64_64 entry we emit for them carries a symbol index,
+    // and index 0 (the null symbol) would make ld.so resolve the slot to the
+    // addend alone -- reproducing the very bug this fixes.
+    for r in abs_dyn_relocs {
+        if dyn_sym_seen.insert(r.name.clone()) {
+            dyn_sym_names.push(r.name.clone());
         }
     }
 
@@ -215,7 +228,15 @@ pub(super) fn emit_executable(
     // Static executables use the separate .rela.iplt + __rela_iplt_start/end
     // protocol handled by glibc's static startup instead.
     let dyn_irelative_count = if is_static { 0 } else { ifunc_symbols.len() };
-    let rela_dyn_count = rela_dyn_glob_count + copy_reloc_syms.len() + dyn_irelative_count;
+    // Absolute relocations against dynamic data symbols also live in .rela.dyn.
+    // Symbols that ended up copy-relocated are excluded: for those the storage
+    // is a local BSS copy that ld.so fills via R_X86_64_COPY, so an additional
+    // R_X86_64_64 would double-apply.
+    let abs_dyn_count = abs_dyn_relocs.iter()
+        .filter(|r| globals.get(r.name.as_str()).map(|g| !g.copy_reloc).unwrap_or(false))
+        .count();
+    let rela_dyn_count =
+        rela_dyn_glob_count + copy_reloc_syms.len() + dyn_irelative_count + abs_dyn_count;
     let rela_dyn_size = rela_dyn_count as u64 * 24;
 
     // Build .gnu.hash table for hashed symbols (copy-reloc + exported)
@@ -1150,6 +1171,24 @@ pub(super) fn emit_executable(
             }
             gd_a += 8;
         }
+        // Absolute R_X86_64_64 relocations against dynamic data symbols.
+        // ld.so writes `symbol_address + addend` into the storage at link time
+        // of loading; we leave the storage itself zero (see the R_X86_64_64
+        // emit arm) so a stale addend cannot be mistaken for a real pointer.
+        for r in abs_dyn_relocs {
+            if globals.get(r.name.as_str()).map(|g| g.copy_reloc).unwrap_or(true) {
+                continue; // copy-relocated: R_X86_64_COPY handles it below
+            }
+            let Some(&(out_idx, sec_off)) = section_map.get(&(r.obj_idx, r.sec_idx)) else { continue };
+            let addr = output_sections[out_idx].addr + sec_off + r.offset;
+            let si = dyn_sym_index.get(r.name.as_str()).copied().unwrap_or(0);
+            debug_assert!(si != 0, "absolute dynamic reloc against symbol absent from .dynsym");
+            w64(&mut out, rd, addr);
+            w64(&mut out, rd + 8, (si << 32) | R_X86_64_64 as u64);
+            w64(&mut out, rd + 16, r.addend as u64);
+            rd += 24;
+        }
+
         // R_X86_64_COPY relocations for copy-relocated symbols
         for (name, _) in &copy_reloc_syms {
             if let Some(gsym) = globals.get(name) {
@@ -1408,14 +1447,34 @@ pub(super) fn emit_executable(
 
                 match rela.rela_type {
                     R_X86_64_64 => {
+                        let mut deferred_to_loader = false;
                         let t = if !sym.name.is_empty() && !sym.is_local() {
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if g.is_dynamic && !g.copy_reloc {
-                                    if let Some(pi) = g.plt_idx { plt_addr + 16 + pi as u64 * 16 } else { s }
+                                    if let Some(pi) = g.plt_idx {
+                                        plt_addr + 16 + pi as u64 * 16
+                                    } else {
+                                        // Dynamic DATA symbol with no PLT: its
+                                        // address is unknown until ld.so maps
+                                        // the library, so a dynamic R_X86_64_64
+                                        // was emitted into .rela.dyn for this
+                                        // storage. Leave the bytes zero -- the
+                                        // loader adds `symbol + addend`, and
+                                        // pre-writing the addend here would make
+                                        // ld.so's RELA (not REL) semantics
+                                        // irrelevant while leaving a bogus
+                                        // pointer if the reloc is ever skipped.
+                                        deferred_to_loader = true;
+                                        0
+                                    }
                                 } else { s }
                             } else { s }
                         } else { s };
-                        w64(&mut out, fp, (t as i64 + a) as u64);
+                        if deferred_to_loader {
+                            w64(&mut out, fp, 0);
+                        } else {
+                            w64(&mut out, fp, (t as i64 + a) as u64);
+                        }
                     }
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
                         let t = if !sym.name.is_empty() && !sym.is_local() {
@@ -1672,9 +1731,15 @@ pub(super) fn emit_executable(
             let ef_start = ef.file_offset as usize;
             let ef_end = ef_start + ef.mem_size as usize;
             if ef_end <= out.len() {
-                let relocated = out[ef_start..ef_end].to_vec();
+                // Build the header from a *borrow* of the already-relocated
+                // .eh_frame bytes. Copying the section first (`to_vec()`) was
+                // only ever needed to satisfy the borrow checker before the
+                // `write_bytes` below, but .eh_frame is large -- 400 KB on a
+                // 20 000-function link -- so that copy was pure waste. The
+                // immutable borrow ends when `hdr` is produced, which is
+                // before `out` is borrowed mutably, so NLL accepts this.
                 let hdr = linker_common::build_eh_frame_hdr(
-                    &relocated, ef.addr, eh_frame_hdr_vaddr, true);
+                    &out[ef_start..ef_end], ef.addr, eh_frame_hdr_vaddr, true);
                 if !hdr.is_empty()
                     && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
                     write_bytes(&mut out, eh_frame_hdr_offset as usize, &hdr);

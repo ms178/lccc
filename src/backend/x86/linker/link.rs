@@ -268,7 +268,7 @@ pub fn link_builtin(
 
     phase!("common");
     // Create PLT/GOT
-    let (plt_names, got_entries) = create_plt_got(&objects, &mut globals);
+    let (plt_names, got_entries, abs_dyn_relocs) = create_plt_got(&objects, &mut globals);
 
     phase!("plt-got");
     // Collect IFUNC symbols for static linking
@@ -278,7 +278,7 @@ pub fn link_builtin(
     // Emit executable
     let r = emit_executable(
         &objects, &mut globals, &mut output_sections, &section_map,
-        &plt_names, &got_entries, &needed_sonames, output_path,
+        &plt_names, &got_entries, &abs_dyn_relocs, &needed_sonames, output_path,
         export_dynamic, &rpath_entries, use_runpath, is_static,
         &ifunc_symbols, entry_symbol.as_deref(),
         parsed_args.z_now, parsed_args.z_relro,
