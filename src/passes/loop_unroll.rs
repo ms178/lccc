@@ -44,7 +44,10 @@ const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
 /// Choose the unroll factor based on total instruction count in body-work blocks.
 fn choose_unroll_factor(body_inst_count: usize) -> u32 {
     match body_inst_count {
-        0..=8 => 8,
+        // Tiny bodies (e.g. a single FmaF64x4 after vectorize): aggressive
+        // unroll exposes independent accumulators without code-size blow-up.
+        0..=4 => 8,
+        5..=8 => 4,
         9..=20 => 4,
         21..=60 => 2,
         _ => 1, // too large — skip
@@ -334,7 +337,12 @@ fn analyze_loop(
                 }
             })
         });
-        if has_iv_widening {
+        let small_const_trip = match &exit_limit {
+            Operand::Const(IrConst::I32(n)) => *n > 0 && (*n as i64) <= 8,
+            Operand::Const(IrConst::I64(n)) => *n > 0 && *n <= 8,
+            _ => false,
+        };
+        if has_iv_widening && !small_const_trip {
             return None;
         }
     }

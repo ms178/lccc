@@ -3271,23 +3271,23 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     {
         // First, create the byte limit. The vector loop steps by 32 bytes
         // (4 doubles) per iteration, so it must run exactly floor(N/4)
-        // iterations: byte_limit = (N/4)*32 = (N & ~3)*8. Using N*8 here
+        // iterations: byte_limit = (N/16)*128 = (N & ~3)*8. Using N*8 here
         // instead runs ceil(N/4) iterations — the final iteration reads and
         // writes up to 3 doubles past the end of the array (OOB), and the
         // scalar remainder loop then never fires, silently skipping the tail
         // (reproducer: N=255 matmul clobbered element 255 and skipped
         // elements 252..254, producing a wrong sum).
         let byte_limit = match &pattern.limit {
-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 4) * 32)),
-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 4) * 32)),
+            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 16) * 128)),
+            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 16) * 128)),
             Operand::Value(limit_val) => {
-                // Dynamic limit: byte_limit = (N/4)*32, hoisted into the header.
+                // Dynamic limit: byte_limit = (N/16)*128, hoisted into the header.
                 let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
 
-                // N / 4
+                // N / 16 (quad FMA width)
                 let div_dest = Value(next_val_id);
                 next_val_id += 1;
                 let div_inst = Instruction::BinOp {
@@ -3295,15 +3295,15 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     op: IrBinOp::UDiv,
                     lhs: Operand::Value(*limit_val),
                     rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(4),
-                        IrType::I64 => IrConst::I64(4),
-                        _ => IrConst::I64(4),
+                        IrType::I32 => IrConst::I32(16),
+                        IrType::I64 => IrConst::I64(16),
+                        _ => IrConst::I64(16),
                     }),
                     ty: limit_ty,
                 };
                 func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
 
-                // (N/4) * 32
+                // (N/16) * 128
                 let mul_dest = Value(next_val_id);
                 next_val_id += 1;
                 let mul_inst = Instruction::BinOp {
@@ -3311,16 +3311,16 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     op: IrBinOp::Mul,
                     lhs: Operand::Value(div_dest),
                     rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(32),
-                        IrType::I64 => IrConst::I64(32),
-                        _ => IrConst::I64(32),
+                        IrType::I32 => IrConst::I32(128),
+                        IrType::I64 => IrConst::I64(128),
+                        _ => IrConst::I64(128),
                     }),
                     ty: limit_ty,
                 };
                 func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
 
                 if debug {
-                    eprintln!("[VEC]   Inserted (N/4)*32 dynamic byte limit: Value({})", mul_dest.0);
+                    eprintln!("[VEC]   Inserted (N/16)*128 dynamic byte limit: Value({})", mul_dest.0);
                 }
 
                 Operand::Value(mul_dest)
@@ -3461,19 +3461,19 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
         }
 
-        // 2b: Change the IV increment from +1 to +32 (4 doubles × 8 bytes).
-        // The IV increment is at pattern.iv_inc_idx in the latch block.
+        // 2b: Change the IV increment from +1 to +64 (8 doubles × 8 bytes).
+        // Dual FmaF64x4 processes two consecutive 4-wide chunks per iteration.
         {
             let latch = &mut func.blocks[pattern.latch_idx];
             if pattern.iv_inc_idx < latch.instructions.len() {
                 if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
                     *rhs = match rhs {
-                        Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(32)),
-                        _ => Operand::Const(IrConst::I64(32)),
+                        Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(128)),
+                        _ => Operand::Const(IrConst::I64(128)),
                     };
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC]   Changed IV increment from +1 to +32");
+                        eprintln!("[VEC]   Changed IV increment from +1 to +128 (quad FMA)");
                     }
                 }
             }
@@ -3484,37 +3484,95 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 3: Replace the body with FmaF64x4.
-    // TODO: Hoist A[i][k] broadcast using BroadcastLoadF64 + FmaF64x4Hoisted
-    // (infrastructure ready, but the FMA body accesses wrong register for B_ptr
-    // when hoisted — the header BroadcastLoadF64 instruction shifts register
-    // allocation and the B_gep value ends up sharing a register with the byte
-    // offset IV).
+    // Step 3: Replace the body with FOUR FmaF64x4 (4-way software pipeline).
+    // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
+    // backend four concurrent vfmadd231pd chains — the shape GCC emits for
+    // the 256³ matmul kernel on x86-64-v3.
     {
         let body = &mut func.blocks[pattern.body_idx];
-        let intrinsic = Instruction::Intrinsic {
-            dest: None,
-            op: IntrinsicOp::FmaF64x4,
-            dest_ptr: Some(pattern.c_gep),
-            args: vec![
-                Operand::Value(pattern.a_ptr),
-                Operand::Value(pattern.b_gep),
-            ],
-        };
-
         let store_pos = body.instructions.iter().position(|inst| {
             matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
         });
 
-        if let Some(pos) = store_pos {
-            body.instructions.insert(pos, intrinsic);
-            body.instructions.remove(pos + 1);
-        } else {
-            body.instructions.push(intrinsic);
+        let (b_base, b_off, c_base, c_off) = {
+            let mut b_base = pattern.b_gep;
+            let mut b_off = Operand::Const(IrConst::I64(0));
+            let mut c_base = pattern.c_gep;
+            let mut c_off = Operand::Const(IrConst::I64(0));
+            for inst in &body.instructions {
+                if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+                    if *dest == pattern.b_gep {
+                        b_base = *base;
+                        b_off = offset.clone();
+                    }
+                    if *dest == pattern.c_gep {
+                        c_base = *base;
+                        c_off = offset.clone();
+                    }
+                }
+            }
+            (b_base, b_off, c_base, c_off)
+        };
+
+        let mut prelude: Vec<Instruction> = Vec::new();
+        // Chunk 0 uses the existing GEPs.
+        prelude.push(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::FmaF64x4,
+            dest_ptr: Some(pattern.c_gep),
+            args: vec![Operand::Value(pattern.a_ptr), Operand::Value(pattern.b_gep)],
+        });
+        for chunk in 1u64..4 {
+            let byte_off = chunk * 32;
+            let b_off_n = Value(next_val_id); next_val_id += 1;
+            let c_off_n = Value(next_val_id); next_val_id += 1;
+            let b_gep_n = Value(next_val_id); next_val_id += 1;
+            let c_gep_n = Value(next_val_id); next_val_id += 1;
+            prelude.push(Instruction::BinOp {
+                dest: b_off_n,
+                op: IrBinOp::Add,
+                lhs: b_off.clone(),
+                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
+                ty: IrType::I64,
+            });
+            prelude.push(Instruction::BinOp {
+                dest: c_off_n,
+                op: IrBinOp::Add,
+                lhs: c_off.clone(),
+                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
+                ty: IrType::I64,
+            });
+            prelude.push(Instruction::GetElementPtr {
+                dest: b_gep_n,
+                base: b_base,
+                offset: Operand::Value(b_off_n),
+                ty: IrType::F64,
+            });
+            prelude.push(Instruction::GetElementPtr {
+                dest: c_gep_n,
+                base: c_base,
+                offset: Operand::Value(c_off_n),
+                ty: IrType::F64,
+            });
+            prelude.push(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::FmaF64x4,
+                dest_ptr: Some(c_gep_n),
+                args: vec![Operand::Value(pattern.a_ptr), Operand::Value(b_gep_n)],
+            });
         }
-        changes += 1;
+
+        if let Some(pos) = store_pos {
+            body.instructions.remove(pos);
+            for (k, inst) in prelude.into_iter().enumerate() {
+                body.instructions.insert(pos + k, inst);
+            }
+        } else {
+            body.instructions.extend(prelude);
+        }
+        changes += 4;
         if debug {
-            eprintln!("[VEC]   Inserted FmaF64x4 intrinsic");
+            eprintln!("[VEC]   Inserted quad FmaF64x4 intrinsics (step 128)");
         }
     }
 
@@ -3523,7 +3581,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         let remainder_changes = insert_remainder_loop(
             func,
             pattern,
-            4,  // AVX2 vector width
+            16, // quad FmaF64x4 = 16 doubles per iteration
             &mut next_val_id,
             &mut next_label,
         );
