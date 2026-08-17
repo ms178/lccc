@@ -27,7 +27,8 @@ mod emit_exec;
 mod emit_shared;
 mod layout_plan;
 mod parallel_reloc;
-mod icf;
+pub mod icf;
+pub use icf::parse_icf_mode;
 
 #[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;

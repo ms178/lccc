@@ -28,6 +28,12 @@ pub struct LinkerArgs {
     pub defsym_defs: Vec<(String, String)>,
     /// Enable garbage collection of unused sections (from `--gc-sections`).
     pub gc_sections: bool,
+    /// Identical Code Folding mode from `--icf=safe|all|none`.
+    ///
+    /// `None` disables ICF. `Some("safe")` refuses to fold functions whose
+    /// address is observable; `Some("all")` folds regardless, which is only
+    /// valid when the program never compares function pointers.
+    pub icf: Option<String>,
     /// Whether `-static` was passed.
     pub is_static: bool,
     /// Entry point symbol from `-e SYM` / `--entry=SYM` (default `_start`).
@@ -191,6 +197,13 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if part == "-Map" && j + 1 < parts.len() {
                     j += 1;
                     result.map_path = Some(parts[j].to_string());
+                } else if let Some(v) = part.strip_prefix("--icf=") {
+                    // Unknown values disable ICF rather than erroring, which
+                    // matches how gold/lld treat --icf=none.
+                    result.icf = crate::backend::x86::linker::parse_icf_mode(v)
+                        .map(str::to_string);
+                } else if part == "--no-icf" {
+                    result.icf = None;
                 } else if part == "--gc-sections" {
                     result.gc_sections = true;
                 } else if part == "--no-gc-sections" {

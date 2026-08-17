@@ -59,7 +59,7 @@ pub struct Elf64Rela {
 }
 
 /// Parsed ELF64 object file (.o).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Elf64Object {
     pub sections: Vec<Elf64Section>,
     pub symbols: Vec<Elf64Symbol>,
