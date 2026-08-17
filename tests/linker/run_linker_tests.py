@@ -1383,6 +1383,40 @@ def _rel_test(name, sources, expect_stdout, asm=None, compile_flags=None):
 # 12. C++ EXCEPTIONS — unwinding through lccc-linked binaries
 # ============================================================================
 
+# A *locally defined* exception class. This is deliberately not
+# std::runtime_error: the typeinfo for a library type lives in libstdc++, so
+# throwing one never makes the linker emit a typeinfo object of its own. A
+# user-defined class forces the compiler to emit `_ZTI1E` into
+# .data.rel.ro, whose first word is an absolute 64-bit reference to
+# `_ZTVN10__cxxabiv117__class_type_infoE` (+0x10) in libstdc++.
+#
+# In an ET_EXEC link that address is unknowable until ld.so maps the library,
+# so it must become a dynamic R_X86_64_64. lccc used to write only the addend
+# (0x10) and emit no dynamic relocation, so __gxx_personality_v0 dereferenced
+# 0x10 while matching the LSDA type table and the program died with SIGSEGV --
+# *after* printing correct output, which is exactly the kind of failure a
+# stdout-only comparison misses. Hence the explicit exit-code check below.
+CXX_EH_LOCAL_TYPE_SRC = r"""
+#include <cstdio>
+struct E { int v; };
+struct F { double d; };
+__attribute__((noinline)) static void deep3(int x){ if (x > 2) throw E{x * 7}; }
+__attribute__((noinline)) static void deep2(int x){ deep3(x); }
+__attribute__((noinline)) static void deep1(int x){ deep2(x); }
+int main(){
+    int caught = 0, sum = 0;
+    for (int i = 0; i < 6; i++) {
+        try { deep1(i); }
+        catch (const E &e) { caught++; sum += e.v; }
+    }
+    // A second, unrelated local type: exercises more than one typeinfo object
+    // and therefore more than one absolute dynamic relocation.
+    try { throw F{1.5}; } catch (const F &f) { printf("f=%.1f\n", f.d); }
+    printf("caught=%d sum=%d\n", caught, sum);
+    return 0;
+}
+"""
+
 CXX_EH_SRC = r"""
 #include <cstdio>
 #include <stdexcept>
@@ -1474,6 +1508,49 @@ def _zdefs_test(args, oracles):
         return Result(name, "FAIL", f"harness exception: {e!r}")
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+def _cxx_eh_local_type_test(args, oracles):
+    """Throw a locally-defined class type across several frames.
+
+    Guards the absolute-dynamic-relocation path (see CXX_EH_LOCAL_TYPE_SRC).
+    Checks the *exit code* as well as stdout, because the historical failure
+    printed the right answer and then segfaulted while unwinding.
+    """
+    name = "cxx_exceptions_local_typeinfo"
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "lt.cpp"), "w") as f:
+            f.write(CXX_EH_LOCAL_TYPE_SRC)
+        r = sh(["g++", "-c", "-O1", "lt.cpp"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "g++ compile failed")
+        r = sh([args.lccc, "lt.o", "-lstdc++", "-o", "lt.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc link failed: {r.stderr.decode()[:300]}")
+        code, out = run_bin(os.path.join(td, "lt.lccc"), [], td)
+        r2 = sh(["g++", "lt.o", "-lstdc++", "-o", "lt.ref"], cwd=td)
+        if r2.returncode != 0:
+            return Result(name, "SKIP", "reference link failed")
+        code2, out2 = run_bin(os.path.join(td, "lt.ref"), [], td)
+        if (code, out) != (code2, out2):
+            return Result(name, "FAIL",
+                f"lccc {(code, out)!r} != g++ {(code2, out2)!r}")
+        # Explicit: a SIGSEGV during unwinding shows up only in the exit code.
+        if code != 0:
+            return Result(name, "FAIL",
+                f"non-zero exit {code} (unwinder crashed?) with output {out!r}")
+        if "caught=3 sum=84" not in out:
+            return Result(name, "FAIL", f"unexpected output {out!r}")
+
+        # The emitted image must carry a dynamic R_X86_64_64 for the class
+        # type_info vtable; without it the typeinfo slot keeps a bare addend.
+        rr = sh(["readelf", "-rW", "lt.lccc"], cwd=td)
+        rel = rr.stdout.decode(errors="replace")
+        if "R_X86_64_64" not in rel or "__cxxabiv1" not in rel:
+            return Result(name, "FAIL",
+                "no dynamic R_X86_64_64 against a __cxxabiv1 type_info vtable; "
+                "the typeinfo slot would hold only the addend")
+        return Result(name, "PASS")
+
 
 def _cxx_eh_test(args, oracles):
     name = "cxx_exceptions_unwind"
@@ -2851,6 +2928,7 @@ def main():
 
     if (not args.filter or "cxx" in args.filter) and (not args.tag or args.tag == "ehframe"):
         results.append(_cxx_eh_test(args, oracles))
+        results.append(_cxx_eh_local_type_test(args, oracles))
 
     if (not args.filter or "pie" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_pie_script_test(args, oracles))

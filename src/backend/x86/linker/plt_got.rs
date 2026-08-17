@@ -22,9 +22,29 @@ pub(super) fn collect_ifunc_symbols(globals: &FxHashMap<String, GlobalSymbol>, _
     ifunc_symbols
 }
 
+/// One absolute (`R_X86_64_64`) relocation against a dynamic data symbol.
+///
+/// These cannot be resolved at link time in an ET_EXEC image: the target lives
+/// in a shared library whose load address is unknown until `ld.so` maps it.
+/// GNU ld emits a dynamic `R_X86_64_64` for each one so the loader patches the
+/// storage in place; see `AbsDynReloc` use in `emit_exec`.
+#[derive(Clone, Debug)]
+pub(super) struct AbsDynReloc {
+    /// Symbol the relocation refers to (index into the dynamic symbol table is
+    /// resolved later, once that table is laid out).
+    pub name: String,
+    /// Input object and section holding the storage to be patched.
+    pub obj_idx: usize,
+    pub sec_idx: usize,
+    /// Offset of the storage within that input section.
+    pub offset: u64,
+    /// Addend to hand the loader (e.g. `+0x10` to skip a vtable's RTTI header).
+    pub addend: i64,
+}
+
 pub(super) fn create_plt_got(
     objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
-) -> (Vec<String>, Vec<(String, bool)>) {
+) -> (Vec<String>, Vec<(String, bool)>, Vec<AbsDynReloc>) {
     // Ordered vectors preserve deterministic layout; the shadow HashSets make
     // membership tests O(1). With tens of thousands of GOT symbols (e.g. a
     // kernel-sized link) the previous Vec::contains scans were O(n^2) and
@@ -36,8 +56,9 @@ pub(super) fn create_plt_got(
     let mut got_only_set: FxHashSet<String> = FxHashSet::default();
     let mut copy_reloc_names: Vec<String> = Vec::new();
     let mut copy_reloc_set: FxHashSet<String> = FxHashSet::default();
+    let mut abs_dyn_relocs: Vec<AbsDynReloc> = Vec::new();
 
-    for obj in objects {
+    for (obj_i, obj) in objects.iter().enumerate() {
         for sec_idx in 0..obj.sections.len() {
             for rela in &obj.relocations[sec_idx] {
                 let si = rela.sym_idx as usize;
@@ -88,9 +109,34 @@ pub(super) fn create_plt_got(
                     }
                     _ if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
-                        if sym_type != STT_OBJECT && rela.rela_type == R_X86_64_64 {
-                            // R_X86_64_64 for dynamic function (e.g. function pointer init) needs PLT
-                            if plt_set.insert(sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                        if rela.rela_type == R_X86_64_64 {
+                            if sym_type != STT_OBJECT {
+                                // Function pointer initialised from a dynamic
+                                // function: the canonical address is its PLT entry.
+                                if plt_set.insert(sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                            } else {
+                                // Absolute 64-bit reference to a dynamic DATA
+                                // symbol, e.g. the `_ZTVN10__cxxabiv1*` vtable
+                                // pointer that every C++ typeinfo object starts
+                                // with. The address is only known once ld.so has
+                                // mapped libstdc++, so it must become a dynamic
+                                // R_X86_64_64 -- a GOT slot is useless here
+                                // because the storage being initialised is the
+                                // typeinfo object itself, not a GOT entry.
+                                //
+                                // Getting this wrong is silent and lethal: the
+                                // slot keeps just the addend (0x10), and the
+                                // first C++ throw of a class type segfaults
+                                // inside __gxx_personality_v0 while reading the
+                                // LSDA type table.
+                                abs_dyn_relocs.push(AbsDynReloc {
+                                    name: sym.name.to_string(),
+                                    obj_idx: obj_i,
+                                    sec_idx,
+                                    offset: rela.offset,
+                                    addend: rela.addend,
+                                });
+                            }
                         } else if !plt_set.contains(sym.name.as_str()) && got_only_set.insert(sym.name.to_string()) {
                             got_only_names.push(sym.name.to_string());
                         }
@@ -165,5 +211,5 @@ pub(super) fn create_plt_got(
             eprintln!("[GOT] idx={} plt={} name={:?}", i, is_plt, name);
         }
     }
-    (plt_names, got_entries)
+    (plt_names, got_entries, abs_dyn_relocs)
 }
