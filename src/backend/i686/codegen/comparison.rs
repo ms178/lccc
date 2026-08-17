@@ -105,8 +105,23 @@ impl I686Codegen {
 
     pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, _ty: IrType) {
         self.operand_to_eax(lhs);
-        self.operand_to_ecx(rhs);
-        self.state.emit("    cmpl %ecx, %eax");
+        // Constant rhs: compare against the immediate directly instead of
+        // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
+        // `cmpl $C,%eax` is 3..6 and `testl %eax,%eax` is 2 (flags are
+        // identical for ALL Jcc: eax-0 and eax&eax both clear CF/OF and set
+        // SF/ZF/PF from eax). GCC emits exactly these forms. This also keeps
+        // %ecx untouched, which the register allocator relies on when it
+        // places a value in %ecx across a constant compare.
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            if imm == 0 {
+                self.state.emit("    testl %eax, %eax");
+            } else {
+                emit!(self.state, "    cmpl ${}, %eax", imm);
+            }
+        } else {
+            self.operand_to_ecx(rhs);
+            self.state.emit("    cmpl %ecx, %eax");
+        }
 
         let set_instr = match op {
             IrCmpOp::Eq => "sete",
@@ -136,8 +151,18 @@ impl I686Codegen {
         false_label: &str,
     ) {
         self.operand_to_eax(lhs);
-        self.operand_to_ecx(rhs);
-        self.state.emit("    cmpl %ecx, %eax");
+        // Same immediate forms as emit_int_cmp_impl (see there for the
+        // testl flags argument); keeps %ecx clean across fused compares.
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            if imm == 0 {
+                self.state.emit("    testl %eax, %eax");
+            } else {
+                emit!(self.state, "    cmpl ${}, %eax", imm);
+            }
+        } else {
+            self.operand_to_ecx(rhs);
+            self.state.emit("    cmpl %ecx, %eax");
+        }
 
         let jcc = match op {
             IrCmpOp::Eq  => "je",

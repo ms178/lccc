@@ -84,8 +84,19 @@ pub struct I686Codegen {
 pub(super) const I686_CALLEE_SAVED: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2)];
 // Extended callee-saved list including ebp (used when -fomit-frame-pointer)
 pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2), PhysReg(3)];
-// No caller-saved registers available for allocation (eax/ecx/edx are scratch)
-pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[];
+// Caller-saved registers for Phase-2 allocation (non-call-spanning values).
+// PhysReg(4) = ecx, PhysReg(5) = edx. %eax stays the accumulator.
+//
+// These are handed out ONLY to values whose live range crosses neither a
+// call point nor a "scratch hazard" -- an instruction whose i686 emitter
+// uses %ecx/%edx internally (non-const binop rhs staging, div/rem, indirect
+// loads/stores, wide operations, casts, atomics, inline asm, ...). The
+// hazard scan lives in regalloc.rs (collect_i686_scratch_hazard_points) and
+// is a WHITELIST: anything not proven clean is a hazard, so a missed case
+// costs a register, never a wrong value. This is GCC's main size advantage
+// on the 32 KiB kernel setup binary: values that live between two compares
+// can sit in %edx instead of forcing a %ebx..%ebp spill + push/pop pair.
+pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[PhysReg(5), PhysReg(4)];
 
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
@@ -93,6 +104,8 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
         1 => "esi",
         2 => "edi",
         3 => "ebp",
+        4 => "ecx",
+        5 => "edx",
         _ => panic!("invalid i686 phys reg: {:?}", reg),
     }
 }
@@ -1279,6 +1292,41 @@ impl ArchCodegen for I686Codegen {
     fn emit_acc_to_phys_reg(&mut self, dest: PhysReg) {
         let dest_name = phys_reg_name(dest);
         emit!(self.state, "    movl %eax, %{}", dest_name);
+    }
+
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+        // The trait DEFAULT for this hook is a NO-OP ("backends override").
+        // i686 never overrode it, so emit_leaq_base_index's default path
+        //     emit_reg_to_acc(base);      <- silently did nothing
+        //     emit_acc_to_secondary();    <- copied the STALE acc (the index!)
+        //     emit_reg_to_acc(index);     <- silently did nothing
+        //     emit_add_secondary_to_acc() <- acc = 2*index, base never added
+        // producing addr = 2*offset for every GEP whose base AND index were
+        // register-allocated: a[i] at -O0 segfaulted (gep0.c/fptest.c).
+        let name = phys_reg_name(reg);
+        emit!(self.state, "    movl %{}, %eax", name);
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    fn emit_leaq_base_index(
+        &mut self,
+        base_reg: PhysReg,
+        index_reg: PhysReg,
+        dest: &Value,
+        dest_reg: Option<PhysReg>,
+    ) {
+        // Single-instruction form, like x86-64: leal (%base,%index), %dest.
+        let b = phys_reg_name(base_reg);
+        let i = phys_reg_name(index_reg);
+        if let Some(d) = dest_reg {
+            let d = phys_reg_name(d);
+            emit!(self.state, "    leal (%{}, %{}), %{}", b, i, d);
+            self.state.reg_cache.invalidate_acc();
+        } else {
+            emit!(self.state, "    leal (%{}, %{}), %eax", b, i);
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        }
     }
 
     // ---- Standard trait methods (kept inline - arch-specific) ----

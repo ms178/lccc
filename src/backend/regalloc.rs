@@ -792,31 +792,85 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     // Phase 2: caller-saved linear scan for unallocated non-call-spanning values.
     if !config.caller_saved_regs.is_empty() {
-        let phase2_intervals: Vec<LiveInterval> = liveness
-            .intervals
+        // i686's pool is %ecx/%edx (PhysReg 4/5) -- registers the i686
+        // emitters ALSO use as internal scratch. A value may live in one of
+        // them only while no instruction in its range clobbers that specific
+        // register, so the pool splits into per-register scans filtered by
+        // the whitelist-based hazard table. 64-bit backends (whose pools
+        // never contain PhysReg 4/5) keep the single unfiltered scan.
+        let i686_pool = config
+            .caller_saved_regs
             .iter()
-            .filter(|iv| eligible.contains(&iv.value_id))
-            .filter(|iv| iv.end > iv.start)
-            .filter(|iv| !assignments.contains_key(&iv.value_id))
-            .filter(|iv| !spans_any_call(iv, call_points))
-            .filter(|iv| !param_ref_values.contains(&iv.value_id))
-            .copied()
-            .collect();
+            .any(|r| matches!(r.0, 4 | 5));
+        let hazards: Option<(Vec<u32>, Vec<u32>)> = if i686_pool {
+            Some(collect_i686_scratch_hazard_points(func, &non_gpr_values))
+        } else {
+            None
+        };
 
-        if !phase2_intervals.is_empty() {
-            let phase2_ranges =
-                live_range::build_live_ranges(&phase2_intervals, &liveness.block_loop_depth, func);
-            let mut caller_allocator =
-                LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
-            caller_allocator.run();
+        let base_filter = |iv: &&LiveInterval| {
+            eligible.contains(&iv.value_id)
+                && iv.end > iv.start
+                && !spans_any_call(iv, call_points)
+                && !param_ref_values.contains(&iv.value_id)
+        };
 
-            for (vid, reg) in caller_allocator.assignments {
-                assignments.insert(vid, reg);
-                // Phase 2 values are proven not to span calls; their ABI
-                // caller-saved registers need neither entry save nor exit
-                // restore. The old insertion into used_regs_set caused every
-                // such register to be pushed/popped as if callee-saved.
-                caller_used_regs_set.insert(reg.0);
+        if let Some((ecx_hazards, edx_hazards)) = hazards {
+            // Per-register scans, %edx first: it has strictly fewer hazards
+            // (no address staging), so it can hold longer ranges.
+            for (reg, reg_hazards) in [
+                (PhysReg(5), &edx_hazards),
+                (PhysReg(4), &ecx_hazards),
+            ] {
+                if !config.caller_saved_regs.contains(&reg) {
+                    continue;
+                }
+                let intervals: Vec<LiveInterval> = liveness
+                    .intervals
+                    .iter()
+                    .filter(&base_filter)
+                    .filter(|iv| !assignments.contains_key(&iv.value_id))
+                    // spans_any_call doubles as "spans any hazard point":
+                    // both lists are sorted program points.
+                    .filter(|iv| !spans_any_call(iv, reg_hazards))
+                    .copied()
+                    .collect();
+                if intervals.is_empty() {
+                    continue;
+                }
+                let ranges =
+                    live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
+                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+                alloc.run();
+                for (vid, r) in alloc.assignments {
+                    assignments.insert(vid, r);
+                    caller_used_regs_set.insert(r.0);
+                }
+            }
+        } else {
+            let phase2_intervals: Vec<LiveInterval> = liveness
+                .intervals
+                .iter()
+                .filter(&base_filter)
+                .filter(|iv| !assignments.contains_key(&iv.value_id))
+                .copied()
+                .collect();
+
+            if !phase2_intervals.is_empty() {
+                let phase2_ranges =
+                    live_range::build_live_ranges(&phase2_intervals, &liveness.block_loop_depth, func);
+                let mut caller_allocator =
+                    LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
+                caller_allocator.run();
+
+                for (vid, reg) in caller_allocator.assignments {
+                    assignments.insert(vid, reg);
+                    // Phase 2 values are proven not to span calls; their ABI
+                    // caller-saved registers need neither entry save nor exit
+                    // restore. The old insertion into used_regs_set caused every
+                    // such register to be pushed/popped as if callee-saved.
+                    caller_used_regs_set.insert(reg.0);
+                }
             }
         }
     }
@@ -2027,6 +2081,197 @@ fn remove_ineligible_operands(
 fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
     let start_idx = call_points.partition_point(|&cp| cp < iv.start);
     start_idx < call_points.len() && call_points[start_idx] <= iv.end
+}
+
+/// i686 scratch-hazard scan for the ecx/edx caller-saved pool.
+///
+/// The i686 emitters use %ecx and %edx as INTERNAL scratch all over the
+/// place (`operand_to_ecx` staging for non-const binop rhs, `cltd; idivl`,
+/// `emit_save_acc` = movl %eax,%edx, indirect load/store pointers in %ecx,
+/// wide i64 halves in %eax:%edx, shifts' %cl, ...). A value parked in
+/// %ecx/%edx therefore only survives across instructions whose emitters are
+/// PROVEN not to touch that register.
+///
+/// This function returns, for each of (%ecx, %edx), the sorted list of
+/// program points at which the emitted code may clobber it. It is a
+/// WHITELIST: every instruction is a hazard for both registers unless the
+/// match arm below proves otherwise (fail-closed: an unknown or new
+/// instruction costs a register, never a value).
+///
+/// Whitelist justification, per arm (i686 emitter audit 2026-08-18):
+///  * BinOp Add/Sub/Mul/And/Or/Xor with CONST rhs: single `op $imm,%eax`
+///    (alu.rs imm paths); Shl/AShr/LShr with CONST rhs: `shl $n,%eax`.
+///    Non-const rhs stages in %ecx -> ecx hazard; Div/Rem clobber both
+///    (cltd + idivl); 64-bit ops use %eax:%edx pairs -> both.
+///  * Cmp with CONST rhs: `cmpl $imm,%eax` / `testl %eax,%eax` (the
+///    immediate-compare commit); non-const rhs -> ecx hazard. 64-bit
+///    compares use the wide path -> both.
+///  * Load/Store DIRECT (alloca slot, 32-bit int): movl slot,%eax /
+///    movl %eax,slot -- no scratch. Anything indirect loads the pointer
+///    into %ecx; wide/f64 use %edx too. We cannot see SlotAddr here, so
+///    only loads/stores whose POINTER IS AN ALLOCA qualify (checked via
+///    alloca_values from the state is not available here either --
+///    conservatively, ALL loads/stores are hazards for %ecx; direct
+///    32-bit ones are clean for %edx).
+///  * Copy of 32-bit values: movl via %eax only (emit_copy_value int path).
+///  * UnaryOp 32-bit int Neg/Not/Clz/Ctz/Bswap/Popcount: acc-only
+///    (negl/notl/lzcnt/tzcnt/bswap/popcnt on %eax).
+///  * GetElementPtr: emitters use %ecx as secondary -> ecx hazard, %edx
+///    clean (traits default path uses acc+secondary only).
+///  * Alloca/Phi/PgoCounterInc/Fence(compile-only): no code or acc-only.
+///  * Everything else (casts, i128, atomics, intrinsics, memcpy, va_*,
+///    inline asm, calls, selects, stack ops, f64/f128 anything): hazard
+///    for BOTH. Calls are additionally call_points, but listing them here
+///    keeps this table independent of the call filter.
+///
+/// Terminators: Return of a 64-bit value materializes %eax:%edx (edx
+/// hazard); Switch uses %ecx for PIC jump tables (ecx hazard);
+/// CondBranch/Branch evaluate the condition through the acc (clean).
+fn collect_i686_scratch_hazard_points(
+    func: &IrFunction,
+    wide: &FxHashSet<u32>,
+) -> (Vec<u32>, Vec<u32>) {
+    use crate::ir::reexports::{IrBinOp, IrUnaryOp};
+    let mut ecx: Vec<u32> = Vec::new();
+    let mut edx: Vec<u32> = Vec::new();
+    let mut point: u32 = 0;
+
+    let is_gpr32 = |ty: &IrType| {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
+    };
+    let const_imm = |op: &Operand| {
+        matches!(
+            op,
+            Operand::Const(IrConst::I8(_))
+                | Operand::Const(IrConst::I16(_))
+                | Operand::Const(IrConst::I32(_))
+                | Operand::Const(IrConst::Zero)
+        ) || matches!(op, Operand::Const(IrConst::I64(v)) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64)
+    };
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let (ecx_clean, edx_clean) = match inst {
+                Instruction::BinOp { op, ty, rhs, .. } if is_gpr32(ty) => match op {
+                    // Const rhs folds to `op $imm,%eax` (acc-only). Non-const
+                    // rhs stages in %ecx (shifts through %cl) -- ecx hazard,
+                    // %edx untouched on all these paths.
+                    IrBinOp::Add
+                    | IrBinOp::Sub
+                    | IrBinOp::Mul
+                    | IrBinOp::And
+                    | IrBinOp::Or
+                    | IrBinOp::Xor
+                    | IrBinOp::Shl
+                    | IrBinOp::AShr
+                    | IrBinOp::LShr => (const_imm(rhs), true),
+                    // div/rem: cltd+idivl clobber %edx, rhs staged in %ecx.
+                    _ => (false, false),
+                },
+                // 32-bit compare: const rhs -> cmpl $imm/testl (acc-only);
+                // value rhs -> staged in %ecx. sete/movzbl are acc-only.
+                // %edx untouched either way.
+                Instruction::Cmp { ty, rhs, .. } if is_gpr32(ty) => (const_imm(rhs), true),
+                Instruction::Copy { dest, src } => {
+                    // 32-bit copies are acc-only; WIDE copies materialize the
+                    // high half in %edx. Wide-ness comes from the non-GPR set
+                    // (I64/U64/F64/F128 on 32-bit targets).
+                    match src {
+                        Operand::Value(v) => {
+                            let c = !wide.contains(&v.0) && !wide.contains(&dest.0);
+                            (c, c)
+                        }
+                        c => {
+                            let k = const_imm(c) && !wide.contains(&dest.0);
+                            (k, k)
+                        }
+                    }
+                }
+                // negl/notl/lzcnt/tzcnt/bswap/popcnt: all acc-only.
+                // BitReverse/IsConstant excluded (fail closed).
+                Instruction::UnaryOp { op, ty, .. }
+                    if is_gpr32(ty)
+                        && matches!(
+                            op,
+                            IrUnaryOp::Neg
+                                | IrUnaryOp::Not
+                                | IrUnaryOp::Clz
+                                | IrUnaryOp::Ctz
+                                | IrUnaryOp::Bswap
+                                | IrUnaryOp::Popcount
+                        ) =>
+                {
+                    (true, true)
+                }
+                // 32-bit loads: direct slot is acc-only, indirect pulls the
+                // pointer through %ecx; can't tell them apart here, so %ecx
+                // is a hazard. No 32-bit load path touches %edx.
+                Instruction::Load { ty, .. } if is_gpr32(ty) => (false, true),
+                // Stores: pointer through %ecx AND the const-offset override
+                // calls emit_save_acc (movl %eax,%edx) on its OverAligned/
+                // Indirect paths -- both registers are hazards.
+                Instruction::Store { .. } => (false, false),
+                // GEP: %ecx is the secondary/address scratch; %edx unused
+                // (emit_gep_direct/indirect_const and leal base+index are
+                // acc-only, general path uses acc+%ecx).
+                Instruction::GetElementPtr { .. } => (false, true),
+                Instruction::Alloca { .. }
+                | Instruction::Phi { .. }
+                | Instruction::PgoCounterInc { .. } => (true, true),
+                // 32-bit select: acc + branch; wide-cond check ORs the halves
+                // through the acc only.
+                Instruction::Select { ty, .. } if is_gpr32(ty) => (true, true),
+                Instruction::ParamRef { ty, .. } if is_gpr32(ty) => (true, true),
+                // movl $sym,%eax / movl sym@GOT(%ebx),%eax: acc + %ebx only.
+                Instruction::GlobalAddr { .. } | Instruction::LabelAddr { .. } => (true, true),
+                // Everything else (casts, i128, atomics, intrinsics, memcpy,
+                // va_*, inline asm, calls, f64/f128 ops, dynalloca, stack
+                // save/restore): fail closed, hazard for both.
+                _ => (false, false),
+            };
+            if !ecx_clean {
+                ecx.push(point);
+            }
+            if !edx_clean {
+                edx.push(point);
+            }
+            point += 1;
+        }
+        // Terminator occupies one program point (liveness.rs increments once
+        // after recording terminator uses).
+        let ret_is_gpr32 = is_gpr32(&func.return_type);
+        let (t_ecx_clean, t_edx_clean) = match &block.terminator {
+            // 32-bit returns load the acc only; wide returns set %eax:%edx.
+            Terminator::Return(Some(_)) => (true, ret_is_gpr32),
+            Terminator::Return(None) => (true, true),
+            Terminator::Branch(_) => (true, true),
+            // Compare-and-branch FUSION re-emits the block's Cmp at the
+            // terminator (recorded operands), so a value-rhs compare runs
+            // operand_to_ecx HERE, not at the Cmp's own program point.
+            // Fail closed: every CondBranch is an %ecx hazard.
+            Terminator::CondBranch { .. } => (false, true),
+            Terminator::Switch { .. } => (false, true), // PIC table via %ecx
+            Terminator::IndirectBranch { .. } => (false, false),
+            Terminator::Unreachable => (true, true), // emits nothing
+        };
+        if !t_ecx_clean {
+            ecx.push(point);
+        }
+        if !t_edx_clean {
+            edx.push(point);
+        }
+        point += 1;
+    }
+    (ecx, edx)
 }
 
 /// Build a sorted list of allocation candidates from live intervals.
