@@ -1610,6 +1610,14 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 
             // A write to the SOURCE breaks the alias immediately -- readers
             // after this point must keep using dst.
+            //
+            // IMPLICIT writes matter as much as explicit ones: `idivl %ecx`
+            // has no comma, so classify_line gives Other{dest_reg: REG_NONE},
+            // yet it clobbers %eax AND %edx. Without the implicit check the
+            // alias from `movl %ebx,%eax` survived the division and the
+            // quotient consumer `movl %eax,%edi` was rewritten to
+            // `movl %ebx,%edi` -- silently replacing a/b with a. Same story
+            // for mull, cltd, xchg and the string ops.
             let writes_src = match infos[j].kind {
                 LineKind::Move { dst, .. } => dst == src_reg,
                 LineKind::LoadEbp { reg, .. } => reg == src_reg,
@@ -1617,7 +1625,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 LineKind::SetCC { reg } => reg == src_reg,
                 LineKind::Other { dest_reg } => dest_reg == src_reg,
                 _ => false,
-            };
+            } || line_writes_reg_implicitly(line, src_reg);
             if writes_src {
                 break;
             }
@@ -1646,7 +1654,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 LineKind::SetCC { reg } => reg == dst_reg,
                 LineKind::Other { dest_reg } => dest_reg == dst_reg,
                 _ => false,
-            };
+            } || line_writes_reg_implicitly(trimmed(store, &infos[j], j), dst_reg);
             if writes_dst {
                 break;
             }
@@ -2373,6 +2381,34 @@ mod tests {
         let asm = "    movl %eax, %eax\n".to_string();
         let result = peephole_optimize(asm);
         assert_eq!(result.trim(), "");
+    }
+
+    /// idivl writes %eax implicitly (no comma operand -> Other{REG_NONE}).
+    /// Copy propagation must NOT rewrite readers of %eax past the division:
+    /// `movl %ebx,%eax; cltd; idivl %ecx; movl %eax,%edi` -- the last move
+    /// consumes the QUOTIENT, not %ebx. (mulhaz.c: a + a/b returned 2*a.)
+    #[test]
+    fn test_copy_prop_stops_at_idivl() {
+        let asm = "    movl %ebx, %eax\n    cltd\n    idivl %ecx\n    movl %eax, %edi\n    pushl %edi\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movl %ebx, %edi"),
+            "quotient consumer must keep reading %eax: {}",
+            result
+        );
+    }
+
+    /// mull (one-operand) clobbers %eax and %edx implicitly; the alias from
+    /// a copy of either must die at the multiply.
+    #[test]
+    fn test_copy_prop_stops_at_mull() {
+        let asm = "    movl %esi, %eax\n    mull %ecx\n    movl %eax, %edi\n    pushl %edi\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movl %esi, %edi"),
+            "product consumer must keep reading %eax: {}",
+            result
+        );
     }
 
     #[test]

@@ -356,10 +356,22 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
+        // Store from the ACCUMULATOR (%eax), not %edx.
+        //
+        // Every caller of this hook loads the value into %eax last:
+        //   * emit_store_default (traits.rs) loads the pointer into %ecx
+        //     first and then the value into %eax -- there is NO save_acc on
+        //     that path, so storing %edx wrote an uninitialized register.
+        //     `g = v;` compiled to `movl %edx, (%ecx)` with %edx never set.
+        //   * our own emit_store_with_const_offset override calls
+        //     emit_save_acc() and then only touches %ecx (slot load /
+        //     lea+add+and), so %eax still holds the value there too.
+        // The ARM backend fixed the identical bug (store from x0, not x1);
+        // x86-64 always stored from %rax.
         let reg = match ty {
-            IrType::I8 | IrType::U8 => "%dl",
-            IrType::I16 | IrType::U16 => "%dx",
-            _ => "%edx",
+            IrType::I8 | IrType::U8 => "%al",
+            IrType::I16 | IrType::U16 => "%ax",
+            _ => "%eax",
         };
         emit!(self.state, "    {} {}, (%ecx)", instr, reg);
     }

@@ -334,7 +334,15 @@ impl Target {
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
-                let optimized = i686::codegen::peephole::peephole_optimize(raw);
+                // Same bisection escape hatch as x86-64: LCCC_NO_PEEPHOLE=1
+                // emits the pre-peephole assembly verbatim. Without this the
+                // i686 peepholes could not be ruled out when triaging a
+                // miscompile (the flag silently did nothing on -m32).
+                let optimized = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
+                    raw
+                } else {
+                    i686::codegen::peephole::peephole_optimize(raw)
+                };
                 if opts.code16gcc {
                     format!(".code16gcc\n{}", optimized)
                 } else {
