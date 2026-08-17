@@ -91,7 +91,15 @@ pub fn run_regalloc_and_merge_clobbers(
         && !has_memcpy_or_vector_intrinsic
         && std::env::var("CCC_DISABLE_SCALAR_FP_XMM").is_ok()
         && std::env::var("CCC_ENABLE_SCALAR_FP_XMM").is_err();
+    // x86-64 detection: callee-saved pool contains rbx=PhysReg(1). This MUST
+    // exclude 32-bit targets: i686's pool is ebx/esi/edi/ebp = PhysReg(0..3),
+    // where PhysReg(1) is %esi -- the old `any(r.0 == 1)` check matched it and
+    // handed the i686 backend XMM PhysRegs (20+) it cannot emit. The slot
+    // assigner then skipped stack slots for those F64 values, and every read
+    // went to a nonexistent home: fptest.c returned garbage at O2 (exit 1 vs
+    // GCC's 23.0). 64-bit gate fixes it (fptest exit 0).
     let xmm_regs = if available_regs.iter().any(|r| r.0 == 1)
+        && !crate::common::types::target_is_32bit()
         && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
         && !disable_scalar_fp_xmm
     {
