@@ -1365,7 +1365,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
         | O::Pmaxub256 | O::Pminub256
         | O::Pxor256 | O::Por256 | O::Pand256
         | O::AddF64x4 | O::MulF64x4 | O::AddI32x8
-        | O::VecAddF64x4 | O::VecMulF64x4 | O::VecAddI32x8
+        | O::VecAddF64x4 | O::VecMulF64x4 | O::VecAddI32x8 | O::VecMulI32x8 | O::VecBroadcastI32x8
         | O::VecAddF32x8 | O::VecMulF32x8
         | O::VecAddF64x2 | O::VecMulF64x2 | O::VecAddI32x4
         | O::VecAddF32x4 | O::VecMulF32x4
@@ -1542,7 +1542,7 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                         | O::VecLoadI32x4 | O::VecLoadI32x8
                         | O::VecLoadF32x4 | O::VecLoadF32x8
                         | O::VecAddF64x2 | O::VecAddF64x4
-                        | O::VecAddI32x4 | O::VecAddI32x8
+                        | O::VecAddI32x4 | O::VecAddI32x8 | O::VecMulI32x8 | O::VecBroadcastI32x8
                         | O::VecAddF32x4 | O::VecAddF32x8
                         | O::VecMulF64x2 | O::VecMulF64x4
                         | O::VecMulF32x4 | O::VecMulF32x8

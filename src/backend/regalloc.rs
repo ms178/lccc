@@ -468,6 +468,19 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // resolve_slot_addr() directly (not register-aware).
     remove_ineligible_operands(func, &mut eligible, config);
 
+    // ParamRef destinations must not take ABI argument registers from the
+    // caller-saved pool (rdi/rsi/r8/r9/...): those still hold *other* params'
+    // incoming values when ParamRefs are emitted. Restrict to callee-saved
+    // (phase 1 / 2c) or stack.
+    let mut param_ref_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef { dest, .. } = inst {
+                param_ref_values.insert(dest.0);
+            }
+        }
+    }
+
     // --- 3-channel multiply ILP ---
     //
     // For loops with many multiply-accumulate patterns (a += b*c), we want 3
@@ -785,6 +798,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !spans_any_call(iv, call_points))
+            .filter(|iv| !param_ref_values.contains(&iv.value_id))
             .copied()
             .collect();
 

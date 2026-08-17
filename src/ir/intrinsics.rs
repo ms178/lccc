@@ -243,12 +243,15 @@ pub enum IntrinsicOp {
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecMulI32x4,
+    VecMulI32x8,
     /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
     /// args[0] = scalar I32 value; dest = result vector
     VecBroadcastI32x4,
+    VecBroadcastI32x8,
     /// Vector store: store 4×I32 vector to memory.
     /// dest_ptr = destination pointer; args[0] = source vector value.
     VecStoreI32x4,
+    VecStoreI32x8,
     /// Load two signed I32 lanes and widen to two I64 lanes.
     VecLoadWidenI32ToI64x2,
     /// Load two I64 lanes (movdqu).
@@ -969,7 +972,7 @@ impl IntrinsicOp {
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
-            | VecAddI32x8 | VecZeroF64x4 | VecZeroI32x8
+            | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecZeroF64x4 | VecZeroI32x8
             | VecLoadF32x8 | VecAddF32x8 | VecMulF32x8 | VecZeroF32x8
             // Newly wired AVX/AVX2 ops (previously scalar header loops)
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
@@ -1087,7 +1090,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecLoadI64x2
             | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
             | IntrinsicOp::VecZeroI64x2
-            | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4
+            | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecMulI32x8 | IntrinsicOp::VecBroadcastI32x4 | IntrinsicOp::VecBroadcastI32x8
             | IntrinsicOp::VecSadalpI32x4
             | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
         )
