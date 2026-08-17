@@ -72,6 +72,7 @@ mod args;
 mod check;
 mod eh_frame;
 mod gc_sections;
+mod mapfile;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //

@@ -25,6 +25,7 @@ mod plt_got;
 mod link;
 mod emit_exec;
 mod emit_shared;
+mod layout_plan;
 mod parallel_reloc;
 mod icf;
 

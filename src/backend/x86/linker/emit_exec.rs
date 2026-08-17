@@ -1227,6 +1227,47 @@ pub(super) fn emit_executable(
     }
 
     zone!("buffer");
+
+    // TLS-consumed ranges: file offsets overwritten by a prior TLS GD/LD→LE
+    // rewrite. Subsequent relocations whose file offset falls inside any range
+    // must be skipped. Small lists use linear scan; past 32 entries the structure
+    // sorts+merges in place and switches to binary search permanently.
+    struct TlsConsumed {
+        ranges: Vec<(usize, usize)>,
+        sorted: bool,
+    }
+    impl TlsConsumed {
+        fn new() -> Self { Self { ranges: Vec::new(), sorted: true } }
+        fn push(&mut self, start: usize, end: usize) {
+            self.ranges.push((start, end));
+            self.sorted = false;
+        }
+        fn contains(&mut self, fp: usize) -> bool {
+            if self.ranges.is_empty() { return false; }
+            if self.ranges.len() <= 32 && !self.sorted {
+                return self.ranges.iter().any(|&(s, e)| fp >= s && fp < e);
+            }
+            if !self.sorted {
+                self.ranges.sort_unstable_by_key(|&(s, _)| s);
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.ranges.len());
+                for (s, e) in self.ranges.drain(..) {
+                    if let Some(last) = merged.last_mut() {
+                        if s <= last.1 { last.1 = last.1.max(e); continue; }
+                    }
+                    merged.push((s, e));
+                }
+                self.ranges = merged;
+                self.sorted = true;
+            }
+            self.ranges.binary_search_by(|&(s, e)| {
+                if fp < s { std::cmp::Ordering::Greater }
+                else if fp >= e { std::cmp::Ordering::Less }
+                else { std::cmp::Ordering::Equal }
+            }).is_ok()
+        }
+    }
+    let mut tls_consumed = TlsConsumed::new();
+
     // === Apply relocations ===
     // `globals` is never touched again after this point, so a plain reborrow
     // suffices. The old `.clone()` deep-copied the entire map — 40k String
@@ -1250,7 +1291,6 @@ pub(super) fn emit_executable(
     // call that follows a relaxed TLSGD/TLSLD sequence has its own PLT32 /
     // GOTPCRELX relocation which must NOT be applied (the call bytes have been
     // overwritten). Ranges are file offsets.
-    let mut tls_consumed: Vec<(usize, usize)> = Vec::new();
 
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
@@ -1272,7 +1312,7 @@ pub(super) fn emit_executable(
 
                 // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
                 // rewrite (the __tls_get_addr call no longer exists).
-                if tls_consumed.iter().any(|&(cs, ce)| fp >= cs && fp < ce) { continue; }
+                if tls_consumed.contains(fp) { continue; }
                 let s = resolve_sym(obj_idx, sym, globals_snap, section_map, output_sections,
                                     plt_addr);
 
@@ -1470,7 +1510,7 @@ pub(super) fn emit_executable(
                             out[st+9] = 0x48; out[st+10] = 0x03; out[st+11] = 0x05;
                             w32(&mut out, st+12, (gea as i64 - (seq_addr as i64 + 16)) as u32);
                         }
-                        tls_consumed.push((fp + 4, fp + 12));
+                        tls_consumed.push(fp + 4, fp + 12);
                     }
                     R_X86_64_TLSLD => {
                         // Local-Dynamic TLS in an executable -> LE. Sequence:
@@ -1490,7 +1530,7 @@ pub(super) fn emit_executable(
                         };
                         out[st..st+12].copy_from_slice(
                             &[0x66,0x66,0x66,0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
-                        tls_consumed.push((fp + 4, fp + 9));
+                        tls_consumed.push(fp + 4, fp + 9);
                     }
                     R_X86_64_DTPOFF32 => {
                         // After LD->LE relaxation %rax holds TP, so DTPOFF becomes
