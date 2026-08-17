@@ -25,14 +25,28 @@ use crate::backend::linker_common::{
 type Object = linker_common::Elf64Object;
 
 const PT_LOAD_: u32 = 1;
+const PT_TLS_: u32 = 7;
 const PT_NOTE_: u32 = 4;
 const ELF64_EHDR_SIZE: u64 = 64;
 const ELF64_PHDR_SIZE: u64 = 56;
 
 /// Bytes occupied by the ELF header and the script-declared program-header
 /// table. GNU ld exposes this value to scripts as `SIZEOF_HEADERS`.
+/// Bytes occupied by the ELF header plus all program headers.
+///
+/// This is what `SIZEOF_HEADERS` evaluates to, so it must agree exactly with
+/// the number of program headers actually written. `extra_phdrs` accounts for
+/// headers the linker synthesises rather than the script declaring them (today:
+/// PT_TLS). Undercounting places the first section on top of the last program
+/// header, and the entry point then lands in header bytes -- observed as an
+/// immediate SIGILL.
+fn script_header_size_with(script: &LinkerScript, extra_phdrs: usize) -> u64 {
+    ELF64_EHDR_SIZE
+        + ELF64_PHDR_SIZE * (script.phdrs.len().max(1) + extra_phdrs) as u64
+}
+
 fn script_header_size(script: &LinkerScript) -> u64 {
-    ELF64_EHDR_SIZE + ELF64_PHDR_SIZE * script.phdrs.len().max(1) as u64
+    script_header_size_with(script, 0)
 }
 
 /// Synthetic dynamic-link information required by an ET_DYN linker-script
@@ -292,6 +306,21 @@ pub fn link_with_script(
         }
     }
 
+    // Symbols the *inputs* declared STV_HIDDEN/STV_INTERNAL. Visibility is an
+    // ABI property decided by the compiler; the linker must honour it before
+    // any version-script globbing is applied.
+    let mut hidden_object_syms: FxHashSet<String> = FxHashSet::default();
+    for obj in objects.iter() {
+        for sym in &obj.symbols {
+            if sym.name.is_empty() || sym.is_undefined() { continue; }
+            // STV_HIDDEN = 2, STV_INTERNAL = 1, STV_PROTECTED = 3 (still exported).
+            let vis = sym.visibility();
+            if vis == 1 || vis == 2 {
+                hidden_object_syms.insert(sym.name.to_string());
+            }
+        }
+    }
+
     // ET_DYN script links (notably Linux's vDSO) require linker-created
     // dynamic metadata. Materialise it as a synthetic input object so the
     // script's ordinary `*(.dynsym)` / `*(.dynamic)` rules decide placement,
@@ -303,9 +332,17 @@ pub fn link_with_script(
     let mut script_dynamic: Option<ScriptDynamic> = None;
     if wants_dynamic {
         if let Some(version) = embedded_version.as_ref() {
-            let mut exports: Vec<String> = def_syms.keys()
-                .filter(|name| version.matches_global(name))
-                .cloned().collect();
+            // STV_HIDDEN / STV_INTERNAL symbols are deliberately not part of
+            // the ABI: they must stay out of .dynsym even when the version
+            // script says `global: *`. GNU ld applies visibility first and the
+            // version script second; doing it the other way round exports the
+            // vDSO's internal helpers and every -fvisibility=hidden symbol in
+            // a script-linked shared object.
+            let mut exports: Vec<String> = def_syms.iter()
+                .filter(|(name, _)| version.matches_global(name))
+                .filter(|(name, _)| !hidden_object_syms.contains(name.as_str()))
+                .map(|(name, _)| name.clone())
+                .collect();
             exports.sort();
             let mut all = objects.to_vec();
             let object_index = all.len();
@@ -389,15 +426,47 @@ pub fn link_with_script(
     // value depends on PHDRS and therefore is not a context-free constant.
     // Seed it before the first assignment is evaluated: Linux's vDSO script
     // starts with `. = SIZEOF_HEADERS`, before any output section exists.
-    symbols.insert("__SIZEOF_HEADERS".into(), script_header_size(&script));
+    // A synthesised PT_TLS adds a program header, so it must be counted here
+    // too or SIZEOF_HEADERS under-reserves and the first section overlaps the
+    // header table. Predict it from the inputs, since output sections do not
+    // exist yet: any allocated SHF_TLS input section will produce one unless
+    // the script already declares PT_TLS.
+    let will_add_tls_phdr = objects.iter().any(|o| o.sections.iter()
+            .any(|sec| (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0
+                       && sec.size > 0))
+        && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    symbols.insert("__SIZEOF_HEADERS".into(),
+                   script_header_size_with(&script, usize::from(will_add_tls_phdr)));
     // GNU ld attributes a script symbol to the output section that was
     // current at its point of definition (e.g. `_end` after .brk belongs to
     // .brk even though .modinfo starts at the same address).
     let mut sym_home: FxHashMap<String, String> = FxHashMap::default();
+    // Symbols defined by HIDDEN()/PROVIDE_HIDDEN(): emitted STV_HIDDEN and
+    // kept out of .dynsym. Losing this bit exports internal markers from every
+    // shared object built with a custom script.
+    let mut hidden_syms: FxHashSet<String> = FxHashSet::default();
     let mut cur_out_name: Option<String> = None;
     let mut sections_meta: FxHashMap<String, (u64, u64, u64, u64)> = FxHashMap::default();
     let mut out_secs: Vec<OutSec> = Vec::new();
     let mut dot: u64 = 0;
+
+    // MEMORY regions: base/limit for the overflow check, plus a per-region
+    // allocation cursor so `> region` sections pack independently of `dot`.
+    let mut region_bounds: FxHashMap<String, (u64, u64)> = FxHashMap::default();
+    let mut region_cursor: FxHashMap<String, u64> = FxHashMap::default();
+    for r in &script.memory {
+        let empty_syms: FxHashMap<String, u64> = FxHashMap::default();
+        let empty_secs: FxHashMap<String, (u64, u64, u64, u64)> = FxHashMap::default();
+        let ctx = linker_script::EvalCtx {
+            dot: 0, symbols: &empty_syms, sections: &empty_secs, segment_starts: None,
+        };
+        let origin = linker_script::eval_expr(&r.origin, &ctx)
+            .map_err(|_| format!("MEMORY region '{}': ORIGIN is not a constant", r.name))?;
+        let length = linker_script::eval_expr(&r.length, &ctx)
+            .map_err(|_| format!("MEMORY region '{}': LENGTH is not a constant", r.name))?;
+        region_bounds.insert(r.name.clone(), (origin, origin.saturating_add(length)));
+        region_cursor.insert(r.name.clone(), origin);
+    }
 
     // Deferred assignments that referenced not-yet-defined symbols; re-run to
     // fixed point after layout.
@@ -448,7 +517,7 @@ pub fn link_with_script(
         placed_map: &FxHashMap<(usize, usize), u64>,
     ) -> Result<u64, String> {
         // Fast path: try direct eval; on undefined symbol, augment.
-        let ctx = EvalCtx { dot, symbols, sections: sections_meta };
+        let ctx = EvalCtx { dot, symbols, sections: sections_meta, segment_starts: None };
         match eval_expr(e, &ctx) {
             Ok(v) => Ok(v),
             Err(EvalError::UndefinedSymbol(n)) => {
@@ -459,7 +528,7 @@ pub fn link_with_script(
                     // may still hit more undefined symbols; recurse via loop
                     let mut aug2 = aug;
                     loop {
-                        let ctx2 = EvalCtx { dot, symbols: &aug2, sections: sections_meta };
+                        let ctx2 = EvalCtx { dot, symbols: &aug2, sections: sections_meta, segment_starts: None };
                         match eval_expr(e, &ctx2) {
                             Ok(v) => return Ok(v),
                             Err(EvalError::UndefinedSymbol(n2)) => {
@@ -494,6 +563,7 @@ pub fn link_with_script(
                             } else { v };
                             if !(a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol))) {
                                 symbols.insert(a.symbol.clone(), nv);
+                                if a.hidden { hidden_syms.insert(a.symbol.clone()); }
                                 if let Some(ref n) = cur_out_name {
                                     sym_home.insert(a.symbol.clone(), n.clone());
                                 }
@@ -509,6 +579,7 @@ pub fn link_with_script(
                     symbol: "__assert__".into(), op: AssignOp::Set,
                     expr: linker_script::Expr::Assert(Box::new(e.clone()), msg.clone()),
                     provide: false,
+                    hidden: false,
                 }, dot));
             }
             SectionsItem::Output(def) => {
@@ -519,10 +590,19 @@ pub fn link_with_script(
                 let explicit_zero = matches!(def.address, Some(linker_script::Expr::Num(0)));
                 let is_alloc = !def.info && !explicit_zero;
 
-                // Section start: explicit address or current dot (aligned).
+                // Section start: explicit address, region base, or dot.
+                //
+                // `> region` sets the VMA from the region's allocation cursor,
+                // so consecutive sections assigned to a region pack into it
+                // independently of the global dot. An explicit address still
+                // wins, matching GNU ld.
                 let mut sec_start = if let Some(ref ae) = def.address {
                     eval_full(ae, dot, &symbols, &sections_meta, &def_syms, &placed_map)
                         .map_err(|e| format!("cannot evaluate address of {}: {}", def.name, e))?
+                } else if let Some(ref rname) = def.region {
+                    *region_cursor.get(rname.as_str()).ok_or_else(|| format!(
+                        "linker script: section {} assigned to undefined MEMORY region '{}'",
+                        def.name, rname))?
                 } else {
                     dot
                 };
@@ -574,6 +654,7 @@ pub fn link_with_script(
                                         } else { v };
                                         if !(a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol))) {
                                             symbols.insert(a.symbol.clone(), nv);
+                                            if a.hidden { hidden_syms.insert(a.symbol.clone()); }
                                             sym_home.insert(a.symbol.clone(), def.name.clone());
                                         }
                                     }
@@ -586,6 +667,7 @@ pub fn link_with_script(
                                 symbol: "__assert__".into(), op: AssignOp::Set,
                                 expr: linker_script::Expr::Assert(Box::new(e.clone()), msg.clone()),
                                 provide: false,
+                    hidden: false,
                             }, cur));
                         }
                         SecItem::Constructors => { /* ELF: no-op */ }
@@ -669,6 +751,35 @@ pub fn link_with_script(
                 };
                 sections_meta.insert(def.name.clone(), (sec_start, size, max_align, lma));
 
+                // MEMORY region accounting. Overrunning a region is the single
+                // most common linker-script mistake, and an unchecked overrun
+                // produces an image whose sections silently overlap. Diagnose
+                // it by name, with the overflow amount, like GNU ld does.
+                if let Some(rname) = def.region.as_deref() {
+                    let end = sec_start.saturating_add(size);
+                    if let Some(&(origin, limit)) = region_bounds.get(rname) {
+                        if end > limit {
+                            return Err(format!(
+                                "linker script: section {} overflows MEMORY region '{}' by \
+                                 {} bytes (region {:#x}..{:#x}, section {:#x}..{:#x})",
+                                def.name, rname, end - limit, origin, limit, sec_start, end));
+                        }
+                    }
+                    region_cursor.insert(rname.to_string(), end);
+                }
+                if let Some(rname) = def.lma_region.as_deref() {
+                    // AT> region: the load image must fit too.
+                    if let Some(&(origin, limit)) = region_bounds.get(rname) {
+                        let lend = lma.saturating_add(size);
+                        if lend > limit {
+                            return Err(format!(
+                                "linker script: load image of {} overflows MEMORY region \
+                                 '{}' by {} bytes (region {:#x}..{:#x})",
+                                def.name, rname, lend - limit, origin, limit));
+                        }
+                    }
+                }
+
                 out_secs.push(OutSec {
                     name: def.name.clone(),
                     vaddr: sec_start,
@@ -745,6 +856,7 @@ pub fn link_with_script(
             if a.symbol == "." { continue; }
             if a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol)) { continue; }
             symbols.insert(a.symbol.clone(), v);
+            if a.hidden { hidden_syms.insert(a.symbol.clone()); }
         }
     }
     for (e, msg) in &script.top_asserts {
@@ -810,8 +922,19 @@ pub fn link_with_script(
 
     // ELF header + phdrs at file start.
     let declared_phdrs: Vec<&linker_script::PhdrDecl> = script.phdrs.iter().collect();
-    let n_phdrs = declared_phdrs.len().max(1);
-    let mut file_off = script_header_size(&script);
+    // A script that places SHF_TLS sections but declares no PT_TLS gets one
+    // synthesised. Without it the loader never allocates the thread block, so
+    // every %fs-relative access reads whatever happens to precede the TCB --
+    // the relocations are correct and the program still misbehaves.
+    //
+    // This must agree with `will_add_tls_phdr` above, which fed SIZEOF_HEADERS.
+    let needs_tls_phdr = out_secs.iter().any(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
+        && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    debug_assert_eq!(needs_tls_phdr, will_add_tls_phdr,
+        "PT_TLS prediction disagreed with the final layout; SIZEOF_HEADERS would be wrong");
+    let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr);
+    let mut file_off = script_header_size_with(
+        &script, usize::from(needs_tls_phdr));
 
     // Assign file offsets: alloc PROGBITS sections in vaddr order get offsets
     // congruent to their LMA modulo the requested maximum page size. The
@@ -868,6 +991,122 @@ pub fn link_with_script(
         }
     }
 
+    /// Relax a GOT-relative reference into direct addressing.
+    ///
+    /// A linker-script link has no GOT: every address is known, so the
+    /// *indirection through a GOT slot* that the compiler emitted must be
+    /// removed rather than satisfied. The x86-64 psABI ("GOTPCRELX
+    /// relaxations") specifies the legal rewrites; this implements the forms
+    /// GCC and Clang actually emit for `-fPIC` code:
+    ///
+    /// | before                              | after                        |
+    /// |-------------------------------------|------------------------------|
+    /// | `mov  sym@GOTPCREL(%rip), %reg` 8b  | `lea sym(%rip), %reg`    8d  |
+    /// | `cmp  %reg, sym@GOTPCREL(%rip)` 3b  | `cmp $sym, %reg`   81 /7 imm |
+    /// | `call *sym@GOTPCREL(%rip)`   ff /2  | `call sym` (e8) + nop        |
+    /// | `jmp  *sym@GOTPCREL(%rip)`   ff /4  | `jmp  sym` (e9) + nop        |
+    ///
+    /// `mov` -> `lea` keeps the operand PC-relative, so it is position
+    /// independent and needs no range beyond the usual +/-2 GiB. The `cmp`
+    /// and indirect-branch forms become absolute/direct and are therefore
+    /// only valid when the target fits the encoding; that is checked.
+    ///
+    /// Returns `Err(<opcode bytes>)` when the form is not one of the above,
+    /// so the caller can produce a precise diagnostic instead of emitting a
+    /// silently corrupt image.
+    fn relax_gotpcrel(
+        out: &mut [u8], fp: usize, s: u64, a: i64, p: u64,
+    ) -> Result<(), String> {
+        // Displacement for a rewritten PC-relative operand. The instruction
+        // length is unchanged by every rewrite below, so `p` still names the
+        // end of the 4-byte field.
+        let pcrel = s as i64 + a - p as i64;
+        let describe = |o: &[u8]| o.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+
+        if fp < 2 || fp + 4 > out.len() {
+            return Err("<truncated>".to_string());
+        }
+        let modrm = out[fp - 1];
+        let op = out[fp - 2];
+
+        // mov m64, r64  ->  lea m64, r64   (opcode 8b -> 8d, ModRM unchanged)
+        if op == 0x8b {
+            out[fp - 2] = 0x8d;
+            w32(out, fp, pcrel as u32);
+            return Ok(());
+        }
+
+        // cmp r64, m64  ->  cmp r64, imm32   (3b /r -> 81 /7 id)
+        // Only valid when the absolute address fits in a sign-extended imm32,
+        // which is the normal case for a -T image below 2 GiB.
+        if op == 0x3b {
+            let abs = s as i64 + a + 4; // addend is -4 for a rip operand
+            if (i32::MIN as i64..=i32::MAX as i64).contains(&abs) {
+                let reg = (modrm >> 3) & 7;
+                out[fp - 2] = 0x81;
+                out[fp - 1] = 0xf8 | reg; // mod=11, /7 (cmp), rm=reg
+                w32(out, fp, abs as u32);
+                return Ok(());
+            }
+            return Err(describe(&out[fp - 2..fp]));
+        }
+
+        // call/jmp *m64 -> direct call/jmp. ff /2 = call, ff /4 = jmp.
+        // The indirect form is 6 bytes (ff /r + disp32) and the direct form is
+        // 5 (e8/e9 + rel32), so a leading nop keeps the length identical --
+        // exactly what GNU ld does.
+        if op == 0xff && fp >= 2 {
+            let ext = (modrm >> 3) & 7;
+            if ext == 2 || ext == 4 {
+                // The rel32 is measured from the end of the 5-byte direct
+                // instruction, which now starts one byte later.
+                let rel = s as i64 + a + 1 - p as i64;
+                if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+                    return Err(describe(&out[fp - 2..fp]));
+                }
+                out[fp - 2] = 0x90; // nop
+                out[fp - 1] = if ext == 2 { 0xe8 } else { 0xe9 };
+                w32(out, fp, rel as u32);
+                return Ok(());
+            }
+        }
+
+        Err(describe(&out[fp - 2..fp]))
+    }
+
+    // ── TLS segment bounds ──
+    //
+    // Initial-Exec TLS offsets are measured from the *end* of the TLS block,
+    // because %fs:0 points just past it on x86-64. The block spans every
+    // SHF_TLS output section; .tbss contributes to the memory size but not to
+    // the file image, exactly as in a PT_TLS program header.
+    let (tls_addr, tls_mem_size) = {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for os in out_secs.iter().filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc) {
+            lo = lo.min(os.vaddr);
+            hi = hi.max(os.vaddr + os.size);
+        }
+        if lo == u64::MAX { (0u64, 0u64) } else { (lo, hi - lo) }
+    };
+
+    // ── Relocation helpers ──
+    //
+    // A 32-bit displacement that does not fit is the classic way a large image
+    // gets silently corrupted: the truncated value points somewhere plausible
+    // and the failure surfaces much later as a wild jump. Diagnose instead.
+    fn reloc_range_err(kind: &str, v: i64, sym: &str, src: &str) -> String {
+        format!("script link: {} against '{}' in {} does not fit: value {:#x} \
+                 is out of range (image too large or wrong load address?)",
+                kind, sym, src, v)
+    }
+    fn check_pcrel32(v: i64, sym: &str, src: &str) -> Result<(), String> {
+        if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+            return Err(reloc_range_err("32-bit PC-relative reference", v, sym, src));
+        }
+        Ok(())
+    }
+
     // ── Apply relocations ──
     let mut undefined: Vec<String> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
@@ -897,11 +1136,111 @@ pub fn link_with_script(
                 };
                 match rela.rela_type {
                     R_X86_64_64 => w64(&mut out, fp, (s as i64 + a) as u64),
-                    R_X86_64_PC32 | R_X86_64_PLT32 =>
-                        w32(&mut out, fp, (s as i64 + a - p as i64) as u32),
-                    R_X86_64_32 | R_X86_64_32S =>
-                        w32(&mut out, fp, (s as i64 + a) as u32),
+                    R_X86_64_PC32 | R_X86_64_PLT32 => {
+                        // A -T link resolves every call directly; there is no
+                        // PLT, so PLT32 degenerates to PC32.
+                        let v = s as i64 + a - p as i64;
+                        check_pcrel32(v, &sym.name, &obj.source_name)?;
+                        w32(&mut out, fp, v as u32)
+                    }
+                    R_X86_64_32 => {
+                        let v = s as i64 + a;
+                        if !(0..=u32::MAX as i64).contains(&v) {
+                            return Err(reloc_range_err("R_X86_64_32", v, &sym.name, &obj.source_name));
+                        }
+                        w32(&mut out, fp, v as u32)
+                    }
+                    R_X86_64_32S => {
+                        let v = s as i64 + a;
+                        if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                            return Err(reloc_range_err("R_X86_64_32S", v, &sym.name, &obj.source_name));
+                        }
+                        w32(&mut out, fp, v as u32)
+                    }
+                    R_X86_64_16 => w16(&mut out, fp, (s as i64 + a) as u16),
+                    R_X86_64_PC16 => w16(&mut out, fp, (s as i64 + a - p as i64) as u16),
+                    R_X86_64_8 => {
+                        if fp < out.len() { out[fp] = (s as i64 + a) as u8; }
+                    }
+                    R_X86_64_PC8 => {
+                        if fp < out.len() { out[fp] = (s as i64 + a - p as i64) as u8; }
+                    }
                     R_X86_64_PC64 => w64(&mut out, fp, (s as i64 + a - p as i64) as u64),
+                    // Symbol size, not address: used by some hand-written asm
+                    // and by __builtin_object_size lowering.
+                    R_X86_64_SIZE32 => w32(&mut out, fp, (sym.size as i64 + a) as u32),
+                    R_X86_64_SIZE64 => w64(&mut out, fp, (sym.size as i64 + a) as u64),
+
+                    // ── GOT-relative forms ──
+                    //
+                    // A linker-script link produces a fully-resolved image with
+                    // no dynamic loader and no GOT of its own, so every GOT
+                    // reference must be relaxed into direct addressing. This is
+                    // exactly what GNU ld does for -no-pie/static links, and it
+                    // is what the kernel's vDSO and early-boot objects rely on:
+                    // they are compiled -fPIC but linked to fixed addresses.
+                    R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                        // A -T link produces a fully-resolved image with no
+                        // dynamic loader and no GOT, so every GOT reference
+                        // must be relaxed into direct addressing. The x86-64
+                        // psABI defines exactly which instruction forms may be
+                        // rewritten; anything else is a hard error, because
+                        // pointing a LOAD at the symbol would read the bytes
+                        // stored there and treat them as a pointer.
+                        match relax_gotpcrel(&mut out, fp, s, a, p) {
+                            Ok(()) => {}
+                            Err(op) => {
+                                return Err(format!(
+                                    "script link: GOTPCREL against '{}' in {} uses an \
+                                     instruction form this linker cannot relax \
+                                     (opcode bytes {}); a -T link has no GOT, and \
+                                     pointing the load at the symbol would read its \
+                                     bytes instead of its address",
+                                    sym.name, obj.source_name, op));
+                            }
+                        }
+                    }
+                    // GOTPC32: distance from the reference to the GOT origin.
+                    // With no GOT, GNU ld still defines _GLOBAL_OFFSET_TABLE_;
+                    // treat its address as the value so `lea _GLOBAL_OFFSET_TABLE_(%rip)`
+                    // sequences stay self-consistent.
+                    R_X86_64_GOTPC32 => {
+                        let got_base = symbols.get("_GLOBAL_OFFSET_TABLE_").copied().unwrap_or(p);
+                        w32(&mut out, fp, (got_base as i64 + a - p as i64) as u32)
+                    }
+                    R_X86_64_GOTOFF64 => {
+                        let got_base = symbols.get("_GLOBAL_OFFSET_TABLE_").copied().unwrap_or(0);
+                        w64(&mut out, fp, (s as i64 + a - got_base as i64) as u64)
+                    }
+                    // ── Thread-local storage ──
+                    //
+                    // A -T link is always static with a fixed TLS block, so
+                    // the Initial-Exec / Local-Exec forms resolve directly and
+                    // no GOT slot or __tls_get_addr call is needed.
+                    R_X86_64_TPOFF32 => {
+                        if tls_mem_size == 0 {
+                            return Err(format!(
+                                "script link: TLS relocation against '{}' in {} but the \
+                                 script places no SHF_TLS section (add .tdata/.tbss)",
+                                sym.name, obj.source_name));
+                        }
+                        // %fs:0 is the end of the block: offsets are negative.
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        let v = tpoff + a;
+                        if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
+                            return Err(reloc_range_err("R_X86_64_TPOFF32", v,
+                                                       &sym.name, &obj.source_name));
+                        }
+                        w32(&mut out, fp, v as u32);
+                    }
+                    R_X86_64_TPOFF64 => {
+                        let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
+                        w64(&mut out, fp, (tpoff + a) as u64);
+                    }
+                    // Offset within the TLS block, used by Local-Dynamic
+                    // sequences; measured from the block start, not its end.
+                    R_X86_64_DTPOFF32 => w32(&mut out, fp, (s as i64 - tls_addr as i64 + a) as u32),
+                    R_X86_64_DTPOFF64 => w64(&mut out, fp, (s as i64 - tls_addr as i64 + a) as u64),
                     R_X86_64_NONE => {}
                     other => {
                         return Err(format!(
@@ -1001,15 +1340,38 @@ pub fn link_with_script(
     }
     if declared_phdrs.is_empty() {
         // Single LOAD spanning everything.
-        let min_v = out_secs.iter().filter(|o| o.is_alloc && o.size > 0)
-            .map(|o| o.vaddr).min().unwrap_or(0);
-        let max_m = out_secs.iter().filter(|o| o.is_alloc && o.size > 0)
-            .map(|o| o.vaddr + o.size).max().unwrap_or(0);
-        let min_f = out_secs.iter().filter(|o| o.is_alloc && !o.nobits && o.size > 0)
+        //
+        // The span is taken over LOAD addresses, not virtual ones. With
+        // overlays (or any AT()) several sections share a VMA while occupying
+        // distinct LMAs, so a VMA-derived memsz can come out smaller than the
+        // file image and produce `filesz > memsz`, which readelf rejects and
+        // loaders treat as corrupt.
+        let alloc = |o: &&OutSec| o.is_alloc && o.size > 0;
+        let min_v = out_secs.iter().filter(alloc).map(|o| o.lma).min().unwrap_or(0);
+        let max_m = out_secs.iter().filter(alloc)
+            .map(|o| o.lma + o.size).max().unwrap_or(0);
+        let min_f = out_secs.iter().filter(|o| alloc(o) && !o.nobits)
             .map(|o| o.file_offset).min().unwrap_or(0);
-        let max_f = out_secs.iter().filter(|o| o.is_alloc && !o.nobits && o.size > 0)
+        let max_f = out_secs.iter().filter(|o| alloc(o) && !o.nobits)
             .map(|o| o.file_offset + o.size).max().unwrap_or(0);
-        wphdr(&mut out, 64, PT_LOAD_, 7, min_f, min_v, max_f - min_f, max_m - min_v, page);
+        let filesz = max_f.saturating_sub(min_f);
+        let memsz = (max_m.saturating_sub(min_v)).max(filesz);
+        wphdr(&mut out, 64, PT_LOAD_, 7, min_f, min_v, filesz, memsz, page);
+        ph_off = 64 + 56;
+    }
+    if needs_tls_phdr {
+        // p_filesz covers .tdata only (.tbss is NOBITS); p_memsz covers both.
+        let tls: Vec<&OutSec> = out_secs.iter()
+            .filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc).collect();
+        let vlo = tls.iter().map(|o| o.vaddr).min().unwrap_or(0);
+        let vhi = tls.iter().map(|o| o.vaddr + o.size).max().unwrap_or(0);
+        let flo = tls.iter().filter(|o| !o.nobits)
+            .map(|o| o.file_offset).min().unwrap_or(0);
+        let fhi = tls.iter().filter(|o| !o.nobits)
+            .map(|o| o.file_offset + o.size).max().unwrap_or(flo);
+        let talign = tls.iter().map(|o| o.align).max().unwrap_or(1).max(1);
+        wphdr(&mut out, ph_off, PT_TLS_, 4 /* PF_R */, flo, vlo,
+              fhi - flo, vhi - vlo, talign);
     }
 
     // ── Section headers (+ optional symtab) ──
@@ -1129,12 +1491,17 @@ pub fn link_with_script(
     // out_secs index -> index of that section's STT_SECTION symbol in .symtab
     let mut out_sec_sym_index: FxHashMap<usize, u32> = FxHashMap::default();
 
+    // STV_* visibility lives in st_other; `elf64_sym_entry` takes it directly.
+    fn add_sym_vis(name: &str, value: u64, size: u64, info: u8, other: u8,
+                   shndx: u16, symtab: &mut Vec<[u8;24]>, strtab: &mut Vec<u8>) {
+        let noff = push_strtab_name(strtab, name.as_bytes());
+        symtab.push(elf64_sym_entry(noff, info, other, shndx, value, size));
+    }
+
     if emit_symtab {
         let mut add_sym = |name: &str, value: u64, size: u64, info: u8, shndx: u16,
                            symtab: &mut Vec<[u8;24]>, strtab: &mut Vec<u8>| {
-            let noff = push_strtab_name(strtab, name.as_bytes());
-            let e = elf64_sym_entry(noff, info, 0 /* st_other */, shndx, value, size);
-            symtab.push(e);
+            add_sym_vis(name, value, size, info, 0, shndx, symtab, strtab);
         };
 
         // --emit-relocs: one STT_SECTION symbol per output section, first in
@@ -1196,7 +1563,11 @@ pub fn link_with_script(
             let sx = sym_home.get(name)
                 .and_then(|h| hdr_by_name.get(h.as_str()).copied())
                 .unwrap_or_else(|| find_shndx(v));
-            add_sym(name, v, 0, (STB_GLOBAL << 4) | STT_NOTYPE_, sx, &mut symtab, &mut strtab);
+            // STV_HIDDEN = 2. A hidden symbol keeps GLOBAL binding in .symtab
+            // (so debuggers still see it) but is excluded from .dynsym.
+            let vis = if hidden_syms.contains(name.as_str()) { 2u8 } else { 0u8 };
+            add_sym_vis(name, v, 0, (STB_GLOBAL << 4) | STT_NOTYPE_, vis, sx,
+                        &mut symtab, &mut strtab);
         }
     } else {
         n_local_syms = 1;

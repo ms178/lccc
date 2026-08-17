@@ -1259,8 +1259,96 @@ def _script_test(name, script, csrc, expect_stdout, cflags=None):
             shutil.rmtree(td, ignore_errors=True)
     return runner
 
+
+# ── Source shared by the MEMORY / SEGMENT_START / visibility script tests ──
+# Runs real code so a mis-placed section shows up as a wrong exit status rather
+# than merely a different section header.
+REGION_TEST_C = r"""
+__attribute__((used, section(".special"))) static int spec1 = 11;
+__attribute__((used, section(".special"))) static int spec2 = 31;
+extern int __special_start[], __special_end[];
+int global_data = 5;
+static long wr(int fd, const void *buf, unsigned long n){
+    long r;
+    __asm__ volatile("syscall" : "=a"(r)
+                     : "a"(1L), "D"((long)fd), "S"(buf), "d"(n)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+void my_start(void){
+    int s = 0;
+    for (int *p = __special_start; p < __special_end; p++) s += *p;
+    char msg[2] = { (char)('0' + (s == 42) + (global_data == 5)), '\n' };
+    wr(1, msg, 2);
+    __asm__ volatile("syscall" :: "a"(60L), "D"(0L));
+    __builtin_unreachable();
+}
+"""
+
+# MEMORY regions drive placement; the image must still run. `org`/`len`
+# abbreviations are exercised because real firmware scripts use them.
+MEMORY_REGION_SCRIPT = r"""
+ENTRY(my_start)
+MEMORY {
+  lowram (rwx) : ORIGIN = 0x400000, LENGTH = 16M
+}
+SECTIONS {
+  .text : { *(.text*) } > lowram
+  .rodata : { *(.rodata*) } > lowram
+  .special : {
+     __special_start = .;
+     *(.special)
+     __special_end = .;
+  } > lowram
+  .data : { *(.data*) } > lowram
+  .bss : { *(.bss*) *(COMMON) } > lowram
+  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
+}
+"""
+
+# SEGMENT_START appears four times in ld's own default script, so any script
+# derived from `ld --verbose` needs it. Without an override it must yield the
+# declared default.
+SEGMENT_START_SCRIPT = r"""
+ENTRY(my_start)
+SECTIONS {
+  . = SEGMENT_START("text-segment", 0x400000) + SIZEOF_HEADERS;
+  .text : { *(.text*) }
+  .rodata : { *(.rodata*) }
+  .special : { __special_start = .; *(.special) __special_end = .; }
+  . = DATA_SEGMENT_ALIGN(0x1000, 0x1000);
+  .data : { *(.data*) }
+  .bss : { *(.bss*) *(COMMON) }
+  . = DATA_SEGMENT_END(.);
+  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
+}
+"""
+
+# HIDDEN()/PROVIDE_HIDDEN() must define usable symbols. Visibility is checked
+# separately in the ET_DYN test; here the point is that the script parses and
+# the values are right.
+HIDDEN_SYMBOL_SCRIPT = r"""
+ENTRY(my_start)
+SECTIONS {
+  . = 0x400000 + SIZEOF_HEADERS;
+  .text : { *(.text*) }
+  .rodata : { *(.rodata*) }
+  .special : {
+     HIDDEN(__special_start = .);
+     *(.special)
+     PROVIDE_HIDDEN(__special_end = .);
+  }
+  .data : { *(.data*) }
+  .bss : { *(.bss*) *(COMMON) }
+  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
+}
+"""
+
 SCRIPT_TESTS = [
     ("script_kernel_style", KERNEL_STYLE_SCRIPT, SCRIPT_TEST_C, "2\n"),
+    ("script_memory_region_placement", MEMORY_REGION_SCRIPT, REGION_TEST_C, "2\n"),
+    ("script_segment_start_and_data_segment", SEGMENT_START_SCRIPT, REGION_TEST_C, "2\n"),
+    ("script_hidden_symbol_definitions", HIDDEN_SYMBOL_SCRIPT, REGION_TEST_C, "2\n"),
 ]
 
 # PIE script link (kernel-decompressor style): base-0 ET_DYN with all
@@ -1358,6 +1446,280 @@ VERSION {
  LCCC_VDSO_1 { global: vdso_answer; local: *; };
 }
 """
+
+
+def _script_overlay_test(args, oracles):
+    """OVERLAY: members share a VMA while their load images stay distinct.
+
+    Checked by running the program and measuring the gap between
+    __load_start_ovl1 and __load_start_ovl2. A layout that gives the members
+    distinct VMAs, or that collapses their LMAs onto each other, both produce a
+    file that looks fine to readelf and a runtime copy routine that clobbers
+    the wrong bytes.
+    """
+    name = "script_overlay_shared_vma"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(r"""
+__attribute__((section(".ovl1"), used)) int o1v = 0x1111;
+__attribute__((section(".ovl2"), used)) int o2v = 0x2222;
+extern char __load_start_ovl1[], __load_stop_ovl1[], __load_start_ovl2[];
+static long wr(int fd, const void *b, unsigned long n){
+    long r; __asm__ volatile("syscall" : "=a"(r)
+        : "a"(1L), "D"((long)fd), "S"(b), "d"(n) : "rcx","r11","memory");
+    return r;
+}
+void my_start(void){
+    long gap = __load_start_ovl2 - __load_start_ovl1;
+    long sz  = __load_stop_ovl1  - __load_start_ovl1;
+    int ok = (gap == 4) && (sz == 4);
+    char m[2] = { (char)('0' + ok), '\n' };
+    wr(1, m, 2);
+    __asm__ volatile("syscall" :: "a"(60L), "D"(0L));
+    __builtin_unreachable();
+}
+""")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write("ENTRY(my_start)\n"
+                    "SECTIONS {\n"
+                    "  . = 0x400000 + SIZEOF_HEADERS;\n"
+                    "  .text : { *(.text*) }\n"
+                    "  OVERLAY 0x500000 : AT (0x480000) {\n"
+                    "    .ovl1 { *(.ovl1) }\n"
+                    "    .ovl2 { *(.ovl2) }\n"
+                    "  }\n"
+                    "  .data : { *(.data*) *(.rodata*) *(.bss*) }\n"
+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n"
+                    "}\n")
+        r = sh([CC, "-c", "-O1", "-ffreestanding", "-fno-pic",
+                "-fno-asynchronous-unwind-tables", "-fno-stack-protector",
+                "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-T", "t.lds", "t.o", "-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+        # Both members must report the same VMA.
+        secs = sh(["readelf", "-SW", "out.lccc"], cwd=td).stdout.decode()
+        addrs = {}
+        for line in secs.splitlines():
+            for nm in (".ovl1", ".ovl2"):
+                if f" {nm} " in line:
+                    parts = line.split()
+                    addrs[nm] = parts[parts.index("PROGBITS") + 1]
+        if len(addrs) == 2 and addrs[".ovl1"] != addrs[".ovl2"]:
+            return Result(name, "FAIL",
+                f"overlay members have different VMAs: {addrs}")
+        code, out = run_bin(os.path.join(td, "out.lccc"), [], td)
+        if (code, out) != (0, "1\n"):
+            return Result(name, "FAIL",
+                f"overlay load addresses wrong at runtime: {(code, out)!r}")
+        r2 = sh(["ld", "-T", "t.lds", "t.o", "-o", "out.ld"], cwd=td)
+        if r2.returncode == 0:
+            code2, out2 = run_bin(os.path.join(td, "out.ld"), [], td)
+            if (code, out) != (code2, out2):
+                return Result(name, "FAIL",
+                    f"lccc {(code, out)!r} != GNU ld {(code2, out2)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _script_tls_test(args, oracles):
+    """Initial-Exec TLS through -T, verified by running the program.
+
+    Two things must both be right. The TPOFF32 value is measured from the END
+    of the TLS block (%fs:0 points past it on x86-64), so an off-by-block-size
+    error still produces a plausible-looking negative offset. And a script that
+    places .tdata/.tbss without declaring PT_TLS needs one synthesised, or the
+    loader never allocates the thread block and every %fs access reads whatever
+    precedes the TCB. Structural checks miss both; executing does not.
+    """
+    name = "script_tls_initial_exec"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(r"""
+__thread int tv1 = 5;
+__thread int tv2 = 37;
+static long wr(int fd, const void *b, unsigned long n){
+    long r; __asm__ volatile("syscall" : "=a"(r)
+        : "a"(1L), "D"((long)fd), "S"(b), "d"(n) : "rcx","r11","memory");
+    return r;
+}
+void my_start(void){
+    extern char __tls_end[];
+    long r;
+    /* arch_prctl(ARCH_SET_FS, __tls_end) */
+    __asm__ volatile("syscall" : "=a"(r)
+        : "a"(158L), "D"(0x1002L), "S"((long)__tls_end) : "rcx","r11","memory");
+    int ok = (tv1 == 5) && (tv2 == 37);
+    char m[2] = { (char)('0' + ok), '\n' };
+    wr(1, m, 2);
+    __asm__ volatile("syscall" :: "a"(60L), "D"(0L));
+    __builtin_unreachable();
+}
+""")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write("ENTRY(my_start)\n"
+                    "SECTIONS {\n"
+                    "  . = 0x400000 + SIZEOF_HEADERS;\n"
+                    "  .text : { *(.text*) }\n"
+                    "  . = ALIGN(8);\n"
+                    "  .tdata : { *(.tdata*) }\n"
+                    "  .tbss : { *(.tbss*) }\n"
+                    "  __tls_end = .;\n"
+                    "  .data : { *(.data*) }\n"
+                    "  .bss : { *(.bss*) *(COMMON) }\n"
+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n"
+                    "}\n")
+        r = sh([CC, "-c", "-O1", "-fno-pic", "-ffreestanding",
+                "-fno-asynchronous-unwind-tables", "-fno-stack-protector",
+                "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-T", "t.lds", "t.o", "-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+        # PT_TLS must exist with memsz covering .tdata + .tbss.
+        seg = sh(["readelf", "-lW", "out.lccc"], cwd=td).stdout.decode()
+        if "TLS" not in seg:
+            return Result(name, "FAIL",
+                "no PT_TLS program header: the loader will not allocate the "
+                "thread block even though the TPOFF values are correct")
+        code, out = run_bin(os.path.join(td, "out.lccc"), [], td)
+        if (code, out) != (0, "1\n"):
+            return Result(name, "FAIL",
+                f"TLS access wrong at runtime: got {(code, out)!r}, want (0, '1\\n')")
+        r2 = sh(["ld", "-T", "t.lds", "t.o", "-o", "out.ld"], cwd=td)
+        if r2.returncode == 0:
+            code2, out2 = run_bin(os.path.join(td, "out.ld"), [], td)
+            if (code, out) != (code2, out2):
+                return Result(name, "FAIL",
+                    f"lccc {(code, out)!r} != GNU ld {(code2, out2)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _script_hidden_visibility_test(args, oracles):
+    """STV_HIDDEN symbols must never reach .dynsym, even under `global: *`.
+
+    Visibility is an ABI decision made by the compiler; a version script's
+    glob cannot override it. Getting this wrong exports every internal helper
+    of a script-linked shared object (the vDSO included), which both bloats
+    the dynamic symbol table and lets external code bind to symbols that were
+    never part of the contract. GNU ld applies visibility first; so must we.
+    """
+    name = "script_hidden_not_exported"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(
+                '__attribute__((visibility("hidden"))) int hidden_fn(void){ return 1; }\n'
+                '__attribute__((visibility("internal"))) int internal_fn(void){ return 2; }\n'
+                '__attribute__((visibility("protected"))) int protected_fn(void){ return 3; }\n'
+                'int public_fn(void){ return hidden_fn() + internal_fn() + protected_fn(); }\n')
+        # `global: *` deliberately globs everything: the point of the test is
+        # that STV_HIDDEN still wins over the glob.
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write(VDSO_SCRIPT.replace(
+                "LCCC_VDSO_1 { global: vdso_answer; local: *; };",
+                "LCCC_VDSO_1 { global: *; };"))
+        r = sh([CC, "-c", "-O1", "-fPIC", "-fno-asynchronous-unwind-tables",
+                "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-shared", "--hash-style=both", "-soname", "vis.so.1",
+                "-T", "t.lds", "t.o", "-o", "out.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+        dyn = sh(["readelf", "--dyn-syms", "-W", "out.so"], cwd=td).stdout.decode()
+        for bad in ("hidden_fn", "internal_fn"):
+            if bad in dyn:
+                return Result(name, "FAIL",
+                    f"{bad} is STV_HIDDEN/INTERNAL but appears in .dynsym; "
+                    f"visibility must be applied before the version script glob")
+        if "public_fn" not in dyn:
+            return Result(name, "FAIL", "public_fn missing from .dynsym")
+        # STV_PROTECTED is still exported (it only forbids preemption).
+        if "protected_fn" not in dyn:
+            return Result(name, "FAIL", "protected_fn must remain exported")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _script_pic_gotpcrel_test(args, oracles):
+    """-fPIC objects must link through -T, with GOT references relaxed.
+
+    A linker-script link has no GOT, so every `sym@GOTPCREL` must be rewritten
+    into direct addressing. The dangerous failure is not an error but a wrong
+    relaxation: `mov sym@GOTPCREL(%rip),%rax` LOADS the slot, so pointing it at
+    the symbol yields the bytes stored there rather than its address. This test
+    runs the program and compares a pointer and a value, which is the only way
+    to tell a correct relaxation from a plausible one.
+    """
+    name = "script_pic_gotpcrel_relaxation"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write(r"""
+int extdata = 1234;
+__attribute__((noinline)) int *get_ptr(void){ return &extdata; }
+__attribute__((noinline)) int  get_val(void){ return extdata; }
+void my_start(void){
+    int ok = (get_ptr() == &extdata) && (get_val() == 1234);
+    __asm__ volatile("syscall" :: "a"(60L), "D"((long)(ok ? 0 : 1)));
+    __builtin_unreachable();
+}
+""")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write("ENTRY(my_start)\n"
+                    "SECTIONS {\n"
+                    "  . = 0x400000 + SIZEOF_HEADERS;\n"
+                    "  .text : { *(.text*) }\n"
+                    "  .rodata : { *(.rodata*) }\n"
+                    "  .data : { *(.data*) }\n"
+                    "  .bss : { *(.bss*) *(COMMON) }\n"
+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) "
+                    "*(.got) *(.got.plt) }\n"
+                    "}\n")
+        # -fPIC is what makes the compiler emit GOTPCREL against extdata.
+        r = sh([CC, "-c", "-O1", "-fPIC", "-fno-asynchronous-unwind-tables",
+                "-fno-stack-protector", "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-T", "t.lds", "t.o", "-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+        code, _ = run_bin(os.path.join(td, "out.lccc"), [], td)
+        if code != 0:
+            return Result(name, "FAIL",
+                f"relaxed binary exited {code}: the GOT reference was rewritten "
+                f"to load the symbol's bytes instead of its address")
+        # Cross-check against GNU ld where available.
+        r2 = sh(["ld", "-T", "t.lds", "t.o", "-o", "out.ld"], cwd=td)
+        if r2.returncode == 0:
+            code2, _ = run_bin(os.path.join(td, "out.ld"), [], td)
+            if code2 != code:
+                return Result(name, "FAIL", f"lccc exit {code} != GNU ld {code2}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def _vdso_script_test(args, oracles):
@@ -3199,6 +3561,14 @@ def main():
         results.append(_pie_script_test(args, oracles))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
+    if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_script_hidden_visibility_test(args, oracles))
+    if (not args.filter or "gotpcrel" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_script_pic_gotpcrel_test(args, oracles))
+    if (not args.filter or "tls" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_script_tls_test(args, oracles))
+    if (not args.filter or "overlay" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_script_overlay_test(args, oracles))
 
     if (not args.filter or "so_" in args.filter) and not args.tag:
         results.append(_interpose_test(args, oracles,

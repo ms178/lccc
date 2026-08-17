@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–10)
+# LCCC Linker — Follow-Up Plan (Sessions 2–11)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -1176,3 +1176,204 @@ by file extension, which is what let the C++ exception-unwinding case
    it (proven in session 9).
 5. COMDAT/`SHT_GROUP` dedup in the exe path; `SymbolId(u32)` interning;
    `LayoutPlan::compute` unwired.
+
+---
+
+# Session 11 — Blindspot sweep of the linker-script path
+
+**Base:** `ms178/lccc` main @ `16410927` (PR #105 merged the session-10 vDSO +
+ICF work).
+**Snapshots:** `S01-script-blindspots` (`b5f7044b`), `S02-script-tls-pt-tls`
+(`db041625`), `S03-script-overlay` (`46f0f905`).
+**Totals:** 780 unit pass / 0 fail / 6 ignored, 152 differential pass / 0 fail
+(bfd, mold, wild), 400 fuzz mutants clean, expat/gzip/zlib-ng differential PASS.
+
+## 11.1 Agent C's patch: already merged, corrections intact
+
+C's `S05-vdso-elf64-dynamic` is the same patch audited in session 10 and is now
+upstream. Re-verified on `16410927` that all three of my corrections survived
+the merge: the `.gnu.hash` bucket clamp is gone
+(`names.len().next_power_of_two().max(1)`, no `.min(64)`), the
+`contains_keyword()` full-script guard is in `version_script.rs`, and the
+synthesised sections use `SectionData::owned`. The verdict stands: **the design
+is right, and it is kept.** Nothing further to fold in.
+
+Since re-auditing a merged patch produces no new value, the session went after
+the more useful question: **what else is missing that no test would ever tell
+us about?**
+
+## 11.2 Method: probe for rejection, not for wrong answers
+
+Unit tests only cover features you know you have. A linker's real failure mode
+is a construct it rejects outright, and nobody notices until a real script hits
+it. So I wrote a differential *feature probe*: 18 minimal scripts, each
+exercising one construct that kernel, firmware or `ld --verbose` scripts depend
+on, each linked with both `lccc-ld` and `ld.bfd`, classified as
+`[both-ok]` / `[GAP]` / `[lccc-ok]` / `[both-no]`.
+
+The first run found **four** rejections; following them up found **two** more
+bugs behind them. The probe is now `tests/linker/probe_script_features.sh`,
+exits non-zero on any gap, and currently reports **18 ok, 0 gaps**.
+
+## 11.3 What was broken
+
+### (a) The script path handled 7 relocation types; the exe path handles 24
+
+Any `-fPIC` object linked with `-T` failed:
+
+```
+lccc-ld: error: script link: unsupported relocation type 41
+```
+
+Type 41 is `R_X86_64_REX_GOTPCRELX` — what GCC emits for ordinary external data
+access under `-fPIC`. This blocked precisely the use case the vDSO work exists
+for: objects compiled `-fPIC` and linked to fixed addresses.
+
+A `-T` link has no GOT, so GOT references must be *relaxed into direct
+addressing*, per the x86-64 psABI:
+
+| before | after |
+|---|---|
+| `mov sym@GOTPCREL(%rip), %reg` `8b` | `lea sym(%rip), %reg` `8d` |
+| `cmp %reg, sym@GOTPCREL(%rip)` `3b` | `cmp $sym, %reg` `81 /7 imm32` |
+| `call *sym@GOTPCREL(%rip)` `ff /2` | `nop; call sym` `e8` |
+| `jmp *sym@GOTPCREL(%rip)` `ff /4` | `nop; jmp sym` `e9` |
+
+The `mov`→`lea` rewrite is the load-bearing one: the original instruction
+*dereferences* the slot, so pointing it at the symbol would load the bytes
+stored there and treat them as a pointer — silently wrong code with no
+diagnostic. Forms that cannot be relaxed are a hard error instead. Also added
+16/PC16/8/PC8, SIZE32/64, GOTPC32, GOTOFF64, and range checks on every 32-bit
+displacement (a truncated PC32 is how an over-large image acquires a wild jump
+that only manifests at runtime).
+
+### (b) STV_HIDDEN symbols were exported from `.dynsym`
+
+The export filter consulted only the version script, so under `global: *` a
+hidden symbol was published. Visibility is an ABI property fixed by the
+compiler and a glob cannot override it; GNU ld applies visibility *first*.
+Verified against bfd on identical input — bfd exports `public_fn` and
+`protected_fn` only, and now so do we. `STV_PROTECTED` stays exported, since it
+only forbids preemption. This leaked the vDSO's internal helpers into the
+dynamic symbol table.
+
+### (c) `PROVIDE_HIDDEN` parsed but threw the hidden bit away
+
+`Assignment` had no visibility field, making `PROVIDE_HIDDEN` a synonym for
+`PROVIDE`. Plumbed through to `st_other` (STV_HIDDEN). `HIDDEN(sym = expr)` was
+not accepted at all; it is now, and unlike `PROVIDE*` it defines
+unconditionally.
+
+### (d) `MEMORY` regions unsupported
+
+Added `MEMORY { name (attrs) : ORIGIN = a, LENGTH = n }` with `> region` and
+`AT> region`, including the `org`/`len` abbreviations firmware scripts use.
+Regions carry an allocation cursor and — the real payoff — an **overflow
+check**. Overrunning a region previously produced silently overlapping
+sections; the diagnostic now names the section, the region, the overflow amount
+and both ranges, which is strictly more informative than bfd's
+``region `tiny' overflowed by 83 bytes``.
+
+### (e) `SEGMENT_START` / `DATA_SEGMENT_ALIGN` / `DATA_SEGMENT_END` rejected
+
+All three appear in **ld.bfd's own default script** (`SEGMENT_START` four
+times), so any script derived from `ld --verbose` failed to parse.
+`SEGMENT_START` now yields its declared default and is overridable through
+`EvalCtx` (wired for `-Ttext`/`-z`). `DATA_SEGMENT_ALIGN` evaluates as
+`ALIGN(maxpagesize)`: the segment-overlap trick is an optional few-KiB file-size
+win, whereas rejecting the script is fatal. A duplicate `CONSTANT()` handler I
+introduced was removed in favour of the pre-existing one, which already had the
+correct x86-64 `MAXPAGESIZE` of `0x200000` — a reminder to read the file before
+adding to it.
+
+### (f) TLS unsupported in the script path
+
+`__thread` under `-fno-pic` emits `R_X86_64_TPOFF32`, rejected as type 23.
+Added TPOFF32/64 and DTPOFF32/64. TPOFF is measured from the **end** of the TLS
+block (`%fs:0` points past it on x86-64); DTPOFF from the start. Getting the
+base wrong still yields a plausible negative offset, so the test executes the
+program. The emitted `mov %fs:-0x4,%eax` is identical to bfd's.
+
+Correct TPOFF values are not enough: without a **PT_TLS** header the loader
+never allocates the thread block. One is now synthesised when the script places
+`SHF_TLS` sections but declares no PT_TLS, with `p_filesz` covering `.tdata`
+only and `p_memsz` covering `.tdata` + `.tbss`.
+
+### (g) `OVERLAY` unsupported
+
+Desugared into ordinary output sections: each member pinned to the overlay's
+VMA, each with its own `AT()` slot, plus GNU ld's `__load_start_<n>` /
+`__load_stop_<n>` symbols (an overlay without them is unusable — the copy
+routine cannot find the bytes). The output-section body grammar is now a shared
+`parse_output_section_body()` so overlay members and normal sections cannot
+drift apart.
+
+## 11.4 Two bugs found *by* the new tests
+
+These are the interesting ones, because both were introduced or exposed by the
+work itself and neither was reachable from any pre-existing test.
+
+**`SIZEOF_HEADERS` undercount → SIGILL.** The first PT_TLS implementation
+crashed instantly. `SIZEOF_HEADERS` is computed from `script.phdrs.len()`
+*before* layout runs, so the synthesised header went uncounted: the reservation
+was 56 bytes short, the first section landed on top of the last program header,
+and the entry point pointed into header bytes — `_start` disassembled to
+`(bad)`. Fixed with `script_header_size_with(script, extra_phdrs)` backing both
+`SIZEOF_HEADERS` and the file-offset cursor, plus a `debug_assert` that the
+pre-layout prediction matches the final layout, because a silent disagreement
+between those two numbers reproduces exactly this corruption.
+
+**`filesz > memsz` in the single-PT_LOAD fallback.** That path derived `p_memsz`
+from the VMA span but `p_filesz` from the file span — fine while LMA == VMA,
+wrong the moment an overlay or any `AT()` separates them, since several sections
+share a VMA while occupying distinct LMAs. `readelf` reported *"the segment's
+file size is larger than its memory size"* and a loader would treat the image as
+corrupt. The span is now taken over load addresses with `memsz >= filesz`. Only
+reachable from scripts that declare no `PHDRS`, which is why nothing caught it
+before.
+
+## 11.5 Tests added
+
+13 unit tests (MEMORY parsing incl. abbreviations/`AT>`/missing-LENGTH
+rejection, SEGMENT_START default and override, DATA_SEGMENT_ALIGN,
+HIDDEN/PROVIDE_HIDDEN flags, overlay VMA/LMA and load symbols) and 6
+differential tests (region placement, SEGMENT_START/DATA_SEGMENT, HIDDEN
+definitions, hidden-not-exported, GOTPCREL relaxation, Initial-Exec TLS,
+OVERLAY). Every script test **runs the linked program** and cross-checks
+against GNU ld; structural inspection would have passed several of the broken
+versions.
+
+Mutation-verified: disabling the region overflow check lets the overflow
+through; dropping the visibility filter fails `script_hidden_not_exported` with
+the leaked symbol's name.
+
+## 11.6 Lessons
+
+1. **Probe for rejection, not just for wrong answers.** A construct the linker
+   refuses is invisible to a test suite that was written against the features
+   it already has. Eighteen four-line scripts found six gaps in an hour.
+2. **`ld --verbose` is a specification.** Two of the missing constructs appear
+   in bfd's own default script; anyone customising it hit a parse error.
+3. **A correct value is not a working feature.** TPOFF was right while TLS was
+   still broken, because PT_TLS was missing. Ship the whole mechanism.
+4. **Derived quantities must have one source.** `SIZEOF_HEADERS` and the file
+   cursor disagreed by one program header and produced a SIGILL. One helper,
+   one assert.
+5. **Read the file before adding to it** — the duplicate `CONSTANT()` handler
+   would have silently downgraded `MAXPAGESIZE` from 0x200000 to 0x1000.
+
+## 11.7 Remaining backlog
+
+1. **§4.2** wire `parallel_reloc.rs` into `emit_exec` — still blocked on this
+   2-vCPU box; measure on the 14700KF.
+2. **§4.4** positional `--as-needed`, ELF32 script path (`setup.elf`),
+   `--print-map` alias, multi-node `@`/`@@` versioning.
+3. **§4.5** grammar-aware ELF fuzzing (the current fuzzer is a byte mutator);
+   the feature probe is a step toward this for scripts specifically.
+4. `mmap` input I/O — the last whole-file copy (no `Vec`-side trick can remove
+   it; proven in session 9).
+5. COMDAT/`SHT_GROUP` dedup in the exe path; `SymbolId(u32)` interning;
+   `LayoutPlan::compute` unwired.
+6. General-Dynamic/Local-Dynamic TLS relaxation in the script path (only
+   Initial/Local-Exec is handled; GD/LD would need the `__tls_get_addr`
+   sequence rewrites the exe path already has).
