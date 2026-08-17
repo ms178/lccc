@@ -1296,8 +1296,10 @@ impl Driver {
         #[cfg(not(feature = "gcc_linker"))]
         {
             let _ = (target, linker_items);
-            // Print GNU ld-compatible version info for build system detection
-            println!("GNU ld (Claude's C Compiler built-in) 2.42");
+            // Print GNU ld-compatible version info for build system detection.
+            // This is shared with standalone lccc-ld so Kconfig/Meson probes
+            // see one stable linker identity on both paths.
+            println!("{}", crate::linker_entry::GNU_LD_VERSION_OUTPUT);
         }
     }
 

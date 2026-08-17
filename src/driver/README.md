@@ -229,7 +229,7 @@ The driver reports as GCC 14.2.0 for build system compatibility:
 | `-v` (alone) | Target and version info |
 | `-print-search-dirs` | Standard library directory layout |
 | `-print-file-name=NAME` | Searches standard GCC library paths; returns bundled include dir for `include` |
-| `-Wl,--version` (no inputs) | With `gcc_linker`: delegates to GCC; otherwise prints `GNU ld (Claude's C Compiler built-in) 2.42` for Meson linker detection |
+| `-Wl,--version` (no inputs) | With `gcc_linker`: delegates to GCC; otherwise prints the shared `GNU ld (LCCC built-in) 2.42` banner used by standalone `lccc-ld`, which is accepted by Meson and Linux Kconfig linker detection |
 
 The `--version` output includes "Free Software Foundation" text because Meson
 detects GCC by grepping for that string. It also prints the backend mode

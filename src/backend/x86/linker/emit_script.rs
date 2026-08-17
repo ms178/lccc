@@ -26,6 +26,212 @@ type Object = linker_common::Elf64Object;
 
 const PT_LOAD_: u32 = 1;
 const PT_NOTE_: u32 = 4;
+const ELF64_EHDR_SIZE: u64 = 64;
+const ELF64_PHDR_SIZE: u64 = 56;
+
+/// Bytes occupied by the ELF header and the script-declared program-header
+/// table. GNU ld exposes this value to scripts as `SIZEOF_HEADERS`.
+fn script_header_size(script: &LinkerScript) -> u64 {
+    ELF64_EHDR_SIZE + ELF64_PHDR_SIZE * script.phdrs.len().max(1) as u64
+}
+
+/// Synthetic dynamic-link information required by an ET_DYN linker-script
+/// image. Linux's vDSO script names `.dynsym`, `.dynstr`, `.hash`,
+/// `.gnu.hash`, `.gnu.version*`, and `.dynamic`, but those sections are linker
+/// products rather than compiler inputs. Treating unmatched patterns as empty
+/// creates an ET_DYN file that looks linked yet cannot be resolved by ld.so.
+struct ScriptDynamic {
+    object_index: usize,
+    exports: Vec<String>,
+    name_offsets: Vec<u32>,
+    version_name: String,
+    soname_offset: Option<u32>,
+    verdef_count: u64,
+}
+
+fn push_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn build_sysv_hash(names: &[String]) -> Vec<u8> {
+    let buckets = names.len().next_power_of_two().max(1);
+    let mut heads = vec![0u32; buckets];
+    let mut chains = vec![0u32; names.len() + 1];
+    for (i, name) in names.iter().enumerate() {
+        let index = (i + 1) as u32;
+        let bucket = linker_common::sysv_hash(name.as_bytes()) as usize % buckets;
+        if heads[bucket] == 0 {
+            heads[bucket] = index;
+        } else {
+            let mut tail = heads[bucket] as usize;
+            while chains[tail] != 0 { tail = chains[tail] as usize; }
+            chains[tail] = index;
+        }
+    }
+    let mut out = Vec::with_capacity(8 + (buckets + chains.len()) * 4);
+    push_u32(&mut out, buckets as u32);
+    push_u32(&mut out, chains.len() as u32);
+    for value in heads { push_u32(&mut out, value); }
+    for value in chains { push_u32(&mut out, value); }
+    out
+}
+
+/// Build a GNU hash table and return the required dynsym order. GNU hash
+/// requires all symbols belonging to a bucket to be contiguous.
+fn build_gnu_hash(mut names: Vec<String>) -> (Vec<u8>, Vec<String>) {
+    // Bucket count: a power of two near the symbol count, so chains stay
+    // short. GNU ld uses a load factor around 1 symbol per bucket for exactly
+    // this reason -- every ld.so lookup walks a chain, so an undersized table
+    // is a permanent runtime tax on the consumer, not a link-time saving.
+    //
+    // A fixed cap (an earlier revision clamped this to 64) is a trap: it looks
+    // harmless on a vDSO with four exports and silently degrades to ~78-symbol
+    // chains at 5 000 exports, versus ~1.5 uncapped -- measured. The table
+    // costs 4 bytes per bucket, so sizing it properly is cheap.
+    let nbuckets = names.len().next_power_of_two().max(1);
+    names.sort_by_key(|name| {
+        let hash = linker_common::gnu_hash(name.as_bytes());
+        (hash % nbuckets as u32, hash, name.clone())
+    });
+    let hashes: Vec<u32> = names.iter()
+        .map(|name| linker_common::gnu_hash(name.as_bytes()))
+        .collect();
+    let bloom_size = ((names.len() + 63) / 64).next_power_of_two().max(1);
+    let bloom_shift = 6u32;
+    let mut bloom = vec![0u64; bloom_size];
+    for &hash in &hashes {
+        let word = (hash as usize / 64) % bloom_size;
+        bloom[word] |= 1u64 << (hash % 64);
+        bloom[word] |= 1u64 << ((hash >> bloom_shift) % 64);
+    }
+    let mut buckets = vec![0u32; nbuckets];
+    let mut chains = vec![0u32; names.len()];
+    for (i, &hash) in hashes.iter().enumerate() {
+        let bucket = hash as usize % nbuckets;
+        if buckets[bucket] == 0 { buckets[bucket] = (i + 1) as u32; }
+        let last = i + 1 == hashes.len()
+            || hashes[i + 1] % nbuckets as u32 != hash % nbuckets as u32;
+        chains[i] = (hash & !1) | u32::from(last);
+    }
+    let mut out = Vec::new();
+    push_u32(&mut out, nbuckets as u32);
+    push_u32(&mut out, 1); // first hashed dynsym follows the null entry
+    push_u32(&mut out, bloom_size as u32);
+    push_u32(&mut out, bloom_shift);
+    for value in bloom { out.extend_from_slice(&value.to_le_bytes()); }
+    for value in buckets { push_u32(&mut out, value); }
+    for value in chains { push_u32(&mut out, value); }
+    (out, names)
+}
+
+fn push_verdef(buf: &mut Vec<u8>, index: u16, name: &str, name_off: u32, next: u32) {
+    // Elf64_Verdef followed by one Elf64_Verdaux.
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&index.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    push_u32(buf, linker_common::sysv_hash(name.as_bytes()));
+    push_u32(buf, 20);
+    push_u32(buf, next);
+    push_u32(buf, name_off);
+    push_u32(buf, 0);
+}
+
+fn synthetic_section(name: &str, sh_type: u32, flags: u64,
+                     align: u64, entsize: u64, data: Vec<u8>) -> (linker_common::Elf64Section, Vec<u8>) {
+    let size = data.len() as u64;
+    (linker_common::Elf64Section {
+        name_idx: 0, name: name.into(), sh_type, flags, addr: 0, offset: 0,
+        size, link: 0, info: 0, addralign: align, entsize,
+    }, data)
+}
+
+fn make_script_dynamic_object(
+    object_index: usize,
+    mut export_candidates: Vec<String>,
+    version: &linker_common::VersionScript,
+    soname: Option<&str>,
+    base_name: &str,
+    bsymbolic: bool,
+) -> (Object, ScriptDynamic) {
+    // GNU ld exposes the version-node name itself as an absolute dynamic
+    // symbol.  Besides matching its ABI, this lets consumers identify the
+    // default version through either ELF hash table.
+    if !export_candidates.iter().any(|name| name == &version.version_name) {
+        export_candidates.push(version.version_name.clone());
+    }
+    let (gnu_hash, exports) = build_gnu_hash(export_candidates);
+    let mut dynstr = vec![0u8];
+    let mut name_offsets = Vec::with_capacity(exports.len());
+    for name in &exports {
+        name_offsets.push(dynstr.len() as u32);
+        dynstr.extend_from_slice(name.as_bytes());
+        dynstr.push(0);
+    }
+    let soname_offset = soname.map(|name| {
+        let off = dynstr.len() as u32;
+        dynstr.extend_from_slice(name.as_bytes());
+        dynstr.push(0);
+        off
+    });
+    let version_name_offset = name_offsets[exports.iter()
+        .position(|name| name == &version.version_name)
+        .expect("version symbol was inserted")];
+
+    let sysv_hash = build_sysv_hash(&exports);
+    let dynsym = vec![0u8; (exports.len() + 1) * 24];
+    let mut versym = Vec::with_capacity((exports.len() + 1) * 2);
+    versym.extend_from_slice(&0u16.to_le_bytes());
+    for _ in &exports { versym.extend_from_slice(&2u16.to_le_bytes()); }
+    let mut verdef = Vec::new();
+    let base_off = if soname == Some(base_name) {
+        soname_offset.expect("SONAME was inserted in dynstr")
+    } else {
+        let off = dynstr.len() as u32;
+        dynstr.extend_from_slice(base_name.as_bytes());
+        dynstr.push(0);
+        off
+    };
+    push_verdef(&mut verdef, 1, base_name, base_off, 28);
+    push_verdef(&mut verdef, 2, &version.version_name, version_name_offset, 0);
+    let verdef_count = 2u64;
+
+    // Fixed tags plus optional SONAME and symbolic binding. Values that depend
+    // on layout are patched after sections receive final virtual addresses.
+    let dynamic_entries = 10usize + usize::from(soname.is_some())
+        + if bsymbolic { 2 } else { 0 };
+    let dynamic = vec![0u8; dynamic_entries * 16];
+
+    let mut sections = Vec::new();
+    let mut section_data = Vec::new();
+    let pairs = [
+        synthetic_section("", SHT_NULL_, 0, 0, 0, Vec::new()),
+        synthetic_section(".hash", 5, SHF_ALLOC_, 8, 4, sysv_hash),
+        synthetic_section(".gnu.hash", 0x6fff_fff6, SHF_ALLOC_, 8, 0, gnu_hash),
+        synthetic_section(".dynsym", 11, SHF_ALLOC_, 8, 24, dynsym),
+        synthetic_section(".dynstr", SHT_STRTAB_, SHF_ALLOC_, 1, 0, dynstr),
+        synthetic_section(".gnu.version", 0x6fff_ffff, SHF_ALLOC_, 2, 2, versym),
+        synthetic_section(".gnu.version_d", 0x6fff_fffd, SHF_ALLOC_, 8, 0, verdef),
+        synthetic_section(".dynamic", 6, SHF_ALLOC_ | SHF_WRITE_, 8, 16, dynamic),
+    ];
+    for (section, data) in pairs {
+        sections.push(section);
+        // Synthesised sections own their bytes; `SectionData::owned` is the
+        // constructor for that case (input-file sections are Arc windows).
+        section_data.push(linker_common::SectionData::owned(data));
+    }
+    let section_count = sections.len();
+    let object = Object {
+        sections, symbols: Vec::new(), section_data,
+        relocations: vec![Vec::new(); section_count],
+        source_name: "<script-dynamic>".into(),
+    };
+    let plan = ScriptDynamic {
+        object_index, exports, name_offsets, version_name: version.version_name.clone(),
+        soname_offset, verdef_count,
+    };
+    (object, plan)
+}
 
 /// One placed input section.
 struct Placed {
@@ -62,6 +268,9 @@ pub fn link_with_script(
     // sections in the output. Required by the Linux kernel's `arch/x86/tools/
     // relocs` pass for CONFIG_RELOCATABLE / KASLR.
     emit_relocs: bool,
+    soname: Option<&str>,
+    bsymbolic: bool,
+    max_page_size: u64,
 ) -> Result<(), String> {
     let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
@@ -83,12 +292,48 @@ pub fn link_with_script(
         }
     }
 
+    // ET_DYN script links (notably Linux's vDSO) require linker-created
+    // dynamic metadata. Materialise it as a synthetic input object so the
+    // script's ordinary `*(.dynsym)` / `*(.dynamic)` rules decide placement,
+    // exactly as they do in GNU ld.
+    let embedded_version = linker_common::VersionScript::parse_text(script_src);
+    let wants_dynamic = is_pie && script.sections.iter().any(|item|
+        matches!(item, SectionsItem::Output(def) if def.name == ".dynamic"));
+    let mut owned_objects: Option<Vec<Object>> = None;
+    let mut script_dynamic: Option<ScriptDynamic> = None;
+    if wants_dynamic {
+        if let Some(version) = embedded_version.as_ref() {
+            let mut exports: Vec<String> = def_syms.keys()
+                .filter(|name| version.matches_global(name))
+                .cloned().collect();
+            exports.sort();
+            let mut all = objects.to_vec();
+            let object_index = all.len();
+            let output_base_name = soname.map(str::to_owned).unwrap_or_else(|| {
+                std::path::Path::new(output_path).file_name()
+                    .and_then(|name| name.to_str()).unwrap_or("a.out").to_owned()
+            });
+            let (dynamic_object, plan) = make_script_dynamic_object(
+                object_index, exports, version, soname, &output_base_name,
+                bsymbolic);
+            all.push(dynamic_object);
+            owned_objects = Some(all);
+            script_dynamic = Some(plan);
+        }
+    }
+    let objects: &[Object] = owned_objects.as_deref().unwrap_or(objects);
+
     // ── Assign input sections to output sections ──
     // Collect allocatable + INFO-listed input sections.
     let mut unassigned: Vec<(usize, usize)> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            if matches!(sec.sh_type, SHT_NULL_ | SHT_STRTAB_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_) { continue; }
+            // Ordinary object string/symbol/relocation tables are linker
+            // metadata rather than input sections.  An allocated string table
+            // is different: .dynstr must participate in script matching.
+            if matches!(sec.sh_type, SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_)
+                || (sec.sh_type == SHT_STRTAB_ && sec.flags & SHF_ALLOC_ == 0)
+            { continue; }
             if sec.size == 0 && sec.name.is_empty() { continue; }
             unassigned.push((oi, si));
         }
@@ -140,6 +385,11 @@ pub fn link_with_script(
 
     // ── Layout: walk the script, maintaining dot ──
     let mut symbols: FxHashMap<String, u64> = FxHashMap::default();
+    // The parser represents SIZEOF_HEADERS as this reserved symbol because the
+    // value depends on PHDRS and therefore is not a context-free constant.
+    // Seed it before the first assignment is evaluated: Linux's vDSO script
+    // starts with `. = SIZEOF_HEADERS`, before any output section exists.
+    symbols.insert("__SIZEOF_HEADERS".into(), script_header_size(&script));
     // GNU ld attributes a script symbol to the output section that was
     // current at its point of definition (e.g. `_end` after .brk belongs to
     // .brk even though .modinfo starts at the same address).
@@ -561,13 +811,12 @@ pub fn link_with_script(
     // ELF header + phdrs at file start.
     let declared_phdrs: Vec<&linker_script::PhdrDecl> = script.phdrs.iter().collect();
     let n_phdrs = declared_phdrs.len().max(1);
-    let ehdr_size = 64u64;
-    let phdr_size = 56u64 * n_phdrs as u64;
-    let mut file_off = ehdr_size + phdr_size;
+    let mut file_off = script_header_size(&script);
 
     // Assign file offsets: alloc PROGBITS sections in vaddr order get offsets
-    // congruent to their LMA modulo the max page size (kernel uses 2 MiB).
-    const PAGE: u64 = 0x200000;
+    // congruent to their LMA modulo the requested maximum page size. The
+    // kernel proper uses 2 MiB; its vDSO explicitly requests 4 KiB.
+    let page = if max_page_size.is_power_of_two() { max_page_size } else { 0x200000 };
     let mut order: Vec<usize> = (0..out_secs.len()).collect();
     order.sort_by_key(|&i| (!out_secs[i].is_alloc, out_secs[i].lma));
 
@@ -576,11 +825,11 @@ pub fn link_with_script(
         if !os.is_alloc || os.nobits || os.size == 0 {
             continue;
         }
-        // congruence: file_off ≡ lma (mod PAGE)
-        let want = os.lma % PAGE;
-        let have = file_off % PAGE;
+        // congruence: file_off ≡ lma (mod page)
+        let want = os.lma % page;
+        let have = file_off % page;
         if want != have {
-            file_off += (want + PAGE - have) % PAGE;
+            file_off += (want + page - have) % page;
         }
         os.file_offset = file_off;
         file_off += os.size;
@@ -678,7 +927,12 @@ pub fn link_with_script(
                 })
             })
         })
-        .unwrap_or_else(|| out_secs.iter().find(|o| o.is_alloc).map(|o| o.vaddr).unwrap_or(0));
+        // A shared object without an explicit ENTRY has no process entry
+        // point.  Choosing its first allocated section would incorrectly make
+        // the ELF hash table look executable (and differs from GNU ld).
+        .unwrap_or_else(|| if is_pie { 0 } else {
+            out_secs.iter().find(|o| o.is_alloc).map(|o| o.vaddr).unwrap_or(0)
+        });
 
     out[0..4].copy_from_slice(&ELF_MAGIC);
     out[4] = ELFCLASS64; out[5] = ELFDATA2LSB; out[6] = 1;
@@ -696,9 +950,11 @@ pub fn link_with_script(
         let mut min_f = u64::MAX; let mut max_f = 0u64;
         let mut max_mem = 0u64;
         let mut min_lma = u64::MAX;
+        let mut segment_align = 1u64;
         for (i, os) in out_secs.iter().enumerate() {
             if !os.is_alloc || os.size == 0 { continue; }
             if !sec_phdrs[i].contains(&decl.name) { continue; }
+            segment_align = segment_align.max(os.align);
             min_v = min_v.min(os.vaddr);
             max_mem = max_mem.max(os.vaddr + os.size);
             min_lma = min_lma.min(os.lma);
@@ -715,13 +971,28 @@ pub fn link_with_script(
             continue;
         }
         if min_f == u64::MAX { min_f = 0; max_f = 0; max_v = min_v; }
+        // FILEHDR/PHDRS make the ELF/program headers part of this segment.
+        // Linux's vDSO verifier requires its sole PT_LOAD to begin exactly at
+        // file offset and virtual address zero.
+        if decl.has_filehdr {
+            // Preserve the VMA-to-file-offset delta while extending the
+            // segment back over every byte preceding its first section.
+            min_v = min_v.saturating_sub(min_f);
+            min_lma = min_lma.saturating_sub(min_f);
+            min_f = 0;
+        } else if decl.has_phdrs {
+            let prefix = min_f.saturating_sub(ELF64_EHDR_SIZE);
+            min_v = min_v.saturating_sub(prefix);
+            min_lma = min_lma.saturating_sub(prefix);
+            min_f = ELF64_EHDR_SIZE;
+        }
         let filesz = max_f.saturating_sub(min_f);
         let memsz = max_mem - min_v;
         let flags = decl.flags.unwrap_or(match decl.ptype {
             PT_LOAD_ => 5,
             _ => 4,
         }) as u32;
-        let align = if decl.ptype == PT_LOAD_ { PAGE } else { 4 };
+        let align = if decl.ptype == PT_LOAD_ { page } else { segment_align };
         // p_paddr = LMA
         wphdr_paddr(&mut out, ph_off, decl.ptype, flags, min_f, min_v,
                     min_lma, filesz, memsz, align);
@@ -738,7 +1009,7 @@ pub fn link_with_script(
             .map(|o| o.file_offset).min().unwrap_or(0);
         let max_f = out_secs.iter().filter(|o| o.is_alloc && !o.nobits && o.size > 0)
             .map(|o| o.file_offset + o.size).max().unwrap_or(0);
-        wphdr(&mut out, 64, PT_LOAD_, 7, min_f, min_v, max_f - min_f, max_m - min_v, PAGE);
+        wphdr(&mut out, 64, PT_LOAD_, 7, min_f, min_v, max_f - min_f, max_m - min_v, page);
     }
 
     // ── Section headers (+ optional symtab) ──
@@ -786,6 +1057,71 @@ pub fn link_with_script(
         }
         SHN_ABS
     };
+
+    // Finish linker-created ET_DYN metadata now that every exported symbol and
+    // synthetic section has a final address.
+    if let Some(plan) = script_dynamic.as_ref() {
+        let synthetic_file_offset = |section_index: usize| -> Option<usize> {
+            let &vaddr = placed_map.get(&(plan.object_index, section_index))?;
+            let &owner = placed_owner.get(&(plan.object_index, section_index))?;
+            let os = &out_secs[owner];
+            Some((os.file_offset + vaddr - os.vaddr) as usize)
+        };
+
+        // .dynsym: null entry followed by the GNU-hash bucket order.
+        if let Some(base) = synthetic_file_offset(3) {
+            for (i, name) in plan.exports.iter().enumerate() {
+                let (value, size, info, shndx) = if let Some(&(oi, shndx, value, size, info))
+                    = def_syms.get(name)
+                {
+                    let value = if shndx == SHN_ABS { value } else {
+                        placed_map.get(&(oi, shndx as usize)).copied().unwrap_or(0) + value
+                    };
+                    (value, size, info, find_shndx(value))
+                } else if name == &plan.version_name {
+                    (0, 0, (STB_GLOBAL << 4) | STT_OBJECT, SHN_ABS)
+                } else {
+                    continue;
+                };
+                let off = base + (i + 1) * 24;
+                w32(&mut out, off, plan.name_offsets[i]);
+                out[off + 4] = info;
+                out[off + 5] = 0;
+                w16(&mut out, off + 6, shndx);
+                w64(&mut out, off + 8, value);
+                w64(&mut out, off + 16, size);
+            }
+        }
+
+        let section_addr = |name: &str| -> u64 {
+            sections_meta.get(name).map(|meta| meta.0).unwrap_or(0)
+        };
+        if let Some(mut off) = synthetic_file_offset(7) {
+            let mut emit = |tag: i64, value: u64| {
+                w64(&mut out, off, tag as u64);
+                w64(&mut out, off + 8, value);
+                off += 16;
+            };
+            if let Some(soname_offset) = plan.soname_offset {
+                emit(DT_SONAME, soname_offset as u64);
+            }
+            if bsymbolic {
+                emit(16, 0); // DT_SYMBOLIC
+                emit(DT_FLAGS, 0x2); // DF_SYMBOLIC
+            }
+            emit(DT_HASH, section_addr(".hash"));
+            emit(DT_GNU_HASH, section_addr(".gnu.hash"));
+            emit(DT_STRTAB, section_addr(".dynstr"));
+            emit(DT_SYMTAB, section_addr(".dynsym"));
+            emit(DT_STRSZ, out_secs.iter().find(|s| s.name == ".dynstr")
+                .map(|s| s.size).unwrap_or(0));
+            emit(DT_SYMENT, 24);
+            emit(DT_VERSYM, section_addr(".gnu.version"));
+            emit(DT_VERDEF, section_addr(".gnu.version_d"));
+            emit(DT_VERDEFNUM, plan.verdef_count);
+            emit(DT_NULL, 0);
+        }
+    }
 
     // --emit-relocs bookkeeping: input symbol -> output .symtab index.
     let mut local_sym_index: FxHashMap<(usize, usize), u32> = FxHashMap::default();
@@ -1012,10 +1348,31 @@ pub fn link_with_script(
     let write_shdr = linker_common::write_elf64_shdr;
     // NULL
     write_shdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    let dynamic_header_index: FxHashMap<&str, u32> = hdr_secs.iter().enumerate()
+        .map(|(h, &i)| (out_secs[i].name.as_str(), (h + 1) as u32))
+        .collect();
     for (h, &i) in hdr_secs.iter().enumerate() {
         let os = &out_secs[i];
+        let link = match os.name.as_str() {
+            ".hash" | ".gnu.hash" | ".gnu.version" =>
+                dynamic_header_index.get(".dynsym").copied().unwrap_or(0),
+            ".dynsym" | ".dynamic" | ".gnu.version_d" =>
+                dynamic_header_index.get(".dynstr").copied().unwrap_or(0),
+            _ => 0,
+        };
+        let info = if os.name == ".gnu.version_d" {
+            script_dynamic.as_ref().map(|p| p.verdef_count as u32).unwrap_or(0)
+        } else if os.name == ".dynsym" { 1 } else { 0 };
+        let entsize = match os.name.as_str() {
+            ".hash" => 4,
+            ".dynsym" => 24,
+            ".gnu.version" => 2,
+            ".dynamic" => 16,
+            _ => 0,
+        };
         write_shdr(&mut out, name_offs[h], os.sh_type, os.flags,
-                   os.vaddr, os.file_offset, os.size, 0, 0, os.align.max(1), 0);
+                   os.vaddr, os.file_offset, os.size, link, info,
+                   os.align.max(1), entsize);
     }
     let n_hdrs = 1 + hdr_secs.len();
     // Header index layout from here on:

@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import ctypes
 import os
 import re
 import shutil
@@ -37,6 +38,11 @@ DEFAULT_LCCC = os.environ.get(
     "LCCC_BIN", os.path.join(REPO, "target", "release", "lccc-x86"))
 
 CC = os.environ.get("LINKTEST_CC", "gcc")
+CXX = os.environ.get("LINKTEST_CXX", "g++")
+
+def compiler_for(fname):
+    """Pick the driver for a fixture source; C++ needs g++, not gcc."""
+    return CXX if os.path.splitext(fname)[1] in (".cpp", ".cc", ".cxx") else CC
 
 class Case:
     def __init__(self, name, sources, link_inputs=None, ldflags=None,
@@ -1168,12 +1174,14 @@ case("large_rodata",
 KERNEL_STYLE_SCRIPT = r"""
 ENTRY(my_start)
 PHDRS {
- text PT_LOAD FLAGS(5);
+ text PT_LOAD FLAGS(5) FILEHDR PHDRS;
  data PT_LOAD FLAGS(6);
 }
 SECTIONS
 {
- . = 0x400000;
+ /* Linux's vDSO starts at SIZEOF_HEADERS. Keep a normal userspace base here
+    so the fixture remains executable while exercising the same expression. */
+ . = 0x400000 + SIZEOF_HEADERS;
  _stext = .;
  .text : {
   *(.text .text.*)
@@ -1322,6 +1330,85 @@ def _pie_script_test(args, oracles):
         if et_a != et_b or sy_a != sy_b:
             return Result(name, "FAIL",
                 f"structure mismatch: lccc ({et_a},{sy_a}) vs ld ({et_b},{sy_b})")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+VDSO_SCRIPT = r"""
+PHDRS {
+ text PT_LOAD FILEHDR PHDRS FLAGS(5);
+ dynamic PT_DYNAMIC FLAGS(4);
+ stack PT_GNU_STACK FLAGS(6);
+}
+SECTIONS {
+ . = SIZEOF_HEADERS;
+ .hash : { *(.hash) } :text
+ .gnu.hash : { *(.gnu.hash) } :text
+ .dynsym : { *(.dynsym) } :text
+ .dynstr : { *(.dynstr) } :text
+ .gnu.version : { *(.gnu.version) } :text
+ .gnu.version_d : { *(.gnu.version_d) } :text
+ .dynamic : { *(.dynamic) } :text :dynamic
+ .text : { *(.text .text.*) } :text
+ /DISCARD/ : { *(.comment) *(.note.*) *(.eh_frame) }
+}
+VERSION {
+ LCCC_VDSO_1 { global: vdso_answer; local: *; };
+}
+"""
+
+
+def _vdso_script_test(args, oracles):
+    """Exercise linker-created dynamic/version metadata and FILEHDR PHDRS."""
+    name = "script_vdso_dynamic"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write("int vdso_answer(void){return 42;}\n"
+                    "int hidden_answer(void){return 7;}\n")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write(VDSO_SCRIPT)
+        r = sh([CC, "-c", "-O1", "-fPIC", "-fno-asynchronous-unwind-tables",
+                "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        common = ["-shared", "--hash-style=both", "-Bsymbolic", "-soname",
+                  "linux-vdso-test.so.1", "-z", "max-page-size=4096",
+                  "-T", "t.lds", "t.o"]
+        r = sh([lccc_ld] + common + ["-o", "out.lccc.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+
+        headers = sh(["readelf", "-h", "-l", "-d", "-W", "out.lccc.so"],
+                     cwd=td).stdout.decode()
+        dynsyms = sh(["readelf", "--dyn-syms", "-W", "out.lccc.so"],
+                     cwd=td).stdout.decode()
+        required = ("DYN (Shared object file)", "SONAME", "HASH", "GNU_HASH",
+                    "STRTAB", "SYMTAB", "VERSYM", "VERDEF", "VERDEFNUM")
+        missing = [token for token in required if token not in headers]
+        load_lines = [line.split() for line in headers.splitlines()
+                      if re.match(r"^\s*LOAD\s", line)]
+        if missing or not load_lines or load_lines[0][1:4] != ["0x000000", "0x0000000000000000",
+                                                                "0x0000000000000000"]:
+            return Result(name, "FAIL",
+                          f"bad ELF structure; missing={missing}, LOAD={load_lines[:1]}")
+        if "vdso_answer@@LCCC_VDSO_1" not in dynsyms or "hidden_answer" in dynsyms:
+            return Result(name, "FAIL", "version-script exports are incorrect")
+
+        # This also validates both hash tables through the system dynamic
+        # loader rather than trusting readelf's structural display alone.
+        lib = ctypes.CDLL(os.path.join(td, "out.lccc.so"))
+        lib.vdso_answer.restype = ctypes.c_int
+        if lib.vdso_answer() != 42:
+            return Result(name, "FAIL", "dynamic lookup returned the wrong function")
+        try:
+            getattr(lib, "hidden_answer")
+            return Result(name, "FAIL", "local:* symbol remained dynamically visible")
+        except AttributeError:
+            pass
         return Result(name, "PASS")
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
@@ -2918,6 +3005,109 @@ def _export_dynamic_test(args, _oracles):
 
 
 # ============================================================================
+# IDENTICAL CODE FOLDING (--icf)
+# ============================================================================
+#
+# The dangerous failure mode of ICF is silent: two functions with identical
+# instruction bytes that differ only in their relocation targets. On x86-64 a
+# call is "e8 <rel32>" with the displacement supplied by a relocation, so
+#     int wrap_a(void){ return alpha(); }
+#     int wrap_b(void){ return beta();  }
+# compile to the same six bytes. A byte-only comparison folds them and wrap_b()
+# starts returning alpha()'s value, with no diagnostic anywhere. These cases
+# run the program and check the values, which is the only way to catch it.
+
+case("icf_never_folds_different_call_targets",
+    {"a.c": """
+#include <stdio.h>
+__attribute__((noinline)) int alpha(void){ return 11; }
+__attribute__((noinline)) int beta (void){ return 22; }
+__attribute__((noinline)) int wrap_a(void){ return alpha(); }
+__attribute__((noinline)) int wrap_b(void){ return beta();  }
+int main(void){ printf("%d %d\\n", wrap_a(), wrap_b()); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="11 22\n",
+    tags=("icf",))
+
+# Genuinely identical functions -- same bytes, same relocation targets -- must
+# fold onto one address. Verified through the symbol table, not just size.
+case("icf_folds_truly_identical_functions",
+    {"a.c": """
+#include <stdio.h>
+__attribute__((noinline)) int leaf(void){ return 5; }
+__attribute__((noinline)) int dup_one(void){ return leaf() * 3 + 1; }
+__attribute__((noinline)) int dup_two(void){ return leaf() * 3 + 1; }
+int main(void){ printf("%d %d\\n", dup_one(), dup_two()); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="16 16\n",
+    tags=("icf",))
+
+# Differing addends are differing code even when the bytes match.
+case("icf_respects_reloc_addends",
+    {"a.c": """
+#include <stdio.h>
+int tbl[4] = {10, 20, 30, 40};
+__attribute__((noinline)) int at0(void){ return tbl[0]; }
+__attribute__((noinline)) int at2(void){ return tbl[2]; }
+int main(void){ printf("%d %d\\n", at0(), at2()); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="10 30\n",
+    tags=("icf",))
+
+# C requires distinct functions to have distinct addresses. Under --icf=safe a
+# function whose address escapes must not be folded. The pointers are volatile
+# so the compiler cannot fold the comparison at compile time.
+case("icf_safe_preserves_function_pointer_identity",
+    {"a.c": """
+#include <stdio.h>
+__attribute__((noinline)) int dup_x(int v){ return v ^ 0x5a5a; }
+__attribute__((noinline)) int dup_y(int v){ return v ^ 0x5a5a; }
+int (*volatile px)(int) = dup_x;
+int (*volatile py)(int) = dup_y;
+int main(void){ printf("same=%d val=%d\\n", px == py, px(1)); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=safe"],
+    expect_stdout="same=0 val=23131\n",
+    tags=("icf",))
+
+# Folding must not disturb C++ exceptions: the unwinder looks up the landing
+# pad by return address, so a fold that loses .eh_frame coverage crashes here.
+case("icf_folded_code_still_unwinds",
+    {"a.cpp": """
+#include <cstdio>
+__attribute__((noinline)) int thrower(int k){ if (k) throw 7; return 0; }
+__attribute__((noinline)) int guard_a(int k){ try { return thrower(k); } catch (int e) { return e + 1; } }
+__attribute__((noinline)) int guard_b(int k){ try { return thrower(k); } catch (int e) { return e + 1; } }
+int main(){ printf("%d %d\\n", guard_a(1), guard_b(1)); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    ldflags=["-lstdc++", "-lm"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="8 8\n",
+    tags=("icf",))
+
+# --icf= with an unrecognised value must disable folding, not fail the link
+# (gold and lld both accept --icf=none this way).
+case("icf_none_is_accepted_and_disables",
+    {"a.c": """
+#include <stdio.h>
+__attribute__((noinline)) int d1(void){ return 3; }
+__attribute__((noinline)) int d2(void){ return 3; }
+int main(void){ printf("%d\\n", d1() + d2()); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=none"],
+    expect_stdout="6\n",
+    tags=("icf",))
+
+# ============================================================================
 # Runner
 # ============================================================================
 
@@ -2932,7 +3122,7 @@ def compile_sources(td, c, flags):
         with open(path, "w") as f:
             f.write(textwrap.dedent(content))
         obj = os.path.splitext(fname)[0] + ".o"
-        r = sh([CC, "-c", fname, "-o", obj] + flags, cwd=td)
+        r = sh([compiler_for(fname), "-c", fname, "-o", obj] + flags, cwd=td)
         if r.returncode != 0:
             return None, f"fixture compile failed: {r.stderr.decode()}"
         objs.append(obj)
@@ -3007,6 +3197,8 @@ def main():
 
     if (not args.filter or "pie" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_pie_script_test(args, oracles))
+    if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
+        results.append(_vdso_script_test(args, oracles))
 
     if (not args.filter or "so_" in args.filter) and not args.tag:
         results.append(_interpose_test(args, oracles,

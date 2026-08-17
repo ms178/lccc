@@ -13,6 +13,7 @@ use super::types::GlobalSymbol;
 use super::input::load_file;
 use super::plt_got::{collect_ifunc_symbols, create_plt_got};
 use super::emit_exec::emit_executable;
+use super::icf;
 use super::emit_shared::emit_shared_library;
 use crate::backend::linker_common::{self, OutputSection};
 
@@ -58,6 +59,12 @@ pub fn link_builtin(
     let use_runpath = parsed_args.use_runpath;
     let defsym_defs = parsed_args.defsym_defs;
     let gc_sections = parsed_args.gc_sections;
+    // Command line wins; LCCC_LD_ICF is the fallback so the feature can be
+    // exercised without touching build systems.
+    let icf_mode: Option<String> = parsed_args
+        .icf
+        .clone()
+        .or_else(|| icf::icf_mode_from_env().map(str::to_string));
     let entry_symbol = parsed_args.entry_symbol;
     let wrap_symbols = parsed_args.wrap_symbols;
     let undefined_symbols = parsed_args.undefined_symbols;
@@ -257,10 +264,45 @@ pub fn link_builtin(
     }
 
     phase!("strmerge");
+    // Identical Code Folding: retire duplicate function sections and alias
+    // them onto their surviving representative. Folded sections are added to
+    // `dead_sections` so the merge step never lays them out; the alias is
+    // installed into `section_map` afterwards, so every symbol address and
+    // relocation that referred to a folded section resolves to the survivor.
+    let icf_plan = match icf_mode.as_deref() {
+        Some(mode) => icf::plan(&objects, mode == "safe"),
+        None => icf::IcfPlan::default(),
+    };
+    for folded in icf_plan.redirect.keys() {
+        dead_sections.insert(*folded);
+    }
+
+    phase!("icf");
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+
+    // Point folded sections at the representative's placement. This must run
+    // after the merge, when the survivor has a real (output, offset) pair, and
+    // before any address assignment consults the map.
+    if !icf_plan.is_empty() {
+        for (&folded, &rep) in icf_plan.redirect.iter() {
+            if let Some(&placement) = section_map.get(&rep) {
+                section_map.insert(folded, placement);
+            }
+        }
+        if std::env::var("LCCC_DEBUG_ICF").is_ok() {
+            eprintln!(
+                "[icf] mode={} groups={} folded={} bytes_saved={} rejected_unsafe={}",
+                icf_mode.as_deref().unwrap_or("none"),
+                icf_plan.result.candidate_groups,
+                icf_plan.result.folded_sections,
+                icf_plan.result.bytes_saved,
+                icf_plan.result.rejected_unsafe
+            );
+        }
+    }
 
     phase!("merge-sections");
     // Allocate COMMON symbols

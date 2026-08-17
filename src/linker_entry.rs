@@ -2,6 +2,31 @@
 
 use crate::backend::linker_common::Elf64Object;
 
+/// Version banner shared by the compiler driver's built-in linker query and
+/// the standalone `lccc-ld` binary.
+///
+/// Keep the first two whitespace-delimited fields exactly `GNU ld` and the
+/// final field numeric. Linux's `scripts/ld-version.sh` (and other build-system
+/// probes modelled on it) reject any linker whose banner is not in GNU ld or
+/// LLD form, even when the linker's command-line interface is compatible.
+/// The compatibility version remains 2.42 rather than tracking LCCC releases:
+/// it describes the GNU-ld interface level advertised by this implementation.
+pub const GNU_LD_VERSION_OUTPUT: &str = "GNU ld (LCCC built-in) 2.42";
+
+#[cfg(test)]
+mod version_tests {
+    use super::GNU_LD_VERSION_OUTPUT;
+
+    #[test]
+    fn standalone_banner_has_linux_ld_version_shape() {
+        let fields: Vec<_> = GNU_LD_VERSION_OUTPUT.split_whitespace().collect();
+        assert_eq!(&fields[..2], &["GNU", "ld"]);
+        assert!(fields.last().unwrap().split('.').all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+        }));
+    }
+}
+
 /// Load a mix of relocatable objects (.o) and archives (.a) for x86-64 with
 /// whole-command-line group semantics. `inputs` is (path, whole_archive).
 pub fn load_inputs_x86(
@@ -56,9 +81,13 @@ pub fn link_with_script_x86(
     emit_symtab: bool,
     is_pie: bool,
     emit_relocs: bool,
+    soname: Option<&str>,
+    bsymbolic: bool,
+    max_page_size: u64,
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script(
-        objects, script_src, output, emit_symtab, is_pie, emit_relocs)
+        objects, script_src, output, emit_symtab, is_pie, emit_relocs,
+        soname, bsymbolic, max_page_size)
 }
 
 /// Standard userspace executable link for the standalone `lccc-ld` driver.

@@ -23,7 +23,49 @@ pub struct VersionScript {
 impl VersionScript {
     pub fn parse(path: &str) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
-        let text = strip_version_script_comments(&text);
+        Self::parse_text(&text)
+    }
+
+    /// Parse a version node embedded in a full linker script.
+    ///
+    /// Linux's vDSO keeps `SECTIONS`, `PHDRS`, and `VERSION` in one file rather
+    /// than passing a separate `--version-script`. Start at the last VERSION
+    /// keyword so braces belonging to SECTIONS cannot be mistaken for the
+    /// version node.
+    pub fn parse_text(input: &str) -> Option<Self> {
+        let text = strip_version_script_comments(input);
+
+        // A *full* linker script with no VERSION node has no version
+        // information at all. Without this guard the scan below falls through
+        // to the first `{` in the file -- which belongs to SECTIONS or PHDRS --
+        // and happily parses `SECTIONS { ... }` as a version node literally
+        // named "SECTIONS", exporting a bogus symbol of that name and treating
+        // section definitions as symbol patterns. Detect the full-script shape
+        // and bail rather than guess.
+        let looks_like_full_script = ["SECTIONS", "PHDRS", "MEMORY", "ENTRY", "OUTPUT_FORMAT"]
+            .iter()
+            .any(|kw| contains_keyword(&text, kw));
+        let has_version_kw = contains_keyword(&text, "VERSION");
+        if looks_like_full_script && !has_version_kw {
+            return None;
+        }
+
+        let version_pos = text.rfind("VERSION")
+            .filter(|&pos| {
+                let before = text[..pos].chars().next_back();
+                let after = text[pos + "VERSION".len()..].chars().next();
+                !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+        let mut text = version_pos.map_or(text.as_str(), |pos| &text[pos + "VERSION".len()..]);
+        if version_pos.is_some() {
+            // Full scripts spell `VERSION { NODE { global: ...; }; }` while a
+            // standalone version script starts directly at `NODE { ... }`.
+            // Peel the outer VERSION block and feed the established parser the
+            // inner node.
+            let outer_open = text.find('{')?;
+            text = &text[outer_open + 1..];
+        }
         let open = text.find('{')?;
         // An ANONYMOUS version node — `{ global: a; local: *; };` with no name
         // before the brace — is the most common form in the wild (it is what
@@ -78,6 +120,25 @@ impl VersionScript {
     pub fn matches_global(&self, name: &str) -> bool {
         self.global_patterns.iter().any(|pat| wildcard_match(pat, name))
     }
+}
+
+/// True when `kw` appears in `text` as a standalone word (not as part of a
+/// longer identifier). Used to distinguish a full linker script from a
+/// standalone version script.
+fn contains_keyword(text: &str, kw: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(kw) {
+        let pos = from + rel;
+        let before = text[..pos].chars().next_back();
+        let after = text[pos + kw.len()..].chars().next();
+        let boundary_before = !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let boundary_after = !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if boundary_before && boundary_after {
+            return true;
+        }
+        from = pos + kw.len();
+    }
+    false
 }
 
 pub(crate) fn strip_version_script_comments(input: &str) -> String {
@@ -160,6 +221,21 @@ mod tests {
         assert!(vs.local_star);
         assert!(vs.matches_global("foo_bar"));
         assert!(!vs.matches_global("bar_foo"));
+    }
+
+    #[test]
+    fn version_node_embedded_after_sections_is_parsed() {
+        let text = r#"
+            SECTIONS { .text : { *(.text) } }
+            PHDRS { text PT_LOAD; }
+            VERSION { LINUX_2.6 { global: clock_gettime; __vdso_clock_gettime;
+                                  local: *; }; }
+        "#;
+        let vs = VersionScript::parse_text(text).expect("embedded VERSION node");
+        assert_eq!(vs.version_name, "LINUX_2.6");
+        assert!(vs.matches_global("clock_gettime"));
+        assert!(vs.matches_global("__vdso_clock_gettime"));
+        assert!(vs.local_star);
     }
 
     #[test]

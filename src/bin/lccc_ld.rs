@@ -138,6 +138,9 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut build_id = false;
     let mut entry_override: Option<String> = None;
     let mut shared = false;
+    let mut soname: Option<String> = None;
+    let mut bsymbolic = false;
+    let mut max_page_size = 0x200000u64;
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
@@ -172,8 +175,8 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             "--strip-debug" | "-S" => {}
             "--strip-all" | "-s" => emit_symtab = false,
-            "-v" | "--version" => {
-                println!("LCCC ld (GNU-compatible) 0.1");
+            "-v" | "-V" | "--version" => {
+                println!("{}", lccc::linker_entry::GNU_LD_VERSION_OUTPUT);
                 return Ok(());
             }
             "--help" => {
@@ -213,6 +216,13 @@ fn run(args: &[String]) -> Result<(), String> {
             "-z" => {
                 i += 1;
                 if let Some(kw) = args.get(i) {
+                    if let Some(value) = kw.strip_prefix("max-page-size=") {
+                        max_page_size = if let Some(hex) = value.strip_prefix("0x") {
+                            u64::from_str_radix(hex, 16).unwrap_or(max_page_size)
+                        } else {
+                            value.parse().unwrap_or(max_page_size)
+                        };
+                    }
                     passthrough.push(format!("-Wl,-z,{}", kw));
                 }
             }
@@ -222,6 +232,14 @@ fn run(args: &[String]) -> Result<(), String> {
             "-Bdynamic" | "-dy" | "-call_shared" => {}
             "--gc-sections" => passthrough.push("-Wl,--gc-sections".to_string()),
             "--no-gc-sections" => {}
+            "--no-undefined" => {
+                // Script links resolve every non-weak relocation eagerly.
+                passthrough.push(a.to_string());
+            }
+            "-Bsymbolic" | "-Bsymbolic-functions" => {
+                bsymbolic = true;
+                passthrough.push(a.to_string());
+            }
             // GNU ld accepts BOTH spellings and gcc's driver emits the
             // single-dash one (`gcc -rdynamic` -> `collect2 ... -export-dynamic`).
             // Matching only the double-dash form silently dropped the flag, so
@@ -297,6 +315,7 @@ fn run(args: &[String]) -> Result<(), String> {
                         args.get(i).cloned().unwrap_or_default()
                     };
                     if !val.is_empty() {
+                        soname = Some(val.clone());
                         passthrough.push(format!("-Wl,-soname,{}", val));
                     }
                 } else if a.starts_with("--build-id") {
@@ -413,7 +432,9 @@ fn run(args: &[String]) -> Result<(), String> {
             script_src = format!("ENTRY({})\n{}", e, script_src);
         }
         return lccc::linker_entry::link_with_script_x86(
-            &objects, &script_src, &output, emit_symtab, is_pie, emit_relocs);
+            &objects, &script_src, &output, emit_symtab,
+            is_pie || shared, emit_relocs, soname.as_deref(), bsymbolic,
+            max_page_size);
     }
 
     // ------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–9)
+# LCCC Linker — Follow-Up Plan (Sessions 2–10)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -974,3 +974,205 @@ valgrind 3.24.0, no PMU.
 5. **Snapshot after every validated change.** `lccc-snapshot.sh` writes an
    atomically-renamed patch + tarball + git bundle and *verifies the patch
    applies to a clean worktree* before reporting success.
+
+---
+
+# Session 10 — Agent C's vDSO patch, audited; and ICF apply
+
+**Base:** `ms178/lccc` main @ `b38d86a` (already contains the session-9 work).
+**Snapshots:** `S01-vdso-et-dyn-script` (`a48fbb7`), `S02-icf-apply` (`cf2c637`).
+**Totals at end of session:** 771 unit pass / 0 fail / 6 ignored, 145
+differential pass / 0 fail (bfd, mold, wild), 400 fuzz mutants clean.
+
+## 10.1 Audit of Agent C's `S05-vdso-elf64-dynamic`
+
+**Verdict: adopt the design, fix two defects.**
+
+### The design is right
+
+C synthesises a `<script-dynamic>` input object carrying `.hash`, `.gnu.hash`,
+`.dynsym`, `.dynstr`, `.gnu.version`, `.gnu.version_d` and `.dynamic`, lets the
+*script's own* `*(...)` wildcards place those sections, and patches the values
+once addresses have settled.
+
+This is the correct choice and I am keeping it. The obvious alternative — a
+second, script-specific layout path that emits dynamic metadata directly — is
+what GNU ld deliberately does *not* do, and it would have meant two independent
+implementations of segment assignment drifting apart. Feeding synthetic
+sections through the ordinary placement machinery means the script author's
+`SECTIONS` block governs the result, exactly as with `ld.bfd`.
+
+**Verified necessary.** On pristine `b38d86a` the reduced Linux v6.12 vDSO
+script fails outright:
+
+```
+lccc-ld: error: linker script: cannot resolve assignment . = ... (__SIZEOF_HEADERS)
+```
+
+With the patch the vDSO links to a 1952-byte image whose exported dynamic
+symbol set matches `ld.bfd` exactly: `clock_gettime@@LINUX_2.6`,
+`getcpu@@LINUX_2.6`, `time@@LINUX_2.6`, plus the `LINUX_2.6` version node.
+
+**Verified correct, not merely plausible.** `readelf -d` prints a broken hash
+table just as happily as a working one, so structural inspection proves
+nothing. I reimplemented the *consumers* — the gABI `.hash` walk and glibc
+`dl-lookup.c`'s `.gnu.hash` bloom-filter/bucket/chain walk — over the raw file
+bytes, and confirmed every exported symbol resolves through **both** tables,
+and that an absent symbol resolves through neither. That reimplementation is
+now `tests/linker/check_dyn_hash.py`. C's SysV hash, GNU hash, bucket, chain
+and bloom constructions are all provably correct. Two bugs I initially
+suspected were falsified by Python reproduction before I touched the code.
+
+### Why I had not proposed this myself
+
+My sessions optimised the **executable** path for instruction count and
+allocation traffic. Nothing in the benchmark corpus (zlib-ng, gzip, expat) or
+in the differential suite links an `ET_DYN` image *through a linker script*, so
+this entire code path had zero coverage and never appeared in a profile. It is
+a genuine blind spot in my own prioritisation, not merely a lower-priority
+item: the kernel vDSO is exactly the case the corpus cannot reach.
+
+### Defect 1 — the bucket count was clamped to 64
+
+```rust
+let nbuckets = (...).next_power_of_two().max(1).min(64);   // before
+```
+
+`.gnu.hash` lookup cost is the chain length in the selected bucket, walked on
+every dynamic symbol resolution for the life of the process. Clamping buckets
+caps the table at 256 bytes and pays for it forever on the consumer side.
+Measured chain lengths:
+
+| exports | capped avg / max | uncapped avg / max |
+|---------|------------------|--------------------|
+| 500     | 7.8 / 18         | 1.9 / 4            |
+| 5000    | 78.1 / 151       | 1.5 / 4            |
+
+At 5000 exports the cap makes the average lookup **52x** longer to save 19 KB
+of buckets. Removed, with the measurement recorded at the site. Cost: +1.8 KB
+on the 501-symbol case (53,688 -> 55,480 bytes). Correct trade.
+
+### Defect 2 — `VersionScript::parse_text` mis-parsed full linker scripts
+
+`parse_text` scanned for the first `{`. Given a complete linker script with
+**no** `VERSION` node, it found the brace belonging to `SECTIONS`, parsed that
+block as a version node named `SECTIONS`, and exported a bogus dynamic symbol
+of that name. Reproduced with `nover.lds`, fixed with a word-boundary
+`contains_keyword()` helper that returns `None` when the text looks like a full
+script (`SECTIONS`/`PHDRS`/`MEMORY`/`ENTRY`/`OUTPUT_FORMAT`) but contains no
+`VERSION`. Verified gone; the vDSO still exports precisely its four symbols.
+
+### Integration defect
+
+The patch `git apply --check`ed clean and then failed to **build**: E0308 at
+`emit_script.rs:214`, because it predates the session-9 `SectionData`
+migration and pushed a `Vec<u8>` where a `SectionData` is now required. Fixed
+with `SectionData::owned(data)`. *A clean apply is not integration proof.*
+
+## 10.2 §4.3 — ICF apply
+
+`icf.rs` analysed and classified but **never folded**; nothing called it. The
+lever was inert. Wiring it up first required fixing the analysis, which was
+unsound.
+
+### The identity test was unsound
+
+`collect_candidates` hashed section **bytes only**. On x86-64 a call is
+`e8 <rel32>` with the displacement supplied by a relocation, so
+
+```c
+int wrap_a(void) { return alpha(); }   /* e8 00000000 c3 */
+int wrap_b(void) { return beta();  }   /* e8 00000000 c3 */
+```
+
+emit byte-identical sections differing only in relocation target. The old
+`group_is_safe` accepted the pair — it rejected only *absolute* relocations,
+and `R_X86_64_PLT32` is relative — so folding them would make `wrap_b()` return
+`alpha()`'s value, silently, with no diagnostic anywhere. Confirmed on
+gcc 14.2 `-O1 -ffunction-sections`: both sections are literally `e800000000c3`.
+
+Two sections are now identical only when bytes, length, flags, entsize,
+**alignment** and the entire relocation list agree — offset, type, addend, and
+resolved target identity (globals by name, locals by target section + value).
+Hash buckets are split into exact-equality classes before folding, so a
+collision can never cause a fold.
+
+### Safety classes
+
+`--icf=safe` additionally refuses to fold any section whose address is
+observable. The scan walks absolute relocations across the **whole link**, not
+just those inside candidate sections — the address of a function is virtually
+always taken from somewhere else, so a local scan would miss it — and maps each
+back to the defining section. This preserves C's guarantee that distinct
+functions compare unequal. `--icf=all` folds regardless, matching gold/lld.
+
+### Application
+
+`plan()` returns a redirect map. Folded sections are added to `dead_sections`
+so the existing `--gc-sections` machinery keeps them out of the layout;
+afterwards each folded section's `section_map` entry is aliased to the
+representative's placement, so every symbol address and relocation resolves to
+the survivor and nothing dangles. Representatives are the lexicographically
+smallest `(object, section)` and buckets are sorted before iteration, so the
+plan does not depend on hash order — **a linker that folds differently between
+runs is not reproducible**, and that would be a defect in its own right.
+
+### Results
+
+C++ template corpus, 8 same-layout instantiations, `g++ -O2
+-ffunction-sections`:
+
+| linker | plain | with ICF |
+|--------|-------|----------|
+| bfd    | 21,800 | (no ICF support) |
+| mold   | 17,320 | 14,824 |
+| **lccc** | 17,576 | **13,480** |
+
+**-23.3%** versus our own no-ICF baseline, and **9.1% smaller than mold's**
+`--icf=all` on identical input, with identical program output.
+
+Honest negative result: on the C corpus the win is small — expat's `xmlwf`
+folds 11 sections for 49 bytes, and gzip/zlib-ng/expat binary sizes are
+unchanged to the byte. Idiomatic C simply has few exactly-identical functions.
+ICF is a C++ lever, and it should be presented as one; the corpus does not
+show it because the corpus is C.
+
+### Tests
+
+9 unit tests plus 6 differential cases. Mutation-verified in both directions:
+restoring byte-only identity fails
+`identical_bytes_different_call_targets_do_not_fold` with an explicit
+"this is a miscompilation" message, and makes the differential case print
+`22 22` instead of `11 22`.
+
+Also fixed in the harness: `run_linker_tests.py` compiled *every* fixture with
+`gcc`, so any `.cpp` fixture could only ever `SKIP`. It now selects the driver
+by file extension, which is what let the C++ exception-unwinding case
+(`icf_folded_code_still_unwinds`) actually run — folding must not disturb
+`.eh_frame`, since the unwinder looks up landing pads by return address.
+
+## 10.3 Lessons
+
+1. **A clean `git apply --check` is not integration proof.** Build it.
+2. **Correct algorithms can still be wrong at the seams.** C's hash maths was
+   flawless; the defects were a hardcoded clamp and an unrelated parser
+   fallthrough. Test the *edges* — no VERSION node, zero exports, 500 exports —
+   not just the motivating case.
+3. **Structural inspection of a hash table proves nothing.** Reimplement the
+   consumer's walk over raw bytes.
+4. **An unapplied optimisation hides its own bugs.** ICF's byte-only comparison
+   sat in the tree looking reasonable precisely because nothing ever ran it.
+5. **Report the negative result.** ICF does almost nothing for C. Saying so is
+   more useful than quoting the C++ number alone.
+
+## 10.4 Remaining backlog (unchanged priority)
+
+1. **§4.2** wire `parallel_reloc.rs` into `emit_exec` — still blocked on
+   hardware (2 vCPU); measure on the 14700KF.
+2. **§4.4** positional `--as-needed`, ELF32 script path (`setup.elf`),
+   `--print-map` alias, multi-node `@`/`@@` versioning.
+3. **§4.5** grammar-aware ELF fuzzing (current fuzzer is a byte mutator).
+4. `mmap` input I/O — the last whole-file copy; no `Vec`-side trick can remove
+   it (proven in session 9).
+5. COMDAT/`SHT_GROUP` dedup in the exe path; `SymbolId(u32)` interning;
+   `LayoutPlan::compute` unwired.

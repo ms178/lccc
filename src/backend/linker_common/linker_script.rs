@@ -324,6 +324,11 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
                                             "PT_NOTE" => decl.ptype = 4,
                                             "PT_PHDR" => decl.ptype = 6,
                                             "PT_TLS" => decl.ptype = 7,
+                                            "PT_GNU_EH_FRAME" => decl.ptype = 0x6474_e550,
+                                            "PT_GNU_STACK" => decl.ptype = 0x6474_e551,
+                                            "PT_GNU_RELRO" => decl.ptype = 0x6474_e552,
+                                            "PT_GNU_PROPERTY" => decl.ptype = 0x6474_e553,
+                                            "PT_GNU_SFRAME" => decl.ptype = 0x6474_e554,
                                             "PHDRS" => decl.has_phdrs = true,
                                             "FILEHDR" => decl.has_filehdr = true,
                                             "FLAGS" => {
@@ -1083,6 +1088,24 @@ mod tests {
         assert!(text.at_lma.is_some());
         // dot assignment first
         assert!(matches!(&s.sections[0], SectionsItem::Assign(a) if a.symbol == "."));
+    }
+
+    #[test]
+    fn parse_phdr_header_membership_and_gnu_types() {
+        let script = parse_linker_script(r#"
+            PHDRS {
+                image PT_LOAD FILEHDR PHDRS FLAGS(5);
+                stack PT_GNU_STACK FLAGS(6);
+                relro PT_GNU_RELRO FLAGS(4);
+            }
+            SECTIONS { . = SIZEOF_HEADERS; .text : { *(.text) } :image }
+        "#).unwrap();
+        assert_eq!(script.phdrs[0].ptype, 1);
+        assert!(script.phdrs[0].has_filehdr);
+        assert!(script.phdrs[0].has_phdrs);
+        assert_eq!(script.phdrs[1].ptype, 0x6474_e551);
+        assert_eq!(script.phdrs[1].flags, Some(6));
+        assert_eq!(script.phdrs[2].ptype, 0x6474_e552);
     }
 
     #[test]
