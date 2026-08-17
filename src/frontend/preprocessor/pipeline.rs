@@ -221,7 +221,7 @@ impl Preprocessor {
         };
 
         // Buffer for accumulating multi-line macro invocations
-        let mut pending_line = String::new();
+        let mut pending_line = String::with_capacity(256);
         let mut pending_newlines: usize = 0;
 
         // Track current line number in the preprocessed output for macro expansion metadata.

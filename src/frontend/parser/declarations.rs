@@ -486,7 +486,7 @@ impl Parser {
         start: crate::common::source::Span,
         mut ctx: DeclContext,
     ) -> Option<ExternalDecl> {
-        let mut declarators = Vec::new();
+        let mut declarators = Vec::with_capacity(4);
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {
@@ -669,7 +669,7 @@ impl Parser {
         let is_static = self.attrs.parsing_static();
         let is_extern = self.attrs.parsing_extern();
 
-        let mut declarators = Vec::new();
+        let mut declarators = Vec::with_capacity(4);
 
         // Handle bare type with semicolon (struct/enum/union definition)
         if matches!(self.peek(), TokenKind::Semicolon) {
@@ -804,9 +804,9 @@ impl Parser {
         if matches!(self.peek(), TokenKind::LBrace) {
             let open = self.peek_span();
             self.advance();
-            let mut items = Vec::new();
+            let mut items = Vec::with_capacity(8);
             while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
-                let mut designators = Vec::new();
+                let mut designators = Vec::with_capacity(4);
                 // Parse designators: [idx] and .field
                 loop {
                     if matches!(self.peek(), TokenKind::LBracket) {

@@ -41,7 +41,7 @@ impl Parser {
     /// Parse a declarator, also returning attribute info:
     /// (name, derived, mode_kind, has_common, aligned_value, is_packed)
     pub(super) fn parse_declarator_with_attrs(&mut self) -> (Option<String>, Vec<DerivedDeclarator>, Option<ModeKind>, bool, Option<usize>, bool) {
-        let mut derived = Vec::new();
+        let mut derived = Vec::with_capacity(4);
 
         let mut pre_aligned: Option<usize> = None;
         let mut is_packed = false;
@@ -78,7 +78,7 @@ impl Parser {
         };
 
         // Parse outer suffixes: array dimensions and function params
-        let mut outer_suffixes = Vec::new();
+        let mut outer_suffixes = Vec::with_capacity(4);
         loop {
             match self.peek() {
                 TokenKind::LBracket => {
@@ -312,7 +312,7 @@ impl Parser {
     pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool) {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "for parameter list");
-        let mut params = Vec::new();
+        let mut params = Vec::with_capacity(8);
         let mut variadic = false;
 
         if matches!(self.peek(), TokenKind::RParen) {
@@ -378,7 +378,7 @@ impl Parser {
                 // Array params: outermost dimension decays to pointer.
                 // Preserve the outermost dimension expression (if any) so side effects
                 // like `a++` in `int b[a++]` can be evaluated during IR lowering.
-                let mut vla_size_exprs = Vec::new();
+                let mut vla_size_exprs = Vec::with_capacity(2);
                 if !array_dims.is_empty() {
                     if let Some(Some(expr)) = array_dims.first() {
                         vla_size_exprs.push((**expr).clone());
@@ -414,7 +414,7 @@ impl Parser {
 
     /// Parse a K&R-style identifier list: foo(a, b, c)
     fn parse_kr_identifier_list(&mut self) -> (Vec<ParamDecl>, bool) {
-        let mut params = Vec::new();
+        let mut params = Vec::with_capacity(8);
         while let TokenKind::Identifier(ref n) = self.peek() {
             let n = n.clone();
             self.advance();
