@@ -8,6 +8,9 @@ pub struct Lexer {
     pos: usize,
     file_id: u32,
     gnu_extensions: bool,
+    at_line_start: bool,
+    ident_pool: std::collections::HashMap<Vec<u8>, std::sync::Arc<str>>,
+    pub diagnostics: Vec<(String, crate::common::source::Span)>,
 }
 
 impl Lexer {
@@ -17,11 +20,27 @@ impl Lexer {
             pos: 0,
             file_id,
             gnu_extensions: true,
+            at_line_start: true,
+            ident_pool: std::collections::HashMap::with_capacity(256),
+            diagnostics: Vec::new(),
         }
     }
 
     pub fn set_gnu_extensions(&mut self, enabled: bool) {
         self.gnu_extensions = enabled;
+    }
+
+    fn intern_ident(&mut self, bytes: &[u8]) -> String {
+        if let Some(existing) = self.ident_pool.get(bytes) {
+            return existing.to_string();
+        }
+        let s: std::sync::Arc<str> = std::str::from_utf8(bytes).unwrap_or("").into();
+        self.ident_pool.insert(bytes.to_vec(), s.clone());
+        s.to_string()
+    }
+
+    fn emit_lex_diag(&mut self, msg: impl Into<String>, start: usize, end: usize) {
+        self.diagnostics.push((msg.into(), Span::new(start as u32, end as u32, self.file_id)));
     }
 
     pub fn tokenize(&mut self) -> Vec<Token> {
@@ -77,6 +96,9 @@ impl Lexer {
         loop {
             // Skip whitespace
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+                if self.input[self.pos] == b'\n' {
+                    self.at_line_start = true;
+                }
                 self.pos += 1;
             }
 
@@ -88,13 +110,14 @@ impl Lexer {
             // These are emitted by the preprocessor and must not be lexed as tokens.
             // A line marker is a '#' at the start of a line (after optional whitespace)
             // followed by a digit.
-            if self.input[self.pos] == b'#' && self.is_line_marker() {
+            if self.at_line_start && self.input[self.pos] == b'#' && self.is_line_marker() {
                 // Skip the entire line
                 while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
                     self.pos += 1;
                 }
                 continue;
             }
+            self.at_line_start = false;
 
             // Skip line comments
             if self.pos + 1 < self.input.len() && self.input[self.pos] == b'/' && self.input[self.pos + 1] == b'/' {
@@ -124,6 +147,25 @@ impl Lexer {
     /// Check if the current position is at a GCC-style line marker.
     /// A line marker is `# <digit>` at the start of a line (i.e., the '#' is
     /// either at position 0 or preceded by a newline).
+    fn accumulate_digits(bytes: &[u8], base: u32) -> (u64, bool) {
+        let mut val: u64 = 0;
+        let mut overflow = false;
+        let base64 = base as u64;
+        for &b in bytes {
+            let digit = match b {
+                b'0'..=b'9' => (b - b'0') as u64,
+                b'a'..=b'f' => (b - b'a' + 10) as u64,
+                b'A'..=b'F' => (b - b'A' + 10) as u64,
+                _ => continue,
+            };
+            if digit >= base64 { continue; }
+            let (m, o1) = val.overflowing_mul(base64);
+            let (a, o2) = m.overflowing_add(digit);
+            if o1 || o2 { overflow = true; val = u64::MAX; } else { val = a; }
+        }
+        (val, overflow)
+    }
+
     fn is_line_marker(&self) -> bool {
         // Must be at '#'
         if self.pos >= self.input.len() || self.input[self.pos] != b'#' {
@@ -195,8 +237,10 @@ impl Lexer {
         }
 
         // Regular hex integer
-        let hex_str = std::str::from_utf8(&self.input[hex_start..self.pos]).unwrap_or("0");
-        let value = u64::from_str_radix(hex_str, 16).unwrap_or(0);
+        let (value, overflow) = Self::accumulate_digits(&self.input[hex_start..self.pos], 16);
+        if overflow {
+            self.emit_lex_diag("integer literal is too large to be represented", hex_start, self.pos);
+        }
         self.finish_int_literal(value, true, start)
     }
 
@@ -288,8 +332,10 @@ impl Lexer {
         while self.pos < self.input.len() && (self.input[self.pos] == b'0' || self.input[self.pos] == b'1') {
             self.pos += 1;
         }
-        let bin_str = std::str::from_utf8(&self.input[bin_start..self.pos]).unwrap_or("0");
-        let value = u64::from_str_radix(bin_str, 2).unwrap_or(0);
+        let (value, overflow) = Self::accumulate_digits(&self.input[bin_start..self.pos], 2);
+        if overflow {
+            self.emit_lex_diag("integer literal is too large to be represented", bin_start, self.pos);
+        }
         self.finish_int_literal(value, true, start)
     }
 
@@ -316,8 +362,10 @@ impl Lexer {
                 return None;
             }
         }
-        let oct_str = std::str::from_utf8(&self.input[oct_start..self.pos]).unwrap_or("0");
-        let value = u64::from_str_radix(oct_str, 8).unwrap_or(0);
+        let (value, overflow) = Self::accumulate_digits(&self.input[oct_start..self.pos], 8);
+        if overflow {
+            self.emit_lex_diag("integer literal is too large to be represented", oct_start, self.pos);
+        }
         Some(self.finish_int_literal(value, true, start))
     }
 
@@ -373,8 +421,10 @@ impl Lexer {
             self.make_float_token(text, float_kind, is_imaginary, start)
         } else {
             // Parse the integer value directly from the &str borrow (no heap allocation).
-            let text = std::str::from_utf8(&self.input[start..num_end]).unwrap_or("0");
-            let uvalue: u64 = text.parse().unwrap_or(0);
+            let (uvalue, overflow) = Self::accumulate_digits(&self.input[start..num_end], 10);
+            if overflow {
+                self.emit_lex_diag("integer literal is too large to be represented", start, num_end);
+            }
             self.finish_int_literal(uvalue, false, start)
         }
     }
@@ -615,7 +665,7 @@ impl Lexer {
 
     fn lex_string(&mut self, start: usize) -> Token {
         self.pos += 1; // skip opening "
-        let mut s = String::new();
+        let mut s = String::with_capacity(32);
         while self.pos < self.input.len() && self.input[self.pos] != b'"' {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
@@ -918,22 +968,38 @@ impl Lexer {
     // TODO: C11 requires exactly num_digits hex digits; emit diagnostic if fewer provided.
     // TODO: C11 §6.4.3 disallows certain code points (below 0x00A0 except 0x24/0x40/0x60,
     //       and surrogates 0xD800-0xDFFF). Validate and emit diagnostics for these.
-    fn lex_unicode_escape(&mut self, num_digits: usize) -> char {
+        fn lex_unicode_escape(&mut self, num_digits: usize) -> char {
+        let esc_start = self.pos.saturating_sub(2);
         let mut val = 0u32;
+        let mut got = 0usize;
         for _ in 0..num_digits {
             if self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
                 val = val * 16 + hex_digit_val(self.input[self.pos]) as u32;
                 self.pos += 1;
+                got += 1;
             } else {
                 break;
             }
         }
-        // TODO: Emit a diagnostic for invalid code points (e.g. surrogates) instead of
-        //       silently using the replacement character.
+        if got < num_digits {
+            self.emit_lex_diag(
+                format!("universal character name expects {} hex digits, got {}", num_digits, got),
+                esc_start,
+                self.pos,
+            );
+        }
+        if (0xD800..=0xDFFF).contains(&val) || val > 0x10FFFF {
+            self.emit_lex_diag(
+                format!("invalid universal character name U+{:X}", val),
+                esc_start,
+                self.pos,
+            );
+            return '\u{FFFD}';
+        }
         char::from_u32(val).unwrap_or('\u{FFFD}')
     }
 
-    fn lex_identifier(&mut self, start: usize) -> Token {
+fn lex_identifier(&mut self, start: usize) -> Token {
         while self.pos < self.input.len() && (self.input[self.pos] == b'_' || self.input[self.pos] == b'$' || self.input[self.pos].is_ascii_alphanumeric()) {
             self.pos += 1;
         }
@@ -987,7 +1053,9 @@ impl Lexer {
         if let Some(kw) = TokenKind::from_keyword(text, self.gnu_extensions) {
             Token::new(kw, span)
         } else {
-            Token::new(TokenKind::Identifier(text.to_string()), span)
+            let bytes = self.input[start..self.pos].to_vec();
+            let name = self.intern_ident(&bytes);
+            Token::new(TokenKind::Identifier(name), span)
         }
     }
 
@@ -1210,10 +1278,17 @@ impl Lexer {
                 // Non-ASCII or unknown character: skip any remaining bytes of
                 // a multi-byte UTF-8 sequence (including PUA-encoded bytes from
                 // non-UTF-8 source files) and continue tokenizing.
-                // TODO: emit a diagnostic for genuinely unknown/invalid characters
+                let bad_start = self.pos;
+                let bad = self.input[self.pos];
+                self.pos += 1;
                 while self.pos < self.input.len() && (self.input[self.pos] & 0xC0) == 0x80 {
-                    self.pos += 1; // skip continuation bytes
+                    self.pos += 1;
                 }
+                self.emit_lex_diag(
+                    format!("unexpected character byte 0x{:02X} in source", bad),
+                    bad_start,
+                    self.pos,
+                );
                 return self.next_token();
             }
         };
