@@ -52,6 +52,30 @@ impl super::InstructionEncoder {
     /// .code16:     mod=00 rm=110 + disp16 + R_386_16 (GAS: `8b 16 <d16>`
     /// for `movw sym, %dx`). A 16-bit reloc field also means the addend
     /// must fit 16 bits, which holds for all real-mode setup symbols.
+    /// Emit ONLY the absolute-address displacement (no ModRM) -- the moffs
+    /// field of the accumulator shortforms A0/A1/A2/A3. Width follows the
+    /// current code mode: disp16 + R_386_16 in .code16, disp32 + R_386_32
+    /// otherwise (matching GAS).
+    pub(super) fn encode_abs_addr_disp_only(&mut self, label: &str) -> Result<(), String> {
+        if let Ok(addr) = label.parse::<i64>() {
+            if self.code16 {
+                self.bytes.extend_from_slice(&(addr as i16).to_le_bytes());
+            } else {
+                self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
+            }
+            return Ok(());
+        }
+        let (sym, addend) = split_label_offset(label);
+        if self.code16 {
+            self.add_relocation(sym, R_386_16, addend);
+            self.bytes.extend_from_slice(&[0, 0]);
+        } else {
+            self.add_relocation(sym, R_386_32, addend);
+            self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        Ok(())
+    }
+
     pub(super) fn encode_abs_addr_modrm(&mut self, reg_field: u8, label: &str) -> Result<(), String> {
         // Numeric literal labels are absolute addresses with no relocation.
         if let Ok(addr) = label.parse::<i64>() {
