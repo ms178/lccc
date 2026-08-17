@@ -65,6 +65,10 @@ pub(super) fn emit_shared_library(
     version_script_path: Option<&str>, bsymbolic: bool,
     // `--exclude-libs`: archives whose symbols must not be re-exported.
     exclude_libs: &[String],
+    // `-Map=FILE`: write a GNU-ld-compatible link map. Previously reachable
+    // only for executables, because link_shared's private argument parser
+    // never recognised -Map at all.
+    map_path: Option<&str>,
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
 
@@ -1711,6 +1715,34 @@ pub(super) fn emit_shared_library(
     out[58..60].copy_from_slice(&64u16.to_le_bytes());           // e_shentsize
     out[60..62].copy_from_slice(&sh_count.to_le_bytes());        // e_shnum
     out[62..64].copy_from_slice(&shstrtab_shidx.to_le_bytes()); // e_shstrndx
+
+    // === -Map=FILE ===
+    // Written after layout so every address is final, and built from the same
+    // `output_sections` / `section_map` state the ELF was emitted from -- the
+    // map is authoritative, not a reconstruction that can drift.
+    if let Some(mp) = map_path {
+        let object_names: Vec<String> =
+            objects.iter().map(|o| o.source_name.clone()).collect();
+        let mut map_syms: Vec<(String, usize, usize, u64)> = Vec::new();
+        for (obj_idx, obj) in objects.iter().enumerate() {
+            for sym in &obj.symbols {
+                if sym.name.is_empty() { continue; }
+                let st = sym.sym_type();
+                if st == STT_SECTION || st == 4 { continue; }
+                if sym.is_undefined() { continue; }
+                let si = sym.shndx as usize;
+                if section_map.contains_key(&(obj_idx, si)) {
+                    map_syms.push((sym.name.to_string(), obj_idx, si, sym.value));
+                }
+            }
+        }
+        // A shared library has no entry point, so pass none rather than
+        // inventing `_start`, which would put a bogus line in the map.
+        let lm = linker_common::build_link_map(
+            output_sections, &object_names, &map_syms, None, 0);
+        lm.write_to_path(std::path::Path::new(mp))
+            .map_err(|e| format!("failed to write map file '{}': {}", mp, e))?;
+    }
 
     std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
     #[cfg(unix)]

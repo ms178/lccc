@@ -1509,6 +1509,81 @@ def _zdefs_test(args, oracles):
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
+def _so_shared_flags_test(args, oracles):
+    """Flags that worked for executables must also work for shared libraries.
+
+    `link_shared` used to carry its own argument parser, a near-copy of
+    `linker_common::parse_linker_args`. Whichever copy was forgotten failed
+    *silently*: measured before the parsers were merged, 21 flags known to
+    args.rs were dropped on the .so path. Two had user-visible consequences and
+    are pinned here, both against ld.bfd:
+
+      -Map=FILE   wrote a map for executables, nothing at all for .so
+      --defsym    bfd emitted the alias symbol, lccc emitted none
+
+    A single-parser regression would silently drop these again, so this test
+    is the guard for the whole class, not just the two instances.
+    """
+    name = "so_shared_flag_parity"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "lib.c"), "w") as f:
+            f.write("int keep_me(void){return 42;}\nint other(void){return 7;}\n")
+        r = sh([CC, "-fPIC", "-c", "lib.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "compile failed")
+
+        ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+
+        # --- -Map on a shared library ---
+        r = sh([ld, "-shared", "-Map=m.map", "-o", "a.so", "lib.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"-Map link failed: {r.stderr.decode()[:200]}")
+        mp = os.path.join(td, "m.map")
+        if not os.path.exists(mp) or os.path.getsize(mp) == 0:
+            return Result(name, "FAIL", "-Map wrote no map file for a shared library")
+
+        # The map must agree with the ELF actually emitted, not merely exist.
+        elf = sh(["readelf", "-SW", "a.so"], cwd=td).stdout.decode(errors="replace")
+        secs = {}
+        for line in elf.splitlines():
+            m = re.match(r"\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-f]+)", line)
+            if m:
+                secs[m.group(1)] = int(m.group(2), 16)
+        checked = 0
+        for line in open(mp):
+            m = re.match(r"^(\.[\w.]+)\s+0x([0-9a-f]+)\s+\d+", line)
+            if m and m.group(1) in secs:
+                if secs[m.group(1)] != int(m.group(2), 16):
+                    return Result(name, "FAIL",
+                        f"map address for {m.group(1)} disagrees with the ELF")
+                checked += 1
+        if checked == 0:
+            return Result(name, "FAIL", "map contained no verifiable section rows")
+
+        # --- --defsym on a shared library, compared against bfd ---
+        bfd = shutil.which("ld.bfd")
+        r = sh([ld, "-shared", "--defsym=alias_sym=keep_me", "-o", "d.so", "lib.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"--defsym link failed: {r.stderr.decode()[:200]}")
+        got = sh(["readelf", "--dyn-syms", "-W", "d.so"], cwd=td).stdout.decode(errors="replace")
+        n_lccc = got.count("alias_sym")
+        if bfd:
+            sh([bfd, "-shared", "--defsym=alias_sym=keep_me", "-o", "db.so", "lib.o"], cwd=td)
+            ref = sh(["readelf", "--dyn-syms", "-W", "db.so"], cwd=td).stdout.decode(errors="replace")
+            n_bfd = ref.count("alias_sym")
+            if n_lccc != n_bfd:
+                return Result(name, "FAIL",
+                    f"--defsym alias count {n_lccc} != bfd {n_bfd}")
+        elif n_lccc == 0:
+            return Result(name, "FAIL", "--defsym produced no alias symbol")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def _cxx_eh_local_type_test(args, oracles):
     """Throw a locally-defined class type across several frames.
 
@@ -2939,6 +3014,7 @@ def main():
         results.append(_interpose_test(args, oracles,
             "so_bsymbolic_binds_local", ["-Wl,-Bsymbolic"], "43\n"))
         results.append(_zdefs_test(args, oracles))
+        results.append(_so_shared_flags_test(args, oracles))
 
     if not args.tag or args.tag == "exports":
         if not args.filter or "export_dynamic" in args.filter or "rdynamic" in args.filter:

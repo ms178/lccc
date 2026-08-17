@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–7)
+# LCCC Linker — Follow-Up Plan (Sessions 2–8)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -606,6 +606,82 @@ carries `unsafe`. This is a good illustration of why every one of these
 the per-symbol traffic — it is now dominated by 16 large `to_vec()` calls, i.e.
 the whole-section copies of §4.1b. That remains the top structural item.
 
+## 2f. DONE in session 8 (structural: one argument parser)
+
+Rebased onto **`82356bf`**; the v5 series (S01–S06) is merged upstream.
+This session went after **structural** debt rather than instruction counts.
+
+### S01 — `link_shared`'s duplicate argument parser is gone
+
+This was flagged in §4.6 as *"highest-value structural item"*. It was not a
+tidiness complaint: **21 flags that `args.rs` understood were silently dropped
+on the shared-library path**, because `link_shared` re-implemented parsing in
+~90 private lines. Two were confirmed as real differential failures against
+`ld.bfd` before touching anything:
+
+| flag | executables | shared libraries (before) | bfd |
+|---|---|---|---|
+| `-Map=FILE` | writes a map | **writes nothing** | writes a map |
+| `--defsym=A=B` | emits alias | **emits nothing** | emits alias |
+
+`--gc-sections` and `--wrap` were *also* in the dropped set but turned out to
+behave identically to bfd on the `.so` path anyway — worth stating, because it
+shows the audit was done by measurement, not by listing flag names.
+
+**The documented blocker was real and is now fixed at the root.** `LinkerArgs`
+could not express positional inputs, so it could not represent
+`--whole-archive`, which applies only to archives *following* it. It now has
+`inputs: Vec<InputItem>` — an ordered list of `(name, is_lib, whole_archive)`
+recording the flag state in effect at each input's position. The old
+order-insensitive views (`extra_object_files`, `libs_to_load`) are retained, so
+no existing caller changed. `soname` / `bsymbolic` / `no_undefined` moved into
+`LinkerArgs` too; only the private parser had understood them.
+
+`link_shared`: **233 → 141 lines**, one parser. `--defsym` now applies on the
+`.so` path; `-Map` is threaded into `emit_shared_library` and written from the
+same `output_sections`/`section_map` the ELF is emitted from — the new test
+verifies the map's addresses **against the emitted ELF**, section by section,
+rather than just asserting the file is non-empty.
+
+**A regression this caused, and why that is the interesting part.** Merging the
+parsers immediately broke `-z defs`. The canonical `-z` arm in `args.rs`
+matched first and threw the keyword away — its comment claimed `defs` was
+*"accepted elsewhere"*, which had been true only because the private parser
+handled it. The later `-z defs` branch I added was therefore unreachable dead
+code. The existing `so_z_defs_rejects_undefined` differential test caught it
+within one run. Two lessons: **a comment asserting that something is handled
+elsewhere becomes a lie the moment "elsewhere" is deleted**, and **when
+merging two implementations, the first matching arm wins — a duplicate arm
+added later is silently dead**.
+
+New tests: 4 unit tests pinning positional semantics (`--whole-archive` in both
+bare and `-Wl,` spellings, command-line ordering, legacy views still
+populated), plus differential `so_shared_flag_parity`, which guards the whole
+flag-parity class against bfd. **Mutation-verified**: it fails on the
+pre-refactor linker with *"-Map wrote no map file for a shared library"*.
+
+### S02 — exact symbol-count reservation
+
+DHAT showed the `Elf64Symbol` vector growing one element at a time: 15
+reallocations, 3.1 MB of memcpy per 20 000-symbol object. `sym_count` was
+already computed exactly two lines earlier.
+
+  allocated **22.03 MB → 19.85 MB (−9.9 %)**, Ir 63,764,826 → 63,661,670.
+
+Byte-identical output. 755 unit + 138 differential + 15 workloads + 800 fuzz
+mutants pass throughout.
+
+### Still open (unchanged priority order)
+
+1. **§4.1b borrowed / mmap section data** — `to_vec` is now only **16 calls but
+   2.68 %** of the link: the whole-section copies. This is the last large
+   structural item and needs the staged, span-driven approach; `section_data`
+   is read at 56 sites in 18 files but **mutated at none of them** after
+   construction, which is what makes a copy-on-write or borrowed representation
+   viable.
+2. §4.2 parallel store path — still blocked on hardware (2 vCPU here).
+3. §4.3 ICF apply — the main remaining *size* lever.
+
 ## 3. Current scoreboard
 
 **Correctness (end of session 4):** **730 unit tests, 136 differential tests**
@@ -790,7 +866,9 @@ harder — this session's campaign was dominated by `.o` mutants.
   `link_shared` also drives *positional* archive handling
   (`--whole-archive` regions, `--start-group`), which `LinkerArgs` does not
   model. Fix that first — give `LinkerArgs` an ordered input list — then delete
-  the duplicate. **Highest-value structural item after the ones below.**
+  the duplicate. **DONE in session 8 (§2f S01):** `LinkerArgs::inputs` models
+  the ordered, positional input list and the private parser is deleted; this
+  fixed `-Map` and `--defsym` on the `.so` path.
 
 ---
 
