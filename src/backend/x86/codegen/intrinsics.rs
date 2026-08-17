@@ -2229,6 +2229,18 @@ impl X86Codegen {
                     self.avx_store_dest(d);
                 }
             }
+            IntrinsicOp::VecLoadI64x2 => {
+                // Load two I64 lanes (movdqu). Same addressing as VecLoadF64x2.
+                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
+                match &index {
+                    Some(ix) => self.state.emit_fmt(format_args!("    movdqu (%{},%{}), %xmm0", base, ix)),
+                    None => self.state.emit_fmt(format_args!("    movdqu (%{}), %xmm0", base)),
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
             IntrinsicOp::VecLoadF64x2 => {
                 // %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64.
                 let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
@@ -2276,6 +2288,11 @@ impl X86Codegen {
             IntrinsicOp::VecAddF64x2 => {
                 if let Some(d) = dest {
                     self.emit_sse_binary_128(d, args, "addpd");
+                }
+            }
+            IntrinsicOp::VecAddI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "paddq");
                 }
             }
             IntrinsicOp::VecMulF64x4 => {
@@ -2336,6 +2353,23 @@ impl X86Codegen {
                 self.state.emit("    movapd %xmm0, %xmm1");
                 self.state.emit("    unpckhpd %xmm0, %xmm1"); // xmm1 = {hi, hi}
                 self.state.emit("    addsd %xmm1, %xmm0");    // xmm0.lo = lo + hi
+                self.state.emit("    movq %xmm0, %rax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecHorizontalAddI64x2 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // 2×I64 → I64 horizontal sum
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state.emit("    movdqu (%rax), %xmm0");
+                }
+                self.state.emit("    pshufd $0xEE, %xmm0, %xmm1"); // xmm1 = {hi, hi}
+                self.state.emit("    paddq %xmm1, %xmm0");
                 self.state.emit("    movq %xmm0, %rax");
                 if let Some(d) = dest {
                     self.store_rax_to(d);
@@ -2522,6 +2556,17 @@ impl X86Codegen {
                     if let Some(slot) = self.state.get_slot(d.0) {
                         // Store zero vector directly to stack slot
                         self.state.out.emit_instr_reg_rbp("    movupd", "xmm0", slot.0 as i64);
+                    }
+                }
+            }
+            IntrinsicOp::VecZeroI64x2 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.state.emit("    pxor %xmm0, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.state.out.emit_instr_reg_rbp("    movdqu", "xmm0", slot.0 as i64);
                     }
                 }
             }

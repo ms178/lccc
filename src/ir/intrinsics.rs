@@ -251,6 +251,8 @@ pub enum IntrinsicOp {
     VecStoreI32x4,
     /// Load two signed I32 lanes and widen to two I64 lanes.
     VecLoadWidenI32ToI64x2,
+    /// Load two I64 lanes (movdqu).
+    VecLoadI64x2,
     VecAddI64x2,
     VecMulI64x2,
 
@@ -1006,7 +1008,7 @@ impl IntrinsicOp {
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
             | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecZeroF32x4
-            | VecLoadWidenI32ToI64x2 | VecAddI64x2 | VecMulI64x2 | VecZeroI64x2
+            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecZeroI64x2
             | VecMulI32x4 | VecBroadcastI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
@@ -1082,7 +1084,7 @@ impl IntrinsicOp {
             IntrinsicOp::VecAddF32x8 | IntrinsicOp::VecAddF32x4 |
             IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
             IntrinsicOp::VecMulF32x8 | IntrinsicOp::VecMulF32x4
-            | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecLoadI64x2
             | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
             | IntrinsicOp::VecZeroI64x2
             | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4

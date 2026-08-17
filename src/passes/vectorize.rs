@@ -202,7 +202,9 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 if debug {
                     eprintln!("[VEC] Skip reduction: constant trip count < 2x vector width ({})", vec_width);
                 }
-            } else if use_sse2 {
+            } else if use_sse2 || red_pattern.element_type == IrType::I64 {
+                // I64 AVX2 4-wide path not wired yet; 2-wide SSE/AVX is competitive
+                // and beats scalar (Godbolt: GCC/Clang/ICX all vectorize I64 sums).
                 if debug {
                     eprintln!("[VEC] Reduction pattern matched! Transforming to SSE2 2-wide");
                 }
@@ -4719,6 +4721,22 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 IntrinsicOp::HorizontalAddI32x4,
             )
         },
+        IrType::I64 => {
+            // Pure I64 sum: 2-wide via SSE2/AVX movdqu + paddq.
+            if pattern.kind == ReductionKind::DotProduct {
+                if debug {
+                    eprintln!("[VEC-RED] I64 dot product not yet supported on SSE2 path");
+                }
+                return 0;
+            }
+            (
+                2u64,
+                IntrinsicOp::VecLoadI64x2,
+                IntrinsicOp::VecAddI64x2,
+                None,
+                IntrinsicOp::VecHorizontalAddI64x2,
+            )
+        },
         IrType::F32 => (
             4u64,
             IntrinsicOp::VecLoadF32x4,
@@ -4985,6 +5003,11 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 ),
                 IntrinsicOp::VecLoadWidenI32ToI64x2 => (
                     IntrinsicOp::VecLoadWidenI32ToI64x2,
+                    IntrinsicOp::VecAddI64x2,
+                    IntrinsicOp::VecZeroI64x2,
+                ),
+                IntrinsicOp::VecLoadI64x2 => (
+                    IntrinsicOp::VecLoadI64x2,
                     IntrinsicOp::VecAddI64x2,
                     IntrinsicOp::VecZeroI64x2,
                 ),
