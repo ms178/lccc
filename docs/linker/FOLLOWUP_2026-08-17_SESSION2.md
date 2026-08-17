@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–8)
+# LCCC Linker — Follow-Up Plan (Sessions 2–9)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -682,6 +682,77 @@ mutants pass throughout.
 2. §4.2 parallel store path — still blocked on hardware (2 vCPU here).
 3. §4.3 ICF apply — the main remaining *size* lever.
 
+## 2g. DONE in session 9 (§4.1b closed: zero-copy section data)
+
+Rebased onto **`09b2fba`**. This closes the last large structural item.
+
+| Step | Ir | Δ |
+|---|---:|---:|
+| v7 baseline on `09b2fba` | 63,661,653 | — |
+| **S01** share the input buffer | 62,244,479 | **−2.2%** |
+| **S02** share the archive buffer (300-member archive) | 71,972,444 (from 72,189,607) | −0.3% |
+
+`to_vec` in the parse path: **1,709,063 → 34 Ir**. Total `memcpy`: **9.78 % →
+7.17 %** of the link.
+
+**`SectionData` is an `Arc<[u8]>` window, not a borrow.** The obvious fix —
+`Vec<&'a [u8]>` into the file buffer — cannot work here, recorded so it is not
+re-litigated: the buffer is a *local* `Vec` inside `load_file` while the
+`Elf64Object` outlives it; archive members are read into temporaries with no
+single buffer to borrow; and some sections are *synthesised* (`strmerge` pools,
+`linker_entry`), so no lifetime describes every case. `Deref<Target = [u8]>`
+made it a genuine drop-in: `section_data` is read at **56 sites in 18 files**
+and the type change produced **four** compile errors, all at synthesising sites.
+
+### The detour that matters most
+
+The first working version was **1.4 M Ir *slower* than baseline** even though it
+removed the copy. Indexing through `SectionData`'s `Deref` re-derives a
+bounds-checked subslice on *every* access, and the symbol loop touches its
+section ~6 times per symbol. Binding `as_slice()` once per section recovered all
+of it and more. **Removing a copy is not automatically a win if the replacement
+adds per-access work** — this would have shipped as a regression had the profile
+not been re-read after the change rather than only before it.
+
+### Two negative results (do not retry)
+
+* **`Vec<u8> → Arc<[u8]>` always copies.** An "exact-size read"
+  (`File::open` + `metadata` + `read_to_end` + `shrink_to_fit`) to stop
+  `fs::read`'s over-allocation forcing a realloc changed *nothing*. A
+  standalone experiment showed why: an `Arc` stores refcounts in a header ahead
+  of the payload, so it can never adopt a plain `Vec`'s allocation. Removing
+  that final copy needs **`mmap`**, not a smarter read.
+* `--whole-archive` on a standard link is **rejected with an explicit
+  diagnostic** (only supported with `-T`/`-r`), so archive benchmarks must use a
+  normal link.
+
+### A flaky test, fixed
+
+The four `ordered_input_tests` from session 8 shared one temp directory keyed
+on the PID. `cargo test` runs them concurrently in one binary, so whichever
+finished first deleted the others' input files:
+`whole_archive_positional_via_wl` passed in isolation and failed in a full run.
+Each call now gets a unique directory; verified stable over five consecutive
+full runs. **A flaky test is worse than a failing one — it trains you to rerun
+instead of investigate.**
+
+### Verification
+
+762 unit · 138 differential (bfd/mold/wild) · 15 real workloads · 800 fuzz
+mutants · Valgrind clean. Output byte-identical against a **separately built
+baseline binary** on three distinct parse routes: the 20 k-symbol link, a
+dynamic libc link (which runs correctly), and an archive link.
+`parsed_sections_alias_the_input_buffer` asserts section bytes live *inside* the
+input allocation — the structural form of "no copy happened", since Ir counts
+would be flaky in a unit test. **Mutation-verified**: restoring `to_vec()` fails
+it with *"it was COPIED"*.
+
+### Remaining structural work
+
+1. **`mmap` input files** — now the only way to remove the last whole-file copy.
+2. §4.2 parallel store path — still blocked on hardware (2 vCPU here).
+3. §4.3 ICF apply — the main remaining *size* lever.
+
 ## 3. Current scoreboard
 
 **Correctness (end of session 4):** **730 unit tests, 136 differential tests**
@@ -795,17 +866,11 @@ line rustc echoed. Spans crossing a newline or a comment are refused outright
 and left for hand-fixing — about 10 sites, all in struct literals whose next
 field followed a comment.
 
-### 4.1b Borrowed / mmap section data — **next, now the top cost**
+### 4.1b Borrowed / mmap section data — **DONE in session 9 (§2g)**
 
-Still open, and now the single largest item: `__memcpy_avx_unaligned_erms` is
-**8.71% of all instructions**, the #1 self cost in the post-S22 profile.
-`parse_elf64_object` copies every section with `to_vec()` (`parse_object.rs`
-:127) after `std::fs::read` already copied the whole file. The remaining 20 234
-allocations are dominated by these section buffers plus the `Elf64Symbol` vec
-growth (3.1 MB in 16 blocks). An arena/lifetime model or `mmap` removes the
-copy; policy prefers a small `unsafe` mmap wrapper over adding `memmap2`.
-`section_data` is referenced 56× across 18 files, so this needs the same
-staged, span-driven approach that worked for `SymStr`.
+Section data now shares the input buffer via `SectionData` (`Arc<[u8]>`
+windows). What remains of this item is only `mmap`, to remove the single
+remaining whole-file copy; see §2g for why no `Vec`-side trick can.
 
 ### 4.2 Wire the parallel store path into `emit_exec`
 

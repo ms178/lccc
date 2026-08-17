@@ -4,6 +4,7 @@
 //! in x86/linker/elf.rs, arm/linker/elf.rs, and riscv/linker/elf_read.rs.
 //! The only parameter that differed was the expected e_machine value.
 
+use super::secdata::SectionData;
 use super::SymStr;
 use crate::backend::elf::{
     ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL,
@@ -16,7 +17,43 @@ use super::types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object};
 ///
 /// `expected_machine` is the ELF e_machine value to validate (e.g., EM_X86_64,
 /// EM_AARCH64, EM_RISCV). Pass 0 to skip machine validation.
+/// Parse an ELF64 object, **sharing** the caller's file buffer.
+///
+/// `buf` is the whole file (or whole archive) already in memory; the object
+/// occupies `buf[base .. base + size]`. Section contents become windows into
+/// `buf` rather than copies of it — see `secdata.rs` for why this is an
+/// `Arc<[u8]>` window and not a borrow with a lifetime.
+///
+/// Prefer this over [`parse_elf64_object`] on any hot path: the latter has to
+/// copy the input into a fresh `Arc` because it only receives a slice.
+pub fn parse_elf64_object_at(
+    buf: &std::sync::Arc<[u8]>,
+    base: usize,
+    size: usize,
+    source_name: &str,
+    expected_machine: u16,
+) -> Result<Elf64Object, String> {
+    let Some(data) = buf.get(base..base.checked_add(size).unwrap_or(usize::MAX)) else {
+        return Err(format!("{}: object extends past end of buffer", source_name));
+    };
+    parse_elf64_object_inner(data, Some((buf, base)), source_name, expected_machine)
+}
+
+/// Parse an ELF64 object from a standalone slice.
+///
+/// Convenience wrapper for callers that do not hold an `Arc` buffer; it copies
+/// `data` once so section windows have something to share. Hot paths should
+/// use [`parse_elf64_object_at`].
 pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16) -> Result<Elf64Object, String> {
+    parse_elf64_object_inner(data, None, source_name, expected_machine)
+}
+
+fn parse_elf64_object_inner(
+    data: &[u8],
+    shared: Option<(&std::sync::Arc<[u8]>, usize)>,
+    source_name: &str,
+    expected_machine: u16,
+) -> Result<Elf64Object, String> {
     if data.len() < 64 {
         return Err(format!("{}: file too small for ELF header", source_name));
     }
@@ -113,18 +150,43 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
         }
     }
 
-    // Read section data
+    // Point each section at its bytes.
+    //
+    // When the caller supplied the backing buffer (`shared`), this is a pure
+    // window: one refcount bump, zero bytes copied. `std::fs::read` has
+    // already paid for one copy of the file; the `to_vec()` this replaces was
+    // a second one, worth 2.68% of a 20 000-symbol link.
+    //
+    // Callers that only have a slice fall back to owning a private copy of
+    // the whole input once, which is still no worse than per-section copies.
+    let owned_buf: Option<std::sync::Arc<[u8]>> = match shared {
+        Some(_) => None,
+        None => Some(std::sync::Arc::from(data)),
+    };
+    let (backing, origin) = match shared {
+        Some((buf, base)) => (buf, base),
+        // SAFETY-free: `owned_buf` is Some on this branch by construction.
+        None => (owned_buf.as_ref().unwrap(), 0usize),
+    };
+
     let mut section_data = Vec::with_capacity(e_shnum);
     for sec in &sections {
         if sec.sh_type == SHT_NOBITS || sec.size == 0 {
-            section_data.push(Vec::new());
+            section_data.push(SectionData::empty());
         } else {
             let start = sec.offset as usize;
             let len = sec.size as usize;
-            let Some(bytes) = slice_at(data, start, len) else {
+            // Validate against the object's own extent first, so a section
+            // that escapes this object but happens to land inside a larger
+            // shared buffer (an archive member reading its neighbour) is still
+            // rejected.
+            if slice_at(data, start, len).is_none() {
+                return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
+            }
+            let Some(sd) = SectionData::slice(backing, origin + start, len) else {
                 return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
             };
-            section_data.push(bytes.to_vec());
+            section_data.push(sd);
         }
     }
 
@@ -133,12 +195,16 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
     for i in 0..sections.len() {
         if sections[i].sh_type == SHT_SYMTAB {
             let strtab_idx = sections[i].link as usize;
-            let strtab_data = if strtab_idx < section_data.len() {
-                &section_data[strtab_idx]
+            let strtab_data: &[u8] = if strtab_idx < section_data.len() {
+                section_data[strtab_idx].as_slice()
             } else {
                 continue;
             };
-            let sym_data = &section_data[i];
+            // Bind the backing slice once. Indexing through `SectionData`'s
+            // Deref re-derives a bounds-checked subslice on *every* access,
+            // and this loop touches it ~6 times per symbol; measured, that
+            // cost more than the section copy this type removed.
+            let sym_data: &[u8] = section_data[i].as_slice();
             let sym_count = sym_data.len() / 24; // sizeof(Elf64_Sym) = 24
             // Reserve the exact count up front. Growing one element at a time
             // reallocated 15 times and memcpy'd 3.1 MB of Elf64Symbol on a
@@ -187,7 +253,7 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
     for i in 0..sections.len() {
         if sections[i].sh_type == SHT_RELA {
             let target_sec = sections[i].info as usize;
-            let rela_data = &section_data[i];
+            let rela_data: &[u8] = section_data[i].as_slice();
             let rela_count = rela_data.len() / 24; // sizeof(Elf64_Rela) = 24
             let mut relas = Vec::with_capacity(rela_count);
             for j in 0..rela_count {

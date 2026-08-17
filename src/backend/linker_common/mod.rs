@@ -75,6 +75,7 @@ mod gc_sections;
 mod mapfile;
 mod version_script;
 mod symstr;
+mod secdata;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -85,7 +86,7 @@ mod symstr;
 pub use types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object, DynSymbol};
 
 // parse_object.rs
-pub use parse_object::parse_elf64_object;
+pub use parse_object::{parse_elf64_object, parse_elf64_object_at};
 pub use section_map::map_section_name;
 
 // parse_shared.rs
@@ -99,6 +100,7 @@ pub use hash::{gnu_hash, sysv_hash};
 
 // symstr.rs
 pub use symstr::SymStr;
+pub use secdata::SectionData;
 
 // version_script.rs
 pub use version_script::VersionScript;
@@ -123,7 +125,7 @@ pub use dynamic::{
 };
 
 // archive.rs
-pub use archive::{load_archive_elf64, load_thin_archive_elf64};
+pub use archive::{load_archive_elf64, load_archive_elf64_shared, load_thin_archive_elf64};
 
 // resolve_lib.rs
 pub use resolve_lib::resolve_lib;

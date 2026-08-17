@@ -19,6 +19,7 @@
 //! recovered (bias unknown), or when its payload does not cleanly divide into
 //! entries. Correctness always wins over size.
 
+use super::SectionData;
 use super::SymStr;
 use crate::common::fx_hash::FxHashMap;
 
@@ -314,7 +315,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
         name_idx: 0, name: String::new(), sh_type: 0, flags: 0, addr: 0,
         offset: 0, size: 0, link: 0, info: 0, addralign: 0, entsize: 0,
     }];
-    let mut section_data = vec![Vec::new()];
+    let mut section_data = vec![SectionData::empty()];
     let mut symbols = Vec::new();
     for (i, pool) in plan.pools.iter().enumerate() {
         let shndx = sections.len() as u16;
@@ -328,7 +329,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
             size: pool.data.len() as u64, link: 0, info: 0,
             addralign: pool.align, entsize: 0,
         });
-        section_data.push(pool.data.clone());
+        section_data.push(SectionData::owned(pool.data.clone()));
         let sym = Elf64Symbol {
             name_idx: 0, name: SymStr::new(&pool_sym_name(i)),
             // LOCAL binding in the DEFINITION keeps the pool symbol out of
@@ -394,7 +395,7 @@ mod tests {
                 flags, addr: 0, offset: 0, size: data.len() as u64,
                 link: 0, info: 0, addralign: 1, entsize,
             });
-            section_data.push(data);
+            section_data.push(SectionData::owned(data));
         }
         let n = sections.len();
         Elf64Object {

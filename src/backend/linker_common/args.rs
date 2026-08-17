@@ -367,7 +367,17 @@ mod ordered_input_tests {
     /// Create real files, because `parse_linker_args` only accepts bare paths
     /// that exist on disk (it must not mistake a stray token for an input).
     fn with_files<T>(names: &[&str], f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let td = std::env::temp_dir().join(format!("lccc_args_{}", std::process::id()));
+        // Unique per call, not just per process: `cargo test` runs these
+        // concurrently in one binary, so a directory keyed only on the PID is
+        // shared between tests and the first one to finish deletes the others'
+        // files out from under them. That produced a genuinely flaky failure
+        // (whole_archive_positional_via_wl passed in isolation, failed in a
+        // full run) which is far worse than an outright bug: it trains you to
+        // rerun instead of investigate.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let td = std::env::temp_dir()
+            .join(format!("lccc_args_{}_{}", std::process::id(), uniq));
         std::fs::create_dir_all(&td).unwrap();
         for n in names {
             std::fs::write(td.join(n), b"").unwrap();

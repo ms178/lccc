@@ -49,7 +49,7 @@ pub fn merge_sections(
                         name: out_name.clone(),
                         sh_type: sec.sh_type,
                         sh_flags: sec.flags,
-                        data: sec_data.clone(),
+                        data: sec_data.to_owned_vec(),
                         vaddr: 0,
                         align: sec.addralign.max(1),
                     });

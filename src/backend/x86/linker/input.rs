@@ -7,6 +7,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use super::elf::*;
+use super::elf::parse_object_shared;
 use crate::backend::linker_common;
 use super::types::{GlobalSymbol, x86_should_replace_extra};
 
@@ -19,11 +20,25 @@ pub(super) fn load_file(
         eprintln!("load_file: {}", path);
     }
 
-    let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
+    // Read the file once into a shared buffer.
+    //
+    // Section contents of the parsed object become windows into this
+    // allocation rather than per-section copies (see `secdata.rs`).
+    //
+    // Note: `Vec<u8> -> Arc<[u8]>` *always* copies, and no amount of capacity
+    // trimming avoids it -- an `Arc` stores its refcounts in a header ahead of
+    // the payload, so it can never adopt a plain `Vec`'s allocation. Verified
+    // experimentally; an "exact-size read" attempt here changed nothing and
+    // was reverted. Eliminating this last copy needs `mmap` (tracked in the
+    // follow-up doc), not a smarter read. It is one copy of the file total,
+    // which is what `fs::read` alone already cost before this work.
+    let data: std::sync::Arc<[u8]> = std::fs::read(path)
+        .map_err(|e| format!("failed to read '{}': {}", path, e))?
+        .into();
 
     // Regular archive
     if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-        return linker_common::load_archive_elf64(&data, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
+        return linker_common::load_archive_elf64_shared(&data, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
     }
 
     // Thin archive
@@ -70,7 +85,7 @@ pub(super) fn load_file(
     }
 
     // Regular ELF object
-    let obj = parse_object(&data, path)?;
+    let obj = parse_object_shared(&data, 0, data.len(), path)?;
     let obj_idx = objects.len();
     linker_common::register_symbols_elf64(obj_idx, &obj, globals, x86_should_replace_extra)?;
     objects.push(obj);

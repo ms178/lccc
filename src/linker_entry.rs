@@ -29,8 +29,9 @@ pub fn append_build_id_object(objects: &mut Vec<Elf64Object>) {
         },
     ];
     let section_data = vec![
-        Vec::new(),
-        vec![0u8; crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE as usize],
+        crate::backend::linker_common::SectionData::empty(),
+        crate::backend::linker_common::SectionData::owned(
+            vec![0u8; crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE as usize]),
     ];
     objects.push(Elf64Object {
         sections, symbols: Vec::new(), section_data,
