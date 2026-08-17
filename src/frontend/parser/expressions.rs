@@ -229,7 +229,7 @@ impl Parser {
                 // GCC extension: &&label (address of label, for computed goto)
                 let span = self.peek_span();
                 if self.pos + 1 < self.tokens.len() {
-                    if let TokenKind::Identifier(ref name) = self.tokens[self.pos + 1].kind {
+                    if let TokenKind::Identifier(ref name) = *self.peek_nth(1) {
                         let label_name = name.clone();
                         self.advance(); // consume &&
                         self.advance(); // consume identifier
@@ -531,7 +531,8 @@ impl Parser {
                 Expr::ImaginaryLiteralLongDouble(val, bytes, span)
             }
             TokenKind::StringLiteral(s) => {
-                let mut result = s.clone();
+                let mut result = String::with_capacity(s.len() + 16);
+                result.push_str(s);
                 let span = self.peek_span();
                 self.advance();
                 // Concatenate adjacent string literals. If any is wide/char16, result upgrades.
@@ -565,7 +566,8 @@ impl Parser {
                 }
             }
             TokenKind::WideStringLiteral(s) => {
-                let mut result = s.clone();
+                let mut result = String::with_capacity(s.len() + 16);
+                result.push_str(s);
                 let span = self.peek_span();
                 self.advance();
                 // Concatenate adjacent string literals (wide + narrow = wide)

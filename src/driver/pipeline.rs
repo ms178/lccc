@@ -1189,6 +1189,7 @@ impl Driver {
         let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
         lexer.set_gnu_extensions(self.gnu_extensions);
         let tokens = lexer.tokenize();
+        let lexer_diags = std::mem::take(&mut lexer.diagnostics);
         if time_phases {
             eprintln!(
                 "[TIME] lex: {:.3}s ({} tokens)",
@@ -1206,6 +1207,11 @@ impl Driver {
         // backward-compatible span_to_location() calls.
         let t2 = std::time::Instant::now();
         diagnostics.set_source_manager(source_manager);
+        // Surface lexer diagnostics after the source manager is attached so
+        // spans resolve to file:line:col.
+        for (msg, span) in lexer_diags {
+            diagnostics.error(msg, span);
+        }
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
         let ast = parser.parse();
