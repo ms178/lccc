@@ -324,6 +324,30 @@ impl Parser {
         self.diagnostics.error(message, span);
     }
 
+    /// Panic-mode recovery: skip until a synchronization point.
+    pub(super) fn sync_to(&mut self, stop: &[TokenKind]) {
+        while !matches!(self.peek(), TokenKind::Eof) {
+            let k = self.peek();
+            if stop.iter().any(|s| std::mem::discriminant(k) == std::mem::discriminant(s)) {
+                return;
+            }
+            if matches!(k,
+                TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof
+                | TokenKind::RParen | TokenKind::RBracket
+            ) {
+                return;
+            }
+            self.advance();
+        }
+    }
+
+    pub(super) fn sync_after_error(&mut self) {
+        self.sync_to(&[TokenKind::Semicolon, TokenKind::RBrace]);
+        if matches!(self.peek(), TokenKind::Semicolon) {
+            self.advance();
+        }
+    }
+
     /// Standard C typedef names commonly provided by system headers.
     /// Since we don't actually include system headers, we pre-seed these.
     fn builtin_typedefs() -> FxHashSet<String> {
@@ -437,6 +461,9 @@ impl Parser {
         } else {
             let span = self.peek_span();
             self.emit_error(format!("expected {} before {}", expected, self.peek()), span);
+            if matches!(expected, TokenKind::Semicolon) {
+                self.sync_after_error();
+            }
             span
         }
     }

@@ -245,11 +245,12 @@ impl Parser {
         let return_type = self.build_return_type(type_spec, &derived);
 
         // Shadow typedef names used as parameter names
-        let saved_shadowed = self.shadowed_typedefs.clone();
+        let mut shadowed_added: Vec<String> = Vec::new();
         for param in &final_params {
             if let Some(ref pname) = param.name {
                 if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
                     self.shadowed_typedefs.insert(pname.clone());
+                    shadowed_added.push(pname.clone());
                 }
             }
         }
@@ -258,7 +259,9 @@ impl Parser {
         // parse_compound_stmt saves/restores attr flags, so this is safe.
         self.attrs.set_noreturn(false);
         let body = self.parse_compound_stmt();
-        self.shadowed_typedefs = saved_shadowed;
+        for n in shadowed_added {
+            self.shadowed_typedefs.remove(&n);
+        }
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
             return_type,
@@ -1243,8 +1246,8 @@ impl Parser {
         let message = if self.consume_if(&TokenKind::Comma) {
             let mut msg = String::new();
             let mut found_string = false;
-            while let TokenKind::StringLiteral(s) = self.peek().clone() {
-                msg.push_str(&s);
+            while let TokenKind::StringLiteral(s) = self.peek() {
+                msg.push_str(s);
                 found_string = true;
                 self.advance();
             }
