@@ -27,6 +27,8 @@ use crate::common::fx_hash::FxHashMap;
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    /// `SEGMENT_START("name", default)` -- overridable segment base.
+    SegmentStart(String, Box<Expr>),
     Num(u64),
     Sym(String),
     Dot,
@@ -61,6 +63,11 @@ pub struct Assignment {
     pub op: AssignOp,
     pub expr: Expr,
     pub provide: bool,
+    /// `PROVIDE_HIDDEN`/`HIDDEN`: the symbol is defined with STV_HIDDEN, so it
+    /// must not appear in `.dynsym` and cannot be preempted. Dropping this bit
+    /// silently exports internal markers (`__init_array_start` and friends)
+    /// from every shared object that uses a custom script.
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,6 +106,10 @@ pub struct OutputSecDef {
     pub fill: Option<u64>,
     /// ALIGN(..) on the section header line (`.foo : ALIGN(8) { ... }`).
     pub align: Option<Expr>,
+    /// `> region` -- the VMA region this section is placed in.
+    pub region: Option<String>,
+    /// `AT> region` -- the LMA region (load address), for ROM-resident data.
+    pub lma_region: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,11 +128,29 @@ pub struct PhdrDecl {
     pub has_filehdr: bool, // FILEHDR keyword attribute
 }
 
+/// A `MEMORY { name (attrs) : ORIGIN = a, LENGTH = n }` region.
+///
+/// Regions give a script author a declarative way to say "this section lives
+/// in SRAM and SRAM is 64 KiB". The value is not the placement -- an explicit
+/// address does that too -- but the *overflow check*: running out of a region
+/// is diagnosed by name instead of producing an image that silently overlaps.
+#[derive(Debug, Clone)]
+pub struct MemoryRegion {
+    pub name: String,
+    pub origin: Expr,
+    pub length: Expr,
+    /// Attribute letters between the parentheses (`rwx`, `!r`, ...). Retained
+    /// verbatim; ELF output has no place for them, but they must parse.
+    pub attrs: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LinkerScript {
     pub entry: Option<String>,
     pub phdrs: Vec<PhdrDecl>,
     pub sections: Vec<SectionsItem>,
+    /// `MEMORY { ... }` regions, in declaration order.
+    pub memory: Vec<MemoryRegion>,
     /// Assignments and asserts appearing outside SECTIONS (evaluated after layout
     /// if they reference section-defined symbols).
     pub top_assigns: Vec<Assignment>,
@@ -356,14 +385,21 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
                     expect(&mut lx, "{")?;
                     parse_sections_body(&mut lx, &mut script.sections)?;
                 }
+                "MEMORY" => {
+                    expect(&mut lx, "{")?;
+                    parse_memory_body(&mut lx, &mut script.memory)?;
+                }
                 "ASSERT" => {
                     let (e, msg) = parse_assert_args(&mut lx)?;
                     script.top_asserts.push((e, msg));
                     eat_semi(&mut lx);
                 }
-                "PROVIDE" | "PROVIDE_HIDDEN" => {
+                "PROVIDE" | "PROVIDE_HIDDEN" | "HIDDEN" => {
                     expect(&mut lx, "(")?;
-                    let a = parse_assignment_inner(&mut lx, true)?;
+                    // HIDDEN(x = e) defines unconditionally; PROVIDE* only if
+                    // the symbol is still undefined.
+                    let a = parse_assignment_inner(
+                        &mut lx, kw != "HIDDEN", kw != "PROVIDE")?;
                     expect(&mut lx, ")")?;
                     eat_semi(&mut lx);
                     script.top_assigns.push(a);
@@ -445,17 +481,80 @@ fn try_parse_assignment(lx: &mut Lexer) -> Result<Option<Assignment>, String> {
     };
     let expr = parse_expr(lx)?;
     eat_semi(lx);
-    Ok(Some(Assignment { symbol: name, op, expr, provide: false }))
+    Ok(Some(Assignment { symbol: name, op, expr, provide: false, hidden: false }))
 }
 
-fn parse_assignment_inner(lx: &mut Lexer, provide: bool) -> Result<Assignment, String> {
+fn parse_assignment_inner(lx: &mut Lexer, provide: bool, hidden: bool)
+    -> Result<Assignment, String>
+{
     let name = match lx.next() {
         Tok::Ident(n) => n,
-        t => return Err(format!("expected symbol in PROVIDE, got {:?}", t)),
+        t => return Err(format!("expected symbol in PROVIDE/HIDDEN, got {:?}", t)),
     };
     expect(lx, "=")?;
     let expr = parse_expr(lx)?;
-    Ok(Assignment { symbol: name, op: AssignOp::Set, expr, provide })
+    Ok(Assignment { symbol: name, op: AssignOp::Set, expr, provide, hidden })
+}
+
+/// Parse a `MEMORY { name (attrs) : ORIGIN = expr, LENGTH = expr  ... }` body.
+///
+/// GNU ld accepts `org`/`o` and `len`/`l` as abbreviations, and allows the
+/// attribute list to be omitted entirely. Both are accepted here because real
+/// firmware scripts use them interchangeably.
+fn parse_memory_body(lx: &mut Lexer, out: &mut Vec<MemoryRegion>) -> Result<(), String> {
+    loop {
+        match lx.next() {
+            Tok::Punct("}") => return Ok(()),
+            Tok::Eof => return Err("unterminated MEMORY block".to_string()),
+            Tok::Ident(name) => {
+                let mut attrs = String::new();
+                let save = lx.save();
+                if lx.next() == Tok::Punct("(") {
+                    // Attribute letters, possibly several tokens (`!`, `rwx`).
+                    loop {
+                        match lx.next() {
+                            Tok::Punct(")") => break,
+                            Tok::Eof => return Err("unterminated MEMORY attributes".into()),
+                            Tok::Ident(a) => attrs.push_str(&a),
+                            Tok::Punct(p) => attrs.push_str(p),
+                            t => return Err(format!("bad MEMORY attribute {:?}", t)),
+                        }
+                    }
+                } else {
+                    lx.restore(save);
+                }
+                expect(lx, ":")?;
+                let mut origin = None;
+                let mut length = None;
+                // ORIGIN = e , LENGTH = e   (either order, comma optional)
+                for _ in 0..2 {
+                    let save = lx.save();
+                    match lx.next() {
+                        Tok::Ident(k) => {
+                            let key = k.to_ascii_uppercase();
+                            expect(lx, "=")?;
+                            let e = parse_expr(lx)?;
+                            if key == "ORIGIN" || key == "ORG" || key == "O" {
+                                origin = Some(e);
+                            } else if key == "LENGTH" || key == "LEN" || key == "L" {
+                                length = Some(e);
+                            } else {
+                                return Err(format!("unknown MEMORY key '{}'", k));
+                            }
+                            let save2 = lx.save();
+                            if lx.next() != Tok::Punct(",") { lx.restore(save2); }
+                        }
+                        _ => { lx.restore(save); break; }
+                    }
+                }
+                let (Some(origin), Some(length)) = (origin, length) else {
+                    return Err(format!("MEMORY region '{}' needs both ORIGIN and LENGTH", name));
+                };
+                out.push(MemoryRegion { name, origin, length, attrs });
+            }
+            t => return Err(format!("unexpected token in MEMORY block: {:?}", t)),
+        }
+    }
 }
 
 fn parse_sections_body(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), String> {
@@ -469,13 +568,14 @@ fn parse_sections_body(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<()
                 eat_semi(lx);
                 out.push(SectionsItem::Assert(e, msg));
             }
-            Tok::Ident(kw) if kw == "PROVIDE" || kw == "PROVIDE_HIDDEN" => {
+            Tok::Ident(kw) if kw == "PROVIDE" || kw == "PROVIDE_HIDDEN" || kw == "HIDDEN" => {
                 expect(lx, "(")?;
-                let a = parse_assignment_inner(lx, true)?;
+                let a = parse_assignment_inner(lx, kw != "HIDDEN", kw != "PROVIDE")?;
                 expect(lx, ")")?;
                 eat_semi(lx);
                 out.push(SectionsItem::Assign(a));
             }
+            Tok::Ident(kw) if kw == "OVERLAY" => parse_overlay(lx, out)?,
             Tok::Ident(_name) => {
                 lx.restore(save);
                 // assignment or output section definition?
@@ -491,6 +591,171 @@ fn parse_sections_body(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<()
     }
 }
 
+/// Parse the `{ ... }` body of an output section into `def`.
+///
+/// Shared by ordinary output sections and OVERLAY members: the body
+/// grammar is identical, and duplicating it would let the two drift.
+/// Parse `OVERLAY [start] : [AT(lma)] { .a { ... } .b { ... } } [>region]`.
+///
+/// Overlay members all share one VMA -- they are alternative contents for the
+/// same address range, swapped in at runtime -- while their load addresses run
+/// consecutively. GNU ld also defines `__load_start_<name>` and
+/// `__load_stop_<name>` so the copy routine can locate the bytes; an overlay is
+/// unusable without them, so they are emitted here too.
+///
+/// The construct is desugared into ordinary output sections: each member gets
+/// an explicit address equal to the overlay start and an `AT()` naming its own
+/// slot in the load region. Layout downstream needs no concept of overlays.
+fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), String> {
+    let mut start: Option<Expr> = None;
+    loop {
+        let save = lx.save();
+        match lx.next() {
+            Tok::Punct(":") => break,
+            Tok::Eof => return Err("unterminated OVERLAY header".into()),
+            _ => { lx.restore(save); start = Some(parse_expr(lx)?); }
+        }
+    }
+    let mut lma: Option<Expr> = None;
+    loop {
+        let save = lx.save();
+        match lx.next() {
+            Tok::Punct("{") => break,
+            Tok::Ident(k) if k == "AT" => {
+                expect(lx, "(")?;
+                lma = Some(parse_expr(lx)?);
+                expect(lx, ")")?;
+            }
+            Tok::Ident(k) if k == "NOCROSSREFS" => {}
+            t => return Err(format!("unexpected token in OVERLAY header: {:?}", t)),
+        }
+    }
+
+    let base = start.unwrap_or(Expr::Dot);
+    let mut lma_off: Option<Expr> = None;
+    loop {
+        let save = lx.save();
+        match lx.next() {
+            Tok::Punct("}") => break,
+            Tok::Eof => return Err("unterminated OVERLAY body".into()),
+            Tok::Ident(name) => {
+                let _ = save;
+                expect(lx, "{")?;
+                let mut def = OutputSecDef {
+                    name: name.clone(), address: Some(base.clone()), info: false,
+                    at_lma: None, items: Vec::new(), phdrs: Vec::new(),
+                    fill: None, align: None, region: None, lma_region: None,
+                };
+                if let Some(ref l) = lma {
+                    def.at_lma = Some(match lma_off {
+                        None => l.clone(),
+                        Some(ref off) => Expr::Bin(BinOp::Add,
+                            Box::new(l.clone()), Box::new(off.clone())),
+                    });
+                }
+                parse_output_section_body(lx, &mut def)?;
+                let this_size = Expr::SizeOf(name.clone());
+                lma_off = Some(match lma_off {
+                    None => this_size,
+                    Some(off) => Expr::Bin(BinOp::Add, Box::new(off), Box::new(this_size)),
+                });
+                let sym_base = name.trim_start_matches('.').replace('.', "_");
+                out.push(SectionsItem::Output(def));
+                out.push(SectionsItem::Assign(Assignment {
+                    symbol: format!("__load_start_{}", sym_base),
+                    op: AssignOp::Set, expr: Expr::LoadAddrOf(name.clone()),
+                    provide: true, hidden: false,
+                }));
+                out.push(SectionsItem::Assign(Assignment {
+                    symbol: format!("__load_stop_{}", sym_base),
+                    op: AssignOp::Set,
+                    expr: Expr::Bin(BinOp::Add,
+                        Box::new(Expr::LoadAddrOf(name.clone())),
+                        Box::new(Expr::SizeOf(name.clone()))),
+                    provide: true, hidden: false,
+                }));
+            }
+            t => return Err(format!("unexpected token in OVERLAY body: {:?}", t)),
+        }
+    }
+    // Trailing `>region` / `:phdr` / `= fill` for the overlay as a whole.
+    loop {
+        let save = lx.save();
+        match lx.next() {
+            Tok::Punct(">") | Tok::Punct(":") => { let _ = lx.next(); }
+            Tok::Punct("=") => { let _ = parse_expr(lx)?; }
+            _ => { lx.restore(save); break; }
+        }
+    }
+    Ok(())
+}
+
+fn parse_output_section_body(lx: &mut Lexer, def: &mut OutputSecDef)
+    -> Result<(), String>
+{
+    loop {
+        let save = lx.save();
+        match lx.next() {
+            Tok::Punct("}") => break,
+            Tok::Eof => return Err("unterminated output section".into()),
+            Tok::Ident(kw) if kw == "KEEP" => {
+                expect(lx, "(")?;
+                let mut spec = parse_input_spec(lx)?;
+                spec.keep = true;
+                expect(lx, ")")?;
+                def.items.push(SecItem::Input(spec));
+            }
+            Tok::Ident(kw) if kw == "ASSERT" => {
+                let (e, msg) = parse_assert_args(lx)?;
+                eat_semi(lx);
+                def.items.push(SecItem::Assert(e, msg));
+            }
+            Tok::Ident(kw) if kw == "PROVIDE" || kw == "PROVIDE_HIDDEN" || kw == "HIDDEN" => {
+                expect(lx, "(")?;
+                let a = parse_assignment_inner(lx, kw != "HIDDEN", kw != "PROVIDE")?;
+                expect(lx, ")")?;
+                eat_semi(lx);
+                def.items.push(SecItem::Assign(a));
+            }
+            Tok::Ident(kw) if kw == "CONSTRUCTORS" => {
+                def.items.push(SecItem::Constructors);
+            }
+            Tok::Ident(kw) if kw == "FILL" => {
+                expect(lx, "(")?;
+                let e = parse_expr(lx)?;
+                expect(lx, ")")?;
+                eat_semi(lx);
+                def.fill = eval_const(&e);
+            }
+            Tok::Ident(kw) if kw == "BYTE" || kw == "SHORT" || kw == "LONG" || kw == "QUAD" => {
+                // data directives - record as an input of literal bytes via assignment hack:
+                // represent as ". += N" advance with a fill; rare in kernel scripts (unused).
+                skip_parens(lx)?;
+                eat_semi(lx);
+            }
+            Tok::Ident(_) => {
+                // assignment or file-pattern input spec like *(...) — but '*' is
+                // lexed as Punct, so an Ident here is an assignment.
+                lx.restore(save);
+                if let Some(a) = try_parse_assignment(lx)? {
+                    def.items.push(SecItem::Assign(a));
+                } else {
+                    let _ = lx.next(); // give up on this token
+                }
+            }
+            Tok::Punct("*") => {
+                // *(patterns)
+                lx.restore(save);
+                let spec = parse_input_spec(lx)?;
+                def.items.push(SecItem::Input(spec));
+            }
+            Tok::Punct(";") => {}
+            t => return Err(format!("unexpected token in section body: {:?}", t)),
+        }
+    }
+    Ok(())
+}
+
 fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
     let name = match lx.next() {
         Tok::Ident(n) => n,
@@ -499,6 +764,7 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
     let mut def = OutputSecDef {
         name, address: None, info: false, at_lma: None,
         items: Vec::new(), phdrs: Vec::new(), fill: None, align: None,
+        region: None, lma_region: None,
     };
 
     // optional address expression and/or (INFO)/(NOLOAD) before ':'
@@ -547,72 +813,31 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
         }
     }
 
-    // section body
+    parse_output_section_body(lx, &mut def)?;
+
+    // trailing `> region`, `AT> region`, `:phdr(s)` and `= fill`
     loop {
         let save = lx.save();
         match lx.next() {
-            Tok::Punct("}") => break,
-            Tok::Eof => return Err("unterminated output section".into()),
-            Tok::Ident(kw) if kw == "KEEP" => {
-                expect(lx, "(")?;
-                let mut spec = parse_input_spec(lx)?;
-                spec.keep = true;
-                expect(lx, ")")?;
-                def.items.push(SecItem::Input(spec));
-            }
-            Tok::Ident(kw) if kw == "ASSERT" => {
-                let (e, msg) = parse_assert_args(lx)?;
-                eat_semi(lx);
-                def.items.push(SecItem::Assert(e, msg));
-            }
-            Tok::Ident(kw) if kw == "PROVIDE" || kw == "PROVIDE_HIDDEN" => {
-                expect(lx, "(")?;
-                let a = parse_assignment_inner(lx, true)?;
-                expect(lx, ")")?;
-                eat_semi(lx);
-                def.items.push(SecItem::Assign(a));
-            }
-            Tok::Ident(kw) if kw == "CONSTRUCTORS" => {
-                def.items.push(SecItem::Constructors);
-            }
-            Tok::Ident(kw) if kw == "FILL" => {
-                expect(lx, "(")?;
-                let e = parse_expr(lx)?;
-                expect(lx, ")")?;
-                eat_semi(lx);
-                def.fill = eval_const(&e);
-            }
-            Tok::Ident(kw) if kw == "BYTE" || kw == "SHORT" || kw == "LONG" || kw == "QUAD" => {
-                // data directives - record as an input of literal bytes via assignment hack:
-                // represent as ". += N" advance with a fill; rare in kernel scripts (unused).
-                skip_parens(lx)?;
-                eat_semi(lx);
-            }
-            Tok::Ident(_) => {
-                // assignment or file-pattern input spec like *(...) — but '*' is
-                // lexed as Punct, so an Ident here is an assignment.
-                lx.restore(save);
-                if let Some(a) = try_parse_assignment(lx)? {
-                    def.items.push(SecItem::Assign(a));
-                } else {
-                    let _ = lx.next(); // give up on this token
+            Tok::Punct(">") => {
+                match lx.next() {
+                    Tok::Ident(r) => def.region = Some(r),
+                    t => return Err(format!("expected region name after '>', got {:?}", t)),
                 }
             }
-            Tok::Punct("*") => {
-                // *(patterns)
-                lx.restore(save);
-                let spec = parse_input_spec(lx)?;
-                def.items.push(SecItem::Input(spec));
+            // `AT> region` places the LMA in a different region than the VMA:
+            // the standard idiom for data that lives in ROM and is copied to
+            // RAM at startup.
+            Tok::Ident(kw) if kw == "AT" => {
+                if lx.next() != Tok::Punct(">") {
+                    lx.restore(save);
+                    break;
+                }
+                match lx.next() {
+                    Tok::Ident(r) => def.lma_region = Some(r),
+                    t => return Err(format!("expected region name after 'AT>', got {:?}", t)),
+                }
             }
-            Tok::Punct(";") => {}
-            t => return Err(format!("unexpected token in section body: {:?}", t)),
-        }
-    }
-
-    // trailing :phdr(s) and fill
-    loop {
-        let save = lx.save();
-        match lx.next() {
             Tok::Punct(":") => {
                 if let Tok::Ident(ph) = lx.next() { def.phdrs.push(ph); }
             }
@@ -803,6 +1028,53 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                 expect(lx, ")")?;
                 Ok(Expr::DefinedSym(n))
             }
+            // SEGMENT_START("segment", default) -- the value a linker uses for a
+            // segment's base, overridable with -Ttext/-Tdata/-Tbss or
+            // `-z <seg>=addr`. ld's own default script uses it four times, so
+            // any script derived from `ld --verbose` needs it. Without an
+            // override the documented behaviour is to yield the default, which
+            // is what makes those scripts work unmodified.
+            "SEGMENT_START" => {
+                expect(lx, "(")?;
+                let seg = match lx.next() {
+                    Tok::Str(s) => s,
+                    t => return Err(format!("SEGMENT_START expects a segment name string, got {:?}", t)),
+                };
+                expect(lx, ",")?;
+                let dflt = parse_expr(lx)?;
+                expect(lx, ")")?;
+                Ok(Expr::SegmentStart(seg, Box::new(dflt)))
+            }
+            // DATA_SEGMENT_ALIGN(maxpagesize, commonpagesize) and its END /
+            // RELRO_END partners exist so ld can overlap the end of the data
+            // segment with the start of the next page. The conservative
+            // evaluation -- plain ALIGN to maxpagesize -- is always *correct*;
+            // it merely forgoes a few KiB of file-size overlap. Silently
+            // rejecting the script, which is what happened before, is not.
+            "DATA_SEGMENT_ALIGN" => {
+                expect(lx, "(")?;
+                let a = parse_expr(lx)?;
+                expect(lx, ",")?;
+                let _common = parse_expr(lx)?;
+                expect(lx, ")")?;
+                Ok(Expr::Align1(Box::new(a)))
+            }
+            "DATA_SEGMENT_RELRO_END" => {
+                expect(lx, "(")?;
+                let off = parse_expr(lx)?;
+                // Second argument is the expression to return.
+                let save = lx.save();
+                let ret = if lx.next() == Tok::Punct(",") {
+                    let e = parse_expr(lx)?; expect(lx, ")")?; e
+                } else { lx.restore(save); expect(lx, ")")?; off.clone() };
+                Ok(ret)
+            }
+            "DATA_SEGMENT_END" => {
+                expect(lx, "(")?;
+                let e = parse_expr(lx)?;
+                expect(lx, ")")?;
+                Ok(e)
+            }
             "MIN" | "MAX" => {
                 expect(lx, "(")?;
                 let a = parse_expr(lx)?;
@@ -892,6 +1164,10 @@ pub struct EvalCtx<'a> {
     pub symbols: &'a FxHashMap<String, u64>,
     /// name -> (addr, size, align, lma)
     pub sections: &'a FxHashMap<String, (u64, u64, u64, u64)>,
+    /// Segment base overrides from `-Ttext`/`-Tdata`/`-Tbss` and
+    /// `-z <segment>=<addr>`, consulted by `SEGMENT_START`. Empty by default,
+    /// in which case `SEGMENT_START` yields its declared default.
+    pub segment_starts: Option<&'a FxHashMap<String, u64>>,
 }
 
 pub enum EvalError {
@@ -904,6 +1180,17 @@ pub fn eval_expr(e: &Expr, ctx: &EvalCtx) -> Result<u64, EvalError> {
     match e {
         Expr::Num(n) => Ok(*n),
         Expr::Dot => Ok(ctx.dot),
+        // An explicit -T<seg>/-z override wins; otherwise the script's own
+        // default applies, which is what makes `ld --verbose` output usable
+        // verbatim.
+        Expr::SegmentStart(seg, dflt) => {
+            if let Some(map) = ctx.segment_starts {
+                if let Some(&v) = map.get(seg.as_str()) {
+                    return Ok(v);
+                }
+            }
+            eval_expr(dflt, ctx)
+        }
         Expr::Sym(name) => ctx.symbols.get(name).copied()
             .ok_or_else(|| EvalError::UndefinedSymbol(name.clone())),
         Expr::Neg(x) => Ok(eval_expr(x, ctx)?.wrapping_neg()),
@@ -1115,7 +1402,159 @@ mod tests {
         let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
         let syms = FxHashMap::default();
         let secs = FxHashMap::default();
-        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs };
+        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
         assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x100 + 0x40));
+    }
+
+    // ── MEMORY regions ──────────────────────────────────────────────────
+
+    #[test]
+    fn memory_regions_parse_with_attributes_and_abbreviations() {
+        let s = parse_linker_script(r#"
+            MEMORY {
+              rom (rx)  : ORIGIN = 0x08000000, LENGTH = 256K
+              ram (rwx) : org    = 0x20000000, len    = 64K
+              bare      : ORIGIN = 0, LENGTH = 16
+            }
+            SECTIONS { .text : { *(.text) } > rom }
+        "#).unwrap();
+        assert_eq!(s.memory.len(), 3);
+        assert_eq!(s.memory[0].name, "rom");
+        assert_eq!(s.memory[0].attrs, "rx");
+        // `org`/`len` are the documented abbreviations and appear in real
+        // firmware scripts; rejecting them would be a silent portability wall.
+        assert_eq!(s.memory[1].name, "ram");
+        assert_eq!(s.memory[2].attrs, "", "attribute list is optional");
+        let SectionsItem::Output(def) = &s.sections[0] else { panic!("expected output section") };
+        assert_eq!(def.region.as_deref(), Some("rom"));
+    }
+
+    #[test]
+    fn memory_region_lma_assignment_is_separate_from_vma() {
+        // `> ram AT> rom` is the ROM-resident/RAM-executing idiom; the two
+        // regions must not be conflated.
+        let s = parse_linker_script(r#"
+            MEMORY {
+              rom (rx)  : ORIGIN = 0x08000000, LENGTH = 256K
+              ram (rwx) : ORIGIN = 0x20000000, LENGTH = 64K
+            }
+            SECTIONS { .data : { *(.data) } > ram AT> rom }
+        "#).unwrap();
+        let SectionsItem::Output(def) = &s.sections[0] else { panic!() };
+        assert_eq!(def.region.as_deref(), Some("ram"));
+        assert_eq!(def.lma_region.as_deref(), Some("rom"));
+    }
+
+    #[test]
+    fn memory_region_without_length_is_rejected() {
+        // A region missing ORIGIN/LENGTH cannot be range-checked; accepting it
+        // would silently disable the overflow diagnostic.
+        assert!(parse_linker_script(
+            "MEMORY { r : ORIGIN = 0 } SECTIONS { .text : { *(.text) } }").is_err());
+    }
+
+    // ── SEGMENT_START / DATA_SEGMENT_* ──────────────────────────────────
+
+    #[test]
+    fn segment_start_uses_default_without_override() {
+        let s = parse_linker_script(
+            r#"SECTIONS { . = SEGMENT_START("text-segment", 0x400000); }"#).unwrap();
+        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let syms = FxHashMap::default();
+        let secs = FxHashMap::default();
+        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
+        assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x400000));
+    }
+
+    #[test]
+    fn segment_start_honours_an_override() {
+        let s = parse_linker_script(
+            r#"SECTIONS { . = SEGMENT_START("text-segment", 0x400000); }"#).unwrap();
+        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let syms = FxHashMap::default();
+        let secs = FxHashMap::default();
+        let mut ov = FxHashMap::default();
+        ov.insert("text-segment".to_string(), 0xdead000u64);
+        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: Some(&ov) };
+        assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0xdead000),
+                   "-Ttext / -z must be able to override SEGMENT_START");
+    }
+
+    #[test]
+    fn data_segment_align_is_a_conservative_align() {
+        // The overlap optimisation is optional; the alignment is not. Treating
+        // DATA_SEGMENT_ALIGN as ALIGN(maxpagesize) is always correct and lets
+        // `ld --verbose` output link unmodified.
+        let s = parse_linker_script(
+            "SECTIONS { . = 0x1001; . = DATA_SEGMENT_ALIGN(0x1000, 0x1000); }").unwrap();
+        let SectionsItem::Assign(a) = &s.sections[1] else { panic!() };
+        let syms = FxHashMap::default();
+        let secs = FxHashMap::default();
+        let ctx = EvalCtx { dot: 0x1001, symbols: &syms, sections: &secs, segment_starts: None };
+        assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x2000));
+    }
+
+    // ── HIDDEN / PROVIDE_HIDDEN ─────────────────────────────────────────
+
+    #[test]
+    fn hidden_and_provide_hidden_set_the_hidden_flag() {
+        let s = parse_linker_script(r#"
+            SECTIONS {
+              .text : { *(.text) }
+              PROVIDE(vis = .);
+              PROVIDE_HIDDEN(ph = .);
+              HIDDEN(h = .);
+            }
+        "#).unwrap();
+        let get = |i: usize| -> &Assignment {
+            match &s.sections[i] { SectionsItem::Assign(a) => a, _ => panic!("not an assign") }
+        };
+        assert!(!get(1).hidden && get(1).provide, "PROVIDE: visible, conditional");
+        assert!(get(2).hidden && get(2).provide, "PROVIDE_HIDDEN: hidden, conditional");
+        // HIDDEN() defines unconditionally -- it is not a PROVIDE.
+        assert!(get(3).hidden && !get(3).provide, "HIDDEN: hidden, unconditional");
+    }
+
+    // ── OVERLAY ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn overlay_members_share_a_vma_and_advance_the_lma() {
+        let s = parse_linker_script(r#"
+            SECTIONS {
+              . = 0x400000;
+              .text : { *(.text) }
+              OVERLAY 0x500000 : AT (0x480000) {
+                .ovl1 { *(.ovl1) }
+                .ovl2 { *(.ovl2) }
+              }
+            }
+        "#).unwrap();
+        let outs: Vec<&OutputSecDef> = s.sections.iter().filter_map(|i| match i {
+            SectionsItem::Output(d) => Some(d), _ => None }).collect();
+        let ovl1 = outs.iter().find(|d| d.name == ".ovl1").expect(".ovl1 missing");
+        let ovl2 = outs.iter().find(|d| d.name == ".ovl2").expect(".ovl2 missing");
+        // Both members are pinned to the overlay's start address...
+        assert!(matches!(ovl1.address, Some(Expr::Num(0x500000))));
+        assert!(matches!(ovl2.address, Some(Expr::Num(0x500000))));
+        // ...while their load addresses differ: the first is the plain base,
+        // the second is base + SIZEOF(.ovl1).
+        assert!(matches!(ovl1.at_lma, Some(Expr::Num(0x480000))));
+        assert!(matches!(ovl2.at_lma, Some(Expr::Bin(BinOp::Add, _, _))),
+                "second member's LMA must advance past the first");
+    }
+
+    #[test]
+    fn overlay_defines_load_start_and_stop_symbols() {
+        // The copy routine cannot find the bytes without these, so an overlay
+        // that omits them is useless even though it lays out correctly.
+        let s = parse_linker_script(r#"
+            SECTIONS {
+              OVERLAY 0x500000 : AT (0x480000) { .ovl1 { *(.ovl1) } }
+            }
+        "#).unwrap();
+        let names: Vec<&str> = s.sections.iter().filter_map(|i| match i {
+            SectionsItem::Assign(a) => Some(a.symbol.as_str()), _ => None }).collect();
+        assert!(names.contains(&"__load_start_ovl1"), "got {:?}", names);
+        assert!(names.contains(&"__load_stop_ovl1"), "got {:?}", names);
     }
 }

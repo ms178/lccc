@@ -53,6 +53,14 @@ pub const R_X86_64_PC64: u32 = 24;
 pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 pub const R_X86_64_IRELATIVE: u32 = 37;
+pub const R_X86_64_16: u32 = 12;
+pub const R_X86_64_PC16: u32 = 13;
+pub const R_X86_64_8: u32 = 14;
+pub const R_X86_64_PC8: u32 = 15;
+pub const R_X86_64_GOTOFF64: u32 = 25;
+pub const R_X86_64_GOTPC32: u32 = 26;
+pub const R_X86_64_SIZE32: u32 = 32;
+pub const R_X86_64_SIZE64: u32 = 33;
 
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{
