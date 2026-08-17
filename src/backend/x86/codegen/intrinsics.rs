@@ -2315,7 +2315,41 @@ impl X86Codegen {
                     }
                 }
             }
-
+            IntrinsicOp::VecMulI32x4 => {
+                if let Some(d) = dest {
+                    // SSE4.1 pmulld, or use pmuludq fallback — target is x86-64-v3.
+                    self.emit_sse_binary_128(d, args, "pmulld");
+                }
+            }
+            IntrinsicOp::VecBroadcastI32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // Broadcast scalar i32 in args[0] to all 4 lanes of xmm0.
+                // Load via 64-bit reg then take low 32 bits — avoids size
+                // mismatch when the operand lives in an rN register.
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    movd %eax, %xmm0");
+                self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecStoreI32x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // dest_ptr = address; args[0] = vector value
+                if let Some(d) = dest {
+                    let _ = d;
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
+                }
+                if let Some(c_ptr) = dest_ptr {
+                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
+                    self.state.emit("    movdqu %xmm0, (%rax)");
+                }
+            }
             IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();

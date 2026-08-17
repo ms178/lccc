@@ -216,11 +216,9 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 total_changes += transform_reduction_avx2(func, &red_pattern);
             }
         } else if force_two_wide && std::env::var("CCC_NO_MAP_VEC").is_err() {
-            // Map pattern (dst[i] = src[i] * scale + offset) — AArch64-only:
-            // force_two_wide is set exclusively by the Aarch64 pipeline entry
-            // (vectorize_function_two_wide), and the VecMul/VecBroadcast/
-            // VecStore intrinsics this transform emits are only lowered by
-            // the NEON backend. CCC_NO_MAP_VEC=1 disables for A/B.
+            // Map pattern — AArch64 entry only until x86 regalloc preserves
+            // distinct src/dst bases across the vectorized body (Godbolt gap).
+            // Backend now lowers VecMul/Broadcast/Store I32x4 for when enabled.
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
                 if debug {
                     eprintln!("[VEC] Map pattern matched! Transforming to NEON 4-wide");
@@ -1759,12 +1757,13 @@ fn analyze_map_pattern(
         for (inst_idx, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
             match inst {
                 Instruction::Load { dest, ptr, ty, .. } => {
-                    if *ty != IrType::I32 || load_info.is_some() { return None; }
+                    // I32 (legacy NEON map) and F32 (saxpy-class) element types.
+                    if !matches!(*ty, IrType::I32 | IrType::F32) || load_info.is_some() { return None; }
                     load_info = Some((block_idx, *dest, *ptr));
                     let _ = inst_idx;
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
-                    if *ty != IrType::I32 || store_info.is_some() { return None; }
+                    if !matches!(*ty, IrType::I32 | IrType::F32) || store_info.is_some() { return None; }
                     let Operand::Value(store_val) = val else { return None };
                     store_info = Some((block_idx, inst_idx, *ptr, *store_val));
                 }
@@ -1875,8 +1874,10 @@ fn analyze_map_pattern(
         }
         None
     };
-    let dst_root = root_kind(resolve_root(gep_base(dst_gep)?))?;
-    let src_root = root_kind(resolve_root(gep_base(src_gep)?))?;
+    let dst_resolved = resolve_root(gep_base(dst_gep)?);
+    let src_resolved = resolve_root(gep_base(src_gep)?);
+    let dst_root = root_kind(dst_resolved).unwrap_or(0x200000000 + dst_resolved.0 as u64);
+    let src_root = root_kind(src_resolved).unwrap_or(0x200000000 + src_resolved.0 as u64);
     if dst_root == src_root {
         if debug { eprintln!("[VEC-MAP]   Bases not provably distinct"); }
         return None;
@@ -5463,6 +5464,14 @@ fn transform_map_neon(func: &mut IrFunction, pattern: &MapPattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
     let vec_width: u64 = 4;
+    // F32 map needs VecBroadcastF32x4 / VecStoreF32x4 — not yet on x86.
+    // Reject here so analysis can still report the pattern while staying correct.
+    for inst in &func.blocks[pattern.body_idx].instructions {
+        if let Instruction::Store { ty: IrType::F32, .. } = inst {
+            if debug { eprintln!("[VEC-MAP]   F32 map transform not yet implemented"); }
+            return 0;
+        }
+    }
 
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label.max(
