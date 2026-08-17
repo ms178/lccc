@@ -115,7 +115,7 @@ struct OutlinableCase {
 
 /// Find the Switch terminators in a function that are worth outlining.
 fn find_outline_candidates(func: &IrFunction) -> Vec<SwitchInfo> {
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(16);
 
     for block in func.blocks.iter() {
         if let Terminator::Switch { cases, default, .. } = &block.terminator {
@@ -181,7 +181,7 @@ fn collect_case_blocks(
     // Collect blocks starting from entry_idx until we hit another case entry.
     // Don't stop at end_block — it may appear within the case (e.g., when the
     // end_block detection picks a block that's inside a case body).
-    let mut case_blocks = Vec::new();
+    let mut case_blocks = Vec::with_capacity(16);
     for idx in entry_idx..func.blocks.len() {
         let bid = func.blocks[idx].label;
 
@@ -748,7 +748,7 @@ fn build_outlined_function(
     let entry_label = BlockId(*global_max_block_id + 1);
     *global_max_block_id += 1;
 
-    let mut entry_instructions = Vec::new();
+    let mut entry_instructions = Vec::with_capacity(16);
     for (i, (_val, _ty)) in case.external_values.iter().enumerate() {
         entry_instructions.push(Instruction::ParamRef {
             dest: Value(param_value_base + i as u32),

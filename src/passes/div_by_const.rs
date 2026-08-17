@@ -429,7 +429,7 @@ fn expand_udiv32(
     }
 
     let (magic, shift, needs_add) = compute_unsigned_magic_32(d)?;
-    let mut insts = Vec::new();
+    let mut insts = Vec::with_capacity(16);
 
     let x64 = fresh_value(next_id);
     insts.push(Instruction::Cast {
@@ -593,7 +593,7 @@ fn expand_sdiv32(
 
     if d > 0 && (d as u32).is_power_of_two() {
         let k = d.trailing_zeros();
-        let mut insts = Vec::new();
+        let mut insts = Vec::with_capacity(16);
 
         let sign = fresh_value(next_id);
         insts.push(Instruction::BinOp {
@@ -634,7 +634,7 @@ fn expand_sdiv32(
     }
 
     let (magic, shift) = compute_signed_magic_32(d);
-    let mut insts = Vec::new();
+    let mut insts = Vec::with_capacity(16);
 
     let x64 = fresh_value(next_id);
     insts.push(Instruction::Cast {
@@ -825,7 +825,7 @@ fn expand_udiv64(
     }
 
     let (magic, shift, needs_add) = compute_unsigned_magic_64(d)?;
-    let mut insts = Vec::new();
+    let mut insts = Vec::with_capacity(16);
 
     let x_u64 = if ty == IrType::U64 {
         *x
@@ -996,7 +996,7 @@ fn expand_sdiv64(
 
     if d > 0 && (d as u64).is_power_of_two() {
         let k = d.trailing_zeros();
-        let mut insts = Vec::new();
+        let mut insts = Vec::with_capacity(16);
 
         let sign = fresh_value(next_id);
         insts.push(Instruction::BinOp {
@@ -1037,7 +1037,7 @@ fn expand_sdiv64(
     }
 
     let (magic, shift) = compute_signed_magic_64(d);
-    let mut insts = Vec::new();
+    let mut insts = Vec::with_capacity(16);
 
     let x128 = fresh_value(next_id);
     insts.push(Instruction::Cast {
@@ -1223,7 +1223,7 @@ fn expand_udiv32_in_i64(
         return None;
     }
 
-    let mut insts = Vec::new();
+    let mut insts = Vec::with_capacity(16);
 
     // Explicitly zero-extend low 32 bits to protect against dirty upper bits from ABI register passing
     let x_masked = fresh_value(next_id);
@@ -1334,7 +1334,7 @@ fn expand_sdiv32_in_i64(
         return None;
     }
 
-    let mut insts = Vec::new();
+    let mut insts = Vec::with_capacity(16);
 
     // Explicitly sign-extend low 32 bits into 64-bit signed integer
     let x_shl = fresh_value(next_id);

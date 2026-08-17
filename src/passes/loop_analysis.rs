@@ -308,7 +308,7 @@ impl NaturalLoop {
 
     /// Find all exiting blocks (blocks inside the loop that have at least one successor outside).
     pub fn exiting_blocks(&self, succs: &analysis::FlatAdj) -> Vec<usize> {
-        let mut exiting = Vec::new();
+        let mut exiting = Vec::with_capacity(16);
         for &block in &self.body {
             for &succ in succs.row(block) {
                 if !self.body.contains(&(succ as usize)) {
@@ -339,7 +339,7 @@ impl NaturalLoop {
 
     /// Find all exit edges `(from, to)` where `from` is inside the loop and `to` is outside.
     pub fn exit_edges(&self, succs: &analysis::FlatAdj) -> Vec<(usize, usize)> {
-        let mut edges = Vec::new();
+        let mut edges = Vec::with_capacity(16);
         for &block in &self.body {
             for &succ in succs.row(block) {
                 let s = succ as usize;
@@ -463,7 +463,7 @@ pub fn find_natural_loops(
     }
 
     let dom = DominanceChecker::new(num_blocks, idom);
-    let mut loops = Vec::new();
+    let mut loops = Vec::with_capacity(16);
 
     // Find back edges: an edge (tail -> header) where header dominates tail in O(1)
     for tail in 0..num_blocks {

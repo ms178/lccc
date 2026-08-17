@@ -18,7 +18,7 @@ use super::text_processing::{strip_line_comment, split_first_word};
 /// Deduplicate a list of macro names, preserving order (first occurrence wins).
 /// Used to remove duplicate names from nested macro expansions.
 fn dedup_macro_names(names: Vec<String>) -> Vec<String> {
-    let mut unique = Vec::new();
+    let mut unique = Vec::with_capacity(8);
     for name in names {
         if !unique.contains(&name) {
             unique.push(name);

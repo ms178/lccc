@@ -618,7 +618,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                     crate::pgo::profile::derive_block_counts(caller_fn, fp);
                 }
                 // For each call site, check if PGO says to force inline or deny
-                let mut filtered = Vec::new();
+                let mut filtered = Vec::with_capacity(16);
                 for site in call_sites {
                     if let Some(callee) = callee_map.get(&site.callee_name) {
                         // Get callee name
@@ -864,7 +864,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                     crate::pgo::profile::derive_block_counts(caller_fn, fp);
                 }
                 // For each call site, check if PGO says to force inline or deny
-                let mut filtered = Vec::new();
+                let mut filtered = Vec::with_capacity(16);
                 for site in call_sites {
                     if let Some(callee) = callee_map.get(&site.callee_name) {
                         // Get callee name
@@ -1379,7 +1379,7 @@ fn validate_function_values(func: &IrFunction, last_inlined_callee: &str) {
     }
 
     // Check all used values
-    let mut errors = Vec::new();
+    let mut errors = Vec::with_capacity(16);
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             for v in inst.used_values() {
@@ -1959,7 +1959,7 @@ fn find_inline_call_sites(
     skip_list: &[String],
     caller_has_section: bool,
 ) -> Vec<InlineCallSite> {
-    let mut sites = Vec::new();
+    let mut sites = Vec::with_capacity(16);
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
@@ -2187,7 +2187,7 @@ fn inline_call_site(
     // (zlib-ng deflateSetParamPre *out=param wrote a stale %rbx). Constants
     // are materialized at the use site, so they have no register interaction.
     let orig_homes: Vec<Value> = {
-        let mut v = Vec::new();
+        let mut v = Vec::with_capacity(16);
         for inst in &callee.blocks[0].instructions {
             if let Instruction::Alloca { dest, .. } = inst {
                 v.push(*dest);
@@ -2426,7 +2426,7 @@ fn inline_call_site(
             block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
         let old_spans = std::mem::take(&mut block.source_spans);
         let mut new_insts = Vec::with_capacity(block.instructions.len());
-        let mut new_spans = Vec::new();
+        let mut new_spans = Vec::with_capacity(16);
         let mut paramref_dests: crate::common::fx_hash::FxHashSet<u32> = crate::common::fx_hash::FxHashSet::default();
         for (idx, inst) in block.instructions.drain(..).enumerate() {
             if let Instruction::ParamRef { dest, .. } = &inst {
@@ -2574,7 +2574,7 @@ fn inline_call_site(
     // Create the merge block with the remaining instructions and original terminator.
     // If the callee had a non-void return, insert a Phi (or Copy for single-predecessor)
     // at the start of the merge block to define the call's result value.
-    let mut merge_instructions = Vec::new();
+    let mut merge_instructions = Vec::with_capacity(16);
     let mut merge_spans: Vec<crate::common::source::Span> = Vec::new();
     if let Some(call_dest) = site.dest {
         if phi_incoming.len() == 1 {

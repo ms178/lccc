@@ -330,7 +330,7 @@ impl Preprocessor {
 
     /// Get default system include paths (arch-neutral only).
     pub(super) fn default_system_include_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
+        let mut paths = Vec::with_capacity(8);
         // Bundled include directory takes priority over system GCC headers
         if let Some(bundled) = Self::bundled_include_dir() {
             paths.push(bundled);

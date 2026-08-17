@@ -140,7 +140,7 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     { continue; }
 
                     let dest_derived = collect_derived_pointers(func, dest);
-                    let mut loads = Vec::new();
+                    let mut loads = Vec::with_capacity(16);
                     let mut safe = true;
                     for (bi, block) in func.blocks.iter().enumerate() {
                         for (ii, inst) in block.instructions.iter().enumerate() {
@@ -923,7 +923,7 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
 
 /// A tiny single-entry copy map used by the post-phi substitution.
 fn copy_single_map(dest: Value, src: Operand) -> Vec<Option<Operand>> {
-    let mut m = Vec::new();
+    let mut m = Vec::with_capacity(16);
     let cap = dest.0 as usize + 1;
     m.resize(cap, None);
     m[dest.0 as usize] = Some(src);

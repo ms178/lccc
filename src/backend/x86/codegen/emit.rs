@@ -91,6 +91,7 @@ fn reg_name_to_32(name: &str) -> &'static str {
 
 /// Map a PhysReg index to its x86-64 register name.
 /// Handles both callee-saved (1-5) and caller-saved (10-15) registers.
+#[inline]
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "rbx",
@@ -130,12 +131,14 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
 }
 
 /// Check if a PhysReg is an XMM register (used for F64 values).
+#[inline]
 pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
     reg.0 >= 20 && reg.0 <= 33
 }
 
 /// Map a PhysReg index to its x86-64 32-bit sub-register name.
 /// Handles both callee-saved (1-5) and caller-saved (10-15) registers.
+#[inline]
 pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "ebx",

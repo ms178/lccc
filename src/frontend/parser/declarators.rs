@@ -554,7 +554,7 @@ impl Parser {
             // These represent "array of pointers" and need to be propagated
             // to the caller so array-to-pointer decay is properly applied.
             // E.g. int (*a[]) = array of ptr-to-int = int **a (after decay)
-            let mut inner_array_dims = Vec::new();
+            let mut inner_array_dims = Vec::with_capacity(8);
             while matches!(self.peek(), TokenKind::LBracket) {
                 self.advance();
                 self.skip_array_qualifiers();
@@ -800,7 +800,7 @@ impl Parser {
         }
 
         // Parse array dimensions after pointer(s): (*[3][4])
-        let mut array_dims = Vec::new();
+        let mut array_dims = Vec::with_capacity(8);
         while matches!(self.peek(), TokenKind::LBracket) {
             self.advance();
             let size = if matches!(self.peek(), TokenKind::RBracket) {

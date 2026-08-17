@@ -12,8 +12,8 @@ impl Parser {
     pub(super) fn parse_compound_stmt(&mut self) -> CompoundStmt {
         let open_brace = self.peek_span();
         self.expect(&TokenKind::LBrace);
-        let mut items = Vec::new();
-        let mut local_labels = Vec::new();
+        let mut items = Vec::with_capacity(16);
+        let mut local_labels = Vec::with_capacity(8);
 
         // Save typedef shadowing state for this scope
         let saved_shadowed = self.shadowed_typedefs.clone();
@@ -319,9 +319,9 @@ impl Parser {
         let template = self.parse_asm_string();
 
         let mut outputs = Vec::new();
-        let mut inputs = Vec::new();
-        let mut clobbers = Vec::new();
-        let mut goto_labels = Vec::new();
+        let mut inputs = Vec::with_capacity(8);
+        let mut clobbers = Vec::with_capacity(8);
+        let mut goto_labels = Vec::with_capacity(8);
 
         // First colon: outputs
         if matches!(self.peek(), TokenKind::Colon) {
@@ -354,7 +354,7 @@ impl Parser {
     }
 
     fn parse_asm_string(&mut self) -> String {
-        let mut result = String::new();
+        let mut result = String::with_capacity(64);
         while let TokenKind::StringLiteral(ref s) = self.peek() {
             result.push_str(s);
             self.advance();
@@ -363,7 +363,7 @@ impl Parser {
     }
 
     fn parse_asm_operands(&mut self) -> Vec<AsmOperand> {
-        let mut operands = Vec::new();
+        let mut operands = Vec::with_capacity(8);
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
             return operands;
         }
@@ -418,7 +418,7 @@ impl Parser {
     }
 
     fn parse_asm_clobbers(&mut self) -> Vec<String> {
-        let mut clobbers = Vec::new();
+        let mut clobbers = Vec::with_capacity(8);
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
             return clobbers;
         }

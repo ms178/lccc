@@ -355,7 +355,7 @@ fn fold_constant_switches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockI
                         .unwrap_or(*default);
 
                     // Collect unique not-taken targets.
-                    let mut not_taken = Vec::new();
+                    let mut not_taken = Vec::with_capacity(16);
                     if *default != taken && !not_taken.contains(default) {
                         not_taken.push(*default);
                     }
@@ -506,10 +506,10 @@ fn collect_thread_redirections(
         });
     }
 
-    let mut redirections = Vec::new();
+    let mut redirections = Vec::with_capacity(16);
 
     for block_idx in 0..func.blocks.len() {
-        let mut edge_changes = Vec::new();
+        let mut edge_changes = Vec::with_capacity(16);
         let block_label = func.blocks[block_idx].label;
 
         match &func.blocks[block_idx].terminator {
@@ -878,7 +878,7 @@ fn find_fusion_candidates(
     asm_goto_targets: &FxHashSet<BlockId>,
 ) -> Vec<(usize, usize)> {
     let entry_label = func.blocks[0].label;
-    let mut fusions = Vec::new();
+    let mut fusions = Vec::with_capacity(16);
     let mut absorbed: FxHashSet<usize> = FxHashSet::default();
     let mut absorbers: FxHashSet<usize> = FxHashSet::default();
 

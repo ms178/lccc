@@ -389,7 +389,7 @@ impl Parser {
                     // Function call
                     let open = self.peek_span();
                     self.advance();
-                    let mut args = Vec::new();
+                    let mut args = Vec::with_capacity(8);
                     if !matches!(self.peek(), TokenKind::RParen) {
                         args.push(self.parse_assignment_expr());
                         while self.consume_if(&TokenKind::Comma) {
@@ -715,7 +715,7 @@ impl Parser {
         self.expect_context(&TokenKind::LParen, "after '_Generic'");
         let controlling = self.parse_assignment_expr();
         self.expect_context(&TokenKind::Comma, "after '_Generic' controlling expression");
-        let mut associations = Vec::new();
+        let mut associations = Vec::with_capacity(8);
         loop {
             if matches!(self.peek(), TokenKind::RParen) {
                 break;

@@ -193,7 +193,7 @@ fn build_refs_and_address_taken(
             func_refs.push(Vec::new());
             continue;
         }
-        let mut refs = Vec::new();
+        let mut refs = Vec::with_capacity(16);
         for block in &func.blocks {
             for inst in &block.instructions {
                 for_each_instruction_symbol(inst, |name, takes_address| {
@@ -210,7 +210,7 @@ fn build_refs_and_address_taken(
 
     let mut global_refs = Vec::with_capacity(module.globals.len());
     for global in &module.globals {
-        let mut refs = Vec::new();
+        let mut refs = Vec::with_capacity(16);
         global.init.for_each_ref(&mut |name| {
             push_named_refs(name, name_to_ids, &mut refs);
             // An initializer that names a symbol takes its address

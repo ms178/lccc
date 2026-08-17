@@ -1261,7 +1261,7 @@ fn contains_standalone_ident(s: &str, ident: &str) -> bool {
 /// Operates on bytes to avoid Vec<char> allocation.
 fn stringify_arg(arg: &str) -> String {
     let trimmed = arg.trim();
-    let mut result = String::new();
+    let mut result = String::with_capacity(64);
     let bytes = trimmed.as_bytes();
     let len = bytes.len();
     let mut i = 0;
@@ -1385,7 +1385,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
     if i < len && bytes[i] == b'(' {
         // Function-like macro
         i += 1; // skip '('
-        let mut params = Vec::new();
+        let mut params = Vec::with_capacity(8);
         let mut is_variadic = false;
         let mut has_named_variadic = false;
 

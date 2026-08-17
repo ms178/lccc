@@ -339,7 +339,7 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            let mut used = Vec::new(); inst.for_each_used_value(|v| used.push(v));
+            let mut used = Vec::with_capacity(16); inst.for_each_used_value(|v| used.push(v));
             for value in used {
                 let Some((root, _)) = paths.get(&value) else { continue };
                 let Some((copy_b, copy_i, _)) = copies.get(root) else { continue };
@@ -529,7 +529,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            let mut used = Vec::new();
+            let mut used = Vec::with_capacity(16);
             inst.for_each_used_value(|v| used.push(v));
             for value in used {
                 let Some((root, _)) = paths.get(&value) else { continue };
@@ -613,7 +613,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         // Same 1:1 length requirement as above (mismatch => drop spans, never index OOB).
         let has_spans = old_spans.len() == old.len();
         let mut out = Vec::with_capacity(old.len());
-        let mut spans = Vec::new();
+        let mut spans = Vec::with_capacity(16);
         for (ii, mut inst) in old.into_iter().enumerate() {
             if let Instruction::Memcpy { dest, .. } = &inst {
                 if candidates.get(&dest.0).is_some_and(|c| c.block == bi && c.inst == ii) {
