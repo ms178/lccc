@@ -3,6 +3,7 @@
 //! These types are used by x86, ARM, and RISC-V linkers. The i686 linker uses
 //! its own ELF32 types since field widths differ (u32 vs u64).
 
+use super::secdata::SectionData;
 use super::symstr::SymStr;
 use crate::backend::elf::SHN_UNDEF;
 use crate::backend::elf::{STB_GLOBAL, STB_LOCAL, STB_WEAK};
@@ -62,7 +63,7 @@ pub struct Elf64Rela {
 pub struct Elf64Object {
     pub sections: Vec<Elf64Section>,
     pub symbols: Vec<Elf64Symbol>,
-    pub section_data: Vec<Vec<u8>>,
+    pub section_data: Vec<SectionData>,
     /// Relocations indexed by the section they apply to.
     pub relocations: Vec<Vec<Elf64Rela>>,
     pub source_name: String,

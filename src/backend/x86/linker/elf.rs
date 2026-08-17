@@ -82,6 +82,14 @@ pub fn parse_object(data: &[u8], source_name: &str) -> Result<ElfObject, String>
     linker_common::parse_elf64_object(data, source_name, EM_X86_64)
 }
 
+/// Parse an object that lives inside an already-shared buffer, so section
+/// contents become windows into it instead of copies. See `secdata.rs`.
+pub fn parse_object_shared(
+    buf: &std::sync::Arc<[u8]>, base: usize, size: usize, source_name: &str,
+) -> Result<ElfObject, String> {
+    linker_common::parse_elf64_object_at(buf, base, size, source_name, EM_X86_64)
+}
+
 pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<DynSymbol>, String> {
     linker_common::parse_shared_library_symbols(data, lib_name)
 }

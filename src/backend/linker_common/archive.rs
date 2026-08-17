@@ -16,7 +16,7 @@ use crate::backend::elf::{
 };
 use super::types::Elf64Object;
 use super::symbols::GlobalSymbolOps;
-use super::parse_object::parse_elf64_object;
+use super::parse_object::{parse_elf64_object, parse_elf64_object_at};
 use super::dynamic::register_symbols_elf64;
 use super::resolve_lib::resolve_lib;
 
@@ -76,6 +76,24 @@ pub fn load_archive_elf64<G: GlobalSymbolOps>(
     expected_machine: u16, should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
+    // Callers holding the archive in an Arc should use the _shared variant,
+    // which avoids re-copying the whole archive here.
+    let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(data);
+    load_archive_elf64_shared(&shared, archive_path, objects, globals,
+                              expected_machine, should_replace_extra, whole_archive)
+}
+
+/// Archive loader that shares the caller's buffer.
+///
+/// Every member is a window into the one archive allocation, so member
+/// sections alias it directly instead of being copied out (see `secdata.rs`).
+pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
+    buf: &std::sync::Arc<[u8]>, archive_path: &str,
+    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
+    expected_machine: u16, should_replace_extra: fn(&G) -> bool,
+    whole_archive: bool,
+) -> Result<(), String> {
+    let data: &[u8] = buf;
     let members = parse_archive_members(data)?;
     let mut member_objects: Vec<Elf64Object> = Vec::new();
     for (name, offset, size) in &members {
@@ -86,7 +104,7 @@ pub fn load_archive_elf64<G: GlobalSymbolOps>(
             if e_machine != expected_machine { continue; }
         }
         let full_name = format!("{}({})", archive_path, name);
-        if let Ok(obj) = parse_elf64_object(member_data, &full_name, expected_machine) {
+        if let Ok(obj) = parse_elf64_object_at(buf, *offset, *size, &full_name, expected_machine) {
             member_objects.push(obj);
         }
     }
