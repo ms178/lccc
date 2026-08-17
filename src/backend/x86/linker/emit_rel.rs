@@ -19,6 +19,7 @@
 //!   undefined, largest COMMON wins, duplicate strong definitions error.
 //! * Local symbols (including STT_FILE) are all preserved, values rebased.
 
+use crate::backend::elf::{push_strtab_name, elf64_sym_entry};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
@@ -373,9 +374,7 @@ pub fn link_relocatable(
     for s in &out_syms {
         let noff: u32 = if s.name.is_empty() { 0 } else {
             *str_off.entry(s.name.clone()).or_insert_with(|| {
-                let o = strtab.len() as u32;
-                strtab.extend_from_slice(s.name.as_bytes());
-                strtab.push(0);
+                let o = push_strtab_name(&mut strtab, s.name.as_bytes());
                 o
             })
         };
@@ -385,13 +384,7 @@ pub fn link_relocatable(
             SymShndx::Common => SHN_COMMON,
             SymShndx::Undef => SHN_UNDEF,
         };
-        let mut e = [0u8; 24];
-        e[0..4].copy_from_slice(&noff.to_le_bytes());
-        e[4] = s.info;
-        e[5] = s.other;
-        e[6..8].copy_from_slice(&shndx.to_le_bytes());
-        e[8..16].copy_from_slice(&s.value.to_le_bytes());
-        e[16..24].copy_from_slice(&s.size.to_le_bytes());
+        let e = elf64_sym_entry(noff, s.info, s.other, shndx, s.value, s.size);
         symtab_data.extend_from_slice(&e);
     }
 

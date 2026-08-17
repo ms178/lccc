@@ -10,6 +10,7 @@
 //! static ET_EXEC image with no dynamic sections; relocation types are the
 //! static x86-64 set (PC32/PLT32/32/32S/64 and TLS LE forms).
 
+use crate::backend::elf::{push_strtab_name, elf64_sym_entry};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
@@ -795,15 +796,8 @@ pub fn link_with_script(
     if emit_symtab {
         let mut add_sym = |name: &str, value: u64, size: u64, info: u8, shndx: u16,
                            symtab: &mut Vec<[u8;24]>, strtab: &mut Vec<u8>| {
-            let noff = strtab.len() as u32;
-            strtab.extend_from_slice(name.as_bytes());
-            strtab.push(0);
-            let mut e = [0u8; 24];
-            e[0..4].copy_from_slice(&noff.to_le_bytes());
-            e[4] = info;
-            e[6..8].copy_from_slice(&shndx.to_le_bytes());
-            e[8..16].copy_from_slice(&value.to_le_bytes());
-            e[16..24].copy_from_slice(&size.to_le_bytes());
+            let noff = push_strtab_name(strtab, name.as_bytes());
+            let e = elf64_sym_entry(noff, info, 0 /* st_other */, shndx, value, size);
             symtab.push(e);
         };
 
