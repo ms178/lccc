@@ -307,123 +307,31 @@ pub fn link_shared(
     let mut needed_sonames: Vec<String> = Vec::new();
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
-    // Parse user args for -L, -l, -Wl,-soname=, bare .o/.a files.
-    // --whole-archive / --no-whole-archive are positional flags that affect
-    // archives appearing after them, so we collect ordered items with their state.
-    let mut extra_lib_paths: Vec<String> = Vec::new();
-    let mut soname: Option<String> = None;
-    let mut rpath_entries: Vec<String> = Vec::new();
-    let mut use_runpath = false; // --enable-new-dtags -> DT_RUNPATH instead of DT_RPATH
-    let mut pending_rpath = false; // for -Wl,-rpath -Wl,/path two-arg form
-    let mut pending_soname = false; // for -Wl,-soname -Wl,name two-arg form
-    let mut pending_version_script = false; // for -Wl,--version-script -Wl,path
-    let mut version_script: Option<String> = None;
-    let mut whole_archive = false;
-    let mut no_undefined = false; // -z defs / --no-undefined
-    let mut bsymbolic = false;    // -Bsymbolic / -Bsymbolic-functions
-    // --exclude-libs: archives whose symbols are linked in but not exported.
+    // Argument parsing is delegated to `linker_common::parse_linker_args`.
     //
-    // NOTE (technical debt): this hand-written parser duplicates
-    // linker_common::parse_linker_args and therefore has to re-implement every
-    // flag, including this one. Replacing it with parse_linker_args is tracked
-    // in docs/linker/FOLLOWUP_2026-08-17_SESSION2.md §4.6; it is not done here
-    // because link_shared's parser also drives positional archive handling,
-    // which parse_linker_args does not model yet.
-    let mut exclude_libs: Vec<String> = Vec::new();
+    // This function used to carry its own ~90-line copy of the parser. That
+    // duplication was live technical debt, not a stylistic wart: every new
+    // flag had to be implemented twice, and whichever copy was forgotten
+    // failed *silently*. Measured before this change, 21 flags known to
+    // `args.rs` were dropped here, including `-Map` (worked for executables,
+    // ignored for shared libraries) and `--defsym` (bfd emitted the alias,
+    // lccc did not). `LinkerArgs::inputs` now models the ordered, positional
+    // input list -- the one thing that previously blocked the merge.
+    let parsed = linker_common::parse_linker_args(user_args);
 
-    // Ordered list of items to load: (path_or_lib, is_lib, whole_archive_state)
-    // is_lib=true means resolve via -l; is_lib=false means bare file path
-    let mut ordered_items: Vec<(String, bool, bool)> = Vec::new();
+    let extra_lib_paths: Vec<String> = parsed.extra_lib_paths.clone();
+    let soname: Option<String> = parsed.soname.clone();
+    let rpath_entries: Vec<String> = parsed.rpath_entries.clone();
+    let use_runpath = parsed.use_runpath;
+    let version_script: Option<String> = parsed.version_script.clone();
+    let no_undefined = parsed.no_undefined;
+    let bsymbolic = parsed.bsymbolic;
+    let exclude_libs: Vec<String> = parsed.exclude_libs.clone();
 
-    let mut i = 0;
-    let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
-    while i < args.len() {
-        let arg = args[i];
-        if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { path };
-            extra_lib_paths.push(p.to_string());
-        } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
-            ordered_items.push((l.to_string(), true, whole_archive));
-        } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
-            let parts: Vec<&str> = wl_arg.split(',').collect();
-            // Handle -Wl,-rpath/-soname/--version-script split across -Wl arguments.
-            if (pending_rpath || pending_soname || pending_version_script) && !parts.is_empty() {
-                if pending_rpath {
-                    rpath_entries.push(parts[0].to_string());
-                    pending_rpath = false;
-                } else if pending_soname {
-                    soname = Some(parts[0].to_string());
-                    pending_soname = false;
-                } else if pending_version_script {
-                    version_script = Some(parts[0].to_string());
-                    pending_version_script = false;
-                }
-                i += 1;
-                continue;
-            }
-            let mut j = 0;
-            while j < parts.len() {
-                let part = parts[j];
-                if let Some(sn) = part.strip_prefix("-soname=") {
-                    soname = Some(sn.to_string());
-                } else if part == "-soname" && j + 1 < parts.len() {
-                    j += 1;
-                    soname = Some(parts[j].to_string());
-                } else if part == "-soname" {
-                    pending_soname = true;
-                } else if let Some(rp) = part.strip_prefix("-rpath=") {
-                    rpath_entries.push(rp.to_string());
-                } else if part == "-rpath" && j + 1 < parts.len() {
-                    j += 1;
-                    rpath_entries.push(parts[j].to_string());
-                } else if part == "-rpath" {
-                    pending_rpath = true;
-                } else if part == "--enable-new-dtags" {
-                    use_runpath = true;
-                } else if part == "--disable-new-dtags" {
-                    use_runpath = false;
-                } else if let Some(vs) = part.strip_prefix("--version-script=") {
-                    version_script = Some(vs.to_string());
-                } else if part == "--version-script" && j + 1 < parts.len() {
-                    j += 1;
-                    version_script = Some(parts[j].to_string());
-                } else if part == "--version-script" {
-                    pending_version_script = true;
-                } else if let Some(lpath) = part.strip_prefix("-L") {
-                    extra_lib_paths.push(lpath.to_string());
-                } else if let Some(lib) = part.strip_prefix("-l") {
-                    ordered_items.push((lib.to_string(), true, whole_archive));
-                } else if part == "--whole-archive" {
-                    whole_archive = true;
-                } else if part == "--no-whole-archive" {
-                    whole_archive = false;
-                } else if part == "--no-undefined" {
-                    no_undefined = true;
-                } else if part == "-z" && j + 1 < parts.len() && parts[j + 1] == "defs" {
-                    j += 1;
-                    no_undefined = true;
-                } else if part == "-Bsymbolic" || part == "-Bsymbolic-functions" {
-                    bsymbolic = true;
-                } else if let Some(v) = part.strip_prefix("--exclude-libs=") {
-                    exclude_libs.extend(
-                        v.split([',', ':']).filter(|s| !s.is_empty())
-                         .map(str::to_string));
-                } else if part == "--exclude-libs" && j + 1 < parts.len() {
-                    j += 1;
-                    exclude_libs.extend(
-                        parts[j].split([',', ':']).filter(|s| !s.is_empty())
-                                .map(str::to_string));
-                }
-                j += 1;
-            }
-        } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" { i += 1; } // skip output path
-        } else if !arg.starts_with('-') && Path::new(arg).exists() {
-            ordered_items.push((arg.to_string(), false, whole_archive));
-        }
-        i += 1;
-    }
+    // (path_or_lib, is_lib, whole_archive_state), in command-line order.
+    let ordered_items: Vec<(String, bool, bool)> = parsed.inputs.iter()
+        .map(|it| (it.name.clone(), it.is_lib, it.whole_archive))
+        .collect();
 
     // Load user object files (from the compiler driver, before user_args)
     for path in object_files {
@@ -512,6 +420,15 @@ pub fn link_shared(
         linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
     }
 
+    // --defsym=ALIAS=TARGET: alias one symbol to another. Same semantics as
+    // the executable path (link_builtin); it was simply unreachable here while
+    // link_shared parsed its own arguments and never looked at defsym_defs.
+    for (alias, target) in &parsed.defsym_defs {
+        if let Some(target_sym) = globals.get(target).cloned() {
+            globals.insert(alias.clone(), target_sym);
+        }
+    }
+
     // Merge sections (no gc-sections for shared libraries)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
@@ -526,5 +443,6 @@ pub fn link_shared(
         &needed_sonames, output_path, soname, &rpath_entries, use_runpath,
         version_script.as_deref(), bsymbolic,
         &exclude_libs,
+        parsed.map_path.as_deref(),
     )
 }
