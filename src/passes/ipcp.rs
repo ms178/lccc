@@ -92,7 +92,7 @@ pub fn run(module: &mut IrModule) -> usize {
             for block in &mut func.blocks {
                 let has_spans = !block.source_spans.is_empty();
                 let mut new_insts = Vec::with_capacity(block.instructions.len());
-                let mut new_spans = Vec::new();
+                let mut new_spans = Vec::with_capacity(16);
                 for (idx, inst) in block.instructions.drain(..).enumerate() {
                     let is_dead = match &inst {
                         Instruction::Call { func, .. } => dead_calls.contains(func.as_str()),
@@ -715,7 +715,7 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
     // parameters that have a uniform constant across all call sites.
     let mut specializations: FxHashMap<String, Vec<(usize, IrConst)>> = FxHashMap::default();
     for (name, param_states) in &func_param_consts {
-        let mut specs = Vec::new();
+        let mut specs = Vec::with_capacity(16);
         for (i, state) in param_states.iter().enumerate() {
             if let ParamState::Const(c) = state {
                 specs.push((i, *c));

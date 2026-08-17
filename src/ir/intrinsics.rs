@@ -238,6 +238,10 @@ pub enum IntrinsicOp {
     VecAddF32x4,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - AVX2 8×F32
     VecMulF32x8,
+    /// Broadcast scalar f32 to 8 lanes (vbroadcastss).
+    VecBroadcastF32x8,
+    /// Broadcast scalar f32 to 4 lanes.
+    VecBroadcastF32x4,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 4×F32
     VecMulF32x4,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
@@ -252,6 +256,10 @@ pub enum IntrinsicOp {
     /// dest_ptr = destination pointer; args[0] = source vector value.
     VecStoreI32x4,
     VecStoreI32x8,
+    /// Store 8×F32 (vmovups ymm).
+    VecStoreF32x8,
+    /// Store 4×F32.
+    VecStoreF32x4,
     /// Load two signed I32 lanes and widen to two I64 lanes.
     VecLoadWidenI32ToI64x2,
     /// Load two I64 lanes (movdqu).
@@ -973,7 +981,7 @@ impl IntrinsicOp {
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
             | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecZeroF64x4 | VecZeroI32x8
-            | VecLoadF32x8 | VecAddF32x8 | VecMulF32x8 | VecZeroF32x8
+            | VecLoadF32x8 | VecAddF32x8 | VecMulF32x8 | VecBroadcastF32x8 | VecZeroF32x8
             // Newly wired AVX/AVX2 ops (previously scalar header loops)
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
@@ -1010,7 +1018,7 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecAddI32x4 | VecZeroF64x2 | VecZeroI32x4
-            | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecZeroF32x4
+            | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecZeroI64x2
             | VecMulI32x4 | VecBroadcastI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128

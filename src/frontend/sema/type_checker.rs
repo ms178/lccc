@@ -607,7 +607,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // GCC extension: determine underlying enum type based on value range.
                 // Uses progression: int -> unsigned int -> long long -> unsigned long long.
                 let values = if let Some(vars) = variants {
-                    let mut vals = Vec::new();
+                    let mut vals = Vec::with_capacity(8);
                     let mut next_val: i64 = 0;
                     for v in vars {
                         if let Some(ref val_expr) = v.value {

@@ -431,7 +431,7 @@ fn find_basic_ivs(
     preheader: usize,
     back_blocks: &[usize],
 ) -> Vec<BasicIV> {
-    let mut ivs = Vec::new();
+    let mut ivs = Vec::with_capacity(16);
 
     // Build a map from value to its defining instruction within the loop
     let mut loop_defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
@@ -533,7 +533,7 @@ fn find_derived_exprs(
     basic_ivs: &[BasicIV],
     loop_body: &FxHashSet<usize>,
 ) -> Vec<DerivedExpr> {
-    let mut derived = Vec::new();
+    let mut derived = Vec::with_capacity(16);
 
     // Build a set of IV phi values for quick lookup
     let mut iv_values: FxHashMap<u32, usize> = FxHashMap::default();
@@ -545,7 +545,7 @@ fn find_derived_exprs(
     // Copy(Cast(iv))). Multiple passes to handle chains.
     let mut iv_derived: FxHashMap<u32, usize> = FxHashMap::default();
     for _ in 0..3 {
-        let mut new_entries = Vec::new();
+        let mut new_entries = Vec::with_capacity(16);
         for &bi in loop_body {
             if bi >= func.blocks.len() {
                 continue;
@@ -702,7 +702,7 @@ fn find_derived_exprs(
 
             // Find GEPs that use this multiply/shift result as their offset
             let mul_dest_id = mul_dest.0;
-            let mut gep_uses = Vec::new();
+            let mut gep_uses = Vec::with_capacity(16);
 
             for &gbi in loop_body {
                 if gbi >= func.blocks.len() {

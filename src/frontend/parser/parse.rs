@@ -411,7 +411,7 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> TranslationUnit {
-        let mut decls = Vec::new();
+        let mut decls = Vec::with_capacity(16);
         while !self.at_eof() {
             if let Some(decl) = self.parse_external_decl() {
                 decls.push(decl);
@@ -882,7 +882,7 @@ impl Parser {
     fn parse_string_attr_arg(&mut self) -> Option<String> {
         if !matches!(self.peek(), TokenKind::LParen) { return None; }
         self.advance(); // consume (
-        let mut result = String::new();
+        let mut result = String::with_capacity(64);
         while let TokenKind::StringLiteral(s) = self.peek() {
             result.push_str(s);
             self.advance();

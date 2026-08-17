@@ -117,7 +117,7 @@ struct Range {
 /// their root AND their full cast chain match (an i8→i32 zero-extension is
 /// not the same operand as an i16→i32 sign-extension).
 fn follow_casts(mut v: Value, cast_defs: &[Option<(Operand, IrType, IrType)>]) -> (Value, Vec<(IrType, IrType)>) {
-    let mut chain = Vec::new();
+    let mut chain = Vec::with_capacity(16);
     loop {
         let idx = v.0 as usize;
         match cast_defs.get(idx).and_then(|x| x.as_ref()) {

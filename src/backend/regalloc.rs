@@ -74,6 +74,7 @@ pub struct RegAllocConfig {
 
 /// Filter live intervals to only those eligible for register allocation,
 /// using the same whitelist + ineligibility rules as the three-phase allocator.
+#[inline]
 fn filter_eligible_intervals(
     liveness: &LivenessResult,
     eligible: &FxHashSet<u32>,
@@ -2017,6 +2018,7 @@ fn remove_ineligible_operands(
 
 /// Check whether a live interval spans any function call point.
 /// Uses binary search since call_points is sorted by program point.
+#[inline]
 fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
     let start_idx = call_points.partition_point(|&cp| cp < iv.start);
     start_idx < call_points.len() && call_points[start_idx] <= iv.end
@@ -2391,6 +2393,7 @@ pub(crate) fn detect_phi_coalesce_groups(
 /// coalescing merge a pointer phi with its backedge increment while the phi
 /// was still live as an intrinsic operand (zlib-ng adler32_avx2 miscompile:
 /// the in-place `addq $32` clobbered the load address).
+#[inline]
 fn uses_value(inst: &Instruction, val_id: u32) -> bool {
     let mut found = false;
     for_each_operand_in_instruction(inst, |op| {

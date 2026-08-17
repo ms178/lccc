@@ -756,7 +756,7 @@ impl SemanticAnalyzer {
                 // Store packed enum info for forward-reference lookups
                 if *is_packed {
                     if let Some(tag) = name {
-                        let mut variant_values = Vec::new();
+                        let mut variant_values = Vec::with_capacity(8);
                         let mut next_val: i64 = 0;
                         for v in variants {
                             if let Some(ref val_expr) = v.value {
@@ -1973,7 +1973,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         // done separately via process_enum_variants (requires &mut self).
         // We carry variant values so packed_size() can compute the correct size.
         let variant_values = if let Some(vars) = variants {
-            let mut result = Vec::new();
+            let mut result = Vec::with_capacity(8);
             let mut next_val: i64 = 0;
             for v in vars {
                 if let Some(ref val_expr) = v.value {

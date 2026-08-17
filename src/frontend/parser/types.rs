@@ -812,7 +812,7 @@ impl Parser {
 
     /// Parse enum variant declarations inside braces.
     pub(super) fn parse_enum_variants(&mut self) -> Vec<EnumVariant> {
-        let mut variants = Vec::new();
+        let mut variants = Vec::with_capacity(8);
         let open = self.peek_span();
         self.expect_context(&TokenKind::LBrace, "for enum body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {

@@ -599,7 +599,7 @@ fn detect_diamond(
     // The merge block must have Phi nodes that reference both arms.
     // Collect phi nodes we can convert.
     let merge_block = &func.blocks[merge_idx];
-    let mut phi_selects = Vec::new();
+    let mut phi_selects = Vec::with_capacity(16);
 
     for inst in &merge_block.instructions {
         if let Instruction::Phi { dest, ty, incoming } = inst {
@@ -784,7 +784,7 @@ fn detect_triangle(
 
     // Collect phi nodes from merge block
     let merge_block = &func.blocks[merge_idx];
-    let mut phi_selects = Vec::new();
+    let mut phi_selects = Vec::with_capacity(16);
 
     for inst in &merge_block.instructions {
         if let Instruction::Phi { dest, ty, incoming } = inst {

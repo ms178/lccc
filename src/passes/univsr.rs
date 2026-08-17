@@ -112,7 +112,7 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
 
 /// Detect IVSR-created pointer IVs in the function.
 fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(16);
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -480,7 +480,7 @@ fn validate_transformation_safety(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> 
 
 /// Find all transitive Load/Store uses of the pointer phi, tracking accumulated constant offsets.
 fn find_transitive_ptr_uses(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> Vec<PtrUse> {
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(16);
     let mut visited_values = FxHashSet::default();
 
     // Queue of (Value, accumulated_offset)

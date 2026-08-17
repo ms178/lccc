@@ -763,7 +763,7 @@ impl<'a> SemaConstEval<'a> {
         }
         // Build from variant list
         let variant_values = if let Some(vars) = variants {
-            let mut result = Vec::new();
+            let mut result = Vec::with_capacity(8);
             let mut next_val: i64 = 0;
             for v in vars {
                 if let Some(ref val_expr) = v.value {
@@ -1161,7 +1161,7 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
             }
             // Inline definition: compute from variants
             if let Some(vars) = variants {
-                let mut variant_values = Vec::new();
+                let mut variant_values = Vec::with_capacity(8);
                 for (next_val, v) in (0_i64..).zip(vars.iter()) {
                     if let Some(ref _val_expr) = v.value {
                         // Can't easily eval here, but this path is rare

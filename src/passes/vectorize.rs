@@ -1808,9 +1808,12 @@ fn analyze_map_pattern(
     // order), with loop-invariant scale and offset.
     let body = &func.blocks[body_idx];
     let add_inst = find_inst_by_dest(body, store_val)?;
-    let Instruction::BinOp { op: IrBinOp::Add, lhs: add_lhs, rhs: add_rhs, ty: IrType::I32, .. } = add_inst else {
+    let Instruction::BinOp { op: IrBinOp::Add, lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. } = add_inst else {
         return None;
     };
+    if !matches!(add_ty, IrType::I32 | IrType::F32) {
+        return None;
+    }
     let (mul_val, offset) = match (add_lhs, add_rhs) {
         (Operand::Value(v), _) if is_invariant(add_rhs) => (*v, add_rhs.clone()),
         (_, Operand::Value(v)) if is_invariant(add_lhs) => (*v, add_lhs.clone()),
@@ -1818,9 +1821,12 @@ fn analyze_map_pattern(
     };
 
     let mul_inst = find_inst_by_dest(body, mul_val)?;
-    let Instruction::BinOp { op: IrBinOp::Mul, lhs: mul_lhs, rhs: mul_rhs, ty: IrType::I32, .. } = mul_inst else {
+    let Instruction::BinOp { op: IrBinOp::Mul, lhs: mul_lhs, rhs: mul_rhs, ty: mul_ty, .. } = mul_inst else {
         return None;
     };
+    if !matches!(mul_ty, IrType::I32 | IrType::F32) || mul_ty != add_ty {
+        return None;
+    }
     let scale = match (mul_lhs, mul_rhs) {
         (Operand::Value(v), _) if *v == load_dest && is_invariant(mul_rhs) => mul_rhs.clone(),
         (_, Operand::Value(v)) if *v == load_dest && is_invariant(mul_lhs) => mul_lhs.clone(),
@@ -2998,7 +3004,7 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
 
             // Collect GEPs that need to be modified (two-pass to avoid borrow issues)
-            let mut geps_to_modify = Vec::new();
+            let mut geps_to_modify = Vec::with_capacity(16);
             for &block_idx in &innermost_blocks {
                 let block = &func.blocks[block_idx];
                 for (inst_idx, inst) in block.instructions.iter().enumerate() {
@@ -3696,7 +3702,7 @@ fn insert_reduction_remainder_loop(
         } else {
             (pattern.accumulator_phi, Vec::new())
         };
-        let mut instructions = Vec::new();
+        let mut instructions = Vec::with_capacity(16);
         instructions.append(&mut prefix);
         instructions.extend_from_slice(&[
             // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
@@ -5465,18 +5471,12 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
     let vec_width: u64 = if avx2 { 8 } else { 4 };
+    // Detect element type from the body store (I32 or F32).
+    let mut elem_is_f32 = false;
     for inst in &func.blocks[pattern.body_idx].instructions {
-        if let Instruction::Store { ty: IrType::F32, .. } = inst {
-            if debug { eprintln!("[VEC-MAP] F32 map not implemented"); }
-            return 0;
-        }
-    }
-    // F32 map needs VecBroadcastF32x4 / VecStoreF32x4 — not yet on x86.
-    // Reject here so analysis can still report the pattern while staying correct.
-    for inst in &func.blocks[pattern.body_idx].instructions {
-        if let Instruction::Store { ty: IrType::F32, .. } = inst {
-            if debug { eprintln!("[VEC-MAP]   F32 map transform not yet implemented"); }
-            return 0;
+        if let Instruction::Store { ty, .. } = inst {
+            elem_is_f32 = matches!(ty, IrType::F32);
+            break;
         }
     }
 
@@ -5602,7 +5602,12 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
     next_val_id += 1;
     {
         let preheader = &mut func.blocks[preheader_idx];
-        let bcast = if avx2 { IntrinsicOp::VecBroadcastI32x8 } else { IntrinsicOp::VecBroadcastI32x4 };
+        let bcast = match (elem_is_f32, avx2) {
+            (true, true) => IntrinsicOp::VecBroadcastF32x8,
+            (true, false) => IntrinsicOp::VecBroadcastF32x4,
+            (false, true) => IntrinsicOp::VecBroadcastI32x8,
+            (false, false) => IntrinsicOp::VecBroadcastI32x4,
+        };
         preheader.instructions.push(Instruction::Intrinsic {
             dest: Some(scale_vec),
             op: bcast,
@@ -5636,12 +5641,19 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
             if debug { eprintln!("[VEC-MAP]   Store not found at transform time"); }
             return changes;
         };
-        let (load_op, mul_op, add_op, store_op) = if avx2 {
-            (IntrinsicOp::VecLoadI32x8, IntrinsicOp::VecMulI32x8,
-             IntrinsicOp::VecAddI32x8, IntrinsicOp::VecStoreI32x8)
-        } else {
-            (IntrinsicOp::VecLoadI32x4, IntrinsicOp::VecMulI32x4,
-             IntrinsicOp::VecAddI32x4, IntrinsicOp::VecStoreI32x4)
+        let (load_op, mul_op, add_op, store_op) = match (elem_is_f32, avx2) {
+            (true, true) => (
+                IntrinsicOp::VecLoadF32x8, IntrinsicOp::VecMulF32x8,
+                IntrinsicOp::VecAddF32x8, IntrinsicOp::VecStoreF32x8),
+            (true, false) => (
+                IntrinsicOp::VecLoadF32x4, IntrinsicOp::VecMulF32x4,
+                IntrinsicOp::VecAddF32x4, IntrinsicOp::VecStoreF32x4),
+            (false, true) => (
+                IntrinsicOp::VecLoadI32x8, IntrinsicOp::VecMulI32x8,
+                IntrinsicOp::VecAddI32x8, IntrinsicOp::VecStoreI32x8),
+            (false, false) => (
+                IntrinsicOp::VecLoadI32x4, IntrinsicOp::VecMulI32x4,
+                IntrinsicOp::VecAddI32x4, IntrinsicOp::VecStoreI32x4),
         };
         let vec_insts = [
             Instruction::Intrinsic {
@@ -5677,7 +5689,7 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
     }
 
     // Step 5: Remainder loop for N % 4.
-    changes += insert_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
+    changes += insert_map_remainder_loop(func, pattern, vec_width, elem_is_f32, &mut next_val_id, &mut next_label);
 
     func.next_value_id = next_val_id;
     func.next_label = next_label;
@@ -5695,9 +5707,11 @@ fn insert_map_remainder_loop(
     func: &mut IrFunction,
     pattern: &MapPattern,
     vec_width: u64,
+    elem_is_f32: bool,
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
+    let elem_ty = if elem_is_f32 { IrType::F32 } else { IrType::I32 };
     // Extract GEP base pointers for the scalar body.
     let mut src_base = None;
     let mut dst_base = None;
@@ -5823,7 +5837,7 @@ fn insert_map_remainder_loop(
             Instruction::Load {
                 dest: load_v,
                 ptr: gep_src,
-                ty: IrType::I32,
+                ty: elem_ty,
                 seg_override: AddressSpace::Default,
             },
             Instruction::BinOp {
@@ -5831,19 +5845,19 @@ fn insert_map_remainder_loop(
                 op: IrBinOp::Mul,
                 lhs: Operand::Value(load_v),
                 rhs: pattern.scale.clone(),
-                ty: IrType::I32,
+                ty: elem_ty,
             },
             Instruction::BinOp {
                 dest: add_v,
                 op: IrBinOp::Add,
                 lhs: Operand::Value(mul_v),
                 rhs: pattern.offset.clone(),
-                ty: IrType::I32,
+                ty: elem_ty,
             },
             Instruction::Store {
                 val: Operand::Value(add_v),
                 ptr: gep_dst,
-                ty: IrType::I32,
+                ty: elem_ty,
                 seg_override: AddressSpace::Default,
             },
         ],

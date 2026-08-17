@@ -14,7 +14,7 @@ impl Preprocessor {
     /// Replace remaining identifiers (not keywords) with 0 in a #if expression.
     /// Per C standard, after macro expansion, undefined identifiers in #if evaluate to 0.
     pub(super) fn replace_remaining_idents_with_zero(&self, expr: &str) -> String {
-        let mut result = String::new();
+        let mut result = String::with_capacity(64);
         let bytes = expr.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -113,7 +113,7 @@ impl Preprocessor {
         if !line.contains("__has_") {
             return line.to_string();
         }
-        let mut result = String::new();
+        let mut result = String::with_capacity(64);
         let bytes = line.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -169,7 +169,7 @@ impl Preprocessor {
     }
 
     pub(super) fn resolve_defined_in_expr(&mut self, expr: &str) -> String {
-        let mut result = String::new();
+        let mut result = String::with_capacity(64);
         let bytes = expr.as_bytes();
         let len = bytes.len();
         let mut i = 0;
