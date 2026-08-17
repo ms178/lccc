@@ -57,6 +57,10 @@ pub fn link_with_script(
     output_path: &str,
     emit_symtab: bool,
     is_pie: bool,
+    // `--emit-relocs`: retain the (already applied) relocations as `.rela.*`
+    // sections in the output. Required by the Linux kernel's `arch/x86/tools/
+    // relocs` pass for CONFIG_RELOCATABLE / KASLR.
+    emit_relocs: bool,
 ) -> Result<(), String> {
     let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
@@ -67,12 +71,12 @@ pub fn link_with_script(
         for sym in &obj.symbols {
             if sym.name.is_empty() || sym.is_local() { continue; }
             if sym.is_undefined() || sym.shndx == SHN_COMMON { continue; }
-            let replace = match def_syms.get(&sym.name) {
+            let replace = match def_syms.get(sym.name.as_str()) {
                 None => true,
                 Some(&(_, _, _, _, info)) => (info >> 4) == STB_WEAK && sym.is_global(),
             };
             if replace {
-                def_syms.insert(sym.name.clone(),
+                def_syms.insert(sym.name.to_string(),
                     (oi, sym.shndx, sym.value, sym.size, sym.info));
             }
         }
@@ -525,8 +529,8 @@ pub fn link_with_script(
                 if sym.shndx == SHN_ABS { return Some(sym.value); }
                 return placed_map.get(&(oi, sym.shndx as usize)).map(|b| b + sym.value);
             }
-            if let Some(&v) = symbols.get(&sym.name) { return Some(v); }
-            if let Some(&(doi, shndx, value, _, _)) = def_syms.get(&sym.name) {
+            if let Some(&v) = symbols.get(sym.name.as_str()) { return Some(v); }
+            if let Some(&(doi, shndx, value, _, _)) = def_syms.get(sym.name.as_str()) {
                 if shndx == SHN_ABS { return Some(value); }
                 return placed_map.get(&(doi, shndx as usize)).map(|b| b + value);
             }
@@ -635,8 +639,8 @@ pub fn link_with_script(
                 let s = match resolve(oi, sym) {
                     Some(v) => v,
                     None => {
-                        if undefined.len() < 20 && !undefined.contains(&sym.name) {
-                            undefined.push(sym.name.clone());
+                        if undefined.len() < 20 && !undefined.iter().any(|u| u == sym.name.as_str()) {
+                            undefined.push(sym.name.to_string());
                         }
                         continue;
                     }
@@ -782,6 +786,12 @@ pub fn link_with_script(
         SHN_ABS
     };
 
+    // --emit-relocs bookkeeping: input symbol -> output .symtab index.
+    let mut local_sym_index: FxHashMap<(usize, usize), u32> = FxHashMap::default();
+    let mut global_sym_index: FxHashMap<String, u32> = FxHashMap::default();
+    // out_secs index -> index of that section's STT_SECTION symbol in .symtab
+    let mut out_sec_sym_index: FxHashMap<usize, u32> = FxHashMap::default();
+
     if emit_symtab {
         let mut add_sym = |name: &str, value: u64, size: u64, info: u8, shndx: u16,
                            symtab: &mut Vec<[u8;24]>, strtab: &mut Vec<u8>| {
@@ -797,14 +807,33 @@ pub fn link_with_script(
             symtab.push(e);
         };
 
+        // --emit-relocs: one STT_SECTION symbol per output section, first in
+        // the local range. GNU ld emits relocations against section symbols
+        // (`.text + 0x9`) rather than folding the address into the addend,
+        // and the kernel's relocs pass and objtool both expect that form.
+        // Without these the records still describe the right bytes, but they
+        // lose the "which section" information a consumer needs.
+        if emit_relocs {
+            for (h, &i) in hdr_secs.iter().enumerate() {
+                out_sec_sym_index.insert(i, symtab.len() as u32);
+                add_sym("", out_secs[i].vaddr, 0,
+                        // STB_LOCAL = 0, so the binding nibble is zero.
+                        STT_SECTION,
+                        (h + 1) as u16, &mut symtab, &mut strtab);
+            }
+        }
+
         // Locals first (ELF requirement).
         for (oi, obj) in objects.iter().enumerate() {
-            for sym in &obj.symbols {
+            for (sidx, sym) in obj.symbols.iter().enumerate() {
                 if !sym.is_local() || sym.name.is_empty() { continue; }
                 if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
                 if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON { continue; }
                 let Some(&base) = placed_map.get(&(oi, sym.shndx as usize)) else { continue };
                 let v = base + sym.value;
+                // --emit-relocs: remember where this input symbol landed in the
+                // output .symtab so retained relocations can point at it.
+                local_sym_index.insert((oi, sidx), symtab.len() as u32);
                 add_sym(&sym.name, v, sym.size, sym.info, find_shndx(v), &mut symtab, &mut strtab);
             }
         }
@@ -821,6 +850,7 @@ pub fn link_with_script(
                 }
             };
             let sx = if shndx == SHN_ABS { SHN_ABS } else { find_shndx(v) };
+            global_sym_index.insert(name.clone(), symtab.len() as u32);
             add_sym(name, v, size, info, sx, &mut symtab, &mut strtab);
         }
         // Script-defined symbols
@@ -842,6 +872,110 @@ pub fn link_with_script(
         n_local_syms = 1;
     }
 
+    // ── --emit-relocs: retain relocations as .rela.<section> ───────────────
+    //
+    // The Linux kernel's arch/x86/tools/relocs pass reads these from a fully
+    // linked vmlinux to build the table that lets the boot code relocate the
+    // image at runtime (CONFIG_RELOCATABLE / CONFIG_RANDOMIZE_BASE, i.e.
+    // KASLR). Without them the kernel links "successfully" and then fails to
+    // boot, which is why accepting-and-ignoring the flag was worse than
+    // rejecting it.
+    //
+    // Semantics (matching GNU ld):
+    //   * relocations are still APPLIED to the section contents above; this
+    //     only preserves a record of them;
+    //   * r_offset is rebased from section-relative to the final VIRTUAL
+    //     ADDRESS (bfd emits absolute addresses here for a linked image);
+    //   * r_info's symbol index is remapped from the input object's symtab to
+    //     the merged output .symtab;
+    //   * the addend is carried through unchanged;
+    //   * one .rela.NAME section per output section that has any, with
+    //     sh_info = target section header index and sh_link = .symtab index.
+    //
+    // Relocations against symbols that did not make it into the output symtab
+    // are emitted with symbol index 0 (STN_UNDEF) and the resolved value
+    // folded into the addend, so the record stays self-consistent rather than
+    // dangling — the same trick bfd uses for section-relative references.
+    struct RetainedRelocs {
+        /// index into out_secs of the section these apply to
+        target: usize,
+        /// raw Elf64_Rela entries, already in output form
+        entries: Vec<[u8; 24]>,
+    }
+    let mut retained: Vec<RetainedRelocs> = Vec::new();
+    if emit_relocs {
+        // Group by target output section, preserving output-section order so
+        // the .rela.* headers appear in a deterministic sequence.
+        let mut by_target: FxHashMap<usize, Vec<[u8; 24]>> = FxHashMap::default();
+        for (oi, obj) in objects.iter().enumerate() {
+            for (si, relas) in obj.relocations.iter().enumerate() {
+                if relas.is_empty() { continue; }
+                let Some(&sec_vaddr) = placed_map.get(&(oi, si)) else { continue };
+                let Some(&owner) = placed_owner.get(&(oi, si)) else { continue };
+                if !out_secs[owner].is_alloc { continue; }
+                for rela in relas {
+                    if rela.rela_type == R_X86_64_NONE { continue; }
+                    let sidx = rela.sym_idx as usize;
+                    let Some(sym) = obj.symbols.get(sidx) else { continue };
+
+                    // Map the input symbol to its output .symtab index.
+                    let (out_sym, extra_addend) = if sym.is_local() {
+                        match local_sym_index.get(&(oi, sidx)) {
+                            Some(&ix) => (ix, 0i64),
+                            None => {
+                                // A reference through a section symbol (the
+                                // common case for .eh_frame and switch tables).
+                                // Point at the OUTPUT section's symbol and
+                                // rebase the addend by how far this input
+                                // section sits inside it — exactly what GNU ld
+                                // emits, e.g. `.text + 0x9`.
+                                let secsym = out_sec_sym_index.get(&owner).copied();
+                                match secsym {
+                                    Some(ix) => {
+                                        let delta = sec_vaddr
+                                            .wrapping_sub(out_secs[owner].vaddr)
+                                            as i64;
+                                        (ix, delta)
+                                    }
+                                    // No section symbol available (symtab
+                                    // suppressed): keep the record
+                                    // self-consistent by folding the resolved
+                                    // address into the addend.
+                                    None => (0u32, resolve(oi, sym).unwrap_or(0) as i64),
+                                }
+                            }
+                        }
+                    } else {
+                        match global_sym_index.get(sym.name.as_str()) {
+                            Some(&ix) => (ix, 0i64),
+                            None => (0u32, resolve(oi, sym).unwrap_or(0) as i64),
+                        }
+                    };
+
+                    let r_offset = sec_vaddr + rela.offset;
+                    let r_info = ((out_sym as u64) << 32) | (rela.rela_type as u64);
+                    let r_addend = rela.addend + extra_addend;
+
+                    let mut e = [0u8; 24];
+                    e[0..8].copy_from_slice(&r_offset.to_le_bytes());
+                    e[8..16].copy_from_slice(&r_info.to_le_bytes());
+                    e[16..24].copy_from_slice(&r_addend.to_le_bytes());
+                    by_target.entry(owner).or_default().push(e);
+                }
+            }
+        }
+        // Deterministic order: follow the output-section header order, and
+        // sort each group by r_offset (bfd emits ascending offsets, and the
+        // kernel's relocs tool is easier to diff against when we match).
+        for (h, &i) in hdr_secs.iter().enumerate() {
+            let _ = h;
+            if let Some(mut entries) = by_target.remove(&i) {
+                entries.sort_by_key(|e| u64::from_le_bytes(e[0..8].try_into().unwrap()));
+                retained.push(RetainedRelocs { target: i, entries });
+            }
+        }
+    }
+
     // Append symtab/strtab/shstrtab data
     while out.len() % 8 != 0 { out.push(0); }
     let symtab_off = out.len() as u64;
@@ -849,12 +983,27 @@ pub fn link_with_script(
     let strtab_off = out.len() as u64;
     out.extend_from_slice(&strtab);
 
+    // --emit-relocs payloads (8-byte aligned, Elf64_Rela is 24 bytes).
+    let mut rela_offsets: Vec<u64> = Vec::with_capacity(retained.len());
+    for rr in &retained {
+        while out.len() % 8 != 0 { out.push(0); }
+        rela_offsets.push(out.len() as u64);
+        for e in &rr.entries { out.extend_from_slice(e); }
+    }
+
     // section header name offsets
     let mut name_offs: Vec<u32> = Vec::new();
     for &i in &hdr_secs {
         let n = out_secs[i].name.clone();
         name_offs.push(shname(&mut shstrtab, &n));
     }
+    // ".rela" + target section name, e.g. ".rela.text".
+    let rela_names: Vec<u32> = retained.iter()
+        .map(|rr| {
+            let n = format!(".rela{}", out_secs[rr.target].name);
+            shname(&mut shstrtab, &n)
+        })
+        .collect();
     let symtab_name = shname(&mut shstrtab, ".symtab");
     let strtab_name = shname(&mut shstrtab, ".strtab");
     let shstrtab_name = shname(&mut shstrtab, ".shstrtab");
@@ -875,15 +1024,33 @@ pub fn link_with_script(
                    os.vaddr, os.file_offset, os.size, 0, 0, os.align.max(1), 0);
     }
     let n_hdrs = 1 + hdr_secs.len();
-    // .symtab links to .strtab which is at index n_hdrs+1
+    // Header index layout from here on:
+    //   [0]              NULL
+    //   [1 .. n_hdrs)    output sections (hdr_secs order)
+    //   [n_hdrs ..]      .rela.* (one per retained group), if --emit-relocs
+    //   then             .symtab, .strtab, .shstrtab
+    let symtab_idx = n_hdrs + retained.len();
+    let strtab_idx = symtab_idx + 1;
+
+    // Map an out_secs index to its section-header index.
+    let hdr_index_of = |target: usize| -> u32 {
+        hdr_secs.iter().position(|&i| i == target).map(|p| p as u32 + 1).unwrap_or(0)
+    };
+    for (k, rr) in retained.iter().enumerate() {
+        // sh_link = .symtab, sh_info = section these relocations apply to.
+        write_shdr(&mut out, rela_names[k], SHT_RELA_, 0, 0, rela_offsets[k],
+                   (rr.entries.len() * 24) as u64,
+                   symtab_idx as u32, hdr_index_of(rr.target), 8, 24);
+    }
+
     write_shdr(&mut out, symtab_name, SHT_SYMTAB_, 0, 0, symtab_off,
-               (symtab.len() * 24) as u64, (n_hdrs + 1) as u32, n_local_syms as u32, 8, 24);
+               (symtab.len() * 24) as u64, strtab_idx as u32, n_local_syms as u32, 8, 24);
     write_shdr(&mut out, strtab_name, SHT_STRTAB_, 0, 0, strtab_off,
                strtab.len() as u64, 0, 0, 1, 0);
     write_shdr(&mut out, shstrtab_name, SHT_STRTAB_, 0, 0, shstrtab_off,
                shstrtab.len() as u64, 0, 0, 1, 0);
 
-    let sh_count = (n_hdrs + 3) as u16;
+    let sh_count = (n_hdrs + retained.len() + 3) as u16;
     out[40..48].copy_from_slice(&shoff.to_le_bytes());
     out[60..62].copy_from_slice(&sh_count.to_le_bytes());
     out[62..64].copy_from_slice(&((sh_count - 1)).to_le_bytes());

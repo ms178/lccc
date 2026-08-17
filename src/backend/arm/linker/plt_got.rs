@@ -24,16 +24,16 @@ pub(super) fn create_plt_got(
                 if si >= obj.symbols.len() { continue; }
                 let sym = &obj.symbols[si];
                 if sym.name.is_empty() { continue; }
-                let gsym_info = globals.get(&sym.name).map(|g| (g.is_dynamic, g.info & 0xf));
+                let gsym_info = globals.get(sym.name.as_str()).map(|g| (g.is_dynamic, g.info & 0xf));
 
                 match rela.rela_type {
                     R_AARCH64_CALL26 | R_AARCH64_JUMP26 if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type == STT_OBJECT {
-                            if !copy_reloc_names.contains(&sym.name) {
-                                copy_reloc_names.push(sym.name.clone());
+                            if !copy_reloc_names.contains(&sym.name.to_string()) {
+                                copy_reloc_names.push(sym.name.to_string());
                             }
-                        } else if !plt_names.contains(&sym.name) { plt_names.push(sym.name.clone()); }
+                        } else if !plt_names.contains(&sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
                     }
                     R_AARCH64_ADR_PREL_PG_HI21 | R_AARCH64_ADD_ABS_LO12_NC
                     | R_AARCH64_LDST64_ABS_LO12_NC | R_AARCH64_LDST32_ABS_LO12_NC
@@ -42,25 +42,25 @@ pub(super) fn create_plt_got(
                     if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type == STT_OBJECT {
-                            if !copy_reloc_names.contains(&sym.name) {
-                                copy_reloc_names.push(sym.name.clone());
+                            if !copy_reloc_names.contains(&sym.name.to_string()) {
+                                copy_reloc_names.push(sym.name.to_string());
                             }
                         } else {
                             // Function referenced via ADRP+ADD (e.g., taking address)
-                            if !plt_names.contains(&sym.name) { plt_names.push(sym.name.clone()); }
+                            if !plt_names.contains(&sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
                         }
                     }
                     R_AARCH64_ABS64 if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type != STT_OBJECT {
-                            if !plt_names.contains(&sym.name) { plt_names.push(sym.name.clone()); }
-                        } else if !copy_reloc_names.contains(&sym.name) {
-                            copy_reloc_names.push(sym.name.clone());
+                            if !plt_names.contains(&sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                        } else if !copy_reloc_names.contains(&sym.name.to_string()) {
+                            copy_reloc_names.push(sym.name.to_string());
                         }
                     }
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => {
-                        if !got_only_names.contains(&sym.name) && !plt_names.contains(&sym.name) {
-                            got_only_names.push(sym.name.clone());
+                        if !got_only_names.contains(&sym.name.to_string()) && !plt_names.contains(&sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
                         }
                     }
                     _ => {}

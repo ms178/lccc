@@ -54,7 +54,7 @@ pub(super) fn resolve_symbols(
                 uses_textrel: false,
             };
 
-            match global_symbols.get(&sym.name) {
+            match global_symbols.get(sym.name.as_str()) {
                 None => {
                     // Note: STB_LOCAL symbols are deliberately inserted here when no
                     // entry exists yet. Unlike ELF64 backends that skip locals entirely,
@@ -62,7 +62,7 @@ pub(super) fn resolve_symbols(
                     // glibc's static archives contain cross-object references that resolve
                     // through local symbols. The Some arm below prevents locals from
                     // *overriding* any existing entry (global, weak, or other local).
-                    global_symbols.insert(sym.name.clone(), new_sym);
+                    global_symbols.insert(sym.name.to_string(), new_sym);
                 }
                 Some(existing) => {
                     // Local symbols must not override any existing entry.
@@ -74,7 +74,7 @@ pub(super) fn resolve_symbols(
                     } else if sym.binding == STB_GLOBAL && (existing.binding == STB_WEAK || existing.binding == STB_LOCAL)
                         || (!existing.is_defined && new_sym.is_defined)
                     {
-                        global_symbols.insert(sym.name.clone(), new_sym);
+                        global_symbols.insert(sym.name.to_string(), new_sym);
                     }
                 }
             }
@@ -90,11 +90,11 @@ pub(super) fn resolve_symbols(
             sym_resolution.insert((obj_idx, sym_idx), sym.name.clone());
 
             if sym.section_index == SHN_UNDEF {
-                if global_symbols.contains_key(&sym.name) { continue; }
+                if global_symbols.contains_key(sym.name.as_str()) { continue; }
 
-                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default, dyn_binding)) = dynlib_syms.get(&sym.name) {
+                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default, dyn_binding)) = dynlib_syms.get(sym.name.as_str()) {
                     let is_func = *dyn_sym_type == STT_FUNC || *dyn_sym_type == STT_GNU_IFUNC;
-                    global_symbols.insert(sym.name.clone(), LinkerSymbol {
+                    global_symbols.insert(sym.name.to_string(), LinkerSymbol {
                         address: 0,
                         size: *dyn_size,
                         sym_type: *dyn_sym_type,
@@ -179,7 +179,7 @@ pub(super) fn allocate_common_symbols(
             if sym.section_index == SHN_COMMON && !sym.name.is_empty() {
                 // Only add if this symbol is still in global_symbols with output_section == usize::MAX
                 // (i.e., it wasn't overridden by a real definition from another object)
-                if let Some(gs) = global_symbols.get(&sym.name) {
+                if let Some(gs) = global_symbols.get(sym.name.as_str()) {
                     if gs.output_section == usize::MAX && gs.is_defined && !gs.is_dynamic {
                         // Check we haven't already added this symbol (could appear in multiple objects)
                         if !common_syms.iter().any(|(n, _, _)| n == &sym.name) {
@@ -254,7 +254,7 @@ pub(super) fn mark_plt_got_needs(
 
                 match rel_type {
                     R_386_PLT32 => {
-                        if let Some(gs) = global_symbols.get_mut(&sym.name) {
+                        if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
                             if gs.is_dynamic {
                                 gs.needs_plt = true;
                                 gs.needs_got = true;
@@ -262,12 +262,12 @@ pub(super) fn mark_plt_got_needs(
                         }
                     }
                     R_386_GOT32 | R_386_GOT32X => {
-                        if let Some(gs) = global_symbols.get_mut(&sym.name) {
+                        if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
                             gs.needs_got = true;
                         }
                     }
                     R_386_TLS_GOTIE | R_386_TLS_IE => {
-                        if let Some(gs) = global_symbols.get_mut(&sym.name) {
+                        if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
                             gs.needs_got = true;
                         }
                     }

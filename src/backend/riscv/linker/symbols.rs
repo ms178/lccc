@@ -32,7 +32,7 @@ pub fn build_global_symbols(
             }
 
             if sym.shndx == SHN_UNDEF {
-                global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
+                global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
                     value: 0, size: 0, binding: sym.binding(),
                     sym_type: sym.sym_type(), visibility: sym.visibility(),
                     defined: false, needs_plt: false, plt_idx: 0,
@@ -42,7 +42,7 @@ pub fn build_global_symbols(
             }
 
             if sym.shndx == SHN_ABS {
-                let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
+                let entry = global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
                     value: sym.value, size: sym.size, binding: sym.binding(),
                     sym_type: sym.sym_type(), visibility: sym.visibility(),
                     defined: true, needs_plt: false, plt_idx: 0,
@@ -71,7 +71,7 @@ pub fn build_global_symbols(
                 None => continue,
             };
 
-            let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
+            let entry = global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
                 value: 0, size: sym.size, binding: sym.binding(),
                 sym_type: sym.sym_type(), visibility: sym.visibility(),
                 defined: false, needs_plt: false, plt_idx: 0,
@@ -123,7 +123,7 @@ fn allocate_common_symbol(
     ms.data.resize(ms.data.len() + sym.size as usize, 0);
     ms.align = ms.align.max(align as u64);
 
-    let entry = global_syms.entry(sym.name.clone()).or_insert_with(|| GlobalSym {
+    let entry = global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
         value: off, size: sym.size, binding: sym.binding(),
         sym_type: STT_OBJECT, visibility: sym.visibility(),
         defined: true, needs_plt: false, plt_idx: 0,
@@ -226,7 +226,7 @@ pub fn build_local_sym_vaddrs(
                 continue;
             }
             if sym.shndx == SHN_COMMON {
-                if let Some(gs) = global_syms.get(&sym.name) {
+                if let Some(gs) = global_syms.get(sym.name.as_str()) {
                     sym_vaddrs[si] = gs.value;
                 }
                 continue;

@@ -45,16 +45,16 @@ pub fn collect_initial_symbols(
     for (_, obj) in input_objs {
         for sym in &obj.symbols {
             if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-                defined_syms.insert(sym.name.clone());
+                defined_syms.insert(sym.name.to_string());
             }
         }
     }
     for (_, obj) in input_objs {
         for sym in &obj.symbols {
             if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-                && !defined_syms.contains(&sym.name)
+                && !defined_syms.contains(sym.name.as_str())
             {
-                undefined_syms.insert(sym.name.clone());
+                undefined_syms.insert(sym.name.to_string());
             }
         }
     }
@@ -327,15 +327,15 @@ fn register_obj_symbols(
 ) {
     for sym in &obj.symbols {
         if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-            defined_syms.insert(sym.name.clone());
-            undefined_syms.remove(&sym.name);
+            defined_syms.insert(sym.name.to_string());
+            undefined_syms.remove(sym.name.as_str());
         }
     }
     for sym in &obj.symbols {
         if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-            && !defined_syms.contains(&sym.name)
+            && !defined_syms.contains(sym.name.as_str())
         {
-            undefined_syms.insert(sym.name.clone());
+            undefined_syms.insert(sym.name.to_string());
         }
     }
 }

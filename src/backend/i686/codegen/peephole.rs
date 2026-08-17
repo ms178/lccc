@@ -995,6 +995,64 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             }
         }
 
+        // Pattern 2b: Immediate/symbol-load + move fusion --
+        // `movl $X, %eax; movl %eax, %REG` becomes `movl $X, %REG` under the
+        // same deadness scan as Pattern 2a. The codegen emits this shape for
+        // every constant that lands in a phase-2 register (%ecx/%edx), e.g.
+        // `movl $.Lstr0, %eax; movl %eax, %edx`. GCC materializes the
+        // constant into the final register directly.
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if dest_reg == REG_EAX {
+                let src_line = trimmed(store, &infos[i], i);
+                if src_line.starts_with("movl $") && src_line.ends_with("%eax")
+                    && !src_line.contains('(')
+                {
+                    if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
+                        if msrc == REG_EAX && mdst != REG_EAX && mdst <= REG_GP_MAX {
+                            // Same bounded deadness scan as Pattern 2a.
+                            let mut k = j + 1;
+                            let mut cnt = 0;
+                            let mut dead = false;
+                            while k < len && cnt < 24 {
+                                if infos[k].is_nop() { k += 1; continue; }
+                                if infos[k].is_barrier() { break; }
+                                let s = trimmed(store, &infos[k], k);
+                                let written = match infos[k].kind {
+                                    LineKind::Other { dest_reg } => dest_reg == REG_EAX,
+                                    LineKind::Move { dst, .. } => dst == REG_EAX,
+                                    LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
+                                    LineKind::SetCC { reg } => reg == REG_EAX,
+                                    _ => false,
+                                };
+                                if written && !line_reads_dest_source(s, REG_EAX) {
+                                    dead = true;
+                                    break;
+                                }
+                                if line_references_reg(s, REG_EAX)
+                                    || line_writes_reg_implicitly(s, REG_EAX)
+                                {
+                                    break;
+                                }
+                                k += 1;
+                                cnt += 1;
+                            }
+                            if dead {
+                                let comma = src_line.rfind(',').unwrap();
+                                let imm = &src_line[..comma]; // "movl $X"
+                                let fused = format!("    {}, {}", imm, reg32_name(mdst));
+                                store.replace(i, fused);
+                                infos[i] = classify_line(store.get(i));
+                                infos[j].kind = LineKind::Nop;
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Pattern 2: Adjacent store/load with same offset
         if let LineKind::StoreEbp { reg: store_reg, offset: store_off, size: store_size } = infos[i].kind {
             if let LineKind::LoadEbp { reg: load_reg, offset: load_off, size: load_size } = infos[j].kind {

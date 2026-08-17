@@ -28,7 +28,7 @@ fn member_resolves_undefined_generic<G: GlobalSymbolOps>(
         if sym.is_undefined() || sym.is_local() { continue; }
         if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
         if sym.name.is_empty() { continue; }
-        if let Some(existing) = globals.get(&sym.name) {
+        if let Some(existing) = globals.get(sym.name.as_str()) {
             if !existing.is_defined() && !existing.is_dynamic() { return true; }
         }
     }

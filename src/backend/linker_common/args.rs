@@ -42,6 +42,13 @@ pub struct LinkerArgs {
     pub z_now: bool,
     /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
     pub z_relro: bool,
+    /// `-Map=FILE` / `-Map FILE`: write a GNU-ld-compatible link map.
+    pub map_path: Option<String>,
+    /// `--exclude-libs=LIST`: archives whose symbols must NOT be re-exported
+    /// from a shared library. Comma/colon-separated basenames, or `ALL`.
+    pub exclude_libs: Vec<String>,
+    /// `--version-script=FILE`: restricts the exported symbol set.
+    pub version_script: Option<String>,
 }
 
 /// Parse user linker arguments into a structured `LinkerArgs`.
@@ -58,6 +65,23 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         let arg = args[i];
         if arg == "-rdynamic" {
             result.export_dynamic = true;
+        } else if let Some(v) = arg.strip_prefix("--version-script=") {
+            result.version_script = Some(v.to_string());
+        } else if arg == "--version-script" && i + 1 < args.len() {
+            i += 1;
+            result.version_script = Some(args[i].to_string());
+        } else if let Some(v) = arg.strip_prefix("--exclude-libs=") {
+            result.exclude_libs.extend(split_lib_list(v));
+        } else if arg == "--exclude-libs" && i + 1 < args.len() {
+            i += 1;
+            result.exclude_libs.extend(split_lib_list(args[i]));
+        } else if let Some(v) = arg.strip_prefix("-Map=") {
+            // Top-level spelling: lccc-ld and other direct callers pass
+            // `-Map=FILE` as its own argument, not inside a `-Wl,` group.
+            result.map_path = Some(v.to_string());
+        } else if arg == "-Map" && i + 1 < args.len() {
+            i += 1;
+            result.map_path = Some(args[i].to_string());
         } else if arg == "-static" {
             result.is_static = true;
         } else if let Some(path) = arg.strip_prefix("-L") {
@@ -113,6 +137,21 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                             defsym_arg[eq_pos + 1..].to_string(),
                         ));
                     }
+                } else if let Some(v) = part.strip_prefix("--version-script=") {
+                    result.version_script = Some(v.to_string());
+                } else if part == "--version-script" && j + 1 < parts.len() {
+                    j += 1;
+                    result.version_script = Some(parts[j].to_string());
+                } else if let Some(v) = part.strip_prefix("--exclude-libs=") {
+                    result.exclude_libs.extend(split_lib_list(v));
+                } else if part == "--exclude-libs" && j + 1 < parts.len() {
+                    j += 1;
+                    result.exclude_libs.extend(split_lib_list(parts[j]));
+                } else if let Some(v) = part.strip_prefix("-Map=") {
+                    result.map_path = Some(v.to_string());
+                } else if part == "-Map" && j + 1 < parts.len() {
+                    j += 1;
+                    result.map_path = Some(parts[j].to_string());
                 } else if part == "--gc-sections" {
                     result.gc_sections = true;
                 } else if part == "--no-gc-sections" {
@@ -166,4 +205,77 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         i += 1;
     }
     result
+}
+
+#[cfg(test)]
+mod map_arg_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `-Map` reaches the linker in four spellings depending on whether the
+    /// caller is a Makefile driving `ld` directly, gcc forwarding via `-Wl,`,
+    /// or a build system using the separated form. All four must work.
+    #[test]
+    fn map_path_is_recognised_in_every_spelling() {
+        assert_eq!(parse_linker_args(&args(&["-Map=out.map"])).map_path.as_deref(),
+                   Some("out.map"));
+        assert_eq!(parse_linker_args(&args(&["-Map", "out.map"])).map_path.as_deref(),
+                   Some("out.map"));
+        assert_eq!(parse_linker_args(&args(&["-Wl,-Map=out.map"])).map_path.as_deref(),
+                   Some("out.map"));
+        assert_eq!(parse_linker_args(&args(&["-Wl,-Map,out.map"])).map_path.as_deref(),
+                   Some("out.map"));
+    }
+
+    #[test]
+    fn map_path_absent_by_default() {
+        assert!(parse_linker_args(&args(&["-static", "a.o"])).map_path.is_none());
+    }
+
+    /// A path containing '=' (legal) must survive intact.
+    #[test]
+    fn map_path_with_equals_in_filename() {
+        assert_eq!(parse_linker_args(&args(&["-Map=/tmp/a=b.map"])).map_path.as_deref(),
+                   Some("/tmp/a=b.map"));
+    }
+}
+
+/// Split an `--exclude-libs` value into archive names.
+///
+/// GNU ld accepts both comma and colon as separators (`--exclude-libs
+/// libfoo.a:libbar.a` and `...=libfoo.a,libbar.a` are both in the wild), and
+/// the special value `ALL`. Entries are stored verbatim; matching happens in
+/// `exclude_libs_matches`.
+fn split_lib_list(v: &str) -> Vec<String> {
+    v.split([',', ':'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does `source_name` (e.g. `/usr/lib/libfoo.a(bar.o)`) belong to an archive
+/// named by `--exclude-libs`?
+///
+/// GNU ld matches on the archive's *basename*, not its path, and `ALL` matches
+/// every static archive. Objects that did not come from an archive (no
+/// parenthesised member) are never excluded — `--exclude-libs` is about
+/// archives only.
+pub fn exclude_libs_matches(exclude: &[String], source_name: &str) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    // Archive members are recorded as "path/to/libfoo.a(member.o)".
+    let Some(paren) = source_name.find('(') else { return false };
+    if !source_name.ends_with(')') {
+        return false;
+    }
+    let archive = &source_name[..paren];
+    let base = archive.rsplit('/').next().unwrap_or(archive);
+    exclude.iter().any(|e| {
+        e.eq_ignore_ascii_case("ALL") || e == base || e == archive
+    })
 }

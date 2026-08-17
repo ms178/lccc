@@ -65,7 +65,7 @@ pub fn link_relocatable(
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
             if sig.is_empty() { continue; }
-            let is_dup = !group_signatures.insert(sig);
+            let is_dup = !group_signatures.insert(sig.to_string());
             if is_dup {
                 for k in (4..data.len()).step_by(4) {
                     if k + 4 > data.len() { break; }
@@ -176,7 +176,7 @@ pub fn link_relocatable(
                 let new_idx = (out_syms.len() + 1) as u32;
                 remap.insert(yi as u32, (new_idx, 0));
                 out_syms.push(OutSym {
-                    name: sym.name.clone(), info: sym.info, other: sym.other,
+                    name: sym.name.to_string(), info: sym.info, other: sym.other,
                     shndx_kind: SymShndx::Abs, value: 0, size: 0,
                 });
                 continue;
@@ -199,7 +199,7 @@ pub fn link_relocatable(
             let new_idx = (out_syms.len() + 1) as u32;
             remap.insert(yi as u32, (new_idx, 0));
             out_syms.push(OutSym {
-                name: sym.name.clone(), info: sym.info, other: sym.other,
+                name: sym.name.to_string(), info: sym.info, other: sym.other,
                 shndx_kind, value, size: sym.size,
             });
         }
@@ -236,13 +236,13 @@ pub fn link_relocatable(
                 (SymShndx::Undef, 0)
             };
 
-            match global_idx.get(&sym.name) {
+            match global_idx.get(sym.name.as_str()) {
                 None => {
                     let idx = out_syms.len();
-                    global_idx.insert(sym.name.clone(), idx);
+                    global_idx.insert(sym.name.to_string(), idx);
                     remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
                     out_syms.push(OutSym {
-                        name: sym.name.clone(), info: sym.info, other: sym.other,
+                        name: sym.name.to_string(), info: sym.info, other: sym.other,
                         shndx_kind, value, size: sym.size,
                     });
                 }
@@ -256,7 +256,7 @@ pub fn link_relocatable(
                     if is_defined {
                         if !e_defined || (e_weak && sym.is_global()) {
                             *existing = OutSym {
-                                name: sym.name.clone(), info: sym.info, other: sym.other,
+                                name: sym.name.to_string(), info: sym.info, other: sym.other,
                                 shndx_kind, value, size: sym.size,
                             };
                         } else if e_defined && !e_weak && sym.is_global() {
@@ -270,7 +270,7 @@ pub fn link_relocatable(
                             if sym.value > existing.value { existing.value = sym.value; }
                         } else if !e_defined && !e_common {
                             *existing = OutSym {
-                                name: sym.name.clone(), info: sym.info, other: sym.other,
+                                name: sym.name.to_string(), info: sym.info, other: sym.other,
                                 shndx_kind: SymShndx::Common, value, size: sym.size,
                             };
                         }

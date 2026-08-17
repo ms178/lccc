@@ -73,6 +73,8 @@ mod check;
 mod eh_frame;
 mod gc_sections;
 mod mapfile;
+mod version_script;
+mod symstr;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -95,9 +97,18 @@ pub use dynstr::DynStrTab;
 // hash.rs
 pub use hash::{gnu_hash, sysv_hash};
 
+// symstr.rs
+pub use symstr::SymStr;
+
+// version_script.rs
+pub use version_script::VersionScript;
+
+// mapfile.rs
+pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_map};
+
 // symbols.rs
 pub use symbols::{
-    OutputSection, GlobalSymbolOps,
+    InputSection, OutputSection, GlobalSymbolOps,
     is_linker_defined_symbol,
     is_valid_c_identifier_for_section, resolve_start_stop_symbols,
 };
@@ -121,7 +132,7 @@ pub use resolve_lib::resolve_lib;
 pub use write::{write_elf64_shdr, write_elf64_phdr, write_elf64_phdr_at, align_up_64, pad_to};
 
 // args.rs
-pub use args::parse_linker_args;
+pub use args::{parse_linker_args, exclude_libs_matches};
 
 // check.rs
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};

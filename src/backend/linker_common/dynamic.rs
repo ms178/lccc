@@ -260,8 +260,8 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
         let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON;
 
         if is_defined {
-            match globals.get_mut(&sym.name) {
-                None => { globals.insert(sym.name.clone(), G::new_defined(obj_idx, sym)); }
+            match globals.get_mut(sym.name.as_str()) {
+                None => { globals.insert(sym.name.to_string(), G::new_defined(obj_idx, sym)); }
                 Some(e) => {
                     let e_weak = e.info() >> 4 == STB_WEAK;
                     // A tentative (COMMON) definition is superseded by any
@@ -284,8 +284,8 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                 }
             }
         } else if sym.shndx == SHN_COMMON {
-            match globals.get_mut(&sym.name) {
-                None => { globals.insert(sym.name.clone(), G::new_common(obj_idx, sym)); }
+            match globals.get_mut(sym.name.as_str()) {
+                None => { globals.insert(sym.name.to_string(), G::new_common(obj_idx, sym)); }
                 Some(e) => {
                     if !e.is_defined() {
                         *e = G::new_common(obj_idx, sym);
@@ -296,8 +296,8 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                     // COMMON vs real definition: the real definition wins; ignore.
                 }
             }
-        } else if !globals.contains_key(&sym.name) {
-            globals.insert(sym.name.clone(), G::new_undefined(sym));
+        } else if !globals.contains_key(sym.name.as_str()) {
+            globals.insert(sym.name.to_string(), G::new_undefined(sym));
         }
     }
     Ok(())

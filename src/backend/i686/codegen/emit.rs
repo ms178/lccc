@@ -1294,6 +1294,53 @@ impl ArchCodegen for I686Codegen {
         emit!(self.state, "    movl %eax, %{}", dest_name);
     }
 
+    fn emit_load_direct_to_phys_reg(&mut self, src: &Operand, dest: PhysReg) -> bool {
+        // Materialize straight into the destination register instead of the
+        // `movl src,%eax; movl %eax,%dest` accumulator detour that
+        // emit_copy_value's default takes. One instruction shorter and it
+        // leaves %eax (and the reg_cache) untouched.
+        let d = phys_reg_name(dest);
+        match src {
+            Operand::Const(c) => {
+                let val: i32 = match c {
+                    IrConst::I8(v) => *v as i32,
+                    IrConst::I16(v) => *v as i32,
+                    IrConst::I32(v) => *v,
+                    IrConst::I64(v) => *v as i32,
+                    IrConst::Zero => 0,
+                    // F32/F64/LongDouble/I128 keep the accumulator path.
+                    _ => return false,
+                };
+                if val == 0 {
+                    emit!(self.state, "    xorl %{}, %{}", d, d);
+                } else {
+                    emit!(self.state, "    movl ${}, %{}", val, d);
+                }
+                true
+            }
+            Operand::Value(v) => {
+                // Wide values need two registers -- never direct.
+                if self.state.wide_values.contains(&v.0) {
+                    return false;
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot);
+                    if self.state.is_alloca(v.0) {
+                        if self.state.alloca_over_align(v.0).is_some() {
+                            return false; // needs the lea+add+and sequence
+                        }
+                        emit!(self.state, "    leal {}, %{}", sr, d);
+                    } else {
+                        emit!(self.state, "    movl {}, %{}", sr, d);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         // The trait DEFAULT for this hook is a NO-OP ("backends override").
         // i686 never overrode it, so emit_leaq_base_index's default path

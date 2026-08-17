@@ -44,19 +44,19 @@ pub(super) fn create_plt_got(
                 if si >= obj.symbols.len() { continue; }
                 let sym = &obj.symbols[si];
                 if sym.name.is_empty() || sym.is_local() { continue; }
-                let gsym_info = globals.get(&sym.name).map(|g| (g.is_dynamic, g.info & 0xf));
+                let gsym_info = globals.get(sym.name.as_str()).map(|g| (g.is_dynamic, g.info & 0xf));
 
                 match rela.rela_type {
                     R_X86_64_PLT32 | R_X86_64_PC32 if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type == STT_OBJECT {
                             // Dynamic data symbol - needs copy relocation
-                            if copy_reloc_set.insert(sym.name.clone()) {
-                                copy_reloc_names.push(sym.name.clone());
+                            if copy_reloc_set.insert(sym.name.to_string()) {
+                                copy_reloc_names.push(sym.name.to_string());
                             }
                         } else {
                             // Dynamic function symbol - needs PLT
-                            if plt_set.insert(sym.name.clone()) { plt_names.push(sym.name.clone()); }
+                            if plt_set.insert(sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
                         }
                     }
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
@@ -66,13 +66,13 @@ pub(super) fn create_plt_got(
                         // for address-of. For symbols with PLT, the GOT entry is
                         // statically filled with the PLT address (no GLOB_DAT);
                         // for other dynamic symbols, GLOB_DAT is used.
-                        if got_only_set.insert(sym.name.clone()) {
-                            got_only_names.push(sym.name.clone());
+                        if got_only_set.insert(sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
                         }
                     }
                     R_X86_64_GOTTPOFF => {
-                        if !plt_set.contains(&sym.name) && got_only_set.insert(sym.name.clone()) {
-                            got_only_names.push(sym.name.clone());
+                        if !plt_set.contains(sym.name.as_str()) && got_only_set.insert(sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
                         }
                     }
                     R_X86_64_TLSGD => {
@@ -81,18 +81,18 @@ pub(super) fn create_plt_got(
                         // relocation. GD against local symbols relaxes to LE
                         // (no GOT entry needed).
                         if gsym_info.map(|g| g.0).unwrap_or(false)
-                            && !plt_set.contains(&sym.name)
-                            && got_only_set.insert(sym.name.clone()) {
-                            got_only_names.push(sym.name.clone());
+                            && !plt_set.contains(sym.name.as_str())
+                            && got_only_set.insert(sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
                         }
                     }
                     _ if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type != STT_OBJECT && rela.rela_type == R_X86_64_64 {
                             // R_X86_64_64 for dynamic function (e.g. function pointer init) needs PLT
-                            if plt_set.insert(sym.name.clone()) { plt_names.push(sym.name.clone()); }
-                        } else if !plt_set.contains(&sym.name) && got_only_set.insert(sym.name.clone()) {
-                            got_only_names.push(sym.name.clone());
+                            if plt_set.insert(sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                        } else if !plt_set.contains(sym.name.as_str()) && got_only_set.insert(sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
                         }
                     }
                     _ => {}

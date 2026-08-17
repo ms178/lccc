@@ -194,7 +194,7 @@ pub fn link_builtin(
                     if (rela.sym_idx as usize) < obj.symbols.len() {
                         let sym = &obj.symbols[rela.sym_idx as usize];
                         if !sym.name.is_empty() {
-                            referenced_from_live.insert(sym.name.clone());
+                            referenced_from_live.insert(sym.name.to_string());
                         }
                     }
                 }
@@ -369,13 +369,13 @@ fn resolve_dynamic_symbols_for_shared(
                 if si >= obj.symbols.len() { continue; }
                 let sym = &obj.symbols[si];
                 if sym.name.is_empty() || sym.is_local() { continue; }
-                let is_undef = if let Some(g) = globals.get(&sym.name) {
+                let is_undef = if let Some(g) = globals.get(sym.name.as_str()) {
                     g.is_dynamic || (g.defined_in.is_none() && g.section_idx == SHN_UNDEF)
                 } else {
                     sym.is_undefined()
                 };
-                if is_undef && !undefined.contains(&sym.name) {
-                    undefined.push(sym.name.clone());
+                if is_undef && !undefined.iter().any(|u| u == sym.name.as_str()) {
+                    undefined.push(sym.name.to_string());
                 }
             }
         }

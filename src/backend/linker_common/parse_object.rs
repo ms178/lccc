@@ -4,10 +4,11 @@
 //! in x86/linker/elf.rs, arm/linker/elf.rs, and riscv/linker/elf_read.rs.
 //! The only parameter that differed was the expected e_machine value.
 
+use super::SymStr;
 use crate::backend::elf::{
     ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL,
     SHT_NOBITS, SHT_SYMTAB, SHT_RELA,
-    read_u16, read_u32, read_u64, read_i64, read_cstr,
+    read_u16, read_u32, read_u64, read_i64, read_cstr, read_cstr_ref, slice_at, table_entry,
 };
 use super::types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object};
 
@@ -52,11 +53,36 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
     }
 
     // Parse section headers
+    // A malformed e_shentsize would make every subsequent field read land at
+    // the wrong offset; reject it up front rather than parsing garbage.
+    if e_shentsize < 64 {
+        return Err(format!("{}: bogus e_shentsize {} (need >= 64)", source_name, e_shentsize));
+    }
+    // `Vec::with_capacity(e_shnum)` on an attacker-controlled u16 is bounded
+    // (<= 65535 * 88 bytes), so no reservation guard is needed here.
     let mut sections = Vec::with_capacity(e_shnum);
     for i in 0..e_shnum {
-        let off = e_shoff + i * e_shentsize;
-        if off + e_shentsize > data.len() {
+        // Overflow-safe: e_shoff is a full u64 and i * e_shentsize can itself
+        // overflow, so both operations are checked.
+        if table_entry(data, e_shoff, i, e_shentsize).is_none() {
             return Err(format!("{}: section header {} out of bounds", source_name, i));
+        }
+        let off = e_shoff + i * e_shentsize;
+        // ELF gABI: sh_addralign is 0 or a positive integral power of two.
+        // A non-power-of-two value is not merely cosmetic: the layout engine
+        // rounds section addresses up to it, so a value such as 0xffffffffff
+        // demands a 1 TiB-aligned output and aborts the process in the
+        // allocator (`memory allocation of 1099511627796 bytes failed`).
+        // A mutation fuzzer found exactly that.  bfd and mold silently accept
+        // the bogus value; wild rejects it, which is the spec-correct and
+        // safe behaviour, so lccc rejects it too — with the offending value
+        // in the message.
+        let addralign = read_u64(data, off + 48);
+        if addralign > 1 && !addralign.is_power_of_two() {
+            return Err(format!(
+                "{}: section header {} has invalid sh_addralign 0x{:x} \
+                 (must be 0 or a power of two)",
+                source_name, i, addralign));
         }
         sections.push(Elf64Section {
             name_idx: read_u32(data, off),
@@ -68,7 +94,7 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
             size: read_u64(data, off + 32),
             link: read_u32(data, off + 40),
             info: read_u32(data, off + 44),
-            addralign: read_u64(data, off + 48),
+            addralign,
             entsize: read_u64(data, off + 56),
         });
     }
@@ -78,8 +104,9 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
         let shstrtab = &sections[e_shstrndx];
         let strtab_off = shstrtab.offset as usize;
         let strtab_size = shstrtab.size as usize;
-        if strtab_off + strtab_size <= data.len() {
-            let strtab_data = &data[strtab_off..strtab_off + strtab_size];
+        // Overflow-safe: `strtab_off + strtab_size` wraps for offsets near
+        // usize::MAX, which previously turned a malformed object into a panic.
+        if let Some(strtab_data) = slice_at(data, strtab_off, strtab_size) {
             for sec in &mut sections {
                 sec.name = read_cstr(strtab_data, sec.name_idx as usize);
             }
@@ -93,11 +120,11 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
             section_data.push(Vec::new());
         } else {
             let start = sec.offset as usize;
-            let end = start + sec.size as usize;
-            if end > data.len() {
+            let len = sec.size as usize;
+            let Some(bytes) = slice_at(data, start, len) else {
                 return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
-            }
-            section_data.push(data[start..end].to_vec());
+            };
+            section_data.push(bytes.to_vec());
         }
     }
 
@@ -119,14 +146,21 @@ pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16)
                     break;
                 }
                 let name_idx = read_u32(sym_data, off);
-                let mut name = read_cstr(strtab_data, name_idx as usize);
-                // Strip @PLT suffix from symbol names. Some assemblers (including
-                // our own in older versions) embed the @PLT modifier in the symbol
-                // name instead of using R_X86_64_PLT32 relocation type. The linker
-                // should resolve these against the base symbol name.
-                if let Some(base) = name.strip_suffix("@PLT") {
-                    name = base.to_string();
-                }
+                // Borrow the name out of the string table and copy it straight
+                // into the symbol's inline storage. Materialising a `String`
+                // here first would add one heap allocation per symbol -- the
+                // single largest source of allocator traffic in the linker.
+                let name = match read_cstr_ref(strtab_data, name_idx as usize) {
+                    // Strip the @PLT suffix some assemblers (including our own,
+                    // historically) embed in the symbol name instead of using a
+                    // R_X86_64_PLT32 relocation; resolution uses the base name.
+                    Some(n) => SymStr::new(n.strip_suffix("@PLT").unwrap_or(n)),
+                    // Non-UTF-8 name: rare but legal, take the allocating path.
+                    None => {
+                        let owned = read_cstr(strtab_data, name_idx as usize);
+                        SymStr::new(owned.strip_suffix("@PLT").unwrap_or(&owned))
+                    }
+                };
                 symbols.push(Elf64Symbol {
                     name_idx,
                     name,

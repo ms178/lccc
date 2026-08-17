@@ -54,9 +54,10 @@ pub fn link_with_script_x86(
     output: &str,
     emit_symtab: bool,
     is_pie: bool,
+    emit_relocs: bool,
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script(
-        objects, script_src, output, emit_symtab, is_pie)
+        objects, script_src, output, emit_symtab, is_pie, emit_relocs)
 }
 
 /// Standard userspace executable link for the standalone `lccc-ld` driver.

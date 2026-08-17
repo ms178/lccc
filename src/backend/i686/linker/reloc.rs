@@ -96,7 +96,7 @@ fn apply_one_reloc(
     let sym_addr = resolve_sym_addr(obj_idx, sym, ctx);
 
     // Check if this symbol goes through PLT
-    let is_dyn = !sym.name.is_empty() && ctx.global_symbols.get(&sym.name)
+    let is_dyn = !sym.name.is_empty() && ctx.global_symbols.get(sym.name.as_str())
         .map(|gs| gs.is_dynamic && gs.needs_plt).unwrap_or(false);
 
     let mut relax_got32x = false;
@@ -107,7 +107,7 @@ fn apply_one_reloc(
         R_386_32 => {
             // Check if this symbol uses text relocations (WEAK dynamic data)
             if !sym.name.is_empty() {
-                if let Some(gs) = ctx.global_symbols.get(&sym.name) {
+                if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
                     if gs.uses_textrel {
                         // Record a text relocation; write 0 for now (dynamic linker fills it)
                         text_reloc = Some((patch_addr, sym.name.clone()));
@@ -124,7 +124,7 @@ fn apply_one_reloc(
         }
         R_386_PC32 | R_386_PLT32 => {
             let s = if is_dyn {
-                ctx.global_symbols.get(&sym.name).map(|gs| gs.address).unwrap_or(0)
+                ctx.global_symbols.get(sym.name.as_str()).map(|gs| gs.address).unwrap_or(0)
             } else {
                 sym_addr
             };
@@ -214,7 +214,7 @@ fn resolve_sym_addr(obj_idx: usize, sym: &InputSymbol, ctx: &RelocContext) -> u3
         // collisions between identically-named locals (e.g. .LC0).
         resolve_via_section_map(obj_idx, sym, ctx)
     } else {
-        match ctx.global_symbols.get(&sym.name) {
+        match ctx.global_symbols.get(sym.name.as_str()) {
             Some(gs) => gs.address,
             None => resolve_via_section_map(obj_idx, sym, ctx),
         }
@@ -246,7 +246,7 @@ pub(super) fn resolve_got_reloc(
     ctx: &RelocContext,
     relax_got32x: &mut bool,
 ) -> u32 {
-    if let Some(gs) = ctx.global_symbols.get(&sym.name) {
+    if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
         if gs.is_dynamic {
             let got_entry_addr = if gs.needs_plt {
                 ctx.gotplt_vaddr + (ctx.gotplt_reserved + gs.plt_index as u32) * 4
@@ -273,7 +273,7 @@ pub(super) fn resolve_got_reloc(
 
 /// Resolve R_386_TLS_IE relocation.
 pub(super) fn resolve_tls_ie(sym: &InputSymbol, sym_addr: u32, addend: i32, ctx: &RelocContext) -> u32 {
-    if let Some(gs) = ctx.global_symbols.get(&sym.name) {
+    if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
         if gs.needs_got {
             let got_entry_addr = ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
             (got_entry_addr as i32 + addend) as u32
@@ -288,7 +288,7 @@ pub(super) fn resolve_tls_ie(sym: &InputSymbol, sym_addr: u32, addend: i32, ctx:
 
 /// Resolve R_386_TLS_GOTIE relocation.
 pub(super) fn resolve_tls_gotie(sym: &InputSymbol, sym_addr: u32, addend: i32, ctx: &RelocContext) -> u32 {
-    if let Some(gs) = ctx.global_symbols.get(&sym.name) {
+    if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
         if gs.needs_got {
             let got_entry_addr = ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
             (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32

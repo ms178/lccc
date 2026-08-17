@@ -68,10 +68,10 @@ pub fn emit_shared_library(
                     if reloc.rela_type == R_RISCV_CALL_PLT {
                         let sym = &obj.symbols[reloc.sym_idx as usize];
                         if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-                            if let Some(gsym) = global_syms.get(&sym.name) {
-                                if !gsym.defined && !plt_set.contains(&sym.name) {
-                                    plt_set.insert(sym.name.clone());
-                                    plt_symbols.push(sym.name.clone());
+                            if let Some(gsym) = global_syms.get(sym.name.as_str()) {
+                                if !gsym.defined && !plt_set.contains(sym.name.as_str()) {
+                                    plt_set.insert(sym.name.to_string());
+                                    plt_symbols.push(sym.name.to_string());
                                 }
                             }
                         }
