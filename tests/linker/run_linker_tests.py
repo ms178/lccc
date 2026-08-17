@@ -628,6 +628,91 @@ case("tls_mixed_models",
     compile_flags=["-O1", "-fpic"],
     tags=("tls",))
 
+
+case("tls_many_gd_sites",
+    {"a.c": """
+        #include <stdio.h>
+        #define TLS(n) \\
+            static __thread int t##n = n; \\
+            int get_##n(void){ return t##n; }
+        TLS(0) TLS(1) TLS(2) TLS(3) TLS(4) TLS(5) TLS(6) TLS(7)
+        TLS(8) TLS(9) TLS(10) TLS(11) TLS(12) TLS(13) TLS(14) TLS(15)
+        int main(void){
+            int s = 0;
+            s += get_0()+get_1()+get_2()+get_3()+get_4()+get_5()+get_6()+get_7();
+            s += get_8()+get_9()+get_10()+get_11()+get_12()+get_13()+get_14()+get_15();
+            printf("%d\\n", s);
+            return 0;
+        }
+     """},
+    compile_flags=["-O1", "-ftls-model=global-dynamic"],
+    tags=("tls", "stress"))
+
+case("tls_consumed_skip_correctness",
+    {"a.c": """
+        #include <stdio.h>
+        static __thread long x = 42;
+        static __thread long y = 7;
+        int main(void){
+            printf("%ld\\n", x + y);
+            return 0;
+        }
+     """},
+    compile_flags=["-O1", "-ftls-model=global-dynamic"],
+    tags=("tls",))
+
+case("icf_identical_leaf_functions",
+    {"a.c": """
+        #include <stdio.h>
+        int leaf_a(int x){ return x * 3 + 1; }
+        int main(void){
+            extern int leaf_b(int);
+            printf("%d\\n", leaf_a(7) + leaf_b(7));
+            return 0;
+        }
+     """,
+     "b.c": "int leaf_b(int x){ return x * 3 + 1; }"},
+    tags=("icf", "sections"))
+
+case("parallel_reloc_smoke",
+    {"a.c": """
+        #include <stdio.h>
+        extern int f0(void), f1(void), f2(void), f3(void), f4(void);
+        extern int f5(void), f6(void), f7(void), f8(void), f9(void);
+        int main(void){
+            int s = f0()+f1()+f2()+f3()+f4()+f5()+f6()+f7()+f8()+f9();
+            printf("%d\\n", s);
+            return 0;
+        }
+     """,
+     "f0.c": "int f0(void){ return 1; }",
+     "f1.c": "int f1(void){ return 2; }",
+     "f2.c": "int f2(void){ return 3; }",
+     "f3.c": "int f3(void){ return 4; }",
+     "f4.c": "int f4(void){ return 5; }",
+     "f5.c": "int f5(void){ return 6; }",
+     "f6.c": "int f6(void){ return 7; }",
+     "f7.c": "int f7(void){ return 8; }",
+     "f8.c": "int f8(void){ return 9; }",
+     "f9.c": "int f9(void){ return 10; }"},
+    tags=("stress", "reloc"))
+
+case("large_got_pressure",
+    {"a.c": """
+        #include <stdio.h>
+        #include <errno.h>
+        int main(void){
+            volatile int *p1 = &errno;
+            volatile void *p2 = stdin;
+            volatile void *p3 = stdout;
+            volatile void *p4 = stderr;
+            printf("%d %d %d %d\\n", p1 != 0, p2 != 0, p3 != 0, p4 != 0);
+            return 0;
+        }
+     """},
+    tags=("got", "dynamic"))
+
+
 case("ifunc_resolver",
     {"a.c": """
         #include <stdio.h>
