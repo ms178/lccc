@@ -1,30 +1,44 @@
 //! Liveness analysis for IR values.
 //!
-//! Computes live intervals for each IR value in an IrFunction. A live interval
-//! represents the range [def_point, last_use_point] where a value is live and
-//! needs to be preserved (either in a register or a stack slot).
+//! Computes live intervals for each IR value in an `IrFunction`. A live interval
+//! is the linear-scan range `[def_point, last_use_point]` where a value must be
+//! preserved (register or stack slot). Linear scan does not represent holes;
+//! loop-carried values therefore cover the whole layout span of the loop.
 //!
-//! The analysis supports loops via backward dataflow iteration:
-//! 1. First, assign sequential program points to all instructions and terminators.
-//! 2. Run backward dataflow to compute live-in/live-out sets for each block.
-//!    This correctly handles values that are live across loop back-edges.
-//! 3. Build intervals by taking the union of def/use points and live-through blocks.
+//! Pipeline:
+//! 1. Assign sequential program points (one per instruction, then one per terminator).
+//! 2. Build per-block gen/kill bitsets (dense value ids).
+//! 3. Backward dataflow to a *true* fixpoint (worklist, seeded in reverse RPO).
+//!    `live_in[B]  = gen[B] ∪ (live_out[B] − kill[B])`
+//!    `live_out[B] = ⋃ live_in[S]` for successors `S` of `B`
+//! 4. Union def/use points with live-through blocks; apply GEP-fold, F128-source,
+//!    phi-incoming and setjmp extensions.
+//!
+//! ## Correctness contracts
+//!
+//! - Hitting an iteration cap and *returning* is a miscompile (under-approx
+//!   live sets → the allocator reuses a register that is still live). This
+//!   module iterates to fixpoint. Bitvector liveness is monotonic, so the
+//!   worklist is guaranteed to terminate.
+//! - Safe degradation is **over**-approximation (more spills), never under.
+//! - GEP-fold / F128 / phi-elim / setjmp insert *implicit* uses the IR
+//!   visitors cannot see. Those extensions run *before* dataflow (so gen is
+//!   right) and the F128 pointer is re-synced *after* live-through extension.
 //!
 //! ## Performance
 //!
-//! The dataflow uses compact bitsets instead of hash sets for gen/kill/live_in/live_out.
-//! Value IDs are remapped to a dense [0..N) range so bitsets are minimal size.
-//! This eliminates per-iteration heap allocation and replaces hash-table operations
-//! with fast word-level bitwise ops (union = OR, difference = AND-NOT, equality = ==).
+//! Gen/kill/live_in/live_out are compact bitsets on a dense `[0..N)` map.
+//! One IR walk collects allocas + value ids; CFG analysis (successors,
+//! predecessors, back-edges, postorder) is shared by loop-depth and dataflow.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value};
+use std::sync::OnceLock;
 
-/// A live interval for an IR value: [start, end] in program point numbering.
-/// start = the point where the value is defined
-/// end = the last point where the value is used
-#[derive(Debug, Clone, Copy)]
+/// A live interval for an IR value: `[start, end]` in program-point numbering.
+/// `start` = defining point, `end` = last point the value must be preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveInterval {
     pub start: u32,
     pub end: u32,
@@ -34,35 +48,38 @@ pub struct LiveInterval {
 /// Result of liveness analysis: maps value IDs to their live intervals.
 pub struct LivenessResult {
     pub intervals: Vec<LiveInterval>,
-    /// Program points that are Call or CallIndirect instructions.
-    /// Used by the register allocator to identify values that cross call boundaries.
+    /// Program points that clobber caller-saved registers (calls, libcalls,
+    /// non-barrier inline asm). Used by RA to force callee-saved / spills
+    /// across the point.
     pub call_points: Vec<u32>,
-    /// Loop nesting depth for each block (block_index -> depth).
-    /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
-    /// Used by the register allocator to weight uses inside loops more heavily.
+    /// Loop nesting depth for each block (`block_index → depth`).
+    /// Depth 0 = not in any loop. Length is always `func.blocks.len()`.
     pub block_loop_depth: Vec<u32>,
 }
 
 // ── Compact bitset for dataflow ──────────────────────────────────────────────
 
-/// A compact bitset stored as a contiguous slice of u64 words.
-/// Supports O(1) insert/contains and O(n/64) union/difference/equality.
-#[derive(Clone)]
+/// Bitset over a dense `[0..num_bits)` index space, stored as `u64` words.
+/// `insert` / `contains` are O(1); union / transfer are O(⌈N/64⌉).
+#[derive(Clone, Debug)]
 struct BitSet {
     words: Vec<u64>,
 }
 
 impl BitSet {
-    /// Create a new empty bitset that can hold indices [0..num_bits).
     fn new(num_bits: usize) -> Self {
-        let num_words = num_bits.div_ceil(64);
         Self {
-            words: vec![0u64; num_words],
+            words: vec![0u64; num_bits.div_ceil(64)],
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, idx: usize) {
+        debug_assert!(
+            idx / 64 < self.words.len(),
+            "BitSet::insert index {idx} out of range ({} words)",
+            self.words.len()
+        );
         let word = idx / 64;
         let bit = idx % 64;
         self.words[word] |= 1u64 << bit;
@@ -71,12 +88,16 @@ impl BitSet {
     #[inline(always)]
     fn contains(&self, idx: usize) -> bool {
         let word = idx / 64;
+        if word >= self.words.len() {
+            return false;
+        }
         let bit = idx % 64;
         (self.words[word] >> bit) & 1 != 0
     }
 
-    /// self = self | other. Returns true if self changed.
+    /// `self |= other`. Returns whether `self` changed.
     fn union_with(&mut self, other: &BitSet) -> bool {
+        debug_assert_eq!(self.words.len(), other.words.len());
         let mut changed = false;
         for (w, o) in self.words.iter_mut().zip(other.words.iter()) {
             let old = *w;
@@ -86,13 +107,16 @@ impl BitSet {
         changed
     }
 
-    /// Computes: self = gen ∪ (out - kill) in one pass. Returns true if self changed.
+    /// `self = gen ∪ (out − kill)`. Returns whether `self` changed.
     fn assign_gen_union_out_minus_kill(
         &mut self,
         gen: &BitSet,
         out: &BitSet,
         kill: &BitSet,
     ) -> bool {
+        debug_assert_eq!(self.words.len(), gen.words.len());
+        debug_assert_eq!(self.words.len(), out.words.len());
+        debug_assert_eq!(self.words.len(), kill.words.len());
         let mut changed = false;
         for i in 0..self.words.len() {
             let new_val = gen.words[i] | (out.words[i] & !kill.words[i]);
@@ -104,7 +128,15 @@ impl BitSet {
         changed
     }
 
-    /// Iterate over all set bits, calling f(bit_index) for each.
+    fn bits_eq(&self, other: &BitSet) -> bool {
+        self.words == other.words
+    }
+
+    fn copy_from(&mut self, other: &BitSet) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        self.words.copy_from_slice(&other.words);
+    }
+
     fn for_each_set_bit(&self, mut f: impl FnMut(usize)) {
         for (word_idx, &word) in self.words.iter().enumerate() {
             if word == 0 {
@@ -115,12 +147,11 @@ impl BitSet {
             while w != 0 {
                 let tz = w.trailing_zeros() as usize;
                 f(base + tz);
-                w &= w - 1; // clear lowest set bit
+                w &= w - 1;
             }
         }
     }
 
-    /// Clear all bits.
     fn clear(&mut self) {
         for w in &mut self.words {
             *w = 0;
@@ -128,7 +159,7 @@ impl BitSet {
     }
 }
 
-/// Intermediate state built during Phase 1 (program point assignment and gen/kill).
+/// Intermediate state from Phase 1 (program points + gen/kill).
 struct ProgramPointState {
     block_start_points: Vec<u32>,
     block_end_points: Vec<u32>,
@@ -137,20 +168,17 @@ struct ProgramPointState {
     block_gen: Vec<BitSet>,
     block_kill: Vec<BitSet>,
     block_id_to_idx: FxHashMap<u32, usize>,
-    setjmp_block_indices: Vec<usize>,
+    /// Program point of every returns-twice call (`setjmp` family).
+    setjmp_points: Vec<u32>,
+    /// `(ptr_id, dest_id)` for every `Load` of `F128` from a non-alloca pointer.
+    f128_loads: Vec<(u32, u32)>,
+    /// SSA copy edges `dest → src`, used by GEP-fold copy-chain following.
+    copy_src: FxHashMap<u32, u32>,
     call_points: Vec<u32>,
     num_points: u32,
 }
 
 /// Compute live intervals for all non-alloca values in a function.
-///
-/// Uses backward dataflow analysis to correctly handle loops:
-/// - live_in[B] = gen[B] ∪ (live_out[B] - kill[B])
-/// - live_out[B] = ∪ live_in[S] for all successors S of B
-///
-/// Values that are live-in to a block have their interval extended to cover
-/// from the block's start point through the entire block. This correctly
-/// extends intervals through loop back-edges.
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
@@ -161,57 +189,56 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         };
     }
 
-    // Debug: trace phi references for GetToken return value
-
-    let alloca_set = collect_alloca_set(func);
-    let (value_ids, id_to_dense) = build_dense_value_map(func, &alloca_set);
-
+    let (alloca_set, value_ids, id_to_dense) = collect_values_and_allocas(func);
     let num_values = value_ids.len();
+
     if num_values == 0 {
+        // Still publish a correctly-sized depth vector so RA indexing is safe.
+        let block_id_to_idx = block_id_map(func);
+        let successors = build_successor_lists(func, num_blocks, &block_id_to_idx);
+        let predecessors = invert_cfg(&successors, num_blocks);
+        let back_edges = find_back_edges(&successors, num_blocks);
         return LivenessResult {
             intervals: Vec::new(),
             call_points: Vec::new(),
-            block_loop_depth: Vec::new(),
+            block_loop_depth: compute_loop_depth(&predecessors, &back_edges, num_blocks),
         };
     }
 
-    // Phase 1: Assign program points and build gen/kill sets.
     let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
 
-    // Phase 1b: Extend liveness of GEP base values for GEP folding.
     extend_gep_base_liveness(
         func,
         &alloca_set,
         &id_to_dense,
+        &ps.copy_src,
         &mut ps.last_use_points,
         &mut ps.block_gen,
     );
 
-    // Phase 1c: Extend liveness for F128 source pointers.
-    extend_f128_source_liveness(
+    apply_f128_source_gen(
         func,
-        &alloca_set,
+        &ps.f128_loads,
         &id_to_dense,
         &mut ps.last_use_points,
         &mut ps.block_gen,
     );
 
-    // Phase 2: Build successor lists for the CFG.
     let successors = build_successor_lists(func, num_blocks, &ps.block_id_to_idx);
+    let predecessors = invert_cfg(&successors, num_blocks);
+    let (back_edges, postorder) = analyze_forward_cfg(&successors, num_blocks);
+    let block_loop_depth = compute_loop_depth(&predecessors, &back_edges, num_blocks);
 
-    // Phase 2b: Compute loop nesting depth per block.
-    let block_loop_depth = compute_loop_depth(&successors, num_blocks);
-
-    // Phase 3: Backward dataflow to compute live-in/live-out per block.
     let (live_in, live_out) = run_backward_dataflow(
         num_blocks,
         num_values,
         &successors,
+        &predecessors,
+        &postorder,
         &ps.block_gen,
         &ps.block_kill,
     );
 
-    // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
     extend_intervals_from_liveness(
         num_blocks,
         &live_in,
@@ -222,32 +249,43 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &mut ps.last_use_points,
     );
 
-    // Phase 4b: Handle setjmp/longjmp.
-    extend_intervals_for_setjmp(
-        &ps.setjmp_block_indices,
+    // Dest last-use may have grown through live-through blocks; keep the
+    // implicit F128 source pointer at least as long.
+    resync_f128_last_use(&ps.f128_loads, &id_to_dense, &mut ps.last_use_points);
+
+    // Point-level (not block-level): catches values defined before setjmp
+    // and used after it in the *same* block — live_in/live_out miss those.
+    extend_intervals_across_setjmp(
+        &ps.setjmp_points,
         ps.num_points,
-        &live_in,
-        &live_out,
+        &ps.def_points,
         &mut ps.last_use_points,
     );
 
-    // Phase 5: Build and sort intervals.
     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
 
-    if let Ok(dbg) = std::env::var("CCC_DEBUG_LIVE") {
-        if let Ok(target) = dbg.parse::<u32>() {
-            if let Some(&dense) = id_to_dense.get(&target) {
-                eprintln!("[LIVE] v{} def={} last_use={}", target, ps.def_points[dense], ps.last_use_points[dense]);
-                for (bi, b) in func.blocks.iter().enumerate() {
-                    let li = live_in[bi].contains(dense);
-                    let lo = live_out[bi].contains(dense);
-                    if li || lo {
-                        eprintln!("[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
-                            bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]);
-                    }
+    if let Some(target) = debug_live_target() {
+        if let Some(&dense) = id_to_dense.get(&target) {
+            eprintln!(
+                "[LIVE] v{} def={} last_use={}",
+                target, ps.def_points[dense], ps.last_use_points[dense]
+            );
+            for (bi, b) in func.blocks.iter().enumerate() {
+                let li = live_in[bi].contains(dense);
+                let lo = live_out[bi].contains(dense);
+                if li || lo {
+                    eprintln!(
+                        "[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
+                        bi,
+                        b.label.0,
+                        li,
+                        lo,
+                        ps.block_start_points[bi],
+                        ps.block_end_points[bi]
+                    );
                 }
-                eprintln!("[LIVE]   call_points={:?}", ps.call_points);
             }
+            eprintln!("[LIVE]   call_points={:?}", ps.call_points);
         }
     }
 
@@ -258,57 +296,62 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     }
 }
 
-/// Collect alloca values (not register-allocatable).
-fn collect_alloca_set(func: &IrFunction) -> FxHashSet<u32> {
-    let mut alloca_set: FxHashSet<u32> = FxHashSet::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Alloca { dest, .. } = inst {
-                alloca_set.insert(dest.0);
-            }
-        }
-    }
-    alloca_set
+fn debug_live_target() -> Option<u32> {
+    static T: OnceLock<Option<u32>> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("CCC_DEBUG_LIVE").ok().and_then(|s| s.parse().ok()))
 }
 
-/// Collect all non-alloca value IDs and build a dense remapping:
-/// sparse value_id -> dense index in [0..num_values).
-fn build_dense_value_map(
+fn block_id_map(func: &IrFunction) -> FxHashMap<u32, usize> {
+    let mut m = FxHashMap::default();
+    m.reserve(func.blocks.len());
+    for (idx, block) in func.blocks.iter().enumerate() {
+        m.insert(block.label.0, idx);
+    }
+    m
+}
+
+/// Single IR walk: alloca set + dense remap of every non-alloca value.
+fn collect_values_and_allocas(
     func: &IrFunction,
-    alloca_set: &FxHashSet<u32>,
-) -> (Vec<u32>, FxHashMap<u32, usize>) {
+) -> (FxHashSet<u32>, Vec<u32>, FxHashMap<u32, usize>) {
+    let mut alloca_set: FxHashSet<u32> = FxHashSet::default();
     let mut value_ids: Vec<u32> = Vec::new();
     let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let hint = func.next_value_id as usize;
+    value_ids.reserve(hint);
+    seen.reserve(hint);
 
-    let maybe_add = |id: u32,
-                     alloca_set: &FxHashSet<u32>,
-                     seen: &mut FxHashSet<u32>,
-                     value_ids: &mut Vec<u32>| {
-        if !alloca_set.contains(&id) && seen.insert(id) {
+    let mut add = |id: u32, seen: &mut FxHashSet<u32>, value_ids: &mut Vec<u32>| {
+        if seen.insert(id) {
             value_ids.push(id);
         }
     };
 
     for block in &func.blocks {
         for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                alloca_set.insert(dest.0);
+            }
             if let Some(dest) = inst.dest() {
-                maybe_add(dest.0, alloca_set, &mut seen, &mut value_ids);
+                add(dest.0, &mut seen, &mut value_ids);
             }
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
-                    maybe_add(v.0, alloca_set, &mut seen, &mut value_ids);
+                    add(v.0, &mut seen, &mut value_ids);
                 }
             });
             for_each_value_use_in_instruction(inst, |v| {
-                maybe_add(v.0, alloca_set, &mut seen, &mut value_ids);
+                add(v.0, &mut seen, &mut value_ids);
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
-                maybe_add(v.0, alloca_set, &mut seen, &mut value_ids);
+                add(v.0, &mut seen, &mut value_ids);
             }
         });
     }
+
+    value_ids.retain(|id| !alloca_set.contains(id));
 
     let mut id_to_dense: FxHashMap<u32, usize> = FxHashMap::default();
     id_to_dense.reserve(value_ids.len());
@@ -316,12 +359,10 @@ fn build_dense_value_map(
         id_to_dense.insert(vid, dense_idx);
     }
 
-    (value_ids, id_to_dense)
+    (alloca_set, value_ids, id_to_dense)
 }
 
-/// Phase 1: Assign sequential program points to all instructions/terminators
-/// and build per-block gen/kill bitsets, def/use point arrays, call points,
-/// and setjmp block indices.
+/// Phase 1: program points, gen/kill, def/use, call points, setjmp, copies, F128 loads.
 fn assign_program_points(
     func: &IrFunction,
     num_blocks: usize,
@@ -337,78 +378,36 @@ fn assign_program_points(
     let mut block_gen: Vec<BitSet> = Vec::with_capacity(num_blocks);
     let mut block_kill: Vec<BitSet> = Vec::with_capacity(num_blocks);
     let mut block_id_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
-    let mut setjmp_block_indices: Vec<usize> = Vec::new();
+    block_id_to_idx.reserve(num_blocks);
+    let mut setjmp_points: Vec<u32> = Vec::new();
+    let mut f128_loads: Vec<(u32, u32)> = Vec::new();
+    let mut copy_src: FxHashMap<u32, u32> = FxHashMap::default();
     let mut call_points: Vec<u32> = Vec::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
-        let block_start = point;
-        block_start_points.push(block_start);
+        block_start_points.push(point);
         let mut gen = BitSet::new(num_values);
         let mut kill = BitSet::new(num_values);
 
         for inst in &block.instructions {
             if is_returns_twice_call(inst) {
-                setjmp_block_indices.push(block_idx);
+                setjmp_points.push(point);
             }
-
-            // Track call instruction program points for register allocation.
-            // InlineAsm instructions with register operands are treated as call
-            // points because they may clobber caller-saved registers (r8-r11 on
-            // x86). This ensures values whose live ranges span inline asm get
-            // callee-saved registers (which survive inline asm), while values NOT
-            // spanning inline asm can safely use caller-saved registers.
-            //
-            // Empty inline asm barriers (e.g., `asm volatile("" ::: "memory")`)
-            // are NOT call points since they don't use any GP registers. These
-            // are common in the kernel for memory barriers, preempt_disable/enable,
-            // etc. Treating them as call points would unnecessarily force values
-            // into callee-saved registers across simple barriers.
-            match inst {
-                Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
-                    call_points.push(point);
+            if instruction_is_call_point(inst) {
+                call_points.push(point);
+            }
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+            } = inst
+            {
+                copy_src.insert(dest.0, src.0);
+            }
+            if let Instruction::Load { dest, ptr, ty, .. } = inst {
+                if *ty == IrType::F128 && !alloca_set.contains(&ptr.0) {
+                    f128_loads.push((ptr.0, dest.0));
                 }
-                Instruction::InlineAsm {
-                    outputs, inputs, ..
-                } => {
-                    // Only treat as call point if the asm has register operands
-                    // (outputs or inputs that bind to GP registers).
-                    if !outputs.is_empty() || !inputs.is_empty() {
-                        call_points.push(point);
-                    }
-                }
-                // Memcpy uses rep movsb which clobbers rdi, rsi, rcx.
-                // VaArg/VaCopy/VaArgStruct clobber rdi/rsi for struct copy.
-                // VaStart is included conservatively for safety.
-                // Treat these as call points so caller-saved registers (including
-                // rdi/rsi) are not allocated across them.
-                Instruction::Memcpy { .. }
-                | Instruction::VaArg { .. }
-                | Instruction::VaStart { .. }
-                | Instruction::VaCopy { .. }
-                | Instruction::VaArgStruct { .. } => {
-                    call_points.push(point);
-                }
-                // i128 div/rem emit implicit calls to __divti3/__udivti3/__modti3/__umodti3.
-                // These are BinOp instructions at the IR level but generate `call` at the
-                // assembly level, clobbering all caller-saved registers.
-                Instruction::BinOp { op, ty, .. }
-                    if matches!(ty, IrType::I128 | IrType::U128)
-                        && matches!(
-                            op,
-                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-                        ) =>
-                {
-                    call_points.push(point);
-                }
-                // i128 <-> float casts emit implicit calls to compiler-rt helpers.
-                Instruction::Cast { from_ty, to_ty, .. }
-                    if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
-                        || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128)) =>
-                {
-                    call_points.push(point);
-                }
-                _ => {}
             }
 
             record_instruction_uses_dense(
@@ -419,18 +418,11 @@ fn assign_program_points(
                 &mut last_use_points,
             );
 
-            // Record InlineAsm output definitions BEFORE gen collection so
-            // that promoted (non-alloca) outputs are in the kill set and won't
-            // be treated as upward-exposed uses.
-            //
-            // Only kill output values that are first defined here (promoted asm
-            // outputs). Output values already defined earlier (e.g., pointer
-            // values passed through for indirect stores like `"=a"(*ptr)`) are
-            // merely *used* by the InlineAsm — the asm reads the pointer from
-            // the slot and stores through it, but does not overwrite the pointer
-            // itself. Killing such values truncates their live interval, letting
-            // the slot packer reuse their slot too early, which corrupts the
-            // pointer on the next loop iteration.
+            // Kill *promoted* InlineAsm outputs (first def here) before gen
+            // collection so they are not upward-exposed. Outputs already
+            // defined (pointers passed through for `"=a"(*ptr)`) are uses of
+            // the pointer, not defs — killing them truncated the pointer's
+            // interval and let the slot packer reuse it mid-loop.
             if let Instruction::InlineAsm { outputs, .. } = inst {
                 for (_, out_val, _) in outputs {
                     if !alloca_set.contains(&out_val.0) {
@@ -457,7 +449,7 @@ fn assign_program_points(
                 }
             }
 
-            point += 1;
+            point = point.saturating_add(1);
         }
 
         record_terminator_uses_dense(
@@ -468,21 +460,17 @@ fn assign_program_points(
             &mut last_use_points,
         );
         collect_terminator_gen_dense(&block.terminator, alloca_set, id_to_dense, &kill, &mut gen);
-        let block_end = point;
-        block_end_points.push(block_end);
-        point += 1;
+        block_end_points.push(point);
+        point = point.saturating_add(1);
 
         block_gen.push(gen);
         block_kill.push(kill);
     }
 
-    // Phase 1d: Extend liveness for phi incoming values.
-    // After phi elimination, each Phi { incoming: [(V, block_X), ...] } becomes
-    // a Copy instruction at the END of block_X. The value V must be live at that
-    // point. Without this extension, V's interval might end earlier (at its last
-    // direct use), allowing its register to be reused before the phi-elimination
-    // Copy executes. This is the root cause of the sqlite3RunParser n-value
-    // corruption: n's register (r13) was reused before the phi Copy.
+    // Phi incoming: after phi elim each `(V, pred)` becomes a Copy at the
+    // *end* of `pred`. V must be live there. On a back-edge `pred` is later
+    // in layout than the Phi, so the Phi's own use point is *earlier* and
+    // does not cover the Copy — this is the sqlite3RunParser `n`/r13 bug.
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Phi { incoming, .. } = inst {
@@ -494,13 +482,10 @@ fn assign_program_points(
                         if let Some(&dense) = id_to_dense.get(&v.0) {
                             if let Some(&pred_idx) = block_id_to_idx.get(&pred_label.0) {
                                 let pred_end = block_end_points[pred_idx];
-                                // Extend the value's last use to the predecessor's end
                                 let entry = &mut last_use_points[dense];
                                 if *entry == u32::MAX || pred_end > *entry {
                                     *entry = pred_end;
                                 }
-                                // Also add to predecessor's gen set so backward
-                                // dataflow propagates liveness correctly
                                 block_gen[pred_idx].insert(dense);
                             }
                         }
@@ -518,216 +503,104 @@ fn assign_program_points(
         block_gen,
         block_kill,
         block_id_to_idx,
-        setjmp_block_indices,
+        setjmp_points,
+        f128_loads,
+        copy_src,
         call_points,
         num_points: point,
     }
 }
 
-/// Phase 2: Build successor lists from block terminators and asm goto labels.
-fn build_successor_lists(
-    func: &IrFunction,
-    num_blocks: usize,
-    block_id_to_idx: &FxHashMap<u32, usize>,
-) -> Vec<Vec<usize>> {
-    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-    for (idx, block) in func.blocks.iter().enumerate() {
-        for target_id in terminator_targets(&block.terminator) {
-            if let Some(&target_idx) = block_id_to_idx.get(&target_id) {
-                successors[idx].push(target_idx);
-            }
+/// Instructions that clobber the caller-saved set at the assembly level.
+fn instruction_is_call_point(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,
+        Instruction::InlineAsm {
+            outputs,
+            inputs,
+            clobbers,
+            ..
+        } => {
+            // `asm volatile("" ::: "memory")` is a compiler barrier, not a
+            // register clobber — treating it as a call forced every crossing
+            // value into a callee-saved GPR (kernel preempt/barrier noise).
+            // A GP/XMM clobber list *without* operands (`syscall ::: rcx,r11`)
+            // *is* a call point; the old `outputs || inputs` test missed it.
+            !outputs.is_empty()
+                || !inputs.is_empty()
+                || clobbers.iter().any(|c| clobber_is_allocatable_reg(c))
         }
-        // InlineAsm goto_labels are implicit control flow edges.
-        for inst in &block.instructions {
-            if let Instruction::InlineAsm { goto_labels, .. } = inst {
-                for (_, label) in goto_labels {
-                    if let Some(&target_idx) = block_id_to_idx.get(&label.0) {
-                        if !successors[idx].contains(&target_idx) {
-                            successors[idx].push(target_idx);
-                        }
-                    }
-                }
-            }
+        // `rep movsb` / va_* helpers clobber rdi/rsi/rcx.
+        Instruction::Memcpy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::VaArgStruct { .. } => true,
+        // i128 div/rem → `__divti3` / `__udivti3` / `__modti3` / `__umodti3`.
+        Instruction::BinOp { op, ty, .. }
+            if matches!(ty, IrType::I128 | IrType::U128)
+                && matches!(
+                    op,
+                    IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+                ) =>
+        {
+            true
         }
-    }
-    successors
-}
-
-/// Phase 3: Backward dataflow to compute live-in/live-out per block.
-/// live_in[B] = gen[B] ∪ (live_out[B] - kill[B])
-/// live_out[B] = ∪ live_in[S] for all successors S of B
-fn run_backward_dataflow(
-    num_blocks: usize,
-    num_values: usize,
-    successors: &[Vec<usize>],
-    block_gen: &[BitSet],
-    block_kill: &[BitSet],
-) -> (Vec<BitSet>, Vec<BitSet>) {
-    let mut live_in: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
-    let mut live_out: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
-    let mut tmp_out = BitSet::new(num_values);
-
-    // Iterate until fixpoint (backward order converges faster).
-    // MAX_ITERATIONS is a safety bound for pathological irreducible control flow.
-    let mut changed = true;
-    let mut iteration = 0;
-    const MAX_ITERATIONS: u32 = 50;
-    while changed && iteration < MAX_ITERATIONS {
-        changed = false;
-        iteration += 1;
-
-        for idx in (0..num_blocks).rev() {
-            tmp_out.clear();
-            for &succ in &successors[idx] {
-                tmp_out.union_with(&live_in[succ]);
-            }
-
-            if tmp_out.words != live_out[idx].words {
-                live_out[idx].words.copy_from_slice(&tmp_out.words);
-                changed = true;
-            }
-
-            let in_changed = live_in[idx].assign_gen_union_out_minus_kill(
-                &block_gen[idx],
-                &live_out[idx],
-                &block_kill[idx],
-            );
-            changed |= in_changed;
+        // F128 ALU/cmp are compiler-rt libcalls on x86-64 (no hardware).
+        Instruction::BinOp { ty, .. } if *ty == IrType::F128 => true,
+        Instruction::UnaryOp { ty, .. } if *ty == IrType::F128 => true,
+        Instruction::Cmp { ty, .. } if *ty == IrType::F128 => true,
+        Instruction::Cast { from_ty, to_ty, .. }
+            if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
+                || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128))
+                || *from_ty == IrType::F128
+                || *to_ty == IrType::F128 =>
+        {
+            true
         }
-    }
-
-    (live_in, live_out)
-}
-
-/// Phase 4: Extend intervals for values that are live-in or live-out of blocks.
-/// A value live-in to a block has its interval cover the entire block.
-fn extend_intervals_from_liveness(
-    num_blocks: usize,
-    live_in: &[BitSet],
-    live_out: &[BitSet],
-    block_start_points: &[u32],
-    block_end_points: &[u32],
-    def_points: &mut [u32],
-    last_use_points: &mut [u32],
-) {
-    for idx in 0..num_blocks {
-        let start = block_start_points[idx];
-        let end = block_end_points[idx];
-
-        live_in[idx].for_each_set_bit(|dense_idx| {
-            let def_entry = &mut def_points[dense_idx];
-            if *def_entry == u32::MAX || start < *def_entry {
-                *def_entry = start;
-            }
-            let entry = &mut last_use_points[dense_idx];
-            if *entry == u32::MAX {
-                *entry = start;
-            }
-            if end > *entry {
-                *entry = end;
-            }
-        });
-
-        live_out[idx].for_each_set_bit(|dense_idx| {
-            let def_entry = &mut def_points[dense_idx];
-            if *def_entry == u32::MAX || start < *def_entry {
-                *def_entry = start;
-            }
-            let entry = &mut last_use_points[dense_idx];
-            if *entry == u32::MAX {
-                *entry = end;
-            }
-            if end > *entry {
-                *entry = end;
-            }
-        });
+        _ => false,
     }
 }
 
-/// Phase 4b: Handle setjmp/longjmp — extend intervals for values live at
-/// setjmp call points to the end of the function, preventing slot reuse.
-fn extend_intervals_for_setjmp(
-    setjmp_block_indices: &[usize],
-    num_points: u32,
-    live_in: &[BitSet],
-    live_out: &[BitSet],
-    last_use_points: &mut [u32],
-) {
-    if setjmp_block_indices.is_empty() {
-        return;
+/// True if an asm clobber names an allocatable register (GPR / XMM / …),
+/// as opposed to a token like `"memory"` / `"cc"`.
+fn clobber_is_allocatable_reg(c: &str) -> bool {
+    let c = c.trim().trim_start_matches('%');
+    if c.is_empty() {
+        return false;
     }
-    let func_end = num_points.saturating_sub(1);
-    for &sjb in setjmp_block_indices {
-        live_in[sjb].for_each_set_bit(|dense_idx| {
-            let entry = &mut last_use_points[dense_idx];
-            if *entry == u32::MAX || func_end > *entry {
-                *entry = func_end;
-            }
-        });
-        live_out[sjb].for_each_set_bit(|dense_idx| {
-            let entry = &mut last_use_points[dense_idx];
-            if *entry == u32::MAX || func_end > *entry {
-                *entry = func_end;
-            }
-        });
+    // Cheap ASCII lower without allocating for the common tokens.
+    let eq_ignore_ascii = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    if eq_ignore_ascii(c, "memory")
+        || eq_ignore_ascii(c, "cc")
+        || eq_ignore_ascii(c, "flags")
+        || eq_ignore_ascii(c, "fpsr")
+        || eq_ignore_ascii(c, "dirflag")
+        || eq_ignore_ascii(c, "uninitialized")
+    {
+        return false;
     }
+    true
 }
 
-/// Phase 5: Build sorted live intervals from def/use point arrays.
-fn build_intervals(
-    value_ids: &[u32],
-    def_points: &[u32],
-    last_use_points: &[u32],
-) -> Vec<LiveInterval> {
-    let mut intervals: Vec<LiveInterval> = Vec::new();
-    for (dense_idx, &vid) in value_ids.iter().enumerate() {
-        let start = def_points[dense_idx];
-        if start == u32::MAX {
-            continue;
-        }
-        let end = last_use_points[dense_idx];
-        let end = if end == u32::MAX {
-            start
-        } else {
-            end.max(start)
-        };
-        intervals.push(LiveInterval {
-            start,
-            end,
-            value_id: vid,
-        });
-    }
-    intervals.sort_unstable_by_key(|iv| iv.start);
-    intervals
+// ── GEP-fold implicit uses ───────────────────────────────────────────────────
+
+enum GepOffset {
+    Const(i64),
+    Index(u32),
 }
 
-/// Extend liveness of GEP base values so that their registers remain valid
-/// at Load/Store use points where the GEP offset can be folded into the
-/// addressing mode.
-///
-/// For each GEP `%gep = gep %base, const_offset` whose result is only used
-/// as a Load/Store ptr operand:
-/// - Find all Load/Store instructions that use %gep as their ptr
-/// - Record %base as "used" at those instruction program points
-/// - Update the gen bitset for the block containing the Load/Store
-///
-/// This ensures the register allocator keeps %base alive through the folded
-/// Load/Store, enabling safe `offset(%base_reg)` addressing at codegen time.
+/// Keep GEP/Add bases (and variable indices) live at the Load/Store that
+/// folds them into an addressing mode. Mirrors `build_gep_fold_map`.
 fn extend_gep_base_liveness(
     func: &IrFunction,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
+    copy_src: &FxHashMap<u32, u32>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
 ) {
-    // Phase A: Identify foldable GEPs with non-alloca bases.
-    // Same criteria as build_gep_fold_map in generation.rs.
-    // Value: (base_id, offset), where offset is Const(i64) or an index Value.
-    enum GepOffset {
-        Const(i64),
-        Index(u32),
-    }
-    let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
+    let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default();
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -738,7 +611,6 @@ fn extend_gep_base_liveness(
                     offset: Operand::Const(c),
                     ..
                 } => {
-                    // Constant-offset GEP: foldable into Load/Store addressing mode
                     if alloca_set.contains(&base.0) {
                         continue;
                     }
@@ -753,21 +625,17 @@ fn extend_gep_base_liveness(
                         gep_info.insert(dest.0, (base.0, GepOffset::Const(offset_val)));
                     }
                 }
-                Instruction::GetElementPtr { dest, base, offset: Operand::Value(off), .. } => {
-                    // Variable-offset GEP: may be used for indexed addressing.
-                    // Both the base pointer AND the index value must stay live
-                    // until the Load/Store that uses this GEP result, otherwise
-                    // the register allocator may reuse either register before
-                    // the indexed load/store executes.
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Value(off),
+                    ..
+                } => {
                     if alloca_set.contains(&base.0) {
                         continue;
                     }
                     gep_info.insert(dest.0, (base.0, GepOffset::Index(off.0)));
                 }
-                // build_gep_fold_map also recognizes integer Add(base, const).
-                // Mirror it here so the base register stays live through the
-                // folded memory operation (the old GEP-only analysis could let
-                // linear scan reuse it one point too early).
                 Instruction::BinOp {
                     dest,
                     op: IrBinOp::Add,
@@ -807,21 +675,18 @@ fn extend_gep_base_liveness(
         return;
     }
 
-    // Phase B: Verify each GEP dest is only used as Load/Store ptr operand.
-    // If used elsewhere, remove from the map (not foldable).
+    // A GEP dest used as anything other than a (non-i128) Load/Store pointer
+    // is not foldable — don't fake a use of the base there.
     let mut non_foldable: FxHashSet<u32> = FxHashSet::default();
-
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
                 Instruction::Load { ptr, ty, .. } => {
-                    // Load.ptr is foldable unless i128
                     if matches!(ty, IrType::I128 | IrType::U128) && gep_info.contains_key(&ptr.0) {
                         non_foldable.insert(ptr.0);
                     }
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
-                    // Store.val is NOT foldable; Store.ptr is (unless i128)
                     if let Operand::Value(v) = val {
                         if gep_info.contains_key(&v.0) {
                             non_foldable.insert(v.0);
@@ -832,7 +697,6 @@ fn extend_gep_base_liveness(
                     }
                 }
                 _ => {
-                    // Any other use invalidates folding
                     for_each_operand_in_instruction(inst, |op| {
                         if let Operand::Value(v) = op {
                             if gep_info.contains_key(&v.0) {
@@ -856,163 +720,170 @@ fn extend_gep_base_liveness(
             }
         });
     }
-
     for id in &non_foldable {
         gep_info.remove(id);
     }
-
     if gep_info.is_empty() {
         return;
     }
 
-    // Phase C: Extend base liveness to Load/Store points that use foldable GEP results.
     let mut block_point: u32 = 0;
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
-            match inst {
-                Instruction::Load { .. } | Instruction::Store { .. } => {
-                    let ptr_id = match inst {
-                        Instruction::Load { ptr, .. } => ptr.0,
-                        Instruction::Store { ptr, .. } => ptr.0,
-                        _ => unreachable!("GEP analysis matched non-Load/Store instruction"),
-                    };
-                    if let Some(&(base_id, ref offset)) = gep_info.get(&ptr_id) {
-                        // Extend a value's last_use to this program point,
-                        // following Copy chains (a base/index defined by a Copy
-                        // needs its source kept live too, or the register may
-                        // be reused before the folded load/store executes).
-                        let mut extend_one = |start_id: u32, last_use_points: &mut [u32], block_gen: &mut [BitSet]| {
-                            let mut extend_id = start_id;
-                            for _ in 0..10 { // max Copy chain depth
-                                if alloca_set.contains(&extend_id) { break; }
-                                if let Some(&dense) = id_to_dense.get(&extend_id) {
-                                    let entry = &mut last_use_points[dense];
-                                    if *entry == u32::MAX || block_point > *entry {
-                                        *entry = block_point;
-                                    }
-                                    block_gen[bi].insert(dense);
-                                }
-                                let mut found_copy_src = None;
-                                for b in &func.blocks {
-                                    for i in &b.instructions {
-                                        if let Instruction::Copy { dest, src: Operand::Value(s) } = i {
-                                            if dest.0 == extend_id {
-                                                found_copy_src = Some(s.0);
-                                            }
-                                        }
-                                    }
-                                }
-                                match found_copy_src {
-                                    Some(src) => extend_id = src,
-                                    None => break,
-                                }
-                            }
-                        };
-                        extend_one(base_id, last_use_points, block_gen);
-                        // For variable-offset (indexed) GEPs, the index value is
-                        // consumed by the folded load/store too — keep it live.
-                        if let GepOffset::Index(idx_id) = offset {
-                            extend_one(*idx_id, last_use_points, block_gen);
-                        }
+            let ptr_id = match inst {
+                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => Some(ptr.0),
+                _ => None,
+            };
+            if let Some(ptr_id) = ptr_id {
+                if let Some(&(base_id, ref offset)) = gep_info.get(&ptr_id) {
+                    extend_use_following_copies(
+                        base_id,
+                        block_point,
+                        bi,
+                        alloca_set,
+                        id_to_dense,
+                        copy_src,
+                        last_use_points,
+                        block_gen,
+                    );
+                    if let GepOffset::Index(idx_id) = *offset {
+                        extend_use_following_copies(
+                            idx_id,
+                            block_point,
+                            bi,
+                            alloca_set,
+                            id_to_dense,
+                            copy_src,
+                            last_use_points,
+                            block_gen,
+                        );
                     }
                 }
-                _ => {}
             }
-            block_point += 1;
+            block_point = block_point.saturating_add(1);
         }
-        // Account for terminator point
-        block_point += 1;
+        block_point = block_point.saturating_add(1);
     }
 }
 
-/// Extend liveness for F128 load source pointers.
+/// Extend `start_id` (and its Copy-chain sources) to `point`.
 ///
-/// When an F128 value is loaded from memory, the codegen records which pointer
-/// was used (via `track_f128_load` in state.rs). Later, during Call emission,
-/// `emit_f128_operand_to_a0_a1` reads the pointer back from its stack slot to
-/// reload the full 128-bit value. This creates an implicit dependency: the
-/// pointer must remain live until the last use of the F128 dest value.
-///
-/// Without this extension, the Tier 2 liveness analysis considers the pointer
-/// dead after the Load instruction, allowing the register allocator (and
-/// subsequently the Tier 3 slot allocator) to reuse its slot. If another value
-/// is placed in that slot before the Call, the pointer is corrupted and the
-/// Call dereferences garbage (typically causing SIGSEGV).
-fn extend_f128_source_liveness(
-    func: &IrFunction,
+/// The old body scanned the entire function for `Copy` insts on every hop
+/// (`O(|F|)` per hop per folded load). The copy map is built in Phase 1.
+fn extend_use_following_copies(
+    start_id: u32,
+    point: u32,
+    block_idx: usize,
     alloca_set: &FxHashSet<u32>,
+    id_to_dense: &FxHashMap<u32, usize>,
+    copy_src: &FxHashMap<u32, u32>,
+    last_use_points: &mut [u32],
+    block_gen: &mut [BitSet],
+) {
+    let mut id = start_id;
+    for _ in 0..16 {
+        if alloca_set.contains(&id) {
+            break;
+        }
+        if let Some(&dense) = id_to_dense.get(&id) {
+            let entry = &mut last_use_points[dense];
+            if *entry == u32::MAX || point > *entry {
+                *entry = point;
+            }
+            block_gen[block_idx].insert(dense);
+        }
+        match copy_src.get(&id) {
+            Some(&src) if src != id => id = src,
+            _ => break,
+        }
+    }
+}
+
+// ── F128 source-pointer implicit uses ────────────────────────────────────────
+
+/// Codegen reloads the F128 *source pointer* at the dest's last use
+/// (`emit_f128_operand_to_a0_a1`). The pointer must stay live that long.
+///
+/// Intra-block: last_use(ptr) := max(last_use(ptr), last_use(dest)) — gen/kill
+/// cannot express a use that is not in the IR.
+/// Inter-block: insert ptr into gen of every block that uses dest so dataflow
+/// carries it through predecessors.
+fn apply_f128_source_gen(
+    func: &IrFunction,
+    f128_loads: &[(u32, u32)],
     id_to_dense: &FxHashMap<u32, usize>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
 ) {
-    // Collect (ptr_id, dest_id) pairs for F128 loads with non-alloca pointers.
-    let mut f128_loads: Vec<(u32, u32)> = Vec::new();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Load { dest, ptr, ty, .. } = inst {
-                if *ty == IrType::F128 && !alloca_set.contains(&ptr.0) {
-                    f128_loads.push((ptr.0, dest.0));
-                }
-            }
-        }
-    }
-
     if f128_loads.is_empty() {
         return;
     }
 
-    // Extend each pointer's last_use_point to match its dest's last_use_point.
-    for &(ptr_id, dest_id) in &f128_loads {
-        let dest_dense = id_to_dense.get(&dest_id).copied();
-        let ptr_dense = id_to_dense.get(&ptr_id).copied();
-        if let (Some(dd), Some(pd)) = (dest_dense, ptr_dense) {
-            let dest_last = last_use_points[dd];
-            if dest_last != u32::MAX {
-                let ptr_entry = &mut last_use_points[pd];
-                if *ptr_entry == u32::MAX || dest_last > *ptr_entry {
-                    *ptr_entry = dest_last;
-                }
+    for &(ptr_id, dest_id) in f128_loads {
+        let (Some(&dd), Some(&pd)) = (id_to_dense.get(&dest_id), id_to_dense.get(&ptr_id)) else {
+            continue;
+        };
+        let dest_last = last_use_points[dd];
+        if dest_last != u32::MAX {
+            let ptr_entry = &mut last_use_points[pd];
+            if *ptr_entry == u32::MAX || dest_last > *ptr_entry {
+                *ptr_entry = dest_last;
             }
         }
     }
 
-    // Update gen sets so backward dataflow propagation keeps the pointer live
-    // in predecessor blocks when the dest value is used in a successor block.
+    let mut dest_to_ptr: FxHashMap<u32, u32> = FxHashMap::default();
+    dest_to_ptr.reserve(f128_loads.len());
+    for &(ptr_id, dest_id) in f128_loads {
+        dest_to_ptr.insert(dest_id, ptr_id);
+    }
+
     for (bi, block) in func.blocks.iter().enumerate() {
-        for inst in &block.instructions {
-            let mut check_use = |vid: u32| {
-                for &(ptr_id, dest_id) in &f128_loads {
-                    if vid == dest_id {
-                        if let Some(&pd) = id_to_dense.get(&ptr_id) {
-                            block_gen[bi].insert(pd);
-                        }
-                    }
+        let mut mark = |vid: u32| {
+            if let Some(&ptr_id) = dest_to_ptr.get(&vid) {
+                if let Some(&pd) = id_to_dense.get(&ptr_id) {
+                    block_gen[bi].insert(pd);
                 }
-            };
+            }
+        };
+        for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
-                    check_use(v.0);
+                    mark(v.0);
                 }
             });
-            for_each_value_use_in_instruction(inst, |v| {
-                check_use(v.0);
-            });
+            for_each_value_use_in_instruction(inst, |v| mark(v.0));
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
-                for &(ptr_id, dest_id) in &f128_loads {
-                    if v.0 == dest_id {
-                        if let Some(&pd) = id_to_dense.get(&ptr_id) {
-                            block_gen[bi].insert(pd);
-                        }
-                    }
-                }
+                mark(v.0);
             }
         });
     }
 }
 
-/// Record uses of operands in an instruction (dense index version).
+fn resync_f128_last_use(
+    f128_loads: &[(u32, u32)],
+    id_to_dense: &FxHashMap<u32, usize>,
+    last_use_points: &mut [u32],
+) {
+    for &(ptr_id, dest_id) in f128_loads {
+        let (Some(&dd), Some(&pd)) = (id_to_dense.get(&dest_id), id_to_dense.get(&ptr_id)) else {
+            continue;
+        };
+        let dest_last = last_use_points[dd];
+        if dest_last == u32::MAX {
+            continue;
+        }
+        let ptr_entry = &mut last_use_points[pd];
+        if *ptr_entry == u32::MAX || dest_last > *ptr_entry {
+            *ptr_entry = dest_last;
+        }
+    }
+}
+
+// ── Use / gen recorders ──────────────────────────────────────────────────────
+
 fn record_instruction_uses_dense(
     inst: &Instruction,
     point: u32,
@@ -1021,28 +892,24 @@ fn record_instruction_uses_dense(
     last_use: &mut [u32],
 ) {
     let mut record = |vid: u32| {
-        if !alloca_set.contains(&vid) {
-            if let Some(&dense) = id_to_dense.get(&vid) {
-                let entry = &mut last_use[dense];
-                if *entry == u32::MAX || point > *entry {
-                    *entry = point;
-                }
+        if alloca_set.contains(&vid) {
+            return;
+        }
+        if let Some(&dense) = id_to_dense.get(&vid) {
+            let entry = &mut last_use[dense];
+            if *entry == u32::MAX || point > *entry {
+                *entry = point;
             }
         }
     };
-
     for_each_operand_in_instruction(inst, |op| {
         if let Operand::Value(v) = op {
             record(v.0);
         }
     });
-
-    for_each_value_use_in_instruction(inst, |v| {
-        record(v.0);
-    });
+    for_each_value_use_in_instruction(inst, |v| record(v.0));
 }
 
-/// Record uses in a terminator (dense index version).
 fn record_terminator_uses_dense(
     term: &Terminator,
     point: u32,
@@ -1052,19 +919,19 @@ fn record_terminator_uses_dense(
 ) {
     for_each_operand_in_terminator(term, |op| {
         if let Operand::Value(v) = op {
-            if !alloca_set.contains(&v.0) {
-                if let Some(&dense) = id_to_dense.get(&v.0) {
-                    let entry = &mut last_use[dense];
-                    if *entry == u32::MAX || point > *entry {
-                        *entry = point;
-                    }
+            if alloca_set.contains(&v.0) {
+                return;
+            }
+            if let Some(&dense) = id_to_dense.get(&v.0) {
+                let entry = &mut last_use[dense];
+                if *entry == u32::MAX || point > *entry {
+                    *entry = point;
                 }
             }
         }
     });
 }
 
-/// Collect gen set for a block's instruction (dense bitset version).
 fn collect_instruction_gen_dense(
     inst: &Instruction,
     alloca_set: &FxHashSet<u32>,
@@ -1073,27 +940,23 @@ fn collect_instruction_gen_dense(
     gen: &mut BitSet,
 ) {
     let mut add_use = |vid: u32| {
-        if !alloca_set.contains(&vid) {
-            if let Some(&dense) = id_to_dense.get(&vid) {
-                if !kill.contains(dense) {
-                    gen.insert(dense);
-                }
+        if alloca_set.contains(&vid) {
+            return;
+        }
+        if let Some(&dense) = id_to_dense.get(&vid) {
+            if !kill.contains(dense) {
+                gen.insert(dense);
             }
         }
     };
-
     for_each_operand_in_instruction(inst, |op| {
         if let Operand::Value(v) = op {
             add_use(v.0);
         }
     });
-
-    for_each_value_use_in_instruction(inst, |v| {
-        add_use(v.0);
-    });
+    for_each_value_use_in_instruction(inst, |v| add_use(v.0));
 }
 
-/// Collect gen set for a terminator (dense bitset version).
 fn collect_terminator_gen_dense(
     term: &Terminator,
     alloca_set: &FxHashSet<u32>,
@@ -1103,45 +966,329 @@ fn collect_terminator_gen_dense(
 ) {
     for_each_operand_in_terminator(term, |op| {
         if let Operand::Value(v) = op {
-            if !alloca_set.contains(&v.0) {
-                if let Some(&dense) = id_to_dense.get(&v.0) {
-                    if !kill.contains(dense) {
-                        gen.insert(dense);
-                    }
+            if alloca_set.contains(&v.0) {
+                return;
+            }
+            if let Some(&dense) = id_to_dense.get(&v.0) {
+                if !kill.contains(dense) {
+                    gen.insert(dense);
                 }
             }
         }
     });
 }
 
-/// Get successor block IDs from a terminator.
-fn terminator_targets(term: &Terminator) -> Vec<u32> {
+// ── CFG ──────────────────────────────────────────────────────────────────────
+
+fn build_successor_lists(
+    func: &IrFunction,
+    num_blocks: usize,
+    block_id_to_idx: &FxHashMap<u32, usize>,
+) -> Vec<Vec<usize>> {
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (idx, block) in func.blocks.iter().enumerate() {
+        for_each_terminator_target(&block.terminator, |target_id| {
+            if let Some(&target_idx) = block_id_to_idx.get(&target_id) {
+                push_unique(&mut successors[idx], target_idx);
+            }
+        });
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    if let Some(&target_idx) = block_id_to_idx.get(&label.0) {
+                        push_unique(&mut successors[idx], target_idx);
+                    }
+                }
+            }
+        }
+    }
+    successors
+}
+
+fn push_unique(vec: &mut Vec<usize>, x: usize) {
+    if !vec.contains(&x) {
+        vec.push(x);
+    }
+}
+
+fn invert_cfg(successors: &[Vec<usize>], num_blocks: usize) -> Vec<Vec<usize>> {
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (src, succs) in successors.iter().enumerate() {
+        for &dst in succs {
+            if dst < num_blocks {
+                predecessors[dst].push(src);
+            }
+        }
+    }
+    predecessors
+}
+
+fn for_each_terminator_target(term: &Terminator, mut f: impl FnMut(u32)) {
     match term {
-        Terminator::Branch(target) => vec![target.0],
+        Terminator::Branch(target) => f(target.0),
         Terminator::CondBranch {
             true_label,
             false_label,
             ..
         } => {
-            vec![true_label.0, false_label.0]
+            f(true_label.0);
+            f(false_label.0);
         }
         Terminator::IndirectBranch {
             possible_targets, ..
-        } => possible_targets.iter().map(|t| t.0).collect(),
-        Terminator::Switch { cases, default, .. } => {
-            let mut targets = vec![default.0];
-            for (_, label) in cases {
-                targets.push(label.0);
+        } => {
+            for t in possible_targets {
+                f(t.0);
             }
-            targets
         }
-        _ => vec![],
+        Terminator::Switch { cases, default, .. } => {
+            f(default.0);
+            for (_, label) in cases {
+                f(label.0);
+            }
+        }
+        _ => {}
     }
 }
 
-/// Return true if the instruction is a call to setjmp, _setjmp, sigsetjmp, or __sigsetjmp.
-/// These functions "return twice": once normally (returning 0) and again when longjmp is called.
-/// Values live at the call point must have their intervals extended to prevent stack slot reuse.
+/// Iterative DFS from every unvisited root: back-edges + postorder.
+fn analyze_forward_cfg(
+    successors: &[Vec<usize>],
+    num_blocks: usize,
+) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let back_edges = find_back_edges(successors, num_blocks);
+    let mut state = vec![0u8; num_blocks];
+    let mut postorder = Vec::with_capacity(num_blocks);
+    let mut next_succ = vec![0usize; num_blocks];
+    for start in 0..num_blocks {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut stack = vec![start];
+        while let Some(&block) = stack.last() {
+            let i = next_succ[block];
+            if i < successors[block].len() {
+                next_succ[block] = i + 1;
+                let nxt = successors[block][i];
+                if nxt < num_blocks && state[nxt] == 0 {
+                    state[nxt] = 1;
+                    stack.push(nxt);
+                }
+            } else {
+                state[block] = 2;
+                postorder.push(block);
+                stack.pop();
+            }
+        }
+    }
+    (back_edges, postorder)
+}
+
+fn find_back_edges(successors: &[Vec<usize>], num_blocks: usize) -> Vec<(usize, usize)> {
+    let mut state = vec![0u8; num_blocks];
+    let mut back_edges: Vec<(usize, usize)> = Vec::new();
+    let mut next_succ = vec![0usize; num_blocks];
+    for start in 0..num_blocks {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut stack = vec![start];
+        while let Some(&block) = stack.last() {
+            let i = next_succ[block];
+            if i < successors[block].len() {
+                next_succ[block] = i + 1;
+                let nxt = successors[block][i];
+                if nxt >= num_blocks {
+                    continue;
+                }
+                match state[nxt] {
+                    0 => {
+                        state[nxt] = 1;
+                        stack.push(nxt);
+                    }
+                    1 => back_edges.push((block, nxt)),
+                    _ => {}
+                }
+            } else {
+                state[block] = 2;
+                stack.pop();
+            }
+        }
+    }
+    back_edges
+}
+
+// ── Dataflow ─────────────────────────────────────────────────────────────────
+
+/// Worklist backward liveness. Seeded in reverse postorder so a linear
+/// chain and a reducible nest typically finish in one pass per nest level.
+///
+/// There is **no** “give up after 50 iterations” cap. Each `live_in` bit
+/// flips at most once (monotonic ∪), so each block is dequeued at most
+/// `O(num_values)` times. Under-approx on timeout was a silent miscompile.
+fn run_backward_dataflow(
+    num_blocks: usize,
+    num_values: usize,
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+    postorder: &[usize],
+    block_gen: &[BitSet],
+    block_kill: &[BitSet],
+) -> (Vec<BitSet>, Vec<BitSet>) {
+    let mut live_in: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
+    let mut live_out: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
+    let mut tmp_out = BitSet::new(num_values);
+
+    // Reverse postorder = exits first for backward problems.
+    let mut worklist: Vec<usize> = postorder.iter().copied().rev().collect();
+    let mut in_queue = vec![false; num_blocks];
+    for &b in &worklist {
+        in_queue[b] = true;
+    }
+    // Unreachable-from-DFS holes (shouldn't happen — we visit every root).
+    for b in 0..num_blocks {
+        if !in_queue[b] {
+            in_queue[b] = true;
+            worklist.push(b);
+        }
+    }
+
+    while let Some(idx) = worklist.pop() {
+        in_queue[idx] = false;
+
+        tmp_out.clear();
+        for &succ in &successors[idx] {
+            tmp_out.union_with(&live_in[succ]);
+        }
+        if !tmp_out.bits_eq(&live_out[idx]) {
+            live_out[idx].copy_from(&tmp_out);
+        }
+
+        if live_in[idx].assign_gen_union_out_minus_kill(
+            &block_gen[idx],
+            &live_out[idx],
+            &block_kill[idx],
+        ) {
+            for &pred in &predecessors[idx] {
+                if !in_queue[pred] {
+                    in_queue[pred] = true;
+                    worklist.push(pred);
+                }
+            }
+        }
+    }
+
+    (live_in, live_out)
+}
+
+/// A value live-*in* to B covers `[B.start, B.end]` (may pull `def` earlier —
+/// needed for loop-carried values whose def is later in layout).
+///
+/// A value live-*out* of B only extends `last_use` to `B.end`. Pulling `def`
+/// back to `B.start` for a value *defined in B* invented a live range before
+/// the def and inflated register pressure for no correctness gain.
+fn extend_intervals_from_liveness(
+    num_blocks: usize,
+    live_in: &[BitSet],
+    live_out: &[BitSet],
+    block_start_points: &[u32],
+    block_end_points: &[u32],
+    def_points: &mut [u32],
+    last_use_points: &mut [u32],
+) {
+    for idx in 0..num_blocks {
+        let start = block_start_points[idx];
+        let end = block_end_points[idx];
+
+        live_in[idx].for_each_set_bit(|dense_idx| {
+            let def_entry = &mut def_points[dense_idx];
+            if *def_entry == u32::MAX || start < *def_entry {
+                *def_entry = start;
+            }
+            let entry = &mut last_use_points[dense_idx];
+            if *entry == u32::MAX || end > *entry {
+                *entry = end;
+            }
+        });
+
+        live_out[idx].for_each_set_bit(|dense_idx| {
+            if def_points[dense_idx] == u32::MAX {
+                // Use with no recorded def: last-resort so the value is not dropped.
+                def_points[dense_idx] = start;
+            }
+            let entry = &mut last_use_points[dense_idx];
+            if *entry == u32::MAX || end > *entry {
+                *entry = end;
+            }
+        });
+    }
+}
+
+/// Any value whose interval contains a setjmp point is live across a
+/// returns-twice edge: longjmp restores the frame, so the slot/reg must
+/// not be reused for the rest of the function.
+fn extend_intervals_across_setjmp(
+    setjmp_points: &[u32],
+    num_points: u32,
+    def_points: &[u32],
+    last_use_points: &mut [u32],
+) {
+    if setjmp_points.is_empty() {
+        return;
+    }
+    let func_end = num_points.saturating_sub(1);
+    for &p in setjmp_points {
+        for (dense_idx, &start) in def_points.iter().enumerate() {
+            if start == u32::MAX || start > p {
+                continue;
+            }
+            let end = last_use_points[dense_idx];
+            // Live at `p` iff the interval already reaches `p` (or has no use
+            // yet, which we treat as live at the def only — not across setjmp
+            // unless a use sits on the other side).
+            if end == u32::MAX || end < p {
+                continue;
+            }
+            if func_end > last_use_points[dense_idx] {
+                last_use_points[dense_idx] = func_end;
+            }
+        }
+    }
+}
+
+fn build_intervals(
+    value_ids: &[u32],
+    def_points: &[u32],
+    last_use_points: &[u32],
+) -> Vec<LiveInterval> {
+    let mut intervals: Vec<LiveInterval> = Vec::with_capacity(value_ids.len());
+    for (dense_idx, &vid) in value_ids.iter().enumerate() {
+        let start = def_points[dense_idx];
+        if start == u32::MAX {
+            continue;
+        }
+        let end = last_use_points[dense_idx];
+        let end = if end == u32::MAX {
+            start
+        } else {
+            end.max(start)
+        };
+        intervals.push(LiveInterval {
+            start,
+            end,
+            value_id: vid,
+        });
+    }
+    intervals.sort_unstable_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.value_id.cmp(&b.value_id))
+    });
+    intervals
+}
+
 fn is_returns_twice_call(inst: &Instruction) -> bool {
     if let Instruction::Call { func, .. } = inst {
         matches!(
@@ -1153,10 +1300,10 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
     }
 }
 
-/// Iterate over all Operand references in an instruction.
-/// This is the single canonical source of truth for instruction operand traversal.
-/// All code that needs to enumerate operands (liveness, use-counting, GEP fold
-/// verification) should call this rather than hand-rolling its own match.
+// ── Canonical operand visitors (shared with live_range.rs) ───────────────────
+
+/// Iterate over all `Operand` references in an instruction.
+/// Single source of truth — liveness, use-counting, GEP-fold verification.
 pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl FnMut(&Operand)) {
     match inst {
         Instruction::Alloca { .. } | Instruction::PgoCounterInc { .. } => {}
@@ -1252,10 +1399,7 @@ pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
     }
 }
 
-/// Iterate over Value references (non-Operand) used in an instruction.
-/// These are pointer/base values used directly (not wrapped in Operand),
-/// e.g., the `ptr` in Store/Load, `base` in GEP, `dest`/`src` in Memcpy.
-/// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
+/// Iterate over bare `Value` uses (pointers, GEP bases, memcpy endpoints, …).
 pub(crate) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl FnMut(&Value)) {
     match inst {
         Instruction::Store { ptr, .. } => f(ptr),
@@ -1295,8 +1439,10 @@ pub(crate) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl 
     }
 }
 
-/// Iterate over all Operand references in a terminator.
-/// Canonical traversal — shared by liveness, use-counting, and GEP fold analysis.
+/// Iterate over `Operand`s in a terminator.
+///
+/// Phi incoming values are **not** terminator operands — they live on
+/// `Instruction::Phi` and are visited by [`for_each_operand_in_instruction`].
 pub(crate) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMut(&Operand)) {
     match term {
         Terminator::Return(Some(op)) => f(op),
@@ -1307,97 +1453,59 @@ pub(crate) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMu
     }
 }
 
-/// Compute the loop nesting depth for each block in the CFG.
+// ── Loop nesting depth ───────────────────────────────────────────────────────
+
+/// Natural-loop nesting depth per block, used as `10^depth` in RA priority.
 ///
-/// Uses DFS-based back-edge detection: an edge src -> dst where dst is an
-/// ancestor in the DFS tree is a back edge defining a natural loop. For each
-/// back edge (src -> header), all blocks on any path from header to src form
-/// the loop body. The depth of a block is the number of loop bodies it belongs to.
-///
-/// This is used by the register allocator to weight uses inside loops more
-/// heavily, so that inner-loop temporaries get priority for register allocation.
-fn compute_loop_depth(successors: &[Vec<usize>], num_blocks: usize) -> Vec<u32> {
+/// A back-edge `tail → header` (header is a DFS ancestor of tail) defines a
+/// natural loop: `header` plus every block that reaches `tail` without going
+/// through `header`. **All back-edges that share a header are one loop** —
+/// incrementing once per back-edge double-counted two-latch loops and made
+/// RA treat a single loop as nested (`priority × 10` extra).
+fn compute_loop_depth(
+    predecessors: &[Vec<usize>],
+    back_edges: &[(usize, usize)],
+    num_blocks: usize,
+) -> Vec<u32> {
     if num_blocks == 0 {
         return Vec::new();
     }
-
     let mut depth = vec![0u32; num_blocks];
+    if back_edges.is_empty() {
+        return depth;
+    }
 
-    // Build predecessor lists from successor lists.
-    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-    for (src, succs) in successors.iter().enumerate() {
-        for &dst in succs {
-            if dst < num_blocks {
-                predecessors[dst].push(src);
-            }
+    let mut tails_of: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for &(tail, header) in back_edges {
+        if header < num_blocks && tail < num_blocks {
+            tails_of.entry(header).or_default().push(tail);
         }
     }
 
-    // DFS to classify edges. An edge src -> dst is a back edge if dst is an
-    // ancestor of src in the DFS tree (i.e., dst was visited but not finished).
-    // State: 0 = unvisited, 1 = in-progress (on stack), 2 = finished.
-    let mut state = vec![0u8; num_blocks];
-    let mut back_edges: Vec<(usize, usize)> = Vec::new(); // (src, header)
+    for (&header, tails) in &tails_of {
+        let mut visited = vec![false; num_blocks];
+        visited[header] = true;
+        depth[header] = depth[header].saturating_add(1);
 
-    // Iterative DFS to avoid stack overflow on deeply nested CFGs.
-    let mut stack: Vec<(usize, usize)> = Vec::new(); // (block, successor_index)
-    state[0] = 1; // Mark entry block as in-progress
-    stack.push((0, 0));
-
-    while let Some(&mut (block, ref mut succ_idx)) = stack.last_mut() {
-        if *succ_idx < successors[block].len() {
-            let next = successors[block][*succ_idx];
-            *succ_idx += 1;
-            if next < num_blocks {
-                match state[next] {
-                    0 => {
-                        // Unvisited: push to stack
-                        state[next] = 1;
-                        stack.push((next, 0));
-                    }
-                    1 => {
-                        // Back edge: next is an ancestor (in-progress)
-                        back_edges.push((block, next));
-                    }
-                    _ => {
-                        // Cross or forward edge: ignore
-                    }
-                }
+        let mut worklist: Vec<usize> = Vec::new();
+        for &tail in tails {
+            if tail == header || visited[tail] {
+                continue;
             }
-        } else {
-            // All successors processed: mark as finished
-            state[block] = 2;
-            stack.pop();
-        }
-    }
-
-    // For each back edge (src -> header), find the natural loop body.
-    // The loop body consists of all blocks that can reach `src` without going
-    // through `header`, plus `header` itself. We compute this by a reverse
-    // BFS/DFS from `src` following predecessor edges, stopping at `header`.
-    for &(tail, header) in &back_edges {
-        // All blocks in the loop body get +1 depth
-        depth[header] += 1;
-        if tail != header {
-            // BFS backwards from tail, stopping at header
-            let mut worklist = vec![tail];
-            let mut visited = vec![false; num_blocks];
-            visited[header] = true; // Don't go past header
             visited[tail] = true;
-            depth[tail] += 1;
-
-            while let Some(b) = worklist.pop() {
-                for &pred in &predecessors[b] {
-                    if pred < num_blocks && !visited[pred] {
-                        visited[pred] = true;
-                        depth[pred] += 1;
-                        worklist.push(pred);
-                    }
+            depth[tail] = depth[tail].saturating_add(1);
+            worklist.push(tail);
+        }
+        while let Some(b) = worklist.pop() {
+            for &pred in &predecessors[b] {
+                if pred < num_blocks && !visited[pred] {
+                    visited[pred] = true;
+                    depth[pred] = depth[pred].saturating_add(1);
+                    worklist.push(pred);
                 }
             }
         }
     }
-
     depth
 }
 
@@ -1407,10 +1515,6 @@ mod tests {
     use crate::common::types::IrType;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp};
 
-    /// Verify that InlineAsm with register operands is treated as a call point.
-    /// This is critical for register allocation: values spanning inline asm with
-    /// register constraints must get callee-saved registers, since inline asm may
-    /// clobber caller-saved registers (r8-r11 on x86).
     #[test]
     fn test_inline_asm_with_operands_is_call_point() {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
@@ -1424,7 +1528,6 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(2)),
                     ty: IrType::I32,
                 },
-                // Inline asm with an output register constraint
                 Instruction::InlineAsm {
                     template: "nop".to_string(),
                     outputs: vec![("=r".to_string(), Value(1), Some("out".to_string()))],
@@ -1442,16 +1545,12 @@ mod tests {
         func.next_value_id = 2;
 
         let result = compute_live_intervals(&func);
-        // The InlineAsm instruction should appear as a call point
         assert!(
             !result.call_points.is_empty(),
             "InlineAsm with register operands should be a call point"
         );
     }
 
-    /// Verify that empty inline asm barriers (no inputs/outputs) are NOT call points.
-    /// Memory barriers like `asm volatile("" ::: "memory")` don't use GP registers
-    /// and should not force values into callee-saved registers.
     #[test]
     fn test_empty_inline_asm_barrier_not_call_point() {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
@@ -1465,7 +1564,6 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(2)),
                     ty: IrType::I32,
                 },
-                // Empty inline asm barrier - no outputs or inputs
                 Instruction::InlineAsm {
                     template: String::new(),
                     outputs: vec![],
@@ -1483,10 +1581,49 @@ mod tests {
         func.next_value_id = 1;
 
         let result = compute_live_intervals(&func);
-        // Call points should only contain the calls, not the empty barrier
         assert!(
             result.call_points.is_empty(),
             "Empty inline asm barriers should NOT be call points"
+        );
+    }
+
+    #[test]
+    fn test_inline_asm_gpr_clobber_is_call_point() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I32(1)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                },
+                Instruction::InlineAsm {
+                    template: "syscall".to_string(),
+                    outputs: vec![],
+                    inputs: vec![],
+                    clobbers: vec![
+                        "rcx".to_string(),
+                        "r11".to_string(),
+                        "memory".to_string(),
+                    ],
+                    operand_types: vec![],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![],
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 1;
+
+        let result = compute_live_intervals(&func);
+        assert!(
+            !result.call_points.is_empty(),
+            "InlineAsm that clobbers GPRs must be a call point"
         );
     }
 
@@ -1522,8 +1659,113 @@ mod tests {
 
         let result = compute_live_intervals(&func);
         let base = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
-        // ParamRef is point 0, Add is point 1, and the folded Load is point 2.
         assert!(base.end >= 2, "base ended before folded Load: {base:?}");
     }
 
+    #[test]
+    fn no_values_still_reports_per_block_loop_depth() {
+        let mut func = IrFunction::new("empty".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 0;
+        let result = compute_live_intervals(&func);
+        assert!(result.intervals.is_empty());
+        assert_eq!(result.block_loop_depth.len(), 1);
+        assert_eq!(result.block_loop_depth[0], 0);
+    }
+
+    #[test]
+    fn loop_depth_single_back_edge() {
+        // 0 → 1 → 2 → 1 (back), 2 → 3
+        let succs = vec![vec![1], vec![2], vec![1, 3], vec![]];
+        let preds = invert_cfg(&succs, 4);
+        let back = find_back_edges(&succs, 4);
+        let d = compute_loop_depth(&preds, &back, 4);
+        assert_eq!(d[0], 0);
+        assert_eq!(d[1], 1);
+        assert_eq!(d[2], 1);
+        assert_eq!(d[3], 0);
+    }
+
+    #[test]
+    fn loop_depth_two_latches_not_double_counted() {
+        // header 0 with two latches — one natural loop, not depth 2.
+        let succs = vec![vec![1, 2], vec![0], vec![0]];
+        let preds = invert_cfg(&succs, 3);
+        let back = find_back_edges(&succs, 3);
+        let d = compute_loop_depth(&preds, &back, 3);
+        assert_eq!(d[0], 1, "header double-counted: {d:?}");
+        assert_eq!(d[1], 1, "{d:?}");
+        assert_eq!(d[2], 1, "{d:?}");
+    }
+
+    #[test]
+    fn loop_depth_nested() {
+        // 0 → 1 → 2 → 1 (inner), 1 → 3 → 0 (outer)
+        let succs = vec![vec![1], vec![2, 3], vec![1], vec![0]];
+        let preds = invert_cfg(&succs, 4);
+        let back = find_back_edges(&succs, 4);
+        let d = compute_loop_depth(&preds, &back, 4);
+        assert_eq!(d[0], 1, "{d:?}");
+        assert!(d[1] >= 2, "inner header should be nested: {d:?}");
+        assert!(d[2] >= 2, "inner latch should be nested: {d:?}");
+        assert_eq!(d[3], 1, "{d:?}");
+    }
+
+    #[test]
+    fn bitset_transfer_function() {
+        let mut gen = BitSet::new(80);
+        let mut kill = BitSet::new(80);
+        let mut out = BitSet::new(80);
+        let mut live_in = BitSet::new(80);
+        gen.insert(1);
+        gen.insert(70);
+        kill.insert(2);
+        out.insert(2);
+        out.insert(3);
+        assert!(live_in.assign_gen_union_out_minus_kill(&gen, &out, &kill));
+        assert!(live_in.contains(1));
+        assert!(live_in.contains(70));
+        assert!(!live_in.contains(2), "killed");
+        assert!(live_in.contains(3));
+        assert!(!live_in.assign_gen_union_out_minus_kill(&gen, &out, &kill));
+    }
+
+    #[test]
+    fn dataflow_propagates_through_long_chain() {
+        // 80-block chain 0→1→…→79, use of v at the end, def at the start.
+        // The old MAX_ITERATIONS=50 cap under-approximated this if layout
+        // order ever fought the sweep; the worklist must not.
+        let n = 80;
+        let mut succs = vec![Vec::new(); n];
+        for i in 0..n - 1 {
+            succs[i].push(i + 1);
+        }
+        let preds = invert_cfg(&succs, n);
+        let (_, post) = analyze_forward_cfg(&succs, n);
+
+        let mut gen: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
+        let kill: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
+        gen[n - 1].insert(0); // use at the exit
+        let mut kill0 = BitSet::new(1);
+        kill0.insert(0);
+        let mut kill = kill;
+        kill[0] = kill0; // def at entry
+
+        let (live_in, live_out) =
+            run_backward_dataflow(n, 1, &succs, &preds, &post, &gen, &kill);
+        // Value is live-out of every block except the exit, live-in of every
+        // block except the entry (killed there).
+        assert!(!live_in[0].contains(0), "def kills upward exposure");
+        for i in 1..n {
+            assert!(live_in[i].contains(0), "live_in[{i}] missing");
+        }
+        for i in 0..n - 1 {
+            assert!(live_out[i].contains(0), "live_out[{i}] missing");
+        }
+    }
 }
