@@ -1370,6 +1370,16 @@ impl super::InstructionEncoder {
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(4, mem)
                     }
+                    // `jmp *sym`: absolute-address indirect jump (FF /4,
+                    // disp-only ModR/M). GAS: `ff 25 <R_386_32 sym>` in
+                    // .code32; `ff 26` + R_386_16 in .code16 (gcc -m16
+                    // itself emits this 16-bit form for `jmp *fp` — the low
+                    // half of the 32-bit pointer is the whole story in real
+                    // mode). Produced by tail-calling the global-fnptr fold.
+                    Operand::Label(label) => {
+                        self.bytes.push(0xFF);
+                        self.encode_abs_addr_modrm(4, label)
+                    }
                     _ => Err("unsupported indirect jmp target".to_string()),
                 }
             }
@@ -1587,6 +1597,16 @@ impl super::InstructionEncoder {
                         self.emit_segment_prefix(mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(2, mem)
+                    }
+                    // `call *sym` / `call *sym+4`: absolute-address indirect
+                    // call through a global function pointer (FF /2 with
+                    // disp-only ModR/M). GAS encodes `call *pio_ops` as
+                    // `ff 15 <R_386_32 pio_ops>` (.code32) / `ff 16` +
+                    // R_386_16 (.code16). The peephole's global-fnptr fold
+                    // emits exactly this shape.
+                    Operand::Label(label) => {
+                        self.bytes.push(0xFF);
+                        self.encode_abs_addr_modrm(2, label)
                     }
                     _ => Err("unsupported indirect call target".to_string()),
                 }

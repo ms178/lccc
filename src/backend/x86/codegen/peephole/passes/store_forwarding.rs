@@ -333,7 +333,12 @@ fn gsf_handle_other(
     if infos[i].has_indirect_mem {
         invalidate_all_mappings(slot_entries, reg_offsets);
     } else if infos[i].rbp_offset != RBP_OFFSET_NONE {
-        invalidate_slots_at(slot_entries, reg_offsets, infos[i].rbp_offset, 1);
+        // A folded memory operand is a RANGE access, not a point: x87
+        // `fstpt -24(%rbp)` writes 10 bytes, `movdqu` 16. Treating it as
+        // 1 byte kept forwarded mappings for the neighboring slots alive
+        // across a wide store (the i686 twin miscompiled spectral_norm
+        // exactly this way). 16 bytes covers every x86 access width.
+        invalidate_slots_at(slot_entries, reg_offsets, infos[i].rbp_offset, 16);
     }
 }
 
