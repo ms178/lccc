@@ -238,6 +238,9 @@ pub struct CodegenState {
     /// and skipped during codegen. These values are never emitted — their registers
     /// are uninitialized. MachInst must not use these as pointers.
     pub folded_gep_values: FxHashSet<u32>,
+    /// Values proven never-materialized before slot assignment (foldable
+    /// GlobalAddr on i686 non-PIC): no register, no slot.
+    pub never_materialized_values: FxHashSet<u32>,
     /// Name of the function currently being code-generated (diagnostics).
     pub current_func_name: String,
     /// Total use count for each value ID across the entire function.
@@ -413,6 +416,7 @@ impl CodegenState {
             reg_cache: RegCache::default(),
             gep_base_offset: FxHashMap::default(),
             folded_gep_values: FxHashSet::default(),
+            never_materialized_values: FxHashSet::default(),
             current_func_name: String::new(),
             value_use_counts: Vec::new(),
             block_use_counts: FxHashMap::default(),
@@ -548,6 +552,7 @@ impl CodegenState {
         self.alloca_alignments.clear();
         self.i128_values.clear();
         self.wide_values.clear();
+        self.never_materialized_values.clear();
         self.has_dyn_alloca = false;
         self.omit_frame_pointer = false;
         self.frame_size = 0;

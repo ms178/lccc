@@ -1224,6 +1224,9 @@ impl X86Codegen {
             };
 
             match class {
+                // I64RegPair exists only under i686 gcc_regparm_mode; this
+                // backend never sets that config flag.
+                ParamClass::I64RegPair { .. } => unreachable!("I64RegPair is i686-regparm-only"),
                 ParamClass::IntReg { reg_idx } => {
                     // Always store the full 64-bit register to ensure the entire 8-byte
                     // slot is initialized. Using a typed store (e.g., movl for I32) would

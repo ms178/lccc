@@ -4,7 +4,7 @@ use crate::ir::reexports::{Instruction, IrFunction, Value};
 use crate::common::types::IrType;
 use crate::backend::generation::{
     is_i128_type, calculate_stack_space_common, run_regalloc_and_merge_clobbers,
-    filter_available_regs, find_param_alloca, collect_inline_asm_callee_saved_with_generic,
+    filter_available_regs, find_param_alloca,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::emit;
@@ -121,7 +121,15 @@ impl I686Codegen {
             I686_CALLEE_SAVED
         };
 
-        collect_inline_asm_callee_saved_with_generic(
+        // Precision variant: the blanket "generic constraint clobbers every
+        // callee-saved register" rule is skipped when a per-block demand scan
+        // proves the scratch allocator can satisfy the block from %ecx/%edx
+        // (the head of its fixed pool). arch/x86/boot is full of one-operand
+        // "=rm"/"r" segment reads that were paying 3 push/pop pairs plus
+        // total register-allocator starvation for a guarantee they never
+        // needed. Falls back to the conservative marking when any block's
+        // demand exceeds the caller-saved prefix.
+        crate::backend::stack_layout::collect_inline_asm_callee_saved_i686(
             func, &mut asm_clobbered_regs,
             i686_constraint_to_phys,
             i686_clobber_to_phys,
@@ -146,10 +154,27 @@ impl I686Codegen {
 
         let caller_saved_regs = I686_CALLER_SAVED.to_vec();
 
-        let (reg_assigned, cached_liveness, _caller_save_spans) = run_regalloc_and_merge_clobbers(
+        // GlobalAddr values whose EVERY use is a foldable Load/Store pointer
+        // never materialize (non-PIC absolute fold in generate_load/store);
+        // keep them out of the allocator so a dead address cannot occupy a
+        // register the live loaded value needs. Mirrors the fold conditions:
+        // non-PIC, non-TLS, non-wide type, default address space.
+        let never_materialized = if !self.state.pic_mode {
+            let gmap = crate::backend::generation::build_global_addr_map_for(
+                func, &self.state.tls_symbols);
+            let set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+            // Also deny stack slots: these values produce no code at all.
+            self.state.never_materialized_values = set.clone();
+            Some(set)
+        } else {
+            None
+        };
+
+        let (reg_assigned, cached_liveness, _caller_save_spans) =
+            crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false,
+            false, never_materialized,
         );
 
         // %ebx must be saved/restored only when it really holds the GOT base.
@@ -202,7 +227,8 @@ impl I686Codegen {
             callee_saved_bytes + 8
         };
         let needed = raw_locals + fixed_overhead;
-        let aligned = (needed + 15) & !15;
+        let b = self.stack_boundary.max(4);
+        let aligned = (needed + (b - 1)) & !(b - 1);
         aligned - fixed_overhead
     }
 
@@ -326,7 +352,7 @@ impl I686Codegen {
         // Used to handle the case where param alloca was eliminated by mem2reg
         // but the register allocator assigned a callee-saved register.
         let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
-        if self.is_fastcall {
+        if self.is_fastcall || self.regparm > 0 {
             for block in &func.blocks {
                 for inst in &block.instructions {
                     if let Instruction::ParamRef { dest, param_idx, .. } = inst {
@@ -340,6 +366,139 @@ impl I686Codegen {
 
         let stack_base: i64 = 8;
         let mut fastcall_reg_idx = 0usize;
+
+        // ── regparm callee-side capture ─────────────────────────────────────
+        // Register parameters (%eax/%edx/%ecx) are caller-saved: the ONLY safe
+        // place to capture them is the prologue, before any body instruction
+        // can clobber them. Three cases per register param:
+        //   1. Param alloca has a slot  -> handled by the per-class arms in
+        //      the main loop below (store reg -> alloca slot).
+        //   2. Alloca gone (mem2reg) but the ParamRef dest is register-
+        //      allocated -> move the ABI register to the assigned register
+        //      NOW and mark param_pre_stored.
+        //   3. Alloca gone but the ParamRef dest has a spill slot -> store
+        //      the ABI register to that slot NOW and mark param_pre_stored.
+        // Params are processed in DESCENDING ABI-register order (ecx, edx,
+        // eax): %ecx/%edx are themselves allocatable (caller-saved phase), so
+        // a pre-store target could be a later param's still-unread source.
+        // Saving higher-numbered sources first makes that impossible.
+        if self.regparm > 0 && !self.is_fastcall {
+            let regparm_srcs = ["%eax", "%edx", "%ecx"];
+            // Phase 1: memory-target captures. Stores never clobber another
+            // param's source register, so they are safe in any order. This
+            // MUST cover register params with live allocas too: the main
+            // loop's stack-param copies stage through %eax (and wide copies
+            // through %edx), which would destroy unsaved register args.
+            let mut reg_moves: Vec<(usize, &'static str, crate::backend::regalloc::PhysReg)> = Vec::new(); // (param_idx, src, dst)
+            for (i, class) in param_classes.iter().enumerate() {
+                let alloca_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0).map(|s| (dest, s)));
+                match *class {
+                    ParamClass::IntReg { reg_idx } => {
+                        let src_full = regparm_srcs[reg_idx];
+                        if let Some((_, slot)) = alloca_slot {
+                            // Typed capture into the alloca slot. Sub-int
+                            // types are extended in-register first (the
+                            // extension clobbers only this param's own
+                            // source register, which is dead afterwards).
+                            let ty = func.params[i].ty;
+                            let regparm_regs_byte = ["%al", "%dl", "%cl"];
+                            let regparm_regs_word = ["%ax", "%dx", "%cx"];
+                            let slot_ref = self.slot_ref(slot);
+                            match ty {
+                                IrType::I8 => {
+                                    emit!(self.state, "    movsbl {}, {}", regparm_regs_byte[reg_idx], src_full);
+                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                }
+                                IrType::U8 => {
+                                    emit!(self.state, "    movzbl {}, {}", regparm_regs_byte[reg_idx], src_full);
+                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                }
+                                IrType::I16 => {
+                                    emit!(self.state, "    movswl {}, {}", regparm_regs_word[reg_idx], src_full);
+                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                }
+                                IrType::U16 => {
+                                    emit!(self.state, "    movzwl {}, {}", regparm_regs_word[reg_idx], src_full);
+                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                }
+                                _ => {
+                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                }
+                            }
+                        } else if let Some(dest) = paramref_dests[i] {
+                            if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                                reg_moves.push((i, src_full, phys));
+                            } else if let Some(slot) = self.state.get_slot(dest.0) {
+                                let sr = self.slot_ref(slot);
+                                emit!(self.state, "    movl {}, {}", src_full, sr);
+                                self.state.param_pre_stored.insert(i);
+                            }
+                            // Neither register nor slot: value is dead.
+                        }
+                    }
+                    ParamClass::I64RegPair { base_reg_idx } => {
+                        // Wide values always live in 8-byte slots on i686.
+                        let slot = alloca_slot.map(|(_, s)| s).or_else(|| {
+                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
+                        });
+                        if let Some(slot) = slot {
+                            let sr0 = self.slot_ref(slot);
+                            let sr4 = self.slot_ref_offset(slot, 4);
+                            emit!(self.state, "    movl {}, {}", regparm_srcs[base_reg_idx], sr0);
+                            emit!(self.state, "    movl {}, {}", regparm_srcs[base_reg_idx + 1], sr4);
+                            if alloca_slot.is_none() {
+                                self.state.param_pre_stored.insert(i);
+                            }
+                        }
+                    }
+                    ParamClass::StructByValReg { base_reg_idx, size } => {
+                        let slot = alloca_slot.map(|(_, s)| s).or_else(|| {
+                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
+                        });
+                        if let Some(slot) = slot {
+                            let words = size.div_ceil(4);
+                            for k in 0..words {
+                                let sr = self.slot_ref_offset(slot, (k * 4) as i64);
+                                emit!(self.state, "    movl {}, {}", regparm_srcs[base_reg_idx + k], sr);
+                            }
+                            if alloca_slot.is_none() {
+                                self.state.param_pre_stored.insert(i);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Phase 2: register-target captures form a parallel move: a target
+            // (%ecx/%edx are allocatable on i686) can be another move's still-
+            // unread source. Standard resolution: repeatedly emit a move whose
+            // target is not a pending source; a stuck state is a swap cycle
+            // among {%edx, %ecx} (%eax is never an allocation target), broken
+            // with xchg.
+            while !reg_moves.is_empty() {
+                let pending_srcs: Vec<&str> = reg_moves.iter().map(|m| m.1).collect();
+                if let Some(pos) = reg_moves.iter().position(|&(_, src, dst)| {
+                    let dst_name = format!("%{}", phys_reg_name(dst));
+                    dst_name == src || !pending_srcs.contains(&dst_name.as_str())
+                }) {
+                    let (i, src, dst) = reg_moves.remove(pos);
+                    let dst_name = phys_reg_name(dst);
+                    if format!("%{}", dst_name) != src {
+                        emit!(self.state, "    movl {}, %{}", src, dst_name);
+                    }
+                    self.state.param_pre_stored.insert(i);
+                } else {
+                    // Pure swap cycle: only possible between %ecx and %edx.
+                    self.state.emit("    xchgl %ecx, %edx");
+                    for m in reg_moves.drain(..) {
+                        // After the swap both values sit in their targets.
+                        self.state.param_pre_stored.insert(m.0);
+                    }
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+        }
 
         // Build a map from physical register -> list of param indices that use it,
         // so we can detect when two params share the same callee-saved register.
@@ -541,41 +700,14 @@ impl I686Codegen {
                     emit!(self.state, "    fstpt {}", dst_ref);
                     self.state.f128_direct_slots.insert(dest_id);
                 }
-                ParamClass::IntReg { reg_idx } => {
-                    // regparm: param arrives in EAX/EDX/ECX (reg_idx 0/1/2)
-                    let regparm_regs_full = ["%eax", "%edx", "%ecx"];
-                    let regparm_regs_byte = ["%al", "%dl", "%cl"];
-                    let regparm_regs_word = ["%ax", "%dx", "%cx"];
-                    let src_full = regparm_regs_full[reg_idx];
-                    let slot_ref = self.slot_ref(slot);
-                    match ty {
-                        IrType::I8 => {
-                            let src_byte = regparm_regs_byte[reg_idx];
-                            emit!(self.state, "    movsbl {}, {}", src_byte, src_full);
-                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-                        }
-                        IrType::U8 => {
-                            let src_byte = regparm_regs_byte[reg_idx];
-                            emit!(self.state, "    movzbl {}, {}", src_byte, src_full);
-                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-                        }
-                        IrType::I16 => {
-                            let src_word = regparm_regs_word[reg_idx];
-                            emit!(self.state, "    movswl {}, {}", src_word, src_full);
-                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-                        }
-                        IrType::U16 => {
-                            let src_word = regparm_regs_word[reg_idx];
-                            emit!(self.state, "    movzwl {}, {}", src_word, src_full);
-                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-                        }
-                        _ => {
-                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-                        }
-                    }
+                ParamClass::IntReg { .. }
+                | ParamClass::I64RegPair { .. }
+                | ParamClass::StructByValReg { .. } => {
+                    // Captured by the regparm phase-1 pass above (which runs
+                    // BEFORE any stack-param copy can clobber %eax/%edx/%ecx).
                 }
                 _ => {
-                    // Remaining register classes (FloatReg, StructByValReg, etc.)
+                    // Remaining register classes (FloatReg, SSE structs, etc.)
                     // don't apply to i686's ABI classification.
                 }
             }
@@ -614,6 +746,23 @@ impl I686Codegen {
                         }
                         return;
                     }
+                }
+                if self.state.get_slot(dest.0).is_none() {
+                    // Dest is register-allocated (or dead) with no spill slot.
+                    // The param value lives in the alloca slot — emit_store_params
+                    // put it there regardless of whether it arrived in a register
+                    // (regparm) or on the stack. Load it from there; falling
+                    // through to the stack-offset fallback is wrong for register
+                    // params (they have no stack home).
+                    if let Some(phys) = self.dest_reg(dest) {
+                        let reg = phys_reg_name(phys);
+                        let load_instr = self.mov_load_for_type(ty);
+                        let src_ref = self.slot_ref(alloca_slot);
+                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                        emit!(self.state, "    movl %eax, %{}", reg);
+                        self.state.reg_cache.invalidate_acc();
+                    }
+                    return;
                 }
                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
                     if is_i128_type(ty) {
@@ -670,11 +819,16 @@ impl I686Codegen {
                 ParamClass::I128Stack { offset } |
                 ParamClass::F128Stack { offset } |
                 ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset - stack_offset_adjust,
-                ParamClass::IntReg { .. } => {
-                    // Regparm: param was stored to its alloca slot in emit_store_params.
-                    // This should have been handled by the alloca_slot path above.
-                    // If we get here, just use a fallback offset.
-                    stack_base + (param_idx as i64) * 4
+                ParamClass::IntReg { .. }
+                | ParamClass::I64RegPair { .. }
+                | ParamClass::StructByValReg { .. } => {
+                    // Register param whose alloca was eliminated: the value was
+                    // captured in the prologue (param_pre_stored) or is dead.
+                    // There IS no stack home to read; falling through to a
+                    // stack load would read the caller's frame garbage.
+                    debug_assert!(false,
+                        "emit_param_ref: register param {} not pre-stored", param_idx);
+                    return;
                 }
                 _ => stack_base + (param_idx as i64) * 4,
             }
@@ -722,7 +876,10 @@ impl I686Codegen {
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         self.emit_epilogue(frame_size);
-        if self.state.uses_sret {
+        if self.state.uses_sret && self.regparm == 0 {
+            // i386 SysV sret: callee pops the hidden pointer.
+            // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
+            // function_value semantics) — nothing is on the stack to pop.
             self.state.emit("    ret $4");
         } else if self.is_fastcall && self.fastcall_stack_cleanup > 0 {
             emit!(self.state, "    ret ${}", self.fastcall_stack_cleanup);

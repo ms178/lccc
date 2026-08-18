@@ -1053,6 +1053,200 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             }
         }
 
+        // Pattern 2c: Zero-idiom + move fusion --
+        // `xorl %eax, %eax; movl %eax, %REG` becomes `xorl %REG, %REG` under
+        // the Pattern-2a deadness scan. Flags: both forms leave the same
+        // arithmetic flag state (xor sets ZF/PF, clears CF/OF; the dropped
+        // mov never touched flags), so even a flag-consuming successor is
+        // unaffected. Codegen emits this pair for every zero landing in a
+        // phase-2 register (%ecx/%edx).
+        if let LineKind::Other { dest_reg } = infos[i].kind {
+            if dest_reg == REG_EAX {
+                let src_line = trimmed(store, &infos[i], i);
+                if src_line == "xorl %eax, %eax" {
+                    if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
+                        if msrc == REG_EAX && mdst != REG_EAX && mdst <= REG_GP_MAX {
+                            let mut k = j + 1;
+                            let mut cnt = 0;
+                            let mut dead = false;
+                            while k < len && cnt < 24 {
+                                if infos[k].is_nop() { k += 1; continue; }
+                                if infos[k].is_barrier() { break; }
+                                let s = trimmed(store, &infos[k], k);
+                                let written = match infos[k].kind {
+                                    LineKind::Other { dest_reg } => dest_reg == REG_EAX,
+                                    LineKind::Move { dst, .. } => dst == REG_EAX,
+                                    LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
+                                    LineKind::SetCC { reg } => reg == REG_EAX,
+                                    _ => false,
+                                };
+                                if written && !line_reads_dest_source(s, REG_EAX) {
+                                    dead = true;
+                                    break;
+                                }
+                                if line_references_reg(s, REG_EAX)
+                                    || line_writes_reg_implicitly(s, REG_EAX)
+                                {
+                                    break;
+                                }
+                                k += 1;
+                                cnt += 1;
+                            }
+                            if dead {
+                                let rn = reg32_name(mdst);
+                                store.replace(i, format!("    xorl {}, {}", rn, rn));
+                                infos[i] = classify_line(store.get(i));
+                                infos[j].kind = LineKind::Nop;
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2d: Copy-then-test collapse --
+        // `movl %S, %eax; testl %S, %eax` (or testl %eax, %S) computes S&S;
+        // rewrite the test to `testl %S, %S`. The mov is kept only if %eax
+        // is read before being rewritten (deadness scan); the common
+        // emitted shape has the branch consume the flags and reload %eax
+        // immediately after, so the mov almost always dies too.
+        if let LineKind::Move { dst: mdst, src: msrc } = infos[i].kind {
+            if mdst == REG_EAX && msrc != REG_EAX && msrc <= REG_GP_MAX {
+                if infos[j].kind == LineKind::Cmp {
+                    let t = trimmed(store, &infos[j], j);
+                    let rn = reg32_name(msrc);
+                    let f1 = format!("testl %{}, %eax", rn);
+                    let f2 = format!("testl %eax, %{}", rn);
+                    if t == f1 || t == f2 {
+                        store.replace(j, format!("    testl %{}, %{}", rn, rn));
+                        infos[j] = classify_line(store.get(j));
+                        // Deadness scan for the mov: skip the (rewritten) test.
+                        let mut k = j + 1;
+                        let mut cnt = 0;
+                        let mut dead = false;
+                        while k < len && cnt < 24 {
+                            if infos[k].is_nop() { k += 1; continue; }
+                            if infos[k].is_barrier() { break; }
+                            let s2 = trimmed(store, &infos[k], k);
+                            let written = match infos[k].kind {
+                                LineKind::Other { dest_reg } => dest_reg == REG_EAX,
+                                LineKind::Move { dst, .. } => dst == REG_EAX,
+                                LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
+                                LineKind::SetCC { reg } => reg == REG_EAX,
+                                _ => false,
+                            };
+                            if written && !line_reads_dest_source(s2, REG_EAX) {
+                                dead = true;
+                                break;
+                            }
+                            if line_references_reg(s2, REG_EAX)
+                                || line_writes_reg_implicitly(s2, REG_EAX)
+                            {
+                                break;
+                            }
+                            k += 1;
+                            cnt += 1;
+                        }
+                        if dead {
+                            infos[i].kind = LineKind::Nop;
+                        }
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Pattern 2e: Memory read-modify-write collapse --
+        // `movl SLOT, %eax; op $imm, %eax; movl %eax, SLOT` becomes
+        // `op $imm, SLOT` when %eax is dead afterwards (Pattern-2a scan).
+        // The store/load pair around a single immediate ALU op is codegen's
+        // shape for `local op= const` on slot-resident locals; GCC emits
+        // the memory-destination form directly. Also covers incl/decl.
+        if let LineKind::LoadEbp { reg: lreg, offset: loff, size: MoveSize::L } = infos[i].kind {
+            if lreg == REG_EAX {
+                // find op line j, then store line at k
+                if let LineKind::Other { dest_reg: op_dst } = infos[j].kind {
+                    if op_dst == REG_EAX {
+                        let op_s = trimmed(store, &infos[j], j).to_string();
+                        let is_imm_alu = (op_s.starts_with("addl $") || op_s.starts_with("subl $")
+                            || op_s.starts_with("andl $") || op_s.starts_with("orl $")
+                            || op_s.starts_with("xorl $") || op_s.starts_with("shll $")
+                            || op_s.starts_with("sarl $") || op_s.starts_with("shrl $"))
+                            && op_s.ends_with(", %eax");
+                        let is_incdec = op_s == "incl %eax" || op_s == "decl %eax";
+                        if is_imm_alu || is_incdec {
+                            let mut k = j + 1;
+                            while k < len && infos[k].is_nop() { k += 1; }
+                            if k < len {
+                                if let LineKind::StoreEbp { reg: sreg, offset: soff, size: MoveSize::L } = infos[k].kind {
+                                    if sreg == REG_EAX && soff == loff {
+                                        // %eax deadness after the store.
+                                        let mut m = k + 1;
+                                        let mut cnt = 0;
+                                        let mut dead = false;
+                                        while m < len && cnt < 24 {
+                                            if infos[m].is_nop() { m += 1; continue; }
+                                            if infos[m].is_barrier() { break; }
+                                            let s2 = trimmed(store, &infos[m], m);
+                                            let written = match infos[m].kind {
+                                                LineKind::Other { dest_reg } => dest_reg == REG_EAX,
+                                                LineKind::Move { dst, .. } => dst == REG_EAX,
+                                                LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
+                                                LineKind::SetCC { reg } => reg == REG_EAX,
+                                                _ => false,
+                                            };
+                                            if written && !line_reads_dest_source(s2, REG_EAX) {
+                                                dead = true;
+                                                break;
+                                            }
+                                            if line_references_reg(s2, REG_EAX)
+                                                || line_writes_reg_implicitly(s2, REG_EAX)
+                                            {
+                                                break;
+                                            }
+                                            m += 1;
+                                            cnt += 1;
+                                        }
+                                        if dead {
+                                            // Rebuild the memory operand exactly as the
+                                            // load line spelled it.
+                                            let load_s = trimmed(store, &infos[i], i);
+                                            let mem = load_s.strip_prefix("movl ")
+                                                .and_then(|r| r.split(',').next())
+                                                .unwrap_or("")
+                                                .trim()
+                                                .to_string();
+                                            if !mem.is_empty() {
+                                                let new_line = if is_incdec {
+                                                    format!("    {} {}", &op_s[..4], mem)
+                                                } else {
+                                                    // "addl $N, %eax" -> "addl $N, MEM"
+                                                    let head = &op_s[..op_s.len() - ", %eax".len()];
+                                                    format!("    {}, {}", head, mem)
+                                                };
+                                                store.replace(j, new_line);
+                                                infos[j] = classify_line(store.get(j));
+                                                infos[i].kind = LineKind::Nop;
+                                                infos[k].kind = LineKind::Nop;
+                                                changed = true;
+                                                i += 1;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Pattern 2: Adjacent store/load with same offset
         if let LineKind::StoreEbp { reg: store_reg, offset: store_off, size: store_size } = infos[i].kind {
             if let LineKind::LoadEbp { reg: load_reg, offset: load_off, size: load_size } = infos[j].kind {
@@ -2155,15 +2349,87 @@ fn try_fold_memory_operand(s: &str, load_reg: RegId, offset: i32, _size: MoveSiz
 fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
     let len = infos.len();
 
-    // Collect all loaded byte ranges (offset, size)
+    // ── ESP-offset soundness ────────────────────────────────────────────────
+    // N(%esp) names DIFFERENT memory before and after any ESP change: a store
+    // to 20(%esp) followed by two pushes is read back as 28(%esp). Comparing
+    // raw ESP offsets across the whole function (as this pass once did)
+    // deleted live parameter-capture stores in exactly that pattern.
+    //
+    // Every ESP-relative offset is therefore NORMALIZED to a frame-anchored
+    // coordinate (offset − sp_down, where sp_down is how far ESP sits below
+    // function entry at that line, tracked through pushl/popl and
+    // subl/addl $imm,%esp). Two situations make the linear sp_down walk
+    // unsound, and each falls back conservatively rather than guessing:
+    //
+    //  * a CALL may change net ESP invisibly (i686 sret callees pop the
+    //    hidden pointer with `ret $4`): after any call, an ESP store is
+    //    eliminated only if the function contains NO ESP-based reads at all
+    //    (shift-immune criterion — a dead slot is dead under any numbering);
+    //  * a label/jump reached with unbalanced pushes, or an ESP write that
+    //    is not push/pop/subl/addl $imm: give up on ESP stores entirely.
+    //
+    // EBP-relative offsets are stable (EBP never moves inside the body), so
+    // the EBP domain keeps full precision in all cases. The two domains are
+    // kept apart by ESP_SLOT_BIAS exactly as in the windowed passes.
+    let mut sp_down: i64 = 0;
+    let mut sp_base: Option<i64> = None; // sp_down after first explicit allocation
+    let mut esp_walk_ok = true;
+    let mut has_call = false;
+    let mut any_esp_read = false;
+    let mut norm: Vec<i32> = vec![0; len]; // per-line ESP normalization (subtract from biased offset)
+
+    for i in 0..len {
+        if infos[i].is_nop() { continue; }
+        let s = trimmed(store, &infos[i], i);
+        norm[i] = sp_down as i32;
+        match infos[i].kind {
+            LineKind::Push { .. } => { norm[i] = sp_down as i32; sp_down += 4; }
+            LineKind::Pop { .. } => { any_esp_read = true; sp_down -= 4; norm[i] = sp_down as i32; }
+            LineKind::Call => { has_call = true; }
+            LineKind::Label | LineKind::Jmp | LineKind::CondJmp => {
+                if let Some(base) = sp_base {
+                    if sp_down != base { esp_walk_ok = false; }
+                } else if sp_down != 0 {
+                    // control flow before the frame allocation: give up
+                    esp_walk_ok = false;
+                }
+            }
+            _ => {
+                if let Some(rest) = s.strip_prefix("subl $") {
+                    if let Some(n) = rest.strip_suffix(", %esp").and_then(|v| v.parse::<i64>().ok()) {
+                        sp_down += n;
+                        if sp_base.is_none() { sp_base = Some(sp_down); }
+                        continue;
+                    }
+                }
+                if let Some(rest) = s.strip_prefix("addl $") {
+                    if let Some(n) = rest.strip_suffix(", %esp").and_then(|v| v.parse::<i64>().ok()) {
+                        sp_down -= n;
+                        continue;
+                    }
+                }
+                // Any other ESP write invalidates the walk.
+                if matches!(infos[i].kind, LineKind::Other { dest_reg } if dest_reg == REG_ESP)
+                    || (s.contains("%esp") && !s.contains("(%esp)")) {
+                    esp_walk_ok = false;
+                }
+            }
+        }
+    }
+
+    let is_esp_biased = |off: i32| off >= ESP_SLOT_BIAS / 2;
+
+    // Collect all loaded byte ranges in normalized coordinates.
     let mut read_ranges: Vec<(i32, i32)> = Vec::new();
     let mut addr_taken = false;
 
     for i in 0..len {
         if infos[i].is_nop() { continue; }
+        let normalize = |off: i32| if is_esp_biased(off) { off - norm[i] } else { off };
         match infos[i].kind {
             LineKind::LoadEbp { offset, size, .. } => {
-                read_ranges.push((offset, size.byte_size()));
+                if is_esp_biased(offset) { any_esp_read = true; }
+                read_ranges.push((normalize(offset), size.byte_size()));
             }
             _ => {
                 let s = trimmed(store, &infos[i], i);
@@ -2175,14 +2441,16 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
                 if infos[i].has_indirect_mem {
                     addr_taken = true;
                 }
-                // Track %ebp-relative reads from non-Load/Store instructions
+                // Track %ebp/%esp-relative reads from non-Load/Store lines
                 // (e.g. folded memory operands like "cmpl -44(%ebp), %eax")
                 let ebp_off = infos[i].ebp_offset;
                 if ebp_off != EBP_OFFSET_NONE {
+                    if is_esp_biased(ebp_off) { any_esp_read = true; }
                     // Conservatively treat as a 4-byte read (max store size on i686)
-                    read_ranges.push((ebp_off, 4));
-                } else if !matches!(infos[i].kind, LineKind::StoreEbp { .. }) && s.contains("(%ebp)") {
-                    // Unknown %ebp reference - bail out
+                    read_ranges.push((normalize(ebp_off), 4));
+                } else if !matches!(infos[i].kind, LineKind::StoreEbp { .. })
+                    && (s.contains("(%ebp)") || s.contains("(%esp)")) {
+                    // Unknown frame reference - bail out
                     addr_taken = true;
                 }
             }
@@ -2195,9 +2463,15 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
     for i in 0..len {
         if infos[i].is_nop() { continue; }
         if let LineKind::StoreEbp { offset, size, .. } = infos[i].kind {
+            let esp_store = is_esp_biased(offset);
+            if esp_store {
+                if !esp_walk_ok { continue; }
+                if has_call && any_esp_read { continue; } // shift-immune rule only
+            }
             let store_bytes = size.byte_size();
+            let norm_off = if esp_store { offset - norm[i] } else { offset };
             let is_read = read_ranges.iter().any(|&(r_off, r_sz)| {
-                ranges_overlap(offset, store_bytes, r_off, r_sz)
+                ranges_overlap(norm_off, store_bytes, r_off, r_sz)
             });
             if !is_read {
                 infos[i].kind = LineKind::Nop;

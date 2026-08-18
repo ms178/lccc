@@ -436,6 +436,22 @@ fn build_gep_fold_map(func: &IrFunction, use_counts: &[u32]) -> FxHashMap<u32, G
 /// TLS symbols are excluded because they require special access patterns
 /// (%fs:/@TPOFF on x86-64, %gs:/@NTPOFF on i686, etc.) and must not be
 /// folded into plain RIP-relative accesses.
+/// Public wrapper for backends needing the fold preview before regalloc.
+pub fn build_global_addr_map_for(
+    func: &IrFunction,
+    tls_symbols: &FxHashSet<String>,
+) -> FxHashMap<u32, String> {
+    build_global_addr_map(func, tls_symbols)
+}
+
+/// Public wrapper for build_foldable_global_addr_set.
+pub fn build_foldable_global_addr_set_for(
+    func: &IrFunction,
+    global_addr_map: &FxHashMap<u32, String>,
+) -> FxHashSet<u32> {
+    build_foldable_global_addr_set(func, global_addr_map)
+}
+
 fn build_global_addr_map(
     func: &IrFunction,
     tls_symbols: &FxHashSet<String>,

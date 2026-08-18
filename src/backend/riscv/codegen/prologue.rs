@@ -170,6 +170,9 @@ impl RiscvCodegen {
             };
 
             match class {
+                // I64RegPair exists only under i686 gcc_regparm_mode; this
+                // backend never sets that config flag.
+                ParamClass::I64RegPair { .. } => unreachable!("I64RegPair is i686-regparm-only"),
                 ParamClass::IntReg { reg_idx } => {
                     // GP register param - extend sub-64-bit values to full
                     // 64 bits and store with sd so the entire 8-byte slot is

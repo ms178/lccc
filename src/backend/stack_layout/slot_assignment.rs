@@ -489,6 +489,10 @@ fn classify_value(
 
     let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
 
+    // Skip values codegen will fold away entirely (no code, no slot).
+    if state.never_materialized_values.contains(&dest.0) {
+        return;
+    }
     // Skip register-assigned values (no stack slot needed).
     if reg_assigned.contains_key(&dest.0) {
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
