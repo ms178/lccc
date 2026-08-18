@@ -1142,12 +1142,21 @@ impl Driver {
                 "-ffast-math" => {
                     self.fast_math = true;
                     self.fp_reassoc = true;
-                    self.fp_contract_fast = true;
+                    // GCC: fast-math implies contract=fast only when no
+                    // explicit -ffp-contract was given (opts_set semantics).
+                    if !self.fp_contract_explicit {
+                        self.fp_contract_fast = true;
+                    }
                 }
                 "-fno-fast-math" => {
                     self.fast_math = false;
                     self.fp_reassoc = false;
-                    self.fp_contract_fast = false;
+                    // Restore the DEFAULT (fast), not "off": GCC's
+                    // -fno-fast-math resets contraction to its default mode,
+                    // and the gnu-C default is fast. Explicit flags stay.
+                    if !self.fp_contract_explicit {
+                        self.fp_contract_fast = true;
+                    }
                 }
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
                     self.fp_reassoc = true;
@@ -1155,12 +1164,16 @@ impl Driver {
                 "-fno-unsafe-math-optimizations" | "-fno-associative-math" => {
                     self.fp_reassoc = false;
                 }
-                "-ffp-contract=fast" => self.fp_contract_fast = true,
+                "-ffp-contract=fast" => {
+                    self.fp_contract_fast = true;
+                    self.fp_contract_explicit = true;
+                }
                 "-ffp-contract=off" | "-ffp-contract=on" => {
                     // `on` permits only language-standard contraction. LCCC
                     // does not yet carry per-expression contraction metadata,
                     // so fail closed rather than fusing across lowered IR.
                     self.fp_contract_fast = false;
+                    self.fp_contract_explicit = true;
                 }
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}
                 "-fdiagnostics-color" | "-fcolor-diagnostics" => {
@@ -1506,6 +1519,30 @@ mod cli_tests {
         ];
         reen.parse_cli_args(&args).unwrap();
         assert!(reen.fp_contract_fast);
+
+        // GCC parity: default is -ffp-contract=fast for gnu C.
+        let mut dflt = Driver::new();
+        let args = vec!["lccc".to_string(), "x.c".to_string()];
+        dflt.parse_cli_args(&args).unwrap();
+        assert!(dflt.fp_contract_fast, "gnu-C default must contract (GCC parity)");
+
+        // Explicit contract flag is sticky against later -ffast-math
+        // (GCC opts_set semantics), in BOTH orders.
+        let mut sticky = Driver::new();
+        let args = vec![
+            "lccc".to_string(), "-ffp-contract=off".to_string(),
+            "-ffast-math".to_string(), "x.c".to_string(),
+        ];
+        sticky.parse_cli_args(&args).unwrap();
+        assert!(!sticky.fp_contract_fast, "explicit off survives -ffast-math");
+
+        // -fno-fast-math restores the default (fast), it does not force off.
+        let mut nfm = Driver::new();
+        let args = vec![
+            "lccc".to_string(), "-fno-fast-math".to_string(), "x.c".to_string(),
+        ];
+        nfm.parse_cli_args(&args).unwrap();
+        assert!(nfm.fp_contract_fast, "-fno-fast-math keeps the fast default");
     }
 
     #[test]

@@ -65,6 +65,12 @@ pub struct Driver {
     /// retain separate multiply and add rounding. Enabled by `-ffast-math` or
     /// an explicit `-ffp-contract=fast`.
     pub(super) fp_contract_fast: bool,
+    /// An explicit -ffp-contract=... was given. GCC's set_fast_math_flags only
+    /// touches the contraction mode when it was NOT explicitly set, so
+    /// `-ffp-contract=off -ffast-math` keeps contraction OFF while
+    /// `-ffast-math -ffp-contract=off` also ends OFF (explicit flag is sticky
+    /// in both orders; explicit-vs-explicit remains last-wins).
+    pub(super) fp_contract_explicit: bool,
     /// Whether the umbrella -ffast-math option is active.  Kept separate from
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
@@ -345,7 +351,13 @@ impl Driver {
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
             fp_reassoc: false,
-            fp_contract_fast: false,
+            // DEFAULT TRUE: GCC's default for gnu* C dialects is
+            // -ffp-contract=fast (verified: `gcc -O3` emits vfmadd132sd for
+            // `c + a*b` with no FP flags at all). Defaulting to false would
+            // silently drop FMA from every build that doesn't pass
+            // -ffast-math while claiming GCC compatibility.
+            fp_contract_fast: true,
+            fp_contract_explicit: false,
             fast_math: false,
             verbose: false,
             mode: CompileMode::Full,
@@ -1817,6 +1829,7 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
+            fp_contract_fast: self.fp_contract_fast,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,

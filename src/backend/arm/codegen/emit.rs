@@ -163,6 +163,8 @@ pub(super) fn arm_invert_cond_code(cc: &str) -> &'static str {
 /// Uses AAPCS64 calling convention with stack-based allocation.
 pub struct ArmCodegen {
     pub(crate) state: CodegenState,
+    /// FP contraction contract; gates fmadd fusion (see supports_fused_float_mul_add).
+    pub(super) fp_contract_fast: bool,
     /// Frame size for the current function (needed for epilogue in terminators).
     pub(super) current_frame_size: i64,
     pub(super) current_return_type: IrType,
@@ -207,6 +209,7 @@ impl ArmCodegen {
     pub fn new() -> Self {
         Self {
             state: CodegenState::new(),
+            fp_contract_fast: false,
             current_frame_size: 0,
             current_return_type: IrType::I64,
             va_gp_save_offset: 0,
@@ -249,6 +252,7 @@ impl ArmCodegen {
         self.set_no_jump_tables(opts.no_jump_tables);
         self.set_general_regs_only(opts.general_regs_only);
         self.state.emit_cfi = opts.emit_cfi;
+        self.fp_contract_fast = opts.fp_contract_fast;
     }
 
     /// Get the physical register assigned to an operand (if it's a Value with a register).
@@ -1848,7 +1852,11 @@ impl ArchCodegen for ArmCodegen {
         self.reg_assignments.contains_key(&vid)
     }
 
-    fn supports_fused_float_mul_add(&self) -> bool { true }
+    fn supports_fused_float_mul_add(&self) -> bool {
+        // AArch64 fmadd is a contraction (single rounding); same contract
+        // gate as x86's vfmadd231 fusion.
+        self.fp_contract_fast
+    }
     fn supports_shifted_logical(&self) -> bool { true }
     fn supports_indexed_addr(&self) -> bool { true }
     fn supports_fused_fp_cmp_branch(&self) -> bool { true }

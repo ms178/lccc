@@ -532,6 +532,16 @@ impl I686Codegen {
             // callee-saved EBX/ESI/EDI/(EBP), so these moves cannot form an
             // incoming-register cycle; spilled destinations are equally safe.
             if let ParamClass::IntReg { reg_idx } = class {
+                // The phase-1/2 capture pass above already saved this param
+                // (param_pre_stored). Re-capturing HERE is a miscompile, not
+                // just redundancy: this loop runs interleaved with the
+                // stack-param copies, which stage through %eax — a second
+                // `movl %eax, %dest` after param 0's copy writes the copied
+                // STACK value over the already-captured register argument
+                // (observed: d_i(double, int) read b as garbage at -O1+).
+                if self.state.param_pre_stored.contains(&i) {
+                    continue;
+                }
                 let has_alloca_slot = find_param_alloca(func, i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
