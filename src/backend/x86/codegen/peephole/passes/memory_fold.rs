@@ -137,10 +137,12 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 /// Fold a single-use scalar-FP register load into an adjacent VEX arithmetic
 /// instruction.
 ///
-///     movsd 8(%rsi), %xmm5
-///     vsubsd %xmm5, %xmm4, %xmm4
-///       ->
-///     vsubsd 8(%rsi), %xmm4, %xmm4
+/// ```text
+/// movsd 8(%rsi), %xmm5
+/// vsubsd %xmm5, %xmm4, %xmm4
+///   ->
+/// vsubsd 8(%rsi), %xmm4, %xmm4
+/// ```
 ///
 /// This deliberately uses a stronger-than-necessary liveness proof: the loaded
 /// XMM register must not be mentioned again before the function's `.size`.

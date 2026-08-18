@@ -239,14 +239,6 @@ fn operand_is_const(op: &Operand) -> bool {
     matches!(op, Operand::Const(_))
 }
 
-/// Unique Value operand, other side a Const — load order is unambiguous on
-/// every backend (imm form / materialise-const then op). Safe without
-/// `lhs_first_binop`. Float Cmp is excluded at the call site (Lt/Le swap).
-fn unique_value_with_const(a: &Operand, b: &Operand, id: u32) -> bool {
-    (operand_is_value(a, id) && operand_is_const(b))
-        || (operand_is_value(b, id) && operand_is_const(a))
-}
-
 /// CFG identical to `liveness.rs`: terminator edges + InlineAsm goto.
 fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let nblocks = func.blocks.len();
@@ -1493,21 +1485,40 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
             if ty.is_float() || ty.is_long_double() {
                 return false;
             }
-            unique_value_with_const(lhs, rhs, value_id)
-                || (lhs_first_binop && operand_is_value(lhs, value_id))
+            // A value is consumed from the accumulator only when it is the LHS
+            // AND the consumer reads the LHS first: either the RHS is a
+            // constant (an immediate / materialised-const form, so the LHS is
+            // the operand staged in the accumulator), or the backend is
+            // lhs_first_binop (x86-64, RISC-V load the LHS before the RHS).
+            // A value that is the RHS of `Sub(Const, v)` is NOT safe: x86-64
+            // lowers it to `movq $0,%rax; subl <v>,%rax` where <v> is loaded
+            // into %rcx or a memory operand from its HOME. Skipping that home
+            // made the load read zero (alu_peepholes sdivm3: `0 - (v/3)`
+            // returned 0 instead of the negated quotient).
+            operand_is_value(lhs, value_id)
+                && (operand_is_const(rhs) || lhs_first_binop)
         }
         Instruction::Cmp { lhs, rhs, ty, .. } => {
             if ty.is_float() || ty.is_long_double() {
                 return false;
             }
-            unique_value_with_const(lhs, rhs, value_id)
-                || (lhs_first_binop && operand_is_value(lhs, value_id))
+            operand_is_value(lhs, value_id)
+                && (operand_is_const(rhs) || lhs_first_binop)
         }
         _ => false,
     }
 }
 
 fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
+    // A value whose single use is `Return` must NOT be skipped: the return
+    // emitter materialises it through the normal location machinery (ABI
+    // return register / slot), and a skipped home breaks the contract on
+    // backends whose accumulator cache is not the return-value path. Only
+    // fused-consume terminators (CondBranch condition, indirect-jump target,
+    // switch operand) consume a value without materialising it.
+    if matches!(term, Terminator::Return(_)) {
+        return false;
+    }
     let mut saw = false;
     let mut extra = false;
     for_each_terminator_value_use(term, |id| {

@@ -2498,6 +2498,12 @@ fn optimize_cfg_register_liveness(
                 local += 1;
                 continue;
             }
+            // Only full-width loads: a movzbl/movsbl/movzwl/movswl reads
+            // 1-2 bytes, but `cmpl $imm, SLOT` would read 4.
+            if !is_full_width_load(trimmed(store, &infos[i], i)) {
+                local += 1;
+                continue;
+            }
             let Some(j_local) = (local + 1..n).find(|&p| !infos[start + p].is_nop()) else {
                 break;
             };
@@ -2916,6 +2922,19 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 
 // ── Pass: Memory operand folding ─────────────────────────────────────────────
 
+/// True when `s` is a genuine 32-bit `movl` load whose memory operand is a
+/// full 4 bytes. `movzbl`/`movsbl`/`movzwl`/`movswl` read 1-2 bytes into a
+/// 32-bit destination and are classified with the same `MoveSize::L` (their
+/// destination register is 32-bit), so a size check alone is NOT enough to
+/// distinguish them. Folding a sub-word load into a `cmpl`/`addl` memory
+/// operand would read 3-4 bytes of a narrower slot — a miscompile:
+/// `uu.b[0] != 0x04` became `cmpl $4, 176(%esp)`, comparing the whole union
+/// word 0x01020304 instead of the byte 0x04.
+fn is_full_width_load(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("movl ")
+}
+
 /// Fold `movl -N(%ebp), %ecx; addl %ecx, %eax` into `addl -N(%ebp), %eax`.
 fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
@@ -2929,6 +2948,11 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         if let LineKind::LoadEbp { reg: load_reg, offset, size } = infos[i].kind {
             // Only fold scratch registers (eax, ecx, edx)
             if !is_caller_saved(load_reg) && load_reg != REG_EAX {
+                i += 1; continue;
+            }
+            // Only full-width loads: movzbl/movsbl/movzwl/movswl read fewer
+            // bytes than the folded memory operand would.
+            if !is_full_width_load(trimmed(store, &infos[i], i)) {
                 i += 1; continue;
             }
 
@@ -4190,6 +4214,54 @@ mod tests {
         assert!(result.contains("4(%esp), %eax") || result.contains("testl %eax, %eax"),
             "load must survive while %eax is live:\n{result}");
         assert!(!result.contains("cmpl $0, 4(%esp)"), "{result}");
+    }
+
+    #[test]
+    fn cmp_with_memory_not_folded_for_byte_load() {
+        // `movzbl SLOT,%eax; cmpl $4,%eax` must NOT become `cmpl $4, SLOT`:
+        // the slot holds a 4-byte word, the byte load only the low byte.
+        // Regression for structs_bitfields (union `uu.b[0] != 0x04`).
+        let asm = concat!(
+            "f:\\n",
+            ".cfi_startproc\\n",
+            "    subl $8, %esp\\n",
+            "    movzbl 4(%esp), %eax\\n",
+            "    cmpl $4, %eax\\n",
+            "    jne .L1\\n",
+            "    xorl %eax, %eax\\n",
+            "    addl $8, %esp\\n",
+            "    ret\\n",
+            ".L1:\\n",
+            "    movl $13, %eax\\n",
+            "    addl $8, %esp\\n",
+            "    ret\\n",
+            ".cfi_endproc\\n",
+            ".size f, .-f\\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movzbl 4(%esp), %eax"), "{result}");
+        assert!(!result.contains("cmpl $4, 4(%esp)"), "{result}");
+    }
+
+    #[test]
+    fn memory_operand_not_folded_for_word_load() {
+        // `movzwl SLOT,%ecx; addl %ecx,%eax` must NOT fold to
+        // `addl SLOT,%eax`: the slot is a 2-byte field, addl reads 4.
+        let asm = concat!(
+            "f:\\n",
+            ".cfi_startproc\\n",
+            "    subl $8, %esp\\n",
+            "    movzwl 4(%esp), %ecx\\n",
+            "    addl %ecx, %eax\\n",
+            "    ret\\n",
+            ".cfi_endproc\\n",
+            ".size f, .-f\\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movzwl 4(%esp), %ecx"), "{result}");
+        assert!(!result.contains("addl 4(%esp), %eax"), "{result}");
     }
 
     #[test]

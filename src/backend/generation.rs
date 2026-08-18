@@ -1988,6 +1988,16 @@ fn generate_function(
                         {
                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                            // The fused sequence reads `lhs` through the
+                            // default accumulator path. If `lhs`'s producer
+                            // is still buffered in the MachInst pipeline,
+                            // that read would see the register/slot BEFORE the
+                            // producer ran (observed miscompile: `mix()`'s
+                            // `(h ^ v) * MAGIC` read %r11 before the buffered
+                            // `xorq` updated it — the xor landed AFTER the
+                            // imul in the final output). Flush the buffer
+                            // first so every operand is materialised.
+                            cg.flush_machinst();
                             cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
                             fused_add_skip.insert(add_i);
                             cg.state().current_program_point += 1;
@@ -2005,6 +2015,10 @@ fn generate_function(
                     {
                         let shift_is_lhs = matches!(lhs, Operand::Value(v) if v.0 == shift_dest.0);
                         let other = if shift_is_lhs { rhs } else { lhs };
+                        // Same buffered-operand hazard as the mul-add fusion:
+                        // the shift's operands must be materialised before the
+                        // fused shifted-logical reads them on the default path.
+                        cg.flush_machinst();
                         cg.emit_shifted_logical(shift_dest, *shift_op, shift_lhs, shift_amount,
                                                 *logical_op, other, dest, *ty);
                         skip_fused_logical = true;
@@ -2021,6 +2035,10 @@ fn generate_function(
                         Instruction::Cmp { op, lhs, rhs, ty: cmp_ty, .. }) =
                     (inst, &block.instructions[ci])
                 {
+                    // Same buffered-operand hazard as the mul-add fusion:
+                    // the Cmp/Select operands must be materialised before the
+                    // fused compare-select reads them on the default path.
+                    cg.flush_machinst();
                     cg.emit_fused_cmp_select(*op, lhs, rhs, *cmp_ty, true_val, false_val, dest, *sel_ty);
                     cg.state().current_program_point += 1;
                     continue;

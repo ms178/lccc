@@ -4,9 +4,53 @@ use crate::ir::reexports::{IrCmpOp, Operand, Value};
 use crate::common::types::IrType;
 use crate::emit;
 use crate::backend::traits::ArchCodegen;
-use super::emit::I686Codegen;
+use super::emit::{I686Codegen, phys_reg_name};
 
 impl I686Codegen {
+    /// Register name for a scalar value safe to compare in place (not an
+    /// alloca address, not a wide pair). None for slot-resident values and
+    /// immediates.
+    fn cmp_operand_reg(&self, op: &Operand) -> Option<&'static str> {
+        if let Operand::Value(v) = op {
+            if self.state.is_alloca(v.0)
+                || self.state.wide_values.contains(&v.0)
+                || self.state.f128_direct_slots.contains(&v.0)
+            {
+                return None;
+            }
+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                return Some(phys_reg_name(phys));
+            }
+        }
+        None
+    }
+
+    /// Emit the flag-setting compare for an integer compare, staging the LHS
+    /// through the accumulator unless it is register-resident (in which case
+    /// `testl %R,%R` / `cmpl $imm,%R` / `cmpl %R,%L` is emitted in place and
+    /// %eax stays untouched). `%ecx` is the slot-operand scratch, so a LHS in
+    /// %ecx never takes the direct path against a slot-resident RHS.
+    fn emit_int_cmp_flags_direct(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) -> bool {
+        let Some(lreg) = self.cmp_operand_reg(lhs) else { return false };
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            let imm = Self::normalize_cmp_imm(imm, ty);
+            if imm == 0 {
+                emit!(self.state, "    testl %{}, %{}", lreg, lreg);
+            } else {
+                emit!(self.state, "    cmpl ${}, %{}", imm, lreg);
+            }
+        } else if let Some(rreg) = self.cmp_operand_reg(rhs) {
+            emit!(self.state, "    cmpl %{}, %{}", rreg, lreg);
+        } else {
+            if lreg == "ecx" {
+                return false; // staging rhs into %ecx would clobber lhs
+            }
+            self.operand_to_ecx(rhs);
+            emit!(self.state, "    cmpl %ecx, %{}", lreg);
+        }
+        true
+    }
+
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if ty == IrType::F64 {
             let swap = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
@@ -125,24 +169,29 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        self.operand_to_eax(lhs);
-        // Constant rhs: compare against the immediate directly instead of
-        // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
-        // `cmpl $C,%eax` is 3..6 and `testl %eax,%eax` is 2 (flags are
-        // identical for ALL Jcc: eax-0 and eax&eax both clear CF/OF and set
-        // SF/ZF/PF from eax). GCC emits exactly these forms. This also keeps
-        // %ecx untouched, which the register allocator relies on when it
-        // places a value in %ecx across a constant compare.
-        if let Some(imm) = Self::const_as_imm32(rhs) {
-            let imm = Self::normalize_cmp_imm(imm, ty);
-            if imm == 0 {
-                self.state.emit("    testl %eax, %eax");
+        // Accumulator-bypass: compare a register-resident LHS in place
+        // (`testl %R,%R` / `cmpl $imm,%R` / `cmpl %R,%L`) instead of the
+        // `movl %R,%eax; cmpl …, %eax` round-trip.
+        if !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
+            self.operand_to_eax(lhs);
+            // Constant rhs: compare against the immediate directly instead of
+            // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
+            // `cmpl $C,%eax` is 3..6 and `testl %eax,%eax` is 2 (flags are
+            // identical for ALL Jcc: eax-0 and eax&eax both clear CF/OF and set
+            // SF/ZF/PF from eax). GCC emits exactly these forms. This also keeps
+            // %ecx untouched, which the register allocator relies on when it
+            // places a value in %ecx across a constant compare.
+            if let Some(imm) = Self::const_as_imm32(rhs) {
+                let imm = Self::normalize_cmp_imm(imm, ty);
+                if imm == 0 {
+                    self.state.emit("    testl %eax, %eax");
+                } else {
+                    emit!(self.state, "    cmpl ${}, %eax", imm);
+                }
             } else {
-                emit!(self.state, "    cmpl ${}, %eax", imm);
+                self.operand_to_ecx(rhs);
+                self.state.emit("    cmpl %ecx, %eax");
             }
-        } else {
-            self.operand_to_ecx(rhs);
-            self.state.emit("    cmpl %ecx, %eax");
         }
 
         let set_instr = match op {
@@ -172,19 +221,23 @@ impl I686Codegen {
         true_label: &str,
         false_label: &str,
     ) {
-        self.operand_to_eax(lhs);
-        // Same immediate forms as emit_int_cmp_impl (see there for the
-        // testl flags argument); keeps %ecx clean across fused compares.
-        if let Some(imm) = Self::const_as_imm32(rhs) {
-            let imm = Self::normalize_cmp_imm(imm, ty);
-            if imm == 0 {
-                self.state.emit("    testl %eax, %eax");
+        // Accumulator-bypass: compare a register-resident LHS in place; the
+        // direct flag emitter leaves %eax untouched (see emit_int_cmp_impl).
+        if !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
+            self.operand_to_eax(lhs);
+            // Same immediate forms as emit_int_cmp_impl (see there for the
+            // testl flags argument); keeps %ecx clean across fused compares.
+            if let Some(imm) = Self::const_as_imm32(rhs) {
+                let imm = Self::normalize_cmp_imm(imm, ty);
+                if imm == 0 {
+                    self.state.emit("    testl %eax, %eax");
+                } else {
+                    emit!(self.state, "    cmpl ${}, %eax", imm);
+                }
             } else {
-                emit!(self.state, "    cmpl ${}, %eax", imm);
+                self.operand_to_ecx(rhs);
+                self.state.emit("    cmpl %ecx, %eax");
             }
-        } else {
-            self.operand_to_ecx(rhs);
-            self.state.emit("    cmpl %ecx, %eax");
         }
 
         let jcc = match op {
