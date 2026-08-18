@@ -464,6 +464,7 @@ pub(crate) fn run_passes(
     opt_level: u32,
     target: crate::backend::Target,
     fp_reassoc: bool,
+    fp_contract_fast: bool,
 ) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     // Debug hook: dump the module IR to stderr before optimization.
@@ -774,15 +775,16 @@ macro_rules! preloop_dump {
             && matches!(target, crate::backend::Target::X86_64 | crate::backend::Target::Aarch64)
             && !disabled.contains("vectorize")
         {
-            let vectorize_fn = match (target, fp_reassoc) {
-                (crate::backend::Target::Aarch64, true) => {
+            let vectorize_fn = match (target, fp_reassoc, fp_contract_fast) {
+                (crate::backend::Target::Aarch64, true, _) => {
                     vectorize::vectorize_function_two_wide_fast_math
                 }
-                (crate::backend::Target::Aarch64, false) => {
+                (crate::backend::Target::Aarch64, false, _) => {
                     vectorize::vectorize_function_two_wide
                 }
-                (_, true) => vectorize::vectorize_function_fast_math,
-                (_, false) => vectorize::vectorize_function,
+                (_, true, true) => vectorize::vectorize_function_fast_math,
+                (_, true, false) => vectorize::vectorize_function_reassoc,
+                (_, false, _) => vectorize::vectorize_function,
             };
             let n = timed_pass!(
                 "vectorize",

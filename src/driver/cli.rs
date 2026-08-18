@@ -1142,16 +1142,25 @@ impl Driver {
                 "-ffast-math" => {
                     self.fast_math = true;
                     self.fp_reassoc = true;
+                    self.fp_contract_fast = true;
                 }
                 "-fno-fast-math" => {
                     self.fast_math = false;
                     self.fp_reassoc = false;
+                    self.fp_contract_fast = false;
                 }
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
                     self.fp_reassoc = true;
                 }
                 "-fno-unsafe-math-optimizations" | "-fno-associative-math" => {
                     self.fp_reassoc = false;
+                }
+                "-ffp-contract=fast" => self.fp_contract_fast = true,
+                "-ffp-contract=off" | "-ffp-contract=on" => {
+                    // `on` permits only language-standard contraction. LCCC
+                    // does not yet carry per-expression contraction metadata,
+                    // so fail closed rather than fusing across lowered IR.
+                    self.fp_contract_fast = false;
                 }
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}
                 "-fdiagnostics-color" | "-fcolor-diagnostics" => {
@@ -1468,6 +1477,35 @@ mod cli_tests {
         disabled.parse_cli_args(&disabled_args).unwrap();
         assert!(!disabled.fp_reassoc);
         assert!(disabled.fast_math, "GCC keeps __FAST_MATH__ for this option sequence");
+    }
+
+    #[test]
+    fn fp_contract_is_independent_and_last_option_wins() {
+        let mut explicit = Driver::new();
+        let args = vec![
+            "lccc".to_string(), "-fassociative-math".to_string(),
+            "-ffp-contract=fast".to_string(), "x.c".to_string(),
+        ];
+        explicit.parse_cli_args(&args).unwrap();
+        assert!(explicit.fp_reassoc);
+        assert!(explicit.fp_contract_fast);
+
+        let mut disabled = Driver::new();
+        let args = vec![
+            "lccc".to_string(), "-ffast-math".to_string(),
+            "-ffp-contract=off".to_string(), "x.c".to_string(),
+        ];
+        disabled.parse_cli_args(&args).unwrap();
+        assert!(disabled.fp_reassoc, "contract-off must not disable reassociation");
+        assert!(!disabled.fp_contract_fast);
+
+        let mut reen = Driver::new();
+        let args = vec![
+            "lccc".to_string(), "-ffp-contract=off".to_string(),
+            "-ffp-contract=fast".to_string(), "x.c".to_string(),
+        ];
+        reen.parse_cli_args(&args).unwrap();
+        assert!(reen.fp_contract_fast);
     }
 
     #[test]

@@ -559,7 +559,8 @@ impl ArmCodegen {
 
             // Register-based vector operations (NEON 128-bit).
             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
-            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x4 => {
+            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadF32x4
+            | IntrinsicOp::VecLoadI32x4 => {
                 if let Some(d) = dest {
                     let addr = self.vec_addr_from_args(&args[0], args.get(1));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
@@ -587,6 +588,7 @@ impl ArmCodegen {
             }
 
             IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x2
+            | IntrinsicOp::VecAddF32x4 | IntrinsicOp::VecMulF32x4
             | IntrinsicOp::VecAddI32x4 | IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
@@ -594,6 +596,8 @@ impl ArmCodegen {
                     let (mnemonic, suffix) = match op {
                         IntrinsicOp::VecAddF64x2 => ("fadd", "2d"),
                         IntrinsicOp::VecMulF64x2 => ("fmul", "2d"),
+                        IntrinsicOp::VecAddF32x4 => ("fadd", "4s"),
+                        IntrinsicOp::VecMulF32x4 => ("fmul", "4s"),
                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
                         _ => ("mul", "4s"),
                     };
@@ -602,6 +606,24 @@ impl ArmCodegen {
                         self.state.emit_fmt(format_args!("    {} {}.{}, {}.{}, {}.{}", mnemonic, name, suffix, a, suffix, b, suffix));
                     } else {
                         self.state.emit_fmt(format_args!("    {} v0.{}, {}.{}, {}.{}", mnemonic, suffix, a, suffix, b, suffix));
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecBroadcastF64x2 | IntrinsicOp::VecBroadcastF32x4 => {
+                if let Some(d) = dest {
+                    let (ty, lane, suffix) = if matches!(op, IntrinsicOp::VecBroadcastF64x2) {
+                        (IrType::F64, "d", "2d")
+                    } else {
+                        (IrType::F32, "s", "4s")
+                    };
+                    self.float_operand_to_reg(&args[0], ty, if ty == IrType::F64 { "d0" } else { "s0" });
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    dup {}.{}, v0.{}[0]", name, suffix, lane));
+                    } else {
+                        self.state.emit_fmt(format_args!("    dup v0.{}, v0.{}[0]", suffix, lane));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
@@ -620,17 +642,30 @@ impl ArmCodegen {
                 }
             }
 
-            IntrinsicOp::VecStoreI32x4 => {
-                // Store a 4×I32 vector to dest_ptr.
-                if let Some(ptr) = dest_ptr {
+            IntrinsicOp::VecStoreF64x2 | IntrinsicOp::VecStoreF32x4
+            | IntrinsicOp::VecStoreI32x4 => {
+                // Store one 128-bit vector to dest_ptr.
+                if dest_ptr.is_some() {
                     let src = self.load_vector_value_128(&args[0], "q0");
-                    let base_phys = self.operand_reg(&Operand::Value(*ptr)).filter(|r| !is_arm_fp_phys(*r));
-                    let addr = base_phys.map(callee_saved_name).unwrap_or("x10");
-                    if base_phys.is_none() {
-                        self.operand_to_x0(&Operand::Value(*ptr));
-                        self.state.emit("    mov x10, x0");
-                    }
-                    self.state.emit_fmt(format_args!("    str {}, [{}]", src.replacen('v', "q", 1), addr));
+                    let addr = if args.len() >= 3 {
+                        self.vec_addr_from_args(&args[1], args.get(2))
+                    } else {
+                        let ptr = dest_ptr.unwrap();
+                        let base_phys = self
+                            .operand_reg(&Operand::Value(ptr))
+                            .filter(|r| !is_arm_fp_phys(*r));
+                        if let Some(reg) = base_phys {
+                            callee_saved_name(reg).to_string()
+                        } else {
+                            self.operand_to_x0(&Operand::Value(ptr));
+                            "x0".to_string()
+                        }
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    str {}, [{}]",
+                        src.replacen('v', "q", 1),
+                        addr
+                    ));
                 }
             }
 

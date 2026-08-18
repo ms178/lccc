@@ -60,6 +60,11 @@ pub struct Driver {
     /// False by default: ordinary -O levels preserve source evaluation order.
     /// Enabled explicitly by -ffast-math/-fassociative-math.
     pub(super) fp_reassoc: bool,
+    /// Permit fused multiply-add contraction. Kept separate from reassociation:
+    /// `-fassociative-math -ffp-contract=off` may vectorize a reduction but must
+    /// retain separate multiply and add rounding. Enabled by `-ffast-math` or
+    /// an explicit `-ffp-contract=fast`.
+    pub(super) fp_contract_fast: bool,
     /// Whether the umbrella -ffast-math option is active.  Kept separate from
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
@@ -340,6 +345,7 @@ impl Driver {
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
             fp_reassoc: false,
+            fp_contract_fast: false,
             fast_math: false,
             verbose: false,
             mode: CompileMode::Full,
@@ -1428,7 +1434,13 @@ impl Driver {
 
         let t6 = std::time::Instant::now();
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
-        run_passes(&mut module, self.opt_level, self.target, self.fp_reassoc);
+        run_passes(
+            &mut module,
+            self.opt_level,
+            self.target,
+            self.fp_reassoc,
+            self.fp_contract_fast,
+        );
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
         }

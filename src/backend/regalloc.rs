@@ -986,60 +986,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Propagate proven phi-coalesce assignments. A candidate carries its
-    // exact same-block definition/copy window from detection; revalidate that
-    // window before changing locations so future refactors fail closed.
-    for candidate in &phi_coalesce {
-        let phi_dest = candidate.phi_dest;
-        let backedge_src = candidate.backedge_src;
-        let Some(block) = func.blocks.get(candidate.block_idx) else {
-            continue;
-        };
-        if candidate.source_def_idx >= candidate.copy_idx
-            || candidate.copy_idx >= block.instructions.len()
-            || block.instructions[candidate.source_def_idx]
-                .dest()
-                .is_none_or(|dest| dest.0 != backedge_src)
-            || !matches!(
-                block.instructions[candidate.copy_idx],
-                Instruction::Copy {
-                    dest,
-                    src: Operand::Value(src),
-                } if dest.0 == phi_dest && src.0 == backedge_src
-            )
-            || block.instructions[candidate.source_def_idx + 1..candidate.copy_idx]
-                .iter()
-                .any(|inst| uses_value(inst, phi_dest))
-        {
-            continue;
-        }
-
-        let Some(&reg) = assignments.get(&phi_dest) else {
-            continue;
-        };
-        let src_interval = liveness
-            .intervals
-            .iter()
-            .find(|iv| iv.value_id == backedge_src);
-        if let Some(src_iv) = src_interval {
-            // A value already allocated to this register must not overlap the
-            // source interval. The phi destination itself is intentionally
-            // excluded: the same-block window proof above establishes the
-            // legal destructive update from old phi value to new source value.
-            let has_conflict = liveness.intervals.iter().any(|iv| {
-                if iv.value_id == backedge_src || iv.value_id == phi_dest {
-                    return false;
-                }
-                assignments.get(&iv.value_id).is_some_and(|other_reg| {
-                    other_reg.0 == reg.0 && iv.start < src_iv.end && src_iv.start < iv.end
-                })
-            });
-            if has_conflict {
-                continue;
-            }
-        }
-        assignments.insert(backedge_src, reg);
-    }
+    // Revalidate and propagate destructive loop-backedge coalescing after each
+    // register class is allocated. GPR assignments are available here; the
+    // same helper runs again after scalar XMM allocation below.
+    apply_phi_coalesce_assignments(
+        func,
+        &liveness,
+        &phi_coalesce,
+        &mut assignments,
+    );
 
     // Debug: count overlaps after phi coalesce
     if std::env::var("CCC_VERIFY_REGALLOC").is_ok() {
@@ -1078,14 +1033,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // admits only the exact F32/F64 reduction web proven safe by the
     // width/class-aware collector above; arbitrary SIMD values retain their
     // protected stack homes.
-    let (vector_values, f64_value_set) = if arm_fp_pool {
-        (collect_vector_values(func), collect_f64_values(func))
-    } else if config.xmm_regs.first().is_some_and(|r| r.0 == 20)
-        && std::env::var("CCC_NO_REDUCTION_VECREG").is_err()
-    {
-        (collect_x86_reduction_vector_values(func), FxHashSet::default())
+    let x86_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 20);
+    let vector_values = if arm_fp_pool {
+        collect_vector_values(func)
+    } else if x86_fp_pool {
+        let mut values = if std::env::var("CCC_NO_REDUCTION_VECREG").is_err() {
+            collect_x86_reduction_vector_values(func)
+        } else {
+            FxHashSet::default()
+        };
+        if std::env::var("CCC_NO_MAP_VECREG").is_err() {
+            values.extend(collect_x86_map_broadcast_values(func));
+        }
+        values
     } else {
-        (FxHashSet::default(), FxHashSet::default())
+        FxHashSet::default()
+    };
+    // Copy-form scalar FP loop accumulators lose their explicit type after phi
+    // elimination. Recover the type through their producer/copy web on both
+    // register-aware backends instead of silently forcing every accumulator to
+    // a stack home.
+    let f64_value_set = if arm_fp_pool
+        || (x86_fp_pool && std::env::var("CCC_NO_FP_COPY_WEB").is_err())
+    {
+        collect_f64_values(func)
+    } else {
+        FxHashSet::default()
     };
 
     // Phase 3: XMM/FP register allocation for scalar FP (F64/F32) values
@@ -1099,7 +1072,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // A copy source feeding (transitively) a real use still qualifies —
         // e.g. an fmadd result copied into a loop accumulator.
         let mut real_use: FxHashSet<u32> = FxHashSet::default();
-        if arm_fp_pool {
+        if arm_fp_pool || x86_fp_pool {
             for block in &func.blocks {
                 for inst in &block.instructions {
                     if matches!(inst, Instruction::Copy { .. }) {
@@ -1145,7 +1118,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| !spans_any_call(iv, call_points))
             // Skip values that are only ever copied (never feed a computation):
             // they don't need a register and would starve values that do.
-            .filter(|iv| !arm_fp_pool || real_use.contains(&iv.value_id))
+            .filter(|iv| !(arm_fp_pool || x86_fp_pool) || real_use.contains(&iv.value_id))
             // Only include values that are actually scalar F64/F32 (not i128,
             // not long double, etc.) — plus the backend's explicitly
             // register-aware vector values and (AArch64) copy-form F64.
@@ -1325,7 +1298,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // accumulator at the backedge the accumulator's own register, eliminating
     // the serial-chain copy. AArch64 applies this to scalar F64 and vectors;
     // x86 applies it only to the conservative reduction-vector set.
-    if arm_fp_pool || !vector_values.is_empty() {
+    if arm_fp_pool || !vector_values.is_empty() || !f64_value_set.is_empty() {
         for candidate in &all_phi_pairs {
             let phi_dest = candidate.phi_dest;
             let backedge_src = candidate.backedge_src;
@@ -1673,6 +1646,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecAddF64x2 | O::VecAddF64x4 | O::VecAddI32x4 | O::VecAddI32x8
             | O::VecAddF32x4 | O::VecAddF32x8
             | O::VecMulF64x2 | O::VecMulF64x4 | O::VecMulF32x4 | O::VecMulF32x8
+            | O::VecFmaF64x4 | O::VecFmaF32x8
             | O::VecHorizontalAddF64x2 | O::VecHorizontalAddF64x4
             | O::VecHorizontalAddI32x4 | O::VecHorizontalAddI32x8
             | O::VecHorizontalAddF32x4 | O::VecHorizontalAddF32x8
@@ -1948,8 +1922,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
 
     let class_of = |op: &O| -> Option<u8> {
         match op {
-            O::VecZeroF32x8 | O::VecLoadF32x8 | O::VecAddF32x8 | O::VecMulF32x8 => Some(1),
-            O::VecZeroF64x4 | O::VecLoadF64x4 | O::VecAddF64x4 | O::VecMulF64x4 => Some(2),
+            O::VecZeroF32x8 | O::VecLoadF32x8 | O::VecAddF32x8
+                | O::VecMulF32x8 | O::VecFmaF32x8 => Some(1),
+            O::VecZeroF64x4 | O::VecLoadF64x4 | O::VecAddF64x4
+                | O::VecMulF64x4 | O::VecFmaF64x4 => Some(2),
             O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4 => Some(3),
             O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2 => Some(4),
             _ => None,
@@ -1957,8 +1933,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     };
     let legal_consumer = |op: &O, class: u8| -> bool {
         match class {
-            1 => matches!(op, O::VecAddF32x8 | O::VecMulF32x8 | O::VecHorizontalAddF32x8),
-            2 => matches!(op, O::VecAddF64x4 | O::VecMulF64x4 | O::VecHorizontalAddF64x4),
+            1 => matches!(op, O::VecAddF32x8 | O::VecMulF32x8
+                | O::VecFmaF32x8 | O::VecHorizontalAddF32x8),
+            2 => matches!(op, O::VecAddF64x4 | O::VecMulF64x4
+                | O::VecFmaF64x4 | O::VecHorizontalAddF64x4),
             3 => matches!(op, O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4),
             4 => matches!(op, O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2),
             _ => false,
@@ -2111,6 +2089,73 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     }
     classes.retain(|value, _| copy_web.contains(value));
     classes.into_keys().collect()
+}
+
+/// Collect loop-invariant map broadcasts whose only uses are same-width packed
+/// arithmetic.  Unlike transient map loads/results (which are best kept in the
+/// emitter's `%ymm0` deferred chain), these values live across every iteration;
+/// assigning them an XMM/YMM family removes a hot-loop stack operand without
+/// introducing producer copies.
+fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    let class_of = |op: &O| -> Option<u8> {
+        match op {
+            O::VecBroadcastF32x8 => Some(1),
+            O::VecBroadcastF64x4 => Some(2),
+            O::VecBroadcastI32x8 => Some(3),
+            O::VecBroadcastF32x4 => Some(4),
+            O::VecBroadcastF64x2 => Some(5),
+            O::VecBroadcastI32x4 => Some(6),
+            _ => None,
+        }
+    };
+    let legal_consumer = |op: &O, class: u8| -> bool {
+        match class {
+            1 => matches!(op, O::VecMulF32x8 | O::VecAddF32x8 | O::VecMaddF32x8),
+            2 => matches!(op, O::VecMulF64x4 | O::VecAddF64x4 | O::VecMaddF64x4),
+            3 => matches!(op, O::VecMulI32x8 | O::VecAddI32x8),
+            4 => matches!(op, O::VecMulF32x4 | O::VecAddF32x4),
+            5 => matches!(op, O::VecMulF64x2 | O::VecAddF64x2),
+            6 => matches!(op, O::VecMulI32x4 | O::VecAddI32x4),
+            _ => false,
+        }
+    };
+
+    let mut candidates: FxHashMap<u32, u8> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+                if let Some(class) = class_of(op) {
+                    candidates.insert(d.0, class);
+                }
+            }
+        }
+    }
+
+    let mut bad = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |operand| {
+                let Operand::Value(value) = operand else { return };
+                let Some(&class) = candidates.get(&value.0) else { return };
+                let legal = matches!(inst,
+                    Instruction::Intrinsic { op, .. } if legal_consumer(op, class));
+                if !legal {
+                    bad.insert(value.0);
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |operand| {
+            if let Operand::Value(value) = operand {
+                if candidates.contains_key(&value.0) {
+                    bad.insert(value.0);
+                }
+            }
+        });
+    }
+    candidates.retain(|value, _| !bad.contains(value));
+    candidates.into_keys().collect()
 }
 
 /// Collect SSA values that hold 128/256-bit vector data: destinations of
@@ -2732,6 +2777,66 @@ pub(crate) struct PhiCoalesceCandidate {
     pub(crate) block_idx: usize,
     pub(crate) source_def_idx: usize,
     pub(crate) copy_idx: usize,
+}
+
+/// Revalidate the exact same-block destructive-update proof and propagate an
+/// assigned phi register to its backedge producer. This is register-class
+/// agnostic: call it after GPR allocation and again after scalar FP allocation.
+fn apply_phi_coalesce_assignments(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    candidates: &[PhiCoalesceCandidate],
+    assignments: &mut FxHashMap<u32, PhysReg>,
+) {
+    for candidate in candidates {
+        let phi_dest = candidate.phi_dest;
+        let backedge_src = candidate.backedge_src;
+        let Some(block) = func.blocks.get(candidate.block_idx) else {
+            continue;
+        };
+        if candidate.source_def_idx >= candidate.copy_idx
+            || candidate.copy_idx >= block.instructions.len()
+            || block.instructions[candidate.source_def_idx]
+                .dest()
+                .is_none_or(|dest| dest.0 != backedge_src)
+            || !matches!(
+                block.instructions[candidate.copy_idx],
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } if dest.0 == phi_dest && src.0 == backedge_src
+            )
+            || block.instructions[candidate.source_def_idx + 1..candidate.copy_idx]
+                .iter()
+                .any(|inst| uses_value(inst, phi_dest))
+        {
+            continue;
+        }
+
+        let Some(&reg) = assignments.get(&phi_dest) else {
+            continue;
+        };
+        let src_interval = liveness
+            .intervals
+            .iter()
+            .find(|iv| iv.value_id == backedge_src);
+        if let Some(src_iv) = src_interval {
+            let has_conflict = liveness.intervals.iter().any(|iv| {
+                if iv.value_id == backedge_src || iv.value_id == phi_dest {
+                    return false;
+                }
+                assignments.get(&iv.value_id).is_some_and(|other_reg| {
+                    other_reg.0 == reg.0
+                        && iv.start < src_iv.end
+                        && src_iv.start < iv.end
+                })
+            });
+            if has_conflict {
+                continue;
+            }
+        }
+        assignments.insert(backedge_src, reg);
+    }
 }
 
 /// Detect safe phi coalesce candidates for loop-carried variables.

@@ -37,8 +37,8 @@ if not re.search(r"\bshrl?\s+\$3", matmul_body):
 for name, shift, packed_op in (
     ("p15_sum_f32", 2, "vaddps"),
     ("p16_sum_f64", 3, "vaddpd"),
-    ("p17_dot_f32", 2, "vmulps"),
-    ("p18_dot_f64", 3, "vmulpd"),
+    ("p17_dot_f32", 2, "vfmadd231ps"),
+    ("p18_dot_f64", 3, "vfmadd231pd"),
 ):
     current = body(reduction, name)
     if packed_op not in current:
