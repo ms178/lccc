@@ -94,7 +94,7 @@ pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
     whole_archive: bool,
 ) -> Result<(), String> {
     load_archive_elf64_backed(
-        &crate::backend::linker_common::filemap::FileBacking::Owned(std::sync::Arc::clone(buf)),
+        &crate::backend::linker_common::filemap::FileBacking::owned(std::sync::Arc::clone(buf)),
         archive_path, objects, globals, expected_machine, should_replace_extra,
         whole_archive)
 }

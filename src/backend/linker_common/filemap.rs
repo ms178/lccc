@@ -188,8 +188,8 @@ impl FileMap {
     #[inline]
     pub fn backing(&self) -> FileBacking {
         match &self.inner {
-            FileMapInner::Mapped(m) => FileBacking::Mapped(Arc::clone(m)),
-            FileMapInner::Owned(v) => FileBacking::Owned(Arc::clone(v)),
+            FileMapInner::Mapped(m) => FileBacking::mapped(Arc::clone(m)),
+            FileMapInner::Owned(v) => FileBacking::owned(Arc::clone(v)),
         }
     }
 }
@@ -206,23 +206,55 @@ impl std::ops::Deref for FileMap {
 ///
 /// Cloning is a refcount bump in both variants, so every section of a file can
 /// hold one without copying anything.
+///
+/// The representation is deliberately opaque, mirroring `FileMap`/
+/// `FileMapInner` above. `Mapping` is a raw-pointer RAII type whose only
+/// invariant is "unmapped exactly once"; exposing it in a public enum variant
+/// would both leak that detail into the crate's API and make the private type
+/// reachable at `pub` visibility (a `private_interfaces` warning). Callers only
+/// ever need `as_slice`, plus `owned` to wrap bytes they already hold.
 #[derive(Clone)]
-pub enum FileBacking {
+pub struct FileBacking {
+    inner: FileBackingInner,
+}
+
+#[derive(Clone)]
+enum FileBackingInner {
     Mapped(Arc<Mapping>),
     Owned(Arc<[u8]>),
 }
 
 impl FileBacking {
+    /// Wrap bytes the caller already owns (synthesised sections, and the
+    /// non-mappable fallback).
+    #[inline]
+    pub fn owned(buf: Arc<[u8]>) -> Self {
+        FileBacking { inner: FileBackingInner::Owned(buf) }
+    }
+
+    #[inline]
+    fn mapped(m: Arc<Mapping>) -> Self {
+        FileBacking { inner: FileBackingInner::Mapped(m) }
+    }
+
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        match self {
+        match &self.inner {
             // SAFETY: as in `FileMap::as_slice`; the `Arc` keeps the mapping
             // alive for at least as long as this borrow.
-            FileBacking::Mapped(m) => unsafe {
+            FileBackingInner::Mapped(m) => unsafe {
                 std::slice::from_raw_parts(m.ptr as *const u8, m.len)
             },
-            FileBacking::Owned(v) => v,
+            FileBackingInner::Owned(v) => v,
         }
+    }
+
+    /// True when these bytes are a mapping rather than a copy.
+    ///
+    /// Only meaningful to tests asserting the zero-copy path is taken.
+    #[inline]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.inner, FileBackingInner::Mapped(_))
     }
 }
 
