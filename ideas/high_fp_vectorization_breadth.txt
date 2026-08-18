@@ -70,14 +70,20 @@ Key files
 - Added exact-class, width-aware XMM/YMM homes for loop-carried F32/F64
   reductions. Five patterns improve with no regression; sum+dot paired VM
   screening measured ratio 0.5021 (CI 0.4589..0.5908), 23/24 wins.
+- Completed one-source affine store-loop vectorization for copy/scale/add/full
+  affine F32/F64/I32/U32, exact in-place maps, signed/unsigned 32/64-bit IVs,
+  AVX2/SSE/AArch64 widths, indexed byte-IV memory streams, register-resident
+  broadcasts, and contract-legal packed FMA. Shifted aliases and non-contiguous
+  strides remain conservatively scalar.
 
 ## Current measured backlog (new session)
 
-1. Dot/sum setup and tails: the RDX fixed-scratch liveness defect is repaired
-   and late remainder `idivl` is gone; next remove the dot-product transient
-   stack temporary and continue reducing address setup.
-2. Integer/FP affine store loops and remaining stencil overhead.
-3. Four live reductions (`p48`); single F32/F64 accumulator homes are done.
+1. Dot/sum setup and tails: division-free transitions and contract-aware
+   memory-folded vector FMA are complete; continue reducing tail address setup.
+2. Width-aware fixed-vector/stencil SLP and complex/interleaved kernels.
+3. Four live reductions (`p48`) now keep independent scalar F32/F64 copy webs
+   in distinct XMM accumulators without stack traffic; packed interleaved
+   reduction remains a separate profitability experiment.
 4. Width-aware fixed-vector SLP and complex/interleaved kernels.
 5. Workload-derived variants from zlib-ng/gzip, expat, SQLite, Linux, and glibc,
    with provenance and real end-to-end workloads.

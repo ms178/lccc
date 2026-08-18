@@ -383,6 +383,31 @@ impl X86Codegen {
             }
         }
 
+        // Map broadcast in an assigned XMM family plus a streamed current
+        // value in xmm0: the legacy two-operand form can consume both directly.
+        if let (Operand::Value(current), Operand::Value(invariant)) = (&args[0], &args[1]) {
+            let current_held = self.state.sse_last_store_reg
+                && self.state.sse_last_store_val == Some(current.0)
+                && self.state.sse_last_store_reg_name == Some("xmm0");
+            if current_held {
+                if let Some(&reg) = self.reg_assignments.get(&invariant.0) {
+                    if is_xmm_reg(reg) {
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %xmm0",
+                            sse_inst,
+                            phys_reg_name(reg)
+                        ));
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(current.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                        self.state.sse_last_store_reg = false;
+                        self.sse_store_dest(dest_ptr, "xmm0");
+                        return;
+                    }
+                }
+            }
+        }
+
         let a1_last = matches!(&args[1], Operand::Value(v)
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
         if a1_last {
@@ -703,6 +728,35 @@ impl X86Codegen {
             Some("rcx".to_string())
         };
         (base, index)
+    }
+
+    /// Store a packed map result either through its legacy materialized GEP or
+    /// directly through `(base, byte_offset)` operands.  The latter lets the
+    /// x86 SIB form replace two LEAs and a pointer shuttle in every iteration.
+    fn emit_vec_store_addr(
+        &mut self,
+        args: &[Operand],
+        dest_ptr: &Option<Value>,
+        mnemonic: &str,
+        source_reg: &str,
+    ) {
+        if args.len() >= 3 {
+            let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
+            match index {
+                Some(index) => self.state.emit_fmt(format_args!(
+                    "    {} %{}, (%{},%{})",
+                    mnemonic, source_reg, base, index
+                )),
+                None => self.state.emit_fmt(format_args!(
+                    "    {} %{}, (%{})",
+                    mnemonic, source_reg, base
+                )),
+            }
+        } else if let Some(ptr) = dest_ptr {
+            self.operand_to_reg(&Operand::Value(*ptr), "rax");
+            self.state
+                .emit_fmt(format_args!("    {} %{}, (%rax)", mnemonic, source_reg));
+        }
     }
 
     pub(super) fn emit_intrinsic_impl(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
@@ -2372,6 +2426,16 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "mulpd");
                 }
             }
+            IntrinsicOp::VecFmaF64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_reduction_fma(d, args, "vfmadd231pd");
+                }
+            }
+            IntrinsicOp::VecMaddF64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_map_fma(d, args, "vfmadd132pd");
+                }
+            }
             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
                 // defer-aware emitters (vpaddd is 3-op VEX, paddd is 2-op).
                 if let Some(d) = dest {
@@ -2428,12 +2492,13 @@ impl X86Codegen {
                             }
                         }
                     }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
                 }
                 self.state.invalidate_vec_peephole();
-                if let Some(c_ptr) = dest_ptr {
-                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
-                    self.state.emit("    movdqu %xmm0, (%rax)");
-                }
+                self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
             }
             IntrinsicOp::VecStoreI32x8 => {
                 // Peek register residency BEFORE invalidating the peephole —
@@ -2449,14 +2514,57 @@ impl X86Codegen {
                             }
                         }
                     }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
                 }
                 self.state.invalidate_vec_peephole();
-                if let Some(c_ptr) = dest_ptr {
-                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
-                    self.state.emit("    vmovdqu %ymm0, (%rax)");
-                }
+                self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", "ymm0");
             }
             
+            IntrinsicOp::VecBroadcastF64x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let mut done = false;
+                if let Operand::Value(v) = &args[0] {
+                    if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                        if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                            self.state.emit_fmt(format_args!(
+                                "    vbroadcastsd {}, %ymm0", self.slot_ref(slot.0)));
+                            done = true;
+                        }
+                    }
+                    if !done {
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            if is_xmm_reg(reg) {
+                                self.state.emit_fmt(format_args!(
+                                    "    vbroadcastsd %{}, %ymm0", phys_reg_name(reg)));
+                                done = true;
+                            }
+                        }
+                    }
+                }
+                if !done {
+                    self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
+                    self.state.emit("    vbroadcastsd %xmm0, %ymm0");
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.avx_store_dest(d);
+                    self.flush_pending_vec_store_impl();
+                }
+            }
+            IntrinsicOp::VecBroadcastF64x2 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
+                self.state.emit("    unpcklpd %xmm0, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
             IntrinsicOp::VecBroadcastF32x8 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
@@ -2484,9 +2592,7 @@ impl X86Codegen {
                     }
                 }
                 if !done {
-                    // Stack/GPR materialisation of the f32 bits.
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movd %eax, %xmm0");
+                    self.emit_fp_operand_to_xmm(&args[0], IrType::F32, "xmm0");
                     self.state.emit("    vbroadcastss %xmm0, %ymm0");
                 }
                 if let Some(d) = dest {
@@ -2499,8 +2605,7 @@ impl X86Codegen {
             IntrinsicOp::VecBroadcastF32x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                self.operand_to_reg(&args[0], "rax");
-                self.state.emit("    movd %eax, %xmm0");
+                self.emit_fp_operand_to_xmm(&args[0], IrType::F32, "xmm0");
                 self.state.emit("    shufps $0x00, %xmm0, %xmm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -2519,12 +2624,13 @@ impl X86Codegen {
                             }
                         }
                     }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
                 }
                 self.state.invalidate_vec_peephole();
-                if let Some(c_ptr) = dest_ptr {
-                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
-                    self.state.emit("    vmovups %ymm0, (%rax)");
-                }
+                self.emit_vec_store_addr(args, dest_ptr, "vmovups", "ymm0");
             }
             IntrinsicOp::VecStoreF32x4 => {
                 let in_reg = matches!(&args[0], Operand::Value(v)
@@ -2538,14 +2644,55 @@ impl X86Codegen {
                             }
                         }
                     }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
                 }
                 self.state.invalidate_vec_peephole();
-                if let Some(c_ptr) = dest_ptr {
-                    self.operand_to_reg(&Operand::Value(*c_ptr), "rax");
-                    self.state.emit("    movups %xmm0, (%rax)");
-                }
+                self.emit_vec_store_addr(args, dest_ptr, "movups", "xmm0");
             }
-IntrinsicOp::VecHorizontalAddF64x4 => {
+            IntrinsicOp::VecStoreF64x4 => {
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!("    vmovupd {}, %ymm0", self.slot_ref(slot.0)));
+                            }
+                        }
+                    }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
+                }
+                self.state.invalidate_vec_peephole();
+                self.emit_vec_store_addr(args, dest_ptr, "vmovupd", "ymm0");
+            }
+            IntrinsicOp::VecStoreF64x2 => {
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!("    movupd {}, %xmm0", self.slot_ref(slot.0)));
+                            }
+                        }
+                    }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
+                }
+                self.state.invalidate_vec_peephole();
+                self.emit_vec_store_addr(args, dest_ptr, "movupd", "xmm0");
+            }
+            IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64.
@@ -2685,6 +2832,16 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                         IntrinsicOp::VecMulF32x4 => self.emit_sse_binary_128(d, args, "mulps"),
                         _ => unreachable!(),
                     }
+                }
+            }
+            IntrinsicOp::VecFmaF32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_reduction_fma(d, args, "vfmadd231ps");
+                }
+            }
+            IntrinsicOp::VecMaddF32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_map_fma(d, args, "vfmadd132ps");
                 }
             }
             IntrinsicOp::VecHorizontalAddF32x8 => {
@@ -2849,6 +3006,117 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
         }
     }
 
+    /// Emit a contract-legal affine map as `input * scale + bias`.  Broadcast
+    /// scale/bias values normally have assigned YMM families, while the packed
+    /// input streams through ymm0 from the preceding load.
+    fn emit_avx_map_fma(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
+        assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
+        if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
+            (&args[0], &args[1], &args[2])
+        {
+            let input_held = self.state.vec_last_store_reg
+                && self.state.vec_last_store_val == Some(input.0)
+                && self.state.vec_last_store_reg_name == Some("ymm0");
+            let scale_reg = self
+                .reg_assignments
+                .get(&scale.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r));
+            let bias_reg = self
+                .reg_assignments
+                .get(&bias.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r));
+            if let (true, Some(scale_reg), Some(bias_reg)) =
+                (input_held, scale_reg, bias_reg)
+            {
+                self.state.emit_fmt(format_args!(
+                    "    {} %{}, %{}, %ymm0",
+                    mnemonic,
+                    phys_reg_name_256(scale_reg),
+                    phys_reg_name_256(bias_reg)
+                ));
+                if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(input.0) {
+                    self.state.pending_vec_store = None;
+                }
+                self.state.vec_last_store_reg = false;
+                self.avx_store_dest(dest);
+                return;
+            }
+        }
+
+        self.avx_load_arg(&args[0]);
+        self.avx_load_arg_to(&args[2], "ymm1");
+        self.avx_load_arg_to(&args[1], "ymm2");
+        self.state.emit_fmt(format_args!(
+            "    {} %ymm2, %ymm1, %ymm0",
+            mnemonic
+        ));
+        self.state.vec_last_store_reg = false;
+        self.avx_store_dest(dest);
+    }
+
+    /// Emit one fused AVX reduction step directly from two memory streams:
+    /// `dest = acc + load(a_base+a_off) * load(b_base+b_off)`.
+    ///
+    /// Keeping one multiplicand in YMM0 and folding the other into FMA avoids
+    /// the old load-A stack home that had to be flushed before load B. The
+    /// vectorizer only creates this intrinsic under a fast-contraction contract.
+    pub(super) fn emit_avx_reduction_fma(
+        &mut self,
+        dest: &Value,
+        args: &[Operand],
+        mnemonic: &str,
+    ) {
+        assert!(args.len() == 5, "{} expects accumulator plus two base/offset pairs", mnemonic);
+
+        let assigned = self.reg_assignments.get(&dest.0).copied().filter(|r| is_xmm_reg(*r));
+        let target = assigned.map(phys_reg_name_256).unwrap_or("ymm2");
+        let acc_same = match (&args[0], assigned) {
+            (Operand::Value(acc), Some(reg)) => {
+                self.reg_assignments.get(&acc.0).is_some_and(|r| *r == reg)
+            }
+            _ => false,
+        };
+        if !acc_same {
+            self.avx_load_arg_to(&args[0], target);
+        }
+
+        let (a_base, a_index) = self.vec_load_addr_regs(&args[1], &args[2]);
+        match a_index {
+            Some(index) => self.state.emit_fmt(format_args!(
+                "    vmovdqu (%{},%{}), %ymm0", a_base, index
+            )),
+            None => self.state.emit_fmt(format_args!(
+                "    vmovdqu (%{}), %ymm0", a_base
+            )),
+        }
+        let (b_base, b_index) = self.vec_load_addr_regs(&args[3], &args[4]);
+        match b_index {
+            Some(index) => self.state.emit_fmt(format_args!(
+                "    {} (%{},%{}), %ymm0, %{}", mnemonic, b_base, index, target
+            )),
+            None => self.state.emit_fmt(format_args!(
+                "    {} (%{}), %ymm0, %{}", mnemonic, b_base, target
+            )),
+        }
+
+        self.state.vector_values.insert(dest.0);
+        if let Some(reg) = assigned {
+            let name = phys_reg_name_256(reg);
+            self.state.vec_live_regs.insert(dest.0, name);
+            self.state.vec_last_store_val = Some(dest.0);
+            self.state.vec_last_store_reg = true;
+            self.state.vec_last_store_reg_name = Some(name);
+        } else {
+            if target != "ymm0" {
+                self.state
+                    .emit_fmt(format_args!("    vmovdqa %{}, %ymm0", target));
+            }
+            self.avx_store_dest(dest);
+        }
+    }
+
     /// Emit AVX binary 256-bit op: load ymm0 from arg0 ptr, ymm1 from arg1 ptr,
     /// apply the given AVX instruction, store result ymm0 to dest_ptr.
     pub(super) fn emit_avx_binary_256(&mut self, dest_ptr: &Value, args: &[Operand], avx_inst: &str, commutative: bool) {
@@ -2895,6 +3163,33 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                         self.state.vec_last_store_val = Some(dest_ptr.0);
                         self.state.vec_last_store_reg = true;
                         self.state.vec_last_store_reg_name = Some(target);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Map kernels keep loop-invariant broadcasts in assigned YMM families
+        // and stream the current element value through %ymm0.  Use that family
+        // directly as the VEX source instead of copying it through %ymm1 on
+        // every iteration.
+        if let (Operand::Value(current), Operand::Value(invariant)) = (&args[0], &args[1]) {
+            let current_held = self.state.vec_last_store_reg
+                && self.state.vec_last_store_val == Some(current.0)
+                && self.state.vec_last_store_reg_name == Some("ymm0");
+            if current_held {
+                if let Some(&reg) = self.reg_assignments.get(&invariant.0) {
+                    if is_xmm_reg(reg) {
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %ymm0, %ymm0",
+                            avx_inst,
+                            phys_reg_name_256(reg)
+                        ));
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(current.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                        self.state.vec_last_store_reg = false;
+                        self.avx_store_dest(dest_ptr);
                         return;
                     }
                 }

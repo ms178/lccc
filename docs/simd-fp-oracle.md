@@ -1,7 +1,10 @@
 # SIMD/FP Compiler Explorer oracle audit
 
 **Date:** 2026-08-18  
-**Base:** `1abb407e597f749a96bd851cb671f0c169f61012`  
+**Original audit base:** `1abb407e597f749a96bd851cb671f0c169f61012`
+
+**Current rebased delivery base:** `89f1404bc67aea48090ef8e611390d39d28a2a7b`
+
 **Target used for screening:** x86-64-v3, AT&T syntax
 
 This document records the reproducible static-code audit introduced by
@@ -255,6 +258,110 @@ exact runner are retained under `artifacts/simd-fp-followup/remainder/`.
 Static counts are deterministic; these noisy wall times are VM screening
 rather than PMU-backed Raptor Lake or bare-metal evidence.
 
+### Sixth distilled fix: contract-aware fused dot reductions
+
+The remaining dot-product stack traffic was caused by two sequential vector
+loads: loading B forced the deferred A value out of YMM0 into a 32-byte stack
+home before multiply.  Under an explicit fast-contraction contract the AVX2
+vectorizer now emits one typed fused reduction intrinsic carrying the
+accumulator plus both base/offset pairs.  x86 loads A into YMM0, folds B as the
+memory operand of `vfmadd231ps/pd`, and updates the coalesced accumulator YMM
+register directly.  No transient vector value or stack home is created.
+
+FMA legality is now independent compiler state rather than being inferred from
+reassociation: `-ffp-contract=fast` and `off` obey last-option-wins, while
+`-fassociative-math -ffp-contract=off` retains separate packed multiply/add.
+CLI unit coverage and a two-mode assembly regression lock down that contract.
+On the 50-pattern corpus, p17, p18, and p23 each improve by three instructions
+and two stack references; **3 improve, 47 tie, 0 regress** (1838 -> 1829).
+The live GCC/Clang/ICC/ICX refresh is under `artifacts/simd-fp-four/fma-dot/`;
+the five-kernel LCCC aggregate moves 270 -> 264 instructions. These are static
+VM/oracle results, not PMU-backed target-hardware claims.
+
+### Seventh distilled fix: multiple scalar FP reductions in registers
+
+Post-phi scalar FP accumulators are represented as multi-def `Copy` values and
+therefore no longer carry an explicit result type.  x86's scalar XMM allocator
+previously recognized only typed arithmetic producers, leaving p48's four
+loop-carried sums in four stack slots despite fourteen available XMM registers.
+Typed FP copy-web recovery now runs on x86 as well as AArch64, excludes
+copy-only dead webs through real-use propagation, and reuses the existing
+same-block destructive-backedge proof.  The GPR and FP coalescing paths also
+share revalidation logic instead of maintaining divergent safety checks.
+
+`multiple_fp_reductions.c` sweeps boundary counts for four simultaneous F32 and
+F64 sums; its structural companion requires four distinct in-place XMM
+accumulators and a kill-switch control with stack homes.  A controlled 50-case
+A/B reports **15 improved, 35 tied, 0 regressed**, aggregate 1829 -> 1742,
+with p48 at 63 -> 46 instructions and 16 -> 0 classified stack references.
+Artifacts are retained under `artifacts/simd-fp-four/multi-reduction/`.
+
+### Eighth distilled fix: width-aware affine store loops
+
+The old map recognizer accepted only the full `I32/F32 load * scale + bias`
+shape. It also rebuilt a multiply and add unconditionally in the remainder,
+used a fixed four-byte element offset, treated signed dynamic bounds as
+unsigned during vector-trip computation, and materialized both packed-loop
+GEPs. The resulting path was narrow, had latent F64/negative-bound correctness
+gaps, and spent several integer instructions per vector iteration constructing
+addresses.
+
+The recognizer now covers the complete one-source affine family—copy, scale,
+add, and scale-plus-bias—for F32, F64, I32, and U32 elements with signed or
+unsigned 32/64-bit induction. Legality requires a canonical contiguous
+`element index * sizeof(element)` address, either disjoint proven object roots
+(`restrict`, separate globals/allocas) or exactly identical in-place GEPs.
+Shifted overlapping accesses remain scalar. Signed power-of-two trip
+quotients use an explicit bias/shift sequence, so negative bounds execute zero
+iterations without an unsigned reinterpretation or `idiv` in the loop.
+
+A separate I64 byte-offset phi advances by the packed byte width while the
+source IV remains an element counter. x86 therefore emits one indexed load,
+one indexed store, and one byte-IV increment instead of two LEAs plus repeated
+cast/scale work. Width selection is F32/I32/U32 x8 and F64 x4 on AVX2, x4/x2
+on the 128-bit diagnostic/AArch64 paths. Loop-invariant broadcasts receive
+narrowly proven XMM/YMM homes and are consumed directly by packed arithmetic;
+the store consumes a deferred result without writing its dead SSA home.
+`CCC_NO_MAP_VECREG=1` retains a stack-home control. Under an explicit fast
+contraction contract, full FP affine maps use `vfmadd132ps/pd`; strict mode
+retains separate multiply and add operations.
+
+The boundary regression checks negative, zero, every packed-width edge through
+79, F32/F64/I32, unsigned bounds, I64 induction, exact in-place operation, and
+a shifted-overlap dependence. Its structural companion checks AVX2 and SSE
+widths, copy/scale/add/full-affine shapes, alias rejection, direct broadcast
+registers, absence of the dead packed-result spill, both kill switches, and
+strict-versus-fast FMA selection. The same F32/F64/I32 intrinsic family is now
+lowered on AArch64 rather than silently falling through an x86-only arm.
+
+A clean pre-item/current static A/B over all 50 corpus functions deliberately
+shows the code-size cost instead of hiding it. Strict mode is **0 improved, 47
+tied, 3 larger**, aggregate **1580 -> 1665**, arithmetic ratio 1.05380 and
+geometric ratio 1.05142. Fast mode is **1 improved, 46 tied, 3 larger**,
+aggregate **1742 -> 1826**, arithmetic ratio 1.04822 and geometric ratio
+1.05106; p12 improves 60 -> 59 through contract-legal packed FMA. The three
+larger functions are newly vectorized p01 copy F32 (21 -> 48), p02 copy F64
+(21 -> 48), and p36 constant-scale F32 (23 -> 54). GCC, Clang, and ICX lower
+the restrict copy to a six-instruction `memcpy` tail call, so LCCC's larger
+inline copy is not presented as a code-size win.
+
+An eleven-run alternating `CLOCK_MONOTONIC` VM screen nevertheless gives a
+large hot-loop signal: copy F32 6.66x, copy F64 3.27x, constant-scale F32 5.98x,
+affine F32 2.51x, and affine I32 2.60x versus the pre-item compiler; arithmetic
+and geometric new/old ratios are 0.28140 and 0.25962. These are unpinned,
+non-PMU VM wall times and therefore screening evidence only, not a Raptor Lake
+superiority claim. Raw source, samples, static A/B, strict/fast outputs, and
+assembly are under `artifacts/simd-fp-four/affine-map/`. Final validation on
+the rebased tree is 325/325 regression checks, 50/50 correctness tests, and
+803 passed Rust library tests (6 ignored).
+
+Fresh live CE comparisons resolve GCC 16.2 `cg162`, Clang 22.1.0
+`cclang2210`, ICC 2021.10 `cicc2021100`, and latest ICX `cicxlatest`. LCCC's
+strict scale F32 is 53 instructions (GCC 53, Clang 52, ICC 71, ICX 24), strict
+affine F64 is 60 (GCC 42, Clang 60, ICC 123, ICX 27), and fast affine F64 is
+59 (GCC 42, Clang 60, ICC 123, ICX 27). Whole-function counts include setup
+and scalar tails and are triage data, not throughput estimates.
+
 ## Correctness policy discovered during the audit
 
 Strict IEEE source order is now the default for FP reductions.  Reassociation
@@ -267,16 +374,13 @@ regressions cover strict ordering and overlapping map/matmul inputs.
 
 ## Next measured targets (deferred to a new session)
 
-The current delivery stops after the validated register-resident reduction fix;
-do not widen its whitelist opportunistically.  A future agent should start from
+The affine store-loop delivery is complete and isolated; do not widen its
+one-source legality proof opportunistically. A future agent should start from
 the retained A/B and live-oracle artifacts, then address in this order:
 
-1. eliminate the remaining dot-product transient stack temporary and evaluate
-   vector FMA only under the existing fast-contract legality rules;
-2. support multiple independent reductions (`p48`) without accumulator spills;
-3. broaden legal store-loop vectorization and add width-aware SLP for fixed
-   vectors/stencils;
-4. graduate promising zlib-ng/gzip, expat, SQLite, Linux, and glibc kernels to
+1. add width-aware SLP for fixed vectors/stencils and complex/interleaved
+   kernels;
+2. graduate promising zlib-ng/gzip, expat, SQLite, Linux, and glibc kernels to
    pinned end-to-end workloads with provenance.
 
 For every item, retain strict-vs-fast differential execution, local/remote

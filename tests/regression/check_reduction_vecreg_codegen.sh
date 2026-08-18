@@ -29,14 +29,10 @@ def body(text, name):
     return match.group(1)
 
 
-cases = {
+for name, mnemonic in {
     "p15_sum_f32": "vaddps",
     "p16_sum_f64": "vaddpd",
-    "p17_dot_f32": "vaddps",
-    "p18_dot_f64": "vaddpd",
-    "p23_sum_squares_f32": "vaddps",
-}
-for name, mnemonic in cases.items():
+}.items():
     current = body(new, name)
     disabled = body(old, name)
     direct = re.search(
@@ -49,8 +45,20 @@ for name, mnemonic in cases.items():
     if not re.search(rf"{mnemonic} .*\(%rbp\)", disabled):
         raise SystemExit(f"{name}: kill-switch control did not restore stack accumulator")
 
-# Sum loops need no vector temporary stack traffic at all. Dot/square loops may
-# retain one product-input temporary, but the accumulator store must be gone.
+for name, suffix in {
+    "p17_dot_f32": "ps",
+    "p18_dot_f64": "pd",
+    "p23_sum_squares_f32": "ps",
+}.items():
+    current = body(new, name)
+    disabled = body(old, name)
+    if not re.search(rf"vfmadd231{suffix} .*%ymm0, %ymm(?:[2-9]|1[0-5])", current):
+        raise SystemExit(f"{name}: fused accumulator is not register-resident")
+    if re.search(r"vmov\w* %ymm\d+, -?\d+\(%rbp\)", current):
+        raise SystemExit(f"{name}: fused vector accumulator still spills")
+    if not re.search(r"vmovdqu %ymm0, -?\d+\(%rbp\)", disabled):
+        raise SystemExit(f"{name}: kill-switch control did not restore stack accumulator")
+
 for name in ("p15_sum_f32", "p16_sum_f64"):
     if re.search(r"vmov\w* %ymm\d+, -?\d+\(%rbp\)", body(new, name)):
         raise SystemExit(f"{name}: unexpected vector stack store")

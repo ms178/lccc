@@ -112,7 +112,7 @@ fn take_reject() -> Option<&'static str> {
 
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
-    vectorize_with_analysis_mode(func, cfg, false, false, false)
+    vectorize_with_analysis_mode(func, cfg, false, false, false, false)
 }
 
 fn vectorize_with_analysis_mode(
@@ -121,6 +121,7 @@ fn vectorize_with_analysis_mode(
     force_two_wide: bool,
     neon: bool,
     fp_reassoc: bool,
+    fp_contract_fast: bool,
 ) -> usize {
     let num_blocks = func.blocks.len();
     let loops = loop_analysis::find_natural_loops(
@@ -236,18 +237,28 @@ fn vectorize_with_analysis_mode(
                 if debug {
                     eprintln!("[VEC] Reduction pattern matched! Transforming to AVX2 4-wide");
                 }
-                total_changes += transform_reduction_avx2(func, &red_pattern);
+                total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract_fast);
             }
         } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
-            // Map pattern — AArch64 entry only until x86 regalloc preserves
-            // distinct src/dst bases across the vectorized body (Godbolt gap).
-            // Backend now lowers VecMul/Broadcast/Store I32x4 for when enabled.
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
+                // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
+                // the focused SSE diagnostic override requests 128-bit code.
+                let avx2 = !neon
+                    && !force_two_wide
+                    && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
                 if debug {
-                    eprintln!("[VEC] Map pattern matched! Transforming to NEON 4-wide");
+                    eprintln!(
+                        "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
+                        if avx2 { 256 } else { 128 },
+                        map_pattern.elem_ty
+                    );
                 }
-                let avx2 = std::env::var("LCCC_FORCE_MAP_SSE").is_err();
-                total_changes += transform_map_vector(func, &map_pattern, avx2);
+                total_changes += transform_map_vector(
+                    func,
+                    &map_pattern,
+                    avx2,
+                    fp_contract_fast,
+                );
             } else {
                 let why = take_reject().unwrap_or("pattern shape not recognized");
                 if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
@@ -1719,8 +1730,9 @@ fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
     }
 }
 
-/// Pattern matching result for a vectorizable map loop:
-/// `dst[i] = src[i] * scale + offset` with loop-invariant scale/offset.
+/// Pattern matching result for a vectorizable one-source store loop:
+/// `dst[i] = src[i]`, `src[i] * scale`, `src[i] + offset`, or the full
+/// `src[i] * scale + offset`, with loop-invariant scalar operands.
 #[derive(Debug)]
 struct MapPattern {
     /// Loop header block index
@@ -1733,25 +1745,27 @@ struct MapPattern {
     exit_idx: usize,
     /// Induction variable (loop counter)
     iv: Value,
+    /// Signed or unsigned 32/64-bit induction type.
+    iv_ty: IrType,
+    /// Element type shared by the source load and destination store.
+    elem_ty: IrType,
     /// Loop limit value (N in `i < N`)
     limit: Operand,
-    /// Comparison instruction index that tests the loop exit condition
-    exit_cmp_inst_idx: usize,
+    /// Normalized strict-less operation that tests the loop exit condition.
+    exit_cmp_op: IrCmpOp,
     /// GEP for the destination store (dst[iv])
     dst_gep: Value,
     /// GEP for the source load (src[iv])
     src_gep: Value,
-    /// Loop-invariant scale operand of the multiply
-    scale: Operand,
-    /// Loop-invariant offset operand of the add
-    offset: Operand,
-    /// Store instruction index in the body block
-    store_idx: usize,
+    /// Optional loop-invariant scale operand of the multiply.
+    scale: Option<Operand>,
+    /// Optional loop-invariant offset operand of the add.
+    offset: Option<Operand>,
     /// All block indices in the loop body
     loop_blocks: FxHashSet<usize>,
 }
 
-/// Analyze a loop for the map pattern `dst[i] = src[i] * scale + offset`.
+/// Analyze a one-source copy/scale/add/affine store loop.
 ///
 /// Strict legality: the loop must be straight-line (no internal conditionals),
 /// contain exactly one load and one store, only simple non-trapping arithmetic,
@@ -1767,6 +1781,14 @@ fn analyze_map_pattern(
 
     let exit_idx = find_exit(func, loop_info)?;
     let latch_idx = find_latch(func, loop_info)?;
+    // The transform redirects the false edge to the scalar remainder.  Require
+    // the canonical while-loop shape rather than guessing branch polarity.
+    if !matches!(header.terminator,
+        Terminator::CondBranch { false_label, .. }
+            if false_label == func.blocks[exit_idx].label)
+    {
+        return None;
+    }
 
     // Reject loops with internal conditionals (predication not supported).
     if loop_info.body.iter().copied().any(|block_idx| {
@@ -1779,8 +1801,12 @@ fn analyze_map_pattern(
     // Identify the induction phi from the header exit comparison.
     let mut iv = None;
     for inst in &header.instructions {
-        let Instruction::Phi { dest, incoming, .. } = inst else { continue };
-        if incoming.len() != 2 { continue };
+        let Instruction::Phi { dest, incoming, ty } = inst else { continue };
+        if incoming.len() != 2
+            || !matches!(*ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+        {
+            continue;
+        };
         let mut derived = FxHashSet::default();
         derived.insert(*dest);
         for candidate in &header.instructions {
@@ -1792,11 +1818,11 @@ fn analyze_map_pattern(
             Instruction::Cmp { lhs, rhs, .. }
                 if matches!(lhs, Operand::Value(v) if derived.contains(v))))
         {
-            iv = Some(*dest);
+            iv = Some((*dest, *ty));
             break;
         }
     }
-    let iv = iv?;
+    let (iv, iv_ty) = iv?;
 
     // IV-derived values across the loop (casts/copies), fixed-point.
     let mut iv_derived = FxHashSet::default();
@@ -1819,22 +1845,40 @@ fn analyze_map_pattern(
 
     // Exit comparison and limit.
     let mut exit_cmp_info = None;
-    for (idx, inst) in header.instructions.iter().enumerate() {
-        if let Instruction::Cmp { dest, lhs, rhs, .. } = inst {
+    for inst in &header.instructions {
+        if let Instruction::Cmp { op, lhs, rhs, ty, .. } = inst {
+            if *ty != iv_ty {
+                continue;
+            }
             if let Operand::Value(lhs_val) = lhs {
-                if iv_derived.contains(lhs_val) {
-                    exit_cmp_info = Some((idx, *dest, rhs.clone()));
+                if iv_derived.contains(lhs_val)
+                    && matches!(*op, IrCmpOp::Slt | IrCmpOp::Ult)
+                {
+                    exit_cmp_info = Some((*op, rhs.clone()));
                     break;
                 }
             } else if let Operand::Value(rhs_val) = rhs {
                 if iv_derived.contains(rhs_val) {
-                    exit_cmp_info = Some((idx, *dest, lhs.clone()));
-                    break;
+                    let normalized = match op {
+                        IrCmpOp::Sgt => Some(IrCmpOp::Slt),
+                        IrCmpOp::Ugt => Some(IrCmpOp::Ult),
+                        _ => None,
+                    };
+                    if let Some(normalized) = normalized {
+                        exit_cmp_info = Some((normalized, lhs.clone()));
+                        break;
+                    }
                 }
             }
         }
     }
-    let (exit_cmp_inst_idx, _exit_cmp_dest, limit) = exit_cmp_info?;
+    let (exit_cmp_op, limit) = exit_cmp_info?;
+    if matches!(&limit, Operand::Value(v)
+        if find_inst_in_loop(func, &loop_info.body, *v).is_some())
+    {
+        set_reject("map trip count is not loop-invariant");
+        return None;
+    }
 
     // Constant trip counts of 4 or fewer are better left scalar.
     if let Operand::Const(c) = &limit {
@@ -1856,21 +1900,28 @@ fn analyze_map_pattern(
 
     // Scan the loop for loads/stores: exactly one of each, and every other
     // instruction must be simple, side-effect-free arithmetic.
-    let mut load_info = None;   // (block, load dest, ptr value)
-    let mut store_info = None;  // (block, inst idx, ptr value, stored val)
+    let mut load_info = None;   // (block, load dest, ptr value, element type)
+    let mut store_info = None;  // (block, ptr value, stored val, element type)
     for &block_idx in &loop_info.body {
-        for (inst_idx, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
+        for inst in &func.blocks[block_idx].instructions {
             match inst {
                 Instruction::Load { dest, ptr, ty, .. } => {
-                    // I32 (legacy NEON map) and F32 (saxpy-class) element types.
-                    if !matches!(*ty, IrType::I32 | IrType::F32) || load_info.is_some() { return None; }
-                    load_info = Some((block_idx, *dest, *ptr));
-                    let _ = inst_idx;
+                    // Packed I32/U32/F32/F64 all have native forms.
+                    if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
+                        || load_info.is_some()
+                    {
+                        return None;
+                    }
+                    load_info = Some((block_idx, *dest, *ptr, *ty));
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
-                    if !matches!(*ty, IrType::I32 | IrType::F32) || store_info.is_some() { return None; }
+                    if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
+                        || store_info.is_some()
+                    {
+                        return None;
+                    }
                     let Operand::Value(store_val) = val else { return None };
-                    store_info = Some((block_idx, inst_idx, *ptr, *store_val));
+                    store_info = Some((block_idx, *ptr, *store_val, *ty));
                 }
                 Instruction::BinOp { op, .. } if op.can_trap() => return None,
                 Instruction::Phi { .. }
@@ -1885,14 +1936,24 @@ fn analyze_map_pattern(
             }
         }
     }
-    let (_, load_dest, src_gep) = load_info?;
-    let (body_idx, store_idx, dst_gep, store_val) = store_info?;
+    let (_, load_dest, src_gep, load_ty) = load_info?;
+    let (body_idx, dst_gep, store_val, elem_ty) = store_info?;
+    if load_ty != elem_ty {
+        return None;
+    }
 
     // Both GEPs must be indexed by the IV.
     if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
         || !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived)
     {
         if debug { eprintln!("[VEC-MAP]   GEPs don't use IV"); }
+        return None;
+    }
+    let elem_size = if elem_ty == IrType::F64 { 8 } else { 4 };
+    if find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
+        || find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none()
+    {
+        set_reject("map access is not a contiguous element-size stride");
         return None;
     }
 
@@ -1908,33 +1969,73 @@ fn analyze_map_pattern(
         }
     };
 
-    // The stored value must be `mul(load, scale) + offset` (either operand
-    // order), with loop-invariant scale and offset.
+    // Accept the complete one-source affine family.  Missing scale/offset
+    // operations are represented explicitly so the transform does not invent
+    // arithmetic (important for copies and pure scales).
     let body = &func.blocks[body_idx];
-    let add_inst = find_inst_by_dest(body, store_val)?;
-    let Instruction::BinOp { op: IrBinOp::Add, lhs: add_lhs, rhs: add_rhs, ty: add_ty, .. } = add_inst else {
-        return None;
-    };
-    if !matches!(add_ty, IrType::I32 | IrType::F32) {
-        return None;
-    }
-    let (mul_val, offset) = match (add_lhs, add_rhs) {
-        (Operand::Value(v), _) if is_invariant(add_rhs) => (*v, add_rhs.clone()),
-        (_, Operand::Value(v)) if is_invariant(add_lhs) => (*v, add_lhs.clone()),
-        _ => return None,
+    let scaled_load = |value: Value| -> Option<Operand> {
+        let Instruction::BinOp {
+            op: IrBinOp::Mul,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } = find_inst_by_dest(body, value)? else {
+            return None;
+        };
+        if *ty != elem_ty {
+            return None;
+        }
+        match (lhs, rhs) {
+            (Operand::Value(v), other) if *v == load_dest && is_invariant(other) => {
+                Some(other.clone())
+            }
+            (other, Operand::Value(v)) if *v == load_dest && is_invariant(other) => {
+                Some(other.clone())
+            }
+            _ => None,
+        }
     };
 
-    let mul_inst = find_inst_by_dest(body, mul_val)?;
-    let Instruction::BinOp { op: IrBinOp::Mul, lhs: mul_lhs, rhs: mul_rhs, ty: mul_ty, .. } = mul_inst else {
-        return None;
-    };
-    if !matches!(mul_ty, IrType::I32 | IrType::F32) || mul_ty != add_ty {
-        return None;
-    }
-    let scale = match (mul_lhs, mul_rhs) {
-        (Operand::Value(v), _) if *v == load_dest && is_invariant(mul_rhs) => mul_rhs.clone(),
-        (_, Operand::Value(v)) if *v == load_dest && is_invariant(mul_lhs) => mul_lhs.clone(),
-        _ => return None,
+    let (scale, offset) = if store_val == load_dest {
+        (None, None)
+    } else {
+        let expression = find_inst_by_dest(body, store_val)?;
+        match expression {
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                ty,
+                ..
+            } if *ty == elem_ty => (Some(scaled_load(store_val)?), None),
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if *ty == elem_ty => {
+                match (lhs, rhs) {
+                    (Operand::Value(v), other)
+                        if *v == load_dest && is_invariant(other) =>
+                    {
+                        (None, Some(other.clone()))
+                    }
+                    (other, Operand::Value(v))
+                        if *v == load_dest && is_invariant(other) =>
+                    {
+                        (None, Some(other.clone()))
+                    }
+                    (Operand::Value(v), other) if is_invariant(other) => {
+                        (Some(scaled_load(*v)?), Some(other.clone()))
+                    }
+                    (other, Operand::Value(v)) if is_invariant(other) => {
+                        (Some(scaled_load(*v)?), Some(other.clone()))
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
     };
 
     // Alias safety: identify the complete pointer roots. Different SSA value
@@ -1942,9 +2043,28 @@ fn analyze_map_pattern(
     // Distinct restrict parameters and distinct globals/allocas are legal.
     let dst_root = proven_object_root(func, dst_gep)?;
     let src_root = proven_object_root(func, src_gep)?;
-    if !roots_proven_distinct(&dst_root, &src_root) {
-        if debug { eprintln!("[VEC-MAP]   Bases not provably distinct: {:?} vs {:?}", dst_root, src_root); }
-        set_reject("map source/destination may alias (use restrict or runtime versioning)");
+    // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
+    // Otherwise require disjoint complete-object roots; merely seeing different
+    // SSA pointer values is not an alias proof.
+    if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
+        && !roots_proven_distinct(&dst_root, &src_root)
+    {
+        if debug {
+            eprintln!(
+                "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
+                dst_gep, src_gep, dst_root, src_root
+            );
+            for &block_idx in &loop_info.body {
+                for inst in &func.blocks[block_idx].instructions {
+                    if matches!(inst, Instruction::GetElementPtr { dest, .. }
+                        if *dest == dst_gep || *dest == src_gep)
+                    {
+                        eprintln!("[VEC-MAP]     {:?}", inst);
+                    }
+                }
+            }
+        }
+        set_reject("map source/destination may alias (use restrict or exact in-place access)");
         return None;
     }
 
@@ -1958,15 +2078,59 @@ fn analyze_map_pattern(
         latch_idx,
         exit_idx,
         iv,
+        iv_ty,
+        elem_ty,
         limit,
-        exit_cmp_inst_idx,
+        exit_cmp_op,
         dst_gep,
         src_gep,
         scale,
         offset,
-        store_idx,
         loop_blocks: loop_info.body.clone(),
     })
+}
+
+/// Prove two loop GEPs denote the same address in every iteration.  Frontend
+/// lowering commonly emits separate GEP SSA destinations for an exact in-place
+/// load/store while sharing the base and byte-offset operands.
+fn geps_proven_identical(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    a: Value,
+    b: Value,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    let find = |target: Value| {
+        for &block_idx in loop_blocks {
+            for inst in &func.blocks[block_idx].instructions {
+                if let Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset,
+                    ..
+                } = inst
+                {
+                    if *dest == target {
+                        return Some((*base, offset.clone()));
+                    }
+                }
+            }
+        }
+        None
+    };
+    match (find(a), find(b)) {
+        (Some((a_base, Operand::Value(a_offset))),
+         Some((b_base, Operand::Value(b_offset)))) => {
+            a_base == b_base && a_offset == b_offset
+        }
+        (Some((a_base, Operand::Const(a_offset))),
+         Some((b_base, Operand::Const(b_offset)))) => {
+            a_base == b_base && a_offset.to_i64() == b_offset.to_i64()
+        }
+        _ => false,
+    }
 }
 
 /// Check if a GEP uses the induction variable.
@@ -4146,7 +4310,11 @@ fn insert_reduction_remainder_loop(
 }
 
 /// Transform reduction loop to use AVX2 256-bit vectorization (4×F64, 8×I32, etc.).
-fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -> usize {
+fn transform_reduction_avx2(
+    func: &mut IrFunction,
+    pattern: &ReductionPattern,
+    fp_contract_fast: bool,
+) -> usize {
     // CONTIGUITY PRECONDITION -- checked BEFORE any IR is touched.
     //
     // The element-index scheme scales each GEP's byte offset by the vector
@@ -4623,18 +4791,20 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
 
             // Map to register-based intrinsics based on element type
             // Note: I32 dot products unsupported (no I32 multiply intrinsic yet)
-            let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op) = match pattern.element_type {
+            let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op) = match pattern.element_type {
                 IrType::F64 => (
                     IntrinsicOp::VecLoadF64x4,
                     IntrinsicOp::VecMulF64x4,
                     IntrinsicOp::VecAddF64x4,
                     IntrinsicOp::VecZeroF64x4,
+                    IntrinsicOp::VecFmaF64x4,
                 ),
                 IrType::F32 => (
                     IntrinsicOp::VecLoadF32x8,
                     IntrinsicOp::VecMulF32x8,
                     IntrinsicOp::VecAddF32x8,
                     IntrinsicOp::VecZeroF32x8,
+                    IntrinsicOp::VecFmaF32x8,
                 ),
                 _ => {
                     if debug {
@@ -4675,73 +4845,84 @@ fn transform_reduction_avx2(func: &mut IrFunction, pattern: &ReductionPattern) -
                 }
             }
 
+            let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
+                (true, Some((base, off))) => {
+                    (Operand::Value(*base), Operand::Value(*off))
+                }
+                _ => (
+                    Operand::Value(pattern.array_a_gep),
+                    Operand::Const(IrConst::I64(0)),
+                ),
+            };
+            let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
+                (true, Some((base, off))) => {
+                    (Operand::Value(*base), Operand::Value(*off))
+                }
+                _ => (
+                    Operand::Value(pattern.array_b_gep.unwrap()),
+                    Operand::Const(IrConst::I64(0)),
+                ),
+            };
             let body_block = &mut func.blocks[pattern.body_idx];
 
-            // Load vector from array A
-            let load_a_inst = Instruction::Intrinsic {
-                dest: Some(vec_load_a),
-                op: vec_load_op,
-                dest_ptr: None,
-                args: {
-                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
-                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
-                    };
-                    vec![base, off]
-                },
-            };
-
-            // Load vector from array B
-            let load_b_inst = Instruction::Intrinsic {
-                dest: Some(vec_load_b),
-                op: vec_load_op,
-                dest_ptr: None,
-                args: {
-                    let (base, off) = match (use_byte_iv, &byte_iv_b) {
-                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (Operand::Value(pattern.array_b_gep.unwrap()), Operand::Const(IrConst::I64(0))),
-                    };
-                    vec![base, off]
-                },
-            };
-
-            // Multiply vectors: A * B
-            let mul_inst = Instruction::Intrinsic {
-                dest: Some(vec_mul),
-                op: vec_mul_op,
-                dest_ptr: None,
-                args: vec![
-                    Operand::Value(vec_load_a),
-                    Operand::Value(vec_load_b),
-                ],
-            };
-
-            // Add to accumulator: sum += (A * B)
-            let add_inst = Instruction::Intrinsic {
-                dest: Some(vec_sum_value),
-                op: vec_add_op,
-                dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.accumulator_phi),
-                    Operand::Value(vec_mul),
-                ],
-            };
-
-            // Insert all instructions and remove old scalar operations
-            body_block.instructions.insert(pattern.accumulator_add_idx, load_a_inst);
-            body_block.instructions.insert(pattern.accumulator_add_idx + 1, load_b_inst);
-            body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
-            body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
-
-            // Remove the dead scalar add (now after the 4 inserted vector ops).
-            // The dead scalar multiply that fed it becomes unreachable and is
-            // cleaned up by DCE. The old code removed TWO instructions at
-            // accumulator_add_idx + 4, which accidentally deleted the latch's
-            // induction-variable increment once the byte-offset IV stopped
-            // inserting per-GEP multiplies (infinite loop / undefined IV on
-            // dot products).
-            body_block.instructions.remove(pattern.accumulator_add_idx + 4);
-            changes += 4;
+            if fp_contract_fast {
+                // One contraction-aware intrinsic lets x86 load A directly to
+                // YMM0 and fold B into vfmadd231p{s,d}. No transient vector
+                // needs a stack home, and the accumulator stays in its
+                // coalesced YMM register.
+                let fma_inst = Instruction::Intrinsic {
+                    dest: Some(vec_sum_value),
+                    op: vec_fma_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.accumulator_phi),
+                        a_base,
+                        a_off,
+                        b_base,
+                        b_off,
+                    ],
+                };
+                body_block.instructions.insert(pattern.accumulator_add_idx, fma_inst);
+                body_block.instructions.remove(pattern.accumulator_add_idx + 1);
+                changes += 1;
+            } else {
+                let load_a_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load_a),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: vec![a_base, a_off],
+                };
+                let load_b_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load_b),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: vec![b_base, b_off],
+                };
+                let mul_inst = Instruction::Intrinsic {
+                    dest: Some(vec_mul),
+                    op: vec_mul_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(vec_load_a),
+                        Operand::Value(vec_load_b),
+                    ],
+                };
+                let add_inst = Instruction::Intrinsic {
+                    dest: Some(vec_sum_value),
+                    op: vec_add_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.accumulator_phi),
+                        Operand::Value(vec_mul),
+                    ],
+                };
+                body_block.instructions.insert(pattern.accumulator_add_idx, load_a_inst);
+                body_block.instructions.insert(pattern.accumulator_add_idx + 1, load_b_inst);
+                body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
+                body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
+                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                changes += 4;
+            }
 
             // Get latch label before taking a mutable reference to header
             let latch_label = func.blocks[pattern.latch_idx].label;
@@ -5583,36 +5764,72 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
     changes
 }
 
-/// Transform a map loop `dst[i] = src[i] * scale + offset` to NEON 4-wide
-/// form: broadcast scale/offset once, then per 4 elements emit
-/// load → mul → add → store with 4×I32 vectors. A scalar remainder loop
-/// handles N % 4.
-fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool) -> usize {
+/// Transform a legal one-source store loop to packed 128/256-bit form.  The
+/// optional scale and offset operations stay optional: copies become exactly
+/// load/store, while scale/add/affine maps emit only their source operations.
+fn transform_map_vector(
+    func: &mut IrFunction,
+    pattern: &MapPattern,
+    avx2: bool,
+    fp_contract_fast: bool,
+) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
-    let vec_width: u64 = if avx2 { 8 } else { 4 };
-    // Detect element type from the body store (I32 or F32).
-    let mut elem_is_f32 = false;
-    for inst in &func.blocks[pattern.body_idx].instructions {
-        if let Instruction::Store { ty, .. } = inst {
-            elem_is_f32 = matches!(ty, IrType::F32);
-            break;
-        }
+    let vec_width: u64 = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => 4,
+        (IrType::F64, false) => 2,
+        (_, true) => 8,
+        (_, false) => 4,
+    };
+
+    // A zero-iteration vector loop plus scalar remainder only adds overhead.
+    if matches!(&pattern.limit, Operand::Const(c)
+        if c.to_i64().map_or(false, |n| n <= vec_width as i64))
+    {
+        return 0;
     }
 
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label.max(
-        func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0).saturating_add(1)
+        func.blocks
+            .iter()
+            .map(|b| b.label.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
     );
 
-    // Locate the preheader (unique block outside the loop branching to the
-    // header) BEFORE mutating anything — the broadcasts live there.
+    // Locate the unique preheader before mutating anything.  Broadcasts live
+    // there and are register-allocated across the packed loop.
     let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
-        if pattern.loop_blocks.contains(&idx) { return None; }
+        if pattern.loop_blocks.contains(&idx) {
+            return None;
+        }
         matches!(block.terminator, Terminator::Branch(label)
-            if label == func.blocks[pattern.header_idx].label).then_some(idx)
+            if label == func.blocks[pattern.header_idx].label)
+        .then_some(idx)
     }) else {
-        if debug { eprintln!("[VEC-MAP]   No preheader found; bailing"); }
+        if debug {
+            eprintln!("[VEC-MAP]   No preheader found; bailing");
+        }
+        return 0;
+    };
+
+    let elem_size = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    let Some((src_base, _)) = find_reduction_byte_iv(
+        func,
+        &pattern.loop_blocks,
+        pattern.src_gep,
+        elem_size,
+    ) else {
+        return 0;
+    };
+    let Some((dst_base, _)) = find_reduction_byte_iv(
+        func,
+        &pattern.loop_blocks,
+        pattern.dst_gep,
+        elem_size,
+    ) else {
         return 0;
     };
 
@@ -5624,7 +5841,9 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
         changed = false;
         for &block_idx in &pattern.loop_blocks {
             for inst in &func.blocks[block_idx].instructions {
-                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst {
+                if let Instruction::Cast { dest, src, .. }
+                | Instruction::Copy { dest, src } = inst
+                {
                     if let Operand::Value(src_val) = src {
                         if iv_derived.contains(src_val) && iv_derived.insert(*dest) {
                             changed = true;
@@ -5635,40 +5854,99 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
         }
     }
 
-    // Step 1: Divide the loop bound by 4 (constant folded, or UDiv for dynamic).
+    // Divide the loop bound by the packed width (constant folded or dynamic).
     let divided_limit = match &pattern.limit {
-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
+        Operand::Const(IrConst::I32(n)) => {
+            Operand::Const(IrConst::I32(*n / vec_width as i32))
+        }
+        Operand::Const(IrConst::I64(n)) => {
+            Operand::Const(IrConst::I64(*n / vec_width as i64))
+        }
         Operand::Value(limit_val) => {
-            let div_dest = Value(next_val_id);
-            next_val_id += 1;
-            let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
-                Instruction::Cmp { ty, .. } => *ty,
-                _ => IrType::I64,
+            let shift = vec_width.trailing_zeros() as i64;
+            let int_const = |n: i64| match pattern.iv_ty {
+                IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
+                _ => IrConst::I64(n),
             };
-            let div_inst = Instruction::BinOp {
-                dest: div_dest,
-                op: IrBinOp::UDiv,
-                lhs: Operand::Value(*limit_val),
-                rhs: Operand::Const(match limit_ty {
-                    IrType::I32 => IrConst::I32(vec_width as i32),
-                    _ => IrConst::I64(vec_width as i64),
-                }),
-                ty: limit_ty,
+            let mut quotient_insts = Vec::new();
+            let div_dest = if pattern.exit_cmp_op == IrCmpOp::Slt {
+                // Signed division by 2^k, rounded toward zero:
+                //   (n + ((n >> (bits-1)) & (2^k-1))) >> k
+                // This preserves negative/zero-trip semantics without putting
+                // a costly `idiv` in the vector loop or its preheader.
+                let sign = Value(next_val_id);
+                next_val_id += 1;
+                let bias = Value(next_val_id);
+                next_val_id += 1;
+                let adjusted = Value(next_val_id);
+                next_val_id += 1;
+                let quotient = Value(next_val_id);
+                next_val_id += 1;
+                quotient_insts.push(Instruction::BinOp {
+                    dest: sign,
+                    op: IrBinOp::AShr,
+                    lhs: Operand::Value(*limit_val),
+                    rhs: Operand::Const(int_const(if matches!(
+                        pattern.iv_ty,
+                        IrType::I32 | IrType::U32
+                    ) {
+                        31
+                    } else {
+                        63
+                    })),
+                    ty: pattern.iv_ty,
+                });
+                quotient_insts.push(Instruction::BinOp {
+                    dest: bias,
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(sign),
+                    rhs: Operand::Const(int_const(vec_width as i64 - 1)),
+                    ty: pattern.iv_ty,
+                });
+                quotient_insts.push(Instruction::BinOp {
+                    dest: adjusted,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(*limit_val),
+                    rhs: Operand::Value(bias),
+                    ty: pattern.iv_ty,
+                });
+                quotient_insts.push(Instruction::BinOp {
+                    dest: quotient,
+                    op: IrBinOp::AShr,
+                    lhs: Operand::Value(adjusted),
+                    rhs: Operand::Const(int_const(shift)),
+                    ty: pattern.iv_ty,
+                });
+                quotient
+            } else {
+                let quotient = Value(next_val_id);
+                next_val_id += 1;
+                quotient_insts.push(Instruction::BinOp {
+                    dest: quotient,
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(*limit_val),
+                    rhs: Operand::Const(int_const(shift)),
+                    ty: pattern.iv_ty,
+                });
+                quotient
             };
-            func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
-            changes += 1;
+            changes += quotient_insts.len();
+            func.blocks[preheader_idx]
+                .instructions
+                .extend(quotient_insts);
             Operand::Value(div_dest)
         }
         _ => return 0,
     };
 
-    // Rewrite all IV-derived comparisons to the divided limit.
+    // Rewrite the canonical IV < limit test to IV < floor(limit / width).
     for &block_idx in &pattern.loop_blocks {
         for inst in &mut func.blocks[block_idx].instructions {
             if let Instruction::Cmp { lhs, rhs, .. } = inst {
-                let modifies_lhs = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
-                let modifies_rhs = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+                let modifies_lhs =
+                    matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
+                let modifies_rhs =
+                    matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
                 if modifies_lhs {
                     *rhs = divided_limit.clone();
                     changes += 1;
@@ -5680,136 +5958,216 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
         }
     }
 
-    // Step 2: Scale both GEP offsets by 4 (insert offset*4 before each GEP).
-    for &block_idx in &pattern.loop_blocks {
-        let mut matches: Vec<usize> = Vec::new();
-        for (inst_idx, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
-            if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                if (*dest == pattern.src_gep || *dest == pattern.dst_gep)
-                    && matches!(offset, Operand::Value(_))
-                {
-                    matches.push(inst_idx);
-                }
-            }
-        }
-        for &inst_idx in matches.iter().rev() {
-            let offset_val = match &func.blocks[block_idx].instructions[inst_idx] {
-                Instruction::GetElementPtr { offset: Operand::Value(v), .. } => *v,
-                _ => unreachable!(),
-            };
-            let mul_dest = Value(next_val_id);
-            next_val_id += 1;
-            let mul_inst = Instruction::BinOp {
-                dest: mul_dest,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(offset_val),
-                rhs: Operand::Const(IrConst::I64(vec_width as i64)),
-                ty: IrType::I64,
-            };
-            let block = &mut func.blocks[block_idx];
-            block.instructions.insert(inst_idx, mul_inst);
-            changes += 1;
-            if let Instruction::GetElementPtr { offset, .. } = &mut block.instructions[inst_idx + 1] {
-                *offset = Operand::Value(mul_dest);
-            }
-        }
-    }
-
-    // Step 3: Broadcast scale and offset into vector registers in the preheader.
-    let scale_vec = Value(next_val_id);
+    // Carry an independent I64 byte offset through the packed loop.  The
+    // source-language IV remains an element counter for its exact signed or
+    // unsigned exit semantics and for scalar-remainder recovery; the byte IV
+    // gives both memory streams one SIB/NEON indexed address with no per-
+    // iteration cast, multiply, or GEP materialization.
+    let byte_iv = Value(next_val_id);
     next_val_id += 1;
-    let offset_vec = Value(next_val_id);
+    let byte_iv_next = Value(next_val_id);
     next_val_id += 1;
-    {
-        let preheader = &mut func.blocks[preheader_idx];
-        let bcast = match (elem_is_f32, avx2) {
-            (true, true) => IntrinsicOp::VecBroadcastF32x8,
-            (true, false) => IntrinsicOp::VecBroadcastF32x4,
-            (false, true) => IntrinsicOp::VecBroadcastI32x8,
-            (false, false) => IntrinsicOp::VecBroadcastI32x4,
-        };
-        preheader.instructions.push(Instruction::Intrinsic {
-            dest: Some(scale_vec),
-            op: bcast,
-            dest_ptr: None,
-            args: vec![pattern.scale.clone()],
+    let preheader_label = func.blocks[preheader_idx].label;
+    let latch_label = func.blocks[pattern.latch_idx].label;
+    let phi_pos = func.blocks[pattern.header_idx]
+        .instructions
+        .iter()
+        .position(|inst| !matches!(inst, Instruction::Phi { .. }))
+        .unwrap_or(func.blocks[pattern.header_idx].instructions.len());
+    func.blocks[pattern.header_idx].instructions.insert(
+        phi_pos,
+        Instruction::Phi {
+            dest: byte_iv,
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Const(IrConst::I64(0)), preheader_label),
+                (Operand::Value(byte_iv_next), latch_label),
+            ],
+        },
+    );
+    func.blocks[pattern.latch_idx]
+        .instructions
+        .push(Instruction::BinOp {
+            dest: byte_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(byte_iv),
+            rhs: Operand::Const(IrConst::I64((elem_size as u64 * vec_width) as i64)),
+            ty: IrType::I64,
         });
-        preheader.instructions.push(Instruction::Intrinsic {
-            dest: Some(offset_vec),
-            op: bcast,
-            dest_ptr: None,
-            args: vec![pattern.offset.clone()],
-        });
-        changes += 2;
-    }
+    changes += 2;
 
-    // Step 4: Replace the scalar store with load → mul → add → store vectors.
-    // The scalar load/mul/add become dead and are cleaned up by DCE.
+    let src_address = (src_base, Operand::Value(byte_iv));
+    let dst_address = (dst_base, Operand::Value(byte_iv));
+
+    let broadcast_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => IntrinsicOp::VecBroadcastF64x4,
+        (IrType::F64, false) => IntrinsicOp::VecBroadcastF64x2,
+        (IrType::F32, true) => IntrinsicOp::VecBroadcastF32x8,
+        (IrType::F32, false) => IntrinsicOp::VecBroadcastF32x4,
+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
+        _ => return 0,
+    };
+
+    let mut emit_broadcast = |operand: &Option<Operand>| -> Option<Value> {
+        let scalar = operand.as_ref()?;
+        let value = Value(next_val_id);
+        next_val_id += 1;
+        func.blocks[preheader_idx]
+            .instructions
+            .push(Instruction::Intrinsic {
+                dest: Some(value),
+                op: broadcast_op,
+                dest_ptr: None,
+                args: vec![scalar.clone()],
+            });
+        changes += 1;
+        Some(value)
+    };
+    let scale_vec = emit_broadcast(&pattern.scale);
+    let offset_vec = emit_broadcast(&pattern.offset);
+
+    let (load_op, mul_op, add_op, store_op) = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => (
+            IntrinsicOp::VecLoadF64x4,
+            IntrinsicOp::VecMulF64x4,
+            IntrinsicOp::VecAddF64x4,
+            IntrinsicOp::VecStoreF64x4,
+        ),
+        (IrType::F64, false) => (
+            IntrinsicOp::VecLoadF64x2,
+            IntrinsicOp::VecMulF64x2,
+            IntrinsicOp::VecAddF64x2,
+            IntrinsicOp::VecStoreF64x2,
+        ),
+        (IrType::F32, true) => (
+            IntrinsicOp::VecLoadF32x8,
+            IntrinsicOp::VecMulF32x8,
+            IntrinsicOp::VecAddF32x8,
+            IntrinsicOp::VecStoreF32x8,
+        ),
+        (IrType::F32, false) => (
+            IntrinsicOp::VecLoadF32x4,
+            IntrinsicOp::VecMulF32x4,
+            IntrinsicOp::VecAddF32x4,
+            IntrinsicOp::VecStoreF32x4,
+        ),
+        (IrType::I32 | IrType::U32, true) => (
+            IntrinsicOp::VecLoadI32x8,
+            IntrinsicOp::VecMulI32x8,
+            IntrinsicOp::VecAddI32x8,
+            IntrinsicOp::VecStoreI32x8,
+        ),
+        (IrType::I32 | IrType::U32, false) => (
+            IntrinsicOp::VecLoadI32x4,
+            IntrinsicOp::VecMulI32x4,
+            IntrinsicOp::VecAddI32x4,
+            IntrinsicOp::VecStoreI32x4,
+        ),
+        _ => return 0,
+    };
+    let madd_op = if fp_contract_fast && avx2 {
+        match pattern.elem_ty {
+            IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
+            IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Replace the scalar store with only the packed operations present in the
+    // source expression.  DCE removes the now-unreachable scalar dataflow.
     {
         let vec_load = Value(next_val_id);
         next_val_id += 1;
-        let vec_mul = Value(next_val_id);
-        next_val_id += 1;
-        let vec_add = Value(next_val_id);
-        next_val_id += 1;
+        let load_args = vec![
+            Operand::Value(src_address.0),
+            src_address.1.clone(),
+        ];
+        let mut vec_insts = vec![Instruction::Intrinsic {
+            dest: Some(vec_load),
+            op: load_op,
+            dest_ptr: None,
+            args: load_args,
+        }];
+        let mut current = vec_load;
+        if let (Some(madd), Some(scale), Some(offset)) =
+            (madd_op, scale_vec, offset_vec)
+        {
+            let result = Value(next_val_id);
+            next_val_id += 1;
+            vec_insts.push(Instruction::Intrinsic {
+                dest: Some(result),
+                op: madd,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(current),
+                    Operand::Value(scale),
+                    Operand::Value(offset),
+                ],
+            });
+            current = result;
+        } else {
+            if let Some(scale) = scale_vec {
+                let result = Value(next_val_id);
+                next_val_id += 1;
+                vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(result),
+                    op: mul_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(current), Operand::Value(scale)],
+                });
+                current = result;
+            }
+            if let Some(offset) = offset_vec {
+                let result = Value(next_val_id);
+                next_val_id += 1;
+                vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(result),
+                    op: add_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(current), Operand::Value(offset)],
+                });
+                current = result;
+            }
+        }
+        let store_args = vec![
+            Operand::Value(current),
+            Operand::Value(dst_address.0),
+            dst_address.1.clone(),
+        ];
+        vec_insts.push(Instruction::Intrinsic {
+            dest: None,
+            op: store_op,
+            dest_ptr: Some(dst_address.0),
+            args: store_args,
+        });
 
-        // Re-locate the store (indices may have shifted with GEP insertions).
         let body = &mut func.blocks[pattern.body_idx];
         let Some(store_pos) = body.instructions.iter().position(|inst| {
             matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.dst_gep)
         }) else {
-            if debug { eprintln!("[VEC-MAP]   Store not found at transform time"); }
+            if debug {
+                eprintln!("[VEC-MAP]   Store not found at transform time");
+            }
             return changes;
         };
-        let (load_op, mul_op, add_op, store_op) = match (elem_is_f32, avx2) {
-            (true, true) => (
-                IntrinsicOp::VecLoadF32x8, IntrinsicOp::VecMulF32x8,
-                IntrinsicOp::VecAddF32x8, IntrinsicOp::VecStoreF32x8),
-            (true, false) => (
-                IntrinsicOp::VecLoadF32x4, IntrinsicOp::VecMulF32x4,
-                IntrinsicOp::VecAddF32x4, IntrinsicOp::VecStoreF32x4),
-            (false, true) => (
-                IntrinsicOp::VecLoadI32x8, IntrinsicOp::VecMulI32x8,
-                IntrinsicOp::VecAddI32x8, IntrinsicOp::VecStoreI32x8),
-            (false, false) => (
-                IntrinsicOp::VecLoadI32x4, IntrinsicOp::VecMulI32x4,
-                IntrinsicOp::VecAddI32x4, IntrinsicOp::VecStoreI32x4),
-        };
-        let vec_insts = [
-            Instruction::Intrinsic {
-                dest: Some(vec_load),
-                op: load_op,
-                dest_ptr: None,
-                args: vec![Operand::Value(pattern.src_gep), Operand::Const(IrConst::I64(0))],
-            },
-            Instruction::Intrinsic {
-                dest: Some(vec_mul),
-                op: mul_op,
-                dest_ptr: None,
-                args: vec![Operand::Value(vec_load), Operand::Value(scale_vec)],
-            },
-            Instruction::Intrinsic {
-                dest: Some(vec_add),
-                op: add_op,
-                dest_ptr: None,
-                args: vec![Operand::Value(vec_mul), Operand::Value(offset_vec)],
-            },
-            Instruction::Intrinsic {
-                dest: None,
-                op: store_op,
-                dest_ptr: Some(pattern.dst_gep),
-                args: vec![Operand::Value(vec_add)],
-            },
-        ];
+        let inserted = vec_insts.len();
         for (i, inst) in vec_insts.into_iter().enumerate() {
             body.instructions.insert(store_pos + i, inst);
         }
-        body.instructions.remove(store_pos + 4);
-        changes += 4;
+        body.instructions.remove(store_pos + inserted);
+        changes += inserted;
     }
 
-    // Step 5: Remainder loop for N % 4.
-    changes += insert_map_remainder_loop(func, pattern, vec_width, elem_is_f32, &mut next_val_id, &mut next_label);
+    changes += insert_map_remainder_loop(
+        func,
+        pattern,
+        vec_width,
+        &mut next_val_id,
+        &mut next_label,
+    );
 
     func.next_value_id = next_val_id;
     func.next_label = next_label;
@@ -5820,26 +6178,27 @@ fn transform_map_vector(func: &mut IrFunction, pattern: &MapPattern, avx2: bool)
     changes
 }
 
-/// Insert the scalar remainder loop for a vectorized map loop.
-/// Mirrors insert_remainder_loop's CFG shape:
-/// [vec_exit] → [remainder_header] ⇄ [remainder_body] → [remainder_latch] → [exit]
+/// Insert an exact scalar remainder for a vectorized map.  It mirrors the
+/// source element/IV widths and optional operations rather than assuming the
+/// old fixed I32/F32 `mul + add` shape.
 fn insert_map_remainder_loop(
     func: &mut IrFunction,
     pattern: &MapPattern,
     vec_width: u64,
-    elem_is_f32: bool,
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
-    let elem_ty = if elem_is_f32 { IrType::F32 } else { IrType::I32 };
-    // Extract GEP base pointers for the scalar body.
     let mut src_base = None;
     let mut dst_base = None;
     for &block_idx in &pattern.loop_blocks {
         for inst in &func.blocks[block_idx].instructions {
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
-                if *dest == pattern.src_gep { src_base = Some(*base); }
-                if *dest == pattern.dst_gep { dst_base = Some(*base); }
+                if *dest == pattern.src_gep {
+                    src_base = Some(*base);
+                }
+                if *dest == pattern.dst_gep {
+                    dst_base = Some(*base);
+                }
             }
         }
     }
@@ -5847,7 +6206,6 @@ fn insert_map_remainder_loop(
         return 0;
     };
 
-    // New block labels.
     let vec_exit_label = BlockId(*next_label);
     *next_label += 1;
     let remainder_header_label = BlockId(*next_label);
@@ -5857,34 +6215,36 @@ fn insert_map_remainder_loop(
     let remainder_latch_label = BlockId(*next_label);
     *next_label += 1;
 
-    // New values.
-    let i_rem_start = Value(*next_val_id);
-    *next_val_id += 1;
-    let i_rem_iv = Value(*next_val_id);
-    *next_val_id += 1;
-    let i_rem_iv_next = Value(*next_val_id);
-    *next_val_id += 1;
-    let i_rem_cmp = Value(*next_val_id);
-    *next_val_id += 1;
-    let i_rem_cast = Value(*next_val_id);
-    *next_val_id += 1;
-    let offset_v = Value(*next_val_id);
-    *next_val_id += 1;
-    let gep_src = Value(*next_val_id);
-    *next_val_id += 1;
-    let gep_dst = Value(*next_val_id);
-    *next_val_id += 1;
-    let load_v = Value(*next_val_id);
-    *next_val_id += 1;
-    let mul_v = Value(*next_val_id);
-    *next_val_id += 1;
-    let add_v = Value(*next_val_id);
-    *next_val_id += 1;
+    let mut fresh = || {
+        let value = Value(*next_val_id);
+        *next_val_id += 1;
+        value
+    };
+    let i_rem_start = fresh();
+    let i_rem_iv = fresh();
+    let i_rem_iv_next = fresh();
+    let i_rem_cmp = fresh();
+    let i_rem_cast = matches!(pattern.iv_ty, IrType::I32 | IrType::U32).then(|| fresh());
+    let offset_v = fresh();
+    let gep_src = fresh();
+    let gep_dst = fresh();
+    let load_v = fresh();
 
-    // Redirect the vectorized header's exit edge to vec_exit.
-    if let Terminator::CondBranch { false_label, .. } = &mut func.blocks[pattern.header_idx].terminator {
+    // Redirect the vectorized header's known false/exit edge.
+    if let Terminator::CondBranch { false_label, .. } =
+        &mut func.blocks[pattern.header_idx].terminator
+    {
         *false_label = vec_exit_label;
     }
+
+    let iv_width_const = match pattern.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(vec_width as i32),
+        _ => IrConst::I64(vec_width as i64),
+    };
+    let one = match pattern.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(1),
+        _ => IrConst::I64(1),
+    };
 
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
@@ -5892,8 +6252,8 @@ fn insert_map_remainder_loop(
             dest: i_rem_start,
             op: IrBinOp::Mul,
             lhs: Operand::Value(pattern.iv),
-            rhs: Operand::Const(IrConst::I32(vec_width as i32)),
-            ty: IrType::I32,
+            rhs: Operand::Const(iv_width_const),
+            ty: pattern.iv_ty,
         }],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
@@ -5904,7 +6264,7 @@ fn insert_map_remainder_loop(
         instructions: vec![
             Instruction::Phi {
                 dest: i_rem_iv,
-                ty: IrType::I32,
+                ty: pattern.iv_ty,
                 incoming: vec![
                     (Operand::Value(i_rem_start), vec_exit_label),
                     (Operand::Value(i_rem_iv_next), remainder_latch_label),
@@ -5912,10 +6272,10 @@ fn insert_map_remainder_loop(
             },
             Instruction::Cmp {
                 dest: i_rem_cmp,
-                op: IrCmpOp::Slt,
+                op: pattern.exit_cmp_op,
                 lhs: Operand::Value(i_rem_iv),
                 rhs: pattern.limit.clone(),
-                ty: IrType::I32,
+                ty: pattern.iv_ty,
             },
         ],
         terminator: Terminator::CondBranch {
@@ -5926,61 +6286,77 @@ fn insert_map_remainder_loop(
         source_spans: vec![],
     };
 
+    let mut remainder_insts = Vec::new();
+    let byte_index = if let Some(cast) = i_rem_cast {
+        remainder_insts.push(Instruction::Cast {
+            dest: cast,
+            src: Operand::Value(i_rem_iv),
+            from_ty: pattern.iv_ty,
+            to_ty: IrType::I64,
+        });
+        cast
+    } else {
+        i_rem_iv
+    };
+    let elem_bytes = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    remainder_insts.push(Instruction::BinOp {
+        dest: offset_v,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(byte_index),
+        rhs: Operand::Const(IrConst::I64(elem_bytes)),
+        ty: IrType::I64,
+    });
+    remainder_insts.push(Instruction::GetElementPtr {
+        dest: gep_src,
+        base: src_base,
+        offset: Operand::Value(offset_v),
+        ty: pattern.elem_ty,
+    });
+    remainder_insts.push(Instruction::GetElementPtr {
+        dest: gep_dst,
+        base: dst_base,
+        offset: Operand::Value(offset_v),
+        ty: pattern.elem_ty,
+    });
+    remainder_insts.push(Instruction::Load {
+        dest: load_v,
+        ptr: gep_src,
+        ty: pattern.elem_ty,
+        seg_override: AddressSpace::Default,
+    });
+    let mut scalar_result = load_v;
+    if let Some(scale) = &pattern.scale {
+        let value = fresh();
+        remainder_insts.push(Instruction::BinOp {
+            dest: value,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(scalar_result),
+            rhs: scale.clone(),
+            ty: pattern.elem_ty,
+        });
+        scalar_result = value;
+    }
+    if let Some(offset) = &pattern.offset {
+        let value = fresh();
+        remainder_insts.push(Instruction::BinOp {
+            dest: value,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(scalar_result),
+            rhs: offset.clone(),
+            ty: pattern.elem_ty,
+        });
+        scalar_result = value;
+    }
+    remainder_insts.push(Instruction::Store {
+        val: Operand::Value(scalar_result),
+        ptr: gep_dst,
+        ty: pattern.elem_ty,
+        seg_override: AddressSpace::Default,
+    });
+
     let remainder_body_block = BasicBlock {
         label: remainder_body_label,
-        instructions: vec![
-            Instruction::Cast {
-                dest: i_rem_cast,
-                src: Operand::Value(i_rem_iv),
-                from_ty: IrType::I32,
-                to_ty: IrType::I64,
-            },
-            Instruction::BinOp {
-                dest: offset_v,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(i_rem_cast),
-                rhs: Operand::Const(IrConst::I64(4)),
-                ty: IrType::I64,
-            },
-            Instruction::GetElementPtr {
-                dest: gep_src,
-                base: src_base,
-                offset: Operand::Value(offset_v),
-                ty: IrType::I32,
-            },
-            Instruction::GetElementPtr {
-                dest: gep_dst,
-                base: dst_base,
-                offset: Operand::Value(offset_v),
-                ty: IrType::I32,
-            },
-            Instruction::Load {
-                dest: load_v,
-                ptr: gep_src,
-                ty: elem_ty,
-                seg_override: AddressSpace::Default,
-            },
-            Instruction::BinOp {
-                dest: mul_v,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(load_v),
-                rhs: pattern.scale.clone(),
-                ty: elem_ty,
-            },
-            Instruction::BinOp {
-                dest: add_v,
-                op: IrBinOp::Add,
-                lhs: Operand::Value(mul_v),
-                rhs: pattern.offset.clone(),
-                ty: elem_ty,
-            },
-            Instruction::Store {
-                val: Operand::Value(add_v),
-                ptr: gep_dst,
-                ty: elem_ty,
-                seg_override: AddressSpace::Default,
-            },
-        ],
+        instructions: remainder_insts,
         terminator: Terminator::Branch(remainder_latch_label),
         source_spans: vec![],
     };
@@ -5991,8 +6367,8 @@ fn insert_map_remainder_loop(
             dest: i_rem_iv_next,
             op: IrBinOp::Add,
             lhs: Operand::Value(i_rem_iv),
-            rhs: Operand::Const(IrConst::I32(1)),
-            ty: IrType::I32,
+            rhs: Operand::Const(one),
+            ty: pattern.iv_ty,
         }],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
@@ -6008,15 +6384,24 @@ fn insert_map_remainder_loop(
 
 /// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, false)
+    vectorize_function_mode(func, false, false)
 }
 
-/// Run x86 vectorization with an explicit FP-reassociation contract.
+/// Run x86 vectorization with reassociation but without FMA contraction.
+pub(crate) fn vectorize_function_reassoc(func: &mut IrFunction) -> usize {
+    vectorize_function_mode(func, true, false)
+}
+
+/// Run x86 vectorization with explicit reassociation and fast contraction.
 pub(crate) fn vectorize_function_fast_math(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true)
+    vectorize_function_mode(func, true, true)
 }
 
-fn vectorize_function_mode(func: &mut IrFunction, fp_reassoc: bool) -> usize {
+fn vectorize_function_mode(
+    func: &mut IrFunction,
+    fp_reassoc: bool,
+    fp_contract_fast: bool,
+) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
@@ -6046,7 +6431,14 @@ fn vectorize_function_mode(func: &mut IrFunction, fp_reassoc: bool) -> usize {
     }
 
     let cfg = CfgAnalysis::build(func);
-    let changes = vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc);
+    let changes = vectorize_with_analysis_mode(
+        func,
+        &cfg,
+        false,
+        false,
+        fp_reassoc,
+        fp_contract_fast,
+    );
 
     // The transforms replace the scalar accumulation with vector intrinsics but
     // leave the orphaned scalar load/mul/GEP/offset chain behind for the global
@@ -6163,10 +6555,10 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
 /// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, false)
+    vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
 }
 
 pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, true)
+    vectorize_with_analysis_mode(func, &cfg, true, true, true, false)
 }
