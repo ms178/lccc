@@ -1556,7 +1556,7 @@ fn push_helper_fn(
         .iter()
         .map(|&ty| crate::ir::reexports::IrParam {
             ty,
-            struct_size: None,
+            noalias: false, struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,

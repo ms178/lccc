@@ -124,6 +124,19 @@ impl X86Codegen {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
 
+        // For a one-block leaf, ParamRefs are eligible for caller-saved homes.
+        // Prefer their incoming ABI registers in argument order so the common
+        // case needs no entry copy at all (rdi->rdi, rsi->rsi, rdx->rdx).
+        // RCX remains reserved scratch; remaining homes follow ABI order and
+        // the ordered parallel-copy emitter handles overlaps such as rcx->r8
+        // while a later argument still arrives in r8.
+        if func.blocks.len() == 1 && std::env::var("CCC_NO_LEAF_PARAM_GPR").is_err() {
+            let preferred = [14u8, 15, 16, 12, 13, 10, 11];
+            caller_saved_regs.sort_by_key(|reg| {
+                preferred.iter().position(|&id| id == reg.0).unwrap_or(preferred.len())
+            });
+        }
+
         // Note: promoting caller-saved registers to callee-saved does NOT work
         // because the x86-64 SysV ABI defines the callee-saved set. When we
         // promote r11 to callee-saved in function A and A calls function B,
@@ -1003,6 +1016,14 @@ impl X86Codegen {
         // value (observed miscompile: constp(a, b, scale) computed (a+b)*a
         // because a's home xmm2 clobbered scale's ABI xmm2).
         let mut fp_prestores: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
+        // Deferred integer/pointer pre-stores form a parallel-copy problem:
+        // caller-saved homes such as r8/r9/rdi/rsi can still contain a later
+        // incoming argument.  Emit them after collection in a dependency-safe
+        // order and break cycles through reserved scratch %rax.
+        // (param_idx, current source, original ABI source, destination, home)
+        let mut gpr_prestores: Vec<(
+            usize, &'static str, &'static str, &'static str, PhysReg
+        )> = Vec::new();
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
@@ -1025,28 +1046,35 @@ impl X86Codegen {
                 }
                 if !has_slot {
                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
-                        // Pre-store to a callee-saved GPR (PhysReg 1-5) or an
-                        // allocated XMM register (PhysReg 20+). Caller-saved
-                        // GPRs (rdi, rsi, r8-r11) cannot be used because they
-                        // overlap ABI argument registers that haven't been
-                        // saved yet; XMM homes are fine because the allocator
-                        // only assigns them to values that do not span calls.
+                        // Callee-saved GPRs can be copied immediately.  x86-64
+                        // caller-saved GPR homes (PhysReg 10..16) are legal for
+                        // values proven not to span a call, but their moves are
+                        // deferred below because a destination may still hold a
+                        // different incoming ABI argument. XMM homes use their
+                        // own ordered parallel-copy set for the same reason.
                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                        let is_caller_saved_gpr = (10..=16).contains(&phys_reg.0);
                         let is_xmm = super::emit::is_xmm_reg(phys_reg);
                         if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
                             let shared = reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
-                            eprintln!("[PRE-STORE]   callee={} shared={} class={:?}", is_callee_saved, shared, class);
+                            eprintln!("[PRE-STORE]   callee={} caller={} shared={} class={:?}",
+                                is_callee_saved, is_caller_saved_gpr, shared, class);
                         }
-                        if is_callee_saved || is_xmm {
+                        if is_callee_saved || is_caller_saved_gpr || is_xmm {
                             let shared = reg_to_params.get(&phys_reg.0)
                                 .is_some_and(|users| users.len() > 1);
                             if !shared {
                                 let dest_reg = phys_reg_name(phys_reg);
                                 if let ParamClass::IntReg { reg_idx } = class {
-                                    self.state.out.emit_instr_reg_reg(
-                                        "    movq", X86_ARG_REGS[reg_idx], dest_reg);
-                                    self.state.param_pre_stored.insert(i);
-                                    self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
+                                    let source = X86_ARG_REGS[reg_idx];
+                                    if is_caller_saved_gpr {
+                                        gpr_prestores.push((i, source, source, dest_reg, phys_reg));
+                                    } else {
+                                        self.state.out.emit_instr_reg_reg(
+                                            "    movq", source, dest_reg);
+                                        self.state.param_pre_stored.insert(i);
+                                        self.param_source_regs.insert(phys_reg.0, source);
+                                    }
                                 } else if let ParamClass::FloatReg { reg_idx } = class {
                                     // FP pre-store: DEFERRED (see above).
                                     // Record the ABI register and home so the
@@ -1250,6 +1278,38 @@ impl X86Codegen {
                 ParamClass::LargeStructByRefReg { .. } | ParamClass::LargeStructByRefStack { .. } |
                 ParamClass::StructSplitRegStack { .. } |
                 ParamClass::ZeroSizeSkip => {}
+            }
+        }
+
+        // Emit integer/pointer parameter moves as a parallel copy.  A move is
+        // safe when its destination is not the current source of another
+        // pending move.  If all remaining moves form a cycle, preserve one
+        // source in reserved scratch %rax and continue.  This is what makes it
+        // sound for register allocation to use r8/r9/rdi/rsi as parameter homes.
+        if !gpr_prestores.is_empty() {
+            let mut pending = gpr_prestores;
+            while !pending.is_empty() {
+                let ready = pending.iter().enumerate().find_map(|(idx, cand)| {
+                    let dest = cand.3;
+                    let clobbers_other_source = pending.iter().enumerate().any(
+                        |(j, other)| j != idx && other.1 == dest
+                    );
+                    (!clobbers_other_source).then_some(idx)
+                });
+                if let Some(idx) = ready {
+                    let (param_idx, source, original_source, dest, home) = pending.remove(idx);
+                    if source != dest {
+                        self.state.out.emit_instr_reg_reg("    movq", source, dest);
+                    }
+                    self.state.param_pre_stored.insert(param_idx);
+                    self.param_source_regs.insert(home.0, original_source);
+                } else {
+                    // Parallel-copy cycle. RAX is excluded from allocation and
+                    // is not an incoming integer argument register.
+                    let source = pending[0].1;
+                    self.state.out.emit_instr_reg_reg("    movq", source, "rax");
+                    pending[0].1 = "rax";
+                }
             }
         }
 

@@ -17,6 +17,8 @@ set -euo pipefail
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
+"$repo_root/scripts/ensure_swap.sh"
+
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"

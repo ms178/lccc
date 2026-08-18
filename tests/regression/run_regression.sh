@@ -67,5 +67,19 @@ for src in "$dir"/*.c; do
   # Undo this test's env file so it cannot affect subsequent tests.
   for _v in $_envfile_vars; do unset "$_v"; done
 done
+
+# Optional structural code-generation regressions.  C tests prove semantics;
+# these checks also lock in assembly properties whose loss would be a silent
+# performance regression.  Each script receives the same compiler via CCC.
+for check in "$dir"/check_*.sh; do
+  [ -e "$check" ] || continue
+  name=$(basename "$check" .sh)
+  if CCC="$CCC" bash "$check" >/tmp/ccc_out.txt 2>&1; then
+    echo "PASS  $name"; pass=$((pass+1))
+  else
+    echo "FAIL  $name: $(tail -1 /tmp/ccc_out.txt)"; fail=$((fail+1))
+  fi
+done
+
 echo "=== Regression: $pass passed, $fail failed ==="
 [ $fail -eq 0 ]

@@ -459,7 +459,12 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
 /// Run optimization passes for the requested optimization level.
 ///
 /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
-pub(crate) fn run_passes(module: &mut IrModule, opt_level: u32, target: crate::backend::Target) {
+pub(crate) fn run_passes(
+    module: &mut IrModule,
+    opt_level: u32,
+    target: crate::backend::Target,
+    fp_reassoc: bool,
+) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     // Debug hook: dump the module IR to stderr before optimization.
     if std::env::var("CCC_DUMP_IR").is_ok() {
@@ -769,10 +774,15 @@ macro_rules! preloop_dump {
             && matches!(target, crate::backend::Target::X86_64 | crate::backend::Target::Aarch64)
             && !disabled.contains("vectorize")
         {
-            let vectorize_fn = if target == crate::backend::Target::Aarch64 {
-                vectorize::vectorize_function_two_wide
-            } else {
-                vectorize::vectorize_function
+            let vectorize_fn = match (target, fp_reassoc) {
+                (crate::backend::Target::Aarch64, true) => {
+                    vectorize::vectorize_function_two_wide_fast_math
+                }
+                (crate::backend::Target::Aarch64, false) => {
+                    vectorize::vectorize_function_two_wide
+                }
+                (_, true) => vectorize::vectorize_function_fast_math,
+                (_, false) => vectorize::vectorize_function,
             };
             let n = timed_pass!(
                 "vectorize",

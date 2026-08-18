@@ -398,6 +398,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
         if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
         if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
+        if !sk("fp_reg_mem_fold") { changed |= memory_fold::fold_fp_register_loads(&mut store, &mut infos); }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
         // masked interaction with expat test_multichar_cdata_utf16 under the
         // full pass mix — root cause still open, so keep it off by default.
@@ -473,6 +474,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            if !sk("fp_reg_mem_fold") { changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos); }
             if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
                 changed2 |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
             }
@@ -520,6 +522,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
             changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            if !sk("fp_reg_mem_fold") { changed3 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos); }
             changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             if !sk("dead_regs") { changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
@@ -687,6 +690,58 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("mulsd -40(%rbp), %xmm0"),
             "should fold movsd+mulsd: {}", result);
+    }
+
+    #[test]
+    fn test_fp_register_load_folds_into_vex_op() {
+        let asm = [
+            "    movsd 8(%rsi), %xmm5",
+            "    vsubsd %xmm5, %xmm4, %xmm4",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("vsubsd 8(%rsi), %xmm4, %xmm4"),
+            "single-use load should become a memory source: {}", result);
+        assert!(!result.contains("movsd 8(%rsi), %xmm5"),
+            "folded load should be deleted: {}", result);
+    }
+
+    #[test]
+    fn test_fp_register_load_kept_when_source_used_later() {
+        let asm = [
+            "    movss (%rdi), %xmm5",
+            "    vaddss %xmm5, %xmm4, %xmm4",
+            "    vmulss %xmm5, %xmm6, %xmm6",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movss (%rdi), %xmm5"),
+            "multi-use source load must remain: {}", result);
+    }
+
+    #[test]
+    fn test_fp_register_load_kept_for_destructive_self_source() {
+        let asm = [
+            "    movsd (%rdi), %xmm5",
+            "    vmulsd %xmm5, %xmm5, %xmm5",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsd (%rdi), %xmm5"),
+            "destination's old value depends on this load: {}", result);
+    }
+
+    #[test]
+    fn test_fp_register_name_boundary_xmm1_vs_xmm10() {
+        let asm = [
+            "    movsd (%rdi), %xmm1",
+            "    vaddsd %xmm1, %xmm4, %xmm4",
+            "    movsd %xmm10, %xmm11",
+            "    ret",
+        ].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("vaddsd (%rdi), %xmm4, %xmm4"),
+            "xmm10 must not count as a later xmm1 use: {}", result);
     }
 
     #[test]

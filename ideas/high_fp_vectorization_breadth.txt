@@ -43,3 +43,42 @@ Measurable success
 Key files
 - src/passes/vectorize.rs, src/backend/x86/codegen/intrinsics.rs
 - reference: LLVM LoopVectorizer + SLP, GCC tree-vectorize, Intel FMA guidance.
+
+---
+
+# 2026-08-18 — live four-oracle SIMD/FP corpus and guarded FMA coalescing
+
+## Accomplished
+
+- Added a standalone 50-function strict/fast SIMD/FP corpus and live CE
+  scoreboard for GCC 16.2, Clang 22.1.0, ICC 2021.10, and latest ICX.  See
+  `docs/simd-fp-oracle.md` for reproducible commands, parser limitations, and
+  the full baseline summary.
+- Closed three correctness hazards before optimizing: strict reductions retain
+  source order; umbrella `-ffast-math` defines `__FAST_MATH__`; unrestricted
+  pointer roots no longer receive an implicit noalias assumption, while C
+  `restrict` propagates to IR `noalias`.
+- Implemented alias-guarded scalar destructive-FMA destination coalescing.
+  `p50_distance3_f64` is 28 -> 22 instructions (best oracle 9).  Runtime and
+  assembly regressions cover direct, alias-fallback, and stack-argument shapes.
+- Added ordered caller-saved/ABI parameter homes for one-block leaves.  p50 is
+  now 14 instructions; a 50-pattern A/B changed only p50 (-8), with no static
+  regressions. VM paired timing was suggestive but inconclusive.
+- Folded proven single-use scalar FP loads into adjacent VEX arithmetic: 12/50
+  patterns improve, none regress, and p50 reaches 11 instructions. A randomized
+  paired stencil5 VM screen improved 13.1% (ratio 0.8694, CI 0.8474..0.8930).
+- Added exact-class, width-aware XMM/YMM homes for loop-carried F32/F64
+  reductions. Five patterns improve with no regression; sum+dot paired VM
+  screening measured ratio 0.5021 (CI 0.4589..0.5908), 23/24 wins.
+
+## Current measured backlog (new session)
+
+1. Dot/sum setup and tails: first repair the signed remainder-index SSA bug;
+   then remove the remaining dot-product transient stack temporary.
+2. Integer/FP affine store loops and remaining stencil overhead.
+3. Four live reductions (`p48`); single F32/F64 accumulator homes are done.
+4. Width-aware fixed-vector SLP and complex/interleaved kernels.
+5. Workload-derived variants from zlib-ng/gzip, expat, SQLite, Linux, and glibc,
+   with provenance and real end-to-end workloads.
+6. Bare-metal Raptor Lake counters and randomized paired timing; VM static and
+   timing results remain screening evidence only.

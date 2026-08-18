@@ -134,6 +134,106 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
+/// Fold a single-use scalar-FP register load into an adjacent VEX arithmetic
+/// instruction.
+///
+///     movsd 8(%rsi), %xmm5
+///     vsubsd %xmm5, %xmm4, %xmm4
+///       ->
+///     vsubsd 8(%rsi), %xmm4, %xmm4
+///
+/// This deliberately uses a stronger-than-necessary liveness proof: the loaded
+/// XMM register must not be mentioned again before the function's `.size`.
+/// That misses registers which are overwritten later, but makes deleting the
+/// defining load safe without teaching the text peephole full XMM dataflow.
+/// The load and consumer must be adjacent, so no address register or memory
+/// state can change between them.  Source==destination is rejected because the
+/// removed load also supplies the destructive destination's old value.
+pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    fn mentions_xmm(line: &str, reg: &str) -> bool {
+        line.match_indices(reg).any(|(at, _)| {
+            line.as_bytes().get(at + reg.len()).is_none_or(|b| !b.is_ascii_digit())
+        })
+    }
+
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i + 1].is_nop() {
+            i += 1;
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i));
+        let Some((load_op, operands)) = load.split_once(' ') else {
+            i += 1;
+            continue;
+        };
+        if load_op != "movsd" && load_op != "movss" {
+            i += 1;
+            continue;
+        }
+        let Some((mem, src_reg)) = operands.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let mem = mem.trim();
+        let src_reg = src_reg.trim();
+        if !src_reg.starts_with("%xmm") || !mem.contains('(') || mem.starts_with('%') {
+            i += 1;
+            continue;
+        }
+
+        let consumer = infos[i + 1].trimmed(store.get(i + 1));
+        let Some((arith_op, arith_operands)) = consumer.split_once(' ') else {
+            i += 1;
+            continue;
+        };
+        let legal_op = match load_op {
+            "movsd" => matches!(arith_op, "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd"),
+            "movss" => matches!(arith_op, "vaddss" | "vsubss" | "vmulss" | "vdivss"),
+            _ => false,
+        };
+        if !legal_op {
+            i += 1;
+            continue;
+        }
+        let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
+        if ops.len() != 3 || ops[0] != src_reg || ops[1] != ops[2] || ops[1] == src_reg {
+            i += 1;
+            continue;
+        }
+
+        // The source value must have no later use. Stop at `.size`; crossing a
+        // label is harmless for this intentionally whole-function proof.
+        let mut later_mention = false;
+        for k in (i + 2)..len {
+            if infos[k].is_nop() {
+                continue;
+            }
+            let t = infos[k].trimmed(store.get(k));
+            if t.starts_with(".size ") {
+                break;
+            }
+            if mentions_xmm(t, src_reg) {
+                later_mention = true;
+                break;
+            }
+        }
+        if later_mention {
+            i += 1;
+            continue;
+        }
+
+        let replacement = format!("    {} {}, {}, {}", arith_op, mem, ops[1], ops[2]);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[i + 1], i + 1, replacement);
+        changed = true;
+        i += 2;
+    }
+    changed
+}
+
 /// Fold stack-load-to-scratch relay moves: eliminate the scratch register
 /// as intermediary when loading from a stack slot to another register.
 ///

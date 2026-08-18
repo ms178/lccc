@@ -577,6 +577,46 @@ impl X86Codegen {
         ty: IrType,
     ) {
         let fma = if matches!(ty, IrType::F64) { "vfmadd231sd" } else { "vfmadd231ss" };
+
+        // Destructive-FMA coalescing: when linear scan assigned the result to
+        // the accumulator's existing XMM home, compute there directly instead
+        // of acc->xmm0, lhs->xmm1, FMA, xmm0->dest. This is the dominant shape
+        // in dot products and short FP reductions. It is safe only when neither
+        // multiply source aliases the destructive destination; otherwise keep
+        // the scratch path below.
+        let xmm_home = |op: &Operand| -> Option<&'static str> {
+            let Operand::Value(v) = op else { return None };
+            let reg = self.reg_assignments.get(&v.0).copied()?;
+            is_xmm_reg(reg).then(|| phys_reg_name(reg))
+        };
+        if let Some(dest_reg) = self.dest_reg(add_dest).filter(|r| is_xmm_reg(*r)) {
+            let dest_name = phys_reg_name(dest_reg);
+            if xmm_home(acc) == Some(dest_name) {
+                if let Some(lhs_name) = xmm_home(mul_lhs).filter(|name| *name != dest_name) {
+                    match mul_rhs {
+                        Operand::Value(v) => {
+                            if let Some(rhs_name) = xmm_home(mul_rhs).filter(|name| *name != dest_name) {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} %{}, %{}, %{}", fma, rhs_name, lhs_name, dest_name
+                                ));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                let sr = self.slot_ref(slot.0);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, %{}, %{}", fma, sr, lhs_name, dest_name
+                                ));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         self.load_fp_to_xmm0(acc, ty);
         self.load_fp_to_reg(mul_lhs, ty, "xmm1");
         match mul_rhs {

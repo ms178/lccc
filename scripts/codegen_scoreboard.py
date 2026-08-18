@@ -54,10 +54,28 @@ ORACLES = ["gcc", "clang", "icc", "icx"]
 
 # Directives and labels carry no instructions.
 _SKIP = re.compile(r"^\s*(\.|#|//|$)")
-_LABEL = re.compile(r"^[.\w$]+:")
+# GCC's CE output quotes externally-visible C labels (`"foo":`), while
+# Clang/ICC/ICX and LCCC generally do not. Capture both, plus $/. characters.
+_LABEL = re.compile(r'^\s*"?([.\w$]+)"?:')
 
-_BRANCH = re.compile(r"^(j\w+|call|ret|loop\w*)$")
-_STACK_MEM = re.compile(r"[-\d+x]*\(%r(sp|bp)\)")
+_BRANCH = re.compile(r"^(j\w+|callq?|retq?|loop\w*)$")
+_STACK_MEM = re.compile(r"(?:[-+]?\d+)?\(%(?:r(?:sp|bp)|e(?:sp|bp))(?:,|\))")
+
+
+def is_simd_instruction(mnemonic: str) -> bool:
+    """Conservative SIMD classifier (do not count VEX scalar FP or popcnt)."""
+    m = mnemonic.lower()
+    if m.startswith("v"):
+        # VEX scalar instructions still begin with v; suffix ss/sd/si marks
+        # scalar arithmetic/conversion. Keep packed ps/pd and vector integer.
+        return not re.search(r"(?:ss|sd|si|2ss|2sd|2si)(?:q|l)?$", m)
+    if m.startswith("p") and not m.startswith(("popcnt", "pause", "prefetch")):
+        return m.startswith((
+            "padd", "psub", "pmul", "pmadd", "pand", "por", "pxor",
+            "pcmp", "pshuf", "psll", "psrl", "psra", "pack", "punpck",
+            "pblend", "pmax", "pmin", "pabs", "psad", "palign",
+        ))
+    return False
 
 
 @dataclass
@@ -83,12 +101,12 @@ def parse_functions(lines: list[str]) -> dict[str, FuncStats]:
         line = raw.rstrip()
         if not line:
             continue
-        m = _LABEL.match(line.strip())
-        if m and not line.strip().startswith("."):
-            cur = FuncStats(line.strip().rstrip(":"))
+        m = _LABEL.match(line)
+        if m and not m.group(1).startswith("."):
+            cur = FuncStats(m.group(1))
             out[cur.name] = cur
             continue
-        if m and line.strip().startswith(".L"):
+        if m and m.group(1).startswith(".L"):
             continue
         if _SKIP.match(line):
             continue
@@ -103,7 +121,7 @@ def parse_functions(lines: list[str]) -> dict[str, FuncStats]:
 
         if _BRANCH.match(mnem):
             cur.branch += 1
-        if mnem.startswith("v") or re.match(r"^p[a-z]", mnem):
+        if is_simd_instruction(mnem):
             cur.vector += 1
 
         # Operand-side memory classification. In AT&T syntax the destination is
@@ -135,13 +153,19 @@ def strip_noise(lines: list[str]) -> list[str]:
 # Godbolt compiler ids. scripts/godbolt.py exposes only compile_on_godbolt(),
 # so the id table and the local-compile path live here.
 ORACLE_IDS = {
-    "gcc":   "cg162",
-    "clang": "cclang2210",
-    "icc":   "cicc2021100",
-    "icx":   "cicx202400",
+    "gcc":   godbolt.resolve_compiler("gcc16.2"),
+    "clang": godbolt.resolve_compiler("clang"),
+    "icc":   godbolt.resolve_compiler("icc"),
+    "icx":   godbolt.resolve_compiler("icx"),
 }
 
 CACHE = Path(__file__).resolve().parent.parent / ".godbolt-cache"
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_LCCC = str(
+    ROOT / "target/fastbuild/lccc"
+    if (ROOT / "target/fastbuild/lccc").exists()
+    else ROOT / "target/release/lccc"
+)
 
 
 def compile_local(lccc: str, path: Path, flags: str) -> list[str]:
@@ -160,12 +184,14 @@ def compile_local(lccc: str, path: Path, flags: str) -> list[str]:
 def compile_remote(name: str, src: str, flags: str) -> list[str]:
     """Compile on godbolt, caching by (compiler, flags, source) digest."""
     cid = ORACLE_IDS.get(name, name)
-    key = hashlib.sha256(f"{cid}\0{flags}\0{src}".encode()).hexdigest()[:32]
+    # Cache key includes syntax/parser ABI. The old cache stored Intel syntax,
+    # which made AT&T load/store metrics silently read as zero.
+    key = hashlib.sha256(f"att-v2\0{cid}\0{flags}\0{src}".encode()).hexdigest()[:32]
     CACHE.mkdir(exist_ok=True)
     hit = CACHE / f"{key}.s"
     if hit.exists():
         return hit.read_text().splitlines()
-    data = godbolt.compile_on_godbolt(cid, src, flags)
+    data = godbolt.compile_on_godbolt(cid, src, flags, intel=False)
     if data is None:
         raise RuntimeError(f"{name}: compile failed")
     lines = [x.get("text", "") for x in (data.get("asm") or [])]
@@ -198,20 +224,22 @@ def measure(path: Path, lccc: str, flags: str, oracles: list[str],
         except Exception as e:  # noqa: BLE001
             return name, {}, f"{type(e).__name__}: {e}"
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(oracles)) as ex:
-        for name, stats, err in ex.map(one, oracles):
-            if err:
-                res.errors[name] = err
-            else:
-                res.per_compiler[name] = stats
+    # An empty list is a useful local-only mode for controlled same-binary A/B
+    # runs; ThreadPoolExecutor rejects max_workers=0.
+    if oracles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(oracles)) as ex:
+            for name, stats, err in ex.map(one, oracles):
+                if err:
+                    res.errors[name] = err
+                else:
+                    res.per_compiler[name] = stats
     return res
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("sources", nargs="+", type=Path)
-    ap.add_argument("--lccc", default=os.environ.get("LCCC",
-                                                     "./target/release/lccc"))
+    ap.add_argument("--lccc", default=os.environ.get("LCCC", DEFAULT_LCCC))
     ap.add_argument("--flags", default=DEFAULT_FLAGS)
     ap.add_argument("--local-flags", default=None,
                     help="flags for LCCC only (default: same as --flags)")

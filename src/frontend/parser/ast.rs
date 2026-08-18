@@ -158,6 +158,10 @@ pub struct ParamDecl {
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
+    /// Whether the adjusted pointer parameter is restrict-qualified. Unlike
+    /// const, this is an optimization contract: accesses based on distinct
+    /// restrict parameters may be proven non-aliasing within the function.
+    pub is_restrict: bool,
     /// VLA size expressions from the outermost array dimension that was decayed to pointer.
     /// E.g., for `void foo(int a, int b[a++])`, the expression `a++` is stored here
     /// so its side effects can be evaluated at function entry during IR lowering.

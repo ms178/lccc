@@ -243,6 +243,10 @@ pub struct IrFunction {
 #[derive(Debug, Clone)]
 pub struct IrParam {
     pub ty: IrType,
+    /// Pointer parameter carries the C `restrict` no-alias contract for this
+    /// function invocation. Preserved into IR so legality checks do not have
+    /// to guess that two arbitrary pointer parameters are disjoint.
+    pub noalias: bool,
     /// If this param is a struct/union passed by value, its byte size. None for non-struct params.
     pub struct_size: Option<usize>,
     /// Struct alignment in bytes. Used on RISC-V to even-align register pairs for

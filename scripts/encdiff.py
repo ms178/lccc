@@ -70,7 +70,7 @@ TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
 REMOTE_ORACLES = {
     "clang": "cclang2210",
     "gcc": "cg162",
-    "icx": "cicx202400",
+    "icx": "cicxlatest",
     "icc": "cicc2021100",
 }
 

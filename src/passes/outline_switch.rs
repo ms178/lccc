@@ -844,7 +844,7 @@ fn build_outlined_function(
         .iter()
         .map(|_| IrParam {
             ty: IrType::Ptr,
-            struct_size: None,
+            noalias: false, struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,

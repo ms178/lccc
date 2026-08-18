@@ -56,6 +56,14 @@ pub struct Driver {
     /// Whether size optimization is requested (-Os or -Oz).
     /// Used to define __OPTIMIZE_SIZE__ predefined macro.
     pub(super) optimize_size: bool,
+    /// Permit transformations that reassociate floating-point operations.
+    /// False by default: ordinary -O levels preserve source evaluation order.
+    /// Enabled explicitly by -ffast-math/-fassociative-math.
+    pub(super) fp_reassoc: bool,
+    /// Whether the umbrella -ffast-math option is active.  Kept separate from
+    /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
+    /// -fassociative-math/-funsafe-math-optimizations options.
+    pub(super) fast_math: bool,
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
@@ -327,6 +335,8 @@ impl Driver {
             opt_level: 2,    // All levels run the same optimizations; default to max
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
+            fp_reassoc: false,
+            fast_math: false,
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,
@@ -978,6 +988,10 @@ impl Driver {
         // The Linux kernel's BUILD_BUG() relies on __OPTIMIZE__ to expand to a noreturn
         // function call instead of a no-op.
         preprocessor.set_optimize(self.optimize, self.optimize_size);
+        // GCC-compatible umbrella feature-test macro.  Individual unsafe or
+        // associative-math flags permit selected transforms but do not define
+        // __FAST_MATH__.
+        preprocessor.set_fast_math(self.fast_math);
         // Set PIC mode: defines __PIC__/__pic__ only when -fPIC is active.
         // This is critical for kernel code where RIP_REL_REF() checks #ifndef __pic__
         // to decide whether to use RIP-relative inline asm for early boot code.
@@ -1409,7 +1423,7 @@ impl Driver {
 
         let t6 = std::time::Instant::now();
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
-        run_passes(&mut module, self.opt_level, self.target);
+        run_passes(&mut module, self.opt_level, self.target, self.fp_reassoc);
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
         }
