@@ -1,7 +1,8 @@
 /* Dynamic-loop-bound reduction vectorization: the byte-offset IV computes the
- * vector limit as floor(n/vec_width)*byte_stride at runtime (div+mul), and the
- * scalar remainder starts at byte_iv_final/element_size. A latent dot-product
- * bug deleted the induction-variable increment here (infinite loop). */
+ * vector limit as floor(n/vec_width)*byte_stride at runtime (shift+multiply),
+ * and the scalar remainder starts at byte_iv_final>>log2(element_size). A
+ * latent dot-product bug deleted the induction-variable increment here
+ * (infinite loop). Keep power-of-two boundaries and both adjacent tail sizes. */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -31,7 +32,11 @@ int main(int argc, char **argv) {
         return 0;
     }
     /* default: sweep a range of runtime bounds (each is a real runtime value) */
-    static const int ns[] = {0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 127, 129, 255, 256, 257, 300};
+    static const int ns[] = {
+        0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17,
+        31, 32, 33, 63, 64, 65, 127, 128, 129,
+        255, 256, 257, 511, 512, 513, 1023, 1024
+    };
     for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++) {
         int n = ns[k];
         long long nn = n;

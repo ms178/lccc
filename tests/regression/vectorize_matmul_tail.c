@@ -2,7 +2,12 @@
  * The byte limit of the vector loop used to be N*8, running ceil(N/4)
  * iterations: the last iteration wrote past the logical end of the row
  * (clobbering a sentinel canary) and the scalar remainder never fired.
- * Correct: floor(N/4) vector iterations + scalar remainder. */
+ * Correct: floor(N/4) vector iterations + scalar remainder.
+ *
+ * This also covers the fixed-scratch register bug exposed when that remainder
+ * transition changed from signed division to a logical shift: division had
+ * accidentally kept the byte IV out of RDX, while the packed-FMA emitter
+ * overwrote RDX. At n=17 the corrupted IV skipped the final scalar element. */
 #include <stdio.h>
 
 static double A[256][256], B[256][256], C[256][256];
@@ -34,7 +39,10 @@ static int matmul_verify(int n) {
 }
 
 int main(void) {
-    static const int ns[] = {5, 6, 7, 9, 15, 16, 17, 31, 63, 64, 65, 255, 256};
+    static const int ns[] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256
+    };
     for (unsigned k = 0; k < sizeof(ns) / sizeof(ns[0]); k++)
         if (!matmul_verify(ns[k])) return 1;
     printf("OK\n");

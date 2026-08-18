@@ -2533,13 +2533,9 @@ fn insert_remainder_loop(
     } else {
         Instruction::BinOp {
             dest: j_rem_start,
-            // Preserve the original signed IV operation.  This is inserted
-            // after div-by-constant and currently survives as `idivl`; directly
-            // substituting UDiv/LShr (or rerunning div-by-constant here) breaks
-            // the n=17 scalar tail.  Optimize only after that SSA bug is fixed.
-            op: IrBinOp::SDiv,
-            lhs: Operand::Value(pattern.iv),   // Final byte offset
-            rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(pattern.iv),   // Final non-negative byte offset
+            rhs: Operand::Const(IrConst::I32(3)),  // log2(sizeof(double))
             ty: IrType::I32,
         }
     };
@@ -3680,7 +3676,7 @@ fn insert_reduction_remainder_loop(
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
 
     // Get element size in bytes
-    let element_size = match pattern.element_type {
+    let element_size: i64 = match pattern.element_type {
         IrType::F64 => 8,
         IrType::F32 => 4,
         IrType::I32 => 4,
@@ -3836,17 +3832,18 @@ fn insert_reduction_remainder_loop(
                 args: vec![Operand::Value(horiz_src)],
             },
             // Compute starting index for the scalar remainder loop.
-            //   byte-offset IV: start = byte_iv_final / element_size
+            //   byte-offset IV: start = byte_iv_final >> log2(element_size)
             //   element-index IV: start = iv_final * vec_width
+            // Vector byte IVs are normalized at zero, increase by a positive
+            // power-of-two stride, and only reach this block from the loop's
+            // non-negative exit.  Use that proof directly rather than leaving
+            // a late signed divide for x86 codegen.
             if byte_offset_iv {
                 Instruction::BinOp {
                     dest: i_rem_start,
-                    // Preserve the signed scalar-IV operation.  This late
-                    // division is a known codegen TODO: replacing it directly
-                    // with UDiv/LShr currently corrupts matmul's scalar tail.
-                    op: IrBinOp::SDiv,
+                    op: IrBinOp::LShr,
                     lhs: Operand::Value(pattern.iv),
-                    rhs: Operand::Const(IrConst::I32(element_size as i32)),
+                    rhs: Operand::Const(IrConst::I32(element_size.trailing_zeros() as i32)),
                     ty: IrType::I32,
                 }
             } else {

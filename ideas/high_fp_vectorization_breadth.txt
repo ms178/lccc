@@ -73,8 +73,9 @@ Key files
 
 ## Current measured backlog (new session)
 
-1. Dot/sum setup and tails: first repair the signed remainder-index SSA bug;
-   then remove the remaining dot-product transient stack temporary.
+1. Dot/sum setup and tails: the RDX fixed-scratch liveness defect is repaired
+   and late remainder `idivl` is gone; next remove the dot-product transient
+   stack temporary and continue reducing address setup.
 2. Integer/FP affine store loops and remaining stencil overhead.
 3. Four live reductions (`p48`); single F32/F64 accumulator homes are done.
 4. Width-aware fixed-vector SLP and complex/interleaved kernels.
