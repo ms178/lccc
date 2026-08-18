@@ -123,6 +123,12 @@ pub(crate) struct CodegenOptions {
     /// Requested stack boundary in bytes (16 = SysV default). i686 honours
     /// 4/8 to shrink frames in kernel realmode code; x86-64 ignores <16.
     pub(crate) preferred_stack_bytes: u8,
+    /// Permit fused multiply-add contraction in BACKEND fusion (scalar
+    /// vfmadd231s{s,d} on x86, fmadd on AArch64). The vectorizer receives the
+    /// same contract via run_passes; both consumers must agree or
+    /// -ffp-contract=off silently loses its single-rounding guarantee in
+    /// whichever layer was forgotten.
+    pub(crate) fp_contract_fast: bool,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     /// When true, functions do not set up EBP as a frame pointer, freeing it
     /// as a general register and saving prologue/epilogue instructions.

@@ -354,6 +354,9 @@ pub struct X86Codegen {
     /// XMM saves and va_start sets fp_offset to overflow immediately.
     pub(super) function_alignment: u32,
     pub(super) skip_rax_setup: bool,
+    /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
+    /// scalar mul+add -> vfmadd231 fusion.
+    pub(super) fp_contract_fast: bool,
     pub(super) no_sse: bool,
     /// Per-function vector-constant pool: (value, byte_width) -> label.
     /// _mm256_set1_* with a constant argument lowers to a single
@@ -597,6 +600,7 @@ impl X86Codegen {
             used_callee_saved: Vec::new(),
             function_alignment: 0,
             skip_rax_setup: false,
+            fp_contract_fast: false,
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
@@ -688,6 +692,7 @@ impl X86Codegen {
         self.set_no_jump_tables(opts.no_jump_tables);
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;
+        self.fp_contract_fast = opts.fp_contract_fast;
     }
 
     /// Reserve (or reuse) a .rodata label holding `value` as `width` bytes for a
@@ -3229,7 +3234,10 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn supports_fused_float_mul_add(&self) -> bool {
-        true
+        // FP contraction changes results (single rounding). Only fuse under
+        // the explicit contract; integer mul+add fusion is unaffected (the
+        // generation-side detector calls this only for float types).
+        self.fp_contract_fast
     }
 
     fn try_lower_machinst(

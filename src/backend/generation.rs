@@ -1049,14 +1049,32 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
         }
 
         // Nearby Add using the mul result; allow pure Copy/Cast between.
+        //
+        // SOUNDNESS: the fused sequence is emitted at the MUL's program
+        // point, i.e. BEFORE any skipped instruction executes. Skipped
+        // Copy/Cast instructions therefore must not DEFINE any value the
+        // Add consumes — otherwise the fusion reads the accumulator operand
+        // before its defining copy ran (observed miscompile: `e += k*t`
+        // where phi-web lowering emits `Copy acc_read <- acc_phi` between
+        // the Mul and the Add; the FMA read the acc register one iteration
+        // stale once the copy-web allocator gave acc_read an XMM home —
+        // nbody -O0 energy() printed -0.3248 instead of -0.1691).
         let mut add_idx = None;
         let mut add_lhs_r = None;
         let mut add_rhs_r = None;
         let mut add_ty_r = None;
+        let mut skipped_defs: [u32; 6] = [u32::MAX; 6];
+        let mut skipped_count = 0usize;
         let max_scan = (idx + 6).min(block.instructions.len());
         for scan in (idx + 1)..max_scan {
             match &block.instructions[scan] {
-                Instruction::Copy { .. } | Instruction::Cast { .. } => continue,
+                Instruction::Copy { dest, .. } | Instruction::Cast { dest, .. } => {
+                    if skipped_count < skipped_defs.len() {
+                        skipped_defs[skipped_count] = dest.0;
+                        skipped_count += 1;
+                    }
+                    continue;
+                }
                 Instruction::BinOp {
                     op: crate::ir::reexports::IrBinOp::Add,
                     lhs, rhs, ty, ..
@@ -1077,6 +1095,15 @@ fn detect_mul_add_fusions(block: &BasicBlock, use_counts: &[u32], fuse_float: bo
         let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
         let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == mul_dest.0);
         if !mul_is_lhs && !mul_is_rhs {
+            continue;
+        }
+
+        // Not-yet-executed defs must not feed the Add (see SOUNDNESS above).
+        let defined_between = |op: &Operand| {
+            matches!(op, Operand::Value(v)
+                if skipped_defs[..skipped_count].contains(&v.0))
+        };
+        if defined_between(add_lhs) || defined_between(add_rhs) {
             continue;
         }
 
