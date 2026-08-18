@@ -129,7 +129,7 @@ fn first_non_phi(block: &BasicBlock) -> usize {
         .unwrap_or(block.instructions.len())
 }
 
-fn abi_align(ty: IrType) -> u32 {
+fn abi_align(ty: IrType) -> usize {
     match ty.size() {
         0 => 1,
         1 => 1,
@@ -336,10 +336,6 @@ fn const_type(c: &IrConst) -> Option<IrType> {
         IrConst::I16(_) => IrType::I16,
         IrConst::I32(_) => IrType::I32,
         IrConst::I64(_) => IrType::I64,
-        IrConst::U8(_) => IrType::U8,
-        IrConst::U16(_) => IrType::U16,
-        IrConst::U32(_) => IrType::U32,
-        IrConst::U64(_) => IrType::U64,
         IrConst::F32(_) => IrType::F32,
         IrConst::F64(_) => IrType::F64,
         _ => return None,
@@ -956,9 +952,8 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         map.insert(vid, new_val.0);
         let block = &mut func.blocks[site_block];
         // load sits at ci+2 after both inserts
-        let first_after_load = ci + 3;
-        for inst in block.instructions[first_after_load.min(block.instructions.len())..].iter_mut()
-        {
+        let first_after_load = (ci + 3).min(block.instructions.len());
+        for inst in block.instructions[first_after_load..].iter_mut() {
             replace_values_in_inst(inst, &map, false);
         }
         replace_values_in_terminator(&mut block.terminator, &map);

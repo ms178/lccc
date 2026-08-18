@@ -337,7 +337,6 @@ fn resolve_lin_form(
                     konst: c.to_i64()?,
                     march: 0,
                 },
-                _ => return None,
             };
             f.march = f.march.checked_add(stride)?;
             return Some(f);
@@ -368,7 +367,6 @@ fn resolve_lin_form(
                     let g = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *ov, fuel)?;
                     f = merge_forms(f, g)?;
                 }
-                _ => return None,
             }
             Some(f)
         }
@@ -1115,9 +1113,10 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     let latch_incoming = subst_operand(&plan.store_val, plan.load_dest.0, phi.0);
     let exit_val = memory_on_exit(plan.exit_from, plan.latch, phi, &latch_incoming);
 
+    let preheader_end = func.blocks[plan.preheader].instructions.len();
     insert_inst(
         &mut func.blocks[plan.preheader],
-        func.blocks[plan.preheader].instructions.len(),
+        preheader_end,
         Instruction::Load {
             dest: init,
             ptr: plan.ptr,
@@ -1163,9 +1162,10 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
         remove_inst(&mut func.blocks[plan.store_b], si);
     }
 
+    let exit_insert = first_non_phi(&func.blocks[plan.exit_block]);
     insert_inst(
         &mut func.blocks[plan.exit_block],
-        first_non_phi(&func.blocks[plan.exit_block]),
+        exit_insert,
         Instruction::Store {
             val: exit_val,
             ptr: plan.ptr,
@@ -1256,10 +1256,12 @@ mod tests {
     fn memory_on_exit_latch_writes_new_value() {
         let phi = Value(10);
         let new = Operand::Value(Value(11));
-        assert_eq!(memory_on_exit(2, 2, phi, &new), new);
-        assert_eq!(
-            memory_on_exit(0, 2, phi, &new),
-            Operand::Value(phi),
+        assert!(matches!(
+            memory_on_exit(2, 2, phi, &new),
+            Operand::Value(Value(11))
+        ));
+        assert!(
+            matches!(memory_on_exit(0, 2, phi, &new), Operand::Value(Value(10))),
             "exit from header must write the pre-store phi"
         );
     }
@@ -1404,14 +1406,14 @@ mod tests {
 
     #[test]
     fn subst_rewrites_only_the_named_value() {
-        assert_eq!(
+        assert!(matches!(
             subst_operand(&Operand::Value(Value(7)), 7, 9),
             Operand::Value(Value(9))
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             subst_operand(&Operand::Value(Value(1)), 7, 9),
             Operand::Value(Value(1))
-        );
+        ));
     }
 
     #[test]
