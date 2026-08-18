@@ -219,13 +219,41 @@ versus GCC 420, Clang 347, ICC 346, and ICX 157.  LCCC therefore beats three
 references on this coarse aggregate but remains far behind ICX; no blanket
 superiority claim is made.
 
-A separate attempted remainder-loop optimization was rejected during full-suite
-validation.  Replacing the vectorizer's late signed `/ 8` with `UDiv`, `LShr`,
-or a second div-by-constant pass made `vectorize_matmul_tail` skip element 16
-when `n == 17`.  The correct signed division is retained even though it emits
-`idivl`; the underlying SSA/narrowing interaction must be fixed before removing
-that cost.  This is recorded to prevent a static-metric win from reintroducing
-the miscompile.
+### Fifth distilled fix: division-free vector remainder transitions
+
+The rejected remainder-loop experiment was reproduced before changing the
+transformation.  Its `n == 17` failure was not caused by shift semantics: the
+late signed division had accidentally disabled RDX allocation for the entire
+function.  Replacing it with `LShr` made the vector byte IV live in RDX, but the
+packed-FMA intrinsic emitter also used RDX as an unmodeled fixed scratch.  The
+first vector iteration overwrote the IV with a pointer; the corrupted exit
+index then skipped element 16.
+
+The x86 allocation pre-scan now excludes RDX when an intrinsic emitter has a
+fixed RDX clobber, independently of whether an unrelated divide happens to be
+present.  With that liveness defect repaired, non-negative, zero-based byte IVs
+use `LShr` by `log2(element_size)` in both matmul and F32/F64/I32 reduction
+remainder transitions.  Generated AVX2 assembly uses `shrl $2/$3` and contains
+no tail `idivl`.  The expanded deterministic boundary sweeps cover 0, every
+vector-width edge through 65, and larger 127/128/129-style edges; a structural
+regression requires both vector instructions and division-free tail shifts.
+
+A clean-base/current static A/B compared 56 functions from the 50-pattern
+corpus plus the matmul regression: **8 improved, 48 tied, 0 regressed**, with
+aggregate instructions **2310 -> 2281** (-29), arithmetic mean ratio 0.99181,
+and geometric mean ratio 0.99158.  Dot F32/F64 each lose five instructions;
+matmul and the other affected sums lose three or four.  Fresh live CE output
+for the five distilled sum/dot/row kernels is retained under
+`artifacts/simd-fp-followup/remainder/live-oracles*`: LCCC moved from 286 to
+270 aggregate instructions; GCC 16.2, Clang 22.1, ICC 2021.10, and latest ICX
+were 355, 332, 379, and 150 respectively.  A CPU-0-pinned randomized 24-pair
+VM screen over small dynamic F64 sum+dot bounds had 22/24 division-free wins,
+but a severe scheduler outlier widened the paired new/base geometric ratio to
+**0.9970** with bootstrap 95% interval **[0.9110, 1.1633]**.  The timing result
+is therefore explicitly unresolved.  Raw samples, compiler hashes, and the
+exact runner are retained under `artifacts/simd-fp-followup/remainder/`.
+Static counts are deterministic; these noisy wall times are VM screening
+rather than PMU-backed Raptor Lake or bare-metal evidence.
 
 ## Correctness policy discovered during the audit
 
@@ -243,14 +271,12 @@ The current delivery stops after the validated register-resident reduction fix;
 do not widen its whitelist opportunistically.  A future agent should start from
 the retained A/B and live-oracle artifacts, then address in this order:
 
-1. fix the vectorizer's signed remainder-index SSA/narrowing defect before
-   replacing the emitted `idiv`, then reduce loop setup/tail overhead;
-2. eliminate the remaining dot-product transient stack temporary and evaluate
+1. eliminate the remaining dot-product transient stack temporary and evaluate
    vector FMA only under the existing fast-contract legality rules;
-3. support multiple independent reductions (`p48`) without accumulator spills;
-4. broaden legal store-loop vectorization and add width-aware SLP for fixed
+2. support multiple independent reductions (`p48`) without accumulator spills;
+3. broaden legal store-loop vectorization and add width-aware SLP for fixed
    vectors/stencils;
-5. graduate promising zlib-ng/gzip, expat, SQLite, Linux, and glibc kernels to
+4. graduate promising zlib-ng/gzip, expat, SQLite, Linux, and glibc kernels to
    pinned end-to-end workloads with provenance.
 
 For every item, retain strict-vs-fast differential execution, local/remote

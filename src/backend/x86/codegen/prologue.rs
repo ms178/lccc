@@ -1,6 +1,6 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IrBinOp, IrCmpOp, IrFunction, Instruction, Operand, Terminator, Value};
+use crate::ir::reexports::{IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -65,6 +65,7 @@ impl X86Codegen {
         let mut has_gep = false;       // GEP → indirect stores → emit_save_acc uses rdx
         let mut has_switch = false;    // Switch → jump tables use rdx
         let mut has_select = false;    // Select → cmov path uses rdx
+        let mut has_rdx_intrinsic = false; // Fixed-scratch intrinsic paths overwrite rdx
         let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
@@ -103,6 +104,29 @@ impl X86Codegen {
                     Instruction::AtomicRmw { .. } => { has_atomic_rmw = true; }
                     Instruction::GetElementPtr { .. } => { has_gep = true; }
                     Instruction::Select { .. } => { has_select = true; }
+                    Instruction::Intrinsic { op, .. } => {
+                        // These x86 emitters use rdx as an unmodeled fixed
+                        // scratch (or architectural output for rdtsc).  Keep
+                        // allocator-owned values out of rdx across them.  A
+                        // late vectorizer SDiv used to hide this bug by
+                        // disabling rdx allocation for the whole function.
+                        has_rdx_intrinsic |= matches!(
+                            op,
+                            IntrinsicOp::Rdtsc
+                                | IntrinsicOp::Rdtscp
+                                | IntrinsicOp::F128Copysign
+                                | IntrinsicOp::FmaF64x2
+                                | IntrinsicOp::FmaF64x4
+                                | IntrinsicOp::FmaF64x4Hoisted
+                                | IntrinsicOp::FmaF64x4SIB
+                                | IntrinsicOp::LoadF64x4
+                                | IntrinsicOp::LoadF64x2
+                                | IntrinsicOp::LoadI32x8
+                                | IntrinsicOp::LoadI32x4
+                                | IntrinsicOp::VecZeroI32x8
+                                | IntrinsicOp::VecZeroI32x4
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -118,9 +142,10 @@ impl X86Codegen {
         // r8: atomic RMW uses rdi instead of r8 (frees r8 unless i128 excludes it).
         // rdx (PhysReg 16) is available as caller-saved when no instruction
         // implicitly clobbers it: division (rdx:rax), i128 ops (rax:rdx pair),
-        // switch jump tables (rdx as dispatch). GEP indirect stores and Select
-        // cmov paths have been taught to use %r11 when rdx is allocated.
-        if !has_div_rem && !has_i128_ops && !has_switch {
+        // switch jump tables (rdx as dispatch), or fixed-scratch intrinsics.
+        // GEP indirect stores and Select cmov paths use %r11 when rdx is
+        // allocated.
+        if !has_div_rem && !has_i128_ops && !has_switch && !has_rdx_intrinsic {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
 

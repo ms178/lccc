@@ -917,15 +917,15 @@ The detailed reproducible report is `docs/simd-fp-oracle.md`.
 8. Exact-class XMM/YMM allocation keeps five F32/F64 reduction accumulators out
    of stack slots. All five improve statically; paired sum+dot VM screening
    measured ratio 0.5021 [0.4589, 0.5908], 23/24 register-version wins.
+9. The rejected late `/8` -> shift change exposed an RDX fixed-scratch liveness
+   bug, not bad shift semantics. Intrinsic clobbers now gate RDX allocation;
+   matmul and reduction remainder transitions use `shrl $2/$3` without `idivl`.
 
 ## Highest-value next-session backlog
 
-1. **Reduction loop overhead.** Register accumulators are complete for the
-   exact F32/F64 reduction family, but dot/sum setup and tails remain large.
-   The late remainder `/8` still emits `idiv`: direct UDiv/LShr and
-   post-vectorization strength-reduction attempts were rejected because each
-   skipped the n=17 matmul tail. Fix that SSA/narrowing defect first; then remove
-   the dot-product transient stack temporary under fast-contract legality.
+1. **Reduction loop overhead.** Remove the dot-product transient vector stack
+   temporary and evaluate packed FMA only under fast-contract legality; continue
+   reducing setup and tail address materialization without weakening IV proofs.
 2. **Store-loop vectorization.** Cover legal F32/F64 maps, affine kernels,
    conversions, masks/min/max, and stencils with alias/tail checks.
 3. **Multi-reduction allocation and local SLP.** Keep independent accumulators
