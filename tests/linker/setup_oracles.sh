@@ -121,12 +121,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# bfd (system) — reported, never built
+# bfd 2.47 (pinned) — the project's reference GAS/bfd version
 # ---------------------------------------------------------------------------
-if command -v ld.bfd >/dev/null; then
-  log "bfd (system): $(ld.bfd --version | head -1)"
+# The codegen/oracle docs pin binutils 2.47 (scripts/README.md §"Oracles").
+# The system bfd can be any distro version, so when it is NOT already 2.47 we
+# build the pinned release from source (gas + bfd only — no gdb/gprof/plugins),
+# which is what the differential tools compare against. This honours the
+# "GAS / bfd 2.47" build preference instead of silently testing a stale oracle.
+BINUTILS_VERSION=2.47
+if have ld.bfd-2.47; then
+  log "bfd 2.47 already present: $("$BIN/ld.bfd-2.47" --version | head -1)"
+elif command -v ld.bfd >/dev/null && ld.bfd --version | grep -q "$BINUTILS_VERSION"; then
+  install -m755 "$(command -v ld.bfd)" "$BIN/ld.bfd-2.47"
+  install -m755 "$(command -v as)"  "$BIN/as-2.47"
+  log "bfd 2.47 (system): $(ld.bfd --version | head -1)"
 else
-  echo "warning: ld.bfd not found; the differential suite loses its baseline oracle" >&2
+  log "building bfd 2.47 from source (gas + bfd only)"
+  if [[ ! -f "$SRC/binutils-$BINUTILS_VERSION.tar.xz" ]]; then
+    curl -fsSL -o "$SRC/binutils-$BINUTILS_VERSION.tar.xz" \
+      "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VERSION.tar.xz"
+  fi
+  rm -rf "$SRC/binutils-$BINUTILS_VERSION" "$SRC/bu-$BINUTILS_VERSION"
+  tar -xf "$SRC/binutils-$BINUTILS_VERSION.tar.xz" -C "$SRC"
+  mkdir -p "$SRC/bu-$BINUTILS_VERSION"
+  ( cd "$SRC/bu-$BINUTILS_VERSION" && \
+    "$SRC/binutils-$BINUTILS_VERSION/configure" --prefix="$SRC/bu-$BINUTILS_VERSION/prefix" \
+      --disable-gdb --disable-gdbserver --disable-sim --disable-readline \
+      --disable-libdecnumber --disable-nls --disable-werror \
+      --disable-gprofng --disable-gprof --disable-plugins --with-system-zlib \
+    && make -j "$JOBS" MAKEINFO=true all-gas all-binutils all-ld \
+    && make MAKEINFO=true install-gas install-binutils install-ld )
+  install -m755 "$SRC/bu-$BINUTILS_VERSION/prefix/bin/ld"  "$BIN/ld.bfd-2.47"
+  install -m755 "$SRC/bu-$BINUTILS_VERSION/prefix/bin/as"  "$BIN/as-2.47"
+  log "bfd 2.47: $("$BIN/ld.bfd-2.47" --version | head -1)"
 fi
 
 cat <<EOF

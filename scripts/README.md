@@ -83,7 +83,7 @@ tar xf binutils-2.47.tar.xz && mkdir bu-build && cd bu-build
   --disable-gdb --disable-gdbserver --disable-sim --disable-readline \
   --disable-libdecnumber --disable-nls --disable-werror \
   --disable-gprofng --disable-gprof --disable-plugins --with-system-zlib
-make -j"$(nproc)" MAKEINFO=true all-gas all-binutils
+make -j"$(nproc)" MAKEINFO=true all-gas all-binutils all-ld
 ```
 
 `godbolt.py` needs only network access:

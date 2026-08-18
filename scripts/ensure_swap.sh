@@ -12,7 +12,9 @@ if [[ -r /proc/swaps ]] && [[ $(wc -l </proc/swaps) -gt 1 ]]; then
 fi
 
 swapfile=${LCCC_SWAPFILE:-/swapfile}
-size=${LCCC_SWAP_SIZE:-4G}
+# 8G default: the full-kernel vmlinux link with lccc/lccc-ld and the Rust
+# bootstrap exceed 4G of combined working set on a 2G VM; 8G gives headroom.
+size=${LCCC_SWAP_SIZE:-8G}
 if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     privilege=()
 elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
@@ -46,4 +48,12 @@ if ! /sbin/swapon --show | grep -Fq "$swapfile"; then
     echo "error: failed to activate swap file $swapfile" >&2
     exit 1
 fi
+
+# Persist across VM reboots and keep the box biased toward reclaiming cold
+# pages rather than the hot compiler working set.
+if ! grep -q "^$swapfile" /etc/fstab 2>/dev/null; then
+    echo "$swapfile none swap sw 0 0" >> /etc/fstab 2>/dev/null || true
+fi
+"${privilege[@]}" /sbin/sysctl -w vm.swappiness=20 >/dev/null 2>&1 || true
+
 /sbin/swapon --show

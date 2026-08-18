@@ -3,11 +3,152 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::generation::is_i128_type;
 use crate::backend::traits::ArchCodegen;
 use crate::emit;
 use super::emit::{I686Codegen, phys_reg_name};
 
 impl I686Codegen {
+    // ---- accumulator-bypass store/load helpers -----------------------------
+    //
+    // The i686 backend is accumulator-centric: %eax is never handed out by the
+    // register allocator, so `load %eax …; movl %eax, %dest` and
+    // `movl %src, %eax; store %eax …` round-trips cost an instruction on every
+    // memory access.  These helpers emit straight into / out of an allocated
+    // GPR when one exists.  Because %eax is never allocatable, none of the
+    // direct paths touch the accumulator, so the reg_cache stays valid across
+    // them (a direct load into %ebx leaves whatever was in %eax in place).
+
+    /// Sub-register name for a *store source*.  %eax is not allocatable, so
+    /// every candidate is a full 32-bit GPR.  In 32-bit mode only %ebx/%ecx/
+    /// %edx have encodable 8-bit sub-registers (%sil/%dil/%bpl need REX), and
+    /// all six GPRs have 16-bit sub-registers.
+    fn store_sub_reg(reg: PhysReg, ty: IrType) -> Option<&'static str> {
+        match ty {
+            IrType::I8 | IrType::U8 => match reg.0 {
+                0 => Some("bl"),
+                4 => Some("cl"),
+                5 => Some("dl"),
+                _ => None,
+            },
+            IrType::I16 | IrType::U16 => match reg.0 {
+                0 => Some("bx"),
+                1 => Some("si"),
+                2 => Some("di"),
+                3 => Some("bp"),
+                4 => Some("cx"),
+                5 => Some("dx"),
+                _ => None,
+            },
+            _ => Some(phys_reg_name(reg)),
+        }
+    }
+
+    /// Best-effort direct store source for `val` (immediate or register-resident
+    /// value), bypassing the `movl …,%eax; store %eax/…` round-trip. Returns
+    /// `None` when the value has no register-resident/imm form that can be
+    /// stored directly (allocas, wide values, F64/F128, byte stores from
+    /// %esi/%edi/%ebp, ...).
+    fn direct_store_src(&self, val: &Operand, ty: IrType) -> Option<String> {
+        match val {
+            Operand::Const(c) => {
+                let imm: i64 = match c {
+                    crate::ir::reexports::IrConst::I8(v) => *v as i64,
+                    crate::ir::reexports::IrConst::I16(v) => *v as i64,
+                    crate::ir::reexports::IrConst::I32(v) => *v as i64,
+                    crate::ir::reexports::IrConst::I64(v)
+                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 =>
+                    {
+                        *v
+                    }
+                    crate::ir::reexports::IrConst::Zero => 0,
+                    _ => return None,
+                };
+                // Mask to the stored width so the assembler sees a legal
+                // imm8/imm16 operand (the byte/word store would drop the high
+                // bits anyway).
+                let imm = match ty {
+                    IrType::I8 | IrType::U8 => imm & 0xff,
+                    IrType::I16 | IrType::U16 => imm & 0xffff,
+                    _ => imm,
+                };
+                Some(format!("${}", imm))
+            }
+            Operand::Value(v) => {
+                if self.state.is_alloca(v.0)
+                    || self.state.wide_values.contains(&v.0)
+                    || self.state.f128_direct_slots.contains(&v.0)
+                {
+                    return None;
+                }
+                let phys = self.reg_assignments.get(&v.0).copied()?;
+                let sub = Self::store_sub_reg(phys, ty)?;
+                Some(format!("%{}", sub))
+            }
+        }
+    }
+
+    /// Emit a scalar integer/pointer load straight into the destination's
+    /// allocated register. Returns false for unsupported shapes (no dest
+    /// register, i128 payloads) so the caller can fall back to the
+    /// accumulator path.
+    fn try_emit_load_direct(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        if is_i128_type(ty) {
+            return false;
+        }
+        let Some(phys) = self.dest_reg(dest) else { return false };
+        let d = phys_reg_name(phys);
+        let load_instr = self.load_instr_for_type(ty);
+        let Some(addr) = self.state.resolve_slot_addr(ptr.0) else { return false };
+        match addr {
+            SlotAddr::Direct(slot) => {
+                let sr = self.slot_ref(slot);
+                emit!(self.state, "    {} {}, %{}", load_instr, sr, d);
+            }
+            SlotAddr::Indirect(slot) => {
+                // Pointer may be register-resident: emit_load_ptr_from_slot
+                // copies %reg → %ecx when so, or dereferences the slot.
+                self.emit_load_ptr_from_slot(slot, ptr.0);
+                emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+            }
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr(slot, id);
+                emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+            }
+        }
+        true
+    }
+
+    /// Emit a store directly from an immediate or register-resident value,
+    /// bypassing the `movl …,%eax; store %eax/…` round-trip. `%ecx` is the
+    /// indirect-address scratch, so a value held in %ecx only qualifies for
+    /// Direct-slot stores. Returns false to fall back to the accumulator path.
+    fn try_emit_store_direct(&mut self, val: &Operand, ptr: &Value, addr: SlotAddr, ty: IrType) -> bool {
+        let store_instr = self.store_instr_for_type(ty);
+        let Some(src) = self.direct_store_src(val, ty) else { return false };
+        if src == "%ecx" || src == "%cl" || src == "%cx" {
+            if !matches!(addr, SlotAddr::Direct(_)) {
+                return false;
+            }
+        }
+        match addr {
+            SlotAddr::Direct(slot) => {
+                let sr = self.slot_ref(slot);
+                emit!(self.state, "    {} {}, {}", store_instr, src, sr);
+            }
+            SlotAddr::Indirect(slot) => {
+                self.emit_load_ptr_from_slot(slot, ptr.0);
+                emit!(self.state, "    {} {}, (%ecx)", store_instr, src);
+            }
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr(slot, id);
+                emit!(self.state, "    {} {}, (%ecx)", store_instr, src);
+            }
+        }
+        true
+    }
+
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
@@ -75,6 +216,11 @@ impl I686Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
+        if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+            if self.try_emit_store_direct(val, ptr, addr, ty) {
+                return;
+            }
+        }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
@@ -128,6 +274,9 @@ impl I686Codegen {
                 self.emit_store_acc_pair(dest);
             }
             self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        if self.try_emit_load_direct(dest, ptr, ty) {
             return;
         }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
@@ -218,23 +367,64 @@ impl I686Codegen {
         // (allocator hands out %ebx/%esi/%edi/%ebp/%ecx/%edx only).
         if let Some(&phys) = self.reg_assignments.get(&base.0) {
             if !self.state.is_alloca(base.0) {
-                self.operand_to_eax(val);
                 let store_instr = self.store_instr_for_type(ty);
-                let src = self.eax_for_type(ty);
                 let base_name = phys_reg_name(phys);
-                if offset != 0 {
-                    emit!(self.state, "    {} {}, {}(%{})", store_instr, src, offset, base_name);
+                let dst = if offset != 0 {
+                    format!("{}(%{})", offset, base_name)
                 } else {
-                    emit!(self.state, "    {} {}, (%{})", store_instr, src, base_name);
+                    format!("(%{})", base_name)
+                };
+                // Accumulator-bypass: an immediate or register-resident value
+                // stores in one instruction (`movl $imm, 40(%ebx)` /
+                // `movl %esi, 40(%ebx)`) with %eax untouched.
+                if let Some(src) = self.direct_store_src(val, ty) {
+                    emit!(self.state, "    {} {}, {}", store_instr, src, dst);
+                    return;
                 }
+                self.operand_to_eax(val);
+                let src = self.eax_for_type(ty);
+                emit!(self.state, "    {} {}, {}", store_instr, src, dst);
                 return;
             }
         }
         // Delegate to default for other types
-        self.operand_to_eax(val);
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
             let store_instr = self.store_instr_for_type(ty);
+            // Accumulator-bypass: store an immediate / register-resident value
+            // in one instruction. Indirect forms use %ecx as the address
+            // scratch, so a value held in %ecx only qualifies for Direct slots.
+            if let Some(src) = self.direct_store_src(val, ty) {
+                let src_is_ecx = src == "%ecx" || src == "%cl" || src == "%cx";
+                match addr {
+                    SlotAddr::Direct(slot) => {
+                        let folded_slot = StackSlot(slot.0 + offset);
+                        let sr = self.slot_ref(folded_slot);
+                        emit!(self.state, "    {} {}, {}", store_instr, src, sr);
+                        return;
+                    }
+                    SlotAddr::Indirect(slot) if !src_is_ecx => {
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        emit!(self.state, "    {} {}, (%ecx)", store_instr, src);
+                        return;
+                    }
+                    SlotAddr::OverAligned(slot, id) if !src_is_ecx => {
+                        self.emit_alloca_aligned_addr(slot, id);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        emit!(self.state, "    {} {}, (%ecx)", store_instr, src);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            // Fallback: accumulator path (value staged in %eax, saved to %edx
+            // when the address scratch %ecx must be computed afterwards).
+            self.operand_to_eax(val);
             match addr {
                 SlotAddr::OverAligned(slot, id) => {
                     self.emit_save_acc();
@@ -332,11 +522,21 @@ impl I686Codegen {
             if !self.state.is_alloca(base.0) {
                 let load_instr = self.load_instr_for_type(ty);
                 let base_name = phys_reg_name(phys);
-                if offset != 0 {
-                    emit!(self.state, "    {} {}(%{}), %eax", load_instr, offset, base_name);
+                let mem = if offset != 0 {
+                    format!("{}(%{})", offset, base_name)
                 } else {
-                    emit!(self.state, "    {} (%{}), %eax", load_instr, base_name);
+                    format!("(%{})", base_name)
+                };
+                // Accumulator-bypass: load straight into the destination's
+                // register when one exists (i128 payloads need the pair path).
+                if !is_i128_type(ty) {
+                    if let Some(dphys) = self.dest_reg(dest) {
+                        let d = phys_reg_name(dphys);
+                        emit!(self.state, "    {} {}, %{}", load_instr, mem, d);
+                        return;
+                    }
                 }
+                emit!(self.state, "    {} {}, %eax", load_instr, mem);
                 self.state.reg_cache.invalidate_acc();
                 self.emit_store_result(dest);
                 return;
@@ -346,6 +546,37 @@ impl I686Codegen {
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
             let load_instr = self.load_instr_for_type(ty);
+            // Accumulator-bypass: load straight into the destination's register
+            // (i128 payloads need the 8-byte pair path).
+            let direct_dest = if is_i128_type(ty) {
+                None
+            } else {
+                self.dest_reg(dest).map(phys_reg_name)
+            };
+            if let Some(d) = direct_dest {
+                match addr {
+                    SlotAddr::OverAligned(slot, id) => {
+                        self.emit_alloca_aligned_addr(slot, id);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+                    }
+                    SlotAddr::Direct(slot) => {
+                        let folded_slot = StackSlot(slot.0 + offset);
+                        let sr = self.slot_ref(folded_slot);
+                        emit!(self.state, "    {} {}, %{}", load_instr, sr, d);
+                    }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+                    }
+                }
+                return;
+            }
             match addr {
                 SlotAddr::OverAligned(slot, id) => {
                     self.emit_alloca_aligned_addr(slot, id);
