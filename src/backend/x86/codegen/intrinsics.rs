@@ -20,7 +20,7 @@ use crate::ir::reexports::{
 use crate::common::types::IrType;
 use crate::backend::state::StackSlot;
 use crate::backend::regalloc::PhysReg;
-use super::emit::{is_xmm_reg, phys_reg_name, X86Codegen};
+use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_256, X86Codegen};
 
 impl X86Codegen {
     /// Load a float operand into %xmm0. Handles both Value operands (from stack)
@@ -351,6 +351,38 @@ impl X86Codegen {
             sse_inst,
             args.len()
         );
+
+        // A loop-carried accumulator and its backedge result are coalesced.
+        // When args[1] is the freshly produced/deferred value in an XMM
+        // register, update the assigned accumulator directly instead of
+        // copying both inputs through xmm0/xmm1 and copying the result back.
+        if let Some(&dest_reg) = self.reg_assignments.get(&dest_ptr.0) {
+            if is_xmm_reg(dest_reg) {
+                if let (Operand::Value(acc), Operand::Value(fresh)) = (&args[0], &args[1]) {
+                    let acc_same = self
+                        .reg_assignments
+                        .get(&acc.0)
+                        .is_some_and(|r| *r == dest_reg);
+                    let fresh_held = self.state.sse_last_store_reg
+                        && self.state.sse_last_store_val == Some(fresh.0);
+                    if acc_same && fresh_held {
+                        let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
+                        let target = phys_reg_name(dest_reg);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}", sse_inst, held, target));
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                        self.state.vec_live_regs.insert(dest_ptr.0, target);
+                        self.state.sse_last_store_val = Some(dest_ptr.0);
+                        self.state.sse_last_store_reg = true;
+                        self.state.sse_last_store_reg_name = Some(target);
+                        return;
+                    }
+                }
+            }
+        }
+
         let a1_last = matches!(&args[1], Operand::Value(v)
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
         if a1_last {
@@ -378,8 +410,27 @@ impl X86Codegen {
 
     pub(super) fn avx_load_arg_to(&mut self, arg: &Operand, ymm: &'static str) {
         if let Operand::Value(v) = arg {
-            // CCC_ENABLE_VECREG (reserved for 256-bit values; 128-bit-only pool
-            // in v5, so this is currently inert for ymm targets).
+            // Width-aware register allocation: PhysReg 20..33 names the SIMD
+            // register family; this AVX helper selects its YMM view. Consult
+            // the assignment at every block boundary because vec_live_regs is
+            // intentionally block-local.
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    let name = phys_reg_name_256(reg);
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    } else {
+                        self.flush_pending_vec_store_impl();
+                    }
+                    if name != ymm {
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqa %{}, %{}", name, ymm));
+                    }
+                    self.state.vec_last_store_reg = false;
+                    return;
+                }
+            }
+            // Value proven live in a YMM register within this block.
             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
                 if held != ymm {
                     self.state
@@ -433,8 +484,22 @@ impl X86Codegen {
     }
     pub(super) fn avx_load_arg(&mut self, arg: &Operand) { self.avx_load_arg_to(arg, "ymm0"); }
 
-    /// Store %ymm0 to a 256-bit operand's home slot.
+    /// Store %ymm0 to a 256-bit operand's register or home slot.
     pub(super) fn avx_store_dest(&mut self, dest_ptr: &Value) {
+        if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
+            if is_xmm_reg(reg) {
+                let name = phys_reg_name_256(reg);
+                if name != "ymm0" {
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqa %ymm0, %{}", name));
+                }
+                self.state.vec_live_regs.insert(dest_ptr.0, name);
+                self.state.vec_last_store_val = Some(dest_ptr.0);
+                self.state.vec_last_store_reg = true;
+                self.state.vec_last_store_reg_name = Some(name);
+                return;
+            }
+        }
         let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
         if deferred && std::env::var("CCC_DEBUG_VDEFER").is_ok() {
             eprintln!("[VDEFER-EMIT] deferring result store for dest_ptr={}", dest_ptr.0);
@@ -2483,16 +2548,10 @@ impl X86Codegen {
 IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                // %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
-                // Load vector from operand and reduce
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    // Direct load from slot
-                    self.state.out.emit_instr_rbp_reg("    vmovupd", slot.0 as i64, "ymm0");
-                } else {
-                    // Fallback: load pointer then dereference
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    vmovupd (%rax), %ymm0");
-                }
+                // %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64.
+                // The generic loader handles both a protected stack home and
+                // a width-aware register assignment.
+                self.avx_load_arg(&args[0]);
                 self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
                 self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1");
@@ -2506,14 +2565,7 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    // Direct load from slot
-                    self.state.out.emit_instr_rbp_reg("    movupd", slot.0 as i64, "xmm0");
-                } else {
-                    // Fallback: load pointer then dereference
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movupd (%rax), %xmm0");
-                }
+                self.sse_load_arg(&args[0], "xmm0");
                 self.state.emit("    movapd %xmm0, %xmm1");
                 self.state.emit("    unpckhpd %xmm0, %xmm1"); // xmm1 = {hi, hi}
                 self.state.emit("    addsd %xmm1, %xmm0");    // xmm0.lo = lo + hi
@@ -2639,12 +2691,7 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // 8×F32 → F32: cross-lane-safe halving reduction.
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    self.state.out.emit_instr_rbp_reg("    vmovups", slot.0 as i64, "ymm0");
-                } else {
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    vmovups (%rax), %ymm0");
-                }
+                self.avx_load_arg(&args[0]);
                 self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
                 self.state.emit("    vaddps %xmm1, %xmm0, %xmm0");      // [s0 s1 s2 s3]
                 self.state.emit("    vmovshdup %xmm0, %xmm1");           // [s1 s1 s3 s3]
@@ -2660,12 +2707,7 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // 4×F32 → F32 (SSE2-only instruction sequence).
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    self.state.out.emit_instr_rbp_reg("    movups", slot.0 as i64, "xmm0");
-                } else {
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movups (%rax), %xmm0");
-                }
+                self.sse_load_arg(&args[0], "xmm0");
                 self.state.emit("    movaps %xmm0, %xmm1");
                 self.state.emit("    movhlps %xmm0, %xmm1"); // xmm1 = [s2 s3 s2 s3]
                 self.state.emit("    addps %xmm1, %xmm0");  // [s0+s2, s1+s3, ..]
@@ -2681,19 +2723,30 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 let is8 = matches!(op, IntrinsicOp::VecZeroF32x8);
-                if is8 {
-                    self.state.emit("    vxorps %ymm0, %ymm0, %ymm0");
-                } else {
-                    self.state.emit("    xorps %xmm0, %xmm0");
-                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if let Some(slot) = self.state.get_slot(d.0) {
+                    let assigned = self
+                        .reg_assignments
+                        .get(&d.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r));
+                    if let Some(reg) = assigned {
+                        let name = if is8 { phys_reg_name_256(reg) } else { phys_reg_name(reg) };
                         if is8 {
-                            self.state.out.emit_instr_reg_rbp("    vmovups", "ymm0", slot.0 as i64);
+                            self.state.emit_fmt(format_args!(
+                                "    vxorps %{}, %{}, %{}", name, name, name
+                            ));
                         } else {
-                            self.state.out.emit_instr_reg_rbp("    movups", "xmm0", slot.0 as i64);
+                            self.state
+                                .emit_fmt(format_args!("    xorps %{}, %{}", name, name));
                         }
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else if is8 {
+                        self.state.emit("    vxorps %ymm0, %ymm0, %ymm0");
+                        self.avx_store_dest(d);
+                    } else {
+                        self.state.emit("    xorps %xmm0, %xmm0");
+                        self.sse_store_dest(d, "xmm0");
                     }
                 }
             }
@@ -2701,12 +2754,17 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
-                self.state.emit("    vxorpd %ymm0, %ymm0, %ymm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        // Store zero vector directly to stack slot
-                        self.state.out.emit_instr_reg_rbp("    vmovupd", "ymm0", slot.0 as i64);
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name_256(reg);
+                        self.state.emit_fmt(format_args!(
+                            "    vxorpd %{}, %{}, %{}", name, name, name
+                        ));
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else {
+                        self.state.emit("    vxorpd %ymm0, %ymm0, %ymm0");
+                        self.avx_store_dest(d);
                     }
                 }
             }
@@ -2714,12 +2772,16 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %dest_vec = {0.0, 0.0} - SSE2 2×F64
-                self.state.emit("    xorpd %xmm0, %xmm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if let Some(slot) = self.state.get_slot(d.0) {
-                        // Store zero vector directly to stack slot
-                        self.state.out.emit_instr_reg_rbp("    movupd", "xmm0", slot.0 as i64);
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name(reg);
+                        self.state
+                            .emit_fmt(format_args!("    xorpd %{}, %{}", name, name));
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else {
+                        self.state.emit("    xorpd %xmm0, %xmm0");
+                        self.sse_store_dest(d, "xmm0");
                     }
                 }
             }
@@ -2805,6 +2867,40 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
             avx_inst,
             args.len()
         );
+
+        // Direct loop-accumulator update. The allocator coalesces args[0], the
+        // backedge result, and dest into one YMM family. args[1] is commonly a
+        // deferred load/product still in ymm0, so the three-operand VEX form
+        // can update the accumulator without any register-renaming moves.
+        if let Some(&dest_reg) = self.reg_assignments.get(&dest_ptr.0) {
+            if is_xmm_reg(dest_reg) {
+                if let (Operand::Value(acc), Operand::Value(fresh)) = (&args[0], &args[1]) {
+                    let acc_same = self
+                        .reg_assignments
+                        .get(&acc.0)
+                        .is_some_and(|r| *r == dest_reg);
+                    let fresh_held = self.state.vec_last_store_reg
+                        && self.state.vec_last_store_val == Some(fresh.0);
+                    if acc_same && fresh_held {
+                        let held = self.state.vec_last_store_reg_name.unwrap_or("ymm0");
+                        let target = phys_reg_name_256(dest_reg);
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}, %{}",
+                            avx_inst, held, target, target
+                        ));
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                        self.state.vec_live_regs.insert(dest_ptr.0, target);
+                        self.state.vec_last_store_val = Some(dest_ptr.0);
+                        self.state.vec_last_store_reg = true;
+                        self.state.vec_last_store_reg_name = Some(target);
+                        return;
+                    }
+                }
+            }
+        }
+
         let mem_of = |this: &Self, arg: &Operand| -> Option<String> {
             match arg {
                 Operand::Value(v) => {
@@ -2826,6 +2922,7 @@ IntrinsicOp::VecHorizontalAddF64x4 => {
         // value flows into dst through %ymm0, so its pending slot store is
         // void — exactly the same consumption contract as avx_load_arg_to.
         if commutative
+            && self.state.vec_last_store_reg_name == Some("ymm0")
             && matches!(&args[1], Operand::Value(v)
                 if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0))
         {

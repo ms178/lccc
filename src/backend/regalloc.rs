@@ -469,10 +469,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // resolve_slot_addr() directly (not register-aware).
     remove_ineligible_operands(func, &mut eligible, config);
 
-    // ParamRef destinations must not take ABI argument registers from the
-    // caller-saved pool (rdi/rsi/r8/r9/...): those still hold *other* params'
-    // incoming values when ParamRefs are emitted. Restrict to callee-saved
-    // (phase 1 / 2c) or stack.
+    // Most backends cannot put ParamRef destinations in their caller-saved
+    // pool: those registers may still hold other incoming parameters.  x86-64
+    // is the exception because its prologue emits the resulting assignments as
+    // one ordered parallel-copy set (including cycle breaking).  Other targets
+    // retain the old callee-saved-or-stack restriction.
+    let x86_ordered_param_copies = !crate::common::types::target_is_32bit()
+        && config.available_regs.iter().any(|r| r.0 == 1)
+        && config.caller_saved_regs.iter().any(|r| r.0 == 10)
+        // Multi-block functions keep using callee-saved homes: consuming
+        // r11/r10 with long-lived parameters displaced hotter loop/CFG
+        // temporaries and added instructions in reductions even when a late
+        // analysis failed to mark their transformed loop depth.  A one-block
+        // leaf has no control-flow ambiguity and cannot amortize push/pop.
+        && func.blocks.len() == 1
+        && std::env::var("CCC_NO_LEAF_PARAM_GPR").is_err();
     let mut param_ref_values: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -812,7 +823,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             eligible.contains(&iv.value_id)
                 && iv.end > iv.start
                 && !spans_any_call(iv, call_points)
-                && !param_ref_values.contains(&iv.value_id)
+                && (x86_ordered_param_copies
+                    || !param_ref_values.contains(&iv.value_id))
         };
 
         if let Some((ecx_hazards, edx_hazards)) = hazards {
@@ -1035,12 +1047,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // AArch64 (allocator IDs 40..47 → v16..v23) additionally allocates
-    // 128-bit vector values and copy-form F64 values (loop accumulators)
-    // to FP/SIMD registers; other targets keep those stack-homed because
-    // their emitters are not register-aware for them.
+    // AArch64 (allocator IDs 40..47 → v16..v23) allocates its complete
+    // register-aware vector set and copy-form F64 loop accumulators. x86-64
+    // admits only the exact F32/F64 reduction web proven safe by the
+    // width/class-aware collector above; arbitrary SIMD values retain their
+    // protected stack homes.
     let (vector_values, f64_value_set) = if arm_fp_pool {
         (collect_vector_values(func), collect_f64_values(func))
+    } else if config.xmm_regs.first().is_some_and(|r| r.0 == 20)
+        && std::env::var("CCC_NO_REDUCTION_VECREG").is_err()
+    {
+        (collect_x86_reduction_vector_values(func), FxHashSet::default())
     } else {
         (FxHashSet::default(), FxHashSet::default())
     };
@@ -1104,8 +1121,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // they don't need a register and would starve values that do.
             .filter(|iv| !arm_fp_pool || real_use.contains(&iv.value_id))
             // Only include values that are actually scalar F64/F32 (not i128,
-            // not long double, etc.) — plus (AArch64) 128-bit vector values
-            // and copy-form F64 values.
+            // not long double, etc.) — plus the backend's explicitly
+            // register-aware vector values and (AArch64) copy-form F64.
             .filter(|iv| {
                 vector_values.contains(&iv.value_id) || f64_value_set.contains(&iv.value_id) || {
                     if arm_fp_pool {
@@ -1278,17 +1295,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // AArch64 FP phi coalescing: give the value copied into a loop-carried
-    // F64/vector accumulator at the backedge the accumulator's own register,
-    // eliminating the backedge fmov/mov from the loop's serial dependency
-    // chain (e.g. `fmadd d16, .., d16` instead of fmadd into a temp + fmov).
-    if arm_fp_pool {
+    // FP/SIMD phi coalescing: give the value copied into a loop-carried
+    // accumulator at the backedge the accumulator's own register, eliminating
+    // the serial-chain copy. AArch64 applies this to scalar F64 and vectors;
+    // x86 applies it only to the conservative reduction-vector set.
+    if arm_fp_pool || !vector_values.is_empty() {
         for candidate in &all_phi_pairs {
             let phi_dest = candidate.phi_dest;
             let backedge_src = candidate.backedge_src;
-            // FP pool spans caller-saved d16..d31 (40..=55) AND callee-saved
-            // d8..d14 (32..=38) — both are valid coalesce targets.
-            let is_fp = |r: &PhysReg| (32..=38).contains(&r.0) || (40..=55).contains(&r.0);
+            let is_fp = |r: &PhysReg| {
+                if arm_fp_pool {
+                    // d8..d14 plus d16..d31.
+                    (32..=38).contains(&r.0) || (40..=55).contains(&r.0)
+                } else {
+                    // xmm/ymm2..15, selected by operand width at emission.
+                    (20..=33).contains(&r.0)
+                }
+            };
             let d_reg = assignments.get(&phi_dest).copied().filter(is_fp);
             let s_reg = assignments.get(&backedge_src).copied().filter(is_fp);
             let (Some(d), Some(s)) = (d_reg, s_reg) else { continue };
@@ -1881,6 +1904,187 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool, arm_fp_pool: bool) 
     }
 
     non_gpr_values
+}
+
+/// Collect x86 auto-vectorizer reduction values whose complete def/use web is
+/// understood by the width-aware XMM/YMM emitter.  This is deliberately much
+/// narrower than `produces_vector_value()`: arbitrary user-intrinsic values can
+/// flow to memcpy, stores, calls, or width-changing operations which still need
+/// protected stack homes.
+///
+/// The accepted web consists only of F32/F64 zero/load/add/mul producers,
+/// same-width Copies, and a final same-width horizontal reduction. Any other
+/// mention invalidates the whole connected copy web. This keeps 128- and
+/// 256-bit values disjoint while admitting the loop-carried accumulators that
+/// otherwise spill every iteration.
+fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    let class_of = |op: &O| -> Option<u8> {
+        match op {
+            O::VecZeroF32x8 | O::VecLoadF32x8 | O::VecAddF32x8 | O::VecMulF32x8 => Some(1),
+            O::VecZeroF64x4 | O::VecLoadF64x4 | O::VecAddF64x4 | O::VecMulF64x4 => Some(2),
+            O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4 => Some(3),
+            O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2 => Some(4),
+            _ => None,
+        }
+    };
+    let legal_consumer = |op: &O, class: u8| -> bool {
+        match class {
+            1 => matches!(op, O::VecAddF32x8 | O::VecMulF32x8 | O::VecHorizontalAddF32x8),
+            2 => matches!(op, O::VecAddF64x4 | O::VecMulF64x4 | O::VecHorizontalAddF64x4),
+            3 => matches!(op, O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4),
+            4 => matches!(op, O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2),
+            _ => false,
+        }
+    };
+
+    // Keep the scratch-register proof local: calls, inline assembly, memcpy,
+    // and any other intrinsic family may clobber an XMM/YMM register without
+    // expressing that clobber as a vector SSA use. Such functions retain the
+    // mature protected-stack path.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::InlineAsm { .. }
+                | Instruction::Memcpy { .. } => return FxHashSet::default(),
+                Instruction::Intrinsic { op, .. }
+                    if class_of(op).is_none()
+                        && !matches!(
+                            op,
+                            O::VecHorizontalAddF32x8 | O::VecHorizontalAddF64x4
+                                | O::VecHorizontalAddF32x4 | O::VecHorizontalAddF64x2
+                        ) =>
+                {
+                    return FxHashSet::default();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut classes: FxHashMap<u32, u8> = FxHashMap::default();
+    let mut conflicts: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+                if let Some(class) = class_of(op) {
+                    if classes.insert(d.0, class).is_some_and(|old| old != class) {
+                        conflicts.insert(d.0);
+                    }
+                }
+            }
+        }
+    }
+    // Phi elimination represents loop-carried vector values as Copy webs.
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(src) } = inst {
+                    if let Some(&class) = classes.get(&src.0) {
+                        match classes.get(&dest.0) {
+                            Some(&old) if old != class => {
+                                conflicts.insert(dest.0);
+                            }
+                            None => {
+                                classes.insert(dest.0, class);
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for value in conflicts {
+        classes.remove(&value);
+    }
+
+    // Reject any value with a consumer outside the exact width-aware family.
+    // Iterate because rejecting one side of a Copy must reject its whole web.
+    loop {
+        let mut bad: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let mut allowed: FxHashSet<u32> = FxHashSet::default();
+                match inst {
+                    Instruction::Copy { dest, src: Operand::Value(src) } => {
+                        if classes.get(&dest.0) == classes.get(&src.0) && classes.contains_key(&src.0) {
+                            allowed.insert(src.0);
+                        }
+                        if classes.contains_key(&dest.0) && !allowed.contains(&src.0) {
+                            bad.insert(dest.0);
+                        }
+                    }
+                    Instruction::Intrinsic { op, args, .. } => {
+                        for arg in args {
+                            if let Operand::Value(v) = arg {
+                                if classes.get(&v.0).is_some_and(|&w| legal_consumer(op, w)) {
+                                    allowed.insert(v.0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        if classes.contains_key(&v.0) && !allowed.contains(&v.0) {
+                            bad.insert(v.0);
+                        }
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    if classes.contains_key(&v.0) && !allowed.contains(&v.0) {
+                        bad.insert(v.0);
+                    }
+                });
+            }
+            for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    if classes.contains_key(&v.0) {
+                        bad.insert(v.0);
+                    }
+                }
+            });
+        }
+        if bad.is_empty() {
+            break;
+        }
+        let old_len = classes.len();
+        for value in bad {
+            classes.remove(&value);
+        }
+        if classes.len() == old_len {
+            break;
+        }
+    }
+
+    // Keep only the loop-carried Copy web (phi destination plus its entry and
+    // backedge producers). Single-use loads/multiplies already use the
+    // deferred-register path; allocating each of them independently would add
+    // a YMM-to-YMM move after every producer and lose more than the accumulator
+    // spill removal saves.
+    let mut copy_web: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Copy { dest, src: Operand::Value(src) } = inst {
+                if classes.get(&dest.0) == classes.get(&src.0) && classes.contains_key(&src.0) {
+                    copy_web.insert(dest.0);
+                    copy_web.insert(src.0);
+                }
+            }
+        }
+    }
+    classes.retain(|value, _| copy_web.contains(value));
+    classes.into_keys().collect()
 }
 
 /// Collect SSA values that hold 128/256-bit vector data: destinations of

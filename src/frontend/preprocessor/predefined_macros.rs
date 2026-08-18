@@ -426,6 +426,16 @@ impl Preprocessor {
         }
     }
 
+    /// Define `__FAST_MATH__` when the command line explicitly permits FP
+    /// reassociation. Ordinary optimization levels must not define it.
+    pub fn set_fast_math(&mut self, enabled: bool) {
+        if enabled {
+            self.define_simple_macro("__FAST_MATH__", "1");
+        } else {
+            self.macros.undefine("__FAST_MATH__");
+        }
+    }
+
     /// Define or undefine __PIC__/__pic__ based on whether PIC mode is active.
     /// GCC defines these to 1 for -fpic and 2 for -fPIC; we always use 2.
     /// When PIC is disabled (e.g. -fno-PIC), these must not be defined, as

@@ -133,19 +133,13 @@ pub(super) fn function_makes_calls(func: &IrFunction) -> bool {
     })
 }
 
-/// PhysReg ids 10-15 are the caller-saved GPR pool (r11, r10, r8, r9, rdi,
-/// rsi). See `X86_CALLER_SAVED` in the x86 emitter.
-///
-/// Only r11 (id 10) and r10 (id 11) are safe as parameter homes. The other
-/// four ARE SysV integer argument registers, so writing a parameter's home
-/// there in the prologue destroys another parameter's incoming value whenever
-/// that parameter is materialised in the function BODY rather than by a
-/// prologue move (`movslq %r8d, %rdi` in a 9-argument callee read r8 after
-/// param 2's home had already overwritten it). The prologue's parallel-copy
-/// ordering only sequences the moves it emits itself and cannot protect body
-/// reads, so the ABI-overlapping registers are excluded here instead.
-pub(super) fn is_scratch_gpr(phys: PhysReg) -> bool {
-    matches!(phys.0, 10 | 11)
+/// x86-64 caller-saved GPR allocator IDs.  In a leaf function these are stable
+/// parameter homes: emit_store_params first captures every stack-backed ABI
+/// argument, then emits all register-backed parameters as one ordered parallel
+/// copy (breaking cycles through reserved RAX).  Therefore even ABI-overlapping
+/// homes r8/r9/rdi/rsi/rdx cannot destroy a later incoming value.
+pub(super) fn is_leaf_caller_gpr(phys: PhysReg) -> bool {
+    matches!(phys.0, 10..=16)
 }
 
 pub(super) fn find_dead_param_allocas(
@@ -181,14 +175,11 @@ pub(super) fn find_dead_param_allocas(
                     // - a callee-saved GPR (survives calls, never clobbered);
                     // - an XMM register (PhysReg 20+), which the allocator
                     //   only assigns to values that do NOT span calls.
-                    // - r11/r10 in a LEAF function. These two are the only
-                    //   caller-saved GPRs that are not also SysV argument
-                    //   registers, so homing a parameter there cannot destroy
-                    //   another parameter's incoming value; and with no calls
-                    //   in the function nothing clobbers them either. The
-                    //   remaining caller-saved GPRs (r8/r9/rdi/rsi) ARE
-                    //   argument registers and stay excluded.
-                    // Allowing it removes a store AND a reload per parameter.
+                    // - any caller-saved GPR in a LEAF function. The x86
+                    //   prologue captures stack-backed params first and emits
+                    //   register homes as an ordered parallel copy, so even an
+                    //   ABI-overlapping home cannot clobber a pending argument.
+                    // Allowing this removes a store AND reload per parameter.
                     // `int cmp(const void*a, const void*b){return *(int*)a -
                     // *(int*)b;}` went from 11 instructions with a 24-byte
                     // frame to GCC's 3.
@@ -196,7 +187,7 @@ pub(super) fn find_dead_param_allocas(
                     let has_stable_home = reg_assigned.get(&dest_id)
                         .map(|phys| callee_saved_regs.contains(phys)
                              || phys.0 >= 20
-                             || (leaf && is_scratch_gpr(*phys)))
+                             || (leaf && is_leaf_caller_gpr(*phys)))
                         .unwrap_or(false);
                     if has_stable_home {
                         dead.insert(pv.0);

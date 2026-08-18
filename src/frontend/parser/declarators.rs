@@ -358,7 +358,7 @@ impl Parser {
                 // Capture whether the base type (before pointer declarators) was const.
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
-                let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls, inner_ptr_depth) =
+                let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls, inner_ptr_depth, param_is_restrict) =
                     self.parse_param_declarator_full();
                 self.skip_gcc_extensions();
 
@@ -396,7 +396,7 @@ impl Parser {
 
                 self.attrs.set_const(saved_const);
                 self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
+                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_restrict: param_is_restrict, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
             } else {
                 self.attrs.set_const(saved_const);
                 self.attrs.set_noreturn(saved_noreturn);
@@ -423,6 +423,7 @@ impl Parser {
                 name: Some(n),
                 fptr_params: None,
                 is_const: false,
+                is_restrict: false,
                 vla_size_exprs: Vec::new(),
                 fptr_inner_ptr_depth: 0,
             });
@@ -436,11 +437,19 @@ impl Parser {
 
     /// Parse a parameter declarator with full type information.
     /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth).
-    pub(super) fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>, u32) {
+    pub(super) fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>, u32, bool) {
         let mut pointer_depth: u32 = 0;
+        let mut is_restrict = false;
         while self.consume_if(&TokenKind::Star) {
             pointer_depth += 1;
+            // Preserve the optimization-significant qualifier instead of
+            // dropping it with const/volatile. Scan exactly the qualifier run
+            // attached to this `*`, before nested function declarators begin.
+            let qualifier_start = self.pos;
             self.skip_cv_qualifiers();
+            is_restrict |= self.tokens[qualifier_start..self.pos]
+                .iter()
+                .any(|tok| matches!(tok.kind, TokenKind::Restrict));
             // Also skip __attribute__(...) after pointer qualifiers.
             // E.g., `int * __attribute__((unused)) p` is valid GNU C.
             self.skip_gcc_extensions();
@@ -493,7 +502,7 @@ impl Parser {
             fptr_params = Some(fp_params);
         }
 
-        (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth)
+        (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth, is_restrict)
     }
 
     /// Parse a parenthesized parameter declarator: (*name)(params), (name), etc.

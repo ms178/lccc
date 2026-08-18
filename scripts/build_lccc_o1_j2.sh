@@ -8,6 +8,11 @@ set -euo pipefail
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
+# Rust/linker peaks exceed physical memory on the constrained research host.
+# The helper is a no-op when any swap is already active and recreates the
+# disposable /swapfile after an Arena root-filesystem reset.
+"$repo_root/scripts/ensure_swap.sh"
+
 # Cargo has no direct `-O1` CLI spelling.  This profile override is the Cargo/
 # rustc equivalent and is intentionally scoped to this invocation.
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=1

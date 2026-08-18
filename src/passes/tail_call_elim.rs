@@ -690,7 +690,7 @@ mod tests {
             .iter()
             .map(|&ty| IrParam {
                 ty,
-                struct_size: None,
+                noalias: false, struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,

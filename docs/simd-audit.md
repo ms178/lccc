@@ -890,3 +890,52 @@ Derived block counts also drive 16-byte alignment for hot loop headers and join
 points, with 32-byte alignment for very hot larger loops. The `pgo_sections`
 roundtrip covers section splitting, alignment, and output equivalence. Assembler
 relaxation fixes apply to both PGO and non-PGO builds.
+
+---
+
+# 2026-08-18 — four-oracle SIMD/FP audit follow-up
+
+The detailed reproducible report is `docs/simd-fp-oracle.md`.
+
+## Accomplished
+
+1. Strict FP reductions preserve source order unless explicit reassociation or
+   fast math is enabled; the umbrella `-ffast-math` defines `__FAST_MATH__`.
+2. C `restrict` now reaches IR `noalias`; unrestricted parameter roots are
+   conservatively treated as possibly overlapping.
+3. A standalone 50-function strict/fast corpus is compared with live GCC 16.2,
+   Clang 22.1.0, ICC 2021.10, and latest ICX through Compiler Explorer.
+4. Alias-guarded scalar destructive-FMA destination coalescing removes six
+   instructions from `p50_distance3_f64` (28 -> 22; best oracle remains 9).
+5. Runtime and structural assembly regressions cover legal direct FMA,
+   multiplicand/destination alias fallback, and incoming stack FP parameters.
+6. Ordered ABI/caller-saved homes remove leaf parameter copies and frames;
+   p50 moved from the post-FMA 22 instructions to 14 with no corpus regression.
+7. Conservative scalar VEX memory-source folding improved 12/50 patterns and
+   removed 19 instructions with no static regression. p50 is now 11; a paired
+   stencil5 VM screen measured ratio 0.8694 [0.8474, 0.8930].
+8. Exact-class XMM/YMM allocation keeps five F32/F64 reduction accumulators out
+   of stack slots. All five improve statically; paired sum+dot VM screening
+   measured ratio 0.5021 [0.4589, 0.5908], 23/24 register-version wins.
+
+## Highest-value next-session backlog
+
+1. **Reduction loop overhead.** Register accumulators are complete for the
+   exact F32/F64 reduction family, but dot/sum setup and tails remain large.
+   The late remainder `/8` still emits `idiv`: direct UDiv/LShr and
+   post-vectorization strength-reduction attempts were rejected because each
+   skipped the n=17 matmul tail. Fix that SSA/narrowing defect first; then remove
+   the dot-product transient stack temporary under fast-contract legality.
+2. **Store-loop vectorization.** Cover legal F32/F64 maps, affine kernels,
+   conversions, masks/min/max, and stencils with alias/tail checks.
+3. **Multi-reduction allocation and local SLP.** Keep independent accumulators
+   live and pack fixed-size distance/complex/stencil operations.
+4. **Workload/provenance expansion.** Add zlib-ng/gzip, expat, SQLite, Linux,
+   and glibc variants with license/source records and end-to-end checks.
+5. **Measurement.** Preserve per-case gains/regressions and raw randomized
+   paired samples.  This VM has no PMU; Raptor Lake superiority claims require
+   counter-backed bare-metal validation on the target i7-14700KF.
+
+Correctness remains a hard barrier: never reassociate strict FP, infer noalias
+from distinct SSA values, or use a destructive x86 form without proving that
+its input operands survive destination overwrite.

@@ -670,7 +670,7 @@ mod tests {
         IrFunction {
             name: "loop_fn".into(),
             return_type: IrType::I32,
-            params: vec![IrParam{ty:IrType::I32,struct_size:None,struct_align:None,struct_eightbyte_classes:vec![],is_f128_sse:false,riscv_float_class:None}],
+            params: vec![IrParam{ty:IrType::I32,noalias:false,struct_size:None,struct_align:None,struct_eightbyte_classes:vec![],is_f128_sse:false,riscv_float_class:None}],
             blocks: vec![
                 mk(0, vec![], Terminator::Branch(BlockId(1))),
                 mk(1, vec![], Terminator::CondBranch{

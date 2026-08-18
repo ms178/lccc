@@ -112,10 +112,16 @@ fn take_reject() -> Option<&'static str> {
 
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
-    vectorize_with_analysis_mode(func, cfg, false, false)
+    vectorize_with_analysis_mode(func, cfg, false, false, false)
 }
 
-fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_two_wide: bool, neon: bool) -> usize {
+fn vectorize_with_analysis_mode(
+    func: &mut IrFunction,
+    cfg: &CfgAnalysis,
+    force_two_wide: bool,
+    neon: bool,
+    fp_reassoc: bool,
+) -> usize {
     let num_blocks = func.blocks.len();
     let loops = loop_analysis::find_natural_loops(
         num_blocks,
@@ -188,6 +194,23 @@ fn vectorize_with_analysis_mode(func: &mut IrFunction, cfg: &CfgAnalysis, force_
                 total_changes += transform_to_fma_f64x4(func, &pattern);
             }
         } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon) {
+            // Packed FP reductions reassociate additions across SIMD lanes.
+            // That is observably different for IEEE-754 values (for example
+            // [1e100, 1, -1e100, 1] sums to 1 in source order but 2 after a
+            // four-lane tree reduction). GCC/Clang likewise require an
+            // explicit fast-math/associative-math contract for this rewrite.
+            if matches!(red_pattern.element_type, IrType::F32 | IrType::F64)
+                && !fp_reassoc
+            {
+                if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
+                    eprintln!(
+                        "[VEC] Loop {} (header block {}) not vectorized: floating-point reduction requires -fassociative-math or -ffast-math",
+                        idx, loop_info.header
+                    );
+                }
+                continue;
+            }
+
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
             let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
@@ -742,6 +765,23 @@ fn analyze_loop_pattern(
             return None;
         }
     };
+
+    // C must be provably disjoint from BOTH read streams. Merely seeing
+    // different parameter SSA values is insufficient: callers may pass c=b+1
+    // or c=a, in which case vectorization changes loop-carried data.
+    let c_root = proven_object_root(func, c_gep)?;
+    let b_root = proven_object_root(func, b_gep)?;
+    let a_root = proven_object_root(func, a_ptr)?;
+    if !roots_proven_distinct(&c_root, &b_root)
+        || !roots_proven_distinct(&c_root, &a_root)
+    {
+        if debug {
+            eprintln!("[VEC]   Rejecting matmul: C may alias source (C={:?}, B={:?}, A={:?})",
+                c_root, b_root, a_root);
+        }
+        set_reject("matmul destination may alias A/B (use restrict or runtime versioning)");
+        return None;
+    }
 
     Some(VectorizablePattern {
         header_idx,
@@ -1615,6 +1655,70 @@ fn analyze_reduction_pattern(
     }
 }
 
+/// Identity of a pointer's statically-known base object.
+///
+/// Parameter roots are retained even when they are not `restrict`: this lets
+/// `roots_proven_distinct` use the contract if either side is restrict while
+/// correctly treating two ordinary pointer parameters as possibly aliasing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProvenObjectRoot {
+    Global(String),
+    Alloca(u32),
+    Param { index: usize, noalias: bool },
+}
+
+/// Follow pointer-preserving IR operations to a global, local alloca, or
+/// parameter. Loads and arbitrary arithmetic stop the proof. The walk is
+/// deliberately bounded/cycle-safe because malformed copy cycles must make an
+/// optimization fail closed, never hang compilation.
+fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoot> {
+    let mut cur = start;
+    let mut seen = FxHashSet::default();
+    for _ in 0..128 {
+        if !seen.insert(cur) {
+            return None;
+        }
+        let defining = func.blocks.iter().find_map(|block| {
+            block.instructions.iter().find(|inst| inst.dest() == Some(cur))
+        })?;
+        match defining {
+            Instruction::GlobalAddr { name, .. } => {
+                return Some(ProvenObjectRoot::Global(name.clone()));
+            }
+            Instruction::Alloca { dest, .. } => {
+                return Some(ProvenObjectRoot::Alloca(dest.0));
+            }
+            Instruction::ParamRef { param_idx, .. } => {
+                let noalias = func.params.get(*param_idx).is_some_and(|p| p.noalias);
+                return Some(ProvenObjectRoot::Param { index: *param_idx, noalias });
+            }
+            Instruction::GetElementPtr { base, .. } => cur = *base,
+            Instruction::Copy { src: Operand::Value(src), .. }
+            | Instruction::Cast { src: Operand::Value(src), .. } => cur = *src,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// C object identity and restrict rules sufficient for vectorization legality.
+/// Distinct globals/allocas cannot overlap. Parameter pointers are only
+/// disjoint when at least one carries `restrict`; otherwise different SSA
+/// value numbers prove nothing (the old implementation made exactly that
+/// unsound inference and miscompiled shifted in-place maps/matmuls).
+fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
+    if a == b {
+        return false;
+    }
+    match (a, b) {
+        (ProvenObjectRoot::Param { noalias: a_noalias, .. },
+         ProvenObjectRoot::Param { noalias: b_noalias, .. }) => *a_noalias || *b_noalias,
+        (ProvenObjectRoot::Param { noalias, .. }, _)
+        | (_, ProvenObjectRoot::Param { noalias, .. }) => *noalias,
+        _ => true,
+    }
+}
+
 /// Pattern matching result for a vectorizable map loop:
 /// `dst[i] = src[i] * scale + offset` with loop-invariant scale/offset.
 #[derive(Debug)]
@@ -1833,60 +1937,14 @@ fn analyze_map_pattern(
         _ => return None,
     };
 
-    // Alias safety: the two GEP base pointers must be provably distinct
-    // (separate globals and/or allocas). Anything else (e.g. two parameters)
-    // could overlap, and a 4-wide store would clobber not-yet-read source lanes.
-    let gep_base = |gep: Value| -> Option<Value> {
-        match find_inst_in_loop(func, &loop_info.body, gep)? {
-            (_, Instruction::GetElementPtr { base, .. }) => Some(*base),
-            _ => None,
-        }
-    };
-    let resolve_root = |start: Value| -> Value {
-        // Follow Copy chains to the underlying GlobalAddr/Alloca value.
-        let mut cur = start;
-        for _ in 0..64 {
-            let mut next = cur;
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::Copy { dest, src: Operand::Value(src) } = inst {
-                        if *dest == cur { next = *src; }
-                    }
-                }
-            }
-            if next == cur { break; }
-            cur = next;
-        }
-        cur
-    };
-    let root_kind = |v: Value| -> Option<u64> {
-        // A stable identity for a non-aliasing base: GlobalAddr by name hash,
-        // Alloca by value id.
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if inst.dest() == Some(v) {
-                    return match inst {
-                        Instruction::GlobalAddr { name, .. } => {
-                            let mut h = 0xcbf29ce484222325u64;
-                            for b in name.as_bytes() {
-                                h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
-                            }
-                            Some(h)
-                        }
-                        Instruction::Alloca { .. } => Some(0x100000000 + v.0 as u64),
-                        _ => None,
-                    };
-                }
-            }
-        }
-        None
-    };
-    let dst_resolved = resolve_root(gep_base(dst_gep)?);
-    let src_resolved = resolve_root(gep_base(src_gep)?);
-    let dst_root = root_kind(dst_resolved).unwrap_or(0x200000000 + dst_resolved.0 as u64);
-    let src_root = root_kind(src_resolved).unwrap_or(0x200000000 + src_resolved.0 as u64);
-    if dst_root == src_root {
-        if debug { eprintln!("[VEC-MAP]   Bases not provably distinct"); }
+    // Alias safety: identify the complete pointer roots. Different SSA value
+    // numbers are NOT an alias proof; ordinary pointer parameters may overlap.
+    // Distinct restrict parameters and distinct globals/allocas are legal.
+    let dst_root = proven_object_root(func, dst_gep)?;
+    let src_root = proven_object_root(func, src_gep)?;
+    if !roots_proven_distinct(&dst_root, &src_root) {
+        if debug { eprintln!("[VEC-MAP]   Bases not provably distinct: {:?} vs {:?}", dst_root, src_root); }
+        set_reject("map source/destination may alias (use restrict or runtime versioning)");
         return None;
     }
 
@@ -2475,6 +2533,10 @@ fn insert_remainder_loop(
     } else {
         Instruction::BinOp {
             dest: j_rem_start,
+            // Preserve the original signed IV operation.  This is inserted
+            // after div-by-constant and currently survives as `idivl`; directly
+            // substituting UDiv/LShr (or rerunning div-by-constant here) breaks
+            // the n=17 scalar tail.  Optimize only after that SSA bug is fixed.
             op: IrBinOp::SDiv,
             lhs: Operand::Value(pattern.iv),   // Final byte offset
             rhs: Operand::Const(IrConst::I32(8)),  // sizeof(double)
@@ -3779,6 +3841,9 @@ fn insert_reduction_remainder_loop(
             if byte_offset_iv {
                 Instruction::BinOp {
                     dest: i_rem_start,
+                    // Preserve the signed scalar-IV operation.  This late
+                    // division is a known codegen TODO: replacing it directly
+                    // with UDiv/LShr currently corrupts matmul's scalar tail.
                     op: IrBinOp::SDiv,
                     lhs: Operand::Value(pattern.iv),
                     rhs: Operand::Const(IrConst::I32(element_size as i32)),
@@ -5944,8 +6009,17 @@ fn insert_map_remainder_loop(
     4
 }
 
-/// Run SSE2 vectorization on a function (builds CFG analysis if needed).
+/// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
+    vectorize_function_mode(func, false)
+}
+
+/// Run x86 vectorization with an explicit FP-reassociation contract.
+pub(crate) fn vectorize_function_fast_math(func: &mut IrFunction) -> usize {
+    vectorize_function_mode(func, true)
+}
+
+fn vectorize_function_mode(func: &mut IrFunction, fp_reassoc: bool) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
@@ -5975,7 +6049,7 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
     }
 
     let cfg = CfgAnalysis::build(func);
-    let changes = vectorize_with_analysis(func, &cfg);
+    let changes = vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc);
 
     // The transforms replace the scalar accumulation with vector intrinsics but
     // leave the orphaned scalar load/mul/GEP/offset chain behind for the global
@@ -6092,5 +6166,10 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
 /// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true)
+    vectorize_with_analysis_mode(func, &cfg, true, true, false)
+}
+
+pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
+    let cfg = CfgAnalysis::build(func);
+    vectorize_with_analysis_mode(func, &cfg, true, true, true)
 }

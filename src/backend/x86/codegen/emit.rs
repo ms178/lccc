@@ -134,6 +134,31 @@ pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
     reg.0 >= 20 && reg.0 <= 33
 }
 
+/// Map an XMM allocator register to the corresponding 256-bit AVX name.
+/// PhysReg identity is shared across XMM/YMM widths; the vector intrinsic
+/// itself supplies the width, so width-specific emission belongs here rather
+/// than in the allocator.
+#[inline]
+pub(super) fn phys_reg_name_256(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        20 => "ymm2",
+        21 => "ymm3",
+        22 => "ymm4",
+        23 => "ymm5",
+        24 => "ymm6",
+        25 => "ymm7",
+        26 => "ymm8",
+        27 => "ymm9",
+        28 => "ymm10",
+        29 => "ymm11",
+        30 => "ymm12",
+        31 => "ymm13",
+        32 => "ymm14",
+        33 => "ymm15",
+        _ => unreachable!("invalid x86 SIMD register index {}", reg.0),
+    }
+}
+
 /// Map a PhysReg index to its x86-64 32-bit sub-register name.
 /// Handles both callee-saved (1-5) and caller-saved (10-15) registers.
 #[inline]
@@ -3729,60 +3754,51 @@ impl ArchCodegen for X86Codegen {
         if let Operand::Value(v) = src {
             if self.state.vector_values.contains(&v.0) {
                 let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+                let is_128 = self.state.vector128_values.contains(&v.0);
                 if debug {
-                    eprintln!("[COPY-VEC] Copying vector SSA {} to SSA {}", v.0, dest.0);
+                    eprintln!(
+                        "[COPY-VEC] Copying {}-bit vector SSA {} to SSA {}",
+                        if is_128 { 128 } else { 256 },
+                        v.0,
+                        dest.0
+                    );
                 }
-                if let (Some(src_slot), Some(dest_slot)) =
-                    (self.state.get_slot(v.0), self.state.get_slot(dest.0))
-                {
-                    if src_slot.0 == dest_slot.0 {
-                        // Copy to the same home slot is a no-op; skipping avoids
-                        // a pointless ymm load/store round-trip per vector op.
-                        self.state.vector_values.insert(dest.0);
-                        return;
+
+                // Coalesced loop-carried vectors already occupy the same
+                // physical SIMD register; their entry/backedge copies vanish.
+                let src_reg = self.reg_assignments.get(&v.0).copied().filter(|r| is_xmm_reg(*r));
+                let dest_reg = self.reg_assignments.get(&dest.0).copied().filter(|r| is_xmm_reg(*r));
+                if let (Some(s), Some(d)) = (src_reg, dest_reg) {
+                    let held = if is_128 { phys_reg_name(s) } else { phys_reg_name_256(s) };
+                    let target = if is_128 { phys_reg_name(d) } else { phys_reg_name_256(d) };
+                    if s != d {
+                        let mov = if is_128 { "movdqa" } else { "vmovdqa" };
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}", mov, held, target));
                     }
-                    // Copy vector from src slot to dest slot. The width MUST
-                    // match the value: a 128-bit (SSE2) vector copied with a
-                    // 256-bit vmovupd reads 16 bytes past its slot and writes
-                    // 16 bytes past the destination, corrupting neighbouring
-                    // locals (reproduced: LCCC_FORCE_SSE2=1 dot-product
-                    // clobbered main()'s loop bound with garbage).
-                    let is_128 = self.state.vector128_values.contains(&v.0);
-                    if debug {
-                        eprintln!(
-                            "[COPY-VEC] Copying {} slot {} to slot {}",
-                            if is_128 { "128-bit" } else { "256-bit" },
-                            src_slot.0,
-                            dest_slot.0
-                        );
-                    }
-                    if is_128 {
-                        self.state
-                            .out
-                            .emit_instr_rbp_reg("    movupd", src_slot.0 as i64, "xmm0");
-                        self.state
-                            .out
-                            .emit_instr_reg_rbp("    movupd", "xmm0", dest_slot.0 as i64);
-                    } else {
-                        self.state
-                            .out
-                            .emit_instr_rbp_reg("    vmovupd", src_slot.0 as i64, "ymm0");
-                        self.state
-                            .out
-                            .emit_instr_reg_rbp("    vmovupd", "ymm0", dest_slot.0 as i64);
-                    }
+                    self.state.vec_live_regs.insert(dest.0, target);
                     self.state.vector_values.insert(dest.0);
                     if is_128 {
                         self.state.vector128_values.insert(dest.0);
                     }
                     return;
-                } else if debug {
-                    eprintln!(
-                        "[COPY-VEC] Missing slot! src_slot={:?}, dest_slot={:?}",
-                        self.state.get_slot(v.0),
-                        self.state.get_slot(dest.0)
-                    );
                 }
+
+                // Mixed assigned/stack and pure stack copies use the same
+                // width-aware load/store helpers as intrinsic operands. This
+                // avoids interpreting register-held vector bits as an address.
+                if is_128 {
+                    self.sse_load_arg(src, "xmm0");
+                    self.sse_store_dest(dest, "xmm0");
+                } else {
+                    self.avx_load_arg(src);
+                    self.avx_store_dest(dest);
+                }
+                self.state.vector_values.insert(dest.0);
+                if is_128 {
+                    self.state.vector128_values.insert(dest.0);
+                }
+                return;
             }
 
             if self.state.f128_direct_slots.contains(&v.0) {

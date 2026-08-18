@@ -1128,6 +1128,27 @@ impl Driver {
                 }
                 "-fexceptions" => self.exceptions = true,
                 "-fno-exceptions" => self.exceptions = false,
+
+                // Floating-point reassociation is an explicit semantic contract,
+                // never an implication of -O2/-O3. Packed sum/dot reductions
+                // change the source addition order and are only legal when one
+                // of these flags permits it. Keep a deliberately narrow bit
+                // rather than pretending that every GCC fast-math sub-option is
+                // implemented.
+                "-ffast-math" => {
+                    self.fast_math = true;
+                    self.fp_reassoc = true;
+                }
+                "-fno-fast-math" => {
+                    self.fast_math = false;
+                    self.fp_reassoc = false;
+                }
+                "-funsafe-math-optimizations" | "-fassociative-math" => {
+                    self.fp_reassoc = true;
+                }
+                "-fno-unsafe-math-optimizations" | "-fno-associative-math" => {
+                    self.fp_reassoc = false;
+                }
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}
                 "-fdiagnostics-color" | "-fcolor-diagnostics" => {
                     self.color_mode = ColorMode::Always;
@@ -1412,6 +1433,37 @@ mod cli_tests {
         let args: Vec<String> = ["ccc", "-mskip-rax-setup", "-mno-sse", "x.c"]
             .iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
+    }
+
+    #[test]
+    fn fp_reassociation_requires_explicit_flag_and_last_option_wins() {
+        let mut strict = Driver::new();
+        let strict_args = vec!["lccc".to_string(), "-O3".to_string(), "x.c".to_string()];
+        strict.parse_cli_args(&strict_args).unwrap();
+        assert!(!strict.fp_reassoc, "-O3 alone must preserve FP reduction order");
+
+        let mut fast = Driver::new();
+        let fast_args = vec!["lccc".to_string(), "-ffast-math".to_string(), "x.c".to_string()];
+        fast.parse_cli_args(&fast_args).unwrap();
+        assert!(fast.fp_reassoc);
+        assert!(fast.fast_math);
+
+        let mut associative = Driver::new();
+        let associative_args = vec![
+            "lccc".to_string(), "-fassociative-math".to_string(), "x.c".to_string(),
+        ];
+        associative.parse_cli_args(&associative_args).unwrap();
+        assert!(associative.fp_reassoc);
+        assert!(!associative.fast_math, "individual flags must not define __FAST_MATH__");
+
+        let mut disabled = Driver::new();
+        let disabled_args = vec![
+            "lccc".to_string(), "-ffast-math".to_string(),
+            "-fno-associative-math".to_string(), "x.c".to_string(),
+        ];
+        disabled.parse_cli_args(&disabled_args).unwrap();
+        assert!(!disabled.fp_reassoc);
+        assert!(disabled.fast_math, "GCC keeps __FAST_MATH__ for this option sequence");
     }
 
     #[test]

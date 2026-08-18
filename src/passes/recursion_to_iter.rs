@@ -433,7 +433,7 @@ mod tests {
     fn make_fib_func() -> IrFunction {
         let params = vec![IrParam {
             ty: IrType::I32,
-            struct_size: None,
+            noalias: false, struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -615,7 +615,7 @@ mod tests {
         // A function with only one recursive call (not binary recursion)
         let params = vec![IrParam {
             ty: IrType::I32,
-            struct_size: None,
+            noalias: false, struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -685,7 +685,7 @@ mod tests {
     fn test_variadic_not_transformed() {
         let params = vec![IrParam {
             ty: IrType::I32,
-            struct_size: None,
+            noalias: false, struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -705,7 +705,7 @@ mod tests {
         let params = vec![
             IrParam {
                 ty: IrType::I32,
-                struct_size: None,
+                noalias: false, struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
@@ -713,7 +713,7 @@ mod tests {
             },
             IrParam {
                 ty: IrType::I32,
-                struct_size: None,
+                noalias: false, struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
@@ -737,7 +737,7 @@ mod tests {
     fn test_declaration_not_transformed() {
         let params = vec![IrParam {
             ty: IrType::I32,
-            struct_size: None,
+            noalias: false, struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
