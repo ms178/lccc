@@ -1158,6 +1158,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                                     && matches!(
                                         op,
                                         O::SqrtF64 | O::FabsF64 | O::SqrtF32 | O::FabsF32
+                                            | O::FixedDistanceF32x8
+                                            | O::FixedDistanceF64x4
                                     )
                             }
                             _ => false,
@@ -1861,6 +1863,8 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool, arm_fp_pool: bool) 
                         op,
                         IntrinsicOp::SqrtF64 | IntrinsicOp::SqrtF32
                             | IntrinsicOp::FabsF64 | IntrinsicOp::FabsF32
+                            | IntrinsicOp::FixedDistanceF32x8
+                            | IntrinsicOp::FixedDistanceF64x4
                     ) || op.produces_vector_value()
                     {
                         non_gpr_values.insert(d.0);

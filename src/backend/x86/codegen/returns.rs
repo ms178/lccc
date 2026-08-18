@@ -9,6 +9,13 @@ impl X86Codegen {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
+            if matches!(ret_ty, IrType::F32 | IrType::F64)
+                && matches!(val, Operand::Value(v)
+                    if self.state.direct_fp_result == Some(v.0))
+            {
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
             // _Float128 (IEEE binary128): the 16-byte value returns in xmm0.
             if self.func_ret_is_f128_sse {
                 match val {
