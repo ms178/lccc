@@ -1,43 +1,39 @@
 //! Liveness analysis for IR values.
 //!
-//! Computes live intervals for each IR value in an `IrFunction`. A live interval
-//! is the linear-scan range `[def_point, last_use_point]` where a value must be
-//! preserved (register or stack slot). Linear scan does not represent holes;
-//! loop-carried values therefore cover the whole layout span of the loop.
+//! Two live-range views (both use the same program-point numbering:
+//! +1 per instruction, +1 per terminator):
+//!
+//! * [`LivenessResult::intervals`] — **fat** `[earliest def, last preserve]`
+//!   per value. Loop-carried values cover the whole layout span of the loop.
+//!   Part 1 `iv_map` / phi-coalesce / loop-pin depend on one interval per
+//!   value (last-write-wins on a segmented vec is a miscompile).
+//! * [`LivenessResult::segments`] — **hole-aware** pieces. A value defined
+//!   in B0, used in B2, dead in B1 (diamond) does *not* cover B1. Linear
+//!   scan on `segments` is the cheap 80% of LLVM's split: a call on the
+//!   dead arm no longer forces a callee-saved GPR.
 //!
 //! Pipeline:
-//! 1. Assign sequential program points (one per instruction, then one per terminator).
-//! 2. Build per-block gen/kill bitsets (dense value ids).
-//! 3. Backward dataflow to a *true* fixpoint (worklist, seeded in reverse RPO).
+//! 1. Sequential program points.
+//! 2. Per-block gen/kill bitsets (dense value ids). Implicit uses (GEP-fold,
+//!    F128 source pointer, phi-incoming Copies) are inserted into gen *before*
+//!    dataflow.
+//! 3. Backward dataflow to a true fixpoint (worklist, seeded so exits pop
+//!    first). No iteration cap — a cap is an under-approx → miscompile.
 //!    `live_in[B]  = gen[B] ∪ (live_out[B] − kill[B])`
-//!    `live_out[B] = ⋃ live_in[S]` for successors `S` of `B`
-//! 4. Union def/use points with live-through blocks; apply GEP-fold, F128-source,
-//!    phi-incoming and setjmp extensions.
+//!    `live_out[B] = ⋃ live_in[S]`  for successors `S` of `B`
+//! 4. Fat intervals from live-through blocks + setjmp extension.
+//! 5. Segments from raw def/use + live_in/live_out (holes preserved).
 //!
-//! ## Correctness contracts
-//!
-//! - Hitting an iteration cap and *returning* is a miscompile (under-approx
-//!   live sets → the allocator reuses a register that is still live). This
-//!   module iterates to fixpoint. Bitvector liveness is monotonic, so the
-//!   worklist is guaranteed to terminate.
-//! - Safe degradation is **over**-approximation (more spills), never under.
-//! - GEP-fold / F128 / phi-elim / setjmp insert *implicit* uses the IR
-//!   visitors cannot see. Those extensions run *before* dataflow (so gen is
-//!   right) and the F128 pointer is re-synced *after* live-through extension.
-//!
-//! ## Performance
-//!
-//! Gen/kill/live_in/live_out are compact bitsets on a dense `[0..N)` map.
-//! One IR walk collects allocas + value ids; CFG analysis (successors,
-//! predecessors, back-edges, postorder) is shared by loop-depth and dataflow.
+//! Safe degradation is **over**-approximation (more spills), never under.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value};
 use std::sync::OnceLock;
 
-/// A live interval for an IR value: `[start, end]` in program-point numbering.
-/// `start` = defining point, `end` = last point the value must be preserved.
+/// `[start, end]` in program-point numbering.
+/// `start` = defining point (or block entry if live-in), `end` = last point
+/// the value must be preserved. Closed on both ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveInterval {
     pub start: u32,
@@ -45,22 +41,102 @@ pub struct LiveInterval {
     pub value_id: u32,
 }
 
-/// Result of liveness analysis: maps value IDs to their live intervals.
+/// Result of liveness analysis.
+///
+/// Extra fields beyond `intervals` / `call_points` / `block_loop_depth` are
+/// additive: Part 1 that only reads those three stays correct. Switch the
+/// linear scan to [`Self::segments`] to take the hole-aware win.
 pub struct LivenessResult {
+    /// Fat `[def, last_use]` — **exactly one** entry per value that has a def.
     pub intervals: Vec<LiveInterval>,
-    /// Program points that clobber caller-saved registers (calls, libcalls,
-    /// non-barrier inline asm). Used by RA to force callee-saved / spills
-    /// across the point.
+    /// Hole-aware pieces, sorted by `(start, value_id)`. Multiple per value.
+    pub segments: Vec<LiveInterval>,
+    /// Sorted program points that clobber the caller-saved set.
     pub call_points: Vec<u32>,
-    /// Loop nesting depth for each block (`block_index → depth`).
-    /// Depth 0 = not in any loop. Length is always `func.blocks.len()`.
+    /// Loop nesting depth per block. Length is always `func.blocks.len()`.
     pub block_loop_depth: Vec<u32>,
+    /// Inclusive start point of each block. Length = `func.blocks.len()`.
+    pub block_starts: Vec<u32>,
+    /// Inclusive terminator point of each block. Length = `func.blocks.len()`.
+    pub block_ends: Vec<u32>,
+    /// One past the last assigned program point.
+    pub num_points: u32,
+    id_to_dense: FxHashMap<u32, usize>,
+    live_in: Vec<BitSet>,
+    live_out: Vec<BitSet>,
+}
+
+impl LivenessResult {
+    pub fn is_live_in(&self, block_idx: usize, value_id: u32) -> bool {
+        let Some(set) = self.live_in.get(block_idx) else {
+            return false;
+        };
+        let Some(&d) = self.id_to_dense.get(&value_id) else {
+            return false;
+        };
+        set.contains(d)
+    }
+
+    pub fn is_live_out(&self, block_idx: usize, value_id: u32) -> bool {
+        let Some(set) = self.live_out.get(block_idx) else {
+            return false;
+        };
+        let Some(&d) = self.id_to_dense.get(&value_id) else {
+            return false;
+        };
+        set.contains(d)
+    }
+
+    /// Block containing `point`, or `None` if out of range.
+    pub fn block_index_at(&self, point: u32) -> Option<usize> {
+        if self.block_starts.is_empty() {
+            return None;
+        }
+        let i = self.block_starts.partition_point(|&s| s <= point);
+        if i == 0 {
+            return None;
+        }
+        let b = i - 1;
+        if point <= self.block_ends[b] {
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    /// Point query against hole-aware segments (closed `[start, end]`).
+    pub fn is_live_at(&self, value_id: u32, point: u32) -> bool {
+        self.segments
+            .iter()
+            .any(|iv| iv.value_id == value_id && iv.start <= point && point <= iv.end)
+    }
+
+    /// True iff some **segment** strictly contains a call (`start < cp < end`).
+    /// Matches Part 1 `spans_any_call`. Fat intervals over-approx this.
+    pub fn live_across_any_call(&self, value_id: u32) -> bool {
+        for iv in &self.segments {
+            if iv.value_id != value_id {
+                continue;
+            }
+            let idx = self.call_points.partition_point(|&cp| cp <= iv.start);
+            if idx < self.call_points.len() && self.call_points[idx] < iv.end {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn fat_interval(&self, value_id: u32) -> Option<(u32, u32)> {
+        self.intervals
+            .iter()
+            .find(|iv| iv.value_id == value_id)
+            .map(|iv| (iv.start, iv.end))
+    }
 }
 
 // ── Compact bitset for dataflow ──────────────────────────────────────────────
 
 /// Bitset over a dense `[0..num_bits)` index space, stored as `u64` words.
-/// `insert` / `contains` are O(1); union / transfer are O(⌈N/64⌉).
 #[derive(Clone, Debug)]
 struct BitSet {
     words: Vec<u64>,
@@ -168,42 +244,37 @@ struct ProgramPointState {
     block_gen: Vec<BitSet>,
     block_kill: Vec<BitSet>,
     block_id_to_idx: FxHashMap<u32, usize>,
-    /// Program point of every returns-twice call (`setjmp` family).
     setjmp_points: Vec<u32>,
-    /// `(ptr_id, dest_id)` for every `Load` of `F128` from a non-alloca pointer.
     f128_loads: Vec<(u32, u32)>,
-    /// SSA copy edges `dest → src`, used by GEP-fold copy-chain following.
-    copy_src: FxHashMap<u32, u32>,
+    /// SSA / phi-elim copy edges `dest → [src, …]`.
+    copy_src: FxHashMap<u32, Vec<u32>>,
     call_points: Vec<u32>,
     num_points: u32,
 }
 
 /// Compute live intervals for all non-alloca values in a function.
+///
+/// Always walks the IR (even when every dest is an alloca): vecreg builds
+/// synthetic alloca intervals and *must* see real `call_points`.
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return LivenessResult {
             intervals: Vec::new(),
+            segments: Vec::new(),
             call_points: Vec::new(),
             block_loop_depth: Vec::new(),
+            block_starts: Vec::new(),
+            block_ends: Vec::new(),
+            num_points: 0,
+            id_to_dense: FxHashMap::default(),
+            live_in: Vec::new(),
+            live_out: Vec::new(),
         };
     }
 
     let (alloca_set, value_ids, id_to_dense) = collect_values_and_allocas(func);
     let num_values = value_ids.len();
-
-    if num_values == 0 {
-        // Still publish a correctly-sized depth vector so RA indexing is safe.
-        let block_id_to_idx = block_id_map(func);
-        let successors = build_successor_lists(func, num_blocks, &block_id_to_idx);
-        let predecessors = invert_cfg(&successors, num_blocks);
-        let back_edges = find_back_edges(&successors, num_blocks);
-        return LivenessResult {
-            intervals: Vec::new(),
-            call_points: Vec::new(),
-            block_loop_depth: compute_loop_depth(&predecessors, &back_edges, num_blocks),
-        };
-    }
 
     let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
 
@@ -239,6 +310,10 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &ps.block_kill,
     );
 
+    // Raw def/use *before* fat live-through pull — segments need holes.
+    let raw_def = ps.def_points.clone();
+    let raw_last = ps.last_use_points.clone();
+
     extend_intervals_from_liveness(
         num_blocks,
         &live_in,
@@ -249,12 +324,8 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &mut ps.last_use_points,
     );
 
-    // Dest last-use may have grown through live-through blocks; keep the
-    // implicit F128 source pointer at least as long.
     resync_f128_last_use(&ps.f128_loads, &id_to_dense, &mut ps.last_use_points);
 
-    // Point-level (not block-level): catches values defined before setjmp
-    // and used after it in the *same* block — live_in/live_out miss those.
     extend_intervals_across_setjmp(
         &ps.setjmp_points,
         ps.num_points,
@@ -263,6 +334,19 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     );
 
     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
+
+    let mut segments = build_segments(
+        num_blocks,
+        &value_ids,
+        &raw_def,
+        &raw_last,
+        &live_in,
+        &live_out,
+        &ps.block_start_points,
+        &ps.block_end_points,
+    );
+    extend_segments_across_setjmp(&ps.setjmp_points, ps.num_points, &mut segments);
+    resync_f128_segments(&ps.f128_loads, &mut segments);
 
     if let Some(target) = debug_live_target() {
         if let Some(&dense) = id_to_dense.get(&target) {
@@ -285,29 +369,33 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
                     );
                 }
             }
+            let segs: Vec<(u32, u32)> = segments
+                .iter()
+                .filter(|iv| iv.value_id == target)
+                .map(|iv| (iv.start, iv.end))
+                .collect();
             eprintln!("[LIVE]   call_points={:?}", ps.call_points);
+            eprintln!("[LIVE]   segments={segs:?}");
         }
     }
 
     LivenessResult {
         intervals,
+        segments,
         call_points: ps.call_points,
         block_loop_depth,
+        block_starts: ps.block_start_points,
+        block_ends: ps.block_end_points,
+        num_points: ps.num_points,
+        id_to_dense,
+        live_in,
+        live_out,
     }
 }
 
 fn debug_live_target() -> Option<u32> {
     static T: OnceLock<Option<u32>> = OnceLock::new();
     *T.get_or_init(|| std::env::var("CCC_DEBUG_LIVE").ok().and_then(|s| s.parse().ok()))
-}
-
-fn block_id_map(func: &IrFunction) -> FxHashMap<u32, usize> {
-    let mut m = FxHashMap::default();
-    m.reserve(func.blocks.len());
-    for (idx, block) in func.blocks.iter().enumerate() {
-        m.insert(block.label.0, idx);
-    }
-    m
 }
 
 /// Single IR walk: alloca set + dense remap of every non-alloca value.
@@ -381,7 +469,7 @@ fn assign_program_points(
     block_id_to_idx.reserve(num_blocks);
     let mut setjmp_points: Vec<u32> = Vec::new();
     let mut f128_loads: Vec<(u32, u32)> = Vec::new();
-    let mut copy_src: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut copy_src: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut call_points: Vec<u32> = Vec::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
@@ -402,7 +490,10 @@ fn assign_program_points(
                 src: Operand::Value(src),
             } = inst
             {
-                copy_src.insert(dest.0, src.0);
+                let srcs = copy_src.entry(dest.0).or_default();
+                if !srcs.contains(&src.0) {
+                    srcs.push(src.0);
+                }
             }
             if let Instruction::Load { dest, ptr, ty, .. } = inst {
                 if *ty == IrType::F128 && !alloca_set.contains(&ptr.0) {
@@ -419,10 +510,10 @@ fn assign_program_points(
             );
 
             // Kill *promoted* InlineAsm outputs (first def here) before gen
-            // collection so they are not upward-exposed. Outputs already
-            // defined (pointers passed through for `"=a"(*ptr)`) are uses of
-            // the pointer, not defs — killing them truncated the pointer's
-            // interval and let the slot packer reuse it mid-loop.
+            // so they are not upward-exposed. Outputs already defined
+            // (pointers passed through for `"=a"(*ptr)`) are uses of the
+            // pointer, not defs — killing them truncated the pointer and
+            // let the slot packer reuse it mid-loop.
             if let Instruction::InlineAsm { outputs, .. } = inst {
                 for (_, out_val, _) in outputs {
                     if !alloca_set.contains(&out_val.0) {
@@ -470,7 +561,7 @@ fn assign_program_points(
     // Phi incoming: after phi elim each `(V, pred)` becomes a Copy at the
     // *end* of `pred`. V must be live there. On a back-edge `pred` is later
     // in layout than the Phi, so the Phi's own use point is *earlier* and
-    // does not cover the Copy — this is the sqlite3RunParser `n`/r13 bug.
+    // does not cover the Copy — sqlite3RunParser `n`/r13.
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Phi { incoming, .. } = inst {
@@ -513,6 +604,7 @@ fn assign_program_points(
 
 /// Instructions that clobber the caller-saved set at the assembly level.
 fn instruction_is_call_point(inst: &Instruction) -> bool {
+    let is_32bit = crate::common::types::target_is_32bit();
     match inst {
         Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,
         Instruction::InlineAsm {
@@ -522,41 +614,38 @@ fn instruction_is_call_point(inst: &Instruction) -> bool {
             ..
         } => {
             // `asm volatile("" ::: "memory")` is a compiler barrier, not a
-            // register clobber — treating it as a call forced every crossing
-            // value into a callee-saved GPR (kernel preempt/barrier noise).
-            // A GP/XMM clobber list *without* operands (`syscall ::: rcx,r11`)
-            // *is* a call point; the old `outputs || inputs` test missed it.
+            // register clobber. A GP/XMM clobber list without operands
+            // (`syscall ::: rcx,r11`) *is* a call point.
             !outputs.is_empty()
                 || !inputs.is_empty()
                 || clobbers.iter().any(|c| clobber_is_allocatable_reg(c))
         }
-        // `rep movsb` / va_* helpers clobber rdi/rsi/rcx.
         Instruction::Memcpy { .. }
         | Instruction::VaArg { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaCopy { .. }
         | Instruction::VaArgStruct { .. } => true,
-        // i128 div/rem → `__divti3` / `__udivti3` / `__modti3` / `__umodti3`.
         Instruction::BinOp { op, ty, .. }
-            if matches!(ty, IrType::I128 | IrType::U128)
-                && matches!(
-                    op,
-                    IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-                ) =>
+            if matches!(
+                op,
+                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+            ) && (matches!(ty, IrType::I128 | IrType::U128)
+                || (is_32bit && matches!(ty, IrType::I64 | IrType::U64))) =>
         {
             true
         }
-        // F128 ALU/cmp are compiler-rt libcalls on x86-64 (no hardware).
         Instruction::BinOp { ty, .. } if *ty == IrType::F128 => true,
         Instruction::UnaryOp { ty, .. } if *ty == IrType::F128 => true,
         Instruction::Cmp { ty, .. } if *ty == IrType::F128 => true,
-        Instruction::Cast { from_ty, to_ty, .. }
-            if (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
-                || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128))
-                || *from_ty == IrType::F128
-                || *to_ty == IrType::F128 =>
-        {
-            true
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            let i128_fp = (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
+                || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128));
+            let f128 = *from_ty == IrType::F128 || *to_ty == IrType::F128;
+            // i686: I64 ↔ FP is `__floatdidf` / `__fixdfdi`.
+            let i64_fp_32 = is_32bit
+                && ((matches!(from_ty, IrType::I64 | IrType::U64) && to_ty.is_float())
+                    || (from_ty.is_float() && matches!(to_ty, IrType::I64 | IrType::U64)));
+            i128_fp || f128 || i64_fp_32
         }
         _ => false,
     }
@@ -569,7 +658,6 @@ fn clobber_is_allocatable_reg(c: &str) -> bool {
     if c.is_empty() {
         return false;
     }
-    // Cheap ASCII lower without allocating for the common tokens.
     let eq_ignore_ascii = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
     if eq_ignore_ascii(c, "memory")
         || eq_ignore_ascii(c, "cc")
@@ -596,7 +684,7 @@ fn extend_gep_base_liveness(
     func: &IrFunction,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
-    copy_src: &FxHashMap<u32, u32>,
+    copy_src: &FxHashMap<u32, Vec<u32>>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
 ) {
@@ -766,24 +854,27 @@ fn extend_gep_base_liveness(
     }
 }
 
-/// Extend `start_id` (and its Copy-chain sources) to `point`.
-///
-/// The old body scanned the entire function for `Copy` insts on every hop
-/// (`O(|F|)` per hop per folded load). The copy map is built in Phase 1.
+/// Extend `start_id` and every Copy-chain source (all phi-elim preds) to `point`.
 fn extend_use_following_copies(
     start_id: u32,
     point: u32,
     block_idx: usize,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
-    copy_src: &FxHashMap<u32, u32>,
+    copy_src: &FxHashMap<u32, Vec<u32>>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
 ) {
-    let mut id = start_id;
-    for _ in 0..16 {
+    let mut stack = vec![start_id];
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    let mut hops = 0u32;
+    while let Some(id) = stack.pop() {
+        if hops >= 16 || !seen.insert(id) {
+            continue;
+        }
+        hops += 1;
         if alloca_set.contains(&id) {
-            break;
+            continue;
         }
         if let Some(&dense) = id_to_dense.get(&id) {
             let entry = &mut last_use_points[dense];
@@ -792,9 +883,12 @@ fn extend_use_following_copies(
             }
             block_gen[block_idx].insert(dense);
         }
-        match copy_src.get(&id) {
-            Some(&src) if src != id => id = src,
-            _ => break,
+        if let Some(srcs) = copy_src.get(&id) {
+            for &src in srcs {
+                if src != id {
+                    stack.push(src);
+                }
+            }
         }
     }
 }
@@ -803,11 +897,6 @@ fn extend_use_following_copies(
 
 /// Codegen reloads the F128 *source pointer* at the dest's last use
 /// (`emit_f128_operand_to_a0_a1`). The pointer must stay live that long.
-///
-/// Intra-block: last_use(ptr) := max(last_use(ptr), last_use(dest)) — gen/kill
-/// cannot express a use that is not in the IR.
-/// Inter-block: insert ptr into gen of every block that uses dest so dataflow
-/// carries it through predecessors.
 fn apply_f128_source_gen(
     func: &IrFunction,
     f128_loads: &[(u32, u32)],
@@ -878,6 +967,42 @@ fn resync_f128_last_use(
         let ptr_entry = &mut last_use_points[pd];
         if *ptr_entry == u32::MAX || dest_last > *ptr_entry {
             *ptr_entry = dest_last;
+        }
+    }
+}
+
+fn resync_f128_segments(f128_loads: &[(u32, u32)], segments: &mut Vec<LiveInterval>) {
+    if f128_loads.is_empty() {
+        return;
+    }
+    for &(ptr_id, dest_id) in f128_loads {
+        let dest_end = segments
+            .iter()
+            .filter(|iv| iv.value_id == dest_id)
+            .map(|iv| iv.end)
+            .max();
+        let Some(dest_end) = dest_end else {
+            continue;
+        };
+        let mut best: Option<usize> = None;
+        for (i, iv) in segments.iter().enumerate() {
+            if iv.value_id == ptr_id {
+                best = Some(match best {
+                    Some(j) if segments[j].end >= iv.end => j,
+                    _ => i,
+                });
+            }
+        }
+        if let Some(i) = best {
+            if segments[i].end < dest_end {
+                segments[i].end = dest_end;
+            }
+        } else {
+            segments.push(LiveInterval {
+                value_id: ptr_id,
+                start: dest_end,
+                end: dest_end,
+            });
         }
     }
 }
@@ -1051,42 +1176,13 @@ fn for_each_terminator_target(term: &Terminator, mut f: impl FnMut(u32)) {
     }
 }
 
-/// Iterative DFS from every unvisited root: back-edges + postorder.
+/// One iterative DFS from every unvisited root: back-edges + postorder.
 fn analyze_forward_cfg(
     successors: &[Vec<usize>],
     num_blocks: usize,
 ) -> (Vec<(usize, usize)>, Vec<usize>) {
-    let back_edges = find_back_edges(successors, num_blocks);
     let mut state = vec![0u8; num_blocks];
     let mut postorder = Vec::with_capacity(num_blocks);
-    let mut next_succ = vec![0usize; num_blocks];
-    for start in 0..num_blocks {
-        if state[start] != 0 {
-            continue;
-        }
-        state[start] = 1;
-        let mut stack = vec![start];
-        while let Some(&block) = stack.last() {
-            let i = next_succ[block];
-            if i < successors[block].len() {
-                next_succ[block] = i + 1;
-                let nxt = successors[block][i];
-                if nxt < num_blocks && state[nxt] == 0 {
-                    state[nxt] = 1;
-                    stack.push(nxt);
-                }
-            } else {
-                state[block] = 2;
-                postorder.push(block);
-                stack.pop();
-            }
-        }
-    }
-    (back_edges, postorder)
-}
-
-fn find_back_edges(successors: &[Vec<usize>], num_blocks: usize) -> Vec<(usize, usize)> {
-    let mut state = vec![0u8; num_blocks];
     let mut back_edges: Vec<(usize, usize)> = Vec::new();
     let mut next_succ = vec![0usize; num_blocks];
     for start in 0..num_blocks {
@@ -1113,21 +1209,24 @@ fn find_back_edges(successors: &[Vec<usize>], num_blocks: usize) -> Vec<(usize, 
                 }
             } else {
                 state[block] = 2;
+                postorder.push(block);
                 stack.pop();
             }
         }
     }
-    back_edges
+    (back_edges, postorder)
+}
+
+fn find_back_edges(successors: &[Vec<usize>], num_blocks: usize) -> Vec<(usize, usize)> {
+    analyze_forward_cfg(successors, num_blocks).0
 }
 
 // ── Dataflow ─────────────────────────────────────────────────────────────────
 
-/// Worklist backward liveness. Seeded in reverse postorder so a linear
-/// chain and a reducible nest typically finish in one pass per nest level.
+/// Worklist backward liveness. Seeded so exits pop first.
 ///
-/// There is **no** “give up after 50 iterations” cap. Each `live_in` bit
-/// flips at most once (monotonic ∪), so each block is dequeued at most
-/// `O(num_values)` times. Under-approx on timeout was a silent miscompile.
+/// Each `live_in` bit flips at most once (monotonic ∪), so each block is
+/// dequeued at most `O(num_values)` times. No timeout.
 fn run_backward_dataflow(
     num_blocks: usize,
     num_values: usize,
@@ -1141,13 +1240,12 @@ fn run_backward_dataflow(
     let mut live_out: Vec<BitSet> = (0..num_blocks).map(|_| BitSet::new(num_values)).collect();
     let mut tmp_out = BitSet::new(num_values);
 
-    // Reverse postorder = exits first for backward problems.
+    // postorder = exits first; rev puts exits at vec-end; pop = exits first.
     let mut worklist: Vec<usize> = postorder.iter().copied().rev().collect();
     let mut in_queue = vec![false; num_blocks];
     for &b in &worklist {
         in_queue[b] = true;
     }
-    // Unreachable-from-DFS holes (shouldn't happen — we visit every root).
     for b in 0..num_blocks {
         if !in_queue[b] {
             in_queue[b] = true;
@@ -1183,12 +1281,12 @@ fn run_backward_dataflow(
     (live_in, live_out)
 }
 
-/// A value live-*in* to B covers `[B.start, B.end]` (may pull `def` earlier —
-/// needed for loop-carried values whose def is later in layout).
+/// Fat-interval live-through pull.
 ///
-/// A value live-*out* of B only extends `last_use` to `B.end`. Pulling `def`
-/// back to `B.start` for a value *defined in B* invented a live range before
-/// the def and inflated register pressure for no correctness gain.
+/// Live-*in* to B covers `[B.start, B.end]` (may pull `def` earlier — needed
+/// for loop-carried values whose def is later in layout).
+/// Live-*out* of B only extends `last_use` to `B.end`. Pulling `def` back to
+/// `B.start` for a value *defined in B* invented a live range before the def.
 fn extend_intervals_from_liveness(
     num_blocks: usize,
     live_in: &[BitSet],
@@ -1215,7 +1313,6 @@ fn extend_intervals_from_liveness(
 
         live_out[idx].for_each_set_bit(|dense_idx| {
             if def_points[dense_idx] == u32::MAX {
-                // Use with no recorded def: last-resort so the value is not dropped.
                 def_points[dense_idx] = start;
             }
             let entry = &mut last_use_points[dense_idx];
@@ -1224,6 +1321,133 @@ fn extend_intervals_from_liveness(
             }
         });
     }
+}
+
+/// Hole-aware segments from raw def/use + block live_in/live_out.
+///
+/// A block where the value is neither live-in nor live-out (and has no
+/// local def/use) is a **hole**. Adjacent covered blocks merge. Never
+/// under-approximates: unknown `!live_in && live_out` without a local def
+/// covers the whole block.
+fn build_segments(
+    num_blocks: usize,
+    value_ids: &[u32],
+    raw_def: &[u32],
+    raw_last: &[u32],
+    live_in: &[BitSet],
+    live_out: &[BitSet],
+    block_starts: &[u32],
+    block_ends: &[u32],
+) -> Vec<LiveInterval> {
+    let nvals = value_ids.len();
+    if nvals == 0 || num_blocks == 0 {
+        return Vec::new();
+    }
+
+    let mut cover: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nvals];
+    let mut seen = vec![false; nvals];
+    let mut touched: Vec<usize> = Vec::new();
+
+    for b in 0..num_blocks {
+        let bs = block_starts[b];
+        let be = block_ends[b];
+
+        let mut consider = |dense: usize| {
+            if seen[dense] {
+                return;
+            }
+            seen[dense] = true;
+            touched.push(dense);
+
+            let li = live_in[b].contains(dense);
+            let lo = live_out[b].contains(dense);
+            let def = raw_def[dense];
+            let last = raw_last[dense];
+            let def_in = def != u32::MAX && def >= bs && def <= be;
+            let last_in = last != u32::MAX && last >= bs && last <= be;
+
+            if !li && !lo && !def_in && !last_in {
+                return;
+            }
+
+            let s = if li {
+                bs
+            } else if def_in {
+                def
+            } else {
+                // use or live_out without a recorded local def: over-approx.
+                bs
+            };
+            let e = if lo {
+                be
+            } else if last_in {
+                last
+            } else if def_in {
+                def
+            } else {
+                be
+            };
+            if e >= s {
+                cover[dense].push((s, e));
+            }
+        };
+
+        live_in[b].for_each_set_bit(&mut consider);
+        live_out[b].for_each_set_bit(&mut consider);
+
+        for d in touched.drain(..) {
+            seen[d] = false;
+        }
+    }
+
+    // Same-block dead temps: never live_in/out, still need [def, last].
+    for d in 0..nvals {
+        if !cover[d].is_empty() {
+            continue;
+        }
+        let def = raw_def[d];
+        if def == u32::MAX {
+            continue;
+        }
+        let last = raw_last[d];
+        let last = if last == u32::MAX { def } else { last.max(def) };
+        cover[d].push((def, last));
+    }
+
+    let mut result: Vec<LiveInterval> = Vec::with_capacity(nvals);
+    for (d, &vid) in value_ids.iter().enumerate() {
+        let segs = &mut cover[d];
+        if segs.is_empty() {
+            continue;
+        }
+        segs.sort_unstable_by_key(|&(s, _)| s);
+        let mut cs = segs[0].0;
+        let mut ce = segs[0].1;
+        for &(s, e) in segs.iter().skip(1) {
+            if s <= ce.saturating_add(1) {
+                ce = ce.max(e);
+            } else {
+                result.push(LiveInterval {
+                    start: cs,
+                    end: ce,
+                    value_id: vid,
+                });
+                cs = s;
+                ce = e;
+            }
+        }
+        result.push(LiveInterval {
+            start: cs,
+            end: ce,
+            value_id: vid,
+        });
+    }
+    result.sort_unstable_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.value_id.cmp(&b.value_id))
+    });
+    result
 }
 
 /// Any value whose interval contains a setjmp point is live across a
@@ -1245,15 +1469,46 @@ fn extend_intervals_across_setjmp(
                 continue;
             }
             let end = last_use_points[dense_idx];
-            // Live at `p` iff the interval already reaches `p` (or has no use
-            // yet, which we treat as live at the def only — not across setjmp
-            // unless a use sits on the other side).
             if end == u32::MAX || end < p {
                 continue;
             }
             if func_end > last_use_points[dense_idx] {
                 last_use_points[dense_idx] = func_end;
             }
+        }
+    }
+}
+
+fn extend_segments_across_setjmp(
+    setjmp_points: &[u32],
+    num_points: u32,
+    segments: &mut Vec<LiveInterval>,
+) {
+    if setjmp_points.is_empty() {
+        return;
+    }
+    let func_end = num_points.saturating_sub(1);
+    let mut extend: FxHashSet<u32> = FxHashSet::default();
+    for iv in segments.iter() {
+        for &p in setjmp_points {
+            if iv.start <= p && p <= iv.end {
+                extend.insert(iv.value_id);
+                break;
+            }
+        }
+    }
+    if extend.is_empty() {
+        return;
+    }
+    let mut last_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    for (i, iv) in segments.iter().enumerate() {
+        if extend.contains(&iv.value_id) {
+            last_idx.insert(iv.value_id, i);
+        }
+    }
+    for (_, i) in last_idx {
+        if segments[i].end < func_end {
+            segments[i].end = func_end;
         }
     }
 }
@@ -1293,7 +1548,7 @@ fn is_returns_twice_call(inst: &Instruction) -> bool {
     if let Instruction::Call { func, .. } = inst {
         matches!(
             func.as_str(),
-            "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp"
+            "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp" | "vfork"
         )
     } else {
         false
@@ -1457,11 +1712,10 @@ pub(crate) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMu
 
 /// Natural-loop nesting depth per block, used as `10^depth` in RA priority.
 ///
-/// A back-edge `tail → header` (header is a DFS ancestor of tail) defines a
-/// natural loop: `header` plus every block that reaches `tail` without going
-/// through `header`. **All back-edges that share a header are one loop** —
-/// incrementing once per back-edge double-counted two-latch loops and made
-/// RA treat a single loop as nested (`priority × 10` extra).
+/// A back-edge `tail → header` defines a natural loop: `header` plus every
+/// block that reaches `tail` without going through `header`. **All back-edges
+/// that share a header are one loop** — incrementing once per back-edge
+/// double-counted two-latch loops.
 fn compute_loop_depth(
     predecessors: &[Vec<usize>],
     back_edges: &[(usize, usize)],
@@ -1514,6 +1768,18 @@ mod tests {
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp};
+
+    fn empty_call_info(dest: Option<Value>) -> crate::ir::reexports::CallInfo {
+        crate::ir::reexports::CallInfo {
+            dest,
+            args: Vec::new(),
+            return_type: IrType::I32,
+            is_variadic: false,
+            param_types: Vec::new(),
+            calling_conv: Default::default(),
+            attributes: Default::default(),
+        }
+    }
 
     #[test]
     fn test_inline_asm_with_operands_is_call_point() {
@@ -1604,11 +1870,7 @@ mod tests {
                     template: "syscall".to_string(),
                     outputs: vec![],
                     inputs: vec![],
-                    clobbers: vec![
-                        "rcx".to_string(),
-                        "r11".to_string(),
-                        "memory".to_string(),
-                    ],
+                    clobbers: vec!["rcx".to_string(), "r11".to_string(), "memory".to_string()],
                     operand_types: vec![],
                     goto_labels: vec![],
                     input_symbols: vec![],
@@ -1676,11 +1938,12 @@ mod tests {
         assert!(result.intervals.is_empty());
         assert_eq!(result.block_loop_depth.len(), 1);
         assert_eq!(result.block_loop_depth[0], 0);
+        assert_eq!(result.block_starts.len(), 1);
+        assert_eq!(result.block_ends.len(), 1);
     }
 
     #[test]
     fn loop_depth_single_back_edge() {
-        // 0 → 1 → 2 → 1 (back), 2 → 3
         let succs = vec![vec![1], vec![2], vec![1, 3], vec![]];
         let preds = invert_cfg(&succs, 4);
         let back = find_back_edges(&succs, 4);
@@ -1693,7 +1956,6 @@ mod tests {
 
     #[test]
     fn loop_depth_two_latches_not_double_counted() {
-        // header 0 with two latches — one natural loop, not depth 2.
         let succs = vec![vec![1, 2], vec![0], vec![0]];
         let preds = invert_cfg(&succs, 3);
         let back = find_back_edges(&succs, 3);
@@ -1705,7 +1967,6 @@ mod tests {
 
     #[test]
     fn loop_depth_nested() {
-        // 0 → 1 → 2 → 1 (inner), 1 → 3 → 0 (outer)
         let succs = vec![vec![1], vec![2, 3], vec![1], vec![0]];
         let preds = invert_cfg(&succs, 4);
         let back = find_back_edges(&succs, 4);
@@ -1737,9 +1998,6 @@ mod tests {
 
     #[test]
     fn dataflow_propagates_through_long_chain() {
-        // 80-block chain 0→1→…→79, use of v at the end, def at the start.
-        // The old MAX_ITERATIONS=50 cap under-approximated this if layout
-        // order ever fought the sweep; the worklist must not.
         let n = 80;
         let mut succs = vec![Vec::new(); n];
         for i in 0..n - 1 {
@@ -1750,16 +2008,13 @@ mod tests {
 
         let mut gen: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
         let kill: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
-        gen[n - 1].insert(0); // use at the exit
+        gen[n - 1].insert(0);
         let mut kill0 = BitSet::new(1);
         kill0.insert(0);
         let mut kill = kill;
-        kill[0] = kill0; // def at entry
+        kill[0] = kill0;
 
-        let (live_in, live_out) =
-            run_backward_dataflow(n, 1, &succs, &preds, &post, &gen, &kill);
-        // Value is live-out of every block except the exit, live-in of every
-        // block except the entry (killed there).
+        let (live_in, live_out) = run_backward_dataflow(n, 1, &succs, &preds, &post, &gen, &kill);
         assert!(!live_in[0].contains(0), "def kills upward exposure");
         for i in 1..n {
             assert!(live_in[i].contains(0), "live_in[{i}] missing");
@@ -1767,5 +2022,118 @@ mod tests {
         for i in 0..n - 1 {
             assert!(live_out[i].contains(0), "live_out[{i}] missing");
         }
+    }
+
+    #[test]
+    fn diamond_hole_does_not_cover_dead_arm() {
+        // B0: v0 = 1; condbr c, B2, B1
+        // B1: call(); br B3          ← v0 is dead here
+        // B2: v1 = v0 + 1; br B3
+        // B3: ret v1
+        //
+        // Fat interval covers B1 (layout hole). Segments must not.
+        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Copy {
+                        dest: Value(0),
+                        src: Operand::Const(IrConst::I32(1)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(3),
+                        src: Operand::Const(IrConst::I32(1)),
+                    },
+                ],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(1),
+                },
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::Call {
+                    func: "puts".to_string(),
+                    info: empty_call_info(None),
+                }],
+                terminator: Terminator::Branch(BlockId(3)),
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                terminator: Terminator::Branch(BlockId(3)),
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(3),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+                source_spans: Vec::new(),
+            },
+        ];
+        func.next_value_id = 4;
+
+        let result = compute_live_intervals(&func);
+        assert_eq!(result.block_starts.len(), 4);
+        assert!(!result.call_points.is_empty(), "B1 call must be recorded");
+
+        let b1_lo = result.block_starts[1];
+        let b1_hi = result.block_ends[1];
+        let covers_b1 = result
+            .segments
+            .iter()
+            .any(|iv| iv.value_id == 0 && iv.start <= b1_hi && b1_lo <= iv.end);
+        assert!(
+            !covers_b1,
+            "v0 segment must hole the dead call arm: segs={:?}",
+            result
+                .segments
+                .iter()
+                .filter(|iv| iv.value_id == 0)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !result.live_across_any_call(0),
+            "v0 must be caller-saved-eligible"
+        );
+
+        // Fat interval still spans the layout hole (Part 1 iv_map contract).
+        let fat = result.fat_interval(0).unwrap();
+        assert!(
+            fat.0 <= b1_lo && fat.1 >= b1_lo,
+            "fat interval must remain conservative: {fat:?}"
+        );
+    }
+
+    #[test]
+    fn one_fat_interval_per_value() {
+        let mut func = IrFunction::new("uniq".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 1;
+        let result = compute_live_intervals(&func);
+        let n = result
+            .intervals
+            .iter()
+            .filter(|iv| iv.value_id == 0)
+            .count();
+        assert_eq!(n, 1, "{:?}", result.intervals);
     }
 }
