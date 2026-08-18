@@ -1425,13 +1425,21 @@ pub(super) fn compute_immediately_consumed(
         }
     }
 
-    // Keep a copy-source slot only if some dest still needs a home.
-    result.retain(|src| {
-        let Some(dests) = copy_dests_of.get(src) else {
-            return true;
-        };
-        dests.iter().all(|d| result.contains(d))
-    });
+    // Copy-source keeps a slot if any dest still needs a home. Snapshot the
+    // skip set first — retain+contains is a double borrow.
+    let drop_srcs: Vec<u32> = copy_dests_of
+        .iter()
+        .filter_map(|(&src, dests)| {
+            if result.contains(&src) && dests.iter().any(|d| !result.contains(d)) {
+                Some(src)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for id in drop_srcs {
+        result.remove(&id);
+    }
 
     result
 }
