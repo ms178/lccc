@@ -374,9 +374,9 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
 
     if !disabled.contains("inline") {
         if size_profile {
-            // -Os/-Oz: tiny/small callees inline (helper bodies fold away);
-            // normal/medium callees stay out to keep code size down.
-            inline::run_small_only(module);
+            // -Os/-Oz: retain tiny/small and profitable one-use/loop
+            // inlines, but reject repeated cold medium-body expansion.
+            inline::run_size_optimized(module);
         } else if allow_inline {
             inline::run(module);
         }
@@ -521,8 +521,9 @@ pub(crate) fn run_passes(
     // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
     // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
     // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
-    // even at -Os: run the small-only inliner so helper bodies fold away while
-    // normal/medium callees stay out. -O1/-O2/-O3 keep full inlining.
+    // even at -Os: run the size-aware inliner so helper bodies fold away while
+    // repeated cold medium-body expansion stays out. -O1/-O2/-O3 keep full
+    // inlining.
 
 macro_rules! preloop_dump {
     ($name:expr) => {
@@ -582,8 +583,17 @@ macro_rules! preloop_dump {
     // cleanup pipeline fold the caller (e.g. tce_sum's sum(10_000_000, 0)).
     // This is intentionally after the recursion transforms: doing it before
     // them would either reject the recursive callee or clone the call tree.
+    //
+    // Preserve the size profile here.  The primary inline phase deliberately
+    // uses the size-aware policy at -Os/-Oz, so running the unrestricted
+    // inliner unconditionally in this later phase defeats that decision and
+    // can clone medium helpers at every call site after the first cleanup.
     if !disabled.contains("postinline") {
-        inline::run(module);
+        if optimize_for_size {
+            inline::run_size_optimized(module);
+        } else {
+            inline::run(module);
+        }
         crate::ir::mem2reg::promote_allocas_with_params(module);
         constant_fold::run(module);
         copy_prop::run(module);
