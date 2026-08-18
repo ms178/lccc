@@ -671,7 +671,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     let line = infos[k].trimmed(store.get(k));
                     let rbp_off = parse_rbp_offset(line);
                     if rbp_off != RBP_OFFSET_NONE {
-                        read_ranges.push((rbp_off, 8));
+                        // Range, not point: x87 folded operands read past
+                        // the named offset (fldt = 10 bytes, movdqu = 16).
+                        // 8 bytes missed the tail of a long double slot.
+                        read_ranges.push((rbp_off, 16));
                     } else if line.contains("(%rbp)") || line.contains("(%rsp)") {
                         has_unparseable_indirect = true;
                         break;
