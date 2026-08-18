@@ -1,41 +1,44 @@
 //! Copy coalescing and immediately-consumed value analysis.
 //!
-//! Copy coalescing identifies Copy instructions where the destination can
-//! share the source's stack slot (eliminating a separate allocation).
-//! The immediately-consumed analysis identifies values that are produced
-//! and consumed in adjacent instructions, allowing them to skip stack
-//! slot allocation entirely by staying in the accumulator register cache.
+//! Stack-slot coalescing is conservative move coalescing on a CFG-precise,
+//! copy-aware interference graph (Chaitin/Briggs): for `d = copy s`, `d`
+//! interferes with every value live after the copy except `s`. Non-interfering
+//! scalar (or vector) webs share one home. Liveness uses dense bitsets and a
+//! worklist so large functions still get a proof.
+//!
+//! CFG construction matches `liveness.rs` (terminator edges + InlineAsm goto)
+//! so coalescing cannot under-approximate live sets.
+//!
+//! Immediately-consumed analysis finds GPR values produced and consumed in
+//! adjacent instructions so they can stay in the accumulator cache and skip
+//! a stack slot. Vector-defer skips the home-slot store of a vector result
+//! that is consumed once from the last-store peephole.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrConst,
-    IrFunction,
-    Operand,
-    Terminator,
-};
-use crate::common::types::IrType;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
+use std::sync::OnceLock;
+
 use crate::backend::liveness::{
-    for_each_operand_in_instruction, for_each_value_use_in_instruction,
-    for_each_operand_in_terminator,
+    for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
 };
+use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator};
 
-/// Return true unless the CFG-aware coalescer is explicitly disabled for
-/// bisection.  v4 made this default after project gates, source regressions,
-/// and two differential fuzz families established that the graph proof is
-/// materially better than the v3 textual interval approximation.
 fn cfg_copy_coalesce_enabled() -> bool {
-    std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CCC_NO_CFG_COPY_COALESCE").is_none())
+}
+
+fn env_flag(name: &'static str) -> bool {
+    std::env::var_os(name).is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CoalesceClass {
-    /// Eight-byte scalar stack representation: integer or pointer values only.
+    /// 8-byte integer/pointer stack home.
     Scalar,
-    /// Auto-vectorizer Vec* vector value (dest-based SSA, lives directly in
-    /// its 16/32-byte home slot). Safe to coalesce through copies because the
-    /// slot is the value's single home and the emitters are slot-aware.
+    /// Auto-vectorizer Vec* SSA value (16/32-byte home, slot-aware emitters).
     Vector,
 }
 
@@ -57,28 +60,29 @@ fn scalar_type(ty: IrType) -> bool {
 fn scalar_const(c: IrConst) -> bool {
     matches!(
         c,
-        IrConst::I8(_)
-            | IrConst::I16(_)
-            | IrConst::I32(_)
-            | IrConst::I64(_)
-            | IrConst::Zero
+        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero
     )
 }
 
-/// Classify values that have the same scalar stack representation in all
-/// relevant paths.  Floats, vectors, i128/F128, allocas, and opaque results
-/// are intentionally excluded: a missed coalescing opportunity is harmless,
-/// whereas widening a slot-sharing rule beyond codegen's exact ABI paths is not.
+/// True when codegen leaves the result in the GPR accumulator cache.
+fn ty_lives_in_gpr_cache(ty: IrType) -> bool {
+    scalar_type(ty) && !ty.is_float() && !ty.is_128bit() && !ty.is_long_double()
+}
+
+/// Classify values that share a uniform stack representation. Floats, i128/F128,
+/// allocas and opaque results are excluded: a missed coalesce is harmless,
+/// a slot-size mismatch is not.
 fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
     let mut classes: FxHashMap<u32, CoalesceClass> = FxHashMap::default();
     let mut allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_dests_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
 
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Alloca { dest, .. } = inst {
                 allocas.insert(dest.0);
             }
-            let class = match inst {
+            match inst {
                 Instruction::BinOp { dest, ty, .. }
                 | Instruction::UnaryOp { dest, ty, .. }
                 | Instruction::Cast { dest, to_ty: ty, .. }
@@ -87,51 +91,58 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
                 | Instruction::AtomicLoad { dest, ty, .. }
                 | Instruction::AtomicRmw { dest, ty, .. }
                 | Instruction::AtomicCmpxchg { dest, ty, .. }
-                | Instruction::ParamRef { dest, ty, .. } if scalar_type(*ty) => Some(dest.0),
+                | Instruction::ParamRef { dest, ty, .. }
+                    if scalar_type(*ty) =>
+                {
+                    classes.insert(dest.0, CoalesceClass::Scalar);
+                }
                 Instruction::Cmp { dest, .. }
                 | Instruction::GetElementPtr { dest, .. }
                 | Instruction::GlobalAddr { dest, .. }
-                | Instruction::LabelAddr { dest, .. } => Some(dest.0),
+                | Instruction::LabelAddr { dest, .. } => {
+                    classes.insert(dest.0, CoalesceClass::Scalar);
+                }
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
-                    if info.dest.is_some() && scalar_type(info.return_type) => info.dest.map(|v| v.0),
-                // the auto-vectorizer's Vec* vector values participate in
-                // copy coalescing (accumulator-phi group), with their own class.
-                Instruction::Intrinsic { dest: Some(d), op, .. }
-                    if op.vector_result_width().is_some() => Some(d.0),
-                _ => None,
-            };
-            if let Some(id) = class {
-                let cls = match inst {
-                    Instruction::Intrinsic { .. } => CoalesceClass::Vector,
-                    _ => CoalesceClass::Scalar,
-                };
-                classes.insert(id, cls);
+                    if info.dest.is_some() && scalar_type(info.return_type) =>
+                {
+                    if let Some(d) = info.dest {
+                        classes.insert(d.0, CoalesceClass::Scalar);
+                    }
+                }
+                Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                } if op.vector_result_width().is_some() => {
+                    classes.insert(d.0, CoalesceClass::Vector);
+                }
+                Instruction::Copy { dest, src } => {
+                    if !allocas.contains(&dest.0) && !classes.contains_key(&dest.0) {
+                        match src {
+                            Operand::Value(v) => {
+                                copy_dests_of.entry(v.0).or_default().push(dest.0);
+                            }
+                            Operand::Const(c) if scalar_const(*c) => {
+                                classes.insert(dest.0, CoalesceClass::Scalar);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    // Copy and phi-lowering chains have no type field. Propagate the scalar
-    // classification to a fixed point through values and scalar constants.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if let Instruction::Copy { dest, src } = inst {
-                    if allocas.contains(&dest.0) || classes.contains_key(&dest.0) {
-                        continue;
-                    }
-                    let src_class = match src {
-                        Operand::Value(v) => classes.get(&v.0).copied(),
-                        Operand::Const(c) if scalar_const(*c) => Some(CoalesceClass::Scalar),
-                        _ => None,
-                    };
-                    if let Some(cls) = src_class {
-                        classes.insert(dest.0, cls);
-                        changed = true;
-                    }
-                }
+    let mut work: Vec<(u32, CoalesceClass)> = classes.iter().map(|(&id, &cls)| (id, cls)).collect();
+    while let Some((id, cls)) = work.pop() {
+        let Some(dests) = copy_dests_of.get(&id) else {
+            continue;
+        };
+        for &dest in dests {
+            if allocas.contains(&dest) || classes.contains_key(&dest) {
+                continue;
             }
+            classes.insert(dest, cls);
+            work.push((dest, cls));
         }
     }
 
@@ -141,232 +152,466 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
     classes
 }
 
-fn instruction_value_uses(inst: &Instruction) -> Vec<u32> {
-    let mut uses = Vec::new();
+/// Slots codegen re-reads around side effects (InlineAsm Phase 4).
+fn collect_unsound_coalesce_ids(func: &IrFunction) -> FxHashSet<u32> {
+    let mut ids = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, v, _) in outputs {
+                    ids.insert(v.0);
+                }
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        ids.insert(v.0);
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    ids.insert(v.0);
+                });
+            }
+        }
+    }
+    ids
+}
+
+fn collect_alloca_ids(func: &IrFunction) -> FxHashSet<u32> {
+    let mut ids = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                ids.insert(dest.0);
+            }
+        }
+    }
+    ids
+}
+
+fn for_each_instruction_value_use(inst: &Instruction, mut f: impl FnMut(u32)) {
     for_each_operand_in_instruction(inst, |op| {
         if let Operand::Value(v) = op {
-            uses.push(v.0);
+            f(v.0);
         }
     });
-    for_each_value_use_in_instruction(inst, |v| uses.push(v.0));
-    uses.sort_unstable();
-    uses.dedup();
-    uses
+    for_each_value_use_in_instruction(inst, |v| f(v.0));
 }
 
-fn terminator_value_uses(term: &Terminator) -> Vec<u32> {
-    let mut uses = Vec::new();
+fn for_each_terminator_value_use(term: &Terminator, mut f: impl FnMut(u32)) {
     for_each_operand_in_terminator(term, |op| {
         if let Operand::Value(v) = op {
-            uses.push(v.0);
+            f(v.0);
         }
     });
-    uses.sort_unstable();
-    uses.dedup();
-    uses
 }
 
-fn insert_interference(
-    graph: &mut FxHashMap<u32, FxHashSet<u32>>,
-    lhs: u32,
-    rhs: u32,
-) {
-    if lhs == rhs {
-        return;
+fn instruction_uses_value(inst: &Instruction, id: u32) -> bool {
+    let mut found = false;
+    for_each_instruction_value_use(inst, |v| {
+        if v == id {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Successor lists matching `liveness.rs`: terminator edges + InlineAsm goto.
+fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let nblocks = func.blocks.len();
+    let mut label_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    label_to_idx.reserve(nblocks);
+    for (idx, block) in func.blocks.iter().enumerate() {
+        label_to_idx.insert(block.label.0, idx);
     }
-    graph.entry(lhs).or_default().insert(rhs);
-    graph.entry(rhs).or_default().insert(lhs);
-}
 
-/// Build an SSA-style, CFG-aware interference graph after phi lowering.
-///
-/// Unlike the former textual interval heuristic, this solves backward liveness
-/// over actual successor edges and then uses copy-aware interference insertion:
-/// for `d = copy s`, `d` interferes with every value live after the copy except
-/// `s` itself.  This is the standard move-coalescing rule: source and
-/// destination may share a location at the handoff, but any other reaching
-/// definition/path that keeps them simultaneously live creates an edge and
-/// blocks the merge.
-fn cfg_copy_interference(
-    func: &IrFunction,
-    tracked: &FxHashSet<u32>,
-) -> Option<FxHashMap<u32, FxHashSet<u32>>> {
-    use crate::ir::analysis;
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+    let mut add_edge = |succs: &mut [Vec<usize>], from: usize, label: u32| {
+        if let Some(&to) = label_to_idx.get(&label) {
+            if !succs[from].contains(&to) {
+                succs[from].push(to);
+            }
+        }
+    };
 
-    let label_map = analysis::build_label_map(func);
-    let (_preds, succs) = analysis::build_cfg(func, &label_map);
-    let succs: Vec<Vec<usize>> = (0..func.blocks.len())
-        .map(|idx| succs.row(idx).iter().map(|&v| v as usize).collect())
-        .collect();
-
-    let mut block_use: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-    let mut block_def: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-    for (block_idx, block) in func.blocks.iter().enumerate() {
+    for (idx, block) in func.blocks.iter().enumerate() {
+        match &block.terminator {
+            Terminator::Branch(target) => add_edge(&mut succs, idx, target.0),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                add_edge(&mut succs, idx, true_label.0);
+                add_edge(&mut succs, idx, false_label.0);
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => {
+                for t in possible_targets {
+                    add_edge(&mut succs, idx, t.0);
+                }
+            }
+            Terminator::Switch { cases, default, .. } => {
+                add_edge(&mut succs, idx, default.0);
+                for (_, label) in cases {
+                    add_edge(&mut succs, idx, label.0);
+                }
+            }
+            _ => {}
+        }
         for inst in &block.instructions {
-            for value in instruction_value_uses(inst) {
-                if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
-                    block_use[block_idx].insert(value);
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    add_edge(&mut succs, idx, label.0);
                 }
-            }
-            if let Some(dest) = inst.dest() {
-                if tracked.contains(&dest.0) {
-                    block_def[block_idx].insert(dest.0);
-                }
-            }
-        }
-        for value in terminator_value_uses(&block.terminator) {
-            if tracked.contains(&value) && !block_def[block_idx].contains(&value) {
-                block_use[block_idx].insert(value);
             }
         }
     }
 
-    let mut live_in: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-    let mut live_out: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); func.blocks.len()];
-    let mut changed = true;
-    let mut iterations = 0usize;
-    // A conservative cap guards malformed irreducible CFGs. Failure to
-    // converge merely under-optimizes because callers reject the empty graph.
-    while changed && iterations < 256 {
-        changed = false;
-        iterations += 1;
-        for block_idx in (0..func.blocks.len()).rev() {
-            let mut out = FxHashSet::default();
-            for &succ in &succs[block_idx] {
-                out.extend(live_in[succ].iter().copied());
-            }
-            let mut input = block_use[block_idx].clone();
-            for value in &out {
-                if !block_def[block_idx].contains(value) {
-                    input.insert(*value);
-                }
-            }
-            if out != live_out[block_idx] {
-                live_out[block_idx] = out;
-                changed = true;
-            }
-            if input != live_in[block_idx] {
-                live_in[block_idx] = input;
-                changed = true;
-            }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+    for (src, dests) in succs.iter().enumerate() {
+        for &d in dests {
+            preds[d].push(src);
         }
     }
-    if changed {
-        // Do not use partially converged dataflow for a correctness proof.
-        return None;
-    }
-
-    let mut graph: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        let mut live = live_out[block_idx].clone();
-        for value in terminator_value_uses(&block.terminator) {
-            if tracked.contains(&value) {
-                live.insert(value);
-            }
-        }
-        for inst in block.instructions.iter().rev() {
-            let copy_source = match inst {
-                Instruction::Copy { src: Operand::Value(source), .. } => Some(source.0),
-                _ => None,
-            };
-            if let Some(dest) = inst.dest() {
-                if tracked.contains(&dest.0) {
-                    for &other in &live {
-                        if copy_source != Some(other) {
-                            insert_interference(&mut graph, dest.0, other);
-                        }
-                    }
-                    live.remove(&dest.0);
-                }
-            }
-            for value in instruction_value_uses(inst) {
-                if tracked.contains(&value) {
-                    live.insert(value);
-                }
-            }
-        }
-    }
-    Some(graph)
+    (succs, preds)
 }
 
-fn find_root(parent: &mut FxHashMap<u32, u32>, value: u32) -> u32 {
-    let mut root = value;
-    while parent.get(&root).copied() != Some(root) {
-        root = parent.get(&root).copied().unwrap_or(root);
+fn instruction_def_id(inst: &Instruction) -> Option<u32> {
+    if let Some(dest) = inst.dest() {
+        return Some(dest.0);
     }
-    let mut cursor = value;
-    while parent.get(&cursor).copied().is_some_and(|p| p != root) {
-        let next = parent[&cursor];
-        parent.insert(cursor, root);
-        cursor = next;
+    match inst {
+        Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => Some(dest.0),
+        _ => None,
+    }
+}
+
+// ── Dense bitsets for liveness + interference ─────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BitSet {
+    words: Vec<u64>,
+    nbits: usize,
+}
+
+impl BitSet {
+    fn new(n: usize) -> Self {
+        Self {
+            words: vec![0; n.saturating_add(63) / 64],
+            nbits: n,
+        }
+    }
+
+    fn clear(&mut self) {
+        for w in &mut self.words {
+            *w = 0;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, i: usize) {
+        if i < self.nbits {
+            self.words[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, i: usize) {
+        if i < self.nbits {
+            self.words[i / 64] &= !(1u64 << (i % 64));
+        }
+    }
+
+    #[inline]
+    fn contains(&self, i: usize) -> bool {
+        if i >= self.nbits {
+            return false;
+        }
+        self.words[i / 64] & (1u64 << (i % 64)) != 0
+    }
+
+    #[inline]
+    fn union_with(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            let n = *a | *b;
+            changed |= n != *a;
+            *a = n;
+        }
+        changed
+    }
+
+    #[inline]
+    fn intersects(&self, other: &Self) -> bool {
+        self.words
+            .iter()
+            .zip(other.words.iter())
+            .any(|(a, b)| a & b != 0)
+    }
+
+    /// `self |= other & !mask`
+    #[inline]
+    fn or_and_not(&mut self, other: &Self, mask: &Self) {
+        for ((a, b), m) in self
+            .words
+            .iter_mut()
+            .zip(other.words.iter())
+            .zip(mask.words.iter())
+        {
+            *a |= *b & !*m;
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(usize)) {
+        for (wi, &word) in self.words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                let i = wi * 64 + b;
+                if i < self.nbits {
+                    f(i);
+                }
+                bits &= bits - 1;
+            }
+        }
+    }
+}
+
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    let mut root = x;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    while parent[x] != root {
+        let next = parent[x];
+        parent[x] = root;
+        x = next;
     }
     root
 }
 
-fn class_members(parent: &mut FxHashMap<u32, u32>, root: u32) -> Vec<u32> {
-    let values: Vec<u32> = parent.keys().copied().collect();
-    values.into_iter()
-        .filter(|value| find_root(parent, *value) == root)
-        .collect()
-}
-
-fn classes_interfere(
-    parent: &mut FxHashMap<u32, u32>,
-    interference: &FxHashMap<u32, FxHashSet<u32>>,
-    lhs_root: u32,
-    rhs_root: u32,
-) -> bool {
-    let lhs = class_members(parent, lhs_root);
-    let rhs = class_members(parent, rhs_root);
-    lhs.iter().any(|value| {
-        interference.get(value).is_some_and(|neighbors| {
-            rhs.iter().any(|other| neighbors.contains(other))
-        })
-    })
-}
-
-/// CFG-aware stack-copy coalescing.
+/// Backward liveness over real successor edges, then copy-aware interference:
+/// `d = copy s` interferes with every value live after the copy except `s`.
 ///
-/// This replaces only the stack-slot alias decision.  It does not change phi
-/// lowering order, register allocation, or emitted copy semantics; it merely
-/// lets provably non-interfering scalar copy webs use one stack home.  Every
-/// alias is marked forceable because the proof is graph-based rather than the
-/// old linear `def <= last_use` approximation.
+/// Worklist + dense bitsets. The lattice is finite and the transfer is
+/// monotone. A defensive bound of `|B|·(|V|+2)` updates is the lattice
+/// height and only fires on an implementation bug.
+fn cfg_copy_interference(
+    func: &IrFunction,
+    dense: &FxHashMap<u32, usize>,
+) -> Option<Vec<BitSet>> {
+    let n = dense.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let nblocks = func.blocks.len();
+    if nblocks == 0 {
+        return Some(vec![BitSet::new(n); n]);
+    }
+
+    let (succs, preds) = build_block_cfg(func);
+
+    let mut block_use: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    let mut block_def: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            for_each_instruction_value_use(inst, |value| {
+                if let Some(&id) = dense.get(&value) {
+                    if !block_def[block_idx].contains(id) {
+                        block_use[block_idx].insert(id);
+                    }
+                }
+            });
+            if let Some(dest) = instruction_def_id(inst) {
+                if let Some(&id) = dense.get(&dest) {
+                    block_def[block_idx].insert(id);
+                }
+            }
+        }
+        for_each_terminator_value_use(&block.terminator, |value| {
+            if let Some(&id) = dense.get(&value) {
+                if !block_def[block_idx].contains(id) {
+                    block_use[block_idx].insert(id);
+                }
+            }
+        });
+    }
+
+    // Unlowered phi incoming is a use at the predecessor terminator
+    // (same contract as `liveness.rs`). After phi elim this is a no-op.
+    let mut label_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        label_to_idx.insert(block.label.0, idx);
+    }
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if let Some(&id) = dense.get(&dest.0) {
+                    block_def[block_idx].insert(id);
+                }
+                for (op, pred_label) in incoming {
+                    if let Operand::Value(v) = op {
+                        if let Some(&id) = dense.get(&v.0) {
+                            if let Some(&pred) = label_to_idx.get(&pred_label.0) {
+                                if !block_def[pred].contains(id) {
+                                    block_use[pred].insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut live_in: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    let mut live_out: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    let mut work: Vec<usize> = (0..nblocks).rev().collect();
+    let mut on_work = vec![true; nblocks];
+    let max_steps = nblocks
+        .saturating_mul(n.saturating_add(2))
+        .saturating_add(16);
+    let mut steps = 0usize;
+    let mut scratch = BitSet::new(n);
+    let mut out = BitSet::new(n);
+
+    while let Some(block_idx) = work.pop() {
+        on_work[block_idx] = false;
+        steps += 1;
+        if steps > max_steps {
+            return None;
+        }
+
+        out.clear();
+        for &succ in &succs[block_idx] {
+            if succ < nblocks {
+                out.union_with(&live_in[succ]);
+            }
+        }
+
+        scratch.clone_from(&block_use[block_idx]);
+        scratch.or_and_not(&out, &block_def[block_idx]);
+
+        if out != live_out[block_idx] {
+            live_out[block_idx].clone_from(&out);
+        }
+        if scratch != live_in[block_idx] {
+            live_in[block_idx].clone_from(&scratch);
+            for &p in &preds[block_idx] {
+                if !on_work[p] {
+                    on_work[p] = true;
+                    work.push(p);
+                }
+            }
+        }
+    }
+
+    let mut adj = vec![BitSet::new(n); n];
+    let mut live = BitSet::new(n);
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        live.clone_from(&live_out[block_idx]);
+        for_each_terminator_value_use(&block.terminator, |value| {
+            if let Some(&id) = dense.get(&value) {
+                live.insert(id);
+            }
+        });
+        // Phi incoming of successors is live at this terminator.
+        for &succ in &succs[block_idx] {
+            if succ >= nblocks {
+                continue;
+            }
+            for inst in &func.blocks[succ].instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, pred_label) in incoming {
+                        if pred_label.0 == func.blocks[block_idx].label.0 {
+                            if let Operand::Value(v) = op {
+                                if let Some(&id) = dense.get(&v.0) {
+                                    live.insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for inst in block.instructions.iter().rev() {
+            let copy_source = match inst {
+                Instruction::Copy {
+                    src: Operand::Value(source),
+                    ..
+                } => dense.get(&source.0).copied(),
+                _ => None,
+            };
+            if let Some(dest) = instruction_def_id(inst) {
+                if let Some(&di) = dense.get(&dest) {
+                    live.for_each(|other| {
+                        if copy_source != Some(other) && other != di {
+                            adj[di].insert(other);
+                            adj[other].insert(di);
+                        }
+                    });
+                    live.remove(di);
+                }
+            }
+            for_each_instruction_value_use(inst, |value| {
+                if let Some(&id) = dense.get(&value) {
+                    live.insert(id);
+                }
+            });
+        }
+    }
+    Some(adj)
+}
+
+/// CFG-aware stack-copy coalescing. Only the stack-slot alias decision;
+/// phi lowering, RA and copy emission are unchanged.
 fn build_cfg_copy_alias_map(
     func: &IrFunction,
     multi_def_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
 ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
     let classes = collect_scalar_values(func);
-    // Auto-vectorizer Vec* values (dest-based SSA, not user-level intrinsic
-    // dest_ptr allocas) MAY coalesce through a loop-carried copy: the
-    // accumulator group {acc_phi, init_zero, vec_sum} shares one home slot,
-    // the backedge copy becomes a no-op, and each iteration updates the slot
-    // in place. Soundness: (1) the cfg_copy_interference dataflow below only
-    // coalesces proven-non-interfering values; (2) a Vec* result whose only
-    // non-vector use is the Copy is never deferred (the store is always
-    // emitted); (3) phi destinations are never register-held, so there is no
-    // stale-register half of the pair. This is the v5 reduction-loop win
-    // (removes the per-iteration accumulator slot-to-slot copy). User-level
-    // intrinsic temporaries (dest_ptr allocas) remain excluded by the
-    // alloca-specific coalescing path, not this one.
+    let unsound = collect_unsound_coalesce_ids(func);
+
     let mut candidates: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Copy { dest, src: Operand::Value(source) } = inst {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(source),
+            } = inst
+            {
                 if dest.0 == source.0
                     || reg_assigned.contains_key(&dest.0)
                     || reg_assigned.contains_key(&source.0)
-                    || !classes.contains_key(&dest.0)
-                    || !classes.contains_key(&source.0)
+                    || unsound.contains(&dest.0)
+                    || unsound.contains(&source.0)
                 {
+                    continue;
+                }
+                let (Some(&dest_cls), Some(&src_cls)) =
+                    (classes.get(&dest.0), classes.get(&source.0))
+                else {
+                    continue;
+                };
+                // Never share an 8-byte scalar home with a 16/32-byte vector home.
+                if dest_cls != src_cls {
                     continue;
                 }
                 candidates.push((dest.0, source.0));
             }
         }
     }
-    candidates.sort_unstable();
+    // Prefer copies that touch a multi-def (phi-web / loop-carried) value.
+    candidates.sort_unstable_by(|a, b| {
+        let score = |dest: u32, src: u32| {
+            u8::from(multi_def_values.contains(&dest)) + u8::from(multi_def_values.contains(&src))
+        };
+        score(b.0, b.1)
+            .cmp(&score(a.0, a.1))
+            .then(a.0.cmp(&b.0))
+            .then(a.1.cmp(&b.1))
+    });
     candidates.dedup();
     if candidates.is_empty() {
         return (FxHashMap::default(), FxHashSet::default());
@@ -376,53 +621,95 @@ fn build_cfg_copy_alias_map(
         .iter()
         .flat_map(|(dest, source)| [*dest, *source])
         .collect();
-    let Some(interference) = cfg_copy_interference(func, &tracked) else {
-        // A non-converged dataflow result is never used as an optimization proof.
+
+    let mut val_of: Vec<u32> = Vec::with_capacity(tracked.len());
+    let mut dense: FxHashMap<u32, usize> = FxHashMap::default();
+    for &v in &tracked {
+        dense.insert(v, val_of.len());
+        val_of.push(v);
+    }
+    let n = val_of.len();
+
+    let Some(adj) = cfg_copy_interference(func, &dense) else {
         return (FxHashMap::default(), FxHashSet::default());
     };
 
-    let mut parent: FxHashMap<u32, u32> = tracked.iter().map(|&id| (id, id)).collect();
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut members: Vec<BitSet> = (0..n)
+        .map(|i| {
+            let mut s = BitSet::new(n);
+            s.insert(i);
+            s
+        })
+        .collect();
+    let mut inter = adj;
+
     for (dest, source) in candidates {
-        let dest_root = find_root(&mut parent, dest);
-        let source_root = find_root(&mut parent, source);
-        if dest_root == source_root
-            || classes_interfere(&mut parent, &interference, dest_root, source_root)
+        let Some(&d) = dense.get(&dest) else {
+            continue;
+        };
+        let Some(&s) = dense.get(&source) else {
+            continue;
+        };
+        let dest_root = uf_find(&mut parent, d);
+        let source_root = uf_find(&mut parent, s);
+        if dest_root == source_root {
+            continue;
+        }
+        if inter[dest_root].intersects(&members[source_root])
+            || inter[source_root].intersects(&members[dest_root])
         {
             continue;
         }
-        // Keep a multi-def phi destination as the group owner. It has the
-        // cross-block lifetime that phi incoming values must feed. Otherwise
-        // use the lower ID to make the output deterministic.
+        // Multi-def phi dest owns the web (cross-block lifetime). Else lower ID.
+        let dest_root_val = val_of[dest_root];
+        let source_root_val = val_of[source_root];
         let owner = match (
-            multi_def_values.contains(&dest_root),
-            multi_def_values.contains(&source_root),
+            multi_def_values.contains(&dest_root_val),
+            multi_def_values.contains(&source_root_val),
         ) {
             (true, false) => dest_root,
             (false, true) => source_root,
-            _ => dest_root.min(source_root),
+            _ => {
+                if dest_root_val <= source_root_val {
+                    dest_root
+                } else {
+                    source_root
+                }
+            }
         };
-        let other = if owner == dest_root { source_root } else { dest_root };
-        parent.insert(other, owner);
+        let other = if owner == dest_root {
+            source_root
+        } else {
+            dest_root
+        };
+        let other_members = members[other].clone();
+        let other_inter = inter[other].clone();
+        members[owner].union_with(&other_members);
+        inter[owner].union_with(&other_inter);
+        parent[other] = owner;
     }
 
     let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for &value in &tracked {
-        let root = find_root(&mut parent, value);
-        groups.entry(root).or_default().push(value);
+    for i in 0..n {
+        let root = uf_find(&mut parent, i);
+        groups.entry(val_of[root]).or_default().push(val_of[i]);
     }
 
     let mut aliases = FxHashMap::default();
     let mut force_aliases = FxHashSet::default();
-    for (root, mut members) in groups {
-        members.sort_unstable();
-        if members.len() < 2 {
+    for (root, mut group_members) in groups {
+        group_members.sort_unstable();
+        if group_members.len() < 2 {
             continue;
         }
-        let preferred_root = members.iter().copied()
+        let preferred_root = group_members
+            .iter()
+            .copied()
             .filter(|id| multi_def_values.contains(id))
             .min()
             .unwrap_or(root);
-        for member in members {
+        for member in group_members {
             if member != preferred_root {
                 aliases.insert(member, preferred_root);
                 force_aliases.insert(member);
@@ -430,7 +717,7 @@ fn build_cfg_copy_alias_map(
         }
     }
 
-    if std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok() && !aliases.is_empty() {
+    if env_flag("CCC_DEBUG_SLOT_COALESCE") && !aliases.is_empty() {
         let mut pairs: Vec<(u32, u32)> = aliases.iter().map(|(&a, &b)| (a, b)).collect();
         pairs.sort_unstable();
         eprintln!(
@@ -444,18 +731,12 @@ fn build_cfg_copy_alias_map(
     (aliases, force_aliases)
 }
 
-/// Build the copy alias map: dest_id -> root_id for Copy instructions where
-/// dest and src can share the same stack slot.
+/// Build dest_id → root_id for Copy instructions that can share a stack slot.
 ///
-/// Safety: only coalesces when the Copy is the SOLE use of the source value,
-/// guaranteeing the source is dead after the Copy (avoids the "lost copy"
-/// problem in phi parallel copy groups).
-/// Returns `(copy_alias, phi_web_aliases)` where phi_web_aliases contains value IDs
-/// that were coalesced via phi-web analysis and need force-overwrite in resolve_copy_aliases.
-/// The third element, `loop_phi_aliases`, contains phi-web aliases certified by
-/// `detect_phi_coalesce_groups` (loop-backedge copies); those skip the generic
-/// def/last-use interference check in resolve_copy_aliases because the detector
-/// already proved the phi dest is dead after the backedge source's definition.
+/// Returns `(copy_alias, phi_web_aliases, loop_phi_aliases)`:
+/// - `phi_web_aliases` need force-overwrite in `resolve_copy_aliases`
+/// - `loop_phi_aliases` are certified by `detect_phi_coalesce_groups` and
+///   skip the generic def/last-use check (legacy path only)
 pub(super) fn build_copy_alias_map(
     func: &IrFunction,
     def_block: &FxHashMap<u32, usize>,
@@ -466,116 +747,71 @@ pub(super) fn build_copy_alias_map(
 ) -> (FxHashMap<u32, u32>, FxHashSet<u32>, FxHashSet<u32>) {
     if cfg_copy_coalesce_enabled() {
         let (aliases, force) = build_cfg_copy_alias_map(func, multi_def_values, reg_assigned);
-        // The CFG path predates loop-backedge slot certification; no aliases
-        // bypass the resolve-time interference check on that path.
         return (aliases, force, FxHashSet::default());
     }
 
-    // Count uses of each value across all instructions.
+    let classes = collect_scalar_values(func);
+    let unsound = collect_unsound_coalesce_ids(func);
+
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    *use_count.entry(v.0).or_insert(0) += 1;
-                }
-            });
-            for_each_value_use_in_instruction(inst, |v| {
-                *use_count.entry(v.0).or_insert(0) += 1;
+            for_each_instruction_value_use(inst, |v| {
+                *use_count.entry(v).or_insert(0) += 1;
             });
         }
-        for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op {
-                *use_count.entry(v.0).or_insert(0) += 1;
-            }
+        for_each_terminator_value_use(&block.terminator, |v| {
+            *use_count.entry(v).or_insert(0) += 1;
         });
     }
 
-    // Build last-use instruction point map (NOT using LiveInterval.end which
-    // includes live-through extensions from backward dataflow). We compute actual
-    // last-instruction-use points by scanning all instructions directly.
-    // This correctly identifies values whose last explicit use IS the Copy instruction.
-    let mut last_use_instr: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut copy_program_points: FxHashMap<(usize, usize), u32> = FxHashMap::default();
-    if cached_liveness.is_some() {
-        let mut pp: u32 = 0;
-        for (blk_idx, block) in func.blocks.iter().enumerate() {
-            for (inst_idx, inst) in block.instructions.iter().enumerate() {
-                // Record program point for Copy instructions.
-                if matches!(inst, Instruction::Copy { .. }) {
-                    copy_program_points.insert((blk_idx, inst_idx), pp);
-                }
-                // Track last-use for all operands (reads of values).
-                for_each_operand_in_instruction(inst, |op| {
-                    if let Operand::Value(v) = op {
-                        last_use_instr.insert(v.0, pp);
-                    }
-                });
-                for_each_value_use_in_instruction(inst, |v| {
-                    last_use_instr.insert(v.0, pp);
-                });
-                pp += 1;
-            }
-            // Terminators also use operands.
-            for_each_operand_in_terminator(&block.terminator, |op| {
-                if let Operand::Value(v) = op {
-                    last_use_instr.insert(v.0, pp);
-                }
-            });
-            pp += 1;
+    let same_class = |a: u32, b: u32| -> bool {
+        match (classes.get(&a), classes.get(&b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
         }
-    }
+    };
 
-    // Collect Copy instructions eligible for aliasing.
     let mut raw_aliases: Vec<(u32, u32)> = Vec::new();
     for (blk_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src_val),
+            } = inst
+            {
                 let d = dest.0;
                 let s = src_val.0;
-                // Never alias a multi-defined source (the aliased value must be
-                // single-def; multi-def values have complex liveness that makes
-                // slot sharing unsafe).
-                if multi_def_values.contains(&s) {
+                if d == s
+                    || multi_def_values.contains(&s)
+                    || reg_assigned.contains_key(&d)
+                    || reg_assigned.contains_key(&s)
+                    || unsound.contains(&d)
+                    || unsound.contains(&s)
+                    || !same_class(d, s)
+                {
                     continue;
                 }
-                if reg_assigned.contains_key(&d) || reg_assigned.contains_key(&s) {
-                    continue;
-                }
-                // Coalesce if Copy is the sole use of the source, OR if the
-                // source's live interval ends at/before this Copy (src is dead after).
                 let sole_use = use_count.get(&s).copied().unwrap_or(0) == 1;
                 if !sole_use {
-                    // Block-local dead-after-copy check: is src unused after this
-                    // Copy within this block, AND not used in any other block?
-                    // (The global last_use_instr doesn't work because phi sources
-                    // may have Copies in multiple predecessor blocks.)
-                    let src_use_blocks = use_blocks_map.get(&s);
-                    let src_only_in_this_block = src_use_blocks
+                    let src_only_in_this_block = use_blocks_map
+                        .get(&s)
                         .map(|blks| blks.iter().all(|&b| b == blk_idx))
                         .unwrap_or(true);
                     if !src_only_in_this_block {
                         continue;
                     }
-                    // Check: is src used AFTER this Copy instruction in this block?
                     let mut used_after = false;
                     for later_inst in &block.instructions[inst_idx + 1..] {
-                        let mut found = false;
-                        for_each_operand_in_instruction(later_inst, |op| {
-                            if let Operand::Value(v) = op {
-                                if v.0 == s { found = true; }
-                            }
-                        });
-                        for_each_value_use_in_instruction(later_inst, |v| {
-                            if v.0 == s { found = true; }
-                        });
-                        if found { used_after = true; break; }
+                        if instruction_uses_value(later_inst, s) {
+                            used_after = true;
+                            break;
+                        }
                     }
-                    // Also check the terminator.
                     if !used_after {
-                        for_each_operand_in_terminator(&block.terminator, |op| {
-                            if let Operand::Value(v) = op {
-                                if v.0 == s { used_after = true; }
+                        for_each_terminator_value_use(&block.terminator, |v| {
+                            if v == s {
+                                used_after = true;
                             }
                         });
                     }
@@ -584,39 +820,19 @@ pub(super) fn build_copy_alias_map(
                     }
                 }
 
-                let src_def_blk = def_block.get(&s).copied();
-                let src_in_copy_block = src_def_blk == Some(blk_idx);
-                let dest_cross_block = use_blocks_map.get(&d)
+                let src_in_copy_block = def_block.get(&s).copied() == Some(blk_idx);
+                let dest_cross_block = use_blocks_map
+                    .get(&d)
                     .map(|blks| blks.iter().any(|&b| b != blk_idx))
                     .unwrap_or(false);
 
                 if src_in_copy_block && dest_cross_block {
-                    // Phi-copy pattern: src is defined and killed in this block
-                    // (sole use = this copy), but dest is used in other blocks.
-                    //
-                    // dest may be multi-defined (phi elimination creates one Copy
-                    // per predecessor that defines the phi dest). That's fine here
-                    // because dest is the slot OWNER (root), not the aliased value.
-                    // All definitions of dest write to the same slot, making the
-                    // backedge copy a same-slot no-op.
-                    //
-                    // Reversed aliasing (src → dest) is safe: src gets dest's slot,
-                    // which is already live across all of dest's uses. After aliasing,
-                    // the copy becomes a same-slot no-op (skipped by generate_copy).
-                    // This eliminates the double-slot pattern that arises from phi
-                    // elimination in loops with spilled variables.
-                    raw_aliases.push((s, d)); // src uses dest's (wider-live) slot
+                    // Phi-copy: src dies here, dest is the wider-live slot owner.
+                    raw_aliases.push((s, d));
                     continue;
                 }
 
-                // Standard same-block coalescing: dest uses src's slot.
-                // Dest must not be multi-defined (would make slot-sharing unsafe
-                // for the standard direction), and dest's uses must all be in the
-                // same block as source's definition.
-                if multi_def_values.contains(&d) {
-                    continue;
-                }
-                if dest_cross_block {
+                if multi_def_values.contains(&d) || dest_cross_block {
                     continue;
                 }
                 raw_aliases.push((d, s));
@@ -624,154 +840,115 @@ pub(super) fn build_copy_alias_map(
         }
     }
 
-    // ── Phi-web coalescing ──────────────────────────────────────────────────
-    //
-    // Force phi web members to share the same stack slot. For Copy(dest, src)
-    // where dest is multi-def (phi dest), coalesce src→dest if src is NOT live
-    // at any program point where dest is written by a DIFFERENT Copy.
-    //
-    // Uses liveness intervals for precise interference: src interferes with a
-    // Copy(dest, src') at program point P' if src.start <= P' <= src.end.
-    // This correctly handles switch statements (case arms are mutually exclusive
-    // so their intervals don't overlap) and loop patterns.
+    // Phi-web: coalesce src → dest for multi-def dest iff src is not live at
+    // any rival dest-write. Only web members may join (external feeds keep
+    // their own home — otherwise the elided copy leaves a stale value).
     let mut phi_web_aliases: FxHashSet<u32> = FxHashSet::default();
-    if !std::env::var("CCC_NO_PHI_WEB_COALESCE").is_ok() {
-        // Phase 1: Collect all Copy(dest, src) pairs with program points.
-        // Program points match liveness.rs numbering (1 per instruction + 1 per terminator).
-        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize, u32)>> = FxHashMap::default(); // dest → [(src, blk, pp)]
-        let mut dest_copy_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default(); // dest → [program_points]
+    if !env_flag("CCC_NO_PHI_WEB_COALESCE") {
+        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize, u32)>> = FxHashMap::default();
+        let mut dest_copy_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         let already_aliased: FxHashSet<u32> = raw_aliases.iter().map(|&(a, _)| a).collect();
         {
             let mut pp: u32 = 0;
             for (blk_idx, block) in func.blocks.iter().enumerate() {
                 for inst in &block.instructions {
-                    if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+                    if let Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src_val),
+                    } = inst
+                    {
                         let d = dest.0;
                         let s = src_val.0;
                         if multi_def_values.contains(&d)
                             && !reg_assigned.contains_key(&s)
+                            && !reg_assigned.contains_key(&d)
                             && !already_aliased.contains(&s)
+                            && !unsound.contains(&d)
+                            && !unsound.contains(&s)
+                            && same_class(d, s)
                         {
                             phi_copies.entry(d).or_default().push((s, blk_idx, pp));
                             dest_copy_points.entry(d).or_default().push(pp);
                         }
                     }
-                    pp += 1;
+                    pp = pp.saturating_add(1);
                 }
-                pp += 1; // terminator
+                pp = pp.saturating_add(1);
             }
         }
 
-        // Phase 2: Build interval map from liveness data.
+        // Program-point numbering matches `liveness.rs` (1 per inst + 1 per term).
         let interval_map: FxHashMap<u32, (u32, u32)> = cached_liveness
             .as_ref()
-            .map(|lr| lr.intervals.iter().map(|iv| (iv.value_id, (iv.start, iv.end))).collect())
+            .map(|lr| {
+                lr.intervals
+                    .iter()
+                    .map(|iv| (iv.value_id, (iv.start, iv.end)))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        // Phase 3: For each phi web, check interference using liveness intervals.
         for (dest_id, sources) in &phi_copies {
-            if sources.len() < 2 { continue; }
-            if reg_assigned.contains_key(dest_id) { continue; }
-
-            // All program points where dest is written by any Copy.
-            let all_copy_points = match dest_copy_points.get(dest_id) {
-                Some(pts) => pts,
-                None => continue,
+            if sources.len() < 2 || reg_assigned.contains_key(dest_id) {
+                continue;
+            }
+            let Some(all_copy_points) = dest_copy_points.get(dest_id) else {
+                continue;
             };
 
             for &(src_id, _src_blk, src_copy_pp) in sources {
-                // SOUNDNESS (maketrees miscompile, 2026-08): only loop-carried
-                // WEB MEMBERS may be aliased into the web. An external feed
-                // value (single-def, defined outside the web — e.g. the
-                // GlobalAddr of the final-iteration separator string) has its
-                // own home; aliasing it in makes the elided phi Copy leave
-                // the web home holding a STALE earlier value, which later
-                // reads of the dest then return. Web membership = src is
-                // itself a phi dest (multi-def loop-carried value).
-                if !phi_copies.contains_key(&src_id)
-                    && !multi_def_values.contains(&src_id)
-                {
+                if !phi_copies.contains_key(&src_id) && !multi_def_values.contains(&src_id) {
                     continue;
                 }
-                // Get src's liveness interval.
-                let src_interval = interval_map.get(&src_id);
 
-                // Interference check: is src live at any program point where dest
-                // is written by a DIFFERENT Copy?
-                //
-                // For single-def sources: use_blocks check is sufficient —
-                // if src has no uses in dest's other def blocks, no interference.
-                //
-                // For multi-def sources: the use_blocks check is too conservative
-                // because multi-def values have definitions (not just uses) spread
-                // across blocks. Instead, check: does src's definition set overlap
-                // with dest's OTHER def blocks? If src is DEFINED in a block where
-                // dest has a DIFFERENT Copy, the two values co-exist there.
-                // But if src is defined there BY THE SAME Copy pattern (it's also
-                // a phi dest being written), the write order is deterministic
-                // and they won't conflict.
-                //
-                // Simple safe heuristic: src doesn't interfere if ALL of src's
-                // use blocks are either (a) the Copy's block, or (b) blocks where
-                // src is defined (def_block or multi-def blocks for src).
-                // Collect dest's other def blocks (blocks with Copy(dest, X) where X ≠ src).
-                let other_def_blks: Vec<usize> = sources.iter()
-                    .filter(|&&(_, _, pp)| pp != src_copy_pp)
-                    .map(|&(_, blk, _)| blk)
+                let other_copy_points: Vec<u32> = all_copy_points
+                    .iter()
+                    .copied()
+                    .filter(|&pp| pp != src_copy_pp)
                     .collect();
 
-                // Check: does src have uses in dest's other def blocks that are
-                // NOT themselves Copy(dest, src) instructions?
-                //
-                // Key insight: use_blocks_map counts Copy(dest, src) as a "use of src"
-                // in the Copy's block. But if src and dest share a slot, that Copy
-                // becomes a no-op — so it's not real interference. We must exclude
-                // uses that come from Copy instructions writing to dest.
-                //
-                // Build set of blocks where src has NON-COPY uses (actual computation
-                // that reads src for purposes other than feeding this phi).
-                let src_non_copy_use_blks: Vec<usize> = {
-                    let mut non_copy_blks = Vec::new();
-                    for (blk_idx, block) in func.blocks.iter().enumerate() {
-                        let mut has_non_copy_use = false;
+                let interferes = if let Some(&(start, end)) = interval_map.get(&src_id) {
+                    other_copy_points
+                        .iter()
+                        .any(|&pp| start <= pp && pp <= end)
+                } else {
+                    let other_def_blks: FxHashSet<usize> = sources
+                        .iter()
+                        .filter(|&&(_, _, pp)| pp != src_copy_pp)
+                        .map(|&(_, blk, _)| blk)
+                        .collect();
+
+                    let mut interferes_fallback = false;
+                    'blocks: for (blk_idx, block) in func.blocks.iter().enumerate() {
+                        if !other_def_blks.contains(&blk_idx) {
+                            continue;
+                        }
                         for inst in &block.instructions {
-                            // Skip Copy instructions that write to dest (these are
-                            // the phi copies we're trying to coalesce).
-                            if let Instruction::Copy { dest: copy_dest, src: Operand::Value(copy_src) } = inst {
+                            if let Instruction::Copy {
+                                dest: copy_dest,
+                                src: Operand::Value(copy_src),
+                            } = inst
+                            {
                                 if copy_dest.0 == *dest_id && copy_src.0 == src_id {
-                                    continue; // This is the phi Copy — not real interference
+                                    continue;
                                 }
                             }
-                            // Check if this instruction uses src as an operand.
-                            let mut uses_src = false;
-                            for_each_operand_in_instruction(inst, |op| {
-                                if let Operand::Value(v) = op {
-                                    if v.0 == src_id { uses_src = true; }
-                                }
-                            });
-                            for_each_value_use_in_instruction(inst, |v| {
-                                if v.0 == src_id { uses_src = true; }
-                            });
-                            if uses_src { has_non_copy_use = true; break; }
+                            if instruction_uses_value(inst, src_id) {
+                                interferes_fallback = true;
+                                break 'blocks;
+                            }
                         }
-                        if !has_non_copy_use {
-                            // Also check terminator.
-                            for_each_operand_in_terminator(&block.terminator, |op| {
-                                if let Operand::Value(v) = op {
-                                    if v.0 == src_id { has_non_copy_use = true; }
-                                }
-                            });
-                        }
-                        if has_non_copy_use {
-                            non_copy_blks.push(blk_idx);
+                        for_each_terminator_value_use(&block.terminator, |v| {
+                            if v == src_id {
+                                interferes_fallback = true;
+                            }
+                        });
+                        if interferes_fallback {
+                            break;
                         }
                     }
-                    non_copy_blks
+                    interferes_fallback
                 };
-
-                let interferes = src_non_copy_use_blks.iter().any(|use_blk| {
-                    other_def_blks.contains(use_blk)
-                });
 
                 if !interferes {
                     raw_aliases.push((src_id, *dest_id));
@@ -781,59 +958,82 @@ pub(super) fn build_copy_alias_map(
         }
     }
 
-    // ── Loop-backedge phi slot coalescing ─────────────────────────────────
-    //
-    // The phi-web phase above only fires for dests with 2+ Value sources, so a
-    // loop-carried variable with a constant initializer (const-init Copy plus
-    // one backedge Copy) is never coalesced: its backedge Copy `v_old <- v_new`
-    // survives as a ldr+str slot-to-slot copy per iteration for every spilled
-    // loop-carried value (e.g. 10 such pairs per iteration in arith_loop).
-    //
-    // detect_phi_coalesce_groups proves the phi dest is not used after the
-    // backedge source is defined, which is precisely the condition that makes
-    // slot sharing sound: v_new may write the shared slot as early as its own
-    // definition, and any later read of the slot (next iteration, or after the
-    // loop) is meant to observe the updated value. Both values must be
-    // stack-homed (register-assigned values are handled by register coalescing)
-    // and the source must be an integer/pointer-typed def (i128/f128/vector
-    // slots are 16/32 bytes and FP copies use different load/store paths).
+    // Loop-backedge phi: const-init + one backedge Copy never enters the
+    // 2-source phi-web. `detect_phi_coalesce_groups` proves dest is dead
+    // after the backedge source def, so they may share the dest slot.
     let mut loop_phi_aliases: FxHashSet<u32> = FxHashSet::default();
-    if std::env::var("CCC_NO_LOOP_PHI_SLOT").is_err() {
+    if !env_flag("CCC_NO_LOOP_PHI_SLOT") {
         if let Some(liveness) = cached_liveness {
-            // Type of each single-def source, for the integer/pointer check.
             let mut def_ty_ok: FxHashMap<u32, bool> = FxHashMap::default();
+            let mut copy_of: Vec<(u32, u32)> = Vec::new();
             for block in &func.blocks {
                 for inst in &block.instructions {
                     let (d, ok) = match inst {
                         Instruction::BinOp { dest, ty, .. }
                         | Instruction::UnaryOp { dest, ty, .. }
                         | Instruction::Load { dest, ty, .. }
-                        | Instruction::Select { dest, ty, .. } => {
-                            (dest.0, !ty.is_float() && !ty.is_128bit() && !ty.is_long_double())
-                        }
+                        | Instruction::Select { dest, ty, .. }
+                        | Instruction::AtomicLoad { dest, ty, .. }
+                        | Instruction::AtomicRmw { dest, ty, .. }
+                        | Instruction::AtomicCmpxchg { dest, ty, .. }
+                        | Instruction::ParamRef { dest, ty, .. } => (dest.0, scalar_type(*ty)),
                         Instruction::Cmp { dest, .. }
-                        | Instruction::GetElementPtr { dest, .. } => (dest.0, true),
-                        Instruction::Cast { dest, to_ty, from_ty, .. } => (
-                            dest.0,
-                            !to_ty.is_float()
-                                && !to_ty.is_128bit()
-                                && !from_ty.is_float()
-                                && !from_ty.is_128bit(),
-                        ),
+                        | Instruction::GetElementPtr { dest, .. }
+                        | Instruction::GlobalAddr { dest, .. }
+                        | Instruction::LabelAddr { dest, .. } => (dest.0, true),
+                        Instruction::Cast {
+                            dest, to_ty, from_ty, ..
+                        } => (dest.0, scalar_type(*to_ty) && scalar_type(*from_ty)),
+                        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                            match info.dest {
+                                Some(d) => (d.0, scalar_type(info.return_type)),
+                                None => continue,
+                            }
+                        }
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Const(c),
+                        } if scalar_const(*c) => (dest.0, true),
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(src),
+                        } => {
+                            copy_of.push((dest.0, src.0));
+                            continue;
+                        }
                         _ => continue,
                     };
                     def_ty_ok.insert(d, ok);
                 }
             }
-            let already_aliased: FxHashSet<u32> =
-                raw_aliases.iter().map(|&(a, _)| a).collect();
-            // Only one NEW slot alias per phi dest: two backedge sources sharing
-            // the dest's slot could see each other's writes (unlike register
-            // coalescing, there is no per-source interval conflict check here).
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &(d, s) in &copy_of {
+                    let Some(&ok) = def_ty_ok.get(&s) else {
+                        continue;
+                    };
+                    match def_ty_ok.get(&d).copied() {
+                        None => {
+                            def_ty_ok.insert(d, ok);
+                            changed = true;
+                        }
+                        Some(true) if !ok => {
+                            def_ty_ok.insert(d, false);
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let already_aliased: FxHashSet<u32> = raw_aliases.iter().map(|&(a, _)| a).collect();
             let mut claimed_dests: FxHashSet<u32> = FxHashSet::default();
+            let debug_loop_phi = env_flag("CCC_DEBUG_LOOP_PHI");
             for cand in detect_phi_coalesce_groups(func, liveness) {
                 let (phi_dest, backedge_src) = (cand.phi_dest, cand.backedge_src);
-                if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() {
+                let src_ty_ok = def_ty_ok.get(&backedge_src).copied().unwrap_or(false);
+                if debug_loop_phi {
                     eprintln!(
                         "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",
                         func.name,
@@ -842,89 +1042,78 @@ pub(super) fn build_copy_alias_map(
                         reg_assigned.contains_key(&phi_dest),
                         reg_assigned.contains_key(&backedge_src),
                         already_aliased.contains(&backedge_src),
-                        def_ty_ok.get(&backedge_src).copied().unwrap_or(false)
+                        src_ty_ok,
                     );
                 }
-                if reg_assigned.contains_key(&phi_dest) || reg_assigned.contains_key(&backedge_src) {
+                if reg_assigned.contains_key(&phi_dest)
+                    || reg_assigned.contains_key(&backedge_src)
+                    || unsound.contains(&phi_dest)
+                    || unsound.contains(&backedge_src)
+                {
                     continue;
                 }
                 if already_aliased.contains(&backedge_src) {
-                    // Already aliased by an earlier phase, but the generic
-                    // interference check at resolve time conservatively rejects
-                    // it (the phi dest is used again on later iterations).
-                    // The detector's proof is stronger, so certify the bypass —
-                    // but only for integer/pointer sources (i128/f128/vector
-                    // values have 16/32-byte slots and must never share an
-                    // 8-byte slot).
-                    if def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
+                    if src_ty_ok {
                         loop_phi_aliases.insert(backedge_src);
                     }
                     continue;
                 }
-                if !def_ty_ok.get(&backedge_src).copied().unwrap_or(false) {
+                if !src_ty_ok {
                     continue;
                 }
                 if !claimed_dests.insert(phi_dest) {
-                    continue; // a source already claims this dest's slot
+                    continue;
                 }
                 raw_aliases.push((backedge_src, phi_dest));
-                phi_web_aliases.insert(backedge_src); // force-overwrite at resolve
-                loop_phi_aliases.insert(backedge_src); // skip generic interference check
+                phi_web_aliases.insert(backedge_src);
+                loop_phi_aliases.insert(backedge_src);
             }
         }
     }
 
-    // Build alias map with transitive resolution: follow chains to find root.
-    // Safety limit on chain depth guards against pathological cycles.
-    const MAX_ALIAS_CHAIN_DEPTH: usize = 100;
+    const MAX_ALIAS_CHAIN_DEPTH: usize = 64;
     let mut copy_alias: FxHashMap<u32, u32> = FxHashMap::default();
     for (dest_id, src_id) in raw_aliases {
+        if dest_id == src_id {
+            continue;
+        }
+        let origin = src_id;
         let mut root = src_id;
-        let mut depth = 0;
+        let mut depth = 0usize;
+        let mut refuse = false;
         while let Some(&parent) = copy_alias.get(&root) {
+            if parent == dest_id || parent == root || parent == origin {
+                refuse = true;
+                break;
+            }
             root = parent;
             depth += 1;
-            if depth > MAX_ALIAS_CHAIN_DEPTH { break; }
+            if depth > MAX_ALIAS_CHAIN_DEPTH {
+                refuse = true;
+                break;
+            }
         }
-        if root != dest_id {
+        if !refuse && root != dest_id {
             copy_alias.insert(dest_id, root);
         }
     }
 
-    // Remove aliases where root or dest is an alloca (alloca slots are special).
-    let alloca_ids: FxHashSet<u32> = func.blocks.iter()
-        .flat_map(|b| b.instructions.iter())
-        .filter_map(|inst| {
-            if let Instruction::Alloca { dest, .. } = inst { Some(dest.0) } else { None }
-        })
-        .collect();
-    copy_alias.retain(|dest_id, root_id| {
-        !alloca_ids.contains(root_id) && !alloca_ids.contains(dest_id)
-    });
+    let alloca_ids = collect_alloca_ids(func);
+    if !alloca_ids.is_empty() {
+        copy_alias.retain(|dest_id, root_id| {
+            !alloca_ids.contains(root_id) && !alloca_ids.contains(dest_id)
+        });
+    }
+    if !unsound.is_empty() {
+        copy_alias.retain(|dest_id, root_id| !unsound.contains(dest_id) && !unsound.contains(root_id));
+    }
 
-    // Remove aliases for InlineAsm output pointer values. InlineAsm Phase 4 reads
-    // output pointers from stack slots AFTER the asm executes; if aliased, the
-    // root's slot may be reused between the Copy and the InlineAsm, corrupting
-    // the pointer read in Phase 4.
-    let mut asm_output_ptrs: FxHashSet<u32> = FxHashSet::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::InlineAsm { outputs, .. } = inst {
-                for (_, v, _) in outputs {
-                    asm_output_ptrs.insert(v.0);
-                }
-            }
-        }
-    }
-    if !asm_output_ptrs.is_empty() {
-        copy_alias.retain(|dest_id, _| !asm_output_ptrs.contains(dest_id));
-    }
-    // A filtered-out alias must not survive in the certified sets.
     loop_phi_aliases.retain(|v| copy_alias.contains_key(v));
     phi_web_aliases.retain(|v| copy_alias.contains_key(v));
 
-    if std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok() && !copy_alias.is_empty() {
-        let mut aliases: Vec<(u32, u32)> = copy_alias.iter()
+    if env_flag("CCC_DEBUG_SLOT_COALESCE") && !copy_alias.is_empty() {
+        let mut aliases: Vec<(u32, u32)> = copy_alias
+            .iter()
             .map(|(&dest, &root)| (dest, root))
             .collect();
         aliases.sort_unstable();
@@ -941,26 +1130,20 @@ pub(super) fn build_copy_alias_map(
     (copy_alias, phi_web_aliases, loop_phi_aliases)
 }
 
-/// Identify values that can skip stack slot allocation because they are
-/// produced and consumed in adjacent instructions within the same block.
+/// Values that can skip a stack slot: produced into the GPR accumulator and
+/// consumed as the first operand of the next instruction (or the terminator).
 ///
-/// A value V defined at instruction I can skip its slot if:
-/// 1. V has exactly one use as an Operand (loaded via operand_to_rax/rcx)
-/// 2. That use is at instruction I+1 (or in the block terminator if I is last)
-/// 3. V is the FIRST Operand of the consumer (loaded first into the accumulator)
-/// 4. V is NOT used as a Value reference (ptr in Store/Load, base in GEP, etc.)
-/// 5. V is not i128/f128 (these need 16-byte slots with special handling)
-/// 6. V is not from a Copy instruction (copy aliasing needs the root's slot)
-/// 7. V is not from an Alloca (allocas always need addressable slots)
-///
-/// The codegen accumulator cache ensures correctness: store_rax_to sets the
-/// cache, and the next instruction's operand_to_rax finds V there.
-pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: bool) -> FxHashSet<u32> {
+/// `lhs_first_binop` is true on backends that always load BinOp/Cmp lhs
+/// before rhs (RISC-V). x86/ARM rhs-conflict / operand-swap paths are unsafe.
+pub(super) fn compute_immediately_consumed(
+    func: &IrFunction,
+    lhs_first_binop: bool,
+) -> FxHashSet<u32> {
     let mut result = FxHashSet::default();
 
-    // First pass: count uses per value (both Operand and Value-ref uses).
     let mut operand_use_count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut has_value_ref_use: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_alias_roots: FxHashSet<u32> = FxHashSet::default();
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -972,6 +1155,13 @@ pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: b
             for_each_value_use_in_instruction(inst, |v| {
                 has_value_ref_use.insert(v.0);
             });
+            if let Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } = inst
+            {
+                copy_alias_roots.insert(v.0);
+            }
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
@@ -980,56 +1170,28 @@ pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: b
         });
     }
 
-    // Collect all copy-alias roots: values that serve as the slot source for copies.
-    // These must keep their slots since aliased copies will use them.
-    let mut copy_alias_roots: FxHashSet<u32> = FxHashSet::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Copy { src: Operand::Value(v), .. } = inst {
-                copy_alias_roots.insert(v.0);
-            }
-        }
-    }
-
-    // Second pass: check adjacency and first-operand conditions.
     for block in &func.blocks {
         let insts = &block.instructions;
         for (i, inst) in insts.iter().enumerate() {
-            let dest = match inst.dest() {
-                Some(d) => d,
-                None => continue,
+            let Some(dest) = inst.dest() else {
+                continue;
             };
+            if !is_gpr_acc_preserving_producer(inst) {
+                continue;
+            }
+            if has_value_ref_use.contains(&dest.0) || copy_alias_roots.contains(&dest.0) {
+                continue;
+            }
+            if operand_use_count.get(&dest.0).copied().unwrap_or(0) != 1 {
+                continue;
+            }
 
-            // Only acc-preserving producers are safe: after these execute,
-            // the accumulator cache still holds the result. Cache-invalidating
-            // instructions (Call, Atomic*, DynAlloca, etc.) clear the cache
-            // after store_rax_to, so the next instruction can't find the value.
-            if !is_acc_preserving_producer(inst) { continue; }
-            // Skip i128/f128 (special 16-byte handling uses emit_load_acc_pair /
-            // emit_store_acc_pair which bypass the normal accumulator cache).
-            if involves_i128_or_f128(inst) { continue; }
-            // Skip if value has Value-ref uses (ptr/base in Store/Load/GEP).
-            if has_value_ref_use.contains(&dest.0) { continue; }
-            // Skip if value is a copy-alias root (other values share its slot).
-            if copy_alias_roots.contains(&dest.0) { continue; }
-            // Must have exactly one Operand use.
-            let use_cnt = operand_use_count.get(&dest.0).copied().unwrap_or(0);
-            if use_cnt != 1 { continue; }
-            if use_cnt != 1 { continue; }
-
-            // Check if the single use is in the immediately next instruction
-            // or in the block terminator (if this is the last instruction).
             if i + 1 < insts.len() {
-                // Use must be in instruction i+1, as the first Operand.
-                let next = &insts[i + 1];
-                if is_safe_sole_consumer(next, dest.0, lhs_first_binop) {
+                if is_safe_sole_consumer(&insts[i + 1], dest.0, lhs_first_binop) {
                     result.insert(dest.0);
                 }
-            } else {
-                // Last instruction: use must be in the terminator, as the sole Operand.
-                if is_sole_operand_of_terminator(&block.terminator, dest.0) {
-                    result.insert(dest.0);
-                }
+            } else if is_sole_operand_of_terminator(&block.terminator, dest.0) {
+                result.insert(dest.0);
             }
         }
     }
@@ -1037,84 +1199,66 @@ pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: b
     result
 }
 
-/// Check if an instruction is an "acc-preserving" producer: after execution,
-/// the accumulator register cache still holds the result value. Only these
-/// instructions can participate in the skip-slot optimization as producers.
-///
-/// Cache-invalidating instructions (Call, Store, Atomic*, DynAlloca, InlineAsm,
-/// etc.) call invalidate_all() after execution, clearing the cache.
-fn is_acc_preserving_producer(inst: &Instruction) -> bool {
-    matches!(inst,
-        Instruction::Load { .. }
-        | Instruction::BinOp { .. }
-        | Instruction::UnaryOp { .. }
-        | Instruction::Cmp { .. }
-        | Instruction::Cast { .. }
-        | Instruction::GetElementPtr { .. }
-        | Instruction::GlobalAddr { .. }
-        | Instruction::Select { .. }
-        | Instruction::LabelAddr { .. }
-    )
-}
-
-/// Check if an instruction involves I128/U128/F128 types in any operand position.
-/// These use emit_load_acc_pair / emit_store_acc_pair which bypass the normal
-/// accumulator cache, so they cannot participate in skip-slot optimization.
-fn involves_i128_or_f128(inst: &Instruction) -> bool {
-    fn is_wide(ty: IrType) -> bool {
-        matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
-    }
+/// Producer leaves its GPR result in the accumulator cache.
+fn is_gpr_acc_preserving_producer(inst: &Instruction) -> bool {
     match inst {
-        Instruction::Cast { from_ty, to_ty, .. } => is_wide(*from_ty) || is_wide(*to_ty),
-        Instruction::UnaryOp { ty, .. } => is_wide(*ty),
-        Instruction::BinOp { ty, .. } => is_wide(*ty),
-        Instruction::Cmp { ty, .. } => is_wide(*ty),
-        Instruction::Load { ty, .. } => is_wide(*ty),
-        _ => {
-            // For other instructions, just check the result type.
-            matches!(inst.result_type(), Some(ty) if is_wide(ty))
+        Instruction::Load { ty, .. }
+        | Instruction::BinOp { ty, .. }
+        | Instruction::UnaryOp { ty, .. }
+        | Instruction::Select { ty, .. } => ty_lives_in_gpr_cache(*ty),
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            ty_lives_in_gpr_cache(*to_ty) && !from_ty.is_128bit() && !from_ty.is_long_double()
         }
+        Instruction::Cmp { ty, .. } => ty_lives_in_gpr_cache(*ty),
+        Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::LabelAddr { .. } => true,
+        _ => false,
     }
 }
 
-/// Check if value_id is the sole Operand loaded by the given instruction,
-/// with guaranteed loading order (no other operand loaded before it).
-///
-/// Only single-operand consumers are safe by default: Store (val loaded first),
-/// Cast, UnaryOp, Copy. Two-operand instructions (BinOp, Cmp) are excluded on
-/// x86/ARM because codegen may load the OTHER operand first (e.g. BinOp's
-/// rhs_conflicts path, float Cmp's Lt/Le operand swap). GEP excluded because
-/// OverAligned base computation clobbers %rax before offset is loaded.
-///
-/// When `lhs_first_binop` is true (RISC-V), BinOp and Cmp are also safe when
-/// value_id is the lhs operand, because the RISC-V backend unconditionally
-/// loads lhs before rhs with no register-direct conflict paths.
+/// `value_id` is the first (and, for default targets, only) operand loaded.
 fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: bool) -> bool {
     match inst {
-        // Store: val is always loaded first via emit_load_operand (operand_to_rax)
-        Instruction::Store { val: Operand::Value(v), .. } => v.0 == value_id,
-        // Single-operand instructions: loaded via operand_to_rax, no other operand
-        Instruction::Cast { src: Operand::Value(v), .. } => v.0 == value_id,
-        Instruction::UnaryOp { src: Operand::Value(v), .. } => v.0 == value_id,
-        Instruction::Copy { src: Operand::Value(v), .. } => v.0 == value_id,
-        // BinOp: safe on architectures that always load lhs first (RISC-V)
-        Instruction::BinOp { lhs: Operand::Value(v), .. } if lhs_first_binop => v.0 == value_id,
-        // Cmp: safe on architectures that always load lhs first (RISC-V)
-        Instruction::Cmp { lhs: Operand::Value(v), .. } if lhs_first_binop => v.0 == value_id,
-        // All other instructions: not safe (GEP, Call, Select, etc.)
+        Instruction::Store {
+            val: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::Cast {
+            src: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::UnaryOp {
+            src: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::Copy {
+            src: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::BinOp {
+            lhs: Operand::Value(v),
+            ..
+        } if lhs_first_binop => v.0 == value_id,
+        Instruction::Cmp {
+            lhs: Operand::Value(v),
+            ..
+        } if lhs_first_binop => v.0 == value_id,
         _ => false,
     }
 }
 
-/// Check if value_id is the sole operand of a block terminator.
 fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
-    match term {
-        Terminator::Return(Some(Operand::Value(v))) => v.0 == value_id,
-        Terminator::CondBranch { cond: Operand::Value(v), .. } => v.0 == value_id,
-        Terminator::Switch { val: Operand::Value(v), .. } => v.0 == value_id,
-        Terminator::IndirectBranch { target: Operand::Value(v), .. } => v.0 == value_id,
-        _ => false,
-    }
+    let mut saw = false;
+    let mut extra = false;
+    for_each_terminator_value_use(term, |id| {
+        if id == value_id {
+            saw = true;
+        } else {
+            extra = true;
+        }
+    });
+    saw && !extra
 }
 
 #[cfg(test)]
@@ -1148,23 +1292,23 @@ mod cfg_copy_coalesce_tests {
             0,
             vec![
                 scalar_def(0, 7),
-                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
             ],
             Terminator::Return(Some(Operand::Value(Value(1)))),
         ));
-        let (aliases, force) = build_cfg_copy_alias_map(
-            &func,
-            &FxHashSet::default(),
-            &FxHashMap::default(),
-        );
+        let (aliases, force) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default());
         assert_eq!(aliases.get(&1), Some(&0));
         assert!(force.contains(&1));
     }
 
     #[test]
     fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
-        // d is a lowered phi: d = x on the left edge, d = y on the right.
-        // x is also used after the join, so x and d must never share a slot.
+        // d is a lowered phi: d = x on the left, d = y on the right.
+        // x is used after the join, so x and d must not share a slot.
         let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![
             block(
@@ -1178,14 +1322,20 @@ mod cfg_copy_coalesce_tests {
             ),
             block(
                 1,
-                vec![Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) }],
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
                 Terminator::Branch(BlockId(3)),
             ),
             block(
                 2,
                 vec![
                     scalar_def(1, 22),
-                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(1)),
+                    },
                 ],
                 Terminator::Branch(BlockId(3)),
             ),
@@ -1206,22 +1356,24 @@ mod cfg_copy_coalesce_tests {
         let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
         assert_ne!(aliases.get(&0), Some(&2));
         assert_ne!(aliases.get(&2), Some(&0));
-        // y is edge-local and may safely use the phi web's home.
         assert_eq!(aliases.get(&1), Some(&2));
     }
 
     #[test]
     fn cfg_copy_coalesces_loop_carried_phi_sources() {
-        // Lowered loop phi: state is initialized from `init` on entry and
-        // from `next` on the back-edge. Neither incoming value is used after
-        // its edge copy, so both may share the phi web's stack home.
+        // init is dead after its edge copy and may share the phi home.
+        // next is redefined at the header; CFG liveness keeps it distinct
+        // because the exit still reads the pre-increment phi.
         let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![
             block(
                 0,
                 vec![
                     scalar_def(0, 3),
-                    Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(0)),
+                    },
                 ],
                 Terminator::Branch(BlockId(1)),
             ),
@@ -1242,7 +1394,10 @@ mod cfg_copy_coalesce_tests {
             ),
             block(
                 2,
-                vec![Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) }],
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                }],
                 Terminator::Branch(BlockId(1)),
             ),
             block(3, vec![], Terminator::Return(Some(Operand::Value(Value(2))))),
@@ -1251,9 +1406,6 @@ mod cfg_copy_coalesce_tests {
         multi_def.insert(2);
         let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
         assert_eq!(aliases.get(&0), Some(&2));
-        // `next` is redefined at the loop header on the next iteration, so
-        // the CFG liveness proof conservatively keeps it distinct from the
-        // phi web instead of relying on textual interval order.
         assert_ne!(aliases.get(&1), Some(&2));
     }
 
@@ -1270,27 +1422,117 @@ mod cfg_copy_coalesce_tests {
                     rhs: Operand::Const(IrConst::I128(2)),
                     ty: IrType::I128,
                 },
-                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
             ],
             Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
         ));
-        let (aliases, _) = build_cfg_copy_alias_map(
-            &func,
-            &FxHashSet::default(),
-            &FxHashMap::default(),
-        );
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default());
         assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn cfg_copy_refuses_self_copy() {
+        let mut func = IrFunction::new("self".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 1),
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        ));
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default());
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn immediately_consumed_picks_adjacent_cast() {
+        let mut func = IrFunction::new("adj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 9),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0));
+        assert!(!skip.contains(&1));
+    }
+
+    #[test]
+    fn immediately_consumed_rejects_two_uses() {
+        let mut func = IrFunction::new("two".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 9),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: crate::ir::reexports::IrUnaryOp::Neg,
+                    src: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(!skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_rejects_float_producer() {
+        let mut func = IrFunction::new("fp".to_string(), IrType::F64, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(0)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::F64,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(!skip.contains(&0));
     }
 }
 
-/// True if the intrinsic's codegen reads its args OUTSIDE the cache-aware
-/// loaders (sse_load_arg/avx_load_arg_to) — i.e. it invalidates the vector
-/// last-store peephole and would observe a deferred (never-written) slot.
+/// Codegen reads args outside `sse_load_arg` / `avx_load_arg_to` and would
+/// observe a deferred (never-written) slot.
 pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::Pblendvb128 | O::Pblendw128
+        O::Pblendvb128
+            | O::Pblendw128
             | O::Loadldi128
             | O::Storeldi128
             | O::FmaF64x2
@@ -1312,103 +1554,167 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI32x8
             | O::VecLoadF32x4
             | O::VecLoadF32x8
-            // VecAdd*/VecMul* are NOT raw readers: they are cache-aware
-            // two-operand binaries whose codegen goes through
-            // emit_avx_binary_256 / emit_sse_binary_128, so they can
-            // consume a deferred single-use load from the register cache and
-            // fold the other operand as a memory operand. VecLoad*/VecZero*/
-            // VecHorizontalAdd* stay raw (pointer/scalar operands).
             | O::VecHorizontalAddF64x2
             | O::VecHorizontalAddF64x4
             | O::VecHorizontalAddI32x4
             | O::VecHorizontalAddI32x8
             | O::VecHorizontalAddF32x4
             | O::VecHorizontalAddF32x8
+            | O::VecZeroF64x2
+            | O::VecZeroF64x4
+            | O::VecZeroI32x4
+            | O::VecZeroI32x8
             | O::VecZeroF32x4
             | O::VecZeroF32x8
     )
 }
 
-/// Ops whose codegen goes through `emit_sse_binary_128` / `emit_avx_binary_256`
-/// — the two-operand emitters that load the last-stored operand FIRST into
-/// %xmm1/%ymm1 when args[1] is still in %xmm0/%ymm0 (the v5 load-order swap).
-/// Only these can soundly consume a deferred value from args[1].
+/// Two-operand emitters that load the last-stored operand first into
+/// `%xmm1`/`%ymm1` when `args[1]` is still in `%xmm0`/`%ymm0`.
 fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        // emit_sse_binary_128
-        O::Pcmpeqb128 | O::Pcmpeqd128 | O::Psubusb128 | O::Psubsb128
-        | O::Por128 | O::Pand128 | O::Pxor128
-        | O::AddPs128 | O::SubPs128 | O::MulPs128
-        | O::AddPd128 | O::SubPd128 | O::MulPd128
-        | O::Paddw128 | O::Psubw128 | O::Pmulhw128 | O::Pmullw128
-        | O::Pmuludq128 | O::Pmuldq128 | O::Pmulld128
-        | O::Pmaddwd128 | O::Pmaddubsw128
-        | O::Pcmpgtw128 | O::Pcmpgtb128
-        | O::Paddd128 | O::Psubd128
-        | O::Paddb128 | O::Psubb128 | O::Psubusw128
-        | O::Psadbw128
-        | O::Pshufb128
-        | O::Pmaxub128 | O::Pminub128
-        | O::Pmovzxbw128 | O::Pmovzxwd128
-        | O::Packssdw128 | O::Packsswb128 | O::Packuswb128
-        | O::Punpcklbw128 | O::Punpckhbw128
-        | O::Punpcklwd128 | O::Punpckhwd128
-        | O::Aesenc128 | O::Aesenclast128 | O::Aesdec128 | O::Aesdeclast128
-        | O::AddF64x2 | O::MulF64x2 | O::AddI32x4
-        // emit_avx_binary_256
-        | O::Paddb256 | O::Paddw256 | O::Paddd256
-        | O::Psubb256 | O::Psubw256 | O::Psubusw256
-        | O::Psadbw256 | O::Pmaddubsw256 | O::Pmaddwd256
-        | O::Pcmpeqb256 | O::Pcmpgtb256 | O::Pshufb256
-        | O::Pmaxub256 | O::Pminub256
-        | O::Pxor256 | O::Por256 | O::Pand256
-        | O::AddF64x4 | O::MulF64x4 | O::AddI32x8
-        | O::VecAddF64x4 | O::VecMulF64x4 | O::VecFmaF64x4
-        | O::VecAddI32x8 | O::VecMulI32x8 | O::VecBroadcastI32x8
-        | O::VecBroadcastF32x8 | O::VecMulF32x8 | O::VecAddF32x8 | O::VecFmaF32x8
-        | O::VecAddF64x2 | O::VecMulF64x2 | O::VecAddI32x4
-        | O::VecAddF32x4 | O::VecMulF32x4
+        O::Pcmpeqb128
+            | O::Pcmpeqd128
+            | O::Psubusb128
+            | O::Psubsb128
+            | O::Por128
+            | O::Pand128
+            | O::Pxor128
+            | O::AddPs128
+            | O::SubPs128
+            | O::MulPs128
+            | O::AddPd128
+            | O::SubPd128
+            | O::MulPd128
+            | O::Paddw128
+            | O::Psubw128
+            | O::Pmulhw128
+            | O::Pmullw128
+            | O::Pmuludq128
+            | O::Pmuldq128
+            | O::Pmulld128
+            | O::Pmaddwd128
+            | O::Pmaddubsw128
+            | O::Pcmpgtw128
+            | O::Pcmpgtb128
+            | O::Paddd128
+            | O::Psubd128
+            | O::Paddb128
+            | O::Psubb128
+            | O::Psubusw128
+            | O::Psadbw128
+            | O::Pshufb128
+            | O::Pmaxub128
+            | O::Pminub128
+            | O::Pmovzxbw128
+            | O::Pmovzxwd128
+            | O::Packssdw128
+            | O::Packsswb128
+            | O::Packuswb128
+            | O::Punpcklbw128
+            | O::Punpckhbw128
+            | O::Punpcklwd128
+            | O::Punpckhwd128
+            | O::Aesenc128
+            | O::Aesenclast128
+            | O::Aesdec128
+            | O::Aesdeclast128
+            | O::AddF64x2
+            | O::MulF64x2
+            | O::AddI32x4
+            | O::Paddb256
+            | O::Paddw256
+            | O::Paddd256
+            | O::Psubb256
+            | O::Psubw256
+            | O::Psubusw256
+            | O::Psadbw256
+            | O::Pmaddubsw256
+            | O::Pmaddwd256
+            | O::Pcmpeqb256
+            | O::Pcmpgtb256
+            | O::Pshufb256
+            | O::Pmaxub256
+            | O::Pminub256
+            | O::Pxor256
+            | O::Por256
+            | O::Pand256
+            | O::AddF64x4
+            | O::MulF64x4
+            | O::AddI32x8
+            | O::VecAddF64x4
+            | O::VecMulF64x4
+            | O::VecFmaF64x4
+            | O::VecAddI32x8
+            | O::VecMulI32x8
+            | O::VecBroadcastI32x8
+            | O::VecBroadcastF32x8
+            | O::VecMulF32x8
+            | O::VecAddF32x8
+            | O::VecFmaF32x8
+            | O::VecAddF64x2
+            | O::VecMulF64x2
+            | O::VecAddI32x4
+            | O::VecAddF32x4
+            | O::VecMulF32x4
     )
 }
 
-/// Values whose vector-result store can be DEFERRED (skipped entirely) — the
-/// "Accumulator renaming" optimization.
+fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x2
+            | O::VecLoadF64x4
+            | O::VecLoadI32x4
+            | O::VecLoadI32x8
+            | O::VecLoadF32x4
+            | O::VecLoadF32x8
+            | O::VecAddF64x2
+            | O::VecAddF64x4
+            | O::VecFmaF64x4
+            | O::VecMaddF64x4
+            | O::VecAddI32x4
+            | O::VecAddI32x8
+            | O::VecMulI32x8
+            | O::VecBroadcastI32x8
+            | O::VecBroadcastF32x8
+            | O::VecMulF32x8
+            | O::VecAddF32x8
+            | O::VecFmaF32x8
+            | O::VecMaddF32x8
+            | O::VecAddF32x4
+            | O::VecMulF64x2
+            | O::VecMulF64x4
+            | O::VecMulF32x4
+            | O::VecZeroF64x2
+            | O::VecZeroF64x4
+            | O::VecZeroI32x4
+            | O::VecZeroI32x8
+            | O::VecZeroF32x4
+            | O::VecZeroF32x8
+    )
+}
+
+fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::Storedqu | O::Storeu256 | O::Store256 | O::Storeldi128 | O::Movntdq | O::Movntpd
+    )
+}
+
+/// Vector-result stores that can be skipped: the dest is consumed once from
+/// the last-store peephole by a cache-aware intrinsic in the same block.
 ///
-/// A vector intrinsic (e.g. `_mm_xor_si128`) computes its result in
-/// %xmm0/%ymm0 and normally stores it to its dest slot; the single-entry
-/// last-store peephole then lets the immediately-following load of the same
-/// value skip the reload. When that following load is the value's ONLY use,
-/// the intermediate store is pure overhead: the store is skipped and the
-/// register carries the value straight into the consumer (a net store+load
-/// elimination).
-///
-/// Soundness (each condition is load-bearing):
-/// 1. V is the dest alloca of a vector intrinsic P (never a user pointer —
-///    excludes `_mm_storeu_*`-style ops whose dest_ptr is a real store target).
-/// 2. V has exactly one ARG use (intrinsic dest_ptr is a write, not counted).
-/// 3. That use is args[0] (or args[1] of a two-operand binary emitter, whose
-///    codegen loads the last-stored operand FIRST into %xmm1/%ymm1) of the
-///    instruction IMMEDIATELY following P in the same block (adjacency ⇒
-///    nothing can clobber the register or read the slot in between).
-/// 4. The consumer's args[0] load goes through sse_load_arg/avx_load_arg_to
-///    into %xmm0/%ymm0 as its FIRST vector op. Excluded raw readers (FMA /
-///    load / horizontal-reduction / auto-vectorizer family, the raw movq
-///    load/store helpers, Pblendvb128) bypass the loaders and would read the
-///    never-written slot or clobber the held register first.
-/// 5. V is not volatile, not written through other paths (no value-ref use,
-///    no copy-alias root, not an address-taken alloca).
-/// 6. ALL def sites of V qualify individually. The defer set is keyed by
-///    slot: codegen skips the store at every instruction writing the slot, so
-///    one non-adjacent site (C temporaries reused across two loop bodies)
-///    disqualifies the slot entirely — otherwise that site's consumer would
-///    read a never-written slot (adler32_ssse3 miscompile, fixed 2026-08).
+/// All def sites of the slot must qualify. Codegen skips the store at every
+/// writer, so one non-adjacent site would make its consumer read a
+/// never-written slot.
 pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
-    use crate::ir::intrinsics::IntrinsicOp;
     let mut result = FxHashSet::default();
 
-    // Pass 0: collect alloca dests (and volatile ones) + copy-alias roots.
     let mut allocas: FxHashSet<u32> = FxHashSet::default();
     let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
     let mut copy_alias_roots: FxHashSet<u32> = FxHashSet::default();
@@ -1426,7 +1732,10 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                         volatile_allocas.insert(dest.0);
                     }
                 }
-                Instruction::Copy { src: Operand::Value(v), .. } => {
+                Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                } => {
                     copy_alias_roots.insert(v.0);
                 }
                 _ => {}
@@ -1434,11 +1743,6 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
         }
     }
 
-    // Pass 1: collect every Operand use site (block, inst index) per value,
-    // plus global flags for non-ARG uses. Intrinsic dest_ptr is a WRITE (not a
-    // use); Call args / Store val / Memcpy / terminator uses are ARG uses but
-    // NOT cache-aware (the slot is really read), so the per-producer scan below
-    // rejects them.
     let mut uses: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
     let mut has_value_ref_use: FxHashSet<u32> = FxHashSet::default();
     let mut non_intrinsic_arg_use: FxHashSet<u32> = FxHashSet::default();
@@ -1473,97 +1777,51 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
         });
     }
 
-    // Instructions that clear the vector-register peephole (the last-store
-    // cache). A cache-aware load AFTER one of these does a REAL memory load,
-    // so a deferred store would be observed. Includes the raw-reader
-    // intrinsics, which invalidate the peephole by design.
     let is_vec_invalidator = |inst: &Instruction| -> bool {
         match inst {
-            Instruction::Call { .. } | Instruction::CallIndirect { .. }
-            | Instruction::InlineAsm { .. } | Instruction::Memcpy { .. }
-            | Instruction::DynAlloca { .. } | Instruction::Store { .. }
-            | Instruction::AtomicLoad { .. } | Instruction::AtomicStore { .. }
-            | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. }
+            Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::Store { .. }
+            | Instruction::AtomicLoad { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicCmpxchg { .. }
             | Instruction::AtomicInc { .. } => true,
             Instruction::Intrinsic { op, .. } => is_raw_reader_intrinsic(op),
             _ => false,
         }
     };
 
-    // Pass 2: per-DEF window analysis. A slot (alloca) may be written by
-    // multiple producers (loop unrolling reuses the same __m256i variable),
-    // each in possibly different blocks. A producer's store is observable only
-    // by the reads that occur after THIS write and before the NEXT write of the
-    // same slot (its "window"). The vector last-store cache is SINGLE-ENTRY:
-    // a real vector load of any other value evicts it, and a cache hit
-    // consumes it — so a store may be deferred only when the def has EXACTLY
-    // ONE use, with no intervening vector-loading instruction (intrinsic) and
-    // no loop-carried read of the slot in the same block (a use before the
-    // def means the block re-enters via a backedge and the slot is the
-    // loop-carried home that must be updated every iteration).
     let mut defs: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
     let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Intrinsic {
-                dest_ptr: Some(d),
-                op,
-                ..
-            } = inst
-            {
-                if matches!(
+            match inst {
+                Instruction::Intrinsic {
+                    dest_ptr: Some(d),
                     op,
-                    IntrinsicOp::Storedqu
-                        | IntrinsicOp::Storeu256
-                        | IntrinsicOp::Store256
-                        | IntrinsicOp::Storeldi128
-                        | IntrinsicOp::Movntdq
-                        | IntrinsicOp::Movntpd
-                ) {
-                    continue;
-                }
-                if allocas.contains(&d.0) {
+                    ..
+                } if !is_user_store_intrinsic(op) && allocas.contains(&d.0) => {
                     defs.entry(d.0).or_default().push((bi, ii));
                     def_blocks.entry(d.0).or_default().insert(bi);
                 }
-            }
-            // the auto-vectorizer's Vec* intrinsics produce their result as
-            // an SSA `dest` (not a `dest_ptr` alloca). Register those defs too,
-            // so a single-use VecLoad result can have its slot store deferred
-            // and its consumer (VecAdd/VecMul) can fold it. VecZero*/VecLoad*/
-            // VecAdd*/VecMul* all write a home slot for `dest`.
-            if let Instruction::Intrinsic {
-                dest: Some(d), op, ..
-            } = inst
-            {
-                use crate::ir::intrinsics::IntrinsicOp as O;
-                let is_vec_producer = matches!(
-                    op,
-                    O::VecLoadF64x2 | O::VecLoadF64x4
-                        | O::VecLoadI32x4 | O::VecLoadI32x8
-                        | O::VecLoadF32x4 | O::VecLoadF32x8
-                        | O::VecAddF64x2 | O::VecAddF64x4 | O::VecFmaF64x4
-                        | O::VecMaddF64x4 | O::VecAddI32x4 | O::VecAddI32x8 | O::VecMulI32x8 | O::VecBroadcastI32x8
-                        | O::VecBroadcastF32x8 | O::VecMulF32x8 | O::VecAddF32x8
-                        | O::VecFmaF32x8 | O::VecMaddF32x8 | O::VecAddF32x4
-                        | O::VecMulF64x2 | O::VecMulF64x4
-                        | O::VecMulF32x4
-                        | O::VecZeroF64x2 | O::VecZeroF64x4
-                        | O::VecZeroI32x4 | O::VecZeroI32x8
-                        | O::VecZeroF32x4 | O::VecZeroF32x8
-                );
-                if is_vec_producer {
+                Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                } if is_vec_ssa_producer(op) => {
                     defs.entry(d.0).or_default().push((bi, ii));
                     def_blocks.entry(d.0).or_default().insert(bi);
                 }
+                _ => {}
             }
         }
     }
 
+    let debug_vdefer = env_flag("CCC_DEBUG_VDEFER");
+
     for (&slot, sites) in &defs {
-        // Global soundness: no deferral if the slot is volatile, copy-aliased,
-        // address-taken (value-ref use), or read by a non-Intrinsic instruction
-        // (call arg / Store val / Memcpy / terminator) anywhere in the function.
         if volatile_allocas.contains(&slot)
             || copy_alias_roots.contains(&slot)
             || has_value_ref_use.contains(&slot)
@@ -1571,44 +1829,37 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
         {
             continue;
         }
-        let mut sites = sites.clone();
-        sites.sort();
-        // Orphan reads: uses of the slot in a block that never writes it.
-        let mut orphan = false;
+
         if let Some(use_sites) = uses.get(&slot) {
-            for &(ubi, _) in use_sites {
-                if !def_blocks.get(&slot).map(|b| b.contains(&ubi)).unwrap_or(false) {
-                    orphan = true;
-                    break;
-                }
+            let written = def_blocks.get(&slot);
+            let orphan = use_sites
+                .iter()
+                .any(|&(ubi, _)| !written.map(|b| b.contains(&ubi)).unwrap_or(false));
+            if orphan {
+                continue;
             }
         }
-        if orphan {
-            continue; // no store may be deferred for this slot
-        }
-        // The defer set is keyed by SLOT, and codegen skips the result store
-        // at EVERY instruction writing the slot. Deferral is therefore sound
-        // only when ALL def sites of the slot satisfy the adjacent-consumer
-        // contract. If any single site is non-adjacent (a C temporary reused
-        // across two loop bodies where one body runs another vector intrinsic
-        // between producer and consumer), the slot must not be deferred at
-        // all: the non-adjacent site's consumer would otherwise read a slot
-        // that was never written (the adler32_ssse3 miscompile).
+
+        let mut sites_sorted = sites.clone();
+        sites_sorted.sort_unstable();
+
         let mut all_sites_ok = true;
-        for &(bi, i) in &sites {
+        for &(bi, i) in &sites_sorted {
             let insts = &func.blocks[bi].instructions;
-            // Loop-carried / RMW guard: a use of the slot in this block at or
-            // before the def means the block re-enters via a backedge (or the
-            // def itself is read-modify-write); the slot must stay updated.
+
+            // Use at or before the def ⇒ backedge / RMW; slot must stay live.
             let earlier_use = uses
                 .get(&slot)
-                .map(|u| u.iter().any(|&(ubi, uii)| ubi == bi && uii <= i))
-                .unwrap_or(false);
+                .is_some_and(|u| u.iter().any(|&(ubi, uii)| ubi == bi && uii <= i));
             if earlier_use {
                 all_sites_ok = false;
                 break;
             }
-            // Window uses: same block, after i, before the next def of the slot.
+
+            let next_def_in_block = sites_sorted
+                .iter()
+                .find(|&&(db, di)| db == bi && di > i)
+                .map(|&(_, di)| di);
             let window_uses: Vec<usize> = uses
                 .get(&slot)
                 .map(|u| {
@@ -1616,24 +1867,25 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                         .filter(|&&(ubi, uii)| {
                             ubi == bi
                                 && uii > i
-                                && !sites.iter().any(|&(db, di)| db == bi && di > i && di < uii)
+                                && next_def_in_block.map(|nd| uii < nd).unwrap_or(true)
                         })
                         .map(|&(_, uii)| uii)
                         .collect()
                 })
                 .unwrap_or_default();
-            // The single-entry cache can serve EXACTLY ONE use.
+
             if window_uses.len() != 1 {
                 all_sites_ok = false;
                 break;
             }
             let u = window_uses[0];
-            // No invalidator and NO intervening intrinsic (any intrinsic may
-            // perform a real vector load and evict the single-entry cache)
-            // strictly between the def and the use.
+            if u >= insts.len() || u <= i {
+                all_sites_ok = false;
+                break;
+            }
+
             let mut ok = true;
-            for k in (i + 1)..u {
-                let ik = &insts[k];
+            for ik in &insts[(i + 1)..u] {
                 if is_vec_invalidator(ik) || matches!(ik, Instruction::Intrinsic { .. }) {
                     ok = false;
                     break;
@@ -1643,28 +1895,29 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                 all_sites_ok = false;
                 break;
             }
-            // The single use must be a cache-aware consumer at a sound position.
-            let (cop, cargs) = match insts.get(u) {
-                Some(Instruction::Intrinsic { op, args, .. }) => (op, args),
-                _ => {
-                    all_sites_ok = false;
-                    break;
-                }
+
+            let Some(Instruction::Intrinsic {
+                op: cop, args: cargs, ..
+            }) = insts.get(u)
+            else {
+                all_sites_ok = false;
+                break;
             };
             let pos = cargs
                 .iter()
-                .position(|a| matches!(a, Operand::Value(v) if v.0 == slot))
-                .unwrap_or(usize::MAX);
-            let cache_aware = if pos == 0 {
-                !is_raw_reader_intrinsic(cop) && !matches!(cop, IntrinsicOp::Pblendvb128 | IntrinsicOp::Pblendw128)
-            } else {
-                is_two_operand_binary(cop)
+                .position(|a| matches!(a, Operand::Value(v) if v.0 == slot));
+            // pos 0: first vector load. pos 1: two-operand emitter load-order swap.
+            // pos ≥ 2 (FMA/etc.) is not covered by that swap.
+            let cache_aware = match pos {
+                Some(0) => !is_raw_reader_intrinsic(cop),
+                Some(1) => is_two_operand_binary(cop),
+                _ => false,
             };
             if !cache_aware {
                 all_sites_ok = false;
                 break;
             }
-            if std::env::var("CCC_DEBUG_VDEFER").is_ok() {
+            if debug_vdefer {
                 eprintln!(
                     "[VDEFER] slot={} def=({},{})(uses_in_window={:?}) consumer=({},{})({:?}) site-ok",
                     slot, bi, i, window_uses, bi, u, cop
