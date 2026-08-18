@@ -288,6 +288,12 @@ pub enum IntrinsicOp {
     VecLoadI64x2,
     VecAddI64x2,
     VecMulI64x2,
+    VecStoreI64x2,
+    VecBroadcastI64x2,
+    VecLoadI64x4,
+    VecAddI64x4,
+    VecHorizontalAddI64x4,
+    VecZeroI64x4,
 
     /// NEON sadalp: sign-extend 4×I32 lanes and accumulate adjacent pairs into
     /// a 2×I64 accumulator: dest = args[0] + pairwise_sums(args[1]).
@@ -1042,7 +1048,7 @@ impl IntrinsicOp {
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
-            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecZeroI64x2
+            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
             | VecMulI32x4 | VecBroadcastI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
@@ -1124,7 +1130,8 @@ impl IntrinsicOp {
             IntrinsicOp::VecMaddF64x4 | IntrinsicOp::VecMaddF32x8
             | IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecLoadI64x2
             | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
-            | IntrinsicOp::VecZeroI64x2
+            | IntrinsicOp::VecStoreI64x2 | IntrinsicOp::VecBroadcastI64x2 | IntrinsicOp::VecZeroI64x2
+            | IntrinsicOp::VecLoadI64x4 | IntrinsicOp::VecAddI64x4 | IntrinsicOp::VecHorizontalAddI64x4 | IntrinsicOp::VecZeroI64x4
             | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecMulI32x8 | IntrinsicOp::VecBroadcastI32x4 | IntrinsicOp::VecBroadcastI32x8
             | IntrinsicOp::VecSadalpI32x4
             | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4

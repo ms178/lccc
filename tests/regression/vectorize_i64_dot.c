@@ -1,0 +1,1 @@
+long long dot_i64(const long long *a,const long long *b,int n){long long s=0;for(int i=0;i<n;i++)s+=a[i]*b[i];return s;}int main(void){long long a[8]={1,2,3,4,5,6,7,8};long long b[8]={1,1,1,1,1,1,1,1};return dot_i64(a,b,8)==36?0:1;}

@@ -1949,7 +1949,11 @@ fn analyze_map_pattern(
         if debug { eprintln!("[VEC-MAP]   GEPs don't use IV"); }
         return None;
     }
-    let elem_size = if elem_ty == IrType::F64 { 8 } else { 4 };
+    let elem_size = match elem_ty {
+        IrType::F64 | IrType::I64 | IrType::U64 => 8,
+        IrType::F32 | IrType::I32 | IrType::U32 => 4,
+        _ => { set_reject("map element type not vectorizable"); return None; }
+    };
     if find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
         || find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none()
     {
@@ -4369,18 +4373,11 @@ fn transform_reduction_avx2(
             IntrinsicOp::HorizontalAddF64x4,  // Used for remainder loop intrinsic selection
         ),
         IrType::I32 => {
-            // I32 multiply intrinsics not yet implemented, only support Sum pattern
-            if pattern.kind == ReductionKind::DotProduct {
-                if debug {
-                    eprintln!("[VEC-RED] I32 dot product not yet supported (missing MulI32x8 intrinsic)");
-                }
-                return 0;
-            }
             (
                 8u64,
                 IntrinsicOp::LoadI32x8,
                 IntrinsicOp::AddI32x8,
-                None,  // No multiply for I32 yet
+                Some(IntrinsicOp::VecMulI32x8),
                 IntrinsicOp::HorizontalAddI32x8,
             )
         },
@@ -4790,7 +4787,6 @@ fn transform_reduction_avx2(
             next_val_id += 1;
 
             // Map to register-based intrinsics based on element type
-            // Note: I32 dot products unsupported (no I32 multiply intrinsic yet)
             let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op) = match pattern.element_type {
                 IrType::F64 => (
                     IntrinsicOp::VecLoadF64x4,
@@ -4805,6 +4801,13 @@ fn transform_reduction_avx2(
                     IntrinsicOp::VecAddF32x8,
                     IntrinsicOp::VecZeroF32x8,
                     IntrinsicOp::VecFmaF32x8,
+                ),
+                IrType::I32 => (
+                    IntrinsicOp::VecLoadI32x8,
+                    IntrinsicOp::VecMulI32x8,
+                    IntrinsicOp::VecAddI32x8,
+                    IntrinsicOp::VecZeroI32x8,
+                    IntrinsicOp::VecMulI32x8,
                 ),
                 _ => {
                     if debug {
@@ -4865,11 +4868,9 @@ fn transform_reduction_avx2(
             };
             let body_block = &mut func.blocks[pattern.body_idx];
 
-            if fp_contract_fast {
-                // One contraction-aware intrinsic lets x86 load A directly to
-                // YMM0 and fold B into vfmadd231p{s,d}. No transient vector
-                // needs a stack home, and the accumulator stays in its
-                // coalesced YMM register.
+            if fp_contract_fast
+                && matches!(pattern.element_type, IrType::F32 | IrType::F64)
+            {
                 let fma_inst = Instruction::Intrinsic {
                     dest: Some(vec_sum_value),
                     op: vec_fma_op,
@@ -5015,34 +5016,20 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             IntrinsicOp::VecHorizontalAddI64x2,
         ),
         IrType::I32 => {
-            // I32 multiply intrinsics not yet implemented, only support Sum pattern
-            if pattern.kind == ReductionKind::DotProduct {
-                if debug {
-                    eprintln!("[VEC-RED] I32 dot product not yet supported (missing MulI32x4 intrinsic)");
-                }
-                return 0;
-            }
             (
                 4u64,
                 IntrinsicOp::LoadI32x4,
                 IntrinsicOp::AddI32x4,
-                None,  // No multiply for I32 yet
+                Some(IntrinsicOp::VecMulI32x4),
                 IntrinsicOp::HorizontalAddI32x4,
             )
         },
         IrType::I64 => {
-            // Pure I64 sum: 2-wide via SSE2/AVX movdqu + paddq.
-            if pattern.kind == ReductionKind::DotProduct {
-                if debug {
-                    eprintln!("[VEC-RED] I64 dot product not yet supported on SSE2 path");
-                }
-                return 0;
-            }
             (
                 2u64,
                 IntrinsicOp::VecLoadI64x2,
                 IntrinsicOp::VecAddI64x2,
-                None,
+                Some(IntrinsicOp::VecMulI64x2),
                 IntrinsicOp::VecHorizontalAddI64x2,
             )
         },
@@ -5606,6 +5593,18 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                     IntrinsicOp::VecAddI64x2,
                     IntrinsicOp::VecZeroI64x2,
                 ),
+                IntrinsicOp::LoadI32x4 => (
+                    IntrinsicOp::VecLoadI32x4,
+                    IntrinsicOp::VecMulI32x4,
+                    IntrinsicOp::VecAddI32x4,
+                    IntrinsicOp::VecZeroI32x4,
+                ),
+                IntrinsicOp::VecLoadI64x2 => (
+                    IntrinsicOp::VecLoadI64x2,
+                    IntrinsicOp::VecMulI64x2,
+                    IntrinsicOp::VecAddI64x2,
+                    IntrinsicOp::VecZeroI64x2,
+                ),
                 _ => {
                     if debug {
                         eprintln!("[VEC-RED] Unsupported SSE2 dot product type: {:?}", load_intrinsic);
@@ -5778,6 +5777,7 @@ fn transform_map_vector(
     let vec_width: u64 = match (pattern.elem_ty, avx2) {
         (IrType::F64, true) => 4,
         (IrType::F64, false) => 2,
+        (IrType::I64 | IrType::U64, _) => 2,
         (_, true) => 8,
         (_, false) => 4,
     };
@@ -6006,6 +6006,7 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecBroadcastF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecBroadcastI64x2,
         _ => return 0,
     };
 
@@ -6063,6 +6064,12 @@ fn transform_map_vector(
             IntrinsicOp::VecMulI32x4,
             IntrinsicOp::VecAddI32x4,
             IntrinsicOp::VecStoreI32x4,
+        ),
+        (IrType::I64 | IrType::U64, _) => (
+            IntrinsicOp::VecLoadI64x2,
+            IntrinsicOp::VecMulI64x2,
+            IntrinsicOp::VecAddI64x2,
+            IntrinsicOp::VecStoreI64x2,
         ),
         _ => return 0,
     };

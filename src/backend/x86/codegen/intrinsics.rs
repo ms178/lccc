@@ -2416,6 +2416,67 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "paddq");
                 }
             }
+            IntrinsicOp::VecMulI64x2 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
+                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
+                }
+                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
+                    self.state.out.emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm1");
+                }
+                self.state.emit("    movq %xmm0, %rax");
+                self.state.emit("    movq %xmm1, %rcx");
+                self.state.emit("    imulq %rcx, %rax");
+                self.state.emit("    movq %rax, %xmm2");
+                self.state.emit("    pshufd $0xee, %xmm0, %xmm0");
+                self.state.emit("    pshufd $0xee, %xmm1, %xmm1");
+                self.state.emit("    movq %xmm0, %rax");
+                self.state.emit("    movq %xmm1, %rcx");
+                self.state.emit("    imulq %rcx, %rax");
+                self.state.emit("    movq %rax, %xmm0");
+                self.state.emit("    punpcklqdq %xmm0, %xmm2");
+                self.state.emit("    movdqa %xmm2, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecStoreI64x2 => {
+                self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
+            }
+            IntrinsicOp::VecBroadcastI64x2 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                match &args[0] {
+                    Operand::Value(v) => {
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            if !is_xmm_reg(reg) {
+                                self.state.emit_fmt(format_args!("    movq %{}, %xmm0", phys_reg_name(reg)));
+                            } else {
+                                self.state.emit_fmt(format_args!("    movdqa %{}, %xmm0", phys_reg_name(reg)));
+                            }
+                        } else if let Some(slot) = self.state.get_slot(v.0) {
+                            self.state.out.emit_instr_rbp_reg("    movq", slot.0 as i64, "xmm0");
+                        } else {
+                            self.operand_to_reg(&args[0], "rax");
+                            self.state.emit("    movq %rax, %xmm0");
+                        }
+                    }
+                    _ => {
+                        self.operand_to_reg(&args[0], "rax");
+                        self.state.emit("    movq %rax, %xmm0");
+                    }
+                }
+                self.state.emit("    unpcklpd %xmm0, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecLoadI64x4 | IntrinsicOp::VecAddI64x4 | IntrinsicOp::VecHorizontalAddI64x4 | IntrinsicOp::VecZeroI64x4 => {
+                let _ = (dest, dest_ptr, args);
+            }
             IntrinsicOp::VecMulF64x4 => {
                 if let Some(d) = dest {
                     self.emit_avx_binary_256(d, args, "vmulpd", true);

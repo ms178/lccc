@@ -1,0 +1,1 @@
+void map_i64(long long *dst,const long long *src,int n){for(int i=0;i<n;i++)dst[i]=src[i]*3+1;}int main(void){long long s[8],d[8];for(int i=0;i<8;i++)s[i]=i;map_i64(d,s,8);for(int i=0;i<8;i++)if(d[i]!=s[i]*3+1)return 1;return 0;}
