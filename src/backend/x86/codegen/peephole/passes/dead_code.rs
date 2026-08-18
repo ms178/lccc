@@ -683,9 +683,21 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 continue;
             }
             if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
+                let store_text = infos[k].trimmed(store.get(k));
+                // `ret` implicitly reads and pops the return address at
+                // 0(%rsp). Inline retpolines deliberately rewrite that slot
+                // with `movq %target,(%rsp); ret`; treating the store as a
+                // never-read frame spill turns the dispatch into the infinite
+                // speculation-trap loop.
+                let next = next_non_nop(infos, k + 1, func_end);
+                if offset == 0 && store_text.contains("(%rsp)")
+                    && next < func_end && matches!(infos[next].kind, LineKind::Ret)
+                {
+                    continue;
+                }
                 // SOUNDNESS: never delete an `(%rbp)` store when %rbp is a
                 // data register (pointer store to arbitrary memory).
-                if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                if !rbp_is_frame && uses_rbp_mem_operand(store_text) {
                     continue;
                 }
                 let store_bytes = size.byte_size();

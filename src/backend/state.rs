@@ -192,6 +192,9 @@ pub struct CodegenState {
     /// This makes deferred stores sound by construction, independent of the
     /// IR analysis' adjacency precision.
     pub pending_vec_store: Option<(u32, &'static str, bool)>,
+    /// Scalar FP value already resident in the SysV return register xmm0.
+    /// Set only by exact direct-result intrinsics immediately before Return.
+    pub direct_fp_result: Option<u32>,
     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
     /// provably holds the vector data (128-bit vector register allocation).
     pub vec_live_regs: FxHashMap<u32, &'static str>,
@@ -403,6 +406,7 @@ impl CodegenState {
             sse_last_store_reg_name: None,
             vector_defer_values: FxHashSet::default(),
             pending_vec_store: None,
+            direct_fp_result: None,
             vec_live_regs: FxHashMap::default(),
             label_counter: 0,
             pic_mode: false,
@@ -585,6 +589,7 @@ impl CodegenState {
         self.protected_slot_values.clear();
         self.vector_defer_values.clear();
         self.pending_vec_store = None;
+        self.direct_fp_result = None;
         self.vec_live_regs.clear();
         self.uses_sret = false;
         self.next_block_label = None;
@@ -602,6 +607,7 @@ impl CodegenState {
         self.sse_last_store_val = None;
         self.sse_last_store_reg = false;
         self.sse_last_store_reg_name = None;
+        self.direct_fp_result = None;
         self.vec_live_regs.clear();
     }
 

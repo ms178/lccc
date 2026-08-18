@@ -75,17 +75,28 @@ Key files
   AVX2/SSE/AArch64 widths, indexed byte-IV memory streams, register-resident
   broadcasts, and contract-legal packed FMA. Shifted aliases and non-contiguous
   strides remain conservatively scalar.
+- Added profitable fixed-width SLP for complete F32x8/F64x4 squared-distance
+  trees under explicit reassociation. It folds the second input as a memory
+  operand, returns directly in XMM0, ties GCC/Clang/ICX static counts, and keeps
+  F32x4/F64x3 plus all strict-mode forms scalar.
+- Graduated GNU gzip 1.14 from a CRC kernel to a pinned complete build, 30-test
+  suite, deterministic bit-identical compression/decompression workload, full
+  disassembly, and raw paired timing. The VM screen exposes a 1.877x geometric
+  LCCC/GCC gap rather than a win; every individual case is retained.
 
 ## Current measured backlog (new session)
 
 1. Dot/sum setup and tails: division-free transitions and contract-aware
    memory-folded vector FMA are complete; continue reducing tail address setup.
-2. Width-aware fixed-vector/stencil SLP and complex/interleaved kernels.
+2. Complex/interleaved kernels and broader SLP only after separate profitability
+   and legality evidence; do not widen the fixed-distance proof opportunistically.
 3. Four live reductions (`p48`) now keep independent scalar F32/F64 copy webs
    in distinct XMM accumulators without stack traffic; packed interleaved
    reduction remains a separate profitability experiment.
-4. Width-aware fixed-vector SLP and complex/interleaved kernels.
-5. Workload-derived variants from zlib-ng/gzip, expat, SQLite, Linux, and glibc,
-   with provenance and real end-to-end workloads.
+4. Root-cause the full gzip deficit as a separate measured item, beginning with
+   redundant scalar CRC/table address formation; do not infer whole-program
+   causality from the CRC reproducer alone.
+5. Graduate another zlib-ng, expat, SQLite, Linux, or glibc project with the
+   same pinned provenance, complete-output, and upstream-suite discipline.
 6. Bare-metal Raptor Lake counters and randomized paired timing; VM static and
    timing results remain screening evidence only.

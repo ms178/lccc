@@ -183,7 +183,7 @@ NOINLINE void p44_rgba_to_gray_f32(float *restrict d, const float *restrict rgba
         d[i] = rgba[4*i] * 0.299f + rgba[4*i+1] * 0.587f + rgba[4*i+2] * 0.114f;
 }
 
-/* 45-50: conversion, independent accumulators, and workload-derived recurrences. */
+/* 45-53: conversion, independent accumulators, recurrences, fixed distances. */
 NOINLINE void p45_u8_to_f32(float *restrict d, const unsigned char *restrict a, int n) {
     for (int i = 0; i < n; i++) d[i] = (float)a[i];
 }
@@ -208,4 +208,18 @@ NOINLINE unsigned int p49_adler_chunk(const unsigned char *a, int n) {
 NOINLINE double p50_distance3_f64(const double *a, const double *b) {
     double x=a[0]-b[0], y=a[1]-b[1], z=a[2]-b[2];
     return x*x + y*y + z*z;
+}
+NOINLINE float p51_distance4_f32(const float *a, const float *b) {
+    float x0=a[0]-b[0], x1=a[1]-b[1], x2=a[2]-b[2], x3=a[3]-b[3];
+    return x0*x0 + x1*x1 + x2*x2 + x3*x3;
+}
+NOINLINE double p52_distance4_f64(const double *a, const double *b) {
+    double x0=a[0]-b[0], x1=a[1]-b[1], x2=a[2]-b[2], x3=a[3]-b[3];
+    return x0*x0 + x1*x1 + x2*x2 + x3*x3;
+}
+NOINLINE float p53_distance8_f32(const float *a, const float *b) {
+    float x0=a[0]-b[0], x1=a[1]-b[1], x2=a[2]-b[2], x3=a[3]-b[3];
+    float x4=a[4]-b[4], x5=a[5]-b[5], x6=a[6]-b[6], x7=a[7]-b[7];
+    return x0*x0 + x1*x1 + x2*x2 + x3*x3
+         + x4*x4 + x5*x5 + x6*x6 + x7*x7;
 }

@@ -2844,6 +2844,16 @@ impl X86Codegen {
                     self.emit_avx_map_fma(d, args, "vfmadd132ps");
                 }
             }
+            IntrinsicOp::FixedDistanceF32x8 => {
+                if let Some(d) = dest {
+                    self.emit_fixed_distance(d, args, false);
+                }
+            }
+            IntrinsicOp::FixedDistanceF64x4 => {
+                if let Some(d) = dest {
+                    self.emit_fixed_distance(d, args, true);
+                }
+            }
             IntrinsicOp::VecHorizontalAddF32x8 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
@@ -3004,6 +3014,60 @@ impl X86Codegen {
             Operand::Value(v) => self.state.get_slot(v.0),
             _ => None,
         }
+    }
+
+    /// Emit a complete fixed-width squared distance directly to xmm0. The SLP
+    /// legality proof guarantees contiguous full vectors and an immediate FP
+    /// return; folding the second base into `vsubp*` avoids transient vector
+    /// homes and exactly matches the target's three-operand dataflow.
+    fn emit_fixed_distance(&mut self, dest: &Value, args: &[Operand], f64_lanes: bool) {
+        assert!(args.len() == 2, "fixed distance expects two base pointers");
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        let is_gpr = |r: PhysReg| (1..=16).contains(&r.0);
+        let a_reg = self.operand_reg(&args[0]).filter(|r| is_gpr(*r));
+        let b_reg = self.operand_reg(&args[1]).filter(|r| is_gpr(*r));
+        let (a, b) = match (a_reg, b_reg) {
+            (Some(a), Some(b)) => (
+                phys_reg_name(a).to_string(),
+                phys_reg_name(b).to_string(),
+            ),
+            (Some(a), None) => {
+                self.operand_to_reg(&args[1], "rax");
+                (phys_reg_name(a).to_string(), "rax".to_string())
+            }
+            (None, Some(b)) => {
+                self.operand_to_reg(&args[0], "rax");
+                ("rax".to_string(), phys_reg_name(b).to_string())
+            }
+            (None, None) => {
+                self.operand_to_reg(&args[0], "rax");
+                self.state.emit("    movq %rax, %rdi");
+                self.operand_to_reg(&args[1], "rax");
+                ("rdi".to_string(), "rax".to_string())
+            }
+        };
+        if f64_lanes {
+            self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", a));
+            self.state.emit_fmt(format_args!("    vsubpd (%{}), %ymm0, %ymm0", b));
+            self.state.emit("    vmulpd %ymm0, %ymm0, %ymm0");
+            self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+            self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");
+            self.state.emit("    vshufpd $1, %xmm0, %xmm0, %xmm1");
+            self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0");
+        } else {
+            self.state.emit_fmt(format_args!("    vmovups (%{}), %ymm0", a));
+            self.state.emit_fmt(format_args!("    vsubps (%{}), %ymm0, %ymm0", b));
+            self.state.emit("    vmulps %ymm0, %ymm0, %ymm0");
+            self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+            self.state.emit("    vaddps %xmm1, %xmm0, %xmm0");
+            self.state.emit("    vshufpd $1, %xmm0, %xmm0, %xmm1");
+            self.state.emit("    vaddps %xmm1, %xmm0, %xmm0");
+            self.state.emit("    vmovshdup %xmm0, %xmm1");
+            self.state.emit("    vaddss %xmm1, %xmm0, %xmm0");
+        }
+        self.state.emit("    vzeroupper");
+        self.state.direct_fp_result = Some(dest.0);
     }
 
     /// Emit a contract-legal affine map as `input * scale + bias`.  Broadcast

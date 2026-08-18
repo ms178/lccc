@@ -248,6 +248,10 @@ pub enum IntrinsicOp {
     VecFmaF32x8,
     /// Contract-legal affine map: input * scale + bias, AVX 8×F32.
     VecMaddF32x8,
+    /// Fixed-width squared distance reduced directly to the scalar FP ABI
+    /// result. args = [a_base, b_base]. Reassociation must be enabled.
+    FixedDistanceF32x8,
+    FixedDistanceF64x4,
     /// Broadcast scalar f32 to 8 lanes (vbroadcastss).
     VecBroadcastF32x8,
     /// Broadcast scalar f32 to 4 lanes.
@@ -997,8 +1001,7 @@ impl IntrinsicOp {
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
-            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4
-            | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8
+            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
             | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8
             | VecBroadcastF32x8 | VecZeroF32x8
@@ -1038,8 +1041,7 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
-            | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4
-            | VecBroadcastF32x4 | VecZeroF32x4
+            | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecZeroI64x2
             | VecMulI32x4 | VecBroadcastI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128

@@ -6382,6 +6382,157 @@ fn insert_map_remainder_loop(
     4
 }
 
+/// Recognize a fixed-width squared-distance expression and pack its independent
+/// lane work.  Reassociation is a hard precondition because the horizontal
+/// reduction tree need not match the source's left-associated additions.
+/// The profitable widths are complete 256-bit F32x8/F64x4 vectors. Narrower
+/// and partial vectors retain scalar code (for example p50's three-double
+/// distance) rather than paying a horizontal-reduction loss or reading past
+/// the object boundary.
+fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
+    if func.blocks.len() != 1 || std::env::var("CCC_NO_FIXED_SLP").is_ok() {
+        return 0;
+    }
+    let ty = func.return_type;
+    if !matches!(ty, IrType::F32 | IrType::F64) {
+        return 0;
+    }
+    let Operand::Value(root) = (match &func.blocks[0].terminator {
+        Terminator::Return(Some(value)) => value.clone(),
+        _ => return 0,
+    }) else {
+        return 0;
+    };
+    let block = &func.blocks[0];
+
+    fn collect_add_terms(
+        block: &BasicBlock,
+        value: Value,
+        ty: IrType,
+        terms: &mut Vec<Value>,
+    ) -> bool {
+        if terms.len() > 8 {
+            return false;
+        }
+        if let Some(Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs: Operand::Value(lhs),
+            rhs: Operand::Value(rhs),
+            ty: add_ty,
+            ..
+        }) = find_inst_by_dest(block, value)
+        {
+            if *add_ty == ty {
+                return collect_add_terms(block, *lhs, ty, terms)
+                    && collect_add_terms(block, *rhs, ty, terms);
+            }
+        }
+        terms.push(value);
+        true
+    }
+
+    fn load_address(block: &BasicBlock, value: Value, ty: IrType) -> Option<(Value, i64)> {
+        let Instruction::Load { ptr, ty: load_ty, .. } = find_inst_by_dest(block, value)? else {
+            return None;
+        };
+        if *load_ty != ty {
+            return None;
+        }
+        if let Some(Instruction::GetElementPtr {
+            base,
+            offset: Operand::Const(offset),
+            ..
+        }) = find_inst_by_dest(block, *ptr)
+        {
+            Some((*base, offset.to_i64()?))
+        } else {
+            Some((*ptr, 0))
+        }
+    }
+
+    let mut terms = Vec::new();
+    if !collect_add_terms(block, root, ty, &mut terms) {
+        return 0;
+    }
+    let lanes = terms.len();
+    // Four F32 or two F64 lanes do not amortize the baseline horizontal
+    // sequence and remain scalar. Full 256-bit F32x8/F64x4 vectors are the
+    // measured profitable widths on x86-64-v3.
+    let width_supported = matches!(
+        (ty, lanes),
+        (IrType::F32, 8) | (IrType::F64, 4)
+    );
+    if !width_supported {
+        return 0;
+    }
+
+    let mut lane_addresses = Vec::with_capacity(lanes);
+    for term in terms {
+        let Some(Instruction::BinOp {
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(lhs),
+            rhs: Operand::Value(rhs),
+            ty: mul_ty,
+            ..
+        }) = find_inst_by_dest(block, term) else {
+            return 0;
+        };
+        if *mul_ty != ty || lhs != rhs {
+            return 0;
+        }
+        let Some(Instruction::BinOp {
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(a),
+            rhs: Operand::Value(b),
+            ty: sub_ty,
+            ..
+        }) = find_inst_by_dest(block, *lhs) else {
+            return 0;
+        };
+        if *sub_ty != ty {
+            return 0;
+        }
+        let Some(a_addr) = load_address(block, *a, ty) else {
+            return 0;
+        };
+        let Some(b_addr) = load_address(block, *b, ty) else {
+            return 0;
+        };
+        lane_addresses.push((a_addr, b_addr));
+    }
+    lane_addresses.sort_by_key(|((_, offset), _)| *offset);
+    let a_base = lane_addresses[0].0.0;
+    let b_base = lane_addresses[0].1.0;
+    let elem_size = if ty == IrType::F64 { 8 } else { 4 };
+    for (lane, ((this_a, a_offset), (this_b, b_offset))) in
+        lane_addresses.iter().enumerate()
+    {
+        let expected = lane as i64 * elem_size;
+        if *this_a != a_base || *this_b != b_base
+            || *a_offset != expected || *b_offset != expected
+        {
+            return 0;
+        }
+    }
+
+    let op = match (ty, lanes) {
+        (IrType::F32, 8) => IntrinsicOp::FixedDistanceF32x8,
+        (IrType::F64, 4) => IntrinsicOp::FixedDistanceF64x4,
+        _ => return 0,
+    };
+    let scalar = Value(func.next_value_id);
+    func.next_value_id += 1;
+    let block = &mut func.blocks[0];
+    block.instructions.push(Instruction::Intrinsic {
+        dest: Some(scalar),
+        op,
+        dest_ptr: None,
+        args: vec![Operand::Value(a_base), Operand::Value(b_base)],
+    });
+    block.terminator = Terminator::Return(Some(Operand::Value(scalar)));
+    1
+}
+
 /// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
     vectorize_function_mode(func, false, false)
@@ -6402,10 +6553,6 @@ fn vectorize_function_mode(
     fp_reassoc: bool,
     fp_contract_fast: bool,
 ) -> usize {
-    if func.blocks.len() < 2 {
-        return 0;
-    }
-
     // A DynAlloca changes the live stack extent at run time. The current vector
     // loop/remainder builder assumes fixed alloca addresses when it rewrites
     // GEPs and carries scalar reductions, which can misaddress a VLA
@@ -6430,8 +6577,20 @@ fn vectorize_function_mode(
         return 0;
     }
 
+    let slp_changes = if fp_reassoc {
+        transform_fixed_distance_slp(func)
+    } else {
+        0
+    };
+    if func.blocks.len() < 2 {
+        if slp_changes > 0 {
+            crate::passes::dce::eliminate_dead_code(func);
+        }
+        return slp_changes;
+    }
+
     let cfg = CfgAnalysis::build(func);
-    let changes = vectorize_with_analysis_mode(
+    let loop_changes = vectorize_with_analysis_mode(
         func,
         &cfg,
         false,
@@ -6439,6 +6598,7 @@ fn vectorize_function_mode(
         fp_reassoc,
         fp_contract_fast,
     );
+    let changes = slp_changes + loop_changes;
 
     // The transforms replace the scalar accumulation with vector intrinsics but
     // leave the orphaned scalar load/mul/GEP/offset chain behind for the global

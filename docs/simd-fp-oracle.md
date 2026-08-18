@@ -3,7 +3,7 @@
 **Date:** 2026-08-18  
 **Original audit base:** `1abb407e597f749a96bd851cb671f0c169f61012`
 
-**Current rebased delivery base:** `89f1404bc67aea48090ef8e611390d39d28a2a7b`
+**Current rebased delivery base:** `208bbfaed003a71fd5b1d0ed20885a195f065c01`
 
 **Target used for screening:** x86-64-v3, AT&T syntax
 
@@ -34,7 +34,7 @@ cannot be reused silently.  Quoted ELF function labels are supported.
 
 ## Corpus
 
-`simd_fp_oracle.c` contains 50 independently measurable functions.  They cover:
+`simd_fp_oracle.c` contains 53 independently measurable functions.  They cover:
 
 * contiguous F32/F64/I32 maps: add, multiply, scale, triad, clamp, copy, and
   conversion;
@@ -362,6 +362,84 @@ affine F64 is 60 (GCC 42, Clang 60, ICC 123, ICX 27), and fast affine F64 is
 59 (GCC 42, Clang 60, ICC 123, ICX 27). Whole-function counts include setup
 and scalar tails and are triage data, not throughput estimates.
 
+### Ninth distilled fix: profitable fixed-width SLP distances
+
+The first fixed-vector SLP target is deliberately narrow: a one-block return of
+an exact sum of squared differences over two contiguous arrays. The proof
+recovers each load's common base and constant byte offset, requires every term
+to be the square of the corresponding subtraction, and accepts only complete
+measured-profitable 256-bit widths (F32x8 or F64x4). F32x4 and partial F64x3
+objects remain scalar, avoiding both an out-of-bounds packed read and a known
+horizontal-reduction profitability loss. Reassociation is a hard gate, so
+strict `-ffp-contract=off` output remains source-ordered scalar code.
+
+After first measuring a generic five-intrinsic implementation, the final x86
+lowering uses one proof-carrying fixed-distance intrinsic. It folds the second
+array into `vsubps/pd`, squares in YMM0, performs the cross-lane reduction in
+XMM0, emits `vzeroupper`, and returns the scalar already in the SysV FP result
+register. A scoped direct-result marker is invalidated by clobbering operations
+and accepted only for that exact immediate return. This removes every transient
+vector home, register relay, and stack frame rather than relying on broad SIMD
+allocation policy.
+
+The controlled 53-function A/B is **2 improved, 51 tied, 0 regressed** in fast
+mode: p52 F64x4 is 14 -> 9 instructions and p53 F32x8 is 28 -> 11; aggregate
+instructions are **1883 -> 1861**, arithmetic ratio 0.98832 and geometric ratio
+0.97437. Strict mode is exactly **0 improved, 53 tied, 0 regressed**
+(1722 -> 1722). Live CE fast-mode comparisons resolve the same four oracle
+families as above: LCCC/GCC/Clang/latest ICX all emit 9 instructions for F64x4
+and 11 for F32x8, while classic ICC emits 16 and 32. The implementation was
+informed by the common data dependencies, not copied from one oracle.
+
+An eleven-run alternating VM wall-clock screen measured F32x8 at ratio 0.71709
+(1.395x faster) and F64x4 at ratio 1.00421 (0.4% slower/noise), for arithmetic
+and geometric ratios 0.86065 and 0.84860. The individual flat/slightly negative
+F64 result is retained rather than hidden by the aggregate. These unpinned,
+non-PMU timings are screening evidence only; target-hardware counters are still
+required. Sources, raw samples, strict/fast output, static A/B, and CE assembly
+are under `artifacts/simd-fp-four/fixed-slp/`.
+
+The structural regression locks in full-width packing, strict and kill-switch
+controls, the narrow/partial scalar decisions, no YMM stack spill, and a static
+F32x8 win. The runtime regression sweeps deterministic exact inputs in strict
+and fast modes. Concurrent live-oracle runs also exposed and fixed a tooling
+race: local assembly temp names now include the process ID, so parallel
+comparisons cannot unlink one another's output. Final validation on latest main
+is 328/328 regression checks, 50/50 correctness tests, and 807 passed Rust
+library tests (6 ignored).
+
+The post-rebase full run also exposed a newly merged peephole correctness defect
+outside SLP: never-read stack-store elimination treated `ret` as if it did not
+read 0(%rsp), deleted an inline-retpoline target rewrite, and left the runtime
+inside the speculation trap. The pass now preserves an immediate
+`movq %target,(%rsp); ret`; the existing 64-deep retpoline runtime regression
+passes and still verifies that no naked indirect branch is emitted.
+
+### Tenth delivery: pinned GNU gzip 1.14 end to end
+
+The workload-derived `gzip_crc32` reproducer has been graduated to a complete
+GNU gzip 1.14 build selected from `packages/gzip/PKGBUILD`. The reproducible
+runner verifies the fetched archive digest, builds the full project with LCCC
+and GCC at `-O3 -march=x86-64-v3`/`make -j2`, requires both upstream suites to
+pass 30/30, checks bit-identical compressed streams at levels 1/6/9 and exact
+decompression, and captures deterministic corpora, binaries, size, objdump,
+build logs, best/worst/median samples, and arithmetic/geometric ratios.
+
+This graduation exposes a real end-to-end deficit rather than a win: across
+five seven-round paired VM cases LCCC/GCC ratios range from 1.74329 to 1.99878,
+with arithmetic 1.87943 and geometric 1.87721. LCCC loses every individual
+case; its text is 114,738 bytes versus GCC's 106,982. Live CE triage of the
+scalar CRC recurrence is LCCC 36 instructions, GCC 15, Clang 49, ICC 35, and
+latest ICX 64. GCC's compact pointer/end loop and folded table address are a
+plausible contributor, while the references' widely different static forms
+show why no one implementation was assumed optimal.
+
+The script and provenance are under `tests/workloads/gzip-1.14/` and raw
+results under `artifacts/simd-fp-four/gzip-e2e/`. This is CPU-pinned VM
+wall-clock screening, not PMU-backed Raptor Lake evidence. The repeatedly
+fetched archive digest still differs from the package recipe checksum and no
+signature was verified here; both limitations remain explicit.
+
 ## Correctness policy discovered during the audit
 
 Strict IEEE source order is now the default for FP reductions.  Reassociation
@@ -374,14 +452,12 @@ regressions cover strict ordering and overlapping map/matmul inputs.
 
 ## Next measured targets (deferred to a new session)
 
-The affine store-loop delivery is complete and isolated; do not widen its
-one-source legality proof opportunistically. A future agent should start from
-the retained A/B and live-oracle artifacts, then address in this order:
-
-1. add width-aware SLP for fixed vectors/stencils and complex/interleaved
-   kernels;
-2. graduate promising zlib-ng/gzip, expat, SQLite, Linux, and glibc kernels to
-   pinned end-to-end workloads with provenance.
+The affine store-loop, first profitable fixed-width SLP, and first full gzip
+workload deliveries are complete and isolated. Do not widen either SIMD
+legality proof opportunistically. Follow-up work should first root-cause the
+measured gzip gap (beginning with redundant CRC/table address formation) as a
+separate optimization, then graduate another expat, SQLite, Linux, glibc, or
+zlib-ng workload with the same provenance and output discipline.
 
 For every item, retain strict-vs-fast differential execution, local/remote
 assembly, individual gains and regressions, and raw randomized paired timing

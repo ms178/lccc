@@ -215,7 +215,12 @@ def _instruction_count(lines: list[str]) -> int:
 
 def _compile_local(executable: str, source: Path, flags: str) -> list[str]:
     digest = hashlib.sha256((str(source.resolve()) + "\0" + flags).encode()).hexdigest()[:16]
-    output = Path(os.environ.get("TMPDIR", "/tmp")) / f"lccc-godbolt-{digest}.s"
+    # Include the process id: separate scoreboard/compare processes are often
+    # launched in parallel for different functions of the same source. A
+    # digest-only name let one process unlink another's completed assembly.
+    output = Path(os.environ.get("TMPDIR", "/tmp")) / (
+        f"lccc-godbolt-{digest}-{os.getpid()}.s"
+    )
     command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:

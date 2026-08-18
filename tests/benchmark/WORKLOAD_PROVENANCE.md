@@ -97,3 +97,36 @@ They can isolate code-generation questions such as:
 They cannot establish full-project wins.  Any promising result must graduate to
 an upstream build/run workload with pinned inputs, assembly capture, controlled
 runtime conditions, and—on bare metal—hardware-counter evidence.
+
+## Graduated end-to-end workload: GNU gzip 1.14
+
+`tests/workloads/gzip-1.14/run.py` now builds and executes the complete pinned
+GNU gzip 1.14 project rather than extrapolating from `gzip_crc32`. The full
+runner verifies archive SHA-256
+`01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6`,
+requires gzip's upstream test suite to pass 30/30 under both LCCC and GCC,
+generates deterministic 8 MiB source-tree and structured/binary corpora,
+requires bit-identical level-1/6/9 streams and exact decompression, captures
+full binary disassembly/size/build logs, and retains randomized CPU-pinned raw
+samples with individual and aggregate statistics.
+
+The first seven-round VM screen on 2026-08-18 did **not** show an LCCC win. LCCC
+was slower in every case: source compression ratios to GCC were 1.94882 (level
+1), 1.81785 (level 6), and 1.88842 (level 9); mixed level 6 was 1.99878; source
+decompression was 1.74329. Arithmetic and geometric ratios were 1.87943 and
+1.87721. LCCC's binary text was 114,738 bytes versus GCC's 106,982. These
+regressions are intentionally explicit rather than hidden by a kernel-only
+score.
+
+A live CE triage of the scalar gzip CRC recurrence found LCCC at 36 static
+instructions, GCC 16.2 at 15, Clang 22.1 at 49, ICC 2021.10 at 35, and latest
+ICX at 64. GCC's key advantage there is a compact pointer/end loop with a
+memory table operand; LCCC repeatedly materializes byte and table addresses.
+That is one plausible generated-code cause, not proof that CRC alone explains
+the end-to-end gap. Raw evidence is retained under
+`artifacts/simd-fp-four/gzip-e2e/`.
+
+This remains VM wall-clock screening without PMU data. The recipe/archive
+checksum discrepancy described above is still unresolved, and the archive
+signature was not verified in this VM; the end-to-end runner reports both
+limitations on every run.
