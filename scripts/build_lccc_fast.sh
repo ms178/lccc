@@ -23,4 +23,16 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
 
+# Fail on warnings unless explicitly opted out.
+#
+# A `private_interfaces` warning shipped once because the build was only ever
+# grepped for '^error': a public enum variant exposed a private RAII type, and
+# `cargo build` reported it while every check treated a zero exit status as
+# success. Warnings are part of the build contract, so the build enforces them.
+#
+# Set LCCC_ALLOW_WARNINGS=1 for a scratch build mid-refactor.
+if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
+    export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
+fi
+
 exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}"

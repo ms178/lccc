@@ -1,4 +1,4 @@
-# LCCC Linker — Follow-Up Plan (Sessions 2–12)
+# LCCC Linker — Follow-Up Plan (Sessions 2–13)
 
 **Date:** 2026-08-17 (second session of the day)
 **Base:** `origin/main` @ `1706984` (post-PR #98)
@@ -1584,3 +1584,72 @@ output format is itself a defect, and that part is fixed.
    archives still read each member separately.
 5. `--icf=safe` currently rejects any address-taken function; mold folds those
    whose address is only compared, not called through.
+
+---
+
+# Session 13 (hotfix) — a shipped compiler warning, and the process hole that let it ship
+
+**Base:** `ms178/lccc` main @ `a48de95b`. **Snapshot:** `S01-fix-private-interfaces-warning` (`b73563ec`).
+
+## 13.1 The defect
+
+The session-12 mmap work shipped a warning:
+
+```
+warning: type `Mapping` is more private than the item `FileBacking::Mapped::0`
+ --> src/backend/linker_common/filemap.rs:211:12
+    field `FileBacking::Mapped::0` is reachable at visibility `pub`
+note: but type `Mapping` is only usable at visibility `pub(self)`
+```
+
+`FileBacking` was a `pub enum` whose `Mapped` variant carried `Arc<Mapping>`,
+and `Mapping` is a private raw-pointer RAII type. A private type was reachable
+through the crate's public API.
+
+The fix is the shape the file already used ten lines earlier: `FileBacking` is
+now an opaque struct wrapping a private `FileBackingInner`, mirroring
+`FileMap`/`FileMapInner`. That is not merely warning-silencing — `Mapping`'s
+only invariant is *unmapped exactly once*, so no caller should be able to
+construct or destructure it. The public surface is `FileBacking::owned(..)`
+(8 call sites converted from the variant constructor) plus `as_slice()`.
+
+## 13.2 Why it was not caught — the part that actually matters
+
+Every build check I ran across sessions 9–12 was some form of
+
+```
+cargo build ... 2>&1 | grep -E "^error" | head
+```
+
+which is blind to warnings by construction, and a zero exit status was then
+read as success. The compiler *did* report the problem on every single build;
+the process that was supposed to validate the work threw the message away.
+
+Grepping harder is not a fix, because it depends on remembering. So
+`scripts/build_lccc_fast.sh` now exports `RUSTFLAGS=-D warnings`, making a
+warning a build failure; `LCCC_ALLOW_WARNINGS=1` opts out for a scratch build
+mid-refactor.
+
+**Mutation-verified**, like any other guard: reintroducing the exact defect now
+yields `error: type Mapping is more private than the item
+FileBackingInner::Mapped::0` and a failed build, instead of a warning nobody
+reads. Warnings are also now checked on **all three surfaces** — lib, bins and
+tests — where previously only the lib was inspected, and only for errors.
+
+## 13.3 Verification
+
+Zero warnings on lib, bins and tests. 802 unit pass, 158 differential pass
+(bfd/mold/wild), 18/18 script probes, 400 byte-mutator + 500 grammar-fuzzer
+links clean, expat/gzip/zlib-ng differential PASS.
+
+Because the change touches the zero-copy path, that was measured rather than
+assumed: gzip output is byte-identical with and without `LCCC_NO_MMAP`, and the
+mmap win is intact at **48,786,539 vs 52,406,946 Ir (−6.9 %)**.
+
+## 13.4 Lesson
+
+**A check that cannot fail is not a check.** Filtering build output for
+`^error` silently redefined "clean build" as "compiles at all", and it stayed
+wrong for four sessions because nothing ever contradicted it. When a class of
+defect escapes, fix the gate, not just the instance — and then prove the gate
+fails on the reintroduced defect.

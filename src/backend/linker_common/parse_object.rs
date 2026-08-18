@@ -35,7 +35,7 @@ pub fn parse_elf64_object_at(
     expected_machine: u16,
 ) -> Result<Elf64Object, String> {
     parse_elf64_object_backed(
-        &FileBacking::Owned(std::sync::Arc::clone(buf)), base, size,
+        &FileBacking::owned(std::sync::Arc::clone(buf)), base, size,
         source_name, expected_machine)
 }
 
@@ -181,7 +181,7 @@ fn parse_elf64_object_inner(
     // the whole input once, which is still no worse than per-section copies.
     let owned_buf: Option<FileBacking> = match shared {
         Some(_) => None,
-        None => Some(FileBacking::Owned(std::sync::Arc::from(data))),
+        None => Some(FileBacking::owned(std::sync::Arc::from(data))),
     };
     let (backing, origin) = match shared {
         Some((buf, base)) => (buf, base),

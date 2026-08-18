@@ -67,7 +67,7 @@ impl SectionData {
     /// Empty section (`SHT_NOBITS`, or a zero-length section).
     #[inline]
     pub fn empty() -> Self {
-        SectionData { buf: FileBacking::Owned(Arc::from(&[][..])), start: 0, end: 0 }
+        SectionData { buf: FileBacking::owned(Arc::from(&[][..])), start: 0, end: 0 }
     }
 
     /// A window `[start, start + len)` into an existing shared buffer.
@@ -77,7 +77,7 @@ impl SectionData {
     /// that into a diagnostic rather than a panic.
     #[inline]
     pub fn slice(buf: &Arc<[u8]>, start: usize, len: usize) -> Option<Self> {
-        Self::slice_backing(&FileBacking::Owned(Arc::clone(buf)), start, len)
+        Self::slice_backing(&FileBacking::owned(Arc::clone(buf)), start, len)
     }
 
     /// A window into an input file's backing storage (mapping or buffer).
@@ -98,7 +98,7 @@ impl SectionData {
     #[inline]
     pub fn owned(bytes: Vec<u8>) -> Self {
         let end = bytes.len();
-        SectionData { buf: FileBacking::Owned(Arc::from(bytes)), start: 0, end }
+        SectionData { buf: FileBacking::owned(Arc::from(bytes)), start: 0, end }
     }
 
     #[inline]
@@ -382,7 +382,7 @@ mod tests {
     fn out_of_range_backing_window_is_rejected() {
         use crate::backend::linker_common::filemap::FileBacking;
         use std::sync::Arc;
-        let backing = FileBacking::Owned(Arc::from(&[0u8; 16][..]));
+        let backing = FileBacking::owned(Arc::from(&[0u8; 16][..]));
         assert!(SectionData::slice_backing(&backing, 8, 8).is_some());
         assert!(SectionData::slice_backing(&backing, 8, 9).is_none());
         assert!(SectionData::slice_backing(&backing, usize::MAX, 1).is_none());
