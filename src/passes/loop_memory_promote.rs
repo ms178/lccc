@@ -9,26 +9,23 @@
 //!
 //! - **Recurrence direction.** Load observes the *previous* iteration's store.
 //!   If load and store share a block, the load must precede the store.
-//!   Store-then-load is a block-local temporary (`int a[2] = {i}; acc += a[0]`)
-//!   and must not be rewritten to the phi (that handed iteration 0 an
-//!   uninitialized preheader read: `loop_alloca_scalar` 281 vs 290).
+//!   Store-then-load is a block-local temporary and must not become a phi
+//!   (that handed iteration 0 an uninitialized preheader read).
 //! - **Exit store value.** `phi` is the value *entering* the iteration.
 //!   The latch store writes `store_val`. If the unique exit leaves from the
 //!   latch, memory must receive `store_val`, not `phi`. Storing `phi` on a
 //!   do-while is a one-iteration-stale write.
 //! - **Must-execute / speculation.** The load is hoisted to the preheader.
-//!   That is a speculative load unless the original load executes on every
-//!   path that enters the header. Allowed only when the address is
-//!   alloca-derived (function-local, non-faulting) **or** the load block
-//!   dominates the unique exit source.
+//!   Allowed only when the address is alloca-derived (function-local,
+//!   non-faulting) **or** the load block dominates the unique exit source.
 //! - **The load dominates the latch.** Otherwise a path to the store skips
 //!   the load and the phi would invent a value.
-//! - **Alias.** Any other load/store that cannot be proved disjoint (same
-//!   object + non-overlapping byte ranges, or affine marching away) blocks
-//!   promotion. Two GEPs of the same field are different value ids — that
-//!   is *not* disjoint (sqlite `sqlite3FpDecode` infinite loop).
+//! - **Alias.** Distinct *allocas* and distinct *globals* are different
+//!   objects. A `ParamRef` or an unknown root may alias anything that is
+//!   not a proven-distinct alloca/global range. Two GEPs of the same field
+//!   are different SSA ids and are **not** disjoint.
 //! - **Unknown memory.** Call, memcpy, inline-asm, atomics, va_*,
-//!   stackrestore, intrinsics: refuse the whole loop.
+//!   stackrestore, intrinsics, fences: refuse the whole loop.
 //! - **Phis stay first.** The exit store is inserted after leading phis.
 //!   `source_spans` stay 1:1 with instructions.
 //!
@@ -37,7 +34,9 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value};
+use crate::ir::reexports::{
+    BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
 use super::loop_analysis;
 use std::sync::OnceLock;
 
@@ -45,9 +44,17 @@ const MAX_PROMOTIONS: usize = 64;
 const RESOLVE_FUEL: u8 = 32;
 const CHAIN_FUEL: u32 = 64;
 
+/// Object-identity tags in the top 4 bits of a [`Path::root`].
+/// The low 60 bits are an id / hash. Different *kinds* never collide.
+const TAG_SHIFT: u32 = 60;
+const TAG_ALLOCA: u64 = 1 << TAG_SHIFT;
+const TAG_PARAM: u64 = 2 << TAG_SHIFT;
+const TAG_GLOBAL: u64 = 3 << TAG_SHIFT;
+const TAG_OTHER: u64 = 4 << TAG_SHIFT;
+const TAG_MASK: u64 = 0xF << TAG_SHIFT;
+
 #[derive(Clone, Copy, Debug)]
 struct Path {
-    /// Object identity, not SSA value id. See [`object_root`].
     root: u64,
     offset: i64,
 }
@@ -65,43 +72,54 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
+fn tag_of(root: u64) -> u64 {
+    root & TAG_MASK
+}
+
+fn is_alloca_root(root: u64) -> bool {
+    tag_of(root) == TAG_ALLOCA
+}
+
+fn is_unique_object_tag(tag: u64) -> bool {
+    tag == TAG_ALLOCA || tag == TAG_GLOBAL
+}
+
 /// Stable identity for the *object* a pointer refers to.
 ///
 /// Two `GlobalAddr "foo"` with different dest ids are the same object.
-/// Two `ParamRef` of the same argument are the same object. Treating dest
-/// ids as roots would prove them disjoint and promote a load through one
-/// while a store through the other stays in the loop.
+/// Two `ParamRef` of the same argument are the same object. Dest ids are
+/// **not** object identity.
 fn object_root(inst: &Instruction, dest: Value) -> u64 {
     match inst {
-        Instruction::GlobalAddr { name, .. } => fnv1a(name.as_bytes()),
-        Instruction::Alloca { .. } => 0x1_0000_0000 + dest.0 as u64,
-        Instruction::ParamRef { param_idx, .. } => 0x2_0000_0000 + *param_idx as u64,
-        _ => 0x3_0000_0000 + dest.0 as u64,
+        Instruction::GlobalAddr { name, .. } => TAG_GLOBAL | (fnv1a(name.as_bytes()) >> 4),
+        Instruction::Alloca { .. } => TAG_ALLOCA | dest.0 as u64,
+        Instruction::ParamRef { param_idx, .. } => TAG_PARAM | *param_idx as u64,
+        _ => TAG_OTHER | dest.0 as u64,
     }
 }
 
-fn is_alloca_inst(inst: &Instruction) -> bool {
-    matches!(inst, Instruction::Alloca { .. })
-}
-
-fn pointer_paths(func: &IrFunction, defs: &FxHashMap<u32, &Instruction>) -> FxHashMap<u32, Path> {
+fn pointer_paths(defs: &FxHashMap<u32, &Instruction>) -> FxHashMap<u32, Path> {
     let mut paths = FxHashMap::default();
     for (&vid, inst) in defs {
         match inst {
             Instruction::Alloca { dest, .. }
             | Instruction::ParamRef { dest, .. }
             | Instruction::GlobalAddr { dest, .. } => {
-                paths.insert(vid, Path { root: object_root(inst, *dest), offset: 0 });
+                paths.insert(
+                    vid,
+                    Path {
+                        root: object_root(inst, *dest),
+                        offset: 0,
+                    },
+                );
             }
             _ => {}
         }
     }
 
-    // Derive GEP/Copy/Add-const. Worklist, not “rescan the whole function
-    // until quiet” — same fixpoint, O(|derived|) not O(|F|²).
-    let mut work: Vec<u32> = paths.keys().copied().collect();
-    while let Some(_) = work.pop() {
-        // Re-walk derived insts; N is tiny (pointer chain length).
+    // Fixpoint on GEP/Copy/Add-const/widening-cast. Each dest is inserted
+    // at most once, so the loop is O(|defs| × chain depth).
+    loop {
         let mut progressed = false;
         for (&vid, inst) in defs {
             if paths.contains_key(&vid) {
@@ -114,20 +132,28 @@ fn pointer_paths(func: &IrFunction, defs: &FxHashMap<u32, &Instruction>) -> FxHa
                     offset: Operand::Const(c),
                     ..
                 } => c.to_i64().and_then(|off| {
-                    paths.get(&base.0).and_then(|p| {
-                        Some((
-                            dest.0,
-                            Path {
-                                root: p.root,
-                                offset: p.offset.checked_add(off)?,
-                            },
-                        ))
-                    })
+                    let p = paths.get(&base.0)?;
+                    Some((
+                        dest.0,
+                        Path {
+                            root: p.root,
+                            offset: p.offset.checked_add(off)?,
+                        },
+                    ))
                 }),
                 Instruction::Copy {
                     dest,
                     src: Operand::Value(src),
                 } => paths.get(&src.0).copied().map(|p| (dest.0, p)),
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    from_ty,
+                    to_ty,
+                    ..
+                } if from_ty.size() <= to_ty.size() => {
+                    paths.get(&src.0).copied().map(|p| (dest.0, p))
+                }
                 Instruction::BinOp {
                     dest,
                     op: IrBinOp::Add,
@@ -137,15 +163,14 @@ fn pointer_paths(func: &IrFunction, defs: &FxHashMap<u32, &Instruction>) -> FxHa
                 } => match (lhs, rhs) {
                     (Operand::Value(base), Operand::Const(c))
                     | (Operand::Const(c), Operand::Value(base)) => c.to_i64().and_then(|off| {
-                        paths.get(&base.0).and_then(|p| {
-                            Some((
-                                dest.0,
-                                Path {
-                                    root: p.root,
-                                    offset: p.offset.checked_add(off)?,
-                                },
-                            ))
-                        })
+                        let p = paths.get(&base.0)?;
+                        Some((
+                            dest.0,
+                            Path {
+                                root: p.root,
+                                offset: p.offset.checked_add(off)?,
+                            },
+                        ))
                     }),
                     _ => None,
                 },
@@ -153,7 +178,6 @@ fn pointer_paths(func: &IrFunction, defs: &FxHashMap<u32, &Instruction>) -> FxHa
             };
             if let Some((dest, path)) = derived {
                 paths.insert(dest, path);
-                work.push(dest);
                 progressed = true;
             }
         }
@@ -178,12 +202,18 @@ fn is_promotable_type(ty: IrType) -> bool {
     byte_size(ty).is_some()
 }
 
+/// True only when the two accesses are **proved** to never overlap.
+///
+/// Different roots are disjoint iff both name uniquely-identified objects
+/// (distinct allocas, distinct globals, or alloca↔global). A parameter or
+/// an unknown root may alias any of those — returning true here would
+/// drop an aliasing in-loop store and leave a load reading stale memory.
 fn disjoint(paths: &FxHashMap<u32, Path>, a: Value, a_ty: IrType, b: Value, b_ty: IrType) -> bool {
     let (Some(pa), Some(pb)) = (paths.get(&a.0), paths.get(&b.0)) else {
         return false;
     };
     if pa.root != pb.root {
-        return true;
+        return is_unique_object_tag(tag_of(pa.root)) && is_unique_object_tag(tag_of(pb.root));
     }
     let (Some(asize), Some(bsize)) = (byte_size(a_ty), byte_size(b_ty)) else {
         return false;
@@ -197,12 +227,15 @@ fn disjoint(paths: &FxHashMap<u32, Path>, a: Value, a_ty: IrType, b: Value, b_ty
 fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Value) -> Option<(u32, i64)> {
     let mut cur = start;
     let mut off: i64 = 0;
+    let mut seen = FxHashSet::default();
     for _ in 0..CHAIN_FUEL {
-        let inst = match defs.get(&cur.0) {
-            Some(i) => *i,
-            None => return Some((cur.0, off)),
+        if !seen.insert(cur.0) {
+            return None;
+        }
+        let Some(inst) = defs.get(&cur.0) else {
+            return Some((cur.0, off));
         };
-        let next = match inst {
+        let next = match *inst {
             Instruction::GetElementPtr {
                 base,
                 offset: Operand::Const(c),
@@ -227,9 +260,6 @@ fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Value) -> Optio
         match next {
             Some((base, k)) => {
                 off = off.checked_add(k)?;
-                if base.0 == cur.0 {
-                    return None;
-                }
                 cur = base;
             }
             None => return Some((cur.0, off)),
@@ -484,11 +514,17 @@ fn merge_forms(mut a: LinForm, b: LinForm) -> Option<LinForm> {
     Some(a)
 }
 
+fn ranges_apart(a0: i64, a_sz: i64, b0: i64, b_sz: i64) -> Option<bool> {
+    let ae = a0.checked_add(a_sz)?;
+    let be = b0.checked_add(b_sz)?;
+    Some(ae <= b0 || be <= a0)
+}
+
 /// Prove `cand` (loop-invariant) never overlaps `store` in any iteration.
 ///
 /// Same root + same symbolic IV terms. If the store marches away from the
 /// candidate's range starting from a non-overlapping `t = 0` slot, later
-/// iterations only recede further.
+/// iterations only recede further. Overflow ⇒ not proved.
 fn affine_disjoint(
     func: &IrFunction,
     defs: &FxHashMap<u32, &Instruction>,
@@ -527,8 +563,7 @@ fn affine_disjoint(
         if cf.syms != sf.syms {
             return false;
         }
-        return cf.konst.saturating_add(cand_sz) <= sf.konst
-            || sf.konst.saturating_add(store_sz) <= cf.konst;
+        return ranges_apart(cf.konst, cand_sz, sf.konst, store_sz).unwrap_or(false);
     }
     if cf.march != 0 {
         return false;
@@ -537,9 +572,13 @@ fn affine_disjoint(
         return false;
     }
     if sf.march > 0 {
-        sf.konst >= cf.konst.saturating_add(cand_sz)
+        cf.konst
+            .checked_add(cand_sz)
+            .is_some_and(|end| sf.konst >= end)
     } else {
-        sf.konst.saturating_add(store_sz) <= cf.konst
+        sf.konst
+            .checked_add(store_sz)
+            .is_some_and(|end| end <= cf.konst)
     }
 }
 
@@ -565,27 +604,28 @@ fn dominates(idom: &[usize], node: usize, anc: usize) -> bool {
 }
 
 fn inst_may_clobber_unknown(inst: &Instruction) -> bool {
-    match inst {
+    matches!(
+        inst,
         Instruction::Call { .. }
-        | Instruction::CallIndirect { .. }
-        | Instruction::Memcpy { .. }
-        | Instruction::InlineAsm { .. }
-        | Instruction::Intrinsic { .. }
-        | Instruction::VaArg { .. }
-        | Instruction::VaStart { .. }
-        | Instruction::VaCopy { .. }
-        | Instruction::VaArgStruct { .. }
-        | Instruction::StackRestore { .. }
-        | Instruction::AtomicRmw { .. }
-        | Instruction::AtomicInc { .. }
-        | Instruction::AtomicCmpxchg { .. }
-        | Instruction::AtomicLoad { .. }
-        | Instruction::AtomicStore { .. } => true,
-        _ => false,
-    }
+            | Instruction::CallIndirect { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::InlineAsm { .. }
+            | Instruction::Intrinsic { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaStart { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::VaArgStruct { .. }
+            | Instruction::StackRestore { .. }
+            | Instruction::Fence { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicLoad { .. }
+            | Instruction::AtomicStore { .. }
+    )
 }
 
-fn first_non_phi(block: &crate::ir::reexports::BasicBlock) -> usize {
+fn first_non_phi(block: &BasicBlock) -> usize {
     block
         .instructions
         .iter()
@@ -593,7 +633,7 @@ fn first_non_phi(block: &crate::ir::reexports::BasicBlock) -> usize {
         .unwrap_or(block.instructions.len())
 }
 
-fn insert_inst(block: &mut crate::ir::reexports::BasicBlock, idx: usize, inst: Instruction) {
+fn insert_inst(block: &mut BasicBlock, idx: usize, inst: Instruction) {
     let n_inst = block.instructions.len();
     let n_span = block.source_spans.len();
     let idx = idx.min(n_inst);
@@ -604,7 +644,7 @@ fn insert_inst(block: &mut crate::ir::reexports::BasicBlock, idx: usize, inst: I
     }
 }
 
-fn remove_inst(block: &mut crate::ir::reexports::BasicBlock, idx: usize) {
+fn remove_inst(block: &mut BasicBlock, idx: usize) {
     if idx >= block.instructions.len() {
         return;
     }
@@ -791,12 +831,31 @@ fn collect_defs(func: &IrFunction) -> (FxHashMap<u32, &Instruction>, FxHashMap<u
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Some(dest) = inst.dest() {
-                defs.insert(dest.0, inst);
-                def_block.insert(dest.0, bi);
+                defs.entry(dest.0).or_insert(inst);
+                def_block.entry(dest.0).or_insert(bi);
             }
         }
     }
     (defs, def_block)
+}
+
+/// Owned snapshot of a legal promotion. Built while `defs` is borrowed,
+/// applied after that borrow ends — otherwise the function does not compile.
+struct PromotePlan {
+    ptr: Value,
+    load_b: usize,
+    load_i: usize,
+    load_dest: Value,
+    load_ty: IrType,
+    load_seg: AddressSpace,
+    store_b: usize,
+    store_i: usize,
+    store_val: Operand,
+    preheader: usize,
+    header: usize,
+    latch: usize,
+    exit_from: usize,
+    exit_block: usize,
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
@@ -814,6 +873,13 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 }
 
 fn run_once(func: &mut IrFunction) -> usize {
+    let Some(plan) = find_promotion(func) else {
+        return 0;
+    };
+    apply_promotion(func, plan)
+}
+
+fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
     let cfg = CfgAnalysis::build(func);
     let loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
         cfg.num_blocks,
@@ -822,11 +888,11 @@ fn run_once(func: &mut IrFunction) -> usize {
         &cfg.idom,
     ));
     if loops.is_empty() {
-        return 0;
+        return None;
     }
 
     let (defs, def_block) = collect_defs(func);
-    let paths = pointer_paths(func, &defs);
+    let paths = pointer_paths(&defs);
     let volatile_roots: FxHashSet<u64> = func
         .blocks
         .iter()
@@ -834,9 +900,10 @@ fn run_once(func: &mut IrFunction) -> usize {
         .filter_map(|inst| match inst {
             Instruction::Alloca {
                 dest,
-                volatile: true,
+                volatile,
+                semantic_volatile,
                 ..
-            } => Some(0x1_0000_0000 + dest.0 as u64),
+            } if *volatile || *semantic_volatile => Some(TAG_ALLOCA | dest.0 as u64),
             _ => None,
         })
         .collect();
@@ -877,6 +944,8 @@ fn run_once(func: &mut IrFunction) -> usize {
         if exit_block >= func.blocks.len() {
             continue;
         }
+        // Unique predecessor so the exit store is the unique writeback
+        // (and so the exit block is not also a join / the preheader).
         if cfg
             .preds
             .row(exit_block)
@@ -910,10 +979,13 @@ fn run_once(func: &mut IrFunction) -> usize {
                         ty,
                         seg_override,
                         ..
-                    } => stores
-                        .entry(ptr.0)
-                        .or_default()
-                        .push((bi, ii, val.clone(), *ty, *seg_override)),
+                    } => stores.entry(ptr.0).or_default().push((
+                        bi,
+                        ii,
+                        val.clone(),
+                        *ty,
+                        *seg_override,
+                    )),
                     other if inst_may_clobber_unknown(other) => has_unknown_mem = true,
                     _ => {}
                 }
@@ -938,7 +1010,6 @@ fn run_once(func: &mut IrFunction) -> usize {
             if !is_promotable_type(load_ty) {
                 continue;
             }
-            // Store-then-load in the same block is not a recurrence.
             if load_b == *store_b && load_i > *store_i {
                 continue;
             }
@@ -958,22 +1029,13 @@ fn run_once(func: &mut IrFunction) -> usize {
 
             // Speculative preheader load: only for alloca roots, or when the
             // original load already executes on every path to the unique exit.
-            let alloca_backed = paths.get(&ptr_id).is_some_and(|p| {
-                defs.values().any(|inst| {
-                    is_alloca_inst(inst)
-                        && object_root(inst, inst.dest().unwrap_or(Value(0))) == p.root
-                })
-            });
-            let alloca_backed = alloca_backed
-                || defs
-                    .get(&ptr_id)
-                    .is_some_and(|i| matches!(i, Instruction::Alloca { .. }));
+            let alloca_backed = paths.get(&ptr_id).is_some_and(|p| is_alloca_root(p.root));
             if !alloca_backed && !dominates(&cfg.idom, exit_from, load_b) {
                 continue;
             }
 
             let mut alias = false;
-            let may_alias = |other: Value, other_ty: IrType| {
+            let mut may_alias = |other: Value, other_ty: IrType| {
                 !disjoint(&paths, ptr, load_ty, other, other_ty)
                     && !affine_disjoint(
                         func,
@@ -999,8 +1061,7 @@ fn run_once(func: &mut IrFunction) -> usize {
             }
             // Other loads through a different SSA pointer that aliases this
             // location must block: the in-loop store is removed, so they
-            // would read stale memory. Two GEPs of the same field are the
-            // sqlite3FpDecode `while (z[n-1]=='0') n--` infinite loop.
+            // would read stale memory (sqlite3FpDecode `n--` infinite loop).
             for (&other_ptr, other_loads) in &loads {
                 if other_ptr == ptr_id {
                     continue;
@@ -1022,78 +1083,97 @@ fn run_once(func: &mut IrFunction) -> usize {
                 );
             }
 
-            let Some(init) = next_value(func) else {
-                return 0;
-            };
-            let Some(phi) = next_value(func) else {
-                return 0;
-            };
-
-            let latch_incoming = subst_operand(store_val, load_dest.0, phi.0);
-            let exit_val = memory_on_exit(exit_from, latch, phi, &latch_incoming);
-
-            insert_inst(
-                &mut func.blocks[preheader],
-                func.blocks[preheader].instructions.len(),
-                Instruction::Load {
-                    dest: init,
-                    ptr,
-                    ty: load_ty,
-                    seg_override: load_seg,
-                },
-            );
-            let pre_label = func.blocks[preheader].label;
-            let latch_label = func.blocks[latch].label;
-            insert_inst(
-                &mut func.blocks[lp.header],
-                0,
-                Instruction::Phi {
-                    dest: phi,
-                    ty: load_ty,
-                    incoming: vec![
-                        (Operand::Value(init), pre_label),
-                        (latch_incoming, latch_label),
-                    ],
-                },
-            );
-            if load_ty == IrType::F64 {
-                func.loop_promoted_f64_values.push(phi);
-            }
-
-            for block in &mut func.blocks {
-                for inst in &mut block.instructions {
-                    rewrite_uses_in_inst(inst, load_dest.0, phi.0);
-                }
-                rewrite_uses_in_terminator(&mut block.terminator, load_dest.0, phi.0);
-            }
-
-            // Phi at header[0] shifted every later index in the header.
-            let shift = |bi: usize, ii: usize| ii + usize::from(bi == lp.header);
-            let li = shift(load_b, load_i);
-            let si = shift(*store_b, *store_i);
-            if load_b == *store_b {
-                let (hi, lo) = if si > li { (si, li) } else { (li, si) };
-                remove_inst(&mut func.blocks[load_b], hi);
-                remove_inst(&mut func.blocks[load_b], lo);
-            } else {
-                remove_inst(&mut func.blocks[load_b], li);
-                remove_inst(&mut func.blocks[*store_b], si);
-            }
-
-            insert_inst(
-                &mut func.blocks[exit_block],
-                first_non_phi(&func.blocks[exit_block]),
-                Instruction::Store {
-                    val: exit_val,
-                    ptr,
-                    ty: load_ty,
-                    seg_override: load_seg,
-                },
-            );
-            return 1;
+            return Some(PromotePlan {
+                ptr,
+                load_b,
+                load_i,
+                load_dest,
+                load_ty,
+                load_seg,
+                store_b: *store_b,
+                store_i: *store_i,
+                store_val: store_val.clone(),
+                preheader,
+                header: lp.header,
+                latch,
+                exit_from,
+                exit_block,
+            });
         }
     }
-    0
+    None
+}
+
+fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
+    let Some(init) = next_value(func) else {
+        return 0;
+    };
+    let Some(phi) = next_value(func) else {
+        return 0;
+    };
+
+    let latch_incoming = subst_operand(&plan.store_val, plan.load_dest.0, phi.0);
+    let exit_val = memory_on_exit(plan.exit_from, plan.latch, phi, &latch_incoming);
+
+    insert_inst(
+        &mut func.blocks[plan.preheader],
+        func.blocks[plan.preheader].instructions.len(),
+        Instruction::Load {
+            dest: init,
+            ptr: plan.ptr,
+            ty: plan.load_ty,
+            seg_override: plan.load_seg,
+        },
+    );
+    let pre_label = func.blocks[plan.preheader].label;
+    let latch_label = func.blocks[plan.latch].label;
+    insert_inst(
+        &mut func.blocks[plan.header],
+        0,
+        Instruction::Phi {
+            dest: phi,
+            ty: plan.load_ty,
+            incoming: vec![
+                (Operand::Value(init), pre_label),
+                (latch_incoming, latch_label),
+            ],
+        },
+    );
+    if plan.load_ty == IrType::F64 {
+        func.loop_promoted_f64_values.push(phi);
+    }
+
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            rewrite_uses_in_inst(inst, plan.load_dest.0, phi.0);
+        }
+        rewrite_uses_in_terminator(&mut block.terminator, plan.load_dest.0, phi.0);
+    }
+
+    // Phi at header[0] shifted every later index in the header.
+    let shift = |bi: usize, ii: usize| ii + usize::from(bi == plan.header);
+    let li = shift(plan.load_b, plan.load_i);
+    let si = shift(plan.store_b, plan.store_i);
+    if plan.load_b == plan.store_b {
+        let (hi, lo) = if si > li { (si, li) } else { (li, si) };
+        remove_inst(&mut func.blocks[plan.load_b], hi);
+        remove_inst(&mut func.blocks[plan.load_b], lo);
+    } else {
+        remove_inst(&mut func.blocks[plan.load_b], li);
+        remove_inst(&mut func.blocks[plan.store_b], si);
+    }
+
+    insert_inst(
+        &mut func.blocks[plan.exit_block],
+        first_non_phi(&func.blocks[plan.exit_block]),
+        Instruction::Store {
+            val: exit_val,
+            ptr: plan.ptr,
+            ty: plan.load_ty,
+            seg_override: plan.load_seg,
+        },
+    );
+    1
 }
 
 /// Mark one ordinary F64 add-reduction for the dedicated ARM loop-register
@@ -1131,9 +1211,9 @@ pub(crate) fn mark_f64_add_reduction(func: &mut IrFunction) -> usize {
             if func.loop_promoted_f64_values.iter().any(|v| v.0 == dest.0) {
                 continue;
             }
-            let has_zero = incoming.iter().any(|(op, _)| {
-                matches!(op, Operand::Const(IrConst::F64(v)) if *v == 0.0)
-            });
+            let has_zero = incoming
+                .iter()
+                .any(|(op, _)| matches!(op, Operand::Const(IrConst::F64(v)) if *v == 0.0));
             if !has_zero {
                 continue;
             }
@@ -1161,7 +1241,7 @@ pub(crate) fn mark_f64_add_reduction(func: &mut IrFunction) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, BlockId};
+    use crate::ir::reexports::BlockId;
 
     fn block(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
         BasicBlock {
@@ -1193,14 +1273,102 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_same_root_nonoverlap() {
+    fn disjoint_unique_objects_only() {
         let mut paths = FxHashMap::default();
-        paths.insert(1, Path { root: 42, offset: 0 });
-        paths.insert(2, Path { root: 42, offset: 8 });
-        paths.insert(3, Path { root: 99, offset: 0 });
-        assert!(disjoint(&paths, Value(1), IrType::I64, Value(2), IrType::I64));
-        assert!(!disjoint(&paths, Value(1), IrType::I64, Value(1), IrType::I64));
-        assert!(disjoint(&paths, Value(1), IrType::I64, Value(3), IrType::I64));
+        paths.insert(
+            1,
+            Path {
+                root: TAG_ALLOCA | 1,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            2,
+            Path {
+                root: TAG_ALLOCA | 1,
+                offset: 8,
+            },
+        );
+        paths.insert(
+            3,
+            Path {
+                root: TAG_ALLOCA | 2,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            4,
+            Path {
+                root: TAG_PARAM | 0,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            5,
+            Path {
+                root: TAG_PARAM | 1,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            6,
+            Path {
+                root: TAG_GLOBAL | 7,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            7,
+            Path {
+                root: TAG_OTHER | 9,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            8,
+            Path {
+                root: TAG_OTHER | 10,
+                offset: 0,
+            },
+        );
+
+        assert!(disjoint(
+            &paths,
+            Value(1),
+            IrType::I64,
+            Value(2),
+            IrType::I64
+        ));
+        assert!(!disjoint(
+            &paths,
+            Value(1),
+            IrType::I64,
+            Value(1),
+            IrType::I64
+        ));
+        assert!(disjoint(
+            &paths,
+            Value(1),
+            IrType::I64,
+            Value(3),
+            IrType::I64
+        ));
+        assert!(
+            !disjoint(&paths, Value(4), IrType::I64, Value(5), IrType::I64),
+            "distinct params may alias"
+        );
+        assert!(
+            !disjoint(&paths, Value(1), IrType::I64, Value(4), IrType::I64),
+            "param may point at alloca"
+        );
+        assert!(
+            disjoint(&paths, Value(1), IrType::I64, Value(6), IrType::I64),
+            "alloca vs global"
+        );
+        assert!(
+            !disjoint(&paths, Value(7), IrType::I64, Value(8), IrType::I64),
+            "unknown roots must not be assumed disjoint"
+        );
         assert!(!disjoint(
             &paths,
             Value(1),
@@ -1208,6 +1376,13 @@ mod tests {
             Value(99),
             IrType::I64
         ));
+    }
+
+    #[test]
+    fn ranges_apart_overflow_is_not_disjoint() {
+        assert_eq!(ranges_apart(i64::MAX - 1, 8, 0, 4), None);
+        assert_eq!(ranges_apart(0, 8, 8, 4), Some(true));
+        assert_eq!(ranges_apart(0, 8, 4, 4), Some(false));
     }
 
     #[test]
@@ -1321,7 +1496,7 @@ mod tests {
         let n = run(&mut func);
         if n == 0 {
             // Loop analysis may refuse this shape on a given CFG builder;
-            // the unit test above still locks the exit-value contract.
+            // `memory_on_exit_latch_writes_new_value` still locks the contract.
             return;
         }
         let exit = func.blocks.last().unwrap();
@@ -1332,8 +1507,6 @@ mod tests {
         let Some(Instruction::Store { val, .. }) = store else {
             panic!("expected exit store after promotion");
         };
-        // y is Value(2); phi is a fresh id (>= 3). Storing the phi here is
-        // the do-while stale-write bug.
         assert!(
             matches!(val, Operand::Value(v) if v.0 == 2),
             "do-while exit store must write the latch new-value, got {val:?}"
