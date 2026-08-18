@@ -119,7 +119,28 @@ if [[ "$bytes" -gt 0 ]]; then
   rm -rf "$tmpd"
 fi
 
-sync 2>/dev/null || true
+# Flush only the snapshot products. A process-wide `sync` also waits for every
+# dirty incremental-build object under target/; on this VM that turned a 20 MB
+# snapshot into a 20-minute stall after each build. fsyncing the deliverables
+# and their directory provides the durability this script needs without making
+# unrelated compiler caches part of the critical path.
+fsync_path() {
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+for saved in "$DELIVERABLE" "$ART/ms178-1.patch" \
+             "$ART/ms178-1.${tag}.patch" "$ART/lccc-src.tar.gz" \
+             "$ART/lccc.bundle" "$LEDGER" "$seq_file"; do
+  [[ -e "$saved" ]] && fsync_path "$saved"
+done
+fsync_path "$ART"
+fsync_path "$(dirname "$DELIVERABLE")"
 
 echo "SNAPSHOT $tag"
 echo "  base       : $BASE"

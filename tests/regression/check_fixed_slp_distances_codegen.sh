@@ -13,10 +13,17 @@ fast=(-ffast-math -ffp-contract=fast)
 "$CCC" "${base[@]}" "${fast[@]}" -S "$dir/fixed_slp_distances.c" -o "$tmp/fast.s"
 CCC_NO_FIXED_SLP=1 "$CCC" "${base[@]}" "${fast[@]}" -S \
     "$dir/fixed_slp_distances.c" -o "$tmp/control.s"
-python3 - "$tmp/strict.s" "$tmp/fast.s" "$tmp/control.s" <<'PY'
+# Baseline x86-64 has no AVX.  Fast FP semantics alone must not introduce a
+# 256-bit instruction into an otherwise scalar function.
+"$CCC" -O3 "${fast[@]}" -S "$dir/fixed_slp_distances.c" -o "$tmp/baseline.s"
+
+python3 - "$tmp/strict.s" "$tmp/fast.s" "$tmp/control.s" \
+    "$tmp/baseline.s" <<'PY'
 import re
 import sys
-strict, fast, control = [open(p, encoding="utf-8").read() for p in sys.argv[1:]]
+strict, fast, control, baseline = [
+    open(p, encoding="utf-8").read() for p in sys.argv[1:]
+]
 
 def body(text, name):
     m = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
@@ -54,5 +61,15 @@ if insns(body(fast, "distance8_f32")) >= insns(body(control, "distance8_f32")):
 for name in ("distance4_f32", "distance3_f64"):
     if "%ymm" in body(fast, name):
         raise SystemExit(f"{name}: partial/narrow vector should remain scalar")
+
+# The fold sinks its packed loads to the return.  Calls/stores/atomics between
+# the source loads and return therefore make the transform illegal.
+if "%ymm" in body(fast, "distance8_before_call"):
+    raise SystemExit("distance8_before_call: loads moved across aliasing call")
+
+# AVX is not part of the baseline x86-64 ISA.
+for name in ("distance8_f32", "distance4_f64"):
+    if "%ymm" in body(baseline, name):
+        raise SystemExit(f"{name}: baseline target unexpectedly uses AVX")
 
 PY

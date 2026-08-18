@@ -86,6 +86,11 @@ pub enum SecItem {
     Input(InputSpec),
     Assign(Assignment),
     Assert(Expr, String),
+    /// Emit a scalar data item at the current location counter.  The width is
+    /// in bytes and is one of 1/2/4/8 for BYTE/SHORT/LONG/QUAD respectively.
+    /// Keeping the expression (rather than folding constants in the parser)
+    /// is required for constructs such as `LONG(symbol - .)`.
+    Data { width: u8, expr: Expr },
     /// CONSTRUCTORS keyword (legacy; no-op for ELF)
     Constructors,
 }
@@ -201,7 +206,9 @@ impl<'a> Lexer<'a> {
         match c {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b'$' => true,
             b'*' | b'?' | b'[' | b']' | b'\\' | b'-' | b'+' if !first => false, // handled by pattern lexer
-            b'/' => !first || c == b'/', // allow /DISCARD/
+            // `/DISCARD/` is recognised explicitly in `next`; every other
+            // slash is the arithmetic division operator.
+            b'/' => false,
             _ => false,
         }
     }
@@ -238,20 +245,20 @@ impl<'a> Lexer<'a> {
             return Tok::Num(self.num_suffix(v));
         }
 
+        // `/DISCARD/` is the one slash-delimited identifier in GNU scripts.
+        // Recognise the complete token here so an ordinary slash remains the
+        // division operator handled by the punctuation table below.
+        if self.src[self.pos..].starts_with(b"/DISCARD/") {
+            self.pos += b"/DISCARD/".len();
+            return Tok::Ident("/DISCARD/".to_string());
+        }
+
         // identifier / section name / keyword
         if Self::is_ident_char(c, true) {
             let start = self.pos;
             self.pos += 1;
             while self.pos < self.src.len() && Self::is_ident_char(self.src[self.pos], false) {
                 self.pos += 1;
-            }
-            // Special-case /DISCARD/: the trailing slash
-            if self.pos < self.src.len() && self.src[self.pos] == b'/' {
-                let s = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
-                if s == "/DISCARD" {
-                    self.pos += 1;
-                    return Tok::Ident("/DISCARD/".to_string());
-                }
             }
             return Tok::Ident(String::from_utf8_lossy(&self.src[start..self.pos]).into_owned());
         }
@@ -728,10 +735,22 @@ fn parse_output_section_body(lx: &mut Lexer, def: &mut OutputSecDef)
                 def.fill = eval_const(&e);
             }
             Tok::Ident(kw) if kw == "BYTE" || kw == "SHORT" || kw == "LONG" || kw == "QUAD" => {
-                // data directives - record as an input of literal bytes via assignment hack:
-                // represent as ". += N" advance with a fill; rare in kernel scripts (unused).
-                skip_parens(lx)?;
+                // These directives consume space *and* write the expression in
+                // target byte order.  Merely skipping them used to omit the
+                // Linux setup image's 0x5a5aaa55 signature and left every
+                // following location-counter assignment four bytes early.
+                let width = match kw.as_str() {
+                    "BYTE" => 1,
+                    "SHORT" => 2,
+                    "LONG" => 4,
+                    "QUAD" => 8,
+                    _ => unreachable!(),
+                };
+                expect(lx, "(")?;
+                let expr = parse_expr(lx)?;
+                expect(lx, ")")?;
                 eat_semi(lx);
+                def.items.push(SecItem::Data { width, expr });
             }
             Tok::Ident(_) => {
                 // assignment or file-pattern input spec like *(...) — but '*' is
@@ -1404,6 +1423,47 @@ mod tests {
         let secs = FxHashMap::default();
         let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
         assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x100 + 0x40));
+    }
+
+    #[test]
+    fn division_and_discard_tokens_do_not_conflict() {
+        let src = r#"SECTIONS {
+            slots = ((text_size + 255) / 256) + 1;
+            /DISCARD/ : { *(.note*) }
+        }"#;
+        let s = parse_linker_script(src).unwrap();
+        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let mut syms = FxHashMap::default();
+        syms.insert("text_size".to_string(), 513);
+        let secs = FxHashMap::default();
+        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
+        assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(4));
+        assert!(matches!(&s.sections[1],
+            SectionsItem::Output(def) if def.name == "/DISCARD/"));
+    }
+
+    #[test]
+    fn scalar_data_directives_preserve_width_and_expression() {
+        let s = parse_linker_script(r#"
+            SECTIONS { .signature : {
+                BYTE(0x12); SHORT(0x3456) LONG(target - .) QUAD(0x123456789abcdef0)
+            } }
+        "#).unwrap();
+        let SectionsItem::Output(def) = &s.sections[0] else { panic!() };
+        let widths: Vec<u8> = def.items.iter().filter_map(|item| match item {
+            SecItem::Data { width, .. } => Some(*width),
+            _ => None,
+        }).collect();
+        assert_eq!(widths, vec![1, 2, 4, 8]);
+        assert!(matches!(def.items[2], SecItem::Data {
+            width: 4, expr: Expr::Bin(BinOp::Sub, _, _)
+        }));
+    }
+
+    #[test]
+    fn malformed_scalar_data_directive_is_rejected() {
+        assert!(parse_linker_script(
+            "SECTIONS { .x : { LONG(1 +); } }").is_err());
     }
 
     // ── MEMORY regions ──────────────────────────────────────────────────

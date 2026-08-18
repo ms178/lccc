@@ -4229,12 +4229,14 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
     live_out
 }
 
-/// Fold a copy/32-bit-shift/copy-back round trip:
-///   movq SRC, TMP; shll $N, TMPd; movl TMPd, SRCd
+/// Fold a copy/32-bit-update/copy-back round trip:
+///   movq SRC, TMP; <update> TMPd; movl TMPd, SRCd
 /// into:
-///   shll $N, SRCd
-/// when TMP is provably dead afterwards. 32-bit writes zero-extend on x86-64,
-/// so both sequences have identical SRC and flag semantics.
+///   <update> SRCd
+/// when TMP is provably dead afterwards.  The update is restricted to ordinary
+/// explicit-operand integer ALU operations; one-operand IMUL and partial-width
+/// forms are rejected. 32-bit writes zero-extend on x86-64, so both sequences
+/// have identical SRC and flag semantics.
 pub(super) fn fold_copy_shift_copyback(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let live_out = compute_gpr_live_out(store, infos);
@@ -4252,13 +4254,19 @@ pub(super) fn fold_copy_shift_copyback(store: &mut LineStore, infos: &mut [LineI
         let j = next_non_nop(infos, i + 1, len);
         if j >= len || infos[j].is_barrier() { i += 1; continue; }
         let b = infos[j].trimmed(store.get(j));
-        if !b.starts_with("shll $")
+        let mnemonic = b.split_ascii_whitespace().next().unwrap_or("");
+        let safe_update = matches!(
+            mnemonic,
+            "incl" | "decl" | "negl" | "notl" | "addl" | "subl"
+                | "andl" | "orl" | "xorl" | "shll" | "shrl" | "sarl" | "sall"
+        ) || (mnemonic == "imull" && b.contains(','));
+        if !safe_update
             || !matches!(infos[j].kind, LineKind::Other { dest_reg } if dest_reg == tmp)
         {
             i += 1; continue;
         }
         let tmp32 = reg_id_to_name(tmp, MoveSize::L);
-        if !b.ends_with(&format!(", {}", tmp32)) { i += 1; continue; }
+        if !b.ends_with(tmp32) { i += 1; continue; }
 
         let k = next_non_nop(infos, j + 1, len);
         if k >= len || infos[k].is_barrier() { i += 1; continue; }

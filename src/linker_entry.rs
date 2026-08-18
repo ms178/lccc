@@ -36,6 +36,13 @@ pub fn load_inputs_x86(
     crate::backend::x86::linker::load_inputs_for_ld(inputs, objects)
 }
 
+/// Load ELF32/i386 objects and archives for a script-driven link.
+pub fn load_inputs_i386_script(
+    inputs: &[(String, bool)],
+) -> Result<Vec<Elf64Object>, String> {
+    crate::backend::i686::linker::load_inputs_for_script(inputs)
+}
+
 /// Append a synthetic object carrying an empty `.note.gnu.build-id`
 /// section (36 bytes for SHA-1). The script engine places it via the usual
 /// `*(.note.*)` input patterns and patches the digest after layout.
@@ -86,6 +93,23 @@ pub fn link_with_script_x86(
     max_page_size: u64,
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script(
+        objects, script_src, output, emit_symtab, is_pie, emit_relocs,
+        soname, bsymbolic, max_page_size)
+}
+
+/// Link pre-loaded ELF32/i386 objects with a full GNU linker script.
+pub fn link_with_script_i386(
+    objects: &[Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    soname: Option<&str>,
+    bsymbolic: bool,
+    max_page_size: u64,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script_i386(
         objects, script_src, output, emit_symtab, is_pie, emit_relocs,
         soname, bsymbolic, max_page_size)
 }
