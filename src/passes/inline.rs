@@ -55,6 +55,10 @@ const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
 const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
 const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
 const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
+/// At -Os, larger loop bodies stay out of enclosing loops even when inlining
+/// their final call site would remove the standalone copy. LCCC's current
+/// register allocator spills the merged nest heavily (zlib-ng Adler-32).
+const MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS: usize = 64;
 
 /// Cap for `static inline` functions whose bodies are dominated by SIMD vector
 /// intrinsics. Such functions (e.g. zlib-ng's compare256_avx2_static, ~70 IR
@@ -289,7 +293,7 @@ fn select_inline_site(
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
     pgo_force_budget_remaining: usize,
-    small_only: bool,
+    size_optimized: bool,
     loop_blocks: &FxHashSet<usize>,
     caller_has_loops: bool,
 ) -> Option<(InlineCallSite, usize, bool)> {
@@ -365,24 +369,51 @@ fn select_inline_site(
     }
 
     // Second pass: use the first eligible normal callee.
-    // (-Os: small_only — skip normal/medium callees to keep size down; tiny and
-    // small callees from the first pass still inline, so helper bodies that are
-    // bigger standalone than inlined (memcpy/memcmp wrappers) are still folded
-    // away, keeping -Os binaries SMALLER than -O3 — previously -Os skipped ALL
-    // inlining and produced larger output than -O3.)
-    if small_only {
-        return None;
-    }
+    // Under -Os, admit normal/medium callees only when inlining cannot duplicate
+    // a static body (one module-wide call site), when the call itself is in a
+    // loop, or when a loop helper is called from another loop function.  The
+    // first is normally a net size reduction; the loop cases preserve the most
+    // valuable dynamic wins and avoid forcing hot loop state through memory at
+    // helper boundaries, without cloning every medium helper at cold call sites.
+    // Keep loop-containing callees in an enclosing loop below a strict size cap:
+    // bounded hash-table loops benefit, while larger merged nests create severe
+    // spills with the current register allocator (zlib-ng Adler-32 guards this).
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
-        if callee_data.is_recursive && !callee_data.is_always_inline {
-            continue;
-        }
+        let call_is_in_loop = loop_blocks.contains(&site.block_idx);
         let callee_inst_count: usize = callee_data
             .blocks
             .iter()
             .map(|b| b.instructions.len())
             .sum();
+        // Cost loop-body cloning after accounting for tiny/static-inline
+        // descendants that the fixed-point inliner will necessarily expand
+        // in the caller.  The raw snapshot can be misleadingly small: Linux's
+        // a20_test is 24 instructions before seven inline-asm wrappers expand,
+        // but 66 instructions afterwards.  Using only 24 bypassed the 64-
+        // instruction nested-loop guard and cloned that expanded body twice.
+        let size_inline_cost = callee_data.size_inline_cost;
+        if size_optimized
+            && !callee_data.is_always_inline
+            && call_is_in_loop
+            && callee_data.has_loops
+            && size_inline_cost > MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS
+        {
+            continue;
+        }
+        if size_optimized
+            && !callee_data.is_always_inline
+            && !callee_data.is_single_call_site_static
+            && !(call_is_in_loop
+                && (!callee_data.has_loops
+                    || size_inline_cost <= MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS))
+            && !(callee_data.has_loops && caller_has_loops && !call_is_in_loop)
+        {
+            continue;
+        }
+        if callee_data.is_recursive && !callee_data.is_always_inline {
+            continue;
+        }
         // For recursive callers, skip non-tiny, non-always_inline callees.
         // (Tiny callees were handled in the first pass.)
         if caller_is_recursive && !callee_data.is_always_inline {
@@ -479,15 +510,15 @@ pub fn run(module: &mut IrModule) -> usize {
     inline_run(module, false)
 }
 
-/// -Os entry point: only tiny/small callees are inlined (first pass only).
-/// GCC inlines trivial helpers at -Os too; skipping ALL inlining made LCCC's
-/// -Os binaries LARGER than its -O3 ones (every memread/memcmp helper emitted
-/// standalone, e.g. zlib-ng libz.a: 510KB at -Os vs 444KB at -O3).
-pub fn run_small_only(module: &mut IrModule) -> usize {
+/// -Os/-Oz entry point. Tiny/small callees still inline; normal static
+/// callees are admitted only by the size-aware and loop-aware profitability
+/// gates in `select_inline_site`. Skipping all inlining made LCCC's -Os
+/// binaries larger than -O3 (for example, standalone zlib-ng helpers).
+pub fn run_size_optimized(module: &mut IrModule) -> usize {
     inline_run(module, true)
 }
 
-fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
+fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
     let mut total_inlined = 0;
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
@@ -572,6 +603,10 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
         let mut pgo_force_budget_remaining = MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER;
+        // During one -Os inliner invocation, clone a large ordinary callee at
+        // most once into a given caller. This permits one profitable
+        // specialization while avoiding repeated medium-body expansion.
+        let mut size_inlined_large_callees: FxHashSet<String> = FxHashSet::default();
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -698,6 +733,11 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 call_sites = filtered;
                 } // end inline_decisions_active
             }
+            if size_optimized && !size_inlined_large_callees.is_empty() {
+                call_sites.retain(|site| {
+                    !size_inlined_large_callees.contains(&site.callee_name)
+                });
+            }
             if call_sites.is_empty() {
                 break;
             }
@@ -707,7 +747,8 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             // high-value (per-iteration call overhead) and exempt from the
             // caller-size caps. Also used to avoid inlining loop-containing
             // callees into a caller that already has loops.
-            let needs_loop_info = caller_too_large
+            let needs_loop_info = size_optimized
+                || caller_too_large
                 || call_sites.iter().any(|s| callee_map[&s.callee_name].has_loops);
             let loop_blocks: FxHashSet<usize> = if needs_loop_info {
                 let cfg = crate::ir::analysis::CfgAnalysis::build(&module.functions[func_idx]);
@@ -732,7 +773,7 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
                 budget_remaining,
                 always_inline_budget_remaining,
                 pgo_force_budget_remaining,
-                small_only,
+                size_optimized,
                 &loop_blocks,
                 caller_has_loops,
             );
@@ -756,6 +797,13 @@ fn inline_run(module: &mut IrModule, small_only: bool) -> usize {
             );
 
             if success {
+                if size_optimized
+                    && !callee_data.is_always_inline
+                    && !callee_data.is_single_call_site_static
+                    && callee_inst_count > MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+                {
+                    size_inlined_large_callees.insert(site.callee_name.clone());
+                }
                 if debug_inline {
                     eprintln!(
                         "[INLINE] Inlined '{}' into '{}'",
@@ -1482,6 +1530,10 @@ struct CalleeData {
     /// static-inline budget: their standalone codegen is memory-bound, and
     /// inlining lets the caller fuse the intrinsic chain.
     has_vector_intrinsics: bool,
+    /// Conservative instruction cost after descendants that the first-pass
+    /// fixed-point policy will necessarily inline have expanded.  -Os uses
+    /// this rather than the stale raw snapshot for its nested-loop limit.
+    size_inline_cost: usize,
 }
 
 /// A call site that is eligible for inlining.
@@ -1914,11 +1966,102 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 has_loops,
                 is_recursive,
                 has_vector_intrinsics: func_has_vector_intrinsics(func),
+                // Filled from the complete map below, after every eligible
+                // descendant is known.
+                size_inline_cost: inst_count,
             },
         );
     }
 
+    // Callee snapshots are captured before any function in this invocation is
+    // processed.  Estimate the body that fixed-point inlining will actually
+    // clone by recursively charging descendants selected by the unconditional
+    // first pass (tiny/small, static-inline, and always_inline).  This closes a
+    // size-policy hole without changing the cloned IR or the normal -O2/-O3
+    // profitability model.
+    let names: Vec<String> = map.keys().cloned().collect();
+    let costs: Vec<(String, usize)> = names
+        .into_iter()
+        .map(|name| {
+            let mut visiting = FxHashSet::default();
+            let cost = estimate_size_inline_cost(&name, &map, &mut visiting, 0);
+            (name, cost)
+        })
+        .collect();
+    for (name, cost) in costs {
+        if let Some(data) = map.get_mut(&name) {
+            data.size_inline_cost = cost;
+        }
+    }
+
     map
+}
+
+/// Return whether a descendant is selected by the inliner's unconditional
+/// first pass, independent of -Os normal-callee profitability gates.
+fn is_mandatory_first_pass_callee(data: &CalleeData) -> bool {
+    let inst_count: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+    let is_tiny = inst_count <= MAX_TINY_INLINE_INSTRUCTIONS && data.blocks.len() <= 1;
+    let is_small =
+        inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS && data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS;
+    let static_inline_block_limit = if data.has_loops {
+        MAX_INLINE_BLOCKS
+    } else {
+        MAX_INLINE_BLOCKS_NO_LOOPS
+    };
+    let is_static_inline_eligible = data.is_static_inline
+        && (inst_count <= MAX_INLINE_INSTRUCTIONS
+            || (data.has_vector_intrinsics
+                && inst_count <= MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS))
+        && data.blocks.len()
+            <= if data.has_vector_intrinsics {
+                MAX_VECTOR_STATIC_INLINE_BLOCKS
+            } else {
+                static_inline_block_limit
+            };
+
+    data.is_always_inline || is_tiny || is_small || is_static_inline_eligible
+}
+
+/// Estimate a callee's instruction count after mandatory descendants expand.
+/// Replacing a direct call removes one instruction, hence `child_cost - 1`.
+/// Cycles and unusually deep wrapper chains are bounded conservatively.
+fn estimate_size_inline_cost(
+    name: &str,
+    map: &FxHashMap<String, CalleeData>,
+    visiting: &mut FxHashSet<String>,
+    depth: usize,
+) -> usize {
+    let Some(data) = map.get(name) else {
+        return 0;
+    };
+    let raw_count: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+    if depth >= 16 || !visiting.insert(name.to_string()) {
+        return raw_count;
+    }
+
+    let mut cost = raw_count;
+    for block in &data.blocks {
+        for inst in &block.instructions {
+            let Instruction::Call {
+                func: child_name, ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some(child) = map.get(child_name) else {
+                continue;
+            };
+            if !is_mandatory_first_pass_callee(child) {
+                continue;
+            }
+            let child_cost = estimate_size_inline_cost(child_name, map, visiting, depth + 1);
+            cost = cost.saturating_add(child_cost.saturating_sub(1));
+        }
+    }
+
+    visiting.remove(name);
+    cost
 }
 
 /// True if the function contains any SIMD vector intrinsics (SSE/AVX/AVX2 ops
