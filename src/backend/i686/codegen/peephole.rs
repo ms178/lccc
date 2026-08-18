@@ -2419,6 +2419,16 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
 
     let is_esp_biased = |off: i32| off >= ESP_SLOT_BIAS / 2;
 
+    // %ebp is the frame base only when the prologue establishes it. Under
+    // -fomit-frame-pointer (kernel realmode) %ebp is a data register:
+    // (%ebp) accesses are POINTER derefs that the classifier nevertheless
+    // parses as ebp-domain frame slots. Those must be exempt from
+    // elimination (they write through a pointer) but do not bail the pass
+    // (no-escape discipline covers them).
+    let ebp_is_frame = (0..len).any(|i| {
+        !infos[i].is_nop() && trimmed(store, &infos[i], i) == "movl %esp, %ebp"
+    });
+
     // Collect all loaded byte ranges in normalized coordinates.
     let mut read_ranges: Vec<(i32, i32)> = Vec::new();
     let mut addr_taken = false;
@@ -2433,12 +2443,43 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
             }
             _ => {
                 let s = trimmed(store, &infos[i], i);
-                // Check for address-of-slot patterns (leal N(%ebp), %reg or leal N(%esp), %reg)
-                if s.starts_with("leal ") && (s.contains("(%ebp)") || s.contains("(%esp)")) {
+                // Escape discipline (ported from the x86-64 DSE): a frame
+                // slot is only observable through an indirect access if a
+                // frame address ESCAPED first — leal of a slot, or a raw
+                // frame-pointer VALUE copied into a data register. Without
+                // an escape event, pointer derefs target caller-owned
+                // memory and cannot alias this fresh frame, so
+                // has_indirect_mem alone is NOT a bail. Any escape still
+                // disables the pass for the whole function.
+                //
+                // %ebp is only a frame base in FP mode (ebp_is_frame,
+                // detected from the `movl %esp, %ebp` prologue). Under
+                // -fomit-frame-pointer it is an ordinary data register:
+                // its value moves are NOT escapes, and `leal N(%ebp)` is
+                // pointer arithmetic on data, not a slot address.
+                let leal_esp = s.starts_with("leal ") && s.contains("(%esp)");
+                let leal_ebp = s.starts_with("leal ") && s.contains("(%ebp)");
+                if leal_esp || (ebp_is_frame && leal_ebp) {
                     addr_taken = true;
                 }
-                // Indirect memory access means we can't know what's read
-                if infos[i].has_indirect_mem {
+                // Raw %esp value flowing somewhere it can be observed
+                // (`movl %esp, %reg`, `movl %esp, mem`). Frame adjustments
+                // (subl/addl $imm) were consumed by the sp_down walk; the
+                // FP prologue/epilogue moves reposition the stack, they do
+                // not leak an address into data flow.
+                if s.contains("%esp") && !s.contains("(%esp)")
+                    && !s.starts_with("subl $") && !s.starts_with("addl $")
+                    && s != "movl %esp, %ebp" && s != "movl %ebp, %esp"
+                    && !matches!(infos[i].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+                {
+                    addr_taken = true;
+                }
+                // Raw %ebp value as data — an escape only in FP mode.
+                if ebp_is_frame
+                    && s.contains("%ebp") && !s.contains("(%ebp)")
+                    && s != "movl %esp, %ebp" && s != "movl %ebp, %esp"
+                    && !matches!(infos[i].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+                {
                     addr_taken = true;
                 }
                 // Track %ebp/%esp-relative reads from non-Load/Store lines
@@ -2467,6 +2508,10 @@ fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
             if esp_store {
                 if !esp_walk_ok { continue; }
                 if has_call && any_esp_read { continue; } // shift-immune rule only
+            } else if !ebp_is_frame {
+                // ebp-domain "store" without a frame pointer = write through
+                // the %ebp DATA register (pointer store). Never a dead slot.
+                continue;
             }
             let store_bytes = size.byte_size();
             let norm_off = if esp_store { offset - norm[i] } else { offset };
@@ -2682,7 +2727,145 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 4: Never-read store elimination
     eliminate_never_read_stores(&store, &mut infos);
 
+    // Phase 5: tail-call conversion (after all epilogue-shape rewrites).
+    optimize_tail_calls_i686(&mut store, &mut infos);
+
     store.build_result(|i| infos[i].is_nop())
+}
+
+// ── Pass: tail-call conversion (call X; <epilogue>; ret → <epilogue>; jmp X) ──
+
+/// i686 port of the x86-64 tail-call peephole.
+///
+/// Converts `call TARGET` immediately followed by a pure epilogue
+/// (addl $N,%esp / popl callee-saved / popl %ebp / movl %ebp,%esp /
+/// leal -N(%ebp),%esp) and `ret` into the epilogue followed by
+/// `jmp TARGET`. Saves 1 insn + the return-address push/pop per site and
+/// shortens the hot return path (GCC does this at -Os everywhere in the
+/// kernel setup code).
+///
+/// i686-specific soundness rules:
+///  * Suppressed for the whole function when a frame address escapes
+///    (leal of an %esp/%ebp slot) or dynamic alloca adjusts %esp by a
+///    register — the callee could dereference a dangling frame pointer.
+///  * Suppressed when the bare `ret` is not plain (ret $N sret/fastcall
+///    cleanup differs between caller and callee — LineKind::Ret only
+///    matches plain `ret`, so this falls out naturally).
+///  * Epilogue restores must not write %eax/%edx (32/64-bit return
+///    value registers). popl of callee-saved regs never does.
+///  * Indirect `call *%reg` converts only if %reg is NOT restored by the
+///    epilogue between call and ret (callee-saved pointers are restored
+///    before the jmp would use them). We only accept `call *%e{c,d}x` /
+///    memory-free operands that no epilogue pop touches.
+fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = infos.len();
+    let mut changed = false;
+    let mut suppress = false;
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+
+        match infos[i].kind {
+            LineKind::Label => {
+                let t = trimmed(store, &infos[i], i);
+                if !t.starts_with(".L") {
+                    suppress = false; // new function
+                }
+                i += 1;
+                continue;
+            }
+            LineKind::Directive => {
+                let t = trimmed(store, &infos[i], i);
+                if t == ".cfi_startproc" {
+                    suppress = false;
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if !suppress {
+            let t = trimmed(store, &infos[i], i);
+            if t.starts_with("leal ") && (t.contains("(%esp)") || t.contains("(%ebp)")) {
+                suppress = true;
+            }
+            // dynamic alloca: subl %reg, %esp
+            if t.starts_with("subl %") && t.ends_with(", %esp") {
+                suppress = true;
+            }
+        }
+
+        if infos[i].kind != LineKind::Call || suppress {
+            i += 1;
+            continue;
+        }
+
+        // Pure-epilogue scan after the call.
+        let limit = (i + 16).min(len);
+        let mut j = i + 1;
+        let mut ret_idx = None;
+        let mut restored_regs: u32 = 0;
+        while j < limit {
+            if infos[j].is_nop() { j += 1; continue; }
+            match infos[j].kind {
+                LineKind::Empty | LineKind::Directive => { j += 1; }
+                LineKind::Pop { reg } => {
+                    if reg == REG_EAX || reg == REG_EDX {
+                        break; // clobbers return value
+                    }
+                    if reg <= 31 { restored_regs |= 1u32 << reg; }
+                    j += 1;
+                }
+                LineKind::Ret => { ret_idx = Some(j); break; }
+                LineKind::Other { .. } => {
+                    let t = trimmed(store, &infos[j], j);
+                    let is_teardown = t == "movl %ebp, %esp"
+                        || (t.starts_with("addl $") && t.ends_with(", %esp")
+                            && t["addl $".len()..t.len() - ", %esp".len()]
+                                .bytes().all(|b| b.is_ascii_digit()))
+                        || (t.starts_with("leal -") && t.ends_with("(%ebp), %esp"));
+                    if is_teardown { j += 1; continue; }
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(ridx) = ret_idx {
+            let call_t = trimmed(store, &infos[i], i).to_string();
+            let jmp_text = if let Some(target) = call_t.strip_prefix("call ") {
+                let target = target.trim();
+                if let Some(reg) = target.strip_prefix("*%") {
+                    // Indirect: the register must survive the epilogue (not
+                    // be one of the restored callee-saved regs).
+                    let fam = register_family(&format!("%{}", reg));
+                    if fam <= REG_GP_MAX && (restored_regs & (1u32 << fam)) == 0 {
+                        Some(format!("jmp {}", target))
+                    } else {
+                        None
+                    }
+                } else if target.starts_with('*') {
+                    None // memory-indirect: frame may be gone
+                } else {
+                    Some(format!("jmp {}", target))
+                }
+            } else {
+                None
+            };
+            if let Some(jmp) = jmp_text {
+                infos[i].kind = LineKind::Nop;
+                store.replace(ridx, format!("    {}", jmp));
+                infos[ridx] = classify_line(store.get(ridx));
+                changed = true;
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2693,11 +2876,53 @@ mod tests {
 
     #[test]
     fn test_redundant_store_load() {
-        let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %eax\n".to_string();
+        // With a frame-pointer prologue, (%ebp) slots are genuine frame
+        // slots: the load is forwarded and the never-read store deleted.
+        let asm = "    pushl %ebp\n    movl %esp, %ebp\n    movl %eax, -8(%ebp)\n    movl -8(%ebp), %eax\n    popl %ebp\n    ret\n".to_string();
         let result = peephole_optimize(asm);
-        // After store/load elimination, the load is removed. Then never-read
-        // store elimination removes the now-unread store too. Both gone.
-        assert_eq!(result.trim(), "");
+        assert!(!result.contains("-8(%ebp)"),
+            "store/load pair should be fully eliminated, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_direct_i686() {
+        let asm = "f:\n    pushl %ebx\n    movl %eax, %ebx\n    call target\n    popl %ebx\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("jmp target"), "expected tail call, got:\n{}", result);
+        assert!(!result.contains("call target"), "call should be gone:\n{}", result);
+        // epilogue pop must stay BEFORE the jmp
+        let jmp_pos = result.find("jmp target").unwrap();
+        let pop_pos = result.find("popl %ebx").unwrap();
+        assert!(pop_pos < jmp_pos, "restore must precede jmp:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_by_leal_slot() {
+        // Address of a frame slot escapes to the callee: converting would
+        // hand the callee a dangling pointer after frame release.
+        let asm = "f:\n    subl $12, %esp\n    leal 4(%esp), %eax\n    call target\n    addl $12, %esp\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("call target"), "must stay a call:\n{}", result);
+    }
+
+    #[test]
+    fn test_tail_call_indirect_not_through_restored_reg() {
+        // call *%ebx with %ebx restored by the epilogue: the pointer dies
+        // before the jmp could use it — must NOT convert.
+        let asm = "f:\n    pushl %ebx\n    movl %eax, %ebx\n    call *%ebx\n    popl %ebx\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("call *%ebx"), "must stay a call:\n{}", result);
+    }
+
+    #[test]
+    fn test_ebp_pointer_store_kept_without_frame() {
+        // WITHOUT the FP prologue (as under -fomit-frame-pointer), %ebp is a
+        // data register: `movl %eax, -8(%ebp)` writes through a pointer and
+        // must survive even though nothing in this function reads it back.
+        let asm = "    movl %eax, -8(%ebp)\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movl %eax, -8(%ebp)"),
+            "pointer-write through data %ebp must not be deleted, got:\n{}", result);
     }
 
     #[test]

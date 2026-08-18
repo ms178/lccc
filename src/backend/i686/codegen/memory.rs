@@ -212,6 +212,24 @@ impl I686Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
+        // Register-resident base: single-instruction store to offset(%reg).
+        // Mirrors the load path (GCC: `movl %eax, 40(%ebx)`); the value is
+        // staged in %eax first — the base register itself is never %eax
+        // (allocator hands out %ebx/%esi/%edi/%ebp/%ecx/%edx only).
+        if let Some(&phys) = self.reg_assignments.get(&base.0) {
+            if !self.state.is_alloca(base.0) {
+                self.operand_to_eax(val);
+                let store_instr = self.store_instr_for_type(ty);
+                let src = self.eax_for_type(ty);
+                let base_name = phys_reg_name(phys);
+                if offset != 0 {
+                    emit!(self.state, "    {} {}, {}(%{})", store_instr, src, offset, base_name);
+                } else {
+                    emit!(self.state, "    {} {}, (%{})", store_instr, src, base_name);
+                }
+                return;
+            }
+        }
         // Delegate to default for other types
         self.operand_to_eax(val);
         let addr = self.state.resolve_slot_addr(base.0);
@@ -305,6 +323,24 @@ impl I686Codegen {
             }
             self.state.reg_cache.invalidate_acc();
             return;
+        }
+        // Register-resident base: single-instruction offset(%reg) load.
+        // This is the whole point of the GEP fold — GCC emits
+        // `movl 40(%ebx), %eax`; the old path re-materialized the address
+        // (movl %ebx,%ecx; addl $40,%ecx; movl (%ecx),%eax) every time.
+        if let Some(&phys) = self.reg_assignments.get(&base.0) {
+            if !self.state.is_alloca(base.0) {
+                let load_instr = self.load_instr_for_type(ty);
+                let base_name = phys_reg_name(phys);
+                if offset != 0 {
+                    emit!(self.state, "    {} {}(%{}), %eax", load_instr, offset, base_name);
+                } else {
+                    emit!(self.state, "    {} (%{}), %eax", load_instr, base_name);
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.emit_store_result(dest);
+                return;
+            }
         }
         // Delegate to default for other types
         let addr = self.state.resolve_slot_addr(base.0);

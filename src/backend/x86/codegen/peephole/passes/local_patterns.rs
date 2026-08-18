@@ -451,6 +451,69 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             }
         }
 
+        // --- Pattern: store/load forwarding across the stored register's
+        //     own modification (post-inc/dec shape) ---
+        //   movq %S, OFF(%rsp)      ; spill of OLD value
+        //   <one line writing %S, not reading OFF, not touching %D or flags-consumers>
+        //   movq OFF(%rsp), %D      ; reload of OLD value
+        // The reload wants the PRE-modification value, so plain forwarding is
+        // wrong — instead hoist the copy above the modifier:
+        //   movq %S, %D
+        //   <modifier>
+        // (store stays; never-read elimination removes it when dead).
+        // Conditions: exact width match (Q/L), S != D, the middle line's
+        // destination is %S itself (LineKind-visible write), middle line does
+        // not reference %D and has no memory operand at OFF, and %D is not a
+        // source of the middle line.
+        if let LineKind::StoreRbp { reg: sr, offset: so, size: ss } = infos[i].kind {
+            if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != 4 && sr != 5 {
+                let m = next_non_nop(infos, i + 1, len);
+                if m < len && !infos[m].is_barrier() {
+                    let l = next_non_nop(infos, m + 1, len);
+                    if l < len {
+                        if let LineKind::LoadRbp { reg: lr, offset: lo, size: ls } = infos[l].kind {
+                            let store_base = line_stack_base(infos[i].trimmed(store.get(i)));
+                            let load_base = line_stack_base(infos[l].trimmed(store.get(l)));
+                            if so == lo && ss == ls && store_base.is_some() && store_base == load_base
+                                && is_valid_gp_reg(lr) && lr != 4 && lr != 5 && lr != sr
+                            {
+                                // Middle line: writes %S, doesn't read %D, no memory access,
+                                // and is a plain register-dest instruction.
+                                let mid_writes_s = get_dest_reg(&infos[m]) == sr
+                                    && matches!(infos[m].kind, LineKind::Other { .. });
+                                let mid_refs_d = infos[m].reg_refs & (1u16 << lr) != 0;
+                                // leaq is address ARITHMETIC: `leaq 1(%r11), %r11`
+                                // reads no memory (has_indirect_mem is a
+                                // classification of the OPERAND TEXT, which
+                                // flags any non-frame paren base — for leaq
+                                // that is an arithmetic source, not a load).
+                                // Any other paren operand is a real access.
+                                let mid_t = infos[m].trimmed(store.get(m));
+                                let mid_is_lea = mid_t.starts_with("leaq ") || mid_t.starts_with("leal ");
+                                let mid_has_mem = infos[m].rbp_offset != RBP_OFFSET_NONE
+                                    || (!mid_is_lea
+                                        && (infos[m].has_indirect_mem || mid_t.contains("(%")));
+                                if mid_writes_s && !mid_refs_d && !mid_has_mem {
+                                    let copy = format!("    {} {}, {}",
+                                        ls.mnemonic(), reg_id_to_name(sr, ls), reg_id_to_name(lr, ls));
+                                    // Rewrite the LOAD line into the hoisted copy and
+                                    // swap it before the modifier by rewriting in place:
+                                    // line i stays (store), line m becomes the copy,
+                                    // line l becomes the modifier's text.
+                                    let mid_text_owned = store.get(m).to_string();
+                                    replace_line(store, &mut infos[m], m, copy);
+                                    replace_line(store, &mut infos[l], l, mid_text_owned);
+                                    changed = true;
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Pattern: redundant zero/sign extension (including cltq) ---
         // Uses pre-classified ExtKind to avoid repeated starts_with/ends_with
         // string comparisons on every iteration.

@@ -568,10 +568,41 @@ impl X86Codegen {
             self.value_types = value_types;
         }
 
-        let (reg_assigned, cached_liveness, caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        // GlobalAddr values whose EVERY use is a foldable Load/Store pointer
+        // never materialize (they become direct sym(%rip) accesses in
+        // generate_load/store). Keep them out of the allocator AND slot
+        // assignment: a dead address value otherwise consumes a register a
+        // live value needs (forcing a callee-saved push/pop or a spill) and
+        // an 8-byte frame slot. Exact same fold-preview the i686 backend
+        // uses; the preconditions mirror generate_load/store (non-TLS,
+        // non-wide type, default address space; GOT-needing symbols are
+        // filtered inside the fold itself via needs_got_for_addr, which the
+        // preview conservatively respects by only listing GlobalAddr dests
+        // whose uses ALL satisfy the foldable-shape test).
+        let never_materialized = {
+            let gmap = crate::backend::generation::build_global_addr_map_for(
+                func, &self.state.tls_symbols);
+            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+            // x86-64 refinement: the fold additionally requires
+            // !needs_got_for_addr(sym) at emission time. Drop candidates
+            // whose symbol would go through the GOT — those DO materialize.
+            set.retain(|vid| {
+                gmap.get(vid).map(|sym| {
+                    // strip "+off" suffixes the GEP-merge may have added
+                    let base = sym.split(['+', '-']).next().unwrap_or(sym);
+                    !self.state.needs_got_for_addr(base)
+                        && !self.state.tls_symbols.contains(base)
+                }).unwrap_or(false)
+            });
+            self.state.never_materialized_values = set.clone();
+            set
+        };
+
+        let (reg_assigned, cached_liveness, caller_save_spans) =
+            crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false,
+            false, Some(never_materialized),
         );
 
         // MachInst is profitable on straight-line and modest-CFG code, but its

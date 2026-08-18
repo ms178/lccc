@@ -544,11 +544,47 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         }
 
         // Phase 1: Collect all "read" byte ranges.
-        // Instead of bailing on ANY indirect memory access, we track which
-        // offsets have their addresses taken (via leaq) and treat those as
-        // "read". This is more precise than the old bail-out approach and
-        // allows dead store elimination in functions with some leaq usage.
+        //
+        // Escape discipline: a stack slot can be observed by an indirect
+        // access (deref through a register, or by a callee) ONLY if a frame
+        // address escaped first — `leaq N(%rsp|%rbp), %reg` or a raw copy of
+        // %rsp/%rbp-as-value into a register. C pointer arguments always
+        // point at caller-owned memory, never at this fresh frame. So:
+        //   * no escape event  -> indirect derefs are irrelevant to frame
+        //     slots and are IGNORED (the old blanket bail killed this pass
+        //     for every pointer-walking loop);
+        //   * any escape event -> bail for the whole function (a leaked
+        //     address may reach any slot via arithmetic or a callee).
+        //
+        // Pre-scan for escape events before collecting reads.
         let mut has_unparseable_indirect = false;
+        for k in body_start..func_end {
+            if infos[k].is_nop() { continue; }
+            let t = infos[k].trimmed(store.get(k));
+            // leaq of a frame slot = address taken.
+            if t.starts_with("leaq ") && (t.contains("(%rsp)") || (rbp_is_frame && t.contains("(%rbp)"))) {
+                has_unparseable_indirect = true;
+                break;
+            }
+            // Raw %rsp value flowing into a register (movq %rsp, %reg etc.).
+            // Frame adjustments (subq/addq $N,%rsp; pushq/popq) and the
+            // FP prologue mov are not escapes.
+            if t.contains("%rsp") && !t.contains("(%rsp)")
+                && !is_rsp_shift_line(t)
+                && t != "movq %rsp, %rbp"
+            {
+                has_unparseable_indirect = true;
+                break;
+            }
+            // Same for %rbp when it is the frame pointer.
+            if rbp_is_frame && t.contains("%rbp") && !t.contains("(%rbp)")
+                && t != "movq %rsp, %rbp"
+                && !matches!(infos[k].kind, LineKind::Push { reg: 5 } | LineKind::Pop { reg: 5 })
+            {
+                has_unparseable_indirect = true;
+                break;
+            }
+        }
         let mut read_ranges: Vec<(i32, i32)> = Vec::new();
 
         for k in body_start..func_end {
@@ -558,24 +594,30 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
 
             // SOUNDNESS: an RSP-shifting instruction (push/pop/subq/addq
             // on %rsp) changes the effective address of every %rsp-relative
-            // slot after it. Offsets are compared verbatim, so a read of slot
-            // X before the shift and a read of slot X after the shift refer
-            // to different physical slots — and, worse, a store before the
-            // shift can be (wrongly) matched against a read of a shifted
-            // offset. The codegen no longer pushes around i128 ops, but F128
-            // conversions still adjust RSP; conservatively skip never-read
-            // elimination for functions containing such lines.
+            // slot after it (offsets are compared verbatim). Bailing on ANY
+            // such line disabled this pass for essentially every frame-
+            // pointer-less function, because their EPILOGUES contain
+            // `addq $N,%rsp` + `popq` chains — dead parameter-copy stores
+            // like `movq %r10, 24(%rsp)` survived in every no-FP loop.
+            //
+            // An epilogue chain is harmless: between the `addq` and the
+            // `ret`/tail-`jmp` only pops (reading their own pushed slots,
+            // which live BELOW the canonical frame) and directives occur, so
+            // no frame-slot load can observe a shifted offset, and after the
+            // terminator the next block re-enters at canonical depth (all
+            // in-body jumps originate at canonical depth — any body-interior
+            // shift still bails below). Accept exactly that shape; every
+            // other RSP shift keeps the conservative bail.
             if is_rsp_shift_line(infos[k].trimmed(store.get(k))) {
-                has_unparseable_indirect = true;
-                break;
+                if !is_epilogue_rsp_shift(store, infos, k, func_end) {
+                    has_unparseable_indirect = true;
+                    break;
+                }
             }
 
-            if infos[k].has_indirect_mem {
-                // Truly indirect memory access (e.g., (%rax) where rax is unknown).
-                // Mark the whole function as having indirect access.
-                has_unparseable_indirect = true;
-                break;
-            }
+            // Indirect memory accesses through non-frame registers cannot
+            // alias frame slots when no frame address escaped (checked by
+            // the pre-scan above), so they are NOT a bail condition here.
 
             match infos[k].kind {
                 LineKind::StoreRbp { .. } => {
@@ -658,4 +700,45 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
 
         i = func_end;
     }
+}
+
+
+/// Is the RSP-shift at `k` part of an epilogue chain?
+///
+/// Accepted shape from `k` forward (within a bounded window): zero or more of
+/// { `addq $N,%rsp`, `popq` (callee-saved restore), nop, directive } ending in
+/// `ret` or an unconditional `jmp` (tail call). `pushq`/`subq` in the window,
+/// or any other instruction, rejects — those are genuine mid-body shifts.
+fn is_epilogue_rsp_shift(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    func_end: usize,
+) -> bool {
+    let mut j = k;
+    let limit = (k + 24).min(func_end);
+    while j < limit {
+        if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+            j += 1;
+            continue;
+        }
+        match infos[j].kind {
+            LineKind::Ret | LineKind::Jmp => return true,
+            LineKind::Pop { .. } => {
+                j += 1;
+                continue;
+            }
+            _ => {
+                let t = infos[j].trimmed(store.get(j));
+                if let Some(rest) = t.strip_prefix("addq $") {
+                    if rest.strip_suffix(", %rsp").and_then(|v| v.parse::<i64>().ok()).is_some() {
+                        j += 1;
+                        continue;
+                    }
+                }
+                return false;
+            }
+        }
+    }
+    false
 }
