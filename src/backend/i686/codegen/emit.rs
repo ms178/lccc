@@ -66,6 +66,9 @@ pub struct I686Codegen {
     /// Number of integer arguments to pass in registers (-mregparm=N).
     /// 0 = standard cdecl, 1-3 = pass first N int args in EAX, EDX, ECX.
     pub(super) regparm: u8,
+    /// Stack boundary in bytes for frame rounding (4, 8, or 16).
+    /// From -mpreferred-stack-boundary; the kernel realmode code uses 4.
+    pub(super) stack_boundary: i64,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     pub(super) omit_frame_pointer: bool,
     /// When omit_frame_pointer is true, this holds the offset from ESP (at its
@@ -148,6 +151,7 @@ impl I686Codegen {
             pic_got_live: false,
             needs_pc_thunk_bx: false,
             regparm: 0,
+            stack_boundary: 16,
             omit_frame_pointer: false,
             frame_base_offset: 0,
             esp_adjust: 0,
@@ -169,6 +173,10 @@ impl I686Codegen {
         self.regparm = opts.regparm;
         self.omit_frame_pointer = opts.omit_frame_pointer;
         self.state.emit_cfi = opts.emit_cfi;
+        // 0 (Default::default()) means "unspecified" -> SysV 16.
+        self.stack_boundary = match opts.preferred_stack_bytes {
+            4 => 4, 8 => 8, _ => 16,
+        };
     }
 
     // --- i686 helper methods ---
@@ -1568,8 +1576,18 @@ impl ArchCodegen for I686Codegen {
         }
     }
 
+    /// Fold GlobalAddr+Load/Store into absolute `movl sym, %eax` — only in
+    /// non-PIC mode (PIC needs @GOT/@GOTOFF through %ebx, handled by
+    /// emit_global_addr). This is the i686 analogue of x86-64's sym(%rip)
+    /// fold; the kernel realmode/decompressor code is always -fno-pic.
+    fn supports_global_addr_fold(&self) -> bool {
+        !self.state.pic_mode
+    }
+
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
-        if is_sret { 4 } else { 0 }
+        // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
+        // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
+        if is_sret && self.regparm == 0 { 4 } else { 0 }
     }
 
     // ---- Control flow ----
@@ -1953,6 +1971,8 @@ impl ArchCodegen for I686Codegen {
         fn emit_call_move_f64_to_acc(&mut self) => emit_call_move_f64_to_acc_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
+        fn emit_global_load_rip_rel(&mut self, dest: &Value, sym: &str, ty: IrType) => emit_global_load_abs_impl;
+        fn emit_global_store_rip_rel(&mut self, val: &Operand, sym: &str, ty: IrType) => emit_global_store_abs_impl;
         fn emit_label_addr(&mut self, dest: &Value, label: &str) => emit_label_addr_impl;
         fn emit_tls_global_addr(&mut self, dest: &Value, name: &str) => emit_tls_global_addr_impl;
         // cast

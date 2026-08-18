@@ -120,6 +120,9 @@ pub(crate) struct CodegenOptions {
     /// in EAX, EDX, ECX respectively. Used by the Linux kernel boot code
     /// (-mregparm=3) to reduce code size in 16-bit real mode.
     pub(crate) regparm: u8,
+    /// Requested stack boundary in bytes (16 = SysV default). i686 honours
+    /// 4/8 to shrink frames in kernel realmode code; x86-64 ignores <16.
+    pub(crate) preferred_stack_bytes: u8,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     /// When true, functions do not set up EBP as a frame pointer, freeing it
     /// as a general register and saving prologue/epilogue instructions.

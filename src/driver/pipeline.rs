@@ -303,6 +303,10 @@ pub struct Driver {
     /// Number of integer arguments to pass in registers for i686 (-mregparm=N).
     /// 0 = standard cdecl (all on stack), 1-3 = pass first N int args in EAX/EDX/ECX.
     pub(super) regparm: u8,
+    /// Requested stack boundary in bytes (-mpreferred-stack-boundary /
+    /// -mstack-alignment). 16 = SysV default; the kernel realmode code
+    /// passes 4 (boundary=2). Only i686 honours values below 16.
+    pub(super) preferred_stack_bytes: u8,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     pub(super) omit_frame_pointer: bool,
     /// Whether to suppress .eh_frame unwind table generation
@@ -444,6 +448,7 @@ impl Driver {
             color_mode: ColorMode::Auto,
             fcommon: false,
             regparm: 0,
+            preferred_stack_bytes: 16,
             omit_frame_pointer: false,
             no_unwind_tables: false,
             raw_args: Vec::new(),
@@ -1796,6 +1801,7 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
+            preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,
         };

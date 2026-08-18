@@ -1036,6 +1036,10 @@ impl Driver {
                             "{}: LCCC guarantees 16-byte stack alignment and cannot realign the stack to {} bytes",
                             arg, bytes));
                     }
+                    // Honour smaller boundaries on i686: the kernel's realmode
+                    // code (boundary=2) otherwise pays up to 12 pad bytes per
+                    // frame. x86-64 keeps 16 (SSE spill slots + psABI).
+                    self.preferred_stack_bytes = bytes.max(4) as u8;
                 }
                 // `-mno-<feature>` for an ISA extension LCCC never emits.
                 //

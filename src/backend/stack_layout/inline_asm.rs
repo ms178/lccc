@@ -144,6 +144,108 @@ fn is_generic_gp_constraint(constraint: &str) -> bool {
     false
 }
 
+/// i686-precision variant: skip the blanket callee-saved marking when every
+/// inline-asm block's worst-case scratch demand fits in the caller-saved
+/// prefix of the i686 scratch pool.
+///
+/// The i686 scratch allocator (asm_emitter.rs) hands out registers in the
+/// fixed order [ecx, edx, esi, edi, eax, ebx], skipping excluded entries.
+/// Therefore, if an asm block can consume at most D scratch registers and
+/// the first two pool entries (ecx, edx) are not excluded by a specific
+/// constraint or clobber, then D <= avail({ecx,edx}) proves no callee-saved
+/// register can ever be handed out for that block — the blanket marking
+/// (which costs push/pop pairs AND starves the register allocator in every
+/// function with a segment-register read, i.e. all of arch/x86/boot) is
+/// dropped.
+///
+/// Demand counting is deliberately over-approximate: every operand that is
+/// not a tied digit, an immediate-only class, an @cc flag output, or an
+/// explicit single-register letter counts as one scratch register (two if
+/// its operand type is 64-bit, since i686 uses a register pair). Memory
+/// operands count too (address staging draws from the same pool).
+pub fn collect_inline_asm_callee_saved_i686(
+    func: &IrFunction,
+    used: &mut Vec<PhysReg>,
+    constraint_to_phys: impl Fn(&str) -> Option<PhysReg>,
+    clobber_to_phys: impl Fn(&str) -> Option<PhysReg>,
+    all_callee_saved: &[PhysReg],
+) {
+    use crate::common::types::IrType;
+
+    // Specific single-register constraint letters on i686.
+    fn specific_reg_letter(c: &str) -> Option<&'static str> {
+        match c {
+            "a" => Some("eax"), "b" => Some("ebx"), "c" => Some("ecx"),
+            "d" => Some("edx"), "S" => Some("esi"), "D" => Some("edi"),
+            _ => None,
+        }
+    }
+    // Immediate-only constraint (no register alternative)?
+    fn imm_only(c: &str) -> bool {
+        !c.is_empty() && c.chars().all(|ch| matches!(ch,
+            'i' | 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'e' | 'Z' | 's'))
+    }
+
+    let mut all_blocks_fit = true;
+    'scan: for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::InlineAsm { outputs, inputs, clobbers, operand_types, .. } = inst
+            else { continue };
+
+            let mut avail: i32 = 2; // ecx, edx
+            let mut ecx_gone = false;
+            let mut edx_gone = false;
+            let mut demand: i32 = 0;
+            let mut op_idx = 0usize;
+
+            let mut account = |c: &str, op_idx: usize,
+                               ecx_gone: &mut bool, edx_gone: &mut bool,
+                               avail: &mut i32, demand: &mut i32| {
+                let c = c.trim_start_matches(['=', '+', '&', '%']);
+                if c.starts_with("@cc") { return; }
+                if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) { return; } // tied
+                if imm_only(c) { return; }
+                if let Some(reg) = specific_reg_letter(c) {
+                    if reg == "ecx" && !*ecx_gone { *ecx_gone = true; *avail -= 1; }
+                    if reg == "edx" && !*edx_gone { *edx_gone = true; *avail -= 1; }
+                    return; // no scratch draw
+                }
+                let wide = matches!(operand_types.get(op_idx),
+                    Some(IrType::I64) | Some(IrType::U64) | Some(IrType::F64));
+                *demand += if wide { 2 } else { 1 };
+            };
+
+            for (c, _, _) in outputs {
+                account(c, op_idx, &mut ecx_gone, &mut edx_gone, &mut avail, &mut demand);
+                op_idx += 1;
+            }
+            for (c, _, _) in inputs {
+                account(c, op_idx, &mut ecx_gone, &mut edx_gone, &mut avail, &mut demand);
+                op_idx += 1;
+            }
+            for cl in clobbers {
+                let name = cl.trim_start_matches('%');
+                if (name == "ecx" || name == "cx") && !ecx_gone { ecx_gone = true; avail -= 1; }
+                if (name == "edx" || name == "dx") && !edx_gone { edx_gone = true; avail -= 1; }
+            }
+
+            if demand > avail.max(0) {
+                all_blocks_fit = false;
+                break 'scan;
+            }
+        }
+    }
+
+    if all_blocks_fit {
+        // Precise mode: only explicitly named callee-saved registers
+        // (constraints/clobbers) are marked; generic classes draw from
+        // the proven-sufficient ecx/edx prefix.
+        collect_inline_asm_callee_saved_inner(func, used, constraint_to_phys, clobber_to_phys, &[]);
+    } else {
+        collect_inline_asm_callee_saved_inner(func, used, constraint_to_phys, clobber_to_phys, all_callee_saved);
+    }
+}
+
 fn collect_inline_asm_callee_saved_inner(
     func: &IrFunction,
     used: &mut Vec<PhysReg>,

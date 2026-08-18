@@ -70,6 +70,9 @@ pub struct RegAllocConfig {
     /// Available XMM registers for F64 allocation (caller-saved, non-call-spanning).
     /// Examples: x86 xmm2-xmm7 (PhysReg 20-25).
     pub xmm_regs: Vec<PhysReg>,
+    /// Value ids that codegen folds away entirely and therefore need no
+    /// register assignment.
+    pub never_materialized: FxHashSet<u32>,
 }
 
 /// Filter live intervals to only those eligible for register allocation,
@@ -468,6 +471,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Exclude values used as pointers in instructions whose codegen paths use
     // resolve_slot_addr() directly (not register-aware).
     remove_ineligible_operands(func, &mut eligible, config);
+    for v in &config.never_materialized {
+        eligible.remove(v);
+    }
 
     // Most backends cannot put ParamRef destinations in their caller-saved
     // pool: those registers may still hold other incoming parameters.  x86-64
@@ -926,6 +932,26 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
             }
         }
+    }
+
+    if std::env::var("CCC_DEBUG_RA").is_ok() {
+        let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
+        v.sort();
+        eprintln!(
+            "[RA] fn={} FINAL={:?} used_callee={:?} caller_used={:?}",
+            func.name,
+            v,
+            {
+                let mut u: Vec<u8> = used_regs_set.iter().copied().collect();
+                u.sort();
+                u
+            },
+            {
+                let mut u: Vec<u8> = caller_used_regs_set.iter().copied().collect();
+                u.sort();
+                u
+            }
+        );
     }
 
     // Debug: count overlaps BEFORE phi coalesce

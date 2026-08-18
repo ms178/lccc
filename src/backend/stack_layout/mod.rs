@@ -46,9 +46,11 @@ pub use inline_asm::{
     collect_inline_asm_callee_saved,
     collect_inline_asm_callee_saved_with_overflow,
     collect_inline_asm_callee_saved_with_generic,
+    collect_inline_asm_callee_saved_i686,
 };
 pub use regalloc_helpers::{
     run_regalloc_and_merge_clobbers,
+    run_regalloc_and_merge_clobbers_ex,
     filter_available_regs,
     find_param_alloca,
 };

@@ -33,6 +33,9 @@ pub enum CallArgClass {
     F128SseReg { reg_idx: usize },
     /// Small struct (<=16 bytes) passed by value in 1-2 GP registers.
     StructByValReg { base_reg_idx: usize, size: usize },
+    /// i686 regparm: I64/U64 in a consecutive GP register pair
+    /// (low half in `base_reg_idx`, high half in `base_reg_idx + 1`).
+    I64RegPair { base_reg_idx: usize },
     /// Small struct (<=16 bytes) where all fields are float/double (SSE class per SysV ABI).
     /// Passed in 1-2 XMM registers instead of GP registers.
     /// `lo_fp_idx` is the FP register for the first eightbyte, `hi_fp_idx` for the second (if size > 8).
@@ -108,6 +111,8 @@ pub enum ParamClass {
     I128RegPair { base_reg_idx: usize },
     /// Small struct (<=16 bytes) by value in 1-2 GP registers.
     StructByValReg { base_reg_idx: usize, size: usize },
+    /// i686 regparm: I64/U64 parameter in a consecutive GP register pair.
+    I64RegPair { base_reg_idx: usize },
     /// Small struct where all eightbytes are SSE class -> 1-2 XMM registers.
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
     /// _Float128 (binary128) arrives in ONE 16-byte XMM register (SysV psABI).
@@ -260,6 +265,21 @@ pub struct CallAbiConfig {
     /// caller and callee agree on where each argument lives.
     /// ARM AAPCS64: true (sret pointer in x8), x86/RISC-V: false (sret in x0/a0).
     pub sret_uses_dedicated_reg: bool,
+    /// GCC i386 `-mregparm=N` semantics (i686 only). Changes the core walk to
+    /// match GCC's function_arg_32 exactly, because the Linux kernel's .S
+    /// files hand-implement this convention when calling C:
+    ///  * variadic functions pass ALL arguments on the stack (regparm is
+    ///    ignored entirely, named and anonymous alike);
+    ///  * I64/U64 consume a consecutive GP register PAIR (low in the lower-
+    ///    numbered register); if the pair does not fit, the argument goes to
+    ///    the stack AND all remaining GP registers are killed;
+    ///  * any integer-eligible argument that overflows kills the remaining
+    ///    GP registers (a later small int cannot grab a free register);
+    ///  * float/double/long-double scalars always go to the stack and do
+    ///    NOT consume or kill GP registers;
+    ///  * small aggregates take ceil(size/4) consecutive registers when they
+    ///    fit, otherwise stack + kill (GCC BLKmode rule).
+    pub gcc_regparm_mode: bool,
 }
 
 /// Result of SysV per-eightbyte struct classification.
@@ -335,6 +355,8 @@ pub(crate) struct ArgInfo<'a> {
     pub(crate) is_long_double: bool,
     /// True for _Float128 (IEEE binary128): ONE 16-byte XMM register (SysV psABI).
     pub(crate) is_f128_sse: bool,
+    /// True for I64/U64 on an ILP32 target (candidate for a regparm GP pair).
+    pub(crate) is_i64_pair: bool,
     /// If this is a struct/union by value: Some(byte_size). None otherwise.
     pub(crate) struct_size: Option<usize>,
     /// Struct alignment in bytes (for RISC-V even-register alignment). None for non-struct.
@@ -363,6 +385,7 @@ enum CoreArgClass {
     /// _Float128 (binary128) in ONE 16-byte XMM register (SysV psABI).
     F128SseReg { reg_idx: usize },
     StructByValReg { base_reg_idx: usize, size: usize },
+    I64RegPair { base_reg_idx: usize },
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
     StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
     StructMixedSseIntReg { fp_reg_idx: usize, int_reg_idx: usize, size: usize },
@@ -392,6 +415,7 @@ struct CoreClassification {
 fn classify_args_core(
     args: &[ArgInfo<'_>],
     is_variadic: bool,
+    real_variadic: bool,
     config: &CallAbiConfig,
 ) -> CoreClassification {
     let mut result = Vec::with_capacity(args.len());
@@ -401,6 +425,79 @@ fn classify_args_core(
 
     for info in args {
         let force_gp = is_variadic && config.variadic_floats_in_gp && info.is_float && !info.is_long_double;
+
+        // GCC i386 -mregparm=N walk (see CallAbiConfig::gcc_regparm_mode).
+        // Verified against gcc -m32 -mregparm=3 (GCC 14.2) on: int/int/int,
+        // ll+int, int+ll, int+int+ll, struct{int,int}+int, struct{int,int,int},
+        // struct{float}, struct{float,int}, double+ints, variadics, and sret.
+        if config.gcc_regparm_mode {
+            if real_variadic {
+                // GCC: variadic functions ignore regparm completely; every
+                // argument (named and anonymous) is on the stack.
+                result.push(if info.struct_size.is_some() {
+                    let size = info.struct_size.unwrap();
+                    if size == 0 { CoreArgClass::ZeroSizeSkip }
+                    else { CoreArgClass::StructByValStack { size } }
+                } else if info.is_long_double {
+                    CoreArgClass::F128Stack
+                } else {
+                    CoreArgClass::Stack
+                });
+                continue;
+            }
+            if let Some(size) = info.struct_size {
+                if size == 0 {
+                    result.push(CoreArgClass::ZeroSizeSkip);
+                    continue;
+                }
+                // Aggregate: ceil(size/4) consecutive GP regs when it fits
+                // entirely; otherwise stack + kill remaining registers.
+                // (GCC ix86 BLKmode: SSE-class structs like {float} are also
+                // integer-register candidates under regparm — verified:
+                // struct{float,int} arrives in %eax,%edx.)
+                let regs_needed = size.div_ceil(4);
+                if int_idx + regs_needed <= config.max_int_regs {
+                    result.push(CoreArgClass::StructByValReg { base_reg_idx: int_idx, size });
+                    int_idx += regs_needed;
+                } else {
+                    result.push(CoreArgClass::StructByValStack { size });
+                    int_idx = config.max_int_regs; // kill
+                }
+                continue;
+            }
+            if info.is_long_double {
+                // long double: always memory, does not kill GP regs.
+                result.push(CoreArgClass::F128Stack);
+                continue;
+            }
+            if info.is_float {
+                // float/double scalars: always memory under regparm,
+                // and do NOT kill the remaining GP registers (verified:
+                // p4(double,int,int,int) passes b,c,d in eax,edx,ecx).
+                result.push(CoreArgClass::Stack);
+                continue;
+            }
+            if info.is_i64_pair {
+                // I64/U64: consecutive GP pair, else stack + kill.
+                if int_idx + 2 <= config.max_int_regs {
+                    result.push(CoreArgClass::I64RegPair { base_reg_idx: int_idx });
+                    int_idx += 2;
+                } else {
+                    result.push(CoreArgClass::Stack);
+                    int_idx = config.max_int_regs; // kill
+                }
+                continue;
+            }
+            // Plain integer/pointer.
+            if int_idx < config.max_int_regs {
+                result.push(CoreArgClass::IntReg { reg_idx: int_idx });
+                int_idx += 1;
+            } else {
+                result.push(CoreArgClass::Stack);
+                int_idx = config.max_int_regs; // kill (idempotent here)
+            }
+            continue;
+        }
 
         if let Some(size) = info.struct_size {
             // Zero-size structs consume no register or stack space per GCC behavior.
@@ -613,10 +710,11 @@ pub fn classify_call_args(
             eightbyte_classes: struct_arg_classes.get(i).map(|v| v.as_slice()).unwrap_or(&[]),
             riscv_float_class: struct_arg_riscv_float_classes.get(i).copied().flatten(),
             is_f128_sse: struct_arg_is_f128_sse.get(i).copied().unwrap_or(false),
+            is_i64_pair: arg_ty.map(|t| matches!(t, IrType::I64 | IrType::U64)).unwrap_or(false),
         }
     }).collect();
 
-    let core = classify_args_core(&arg_infos, is_variadic, config);
+    let core = classify_args_core(&arg_infos, is_variadic, is_variadic, config);
 
     // Convert CoreArgClass -> CallArgClass (drop by-ref variants that only appear
     // when large_struct_by_ref is true, which maps to IntReg/Stack on the caller side).
@@ -628,6 +726,7 @@ pub fn classify_call_args(
         CoreArgClass::F128Stack => CallArgClass::F128Stack,
         CoreArgClass::F128SseReg { reg_idx } => CallArgClass::F128SseReg { reg_idx },
         CoreArgClass::StructByValReg { base_reg_idx, size } => CallArgClass::StructByValReg { base_reg_idx, size },
+        CoreArgClass::I64RegPair { base_reg_idx } => CallArgClass::I64RegPair { base_reg_idx },
         CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
         CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
         CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => CallArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },
@@ -679,6 +778,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             eightbyte_classes: &param.struct_eightbyte_classes,
             riscv_float_class: param.riscv_float_class,
             is_f128_sse: param.is_f128_sse,
+            is_i64_pair: matches!(param.ty, IrType::I64 | IrType::U64),
         }
     }).collect();
 
@@ -687,7 +787,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     // The force_gp check is: is_variadic && config.variadic_floats_in_gp && is_float.
     // For non-variadic functions, config.variadic_floats_in_gp is false, so force_gp
     // is false regardless of the is_variadic flag — making this safe.
-    let mut core = classify_args_core(&arg_infos, true, config);
+    let mut core = classify_args_core(&arg_infos, true, func.is_variadic, config);
 
     // AArch64 ABI: when sret uses a dedicated register (x8), the classification initially
     // assigns the sret pointer to IntReg(0), consuming one GP register slot. On the caller
@@ -735,6 +835,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             CoreArgClass::FloatReg { reg_idx } => ParamClass::FloatReg { reg_idx },
             CoreArgClass::I128RegPair { base_reg_idx } => ParamClass::I128RegPair { base_reg_idx },
             CoreArgClass::StructByValReg { base_reg_idx, size } => ParamClass::StructByValReg { base_reg_idx, size },
+            CoreArgClass::I64RegPair { base_reg_idx } => ParamClass::I64RegPair { base_reg_idx },
             CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => ParamClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
             CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
             CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },

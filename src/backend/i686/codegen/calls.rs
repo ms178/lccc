@@ -23,6 +23,7 @@ impl I686Codegen {
             allow_struct_split_reg_stack: false,
             align_struct_pairs: false,
             sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: true,
         }
     }
 
@@ -43,6 +44,8 @@ impl I686Codegen {
                 call_abi::CallArgClass::LargeStructStack { size } => total += (*size + 3) & !3,
                 call_abi::CallArgClass::ZeroSizeSkip => {}
                 call_abi::CallArgClass::IntReg { .. } => {} // regparm: in register, no stack space
+                call_abi::CallArgClass::I64RegPair { .. } => {} // regparm: register pair
+                call_abi::CallArgClass::StructByValReg { .. } => {} // regparm: struct in registers
                 _ => total += 4,
             }
         }
@@ -91,6 +94,8 @@ impl I686Codegen {
                 }
                 call_abi::CallArgClass::ZeroSizeSkip => {}
                 call_abi::CallArgClass::IntReg { .. } => {} // regparm: handled in emit_call_reg_args
+                call_abi::CallArgClass::I64RegPair { .. } => {}      // regparm: register pair
+                call_abi::CallArgClass::StructByValReg { .. } => {} // regparm: struct in registers
                 _ => {
                     self.operand_to_eax(&args[i]);
                     emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
@@ -110,28 +115,88 @@ impl I686Codegen {
             return; // cdecl: no register args
         }
         // regparm register order: EAX (reg_idx 0), EDX (reg_idx 1), ECX (reg_idx 2).
-        // We must load args into registers in reverse order to avoid clobbering
-        // EAX (the accumulator) before we're done using it to load other values.
-        // Collect register args first, then emit in reverse order.
+        //
+        // Args are emitted in DESCENDING base-register order so that %eax —
+        // the staging register for operand_to_eax and the pointer register
+        // for register-struct copies — is written by the very last move.
+        // Register targets are disjoint across args, so descending order
+        // guarantees no arg's staging clobbers an already-loaded target.
         let regparm_regs: &[&str] = &["%eax", "%edx", "%ecx"];
-        let mut reg_args: Vec<(usize, usize)> = Vec::new(); // (arg_idx, reg_idx)
+        let mut items: Vec<(usize, usize)> = Vec::new(); // (base_reg_idx, arg_idx)
         for (i, ac) in arg_classes.iter().enumerate() {
-            if let call_abi::CallArgClass::IntReg { reg_idx } = ac {
-                reg_args.push((i, *reg_idx));
+            match ac {
+                call_abi::CallArgClass::IntReg { reg_idx } if *reg_idx < 3 => items.push((*reg_idx, i)),
+                call_abi::CallArgClass::I64RegPair { base_reg_idx } if *base_reg_idx + 1 < 3 + 1 => items.push((*base_reg_idx, i)),
+                call_abi::CallArgClass::StructByValReg { base_reg_idx, .. } => items.push((*base_reg_idx, i)),
+                _ => {}
             }
         }
-        // Emit in reverse order so we load into edx/ecx before eax
-        // (since operand_to_eax uses eax as accumulator).
-        for &(arg_i, reg_idx) in reg_args.iter().rev() {
-            if reg_idx < regparm_regs.len() {
-                let dest_reg = regparm_regs[reg_idx];
-                if dest_reg == "%eax" {
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        for &(base, arg_i) in &items {
+            match &arg_classes[arg_i] {
+                call_abi::CallArgClass::IntReg { reg_idx } => {
+                    let dest_reg = regparm_regs[*reg_idx];
                     self.operand_to_eax(&args[arg_i]);
-                } else {
-                    self.operand_to_eax(&args[arg_i]);
-                    emit!(self.state, "    movl %eax, {}", dest_reg);
+                    if dest_reg != "%eax" {
+                        emit!(self.state, "    movl %eax, {}", dest_reg);
+                        self.state.reg_cache.invalidate_acc();
+                    }
+                }
+                call_abi::CallArgClass::I64RegPair { base_reg_idx } => {
+                    let lo = regparm_regs[*base_reg_idx];
+                    let hi = regparm_regs[*base_reg_idx + 1];
+                    match &args[arg_i] {
+                        Operand::Const(c) => {
+                            let v = c.to_i64().unwrap_or(0);
+                            emit!(self.state, "    movl ${}, {}", (v & 0xFFFF_FFFF) as i32, lo);
+                            emit!(self.state, "    movl ${}, {}", ((v as u64) >> 32) as i32, hi);
+                        }
+                        Operand::Value(v) => {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                // Direct mem->reg loads: no staging, order-safe.
+                                let sr0 = self.slot_ref(slot);
+                                let sr4 = self.slot_ref_offset(slot, 4);
+                                emit!(self.state, "    movl {}, {}", sr4, hi);
+                                emit!(self.state, "    movl {}, {}", sr0, lo);
+                            } else {
+                                // Wide values are always slotted on i686, but stay
+                                // defensive: acc-pair produces eax(lo):edx(hi).
+                                self.emit_load_acc_pair(&args[arg_i]);
+                                if *base_reg_idx == 1 {
+                                    self.state.emit("    movl %edx, %ecx");
+                                    self.state.emit("    movl %eax, %edx");
+                                }
+                            }
+                        }
+                    }
                     self.state.reg_cache.invalidate_acc();
                 }
+                call_abi::CallArgClass::StructByValReg { base_reg_idx, size } => {
+                    let words = size.div_ceil(4);
+                    if let Operand::Value(v) = &args[arg_i] {
+                        if self.state.is_alloca(v.0) {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                // Direct slot-word -> reg loads (full-word reads:
+                                // slots are 4-byte rounded, GCC reads word_mode
+                                // chunks here too).
+                                for k in (0..words).rev() {
+                                    let sr = self.slot_ref_offset(slot, (k * 4) as i64);
+                                    emit!(self.state, "    movl {}, {}", sr, regparm_regs[base_reg_idx + k]);
+                                }
+                            }
+                        } else {
+                            // Pointer to struct data: pointer staged in %eax;
+                            // descending word order means an %eax target (only
+                            // possible at word 0 when base==0) is written last.
+                            self.operand_to_eax(&args[arg_i]);
+                            for k in (0..words).rev() {
+                                emit!(self.state, "    movl {}(%eax), {}", k * 4, regparm_regs[base_reg_idx + k]);
+                            }
+                        }
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                }
+                _ => {}
             }
         }
     }
@@ -146,6 +211,32 @@ impl I686Codegen {
             }
         } else if indirect {
             if let Some(fptr) = func_ptr {
+                if self.regparm > 0 {
+                    // Under regparm, %eax/%edx/%ecx carry arguments — staging
+                    // the target in %eax would destroy arg 0. Call through
+                    // the value's home directly (register or stack slot);
+                    // i686 values always have one or the other.
+                    if let Operand::Value(v) = fptr {
+                        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                            emit!(self.state, "    call *%{}", super::emit::phys_reg_name(phys));
+                            return;
+                        }
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            let sr = self.slot_ref(slot);
+                            emit!(self.state, "    call *{}", sr);
+                            return;
+                        }
+                    }
+                    // Constant target (rare): safe only because no register
+                    // argument exists if we got here without a home — still,
+                    // prefer an absolute call over clobbering %eax.
+                    if let Operand::Const(c) = fptr {
+                        if let Some(v) = c.to_i64() {
+                            emit!(self.state, "    call *${}", v);
+                            return;
+                        }
+                    }
+                }
                 self.operand_to_eax(fptr);
             }
             self.state.emit("    call *%eax");
