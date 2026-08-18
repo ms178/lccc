@@ -1,24 +1,21 @@
-//! Copy coalescing and immediately-consumed value analysis.
+//! Copy coalescing, immediately-consumed GPR analysis, vector-store deferral.
 //!
-//! Stack-slot coalescing is conservative move coalescing on a CFG-precise,
-//! copy-aware interference graph (Chaitin/Briggs): for `d = copy s`, `d`
-//! interferes with every value live after the copy except `s`. Non-interfering
-//! scalar (or vector) webs share one home. Liveness uses dense bitsets and a
-//! worklist so large functions still get a proof.
+//! Stack coalescing is frequency-weighted conservative move coalescing on a
+//! CFG-precise, copy-aware interference graph (George/Appel; Chaitin/Briggs
+//! move rule). For `d = copy s`, `d` interferes with every value live after
+//! the copy except `s`. Unlimited stack homes ⇒ the George test collapses to
+//! “no edge”: greedy merge by execution weight is the practical maximum-
+//! weight coalescing heuristic (exact MWCP is NP-hard).
 //!
-//! CFG construction matches `liveness.rs` (terminator edges + InlineAsm goto)
-//! so coalescing cannot under-approximate live sets.
-//!
-//! Immediately-consumed analysis finds GPR values produced and consumed in
-//! adjacent instructions so they can stay in the accumulator cache and skip
-//! a stack slot. Vector-defer skips the home-slot store of a vector result
-//! that is consumed once from the last-store peephole.
+//! Weights use the same `10^depth` loop scale as RA so inner-loop copies
+//! win ties against cold ones. CFG matches `liveness.rs` (terminators +
+//! asm-goto). Safe degradation is extra slots, never a wrong merge.
 
 use std::sync::OnceLock;
 
 use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_operand_in_terminator,
-    for_each_value_use_in_instruction,
+    for_each_value_use_in_instruction, LivenessResult,
 };
 use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -36,9 +33,7 @@ fn env_flag(name: &'static str) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CoalesceClass {
-    /// 8-byte integer/pointer stack home.
     Scalar,
-    /// Auto-vectorizer Vec* SSA value (16/32-byte home, slot-aware emitters).
     Vector,
 }
 
@@ -64,14 +59,24 @@ fn scalar_const(c: IrConst) -> bool {
     )
 }
 
-/// True when codegen leaves the result in the GPR accumulator cache.
 fn ty_lives_in_gpr_cache(ty: IrType) -> bool {
     scalar_type(ty) && !ty.is_float() && !ty.is_128bit() && !ty.is_long_double()
 }
 
-/// Classify values that share a uniform stack representation. Floats, i128/F128,
-/// allocas and opaque results are excluded: a missed coalesce is harmless,
-/// a slot-size mismatch is not.
+/// `10^min(depth,6)` so an inner-loop copy outranks any nest of cold ones.
+/// Multi-def (phi / loop-carried) gets another ×10: those copies execute
+/// once per iteration and dominate stack traffic on spilled IVs.
+fn copy_weight(loop_depth: u32, touches_multi_def: bool) -> u32 {
+    let mut w = 1u32;
+    for _ in 0..loop_depth.min(6) {
+        w = w.saturating_mul(10);
+    }
+    if touches_multi_def {
+        w = w.saturating_mul(10);
+    }
+    w
+}
+
 fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
     let mut classes: FxHashMap<u32, CoalesceClass> = FxHashMap::default();
     let mut allocas: FxHashSet<u32> = FxHashSet::default();
@@ -114,6 +119,9 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
                 } if op.vector_result_width().is_some() => {
                     classes.insert(d.0, CoalesceClass::Vector);
                 }
+                Instruction::Phi { dest, ty, .. } if scalar_type(*ty) => {
+                    classes.insert(dest.0, CoalesceClass::Scalar);
+                }
                 Instruction::Copy { dest, src } => {
                     if !allocas.contains(&dest.0) && !classes.contains_key(&dest.0) {
                         match src {
@@ -152,7 +160,6 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
     classes
 }
 
-/// Slots codegen re-reads around side effects (InlineAsm Phase 4).
 fn collect_unsound_coalesce_ids(func: &IrFunction) -> FxHashSet<u32> {
     let mut ids = FxHashSet::default();
     for block in &func.blocks {
@@ -214,7 +221,33 @@ fn instruction_uses_value(inst: &Instruction, id: u32) -> bool {
     found
 }
 
-/// Successor lists matching `liveness.rs`: terminator edges + InlineAsm goto.
+fn instruction_def_id(inst: &Instruction) -> Option<u32> {
+    if let Some(dest) = inst.dest() {
+        return Some(dest.0);
+    }
+    match inst {
+        Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => Some(dest.0),
+        _ => None,
+    }
+}
+
+fn operand_is_value(op: &Operand, id: u32) -> bool {
+    matches!(op, Operand::Value(v) if v.0 == id)
+}
+
+fn operand_is_const(op: &Operand) -> bool {
+    matches!(op, Operand::Const(_))
+}
+
+/// Unique Value operand, other side a Const — load order is unambiguous on
+/// every backend (imm form / materialise-const then op). Safe without
+/// `lhs_first_binop`. Float Cmp is excluded at the call site (Lt/Le swap).
+fn unique_value_with_const(a: &Operand, b: &Operand, id: u32) -> bool {
+    (operand_is_value(a, id) && operand_is_const(b))
+        || (operand_is_value(b, id) && operand_is_const(a))
+}
+
+/// CFG identical to `liveness.rs`: terminator edges + InlineAsm goto.
 fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     let nblocks = func.blocks.len();
     let mut label_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
@@ -276,17 +309,113 @@ fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
     (succs, preds)
 }
 
-fn instruction_def_id(inst: &Instruction) -> Option<u32> {
-    if let Some(dest) = inst.dest() {
-        return Some(dest.0);
+fn cfg_postorder(succs: &[Vec<usize>]) -> Vec<usize> {
+    let n = succs.len();
+    let mut state = vec![0u8; n];
+    let mut post = Vec::with_capacity(n);
+    let mut next = vec![0usize; n];
+    for start in 0..n {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut stack = vec![start];
+        while let Some(&b) = stack.last() {
+            let i = next[b];
+            if i < succs[b].len() {
+                next[b] = i + 1;
+                let s = succs[b][i];
+                if s < n && state[s] == 0 {
+                    state[s] = 1;
+                    stack.push(s);
+                }
+            } else {
+                state[b] = 2;
+                post.push(b);
+                stack.pop();
+            }
+        }
     }
-    match inst {
-        Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => Some(dest.0),
-        _ => None,
-    }
+    post
 }
 
-// ── Dense bitsets for liveness + interference ─────────────────────────────
+/// Natural-loop depth, one increment per header (two latches ≠ nest).
+fn cheap_loop_depth(succs: &[Vec<usize>], preds: &[Vec<usize>]) -> Vec<u32> {
+    let n = succs.len();
+    let mut depth = vec![0u32; n];
+    if n == 0 {
+        return depth;
+    }
+
+    let mut state = vec![0u8; n];
+    let mut next = vec![0usize; n];
+    let mut back_headers: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for start in 0..n {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut stack = vec![start];
+        while let Some(&b) = stack.last() {
+            let i = next[b];
+            if i < succs[b].len() {
+                next[b] = i + 1;
+                let s = succs[b][i];
+                if s >= n {
+                    continue;
+                }
+                match state[s] {
+                    0 => {
+                        state[s] = 1;
+                        stack.push(s);
+                    }
+                    1 => back_headers.entry(s).or_default().push(b),
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+    }
+
+    for (&header, tails) in &back_headers {
+        let mut seen = vec![false; n];
+        seen[header] = true;
+        depth[header] = depth[header].saturating_add(1);
+        let mut work: Vec<usize> = Vec::new();
+        for &tail in tails {
+            if tail == header || seen[tail] {
+                continue;
+            }
+            seen[tail] = true;
+            depth[tail] = depth[tail].saturating_add(1);
+            work.push(tail);
+        }
+        while let Some(b) = work.pop() {
+            for &p in &preds[b] {
+                if p < n && !seen[p] {
+                    seen[p] = true;
+                    depth[p] = depth[p].saturating_add(1);
+                    work.push(p);
+                }
+            }
+        }
+    }
+    depth
+}
+
+fn loop_depth_for(func: &IrFunction, liveness: Option<&LivenessResult>) -> Vec<u32> {
+    if let Some(lr) = liveness {
+        if lr.block_loop_depth.len() == func.blocks.len() {
+            return lr.block_loop_depth.clone();
+        }
+    }
+    let (succs, preds) = build_block_cfg(func);
+    cheap_loop_depth(&succs, &preds)
+}
+
+// ── Dense bitsets ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BitSet {
@@ -324,10 +453,7 @@ impl BitSet {
 
     #[inline]
     fn contains(&self, i: usize) -> bool {
-        if i >= self.nbits {
-            return false;
-        }
-        self.words[i / 64] & (1u64 << (i % 64)) != 0
+        i < self.nbits && self.words[i / 64] & (1u64 << (i % 64)) != 0
     }
 
     #[inline]
@@ -349,7 +475,6 @@ impl BitSet {
             .any(|(a, b)| a & b != 0)
     }
 
-    /// `self |= other & !mask`
     #[inline]
     fn or_and_not(&mut self, other: &Self, mask: &Self) {
         for ((a, b), m) in self
@@ -390,12 +515,8 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
     root
 }
 
-/// Backward liveness over real successor edges, then copy-aware interference:
-/// `d = copy s` interferes with every value live after the copy except `s`.
-///
-/// Worklist + dense bitsets. The lattice is finite and the transfer is
-/// monotone. A defensive bound of `|B|·(|V|+2)` updates is the lattice
-/// height and only fires on an implementation bug.
+/// Worklist liveness seeded in reverse postorder (exits first), then
+/// copy-aware interference. Lattice-height cap is an impl-bug guard only.
 fn cfg_copy_interference(
     func: &IrFunction,
     dense: &FxHashMap<u32, usize>,
@@ -437,12 +558,12 @@ fn cfg_copy_interference(
         });
     }
 
-    // Unlowered phi incoming is a use at the predecessor terminator
-    // (same contract as `liveness.rs`). After phi elim this is a no-op.
     let mut label_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
     for (idx, block) in func.blocks.iter().enumerate() {
         label_to_idx.insert(block.label.0, idx);
     }
+    // Unlowered phi: incoming is a use at the predecessor terminator, dest
+    // is a def at the header (same contract as liveness.rs).
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -466,8 +587,19 @@ fn cfg_copy_interference(
 
     let mut live_in: Vec<BitSet> = vec![BitSet::new(n); nblocks];
     let mut live_out: Vec<BitSet> = vec![BitSet::new(n); nblocks];
-    let mut work: Vec<usize> = (0..nblocks).rev().collect();
-    let mut on_work = vec![true; nblocks];
+    let post = cfg_postorder(&succs);
+    let mut work: Vec<usize> = post.iter().rev().copied().collect();
+    let mut on_work = vec![false; nblocks];
+    for &b in &work {
+        on_work[b] = true;
+    }
+    for b in 0..nblocks {
+        if !on_work[b] {
+            on_work[b] = true;
+            work.push(b);
+        }
+    }
+
     let max_steps = nblocks
         .saturating_mul(n.saturating_add(2))
         .saturating_add(16);
@@ -515,7 +647,6 @@ fn cfg_copy_interference(
                 live.insert(id);
             }
         });
-        // Phi incoming of successors is live at this terminator.
         for &succ in &succs[block_idx] {
             if succ >= nblocks {
                 continue;
@@ -563,72 +694,140 @@ fn cfg_copy_interference(
     Some(adj)
 }
 
-/// CFG-aware stack-copy coalescing. Only the stack-slot alias decision;
-/// phi lowering, RA and copy emission are unchanged.
+struct Affinity {
+    dest: u32,
+    src: u32,
+    weight: u32,
+}
+
+fn try_push_affinity(
+    out: &mut Vec<Affinity>,
+    dest: u32,
+    src: u32,
+    weight: u32,
+    classes: &FxHashMap<u32, CoalesceClass>,
+    unsound: &FxHashSet<u32>,
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+) {
+    if dest == src
+        || reg_assigned.contains_key(&dest)
+        || reg_assigned.contains_key(&src)
+        || unsound.contains(&dest)
+        || unsound.contains(&src)
+    {
+        return;
+    }
+    let (Some(&dc), Some(&sc)) = (classes.get(&dest), classes.get(&src)) else {
+        return;
+    };
+    if dc != sc {
+        return;
+    }
+    out.push(Affinity { dest, src, weight });
+}
+
 fn build_cfg_copy_alias_map(
     func: &IrFunction,
     multi_def_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
+    liveness: Option<&LivenessResult>,
 ) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
     let classes = collect_scalar_values(func);
     let unsound = collect_unsound_coalesce_ids(func);
+    let depths = loop_depth_for(func, liveness);
 
-    let mut candidates: Vec<(u32, u32)> = Vec::new();
-    for block in &func.blocks {
+    let mut affinities: Vec<Affinity> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let depth = depths.get(bi).copied().unwrap_or(0);
         for inst in &block.instructions {
-            if let Instruction::Copy {
-                dest,
-                src: Operand::Value(source),
-            } = inst
-            {
-                if dest.0 == source.0
-                    || reg_assigned.contains_key(&dest.0)
-                    || reg_assigned.contains_key(&source.0)
-                    || unsound.contains(&dest.0)
-                    || unsound.contains(&source.0)
-                {
-                    continue;
+            match inst {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(source),
+                } => {
+                    let multi = multi_def_values.contains(&dest.0)
+                        || multi_def_values.contains(&source.0);
+                    try_push_affinity(
+                        &mut affinities,
+                        dest.0,
+                        source.0,
+                        copy_weight(depth, multi),
+                        &classes,
+                        &unsound,
+                        reg_assigned,
+                    );
                 }
-                let (Some(&dest_cls), Some(&src_cls)) =
-                    (classes.get(&dest.0), classes.get(&source.0))
-                else {
-                    continue;
-                };
-                // Never share an 8-byte scalar home with a 16/32-byte vector home.
-                if dest_cls != src_cls {
-                    continue;
+                // Virtual copies: unlowered phi incoming ≡ copy at the pred edge.
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, pred_label) in incoming {
+                        let Operand::Value(source) = op else {
+                            continue;
+                        };
+                        let pred_depth = func
+                            .blocks
+                            .iter()
+                            .position(|b| b.label.0 == pred_label.0)
+                            .and_then(|i| depths.get(i).copied())
+                            .unwrap_or(depth);
+                        try_push_affinity(
+                            &mut affinities,
+                            dest.0,
+                            source.0,
+                            copy_weight(pred_depth, true),
+                            &classes,
+                            &unsound,
+                            reg_assigned,
+                        );
+                    }
                 }
-                candidates.push((dest.0, source.0));
+                _ => {}
             }
         }
     }
-    // Prefer copies that touch a multi-def (phi-web / loop-carried) value.
-    candidates.sort_unstable_by(|a, b| {
-        let score = |dest: u32, src: u32| {
-            u8::from(multi_def_values.contains(&dest)) + u8::from(multi_def_values.contains(&src))
-        };
-        score(b.0, b.1)
-            .cmp(&score(a.0, a.1))
-            .then(a.0.cmp(&b.0))
-            .then(a.1.cmp(&b.1))
+
+    // Loop-phi pairs the linear-scan interval check would reject after the
+    // fact: feed them through the *same* graph. If they interfere here they
+    // are not merged (CFG proof wins). High weight so a legal pair is not
+    // blocked by an earlier cold merge.
+    if let Some(lr) = liveness {
+        for cand in detect_phi_coalesce_groups(func, lr) {
+            let depth = 4;
+            try_push_affinity(
+                &mut affinities,
+                cand.phi_dest,
+                cand.backedge_src,
+                copy_weight(depth, true),
+                &classes,
+                &unsound,
+                reg_assigned,
+            );
+        }
+    }
+
+    affinities.sort_unstable_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then(a.dest.cmp(&b.dest))
+            .then(a.src.cmp(&b.src))
     });
-    candidates.dedup();
-    if candidates.is_empty() {
+    affinities.dedup_by(|a, b| a.dest == b.dest && a.src == b.src);
+    if affinities.is_empty() {
         return (FxHashMap::default(), FxHashSet::default());
     }
 
-    let tracked: FxHashSet<u32> = candidates
+    let mut tracked: Vec<u32> = affinities
         .iter()
-        .flat_map(|(dest, source)| [*dest, *source])
+        .flat_map(|a| [a.dest, a.src])
         .collect();
+    tracked.sort_unstable();
+    tracked.dedup();
 
-    let mut val_of: Vec<u32> = Vec::with_capacity(tracked.len());
     let mut dense: FxHashMap<u32, usize> = FxHashMap::default();
-    for &v in &tracked {
-        dense.insert(v, val_of.len());
-        val_of.push(v);
+    dense.reserve(tracked.len());
+    for (i, &v) in tracked.iter().enumerate() {
+        dense.insert(v, i);
     }
-    let n = val_of.len();
+    let n = tracked.len();
 
     let Some(adj) = cfg_copy_interference(func, &dense) else {
         return (FxHashMap::default(), FxHashSet::default());
@@ -644,11 +843,11 @@ fn build_cfg_copy_alias_map(
         .collect();
     let mut inter = adj;
 
-    for (dest, source) in candidates {
-        let Some(&d) = dense.get(&dest) else {
+    for aff in &affinities {
+        let Some(&d) = dense.get(&aff.dest) else {
             continue;
         };
-        let Some(&s) = dense.get(&source) else {
+        let Some(&s) = dense.get(&aff.src) else {
             continue;
         };
         let dest_root = uf_find(&mut parent, d);
@@ -661,9 +860,8 @@ fn build_cfg_copy_alias_map(
         {
             continue;
         }
-        // Multi-def phi dest owns the web (cross-block lifetime). Else lower ID.
-        let dest_root_val = val_of[dest_root];
-        let source_root_val = val_of[source_root];
+        let dest_root_val = tracked[dest_root];
+        let source_root_val = tracked[source_root];
         let owner = match (
             multi_def_values.contains(&dest_root_val),
             multi_def_values.contains(&source_root_val),
@@ -693,7 +891,7 @@ fn build_cfg_copy_alias_map(
     let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for i in 0..n {
         let root = uf_find(&mut parent, i);
-        groups.entry(val_of[root]).or_default().push(val_of[i]);
+        groups.entry(tracked[root]).or_default().push(tracked[i]);
     }
 
     let mut aliases = FxHashMap::default();
@@ -731,22 +929,26 @@ fn build_cfg_copy_alias_map(
     (aliases, force_aliases)
 }
 
-/// Build dest_id → root_id for Copy instructions that can share a stack slot.
+/// dest_id → root_id for Copy instructions that can share a stack slot.
 ///
 /// Returns `(copy_alias, phi_web_aliases, loop_phi_aliases)`:
 /// - `phi_web_aliases` need force-overwrite in `resolve_copy_aliases`
-/// - `loop_phi_aliases` are certified by `detect_phi_coalesce_groups` and
-///   skip the generic def/last-use check (legacy path only)
+/// - `loop_phi_aliases` skip the generic def/last-use check (legacy path)
 pub(super) fn build_copy_alias_map(
     func: &IrFunction,
     def_block: &FxHashMap<u32, usize>,
     multi_def_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
     use_blocks_map: &FxHashMap<u32, Vec<usize>>,
-    cached_liveness: &Option<crate::backend::liveness::LivenessResult>,
+    cached_liveness: &Option<LivenessResult>,
 ) -> (FxHashMap<u32, u32>, FxHashSet<u32>, FxHashSet<u32>) {
     if cfg_copy_coalesce_enabled() {
-        let (aliases, force) = build_cfg_copy_alias_map(func, multi_def_values, reg_assigned);
+        let (aliases, force) = build_cfg_copy_alias_map(
+            func,
+            multi_def_values,
+            reg_assigned,
+            cached_liveness.as_ref(),
+        );
         return (aliases, force, FxHashSet::default());
     }
 
@@ -827,7 +1029,6 @@ pub(super) fn build_copy_alias_map(
                     .unwrap_or(false);
 
                 if src_in_copy_block && dest_cross_block {
-                    // Phi-copy: src dies here, dest is the wider-live slot owner.
                     raw_aliases.push((s, d));
                     continue;
                 }
@@ -840,9 +1041,6 @@ pub(super) fn build_copy_alias_map(
         }
     }
 
-    // Phi-web: coalesce src → dest for multi-def dest iff src is not live at
-    // any rival dest-write. Only web members may join (external feeds keep
-    // their own home — otherwise the elided copy leaves a stale value).
     let mut phi_web_aliases: FxHashSet<u32> = FxHashSet::default();
     if !env_flag("CCC_NO_PHI_WEB_COALESCE") {
         let mut phi_copies: FxHashMap<u32, Vec<(u32, usize, u32)>> = FxHashMap::default();
@@ -877,7 +1075,6 @@ pub(super) fn build_copy_alias_map(
             }
         }
 
-        // Program-point numbering matches `liveness.rs` (1 per inst + 1 per term).
         let interval_map: FxHashMap<u32, (u32, u32)> = cached_liveness
             .as_ref()
             .map(|lr| {
@@ -958,9 +1155,6 @@ pub(super) fn build_copy_alias_map(
         }
     }
 
-    // Loop-backedge phi: const-init + one backedge Copy never enters the
-    // 2-source phi-web. `detect_phi_coalesce_groups` proves dest is dead
-    // after the backedge source def, so they may share the dest slot.
     let mut loop_phi_aliases: FxHashSet<u32> = FxHashSet::default();
     if !env_flag("CCC_NO_LOOP_PHI_SLOT") {
         if let Some(liveness) = cached_liveness {
@@ -1105,7 +1299,9 @@ pub(super) fn build_copy_alias_map(
         });
     }
     if !unsound.is_empty() {
-        copy_alias.retain(|dest_id, root_id| !unsound.contains(dest_id) && !unsound.contains(root_id));
+        copy_alias.retain(|dest_id, root_id| {
+            !unsound.contains(dest_id) && !unsound.contains(root_id)
+        });
     }
 
     loop_phi_aliases.retain(|v| copy_alias.contains_key(v));
@@ -1130,20 +1326,21 @@ pub(super) fn build_copy_alias_map(
     (copy_alias, phi_web_aliases, loop_phi_aliases)
 }
 
-/// Values that can skip a stack slot: produced into the GPR accumulator and
-/// consumed as the first operand of the next instruction (or the terminator).
+/// GPR values that can skip a stack slot: produced into the accumulator and
+/// consumed as the first (or uniquely-loaded) operand of the next instruction.
 ///
-/// `lhs_first_binop` is true on backends that always load BinOp/Cmp lhs
-/// before rhs (RISC-V). x86/ARM rhs-conflict / operand-swap paths are unsafe.
+/// Copy is acc-preserving (`store_rax_to` leaves the cache armed). A copy
+/// source is excluded from the skip set only when some dest still needs the
+/// home — if every dest is itself skipped, the whole rename chain stays in
+/// the accumulator (0 stores).
 pub(super) fn compute_immediately_consumed(
     func: &IrFunction,
     lhs_first_binop: bool,
 ) -> FxHashSet<u32> {
-    let mut result = FxHashSet::default();
-
     let mut operand_use_count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut has_value_ref_use: FxHashSet<u32> = FxHashSet::default();
-    let mut copy_alias_roots: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_dests_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut non_gpr: FxHashSet<u32> = FxHashSet::default();
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -1155,12 +1352,29 @@ pub(super) fn compute_immediately_consumed(
             for_each_value_use_in_instruction(inst, |v| {
                 has_value_ref_use.insert(v.0);
             });
-            if let Instruction::Copy {
-                src: Operand::Value(v),
-                ..
-            } = inst
-            {
-                copy_alias_roots.insert(v.0);
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::Select { dest, ty, .. }
+                    if !ty_lives_in_gpr_cache(*ty) =>
+                {
+                    non_gpr.insert(dest.0);
+                }
+                Instruction::Cast { dest, to_ty, from_ty, .. }
+                    if !ty_lives_in_gpr_cache(*to_ty)
+                        || from_ty.is_128bit()
+                        || from_ty.is_long_double() =>
+                {
+                    non_gpr.insert(dest.0);
+                }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(v),
+                } => {
+                    copy_dests_of.entry(v.0).or_default().push(dest.0);
+                }
+                _ => {}
             }
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
@@ -1170,16 +1384,31 @@ pub(super) fn compute_immediately_consumed(
         });
     }
 
+    let mut work: Vec<u32> = non_gpr.iter().copied().collect();
+    while let Some(id) = work.pop() {
+        if let Some(dests) = copy_dests_of.get(&id) {
+            for &d in dests {
+                if non_gpr.insert(d) {
+                    work.push(d);
+                }
+            }
+        }
+    }
+
+    let mut result = FxHashSet::default();
     for block in &func.blocks {
         let insts = &block.instructions;
         for (i, inst) in insts.iter().enumerate() {
-            let Some(dest) = inst.dest() else {
+            let Some(dest) = inst.dest().or_else(|| match inst {
+                Instruction::Copy { dest, .. } => Some(*dest),
+                _ => None,
+            }) else {
                 continue;
             };
-            if !is_gpr_acc_preserving_producer(inst) {
+            if non_gpr.contains(&dest.0) || has_value_ref_use.contains(&dest.0) {
                 continue;
             }
-            if has_value_ref_use.contains(&dest.0) || copy_alias_roots.contains(&dest.0) {
+            if !is_gpr_acc_preserving_producer(inst) {
                 continue;
             }
             if operand_use_count.get(&dest.0).copied().unwrap_or(0) != 1 {
@@ -1196,10 +1425,17 @@ pub(super) fn compute_immediately_consumed(
         }
     }
 
+    // Keep a copy-source slot only if some dest still needs a home.
+    result.retain(|src| {
+        let Some(dests) = copy_dests_of.get(src) else {
+            return true;
+        };
+        dests.iter().all(|d| result.contains(d))
+    });
+
     result
 }
 
-/// Producer leaves its GPR result in the accumulator cache.
 fn is_gpr_acc_preserving_producer(inst: &Instruction) -> bool {
     match inst {
         Instruction::Load { ty, .. }
@@ -1209,15 +1445,24 @@ fn is_gpr_acc_preserving_producer(inst: &Instruction) -> bool {
         Instruction::Cast { from_ty, to_ty, .. } => {
             ty_lives_in_gpr_cache(*to_ty) && !from_ty.is_128bit() && !from_ty.is_long_double()
         }
-        Instruction::Cmp { ty, .. } => ty_lives_in_gpr_cache(*ty),
+        // Predicate lands in a GPR via setcc; compared type may be float.
+        Instruction::Cmp { .. } => true,
         Instruction::GetElementPtr { .. }
         | Instruction::GlobalAddr { .. }
         | Instruction::LabelAddr { .. } => true,
+        // store_rax_to leaves the cache holding dest.
+        Instruction::Copy {
+            src: Operand::Value(_),
+            ..
+        }
+        | Instruction::Copy {
+            src: Operand::Const(_),
+            ..
+        } => true,
         _ => false,
     }
 }
 
-/// `value_id` is the first (and, for default targets, only) operand loaded.
 fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: bool) -> bool {
     match inst {
         Instruction::Store {
@@ -1236,14 +1481,20 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
             src: Operand::Value(v),
             ..
         } => v.0 == value_id,
-        Instruction::BinOp {
-            lhs: Operand::Value(v),
-            ..
-        } if lhs_first_binop => v.0 == value_id,
-        Instruction::Cmp {
-            lhs: Operand::Value(v),
-            ..
-        } if lhs_first_binop => v.0 == value_id,
+        Instruction::BinOp { lhs, rhs, ty, .. } => {
+            if ty.is_float() || ty.is_long_double() {
+                return false;
+            }
+            unique_value_with_const(lhs, rhs, value_id)
+                || (lhs_first_binop && operand_is_value(lhs, value_id))
+        }
+        Instruction::Cmp { lhs, rhs, ty, .. } => {
+            if ty.is_float() || ty.is_long_double() {
+                return false;
+            }
+            unique_value_with_const(lhs, rhs, value_id)
+                || (lhs_first_binop && operand_is_value(lhs, value_id))
+        }
         _ => false,
     }
 }
@@ -1299,16 +1550,18 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Value(Value(1)))),
         ));
-        let (aliases, force) =
-            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default());
+        let (aliases, force) = build_cfg_copy_alias_map(
+            &func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            None,
+        );
         assert_eq!(aliases.get(&1), Some(&0));
         assert!(force.contains(&1));
     }
 
     #[test]
     fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
-        // d is a lowered phi: d = x on the left, d = y on the right.
-        // x is used after the join, so x and d must not share a slot.
         let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![
             block(
@@ -1353,7 +1606,8 @@ mod cfg_copy_coalesce_tests {
         ];
         let mut multi_def = FxHashSet::default();
         multi_def.insert(2);
-        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
         assert_ne!(aliases.get(&0), Some(&2));
         assert_ne!(aliases.get(&2), Some(&0));
         assert_eq!(aliases.get(&1), Some(&2));
@@ -1361,9 +1615,6 @@ mod cfg_copy_coalesce_tests {
 
     #[test]
     fn cfg_copy_coalesces_loop_carried_phi_sources() {
-        // init is dead after its edge copy and may share the phi home.
-        // next is redefined at the header; CFG liveness keeps it distinct
-        // because the exit still reads the pre-increment phi.
         let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![
             block(
@@ -1404,7 +1655,8 @@ mod cfg_copy_coalesce_tests {
         ];
         let mut multi_def = FxHashSet::default();
         multi_def.insert(2);
-        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default());
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
         assert_eq!(aliases.get(&0), Some(&2));
         assert_ne!(aliases.get(&1), Some(&2));
     }
@@ -1429,8 +1681,12 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
         ));
-        let (aliases, _) =
-            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default());
+        let (aliases, _) = build_cfg_copy_alias_map(
+            &func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            None,
+        );
         assert!(aliases.is_empty());
     }
 
@@ -1448,8 +1704,12 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Value(Value(0)))),
         ));
-        let (aliases, _) =
-            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default());
+        let (aliases, _) = build_cfg_copy_alias_map(
+            &func,
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+            None,
+        );
         assert!(aliases.is_empty());
     }
 
@@ -1523,10 +1783,54 @@ mod cfg_copy_coalesce_tests {
         let skip = compute_immediately_consumed(&func, false);
         assert!(!skip.contains(&0));
     }
+
+    #[test]
+    fn immediately_consumed_binop_const_rhs_on_x86() {
+        let mut func = IrFunction::new("imm".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 1),
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_copy_rename_chain() {
+        let mut func = IrFunction::new("rename".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 4),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0), "src of dead copy should stay in acc");
+        assert!(skip.contains(&1), "copy dest consumed by cast");
+    }
 }
 
-/// Codegen reads args outside `sse_load_arg` / `avx_load_arg_to` and would
-/// observe a deferred (never-written) slot.
 pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
@@ -1569,8 +1873,6 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
     )
 }
 
-/// Two-operand emitters that load the last-stored operand first into
-/// `%xmm1`/`%ymm1` when `args[1]` is still in `%xmm0`/`%ymm0`.
 fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
@@ -1706,12 +2008,8 @@ fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     )
 }
 
-/// Vector-result stores that can be skipped: the dest is consumed once from
-/// the last-store peephole by a cache-aware intrinsic in the same block.
-///
-/// All def sites of the slot must qualify. Codegen skips the store at every
-/// writer, so one non-adjacent site would make its consumer read a
-/// never-written slot.
+/// Defer a vector home-slot store when every def is consumed once from the
+/// last-store peephole by a cache-aware intrinsic in the same block.
 pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut result = FxHashSet::default();
 
@@ -1847,7 +2145,6 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
         for &(bi, i) in &sites_sorted {
             let insts = &func.blocks[bi].instructions;
 
-            // Use at or before the def ⇒ backedge / RMW; slot must stay live.
             let earlier_use = uses
                 .get(&slot)
                 .is_some_and(|u| u.iter().any(|&(ubi, uii)| ubi == bi && uii <= i));
@@ -1906,8 +2203,6 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
             let pos = cargs
                 .iter()
                 .position(|a| matches!(a, Operand::Value(v) if v.0 == slot));
-            // pos 0: first vector load. pos 1: two-operand emitter load-order swap.
-            // pos ≥ 2 (FMA/etc.) is not covered by that swap.
             let cache_aware = match pos {
                 Some(0) => !is_raw_reader_intrinsic(cop),
                 Some(1) => is_two_operand_binary(cop),
