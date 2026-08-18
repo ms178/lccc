@@ -234,7 +234,16 @@ impl I686Codegen {
 
     // ---- emit_prologue ----
 
-    pub(super) fn emit_prologue_impl(&mut self, _func: &IrFunction, frame_size: i64) {
+    pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        // Private codegen metadata consumed (and removed) by the i686 assembly
+        // peephole.  Without the return type it must conservatively keep EDX
+        // live at every ret for the i64 ABI, which preserves hundreds of dead
+        // `mov ..., %edx` relays in ordinary 32-bit-returning functions.
+        if matches!(func.return_type, IrType::I64 | IrType::U64)
+            || is_i128_type(func.return_type)
+        {
+            self.state.emit("# lccc-i686-return-uses-edx");
+        }
         if self.omit_frame_pointer {
             // No frame pointer setup; use ESP-relative addressing.
             // frame_base_offset and esp_adjust will be set after callee-saved pushes.
@@ -515,6 +524,49 @@ impl I686Codegen {
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
+
+            // mem2reg commonly removes the frontend's parameter alloca.  A
+            // regparm value still arrives in EAX/EDX/ECX and must be captured
+            // at function entry, before ordinary code can clobber those
+            // caller-saved registers.  i686's global allocator assigns only
+            // callee-saved EBX/ESI/EDI/(EBP), so these moves cannot form an
+            // incoming-register cycle; spilled destinations are equally safe.
+            if let ParamClass::IntReg { reg_idx } = class {
+                let has_alloca_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
+                    .is_some();
+                if !has_alloca_slot {
+                    if let Some(paramref_dest) = paramref_dests[i] {
+                        let full = ["%eax", "%edx", "%ecx"][reg_idx];
+                        let byte = ["%al", "%dl", "%cl"][reg_idx];
+                        let word = ["%ax", "%dx", "%cx"][reg_idx];
+                        let ty = func.params[i].ty;
+                        if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
+                            let dest_reg = phys_reg_name(phys_reg);
+                            match ty {
+                                IrType::I8 => emit!(self.state, "    movsbl {}, %{}", byte, dest_reg),
+                                IrType::U8 => emit!(self.state, "    movzbl {}, %{}", byte, dest_reg),
+                                IrType::I16 => emit!(self.state, "    movswl {}, %{}", word, dest_reg),
+                                IrType::U16 => emit!(self.state, "    movzwl {}, %{}", word, dest_reg),
+                                _ => emit!(self.state, "    movl {}, %{}", full, dest_reg),
+                            }
+                            self.state.param_pre_stored.insert(i);
+                        } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
+                            let slot_ref = self.slot_ref(slot);
+                            match ty {
+                                IrType::I8 => emit!(self.state, "    movsbl {}, {}", byte, full),
+                                IrType::U8 => emit!(self.state, "    movzbl {}, {}", byte, full),
+                                IrType::I16 => emit!(self.state, "    movswl {}, {}", word, full),
+                                IrType::U16 => emit!(self.state, "    movzwl {}, {}", word, full),
+                                _ => {}
+                            }
+                            emit!(self.state, "    movl {}, {}", full, slot_ref);
+                            self.state.param_pre_stored.insert(i);
+                        }
+                    }
+                    continue;
+                }
+            }
 
             // Pre-store optimization for fastcall register params: when the param's
             // alloca was eliminated (by mem2reg) but the ParamRef dest is register-

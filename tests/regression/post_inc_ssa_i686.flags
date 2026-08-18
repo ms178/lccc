@@ -1,0 +1,1 @@
+-m32 -nostdlib -static -Wl,-e,_start

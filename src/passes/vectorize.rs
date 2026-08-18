@@ -6393,17 +6393,42 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
     if func.blocks.len() != 1 || std::env::var("CCC_NO_FIXED_SLP").is_ok() {
         return 0;
     }
+    let block = &func.blocks[0];
+    // The packed intrinsic performs its loads at the replacement site, just
+    // before the return.  A call, store, atomic, or other ordered operation
+    // anywhere in this straight-line block could change the source objects (or
+    // make the original access order observable) between the scalar loads and
+    // that site.  Restrict this specialized SLP fold to pure address/scalar
+    // computation plus ordinary loads.  This conservative whitelist also makes
+    // future side-effecting IR variants reject by default.
+    if block.instructions.iter().any(|inst| !matches!(
+        inst,
+        Instruction::Alloca { .. }
+            | Instruction::Load { .. }
+            | Instruction::BinOp { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::Cmp { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::Phi { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Select { .. }
+            | Instruction::ParamRef { .. }
+    )) {
+        return 0;
+    }
     let ty = func.return_type;
     if !matches!(ty, IrType::F32 | IrType::F64) {
         return 0;
     }
-    let Operand::Value(root) = (match &func.blocks[0].terminator {
+    let Operand::Value(root) = (match &block.terminator {
         Terminator::Return(Some(value)) => value.clone(),
         _ => return 0,
     }) else {
         return 0;
     };
-    let block = &func.blocks[0];
 
     fn collect_add_terms(
         block: &BasicBlock,
@@ -6432,10 +6457,18 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
     }
 
     fn load_address(block: &BasicBlock, value: Value, ty: IrType) -> Option<(Value, i64)> {
-        let Instruction::Load { ptr, ty: load_ty, .. } = find_inst_by_dest(block, value)? else {
+        let Instruction::Load {
+            ptr,
+            ty: load_ty,
+            seg_override,
+            ..
+        } = find_inst_by_dest(block, value)? else {
             return None;
         };
-        if *load_ty != ty {
+        // The fixed-distance intrinsic currently emits ordinary (%gpr) vector
+        // loads.  Folding a __seg_fs/__seg_gs scalar load would silently drop
+        // its architectural address-space prefix and read different memory.
+        if *load_ty != ty || *seg_override != AddressSpace::Default {
             return None;
         }
         if let Some(Instruction::GetElementPtr {
@@ -6535,23 +6568,35 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
 
 /// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, false, false)
+    vectorize_function_mode(func, false, false, false)
 }
 
 /// Run x86 vectorization with reassociation but without FMA contraction.
 pub(crate) fn vectorize_function_reassoc(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, false)
+    vectorize_function_mode(func, true, false, true)
+}
+
+/// Preserve the established loop-vectorization policy while withholding the
+/// fixed-width 256-bit SLP fold when the requested ISA has no AVX.
+pub(crate) fn vectorize_function_reassoc_without_fixed_slp(func: &mut IrFunction) -> usize {
+    vectorize_function_mode(func, true, false, false)
 }
 
 /// Run x86 vectorization with explicit reassociation and fast contraction.
 pub(crate) fn vectorize_function_fast_math(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, true)
+    vectorize_function_mode(func, true, true, true)
+}
+
+/// Fast-math counterpart used for baseline x86-64 targets without AVX.
+pub(crate) fn vectorize_function_fast_math_without_fixed_slp(func: &mut IrFunction) -> usize {
+    vectorize_function_mode(func, true, true, false)
 }
 
 fn vectorize_function_mode(
     func: &mut IrFunction,
     fp_reassoc: bool,
     fp_contract_fast: bool,
+    enable_fixed_slp: bool,
 ) -> usize {
     // A DynAlloca changes the live stack extent at run time. The current vector
     // loop/remainder builder assumes fixed alloca addresses when it rewrites
@@ -6577,7 +6622,7 @@ fn vectorize_function_mode(
         return 0;
     }
 
-    let slp_changes = if fp_reassoc {
+    let slp_changes = if fp_reassoc && enable_fixed_slp {
         transform_fixed_distance_slp(func)
     } else {
         0
@@ -6721,4 +6766,133 @@ pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
 pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis_mode(func, &cfg, true, true, true, false)
+}
+
+#[cfg(test)]
+mod fixed_distance_slp_tests {
+    use super::*;
+
+    fn make_f64x4(seg_override: AddressSpace, trailing_store: bool) -> IrFunction {
+        let mut func = IrFunction::new("fixed_f64x4".into(), IrType::F64, vec![], false);
+        let mut instructions = Vec::new();
+        let mut next = 2u32;
+        let mut fresh = || {
+            let value = Value(next);
+            next += 1;
+            value
+        };
+        let mut terms = Vec::new();
+        for lane in 0..4 {
+            let a_ptr = fresh();
+            instructions.push(Instruction::GetElementPtr {
+                dest: a_ptr,
+                base: Value(0),
+                offset: Operand::Const(IrConst::I64(lane * 8)),
+                ty: IrType::F64,
+            });
+            let a = fresh();
+            instructions.push(Instruction::Load {
+                dest: a,
+                ptr: a_ptr,
+                ty: IrType::F64,
+                seg_override,
+            });
+            let b_ptr = fresh();
+            instructions.push(Instruction::GetElementPtr {
+                dest: b_ptr,
+                base: Value(1),
+                offset: Operand::Const(IrConst::I64(lane * 8)),
+                ty: IrType::F64,
+            });
+            let b = fresh();
+            instructions.push(Instruction::Load {
+                dest: b,
+                ptr: b_ptr,
+                ty: IrType::F64,
+                seg_override,
+            });
+            let delta = fresh();
+            instructions.push(Instruction::BinOp {
+                dest: delta,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ty: IrType::F64,
+            });
+            let square = fresh();
+            instructions.push(Instruction::BinOp {
+                dest: square,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(delta),
+                rhs: Operand::Value(delta),
+                ty: IrType::F64,
+            });
+            terms.push(square);
+        }
+        let lhs = fresh();
+        instructions.push(Instruction::BinOp {
+            dest: lhs,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(terms[0]),
+            rhs: Operand::Value(terms[1]),
+            ty: IrType::F64,
+        });
+        let rhs = fresh();
+        instructions.push(Instruction::BinOp {
+            dest: rhs,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(terms[2]),
+            rhs: Operand::Value(terms[3]),
+            ty: IrType::F64,
+        });
+        let root = fresh();
+        instructions.push(Instruction::BinOp {
+            dest: root,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(lhs),
+            rhs: Operand::Value(rhs),
+            ty: IrType::F64,
+        });
+        if trailing_store {
+            instructions.push(Instruction::Store {
+                val: Operand::Const(IrConst::F64(0.0)),
+                ptr: Value(0),
+                ty: IrType::F64,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        func.next_value_id = next;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(root))),
+            source_spans: vec![],
+        });
+        func
+    }
+
+    #[test]
+    fn fixed_distance_packs_default_address_space() {
+        let mut func = make_f64x4(AddressSpace::Default, false);
+        assert_eq!(transform_fixed_distance_slp(&mut func), 1);
+        assert!(func.blocks[0].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Intrinsic {
+                op: IntrinsicOp::FixedDistanceF64x4,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn fixed_distance_rejects_segment_address_space() {
+        let mut func = make_f64x4(AddressSpace::SegGs, false);
+        assert_eq!(transform_fixed_distance_slp(&mut func), 0);
+    }
+
+    #[test]
+    fn fixed_distance_does_not_sink_loads_across_store() {
+        let mut func = make_f64x4(AddressSpace::Default, true);
+        assert_eq!(transform_fixed_distance_slp(&mut func), 0);
+    }
 }

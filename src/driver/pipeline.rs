@@ -1440,6 +1440,10 @@ impl Driver {
             self.target,
             self.fp_reassoc,
             self.fp_contract_fast,
+            self.target == Target::X86_64
+                && self.enable_avx
+                && !self.no_sse
+                && !self.general_regs_only,
         );
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());

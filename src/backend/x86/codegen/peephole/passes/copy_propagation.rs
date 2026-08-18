@@ -19,6 +19,18 @@
 use super::super::types::*;
 use super::helpers::*;
 
+/// Dynamic memory operands are normally alias-analysis barriers, but a single
+/// ordinary move/LEA has fully explicit register semantics.  It is safe to
+/// rewrite an aliased address register even when that instruction overwrites
+/// the alias source: x86 evaluates source addresses before writing the
+/// destination.  Multi-instruction and implicit-register forms stay opaque.
+fn allows_address_copy_propagation(trimmed: &str) -> bool {
+    let mnemonic = trimmed.split_ascii_whitespace().next().unwrap_or("");
+    (mnemonic.starts_with("mov") || mnemonic.starts_with("lea"))
+        && !trimmed.contains(';')
+        && !has_implicit_reg_usage(trimmed)
+}
+
 /// Try to replace uses of `dst_id` with `src_id` in instruction at index `j`.
 /// Returns true if a replacement was made.
 fn try_propagate_into(
@@ -28,12 +40,14 @@ fn try_propagate_into(
     src_id: RegId,
     dst_id: RegId,
 ) -> bool {
-    // Never propagate into opaque lines (inline asm, multi-instruction sequences)
-    if infos[j].has_indirect_mem {
+    let trimmed = infos[j].trimmed(store.get(j));
+
+    // Dynamic memory is opaque except for the narrow source-address case
+    // above.  In particular, do not weaken barriers for inline asm or
+    // instructions with architectural operands omitted from the text.
+    if infos[j].has_indirect_mem && !allows_address_copy_propagation(trimmed) {
         return false;
     }
-
-    let trimmed = infos[j].trimmed(store.get(j));
 
     // The instruction must reference the destination register
     if infos[j].reg_refs & (1u16 << dst_id) == 0 {
@@ -146,18 +160,33 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
             continue;
         }
 
-        // Lines with indirect memory access (including semicolon-separated
-        // inline asm like "pushf ; pop %rcx") are opaque: don't propagate
-        // into them and invalidate all copies, since we can't determine which
-        // registers the multi-instruction sequence reads or writes.
+        // Dynamic-memory lines remain barriers, except for one final reader
+        // that overwrites the alias SOURCE itself.  Rewrite that address before
+        // clearing state; do not propagate into arbitrary memory operations,
+        // because doing so can interfere with stronger SIB/LEA folds.
+        let trimmed = infos[i].trimmed(store.get(i));
         if infos[i].has_indirect_mem {
+            if allows_address_copy_propagation(trimmed) {
+                let dest = get_dest_reg(&infos[i]);
+                for reg in 0..16u8 {
+                    let src = copy_src[reg as usize];
+                    if src != REG_NONE
+                        && src == dest
+                        && infos[i].reg_refs & (1u16 << reg) != 0
+                    {
+                        if try_propagate_into(store, infos, i, src, reg) {
+                            changed = true;
+                        }
+                        break;
+                    }
+                }
+            }
             copy_src = [REG_NONE; 16];
             i += 1;
             continue;
         }
 
         // Check if this is a reg-to-reg movq that defines a new copy
-        let trimmed = infos[i].trimmed(store.get(i));
         if let Some((src_id, dst_id)) = parse_reg_to_reg_movq(&infos[i], trimmed) {
             // Resolve transitive copies
             let ultimate_src = if copy_src[src_id as usize] != REG_NONE {

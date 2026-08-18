@@ -836,46 +836,67 @@ fn detect_cmp_branch_fusion(
         _ => return None,
     };
 
-    // Locate the Cmp feeding the branch, plus an optional dead trailing Copy
-    // to skip (common after phi-web lowering: Cmp ; Copy ; CondBranch).
+    // Walk backward through the complete value-preserving boolean chain:
+    //
+    //   Cmp -> [Copy | integer Cast]* -> CondBranch
+    //
+    // Cmp results are exactly 0 or 1, so integer width/sign casts preserve
+    // their truth value.  Frontend integer promotions commonly leave several
+    // casts here (for example i8 -> signed char -> int).  Materializing every
+    // step as setcc/movzx/movsx only to test the result is pure overhead.
     let n = block.instructions.len();
     if n == 0 {
         return None;
     }
-    let (cmp_idx, dead_copy_idx) = match &block.instructions[n - 1] {
-        // Common case: the Cmp is the last instruction.
-        Instruction::Cmp { dest, .. } if dest.0 == cond_val.0 => (n - 1, None),
-        _ if n >= 2 => {
-            let (cmp_dest, copy_idx) = match &block.instructions[n - 2] {
-                Instruction::Cmp { dest, .. } => (dest.0, n - 1),
-                _ => return None,
-            };
-            let Instruction::Copy { dest: cd, src: Operand::Value(cs) } = &block.instructions[copy_idx]
-            else {
-                return None;
-            };
-            if cs.0 != cmp_dest {
-                return None;
-            }
-            let cmp_uses = use_counts.get(cmp_dest as usize).copied().unwrap_or(u32::MAX);
-            if cond_val.0 == cmp_dest {
-                // Branch reads the Cmp directly; the Copy must be dead.
-                if use_counts.get(cd.0 as usize).copied().unwrap_or(0) != 0 || cmp_uses != 2 {
-                    return None;
-                }
-            } else if cond_val.0 == cd.0 {
-                // Branch reads the Copy; the Cmp must feed only the Copy, and
-                // the Copy only the branch.
-                if use_counts.get(cd.0 as usize).copied().unwrap_or(u32::MAX) != 1 || cmp_uses != 1 {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-            (n - 2, Some(copy_idx))
+    let mut wanted = cond_val.0;
+    let mut scan = n;
+    let mut chain_end = None;
+    let cmp_idx = loop {
+        if scan == 0 {
+            return None;
         }
-        _ => return None,
+        scan -= 1;
+        match &block.instructions[scan] {
+            Instruction::Cmp { dest, .. } if dest.0 == wanted => break scan,
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+            } if dest.0 == wanted => {
+                if use_counts.get(dest.0 as usize).copied().unwrap_or(u32::MAX) != 1 {
+                    return None;
+                }
+                chain_end.get_or_insert(n - 1);
+                wanted = src.0;
+            }
+            Instruction::Cast {
+                dest,
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+            } if dest.0 == wanted && from_ty.is_integer() && to_ty.is_integer() => {
+                if use_counts.get(dest.0 as usize).copied().unwrap_or(u32::MAX) != 1 {
+                    return None;
+                }
+                chain_end.get_or_insert(n - 1);
+                wanted = src.0;
+            }
+            _ => return None,
+        }
     };
+
+    let cmp_dest = match &block.instructions[cmp_idx] {
+        Instruction::Cmp { dest, .. } => dest.0,
+        _ => unreachable!(),
+    };
+    if wanted != cmp_dest
+        || use_counts
+            .get(cmp_dest as usize)
+            .copied()
+            .unwrap_or(u32::MAX)
+            != 1
+    {
+        return None;
+    }
 
     let ty = match &block.instructions[cmp_idx] {
         Instruction::Cmp { ty, .. } => ty,
@@ -899,14 +920,7 @@ fn detect_cmp_branch_fusion(
         return None;
     }
 
-    // For the simple case the Cmp result must be used exactly once (by the
-    // CondBranch terminator). The dead-Copy shapes carry their own counts above.
-    if dead_copy_idx.is_none()
-        && !((cond_val.0 as usize) < use_counts.len() && use_counts[cond_val.0 as usize] == 1)
-    {
-        return None;
-    }
-    Some((cmp_idx, dead_copy_idx))
+    Some((cmp_idx, chain_end))
 }
 
 /// Detect compare-and-select fusion opportunities within a block.
@@ -1855,9 +1869,13 @@ fn generate_function(
                 cg.state().current_program_point += 1;
                 continue;
             }
-            if fuse_idx.and_then(|f| f.1) == Some(idx) {
-                // Dead Copy between the Cmp and the fused branch: nothing is
-                // emitted, but liveness numbered it — keep the point aligned.
+            if fuse_idx
+                .and_then(|f| f.1.map(|end| idx > f.0 && idx <= end))
+                .unwrap_or(false)
+            {
+                // A value-preserving Copy/Cast between the Cmp and fused
+                // branch emits nothing, but liveness numbered it.  Keep the
+                // codegen program point aligned for every skipped link.
                 cg.state().current_program_point += 1;
                 continue;
             }

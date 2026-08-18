@@ -141,6 +141,8 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut soname: Option<String> = None;
     let mut bsymbolic = false;
     let mut max_page_size = 0x200000u64;
+    let mut max_page_size_explicit = false;
+    let mut elf_i386 = false;
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
@@ -153,21 +155,16 @@ fn run(args: &[String]) -> Result<(), String> {
         match a {
             "-o" => { i += 1; output = args.get(i).cloned().ok_or("-o needs an argument")?; }
             "-m" => {
-                // Emulation selects the output class/machine. This driver
-                // emits ELF64 x86-64 only, so accepting `-m elf_i386` and
-                // then producing a 64-bit image (or, as before, failing later
-                // with the opaque "not 64-bit ELF" when the first input is
-                // read) is worse than refusing up front. The kernel's
-                // setup.elf needs a real ELF32 path; until that exists, say so.
+                // Emulation selects both the input parser and output ELF
+                // class. ELF32 is currently supported for full script links,
+                // which is the path used by Linux's real-mode setup image.
                 i += 1;
                 match args.get(i).map(String::as_str) {
-                    Some("elf_x86_64") | Some("elf64_x86_64") | None => {}
+                    Some("elf_x86_64") | Some("elf64_x86_64") => elf_i386 = false,
+                    Some("elf_i386") | Some("i386linux") => elf_i386 = true,
+                    None => return Err("-m needs an argument".into()),
                     Some(other) => {
-                        return Err(format!(
-                            "unsupported emulation '-m {other}': this linker emits \
-                             ELF64 x86-64 only. 32-bit output (elf_i386) is not \
-                             implemented; use the i686 backend or GNU ld for it."
-                        ));
+                        return Err(format!("unsupported emulation '-m {other}'"));
                     }
                 }
             }
@@ -239,6 +236,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
                 if let Some(kw) = args.get(i) {
                     if let Some(value) = kw.strip_prefix("max-page-size=") {
+                        max_page_size_explicit = true;
                         max_page_size = if let Some(hex) = value.strip_prefix("0x") {
                             u64::from_str_radix(hex, 16).unwrap_or(max_page_size)
                         } else {
@@ -413,11 +411,20 @@ fn run(args: &[String]) -> Result<(), String> {
     if inputs.is_empty() {
         return Err("no input files".into());
     }
+    // i386's ABI maximum page size is 4 KiB. Preserve an explicit
+    // `-z max-page-size=` override, but do not inherit x86-64's 2 MiB default:
+    // doing so puts setup.elf's first 32 KiB section behind a 2 MiB file hole.
+    if elf_i386 && !max_page_size_explicit {
+        max_page_size = 0x1000;
+    }
 
     // ------------------------------------------------------------------
     // Mode 1: relocatable link (ld -r).
     // ------------------------------------------------------------------
     if relocatable {
+        if elf_i386 {
+            return Err("ELF32/i386 relocatable (-r) output is not implemented; ELF32 is currently supported with -T/--script".into());
+        }
         if script_path.is_some() {
             eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
         }
@@ -448,8 +455,13 @@ fn run(args: &[String]) -> Result<(), String> {
     // Mode 2: script-driven link (kernel-style -T).
     // ------------------------------------------------------------------
     if let Some(script_path) = script_path {
-        let mut objects = Vec::new();
-        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+        let mut objects = if elf_i386 {
+            lccc::linker_entry::load_inputs_i386_script(&inputs)?
+        } else {
+            let mut objects = Vec::new();
+            lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+            objects
+        };
         if build_id {
             lccc::linker_entry::append_build_id_object(&mut objects);
         }
@@ -459,10 +471,20 @@ fn run(args: &[String]) -> Result<(), String> {
             // command-line -e overrides ENTRY() in the script
             script_src = format!("ENTRY({})\n{}", e, script_src);
         }
+        if elf_i386 {
+            return lccc::linker_entry::link_with_script_i386(
+                &objects, &script_src, &output, emit_symtab,
+                is_pie || shared, emit_relocs, soname.as_deref(), bsymbolic,
+                max_page_size);
+        }
         return lccc::linker_entry::link_with_script_x86(
             &objects, &script_src, &output, emit_symtab,
             is_pie || shared, emit_relocs, soname.as_deref(), bsymbolic,
             max_page_size);
+    }
+
+    if elf_i386 {
+        return Err("ELF32/i386 output without a linker script is not implemented in lccc-ld; use the i686 compiler driver or pass -T".into());
     }
 
     // ------------------------------------------------------------------

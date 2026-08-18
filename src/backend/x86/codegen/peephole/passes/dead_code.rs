@@ -141,10 +141,18 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             }
 
             if infos[j].is_barrier() {
-                // At a basic block boundary, we can't prove the register is dead
-                // without analyzing all successor paths. Conservatively stop.
-                // (Previously this followed jmp targets, but that was unsound for
-                // complex control flow with conditional branches at the target.)
+                // A return cannot observe non-result caller-saved registers.
+                // This lets copy propagation finish folds such as
+                // `movq %rax,%rcx; movsbl (%rcx),%eax` at a leaf return.
+                // Keep RAX/RDX (scalar/aggregate results), all callee-saved
+                // registers, and every other control-flow boundary conservative.
+                if infos[j].kind == LineKind::Ret
+                    && matches!(dst_reg, 1 | 6 | 7 | 8 | 9 | 10 | 11)
+                {
+                    dead = true;
+                }
+                // At any other basic block boundary, we can't prove the
+                // register dead without analyzing every successor path.
                 break;
             }
 
@@ -684,14 +692,14 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
             if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
                 let store_text = infos[k].trimmed(store.get(k));
-                // `ret` implicitly reads and pops the return address at
-                // 0(%rsp). Inline retpolines deliberately rewrite that slot
-                // with `movq %target,(%rsp); ret`; treating the store as a
-                // never-read frame spill turns the dispatch into the infinite
-                // speculation-trap loop.
-                let next = next_non_nop(infos, k + 1, func_end);
-                if offset == 0 && store_text.contains("(%rsp)")
-                    && next < func_end && matches!(infos[next].kind, LineKind::Ret)
+                // A store to the current stack top is an architectural input
+                // to an immediately following pop/ret.  Inline retpolines use
+                // exactly `movq %target,(%rsp); ret` to replace the speculative
+                // return address.  Treating only explicit loads as reads
+                // deleted that store and trapped forever in the pause loop.
+                if offset == 0
+                    && store_text.ends_with("(%rsp)")
+                    && stack_top_is_consumed_next(store, infos, k + 1, func_end)
                 {
                     continue;
                 }
@@ -714,6 +722,31 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
     }
 }
 
+
+/// Whether the next executable instruction consumes the current stack top.
+/// Labels and unwind directives do not execute and therefore do not break the
+/// producer/consumer relation.
+fn stack_top_is_consumed_next(
+    store: &LineStore,
+    infos: &[LineInfo],
+    mut idx: usize,
+    end: usize,
+) -> bool {
+    while idx < end {
+        if infos[idx].is_nop()
+            || matches!(
+                infos[idx].kind,
+                LineKind::Empty | LineKind::Directive | LineKind::Label
+            )
+        {
+            idx += 1;
+            continue;
+        }
+        return matches!(infos[idx].kind, LineKind::Pop { .. } | LineKind::Ret)
+            || infos[idx].trimmed(store.get(idx)).starts_with("ret ");
+    }
+    false
+}
 
 /// Is the RSP-shift at `k` part of an epilogue chain?
 ///

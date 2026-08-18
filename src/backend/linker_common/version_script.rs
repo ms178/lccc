@@ -109,11 +109,22 @@ impl VersionScript {
     /// symbol listed only in `LIBV_2.0` is still exported. Consulting one node
     /// silently dropped every symbol introduced by a later version.
     pub fn matches_global(&self, name: &str) -> bool {
+        self.version_node_for(name).is_some()
+    }
+
+    /// Return the declaration-order node that versions `name`.
+    ///
+    /// Dynamic metadata needs more than a yes/no export decision: each dynsym
+    /// entry's `.gnu.version` value must identify the node that matched it.
+    /// Keeping that lookup here ensures the export filter and version-index
+    /// assignment use exactly the same wildcard semantics.
+    pub fn version_node_for(&self, name: &str) -> Option<usize> {
         if self.nodes.is_empty() {
-            return self.global_patterns.iter().any(|pat| wildcard_match(pat, name));
+            return self.global_patterns.iter()
+                .any(|pat| wildcard_match(pat, name)).then_some(0);
         }
-        self.nodes.iter().any(|n|
-            n.global_patterns.iter().any(|pat| wildcard_match(pat, name)))
+        self.nodes.iter().position(|node|
+            node.global_patterns.iter().any(|pat| wildcard_match(pat, name)))
     }
 
     /// True when `name` is explicitly matched by some node's `local:` list.
@@ -398,6 +409,9 @@ mod tests {
         assert!(vs.matches_global("old_fn"));
         assert!(vs.matches_global("new_fn"),
                 "a symbol introduced by a later node is still exported");
+        assert_eq!(vs.version_node_for("old_fn"), Some(0));
+        assert_eq!(vs.version_node_for("new_fn"), Some(1),
+                   "dynsym must receive the later node's version index");
         assert!(!vs.matches_global("internal_fn"));
         assert!(vs.any_local_star(), "local: * in any node hides the rest");
     }

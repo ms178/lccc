@@ -601,6 +601,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_cfg_retargets_accumulator_update_copyback() {
+        let asm = concat!(
+            "f:\n",
+            "    movq %rcx, %rax\n",
+            "    incl %eax\n",
+            "    movl %eax, %ecx\n",
+            "    movq $0, %rax\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("incl %ecx"), "{result}");
+        assert!(!result.contains("movq %rcx, %rax\n    incl %eax"), "{result}");
+    }
+
+    #[test]
+    fn test_copy_propagates_into_source_clobbering_address_load() {
+        let asm = concat!(
+            "f:\n",
+            "    movq %rax, %rcx\n",
+            "    movsbl (%rcx), %eax\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsbl (%rax), %eax"), "{result}");
+        assert!(!result.contains("movq %rax, %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_stack_top_store_consumed_by_ret_survives_dse() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $16, %rsp\n",
+            ".Lset:\n",
+            "    movq %rdx, (%rsp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movq %rdx, (%rsp)"), "{result}");
+    }
+
+    #[test]
     fn test_fp_xmm_roundtrip_load_rax() {
         let asm = "    movq -32(%rbp), %rax\n    movq %rax, %xmm0\n".to_string();
         let result = peephole_optimize(asm);

@@ -1653,3 +1653,157 @@ mmap win is intact at **48,786,539 vs 52,406,946 Ir (−6.9 %)**.
 wrong for four sessions because nothing ever contradicted it. When a class of
 defect escapes, fix the gate, not just the instance — and then prove the gate
 fails on the reintroduced defect.
+
+---
+
+# Session 14 — focused Linux i686 setup reproduction and code-size work
+
+**Rebased base:** `ms178/lccc` main `208bbfae` (PR #114).
+**Kernel:** Linux 6.18.44 with all 26 selected `linux-cachymod-6.18` package
+patches applied. **Scope:** exactly the 24 objects in `arch/x86/boot/setup-y`;
+no full kernel build. C objects are compiled by LCCC and the final setup ELF is
+linked by `lccc-ld`, with GNU BFD used as a file-level oracle.
+
+## 14.1 Reproducing the wall
+
+A guarded top-level make target (active only at `MAKELEVEL=1`) drives the
+subdirectory with the kernel's real setup flags. This avoids two invalid
+shortcuts: asking kbuild for individual objects selects generic `-m64`, while
+an unguarded injected target is recursively redefined. The focused build now
+reliably produces all 24 setup objects without attempting a full kernel.
+
+The current relaxed-assertion link still demonstrates that code generation,
+not just the historical assertion, is the blocker. After rebasing S21 onto
+main `208bbfae`, `.text` alone is `0x9303` (37,635 bytes), and its end is
+`0x97e5`, 6,117 bytes beyond 32 KiB. The improved placement now gives
+`setup_size=0xb000`, `setup_sects=0x58`, and `_end=0xba00`. Relaxing the
+assertion therefore diagnoses the overrun; it does not solve it.
+
+## 14.2 Correctness fixes required before optimization
+
+The i686 path first needed ABI and optimizer repairs: regparm callees capture
+incoming `%eax/%edx/%ecx` correctly; dead epilogue writes and genuinely unused
+callee-save pairs can be removed without changing body `%esp`; wide integer
+returns keep `%edx` live only in marked functions; and whole-function stack-slot
+DSE no longer compares unstable raw `N(%esp)` offsets across pushes or stack
+adjustments.
+
+The final dead-move pass now solves backward liveness over the function CFG,
+including branches and loop backedges. Unknown jump targets remain
+conservative. Architectural operands omitted from AT&T syntax are explicit in
+the liveness model: one-operand multiply/divide, `cltd`, `xchg`, and string
+operations cannot lose live inputs. A red-team test uses the high half of
+`mull` specifically because the old explicit-text-only model could otherwise
+consider the `%eax` dividend dead.
+
+`movsbl`/`movswl` also must not be identified as implicit `movs` string
+instructions merely because their mnemonic starts with `movs`; string opcodes
+are now matched exactly, including optional `rep` prefixes.
+
+## 14.3 S21: source-clobber propagation and accumulator updates
+
+Two frequent accumulator-backend shapes survived S20:
+
+```asm
+movl %eax,%ecx
+movsbl (%ecx),%eax
+```
+
+and
+
+```asm
+movl %ebx,%eax
+incl %eax
+movl %eax,%ebx
+```
+
+The first copy is valid for the source read of the clobbering load itself: x86
+reads the address before writing `%eax`. Copy propagation now rewrites that
+last reader and then stops, retaining conservative rejection of partial or
+unencodable substitutions.
+
+The second sequence is retargeted to `incl %ebx` only when CFG liveness proves
+`%eax` dead after the copy-back. All whole `%eax` source occurrences are
+retargeted too (`addl %eax,%eax` becomes `addl %ebx,%ebx`); implicit one-operand
+`imull` and partial-register operations are explicitly rejected. Zero idioms
+such as `xorl %eax,%eax` are modeled as writes with no dependency on old
+`%eax`, which exposes additional safe cases.
+
+Concrete kernel changes include `skip_atoi` folding
+`movl (%ebx),%eax; movl %eax,%ecx; movsbl (%ecx),%eax` to the two-instruction
+form, and `strlen` replacing its three-instruction cursor increment with
+`incl %ebx`.
+
+## 14.4 Measured result and validation
+
+Compared with S20, aggregate text across the same 24 setup objects fell from
+45,106 to **40,258 bytes**, a further **4,848-byte reduction** after combining
+the rebased main work with this series. Twenty objects shrank, three assembler
+objects were unchanged, and `cpu.o` grew by 97 bytes; the latter remains a
+specific follow-up rather than being hidden by the much larger aggregate win.
+The largest reductions were:
+
+| object | S20 | rebased S21 | delta |
+|---|---:|---:|---:|
+| `video.o` | 6,401 | 5,499 | -902 |
+| `video-vesa.o` | 2,822 | 2,104 | -718 |
+| `video-mode.o` | 2,671 | 2,124 | -547 |
+| `video-bios.o` | 2,246 | 1,801 | -445 |
+| `video-vga.o` | 2,091 | 1,744 | -347 |
+| `main.o` | 1,537 | 1,226 | -311 |
+
+Validation is intentionally layered:
+
+- 38 focused i686 peephole tests pass, including alias-clobber, loop-backedge,
+  partial/implicit-op rejection, wide return, `%esp` store, stack-top/`ret`,
+  and multiply-input soundness cases;
+- 118 focused x86-64 peephole tests pass (two pre-existing tests remain
+  intentionally ignored);
+- the official executable comparison is 325 passes and the same six known
+  oracle mismatches; `post_inc_ssa_i686`, `i686_return64_peephole`, and the
+  repaired `retpoline_thunk_inline` runtime test pass;
+- all 24 setup objects rebuild with clean-source fastbuild LCCC;
+- `lccc-ld` and GNU BFD produce byte-identical 42,656-byte setup binaries,
+  SHA-256 `1281fe86c7452d5281f52521829046fc7f5651ac6c0199813aabea7a60e2e5fa`.
+
+A broad caller-saved allocation experiment for i686 `ParamRef` values was
+rejected: it enlarged `string.o` by 75 bytes and did not improve `strlen`. It
+would also require real parallel-copy handling for incoming
+`%eax/%edx/%ecx`, including `%edx`↔`%ecx` cycles; the naive change is not kept.
+
+## 14.5 Latest-main red-team findings and cross-backend parity
+
+The latest main changes were complementary and account for most of the rebased
+size win: escape-aware DSE, i686 register-base GEP folding, tail calls, and the
+new x86-64 CFG liveness machinery all survived the rebase. The older blanket
+ESP-store exclusion was deliberately not restored; main's normalized ESP walk
+is more precise and passes the cross-push regression.
+
+The audit did find one release-blocking DSE bug. Inline retpolines dispatch with
+`movq %target,(%rsp); ret`; the escape-aware x86-64 never-read-store pass
+counted only textual loads, deleted the stack-top write, and left execution
+spinning forever in `pause; lfence; jmp`. DSE now recognizes a stack-top store
+immediately consumed by `ret` or `pop`. The same architectural rule and test
+were added to i686 rather than fixing only the observed x86-64 failure. The
+full retpoline runtime test now terminates and its disassembly retains the
+required store.
+
+The two S21 code-size folds are also wired in both backends where applicable.
+x86-64 copy propagation now permits only the narrow final address-reader case
+that overwrites the alias source; a first broad implementation was rejected
+because it interfered with a stronger SIB/LEA fold. x86-64's existing
+CFG-liveness copy/shift/copy-back fold now accepts the same safe explicit
+32-bit ALU update family as i686, while rejecting partial-width and implicit
+one-operand multiply forms. A non-result caller-saved move with no read before
+`ret` can be deleted on x86-64, allowing the propagated relay copy to disappear
+without treating arbitrary branch boundaries as dead.
+
+## 14.6 Follow-up
+
+The setup image is materially smaller but is not yet below the 32 KiB wall.
+Next work should profile the remaining large bodies (`video.o`, `printf.o`,
+`string.o`) for repeatable accumulator/spill shapes, add semantic tests before
+each rewrite, and continue file-level BFD comparison after every linked-layout
+change. lld, mold, and wild were lost with the interrupted workspace and must
+be restored before claiming renewed four-linker coverage; GNU BFD is the
+current ELF32 setup oracle.

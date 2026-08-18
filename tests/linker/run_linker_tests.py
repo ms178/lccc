@@ -2223,6 +2223,280 @@ def _vdso_script_test(args, oracles):
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
+def _elf32_script_test(args, oracles):
+    """Linux setup.elf-shaped ELF32 link, including every narrow i386 REL.
+
+    Compare the flat alloc image byte-for-byte with GNU BFD.  This catches both
+    relocation formulas and output-class mistakes; merely asking readelf to
+    parse the file would not notice a missing LONG signature or a bad addend.
+    """
+    name = "script_elf32_i386_relocations"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        asm = r'''
+            .code32
+            .section .text,"ax"
+            .globl _start
+        _start:
+        low_target:
+            call target
+            .long target
+            .word target
+            .byte target
+            ret
+            .section .text16,"ax"
+            .code16
+            # These displacements are mathematically below -32768, but are
+            # valid after the modulo-2^16 wrap specified for R_386_PC16.
+            call low_target
+            jmp low_target
+            .code32
+            .section .data,"aw"
+            .globl target
+        target:
+            .long 0x12345678
+        '''
+        script = r'''
+            OUTPUT_FORMAT("elf32-i386")
+            OUTPUT_ARCH(i386)
+            ENTRY(_start)
+            SECTIONS {
+              . = 0;
+              .text : { *(.text) }
+              .data : { *(.data) }
+              . = 0x8200;
+              .text16 : { *(.text16) }
+              .signature : { BYTE(0x12) SHORT(0x3456) LONG(0x5a5aaa55) }
+              _end = .;
+              /DISCARD/ : { *(.note*) }
+            }
+        '''
+        with open(os.path.join(td, "in.s"), "w") as f:
+            f.write(textwrap.dedent(asm))
+        with open(os.path.join(td, "setup.ld"), "w") as f:
+            f.write(textwrap.dedent(script))
+        r = sh(["as", "--32", "-o", "in.o", "in.s"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:200])
+
+        rels = sh(["readelf", "-rW", "in.o"], cwd=td).stdout.decode()
+        required_relocs = ("R_386_32", "R_386_PC32", "R_386_16",
+                           "R_386_PC16", "R_386_8")
+        if any(rel not in rels for rel in required_relocs):
+            return Result(name, "SKIP", "assembler did not emit required i386 REL set")
+
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-m", "elf_i386", "-T", "setup.ld",
+                "-o", "out.lccc", "in.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:400]}")
+        r = sh(["ld.bfd", "-m", "elf_i386", "-T", "setup.ld",
+                "-o", "out.bfd", "in.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", f"bfd unavailable: {r.stderr.decode()[:200]}")
+
+        for stem in ("lccc", "bfd"):
+            r = sh(["objcopy", "-O", "binary", f"out.{stem}", f"out.{stem}.bin"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"objcopy rejected {stem}: {r.stderr.decode()[:200]}")
+        with open(os.path.join(td, "out.lccc.bin"), "rb") as f:
+            lccc_bytes = f.read()
+        with open(os.path.join(td, "out.bfd.bin"), "rb") as f:
+            bfd_bytes = f.read()
+        if lccc_bytes != bfd_bytes:
+            return Result(name, "FAIL",
+                          f"flat image differs from bfd ({len(lccc_bytes)} vs {len(bfd_bytes)} bytes)")
+        if not lccc_bytes.endswith(bytes.fromhex("12563455aa5a5a")):
+            return Result(name, "FAIL", "BYTE/SHORT/LONG signature bytes are absent")
+
+        hdr = sh(["readelf", "-hW", "out.lccc"], cwd=td).stdout.decode()
+        required_hdr = ("Class:                             ELF32",
+                        "Machine:                           Intel 80386",
+                        "Size of this header:               52 (bytes)",
+                        "Size of program headers:           32 (bytes)",
+                        "Size of section headers:           40 (bytes)")
+        missing = [token for token in required_hdr if token not in hdr]
+        if missing:
+            return Result(name, "FAIL", f"bad ELF32 header; missing={missing}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _elf32_vdso_test(args, oracles):
+    """ELF32 ET_DYN metadata, i386 PIC relocations and multi-node versions."""
+    name = "script_elf32_vdso_multiversion"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        source = """
+            __attribute__((visibility("hidden"))) int hidden_data = 40;
+            int old_api(void) { return hidden_data + 1; }
+            int new_api(void) { return hidden_data + 2; }
+        """
+        script = r'''
+            OUTPUT_FORMAT("elf32-i386")
+            OUTPUT_ARCH(i386)
+            PHDRS {
+              text PT_LOAD FLAGS(5) FILEHDR PHDRS;
+              dynamic PT_DYNAMIC FLAGS(4);
+            }
+            SECTIONS {
+              . = SIZEOF_HEADERS;
+              .hash : { *(.hash) } :text
+              .gnu.hash : { *(.gnu.hash) }
+              .dynsym : { *(.dynsym) }
+              .dynstr : { *(.dynstr) }
+              .gnu.version : { *(.gnu.version) }
+              .gnu.version_d : { *(.gnu.version_d) }
+              .dynamic : { *(.dynamic) } :text :dynamic
+              .text : { *(.text*) } :text
+              .data : { *(.data*) } :text
+              /DISCARD/ : { *(.note*) *(.eh_frame*) *(.comment) }
+            }
+            VERSION {
+              OLD_1 { global: old_api; local: *; };
+              NEW_2 { global: new_api; } OLD_1;
+            }
+        '''
+        with open(os.path.join(td, "v.c"), "w") as f:
+            f.write(textwrap.dedent(source))
+        with open(os.path.join(td, "v.lds"), "w") as f:
+            f.write(textwrap.dedent(script))
+        r = sh([CC, "-m32", "-fPIC", "-O1", "-fno-asynchronous-unwind-tables",
+                "-fno-stack-protector", "-c", "v.c", "-o", "v.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:200])
+        input_relocs = sh(["readelf", "-rW", "v.o"], cwd=td).stdout.decode()
+        if "R_386_GOTPC" not in input_relocs or "R_386_GOTOFF" not in input_relocs:
+            return Result(name, "SKIP", "compiler did not emit i386 PIC GOT relocations")
+
+        common = ["-m", "elf_i386", "-shared", "-Bsymbolic", "-soname",
+                  "test-vdso32.so.1", "-T", "v.lds", "v.o"]
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld] + common + ["-o", "out.lccc.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:400]}")
+        r = sh(["ld.bfd"] + common + ["-o", "out.bfd.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", f"bfd rejected oracle fixture: {r.stderr.decode()[:200]}")
+
+        dynsyms = sh(["readelf", "--dyn-syms", "-W", "out.lccc.so"], cwd=td).stdout.decode()
+        versions = sh(["readelf", "-V", "-W", "out.lccc.so"], cwd=td).stdout.decode()
+        dynamic = sh(["readelf", "-d", "-W", "out.lccc.so"], cwd=td).stdout.decode()
+        remaining = sh(["readelf", "-r", "-W", "out.lccc.so"], cwd=td).stdout.decode()
+        required = ("old_api@@OLD_1", "new_api@@NEW_2")
+        if any(token not in dynsyms for token in required) or "hidden_data" in dynsyms:
+            return Result(name, "FAIL", "ELF32 dynsym version/visibility assignment is wrong")
+        if "Parent 1: OLD_1" not in versions or "REV: 1" not in versions.upper():
+            return Result(name, "FAIL", "multi-node verdef inheritance is absent")
+        for token in ("SONAME", "HASH", "GNU_HASH", "SYMENT"):
+            if token not in dynamic:
+                return Result(name, "FAIL", f"ELF32 .dynamic lacks {token}")
+        if re.search(r" R_386_", remaining):
+            return Result(name, "FAIL", "vDSO retained a dynamic relocation")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _script_nonalloc_section_test(args, oracles):
+    """Non-ALLOC PROGBITS must be written and have relocations applied."""
+    name = "script_nonalloc_debug_payload"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        asm = r'''
+            .globl _start
+            .section .text,"ax"
+        _start:
+            ret
+            .section .discard.addressable,"a",@progbits
+        discarded_local:
+            .long 0xdeadbeef
+            .section .debug_test,"",@progbits
+            .quad _start
+            .quad discarded_local
+            .ascii "DWARF"
+        '''
+        script = r'''
+            ENTRY(_start)
+            SECTIONS {
+              . = 0x400000;
+              .text : {
+                *(.text)
+                inside_text_end = .;
+                inside_constant = 5;
+                inside_absolute = ABSOLUTE(.);
+              }
+              relative_text_end = .;
+              absolute_text_size = relative_text_end - ADDR(.text);
+              forced_absolute_end = ABSOLUTE(.);
+              .debug_test 0 : { *(.debug_test) }
+              /DISCARD/ : { *(.note*) *(.discard.addressable) }
+            }
+        '''
+        with open(os.path.join(td, "d.s"), "w") as f:
+            f.write(textwrap.dedent(asm))
+        with open(os.path.join(td, "d.lds"), "w") as f:
+            f.write(textwrap.dedent(script))
+        r = sh([CC, "-c", "d.s", "-o", "d.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:200])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        for linker, output in ((lccc_ld, "out.lccc"), ("ld.bfd", "out.bfd")):
+            r = sh([linker, "-T", "d.lds", "d.o", "-o", output], cwd=td)
+            if r.returncode != 0:
+                status = "FAIL" if linker == lccc_ld else "SKIP"
+                return Result(name, status, r.stderr.decode()[:300])
+            r = sh(["objcopy", "--dump-section", f".debug_test={output}.debug",
+                    output], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"objcopy rejected {output}: {r.stderr.decode()[:200]}")
+        lccc_data = open(os.path.join(td, "out.lccc.debug"), "rb").read()
+        bfd_data = open(os.path.join(td, "out.bfd.debug"), "rb").read()
+        expected = (0x400000).to_bytes(8, "little") + bytes(8) + b"DWARF"
+        if lccc_data != bfd_data or lccc_data != expected:
+            return Result(name, "FAIL", "non-ALLOC bytes/relocation differ from bfd")
+        readelf = sh(["readelf", "-SW", "out.lccc"], cwd=td)
+        if readelf.returncode != 0 or b"past end of file" in readelf.stderr:
+            return Result(name, "FAIL", "section header extends beyond the output file")
+        names = {
+            "inside_text_end", "inside_constant", "inside_absolute",
+            "relative_text_end", "absolute_text_size", "forced_absolute_end",
+        }
+        def symbol_semantics(output):
+            result = {}
+            lines = sh(["readelf", "-sW", output], cwd=td).stdout.decode().splitlines()
+            for line in lines:
+                fields = line.split()
+                if len(fields) >= 8 and fields[7] in names:
+                    result[fields[7]] = (fields[1], fields[6])
+            return result
+        lccc_syms = symbol_semantics("out.lccc")
+        bfd_syms = symbol_semantics("out.bfd")
+        if lccc_syms != bfd_syms:
+            return Result(name, "FAIL",
+                          f"script symbol value/section semantics differ: "
+                          f"lccc={lccc_syms}, bfd={bfd_syms}")
+        for relative in ("inside_text_end", "inside_constant", "relative_text_end"):
+            if lccc_syms.get(relative, (None, "ABS"))[1] == "ABS":
+                return Result(name, "FAIL", f"{relative} lost its output-section home")
+        for absolute in ("inside_absolute", "absolute_text_size", "forced_absolute_end"):
+            if lccc_syms.get(absolute, (None, None))[1] != "ABS":
+                return Result(name, "FAIL", f"{absolute} is not SHN_ABS")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 # ============================================================================
 # 11. RELOCATABLE LINKING (ld -r) — differential against GNU ld -r
 # ============================================================================
@@ -4007,6 +4281,10 @@ def main():
         results.append(_pie_script_test(args, oracles))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
+    if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \
+            and (not args.tag or args.tag in ("script", "kernel")):
+        results.append(_elf32_script_test(args, oracles))
+        results.append(_elf32_vdso_test(args, oracles))
     if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_hidden_visibility_test(args, oracles))
     if (not args.filter or "gotpcrel" in args.filter) and (not args.tag or args.tag == "script"):
@@ -4027,6 +4305,9 @@ def main():
         results.append(_comdat_dedup_test(args, oracles))
     if (not args.filter or "section_header" in args.filter) and not args.tag:
         results.append(_section_header_index_consistency_test(args, oracles))
+    if (not args.filter or "nonalloc" in args.filter or "debug_payload" in args.filter) \
+            and (not args.tag or args.tag in ("script", "kernel")):
+        results.append(_script_nonalloc_section_test(args, oracles))
 
     if (not args.filter or "so_" in args.filter) and not args.tag:
         results.append(_interpose_test(args, oracles,

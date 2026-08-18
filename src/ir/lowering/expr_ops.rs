@@ -936,24 +936,12 @@ impl Lowerer {
             let loaded = self.load_lvalue_typed(&lv, ty);
             let loaded_val = self.operand_to_value(loaded);
 
-            // Post-inc/dec saves the old value to a volatile alloca before
-            // computing the new one (register coalescing would otherwise
-            // clobber it, e.g. `while (n--)`). When the result is DISCARDED
-            // (expression statement, for-increment) the old value is never
-            // observed, so the per-iteration spill is pure overhead — skip it.
-            let mut postdec_alloca = None;
-            if !return_new && !self.discard_expr_result {
-                let alloca_ty = if ty == IrType::Ptr { IrType::I64 } else { ty };
-                let tmp = self.emit_entry_alloca_with_flags(
-                    alloca_ty, alloca_ty.size(), 0, true, false,
-                );
-                self.emit(Instruction::Store {
-                    val: Operand::Value(loaded_val), ptr: tmp,
-                    ty: alloca_ty, seg_override: AddressSpace::Default,
-                });
-                postdec_alloca = Some((tmp, alloca_ty));
-            }
-
+            // The loaded value is an SSA definition and is therefore already
+            // the stable result of a post-inc/dec expression.  Keep it in SSA
+            // instead of forcing every evaluated post-inc/dec through a
+            // non-promotable stack home.  The latter was an old workaround for
+            // backend copy coalescing, but it both obscured the true live range
+            // and generated a store/load pair on every loop iteration.
             let (step, binop_ty) = self.inc_dec_step_and_type(ty, inner);
             let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
             let result = self.emit_binop_val(ir_op, Operand::Value(loaded_val), step, binop_ty);
@@ -968,19 +956,12 @@ impl Lowerer {
             if return_new {
                 return store_op;
             }
-            // Result is discarded: no volatile spill was emitted and the old
-            // value is never observed — nothing left to do.
+            // A discarded result needs no old value.  Otherwise the pre-update
+            // load is exactly the value required by C post-inc/dec semantics.
             if self.discard_expr_result {
                 return store_op;
             }
-            // Reload the old value from the alloca we saved earlier
-            let (tmp, alloca_ty) = postdec_alloca.unwrap();
-            let reload_dest = self.fresh_value();
-            self.emit(Instruction::Load {
-                dest: reload_dest, ptr: tmp,
-                ty: alloca_ty, seg_override: AddressSpace::Default,
-            });
-            return Operand::Value(reload_dest);
+            return Operand::Value(loaded_val);
         }
         self.lower_expr(inner)
     }
