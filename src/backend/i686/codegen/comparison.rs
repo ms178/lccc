@@ -103,7 +103,28 @@ impl I686Codegen {
         self.store_eax_to(dest);
     }
 
-    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, _ty: IrType) {
+    /// Normalize a compare immediate to the OPERAND's width and signedness.
+    ///
+    /// lhs reaches %eax via movzbl/movswl/movsbl (operand_to_eax extends
+    /// sub-int loads to 32 bits), so the 32-bit compare is exact ONLY when
+    /// the immediate is represented the same way the extension represents
+    /// the operand. `(unsigned char)255 == (char)-1` miscompiled to
+    /// `cmpl $-1, %eax` against a zero-extended 255 (i686-only; x86-64 uses
+    /// width-matched cmpb). Truncate to the type's width, then zero- or
+    /// sign-extend by the type's signedness — matching operand_to_eax.
+    fn normalize_cmp_imm(imm: i64, ty: IrType) -> i64 {
+        match ty {
+            IrType::I8 => imm as i8 as i64,
+            IrType::U8 => imm as u8 as i64,
+            IrType::I16 => imm as i16 as i64,
+            IrType::U16 => imm as u16 as i64,
+            // I32/U32/Ptr compare as full 32-bit; U32 immediates keep their
+            // bit pattern under the i32 print (cmpl is width-exact).
+            _ => imm as i32 as i64,
+        }
+    }
+
+    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         self.operand_to_eax(lhs);
         // Constant rhs: compare against the immediate directly instead of
         // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
@@ -113,6 +134,7 @@ impl I686Codegen {
         // %ecx untouched, which the register allocator relies on when it
         // places a value in %ecx across a constant compare.
         if let Some(imm) = Self::const_as_imm32(rhs) {
+            let imm = Self::normalize_cmp_imm(imm, ty);
             if imm == 0 {
                 self.state.emit("    testl %eax, %eax");
             } else {
@@ -146,7 +168,7 @@ impl I686Codegen {
         op: IrCmpOp,
         lhs: &Operand,
         rhs: &Operand,
-        _ty: IrType,
+        ty: IrType,
         true_label: &str,
         false_label: &str,
     ) {
@@ -154,6 +176,7 @@ impl I686Codegen {
         // Same immediate forms as emit_int_cmp_impl (see there for the
         // testl flags argument); keeps %ecx clean across fused compares.
         if let Some(imm) = Self::const_as_imm32(rhs) {
+            let imm = Self::normalize_cmp_imm(imm, ty);
             if imm == 0 {
                 self.state.emit("    testl %eax, %eax");
             } else {

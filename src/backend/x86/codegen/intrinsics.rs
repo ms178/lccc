@@ -3135,7 +3135,12 @@ impl X86Codegen {
         assert!(args.len() == 5, "{} expects accumulator plus two base/offset pairs", mnemonic);
 
         let assigned = self.reg_assignments.get(&dest.0).copied().filter(|r| is_xmm_reg(*r));
-        let target = assigned.map(phys_reg_name_256).unwrap_or("ymm2");
+        // Fallback scratch MUST come from the reserved pair (ymm0/ymm1):
+        // ymm2 is PhysReg(20), the FIRST allocatable SIMD register — using it
+        // as scratch clobbers whichever live value the allocator parked
+        // there whenever this dest itself missed allocation. ymm0 carries
+        // the A-stream load below, so the accumulator staging uses ymm1.
+        let target = assigned.map(phys_reg_name_256).unwrap_or("ymm1");
         let acc_same = match (&args[0], assigned) {
             (Operand::Value(acc), Some(reg)) => {
                 self.reg_assignments.get(&acc.0).is_some_and(|r| *r == reg)
@@ -3173,10 +3178,9 @@ impl X86Codegen {
             self.state.vec_last_store_reg = true;
             self.state.vec_last_store_reg_name = Some(name);
         } else {
-            if target != "ymm0" {
-                self.state
-                    .emit_fmt(format_args!("    vmovdqa %{}, %ymm0", target));
-            }
+            // target is the reserved ymm1 here (assigned==None).
+            self.state
+                .emit_fmt(format_args!("    vmovdqa %{}, %ymm0", target));
             self.avx_store_dest(dest);
         }
     }

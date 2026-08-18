@@ -995,18 +995,25 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             }
         }
 
-        // Pattern 2b: Immediate/symbol-load + move fusion --
-        // `movl $X, %eax; movl %eax, %REG` becomes `movl $X, %REG` under the
-        // same deadness scan as Pattern 2a. The codegen emits this shape for
-        // every constant that lands in a phase-2 register (%ecx/%edx), e.g.
-        // `movl $.Lstr0, %eax; movl %eax, %edx`. GCC materializes the
-        // constant into the final register directly.
+        // Pattern 2b: Immediate/symbol/lea + move fusion --
+        // `movl $X, %eax; movl %eax, %REG` becomes `movl $X, %REG`, and
+        // `leal M(%r), %eax; movl %eax, %REG` becomes `leal M(%r), %REG`,
+        // under the same deadness scan as Pattern 2a. The codegen emits
+        // these shapes for every constant/address that lands in a phase-2
+        // register (%ecx/%edx), e.g. `leal 68(%esp), %eax; movl %eax, %edx`
+        // before every regparm intcall. GCC materializes into the final
+        // register directly. The lea form requires the source ADDRESS not
+        // to use %eax as base/index (it would change meaning when retargeted;
+        // dest-only retarget is always safe since lea doesn't read its dest).
         if let LineKind::Other { dest_reg } = infos[i].kind {
             if dest_reg == REG_EAX {
                 let src_line = trimmed(store, &infos[i], i);
-                if src_line.starts_with("movl $") && src_line.ends_with("%eax")
-                    && !src_line.contains('(')
-                {
+                let is_imm = src_line.starts_with("movl $") && src_line.ends_with("%eax")
+                    && !src_line.contains('(');
+                let is_lea = src_line.starts_with("leal ") && src_line.ends_with("%eax")
+                    && !src_line.contains("%eax,") // %eax not a base/index
+                    && !src_line.contains("(%eax");
+                if is_imm || is_lea {
                     if let LineKind::Move { dst: mdst, src: msrc } = infos[j].kind {
                         if msrc == REG_EAX && mdst != REG_EAX && mdst <= REG_GP_MAX {
                             // Same bounded deadness scan as Pattern 2a.
@@ -1038,8 +1045,8 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             }
                             if dead {
                                 let comma = src_line.rfind(',').unwrap();
-                                let imm = &src_line[..comma]; // "movl $X"
-                                let fused = format!("    {}, {}", imm, reg32_name(mdst));
+                                let head = &src_line[..comma]; // "movl $X" or "leal M(%r)"
+                                let fused = format!("    {}, {}", head, reg32_name(mdst));
                                 store.replace(i, fused);
                                 infos[i] = classify_line(store.get(i));
                                 infos[j].kind = LineKind::Nop;
@@ -3201,6 +3208,21 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    // Phase 3.5: redundant zero-extension elimination (may expose dead
+    // stores and moves by shortening def-use chains, so it runs before DSE
+    // and the liveness cleanup).
+    if eliminate_redundant_zext_i686(&mut store, &mut infos) {
+        let mut changed3 = true;
+        let mut pass_count3 = 0;
+        while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
+            changed3 = false;
+            changed3 |= combined_local_pass(&mut store, &mut infos);
+            changed3 |= eliminate_dead_reg_moves(&store, &mut infos);
+            changed3 |= eliminate_dead_stores(&store, &mut infos);
+            pass_count3 += 1;
+        }
+    }
+
     // Phase 4: Never-read store elimination, then remove callee-save pairs
     // made unused by the dead-move cleanup above.
     eliminate_never_read_stores(&store, &mut infos);
@@ -3211,6 +3233,155 @@ pub fn peephole_optimize(asm: String) -> String {
     optimize_tail_calls_i686(&mut store, &mut infos);
 
     store.build_result(|i| infos[i].is_nop())
+}
+
+// ── Pass: redundant zero-extension elimination (i686 redundant_ext port) ────
+
+/// Track which GP register families provably hold byte values (bits 8..31
+/// zero) or 16-bit values (bits 16..31 zero), and remove/rewrite redundant
+/// re-extensions:
+///   * `movzbl %al, %eax` when %eax already holds a byte value  -> removed
+///   * `movzbl %al, %REG` when %eax already holds a byte value  -> movl copy
+///   * `movzwl %ax, %eax` when %eax already holds a 16-bit value -> removed
+///
+/// The setup-code i686 emitter re-extends after EVERY sub-int operation
+/// (43 movzbl in video-bios.o alone, 15 of them provably redundant), because
+/// operand_to_eax cannot see the producer. Same state machine as the x86-64
+/// pass (redundant_ext.rs): flags cleared at labels/calls/barriers, updated
+/// by extensions, copies, and byte-preserving andl; anything else clears the
+/// written family. Fail-closed: implicit multi-register writers clear all.
+fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = infos.len();
+    let mut is_byte = [false; 8]; // per family: value < 256
+    let mut is_16 = [false; 8];   // per family: value < 65536
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_barrier() {
+            is_byte = [false; 8];
+            is_16 = [false; 8];
+            i += 1;
+            continue;
+        }
+        let t = trimmed(store, &infos[i], i).to_string();
+
+        // movzbl SRC, %DST
+        if let Some(rest) = t.strip_prefix("movzbl ") {
+            if let Some((src, dst)) = rest.split_once(',') {
+                let src = src.trim();
+                let dst = dst.trim();
+                let df = register_family(dst);
+                if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
+                    let sf = register_family(src);
+                    if sf <= REG_GP_MAX && is_byte[sf as usize] {
+                        if sf == df {
+                            // pure no-op
+                            infos[i].kind = LineKind::Nop;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        // cross-register: plain 32-bit copy (shorter, no
+                        // partial-register stall).
+                        store.replace(i, format!(
+                            "    movl {}, {}", reg32_name(sf), reg32_name(df)));
+                        infos[i] = classify_line(store.get(i));
+                        is_byte[df as usize] = true;
+                        is_16[df as usize] = true;
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+                if df <= REG_GP_MAX {
+                    is_byte[df as usize] = true;
+                    is_16[df as usize] = true;
+                }
+                i += 1;
+                continue;
+            }
+        }
+        // movzwl SRC, %DST
+        if let Some(rest) = t.strip_prefix("movzwl ") {
+            if let Some((src, dst)) = rest.split_once(',') {
+                let src = src.trim();
+                let dst = dst.trim();
+                let df = register_family(dst);
+                if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
+                    let sf = register_family(src);
+                    if sf <= REG_GP_MAX && is_16[sf as usize] && sf == df {
+                        infos[i].kind = LineKind::Nop;
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+                if df <= REG_GP_MAX {
+                    is_byte[df as usize] = false;
+                    is_16[df as usize] = true;
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        // Flag propagation / invalidation for everything else.
+        match infos[i].kind {
+            LineKind::Move { dst, src } => {
+                is_byte[dst as usize] = is_byte[src as usize];
+                is_16[dst as usize] = is_16[src as usize];
+            }
+            LineKind::LoadEbp { reg, .. } | LineKind::Pop { reg } => {
+                if reg <= REG_GP_MAX {
+                    is_byte[reg as usize] = false;
+                    is_16[reg as usize] = false;
+                }
+            }
+            LineKind::StoreEbp { .. } | LineKind::Push { .. }
+            | LineKind::Cmp | LineKind::Empty | LineKind::SelfMove => {}
+            LineKind::SetCC { reg } => {
+                // setCC writes the low byte only; upper bits UNCHANGED —
+                // conservatively clear (the canonical setcc+movzbl pair
+                // re-establishes byte-ness via the movzbl above).
+                if reg <= REG_GP_MAX {
+                    is_byte[reg as usize] = false;
+                    is_16[reg as usize] = false;
+                }
+            }
+            _ => {
+                let d = parse_dest_reg(&t);
+                if d <= REG_GP_MAX {
+                    if t.starts_with("andl $") {
+                        // andl $imm: result <= imm, so byte/16 flags follow
+                        // the immediate's range regardless of prior state.
+                        let imm = t["andl $".len()..]
+                            .split(',').next()
+                            .and_then(|v| v.trim().parse::<i64>().ok());
+                        is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
+                        is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
+                    } else {
+                        is_byte[d as usize] = false;
+                        is_16[d as usize] = false;
+                    }
+                }
+                // Implicit multi-register writers: fail closed on all flags.
+                if t.starts_with("mul") || t.starts_with("imul")
+                    || t.starts_with("div") || t.starts_with("idiv")
+                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
+                    || t.starts_with("rep") || t.starts_with("lods")
+                    || t.starts_with("stos") || t.starts_with("movs")
+                    || t.starts_with("cmps") || t.starts_with("scas")
+                {
+                    is_byte = [false; 8];
+                    is_16 = [false; 8];
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
 }
 
 // ── Pass: tail-call conversion (call X; <epilogue>; ret → <epilogue>; jmp X) ──
@@ -3579,6 +3750,42 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(!result.contains("-8(%ebp)"),
             "store/load pair should be fully eliminated, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_redundant_zext_removed() {
+        // Second movzbl of an already-byte value is a no-op.
+        let asm = "f:\n    movzbl (%ecx), %eax\n    movzbl %al, %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("movzbl").count(), 1,
+            "redundant re-extension must be removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_zext_cleared_at_label() {
+        // Byte-ness must not survive a control-flow merge.
+        let asm = "f:\n    movzbl (%ecx), %eax\n.LBB1:\n    movzbl %al, %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("movzbl").count(), 2,
+            "flags must clear at labels:\n{}", result);
+    }
+
+    #[test]
+    fn test_zext_cleared_by_add() {
+        // addl can overflow past 255: re-extension is REQUIRED.
+        let asm = "f:\n    movzbl (%ecx), %eax\n    addl $200, %eax\n    movzbl %al, %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("movzbl").count(), 2,
+            "addl invalidates byte-ness:\n{}", result);
+    }
+
+    #[test]
+    fn test_zext_preserved_by_andl_imm8() {
+        // andl $127 keeps the value in byte range: re-extension is dead.
+        let asm = "f:\n    movzbl (%ecx), %eax\n    andl $127, %eax\n    movzbl %al, %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("movzbl").count(), 1,
+            "andl imm8 preserves byte-ness:\n{}", result);
     }
 
     #[test]
