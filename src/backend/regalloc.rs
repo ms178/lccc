@@ -199,11 +199,6 @@ fn bump_gep_base_priority(
 }
 
 /// For each value with exactly one definition that is a `Load`, the loaded
-/// type. Values with multiple defs (phis) or non-load defs are absent.
-/// A sub-word load (I8/U8/I16/U16) sign/zero-extends into its register
-/// (`movsbl`/`movzbl`/`movswl`/`movzwl`), so a widening cast of that load is
-/// a bit-preserving no-op and may coalesce exactly like a Copy.
-/// For each value with exactly one definition that is a `Load`, the loaded
 /// type, paired with the value's operand-use count. Values with multiple defs
 /// (phis) or non-load defs are absent. A sub-word load (I8/U8/I16/U16)
 /// sign/zero-extends into its register (`movsbl`/`movzbl`/`movswl`/`movzwl`),
@@ -239,6 +234,7 @@ fn unique_load_def_types(func: &IrFunction) -> FxHashMap<u32, (IrType, u32)> {
         .map(|(k, ty)| (k, (ty, use_count.get(&k).copied().unwrap_or(0))))
         .collect()
 }
+
 
 fn build_coalesce_groups(
     func: &IrFunction,

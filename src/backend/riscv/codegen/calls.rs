@@ -23,7 +23,7 @@ impl RiscvCodegen {
         }
     }
 
-    pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[CallArgClass], _arg_types: &[IrType]) -> usize {
+    pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[CallArgClass], _arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize {
         compute_stack_arg_space(arg_classes)
     }
 
@@ -54,7 +54,7 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_call_stack_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
-                            _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize) -> i64 {
+                            _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>]) -> i64 {
         if stack_arg_space > 0 {
             self.emit_addi_sp(-(stack_arg_space as i64));
             let mut offset: usize = 0;

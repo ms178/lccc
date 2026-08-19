@@ -1242,6 +1242,7 @@ impl Lowerer {
                 dest_ptr: alloca,
                 va_list_ptr,
                 size: struct_size,
+                align: struct_align,
                 eightbyte_classes,
             });
             return Operand::Value(alloca);
@@ -1434,6 +1435,8 @@ impl Lowerer {
                 dest_ptr: alloca,
                 va_list_ptr,
                 size: 16, // 2 x 8 bytes
+                // _Complex double = 2 doubles, alignment 8 on LP64.
+                align: 8,
                 eightbyte_classes: vec![
                     crate::common::types::EightbyteClass::Sse,
                     crate::common::types::EightbyteClass::Sse,

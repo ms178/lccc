@@ -70,7 +70,12 @@ impl Lowerer {
         } else {
             let rhs_val = self.lower_expr(rhs);
             let rhs_ty = self.value_ir_type(rhs);
-            self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
+            if lhs_ct == CType::Float128 || rhs_ct == CType::Float128 {
+                // _Float128 assignments route through the soft-float helpers.
+                self.convert_scalar_ctype(rhs_val, rhs_ty, &rhs_ct, &lhs_ct)
+            } else {
+                self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
+            }
         };
 
         if let Some(lv) = lv {

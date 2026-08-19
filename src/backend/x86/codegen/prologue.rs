@@ -35,9 +35,7 @@ impl X86Codegen {
             let mut named_fp = 0usize;
             for class in &classification.classes {
                 named_gp += class.gp_reg_count();
-                if matches!(class, crate::backend::call_abi::ParamClass::FloatReg { .. }) {
-                    named_fp += 1;
-                }
+                named_fp += class.fp_reg_count();
             }
             self.num_named_int_params = named_gp;
             self.num_named_fp_params = named_fp;
@@ -997,15 +995,40 @@ impl X86Codegen {
 
         if func.is_variadic {
             let base = self.reg_save_area_offset;
-            self.state.out.emit_instr_reg_rbp("    movq", "rdi", base);
-            self.state.out.emit_instr_reg_rbp("    movq", "rsi", base + 8);
-            self.state.out.emit_instr_reg_rbp("    movq", "rdx", base + 16);
-            self.state.out.emit_instr_reg_rbp("    movq", "rcx", base + 24);
-            self.state.out.emit_instr_reg_rbp("    movq", "r8", base + 32);
-            self.state.out.emit_instr_reg_rbp("    movq", "r9", base + 40);
+
+            // Save only the GP registers that can hold VARIADIC arguments: the
+            // first `num_named_int_params` registers carried named params, and
+            // va_start sets gp_offset past them, so va_arg can never read their
+            // save slots. (GCC/Clang skip them the same way; `sum3(a,b,c,...)`
+            // saves only %rcx/%r8/%r9.)
+            let gp_start = self.num_named_int_params.min(6);
+            let gp_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+            for i in gp_start..6 {
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movq", gp_regs[i], base + (i as i64) * 8);
+            }
+
+            // Save only the XMM registers that can hold variadic FP arguments
+            // (xmm[num_named_fp_params..7]), and only when the caller actually
+            // placed any argument in an SSE register: %al holds that count
+            // (0-8) for variadic calls (SysV AMD64 §3.5.7). Integer-only
+            // varargs — printf-style wrappers, the kernel's printk path — skip
+            // all eight 16-byte saves this way.
             if !self.no_sse {
-                for i in 0..8i64 {
-                    self.state.emit_fmt(format_args!("    movdqu %xmm{}, {}(%rbp)", i, base + 48 + i * 16));
+                let fp_start = self.num_named_fp_params.min(8);
+                if fp_start < 8 {
+                    let skip = self.state.fresh_label("no_fp_save");
+                    self.state.emit("    testb %al, %al");
+                    self.state.out.emit_jcc_label("    je", &skip);
+                    for i in fp_start..8usize {
+                        self.state.emit_fmt(format_args!(
+                            "    movdqu %xmm{}, {}(%rbp)",
+                            i,
+                            base + 48 + (i as i64) * 16
+                        ));
+                    }
+                    self.state.out.emit_named_label(&skip);
                 }
             }
         }

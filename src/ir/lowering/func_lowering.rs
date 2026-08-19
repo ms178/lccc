@@ -57,6 +57,7 @@ impl Lowerer {
         self.func_state = Some(FunctionBuildState::new(
             func.name.clone(), base_return_type, return_is_bool,
         ));
+        self.func_mut().return_ctype = Some(self.type_spec_to_ctype(&func.return_type));
         // Clear get_expr_ctype memoization cache: results depend on
         // per-function state (local variables), so cannot span functions.
         self.expr_ctype_cache.borrow_mut().clear();
@@ -293,7 +294,12 @@ impl Lowerer {
                 continue;
             }
             let size = param.ty.size().max(param.struct_size.unwrap_or(param.ty.size()));
-            self.emit(Instruction::Alloca { dest: alloca, ty: param.ty, size, align: 0, volatile: false, semantic_volatile: false });
+            // Carry the struct's ABI alignment onto its parameter alloca. Without
+            // this, a by-value `_Alignas(16)` struct parameter is copied into an
+            // 8-aligned slot in emit_store_params and `&s` (or an aligned vector
+            // access on the param) sees a misaligned address.
+            let align = param.struct_align.unwrap_or(0);
+            self.emit(Instruction::Alloca { dest: alloca, ty: param.ty, size, align, volatile: false, semantic_volatile: false });
             ir_allocas.push(alloca);
         }
 

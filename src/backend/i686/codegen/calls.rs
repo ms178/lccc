@@ -27,7 +27,7 @@ impl I686Codegen {
         }
     }
 
-    pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType]) -> usize {
+    pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize {
         let mut total = 0;
         for (i, ac) in arg_classes.iter().enumerate() {
             let ty = if i < arg_types.len() { arg_types[i] } else { IrType::I32 };
@@ -58,7 +58,7 @@ impl I686Codegen {
 
     pub(super) fn emit_call_stack_args_impl(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass],
                             arg_types: &[IrType], stack_arg_space: usize,
-                            _fptr_spill: usize, _f128_temp_space: usize) -> i64 {
+                            _fptr_spill: usize, _f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>]) -> i64 {
         if stack_arg_space > 0 {
             emit!(self.state, "    subl ${}, %esp", stack_arg_space);
             self.esp_adjust += stack_arg_space as i64;

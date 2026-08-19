@@ -1447,6 +1447,44 @@ impl Lowerer {
 
     /// Convert `val` (of C type `from_ct`) to _Float128 via the libgcc
     /// widening helpers, matching GCC's codegen.
+    /// Convert a scalar operand of C type `src_ct` to C type `target_ct`.
+    ///
+    /// This is the CType-aware sibling of `emit_implicit_cast`: when either
+    /// side is `_Float128` (IEEE binary128), the conversion must go through the
+    /// libgcc soft-float helpers (`__extenddftf2`, `__trunctfdf2`, …), because
+    /// the IR carrier type (`U128`) is ambiguous with `unsigned __int128` and
+    /// the bit-cast machinery would produce garbage bit patterns
+    /// (`_Float128 a = 100.0` became `{100,0}` instead of binary128 100.0).
+    pub(super) fn convert_scalar_ctype(
+        &mut self,
+        src: Operand,
+        src_ty: IrType,
+        src_ct: &CType,
+        target_ct: &CType,
+    ) -> Operand {
+        use crate::common::types::CType;
+        if *target_ct == CType::Float128 {
+            // A source that is ALREADY the 128-bit carrier — an I128 constant
+            // payload (a `1.5F128` literal or a `__builtin_*f128` result) or a
+            // U128-typed value (a _Float128 variable) — must be copied
+            // bit-exactly. Anything else is a genuine value conversion
+            // (double/int/... -> binary128) via the soft-float helpers.
+            // (An unsigned __int128 constant would also take the identity path
+            // instead of __floatuntitf — a rare corner.)
+            let already_carrier = matches!(&src, Operand::Const(IrConst::I128(_)))
+                || src_ty == IrType::U128;
+            if already_carrier {
+                return src;
+            }
+            return self.convert_to_f128(src, src_ct);
+        }
+        if *src_ct == CType::Float128 {
+            return self.convert_from_f128(src, target_ct);
+        }
+        let target_ty = IrType::from_ctype(target_ct);
+        self.emit_implicit_cast(src, src_ty, target_ty)
+    }
+
     pub(super) fn convert_to_f128(&mut self, val: Operand, from_ct: &crate::common::types::CType) -> Operand {
         use crate::common::types::CType;
         let (helper, arg_ty, struct_info): (&str, IrType, Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)>) = match from_ct {

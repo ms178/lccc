@@ -65,7 +65,7 @@ impl I686Codegen {
         self.state.emit("    movl %eax, (%edx)");
     }
 
-    pub(super) fn emit_va_arg_struct_impl(&mut self, _dest_ptr: &Value, _va_list_ptr: &Value, _size: usize) {
+    pub(super) fn emit_va_arg_struct_impl(&mut self, _dest_ptr: &Value, _va_list_ptr: &Value, _size: usize, _align: usize) {
         panic!("VaArgStruct should not be emitted for i686 target");
     }
 }
