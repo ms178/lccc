@@ -335,7 +335,9 @@ fn classify_alloca(
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
 ) {
-    let effective_align = align;
+    // Recover over-aligned parameter allocas: the authoritative ABI alignment
+    // (IrParam.struct_align) may exceed a pass-dropped `Alloca.align`.
+    let effective_align = align.max(ctx.param_aligns.get(&dest.0).copied().unwrap_or(0));
     let extra = if effective_align > 16 { effective_align - 1 } else { 0 };
     let ptr_size = crate::common::types::target_ptr_size() as i64;
     // Alloca slots must be at least pointer-sized (8 bytes on 64-bit, 4 on 32-bit)

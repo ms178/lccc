@@ -332,6 +332,7 @@ impl Target {
             Target::X86_64 => {
                 let mut cg = x86::X86Codegen::new();
                 cg.apply_options(opts);
+                cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
@@ -346,6 +347,7 @@ impl Target {
             Target::I686 => {
                 let mut cg = i686::I686Codegen::new();
                 cg.apply_options(opts);
+                cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
@@ -367,6 +369,7 @@ impl Target {
             Target::Aarch64 => {
                 let mut cg = arm::ArmCodegen::new();
                 cg.apply_options(opts);
+                cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
@@ -375,6 +378,7 @@ impl Target {
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new();
                 cg.apply_options(opts);
+                cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 cg.emit_pre_directives();

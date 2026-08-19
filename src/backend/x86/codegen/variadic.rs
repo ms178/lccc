@@ -494,8 +494,12 @@ impl X86Codegen {
             .out
             .emit_instr_imm_mem("    movl", fp_offset as i64, 4, "rax");
 
-        // overflow_arg_area = rbp + 16 + named_stack_bytes.
-        let overflow_offset = 16 + self.num_named_stack_bytes;
+        // overflow_arg_area = first caller stack arg + named_stack_bytes.
+        // In rbp mode the first stack arg is at 16(%rbp) (ret addr + saved rbp);
+        // in FPO mode it is at 8 past the virtual rbp (ret addr only). The
+        // rsp-aware emitter adds the frame size in FPO mode.
+        let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
+        let overflow_offset = stack_base + self.num_named_stack_bytes as i64;
         self.state
             .out
             .emit_instr_rbp_reg("    leaq", overflow_offset as i64, "rcx");

@@ -1,7 +1,7 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
 use crate::ir::reexports::{IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Instruction, Operand, Terminator, Value};
-use crate::common::types::{AddressSpace, IrType};
+use crate::common::types::{AddressSpace, EightbyteClass, IrType};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -26,6 +26,93 @@ impl X86Codegen {
 
         // Track variadic function info
         self.is_variadic = func.is_variadic;
+        if func.is_variadic {
+            // Dead-save elimination (GCC's `sum_int`/`sum_dbl` behavior): the
+            // register save area only needs to preserve a class (GP / SSE) if
+            // some va_arg in THIS body actually reads it, or the va_list
+            // escapes to a callee that may read any class. This skips all 8
+            // 16-byte XMM saves in integer-only varargs (printf/printk
+            // wrappers that never re-consume FP), and the 6 GP saves in
+            // FP-only varargs.
+            let (mut needs_gp, mut needs_fp) = (false, false);
+            // va_list-aliased values (VaStart root + every va_copy src/dest),
+            // closed transitively over Copy so `va_list ap2 = ap; f(ap2)` is
+            // still detected as an escape.
+            let mut va_ids: FxHashSet<u32> = FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::VaStart { va_list_ptr } => {
+                            va_ids.insert(va_list_ptr.0);
+                        }
+                        Instruction::VaCopy { dest_ptr, src_ptr } => {
+                            va_ids.insert(dest_ptr.0);
+                            va_ids.insert(src_ptr.0);
+                        }
+                        Instruction::VaArg { result_ty, .. } => {
+                            if result_ty.is_128bit() || !result_ty.is_float() {
+                                needs_gp = true;
+                            } else if !result_ty.is_long_double() {
+                                // F32/F64 (SSE class). long double is MEMORY.
+                                needs_fp = true;
+                            }
+                        }
+                        Instruction::VaArgStruct { eightbyte_classes, .. } => {
+                            for c in eightbyte_classes {
+                                match c {
+                                    EightbyteClass::Integer | EightbyteClass::NoClass => {
+                                        needs_gp = true
+                                    }
+                                    EightbyteClass::Sse => needs_fp = true,
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Copy-closure: a value copied from a va_list value is still the
+            // same va_list.
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Copy {
+                            dest,
+                            src: Operand::Value(sv),
+                        } = inst
+                        {
+                            if va_ids.contains(&sv.0) && va_ids.insert(dest.0) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Escape: any call argument that references a va_list value.
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let info = match inst {
+                        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                            info
+                        }
+                        _ => continue,
+                    };
+                    for arg in &info.args {
+                        if let Operand::Value(v) = arg {
+                            if va_ids.contains(&v.0) {
+                                needs_gp = true;
+                                needs_fp = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            self.vararg_gp_save = needs_gp;
+            self.vararg_fp_save = needs_fp;
+        }
         // Count named params using the shared ABI classification, so this
         // stays in sync with classify_call_args (caller side) automatically.
         {
@@ -826,10 +913,23 @@ impl X86Codegen {
         // -(N*8 + 8), safely below the callee-save area.
         let n_callee = self.used_callee_saved.len() as i64;
         let callee_save_reserve = if n_callee > 0 { n_callee * 8 + 8 } else { 0 };
+        // Capture before `self.state` is mutably borrowed by the layout closure.
+        let fpo = self.state.omit_frame_pointer;
         let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let alloc = (alloc_size + 7) & !7;
-            let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
+            let mut new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
+            // FPO: the virtual frame base (rsp + frame_size) is entry %rsp,
+            // which is ≡ 8 (mod 16) because the caller's CALL pushed the return
+            // address. A slot assigned here at offset ≡ 0 (mod A) therefore
+            // lands at ≡ 8 (mod 16) — misaligned for any A >= 16. Shifting the
+            // slot by 8 makes the final address (entry_rsp + offset) ≡
+            // (8 + A-8) = 0 (mod A), exactly right for every power-of-two
+            // alignment >= 16 (16, 32, 64, ...). (rbp mode is unaffected:
+            // %rbp = entry_rsp - 8 is already 16-aligned.)
+            if fpo && effective_align >= 16 {
+                new_space += 8;
+            }
             (-new_space, new_space)
         }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, true);
 
@@ -892,9 +992,12 @@ impl X86Codegen {
             self.state.emit("    endbr64");
         }
 
-        // Variadic functions need the frame pointer for va_start/va_arg to
-        // compute register save area addresses relative to %rbp. Override FPO.
-        let omit_fp = self.state.omit_frame_pointer && !func.is_variadic;
+        // Variadic functions no longer force a frame pointer: va_start/va_arg
+        // address the register save area and overflow area %rsp-relative via
+        // the same slot_ref / emit_instr_*_rbp machinery (which adds the frame
+        // size in FPO mode). The 16-byte reg-save slots only ever use
+        // unaligned moves (movdqu/movsd), so no extra alignment is required.
+        let omit_fp = self.state.omit_frame_pointer;
         let used_regs = self.used_callee_saved.clone();
 
         if omit_fp {
@@ -1000,33 +1103,43 @@ impl X86Codegen {
             // first `num_named_int_params` registers carried named params, and
             // va_start sets gp_offset past them, so va_arg can never read their
             // save slots. (GCC/Clang skip them the same way; `sum3(a,b,c,...)`
-            // saves only %rcx/%r8/%r9.)
-            let gp_start = self.num_named_int_params.min(6);
-            let gp_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
-            for i in gp_start..6 {
-                self.state
-                    .out
-                    .emit_instr_reg_rbp("    movq", gp_regs[i], base + (i as i64) * 8);
+            // saves only %rcx/%r8/%r9.) When no va_arg in the body reads the
+            // INTEGER class AND the va_list never escapes (vararg_gp_save is
+            // false), the whole GP block is dead and skipped — FP-only varargs
+            // save nothing in the GP area (GCC's `sum_dbl` behavior).
+            if self.vararg_gp_save {
+                let gp_start = self.num_named_int_params.min(6);
+                let gp_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+                for i in gp_start..6 {
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", gp_regs[i], base + (i as i64) * 8);
+                }
             }
 
             // Save only the XMM registers that can hold variadic FP arguments
             // (xmm[num_named_fp_params..7]), and only when the caller actually
             // placed any argument in an SSE register: %al holds that count
-            // (0-8) for variadic calls (SysV AMD64 §3.5.7). Integer-only
-            // varargs — printf-style wrappers, the kernel's printk path — skip
-            // all eight 16-byte saves this way.
-            if !self.no_sse {
+            // (0-8) for variadic calls (SysV AMD64 §3.5.7). When no va_arg in
+            // the body reads the SSE class AND the va_list never escapes
+            // (vararg_fp_save is false), the whole XMM block is skipped —
+            // integer-only varargs (printf/printk wrappers) save nothing here,
+            // not even behind the %al gate.
+            if !self.no_sse && self.vararg_fp_save {
                 let fp_start = self.num_named_fp_params.min(8);
                 if fp_start < 8 {
                     let skip = self.state.fresh_label("no_fp_save");
                     self.state.emit("    testb %al, %al");
                     self.state.out.emit_jcc_label("    je", &skip);
                     for i in fp_start..8usize {
-                        self.state.emit_fmt(format_args!(
-                            "    movdqu %xmm{}, {}(%rbp)",
-                            i,
-                            base + 48 + (i as i64) * 16
-                        ));
+                        // rsp-aware emitter: emits `offset(%rbp)` in rbp mode
+                        // and `(frame_size + offset)(%rsp)` in FPO mode.
+                        let xmm = format!("xmm{}", i);
+                        self.state.out.emit_instr_reg_rbp(
+                            "    movdqu",
+                            &xmm,
+                            base + 48 + (i as i64) * 16,
+                        );
                     }
                     self.state.out.emit_named_label(&skip);
                 }
@@ -1037,7 +1150,7 @@ impl X86Codegen {
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
-        let omit_fp = self.state.omit_frame_pointer && !self.state.func_is_variadic;
+        let omit_fp = self.state.omit_frame_pointer;
 
         if omit_fp {
             let use_push_pop = num_saved > 0;
@@ -1384,11 +1497,36 @@ impl X86Codegen {
                 ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
                     let src = stack_base + offset;
                     let n_qwords = size.div_ceil(8);
-                    for qi in 0..n_qwords {
-                        let src_off = src + (qi as i64 * 8);
-                        let dst_off = slot.0 + (qi as i64 * 8);
-                        self.state.out.emit_instr_rbp_reg("    movq", src_off, "rax");
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", dst_off);
+                    // Over-aligned (>16) parameter allocas have their slot
+                    // oversized by (align-1); the EFFECTIVE address is
+                    // align_up(slot, align). `&s` (via value_to_reg) resolves
+                    // that same aligned address, so the copy must target it too
+                    // — writing the raw slot desyncs the two by the alignment
+                    // pad (the _Alignas(32) struct param regression).
+                    let over_align = find_param_alloca(func, i)
+                        .and_then(|(dest, _)| self.state.alloca_over_align(dest.0))
+                        .filter(|&a| a > 16);
+                    if let Some(a) = over_align {
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rcx");
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    addq", (a - 1) as i64, "rcx");
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    andq", -(a as i64), "rcx");
+                        for qi in 0..n_qwords {
+                            let src_off = src + (qi as i64 * 8);
+                            self.state.out.emit_instr_rbp_reg("    movq", src_off, "rax");
+                            self.state
+                                .emit_fmt(format_args!("    movq %rax, {}(%rcx)", qi * 8));
+                        }
+                    } else {
+                        for qi in 0..n_qwords {
+                            let src_off = src + (qi as i64 * 8);
+                            let dst_off = slot.0 + (qi as i64 * 8);
+                            self.state.out.emit_instr_rbp_reg("    movq", src_off, "rax");
+                            self.state.out.emit_instr_reg_rbp("    movq", "rax", dst_off);
+                        }
                     }
                 }
                 ParamClass::F128FpReg { .. } | ParamClass::F128GpPair { .. } | ParamClass::F128Stack { .. } |
