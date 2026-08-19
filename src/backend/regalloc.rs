@@ -718,6 +718,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         };
 
         if let Some((ecx_hazards, edx_hazards)) = hazards {
+            if env_on("CCC_DEBUG_RA_INTERVALS") {
+                eprintln!(
+                    "[RA-P2] fn={} ecx_hazards={:?} edx_hazards={:?}",
+                    func.name, ecx_hazards, edx_hazards
+                );
+            }
             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards), (PhysReg(4), &ecx_hazards)] {
                 if !config.caller_saved_regs.contains(&reg) {
                     continue;
@@ -728,6 +734,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| base_ok(&assignments, iv))
                     .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
                     .collect();
+                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
+                    eprintln!("[RA-P2] fn={} reg={:?} candidates={:?}", func.name, reg, cands);
+                }
                 if intervals.is_empty() {
                     continue;
                 }
@@ -1009,6 +1019,38 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
         v.sort_unstable();
         eprintln!("[RA] fn={} FINAL={:?}", func.name, v);
+        if env_on("CCC_DEBUG_RA_INTERVALS") {
+            let mut ivs: Vec<(u32, u32, u32, bool, u64)> = iv_map
+                .iter()
+                .map(|(vid, &(s, e))| {
+                    (
+                        *vid,
+                        s,
+                        e,
+                        call_spanning.contains(vid),
+                        use_count.get(vid).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+            ivs.sort_unstable();
+            for (vid, s, e, spans, uses) in ivs {
+                let home = match assignments.get(&vid) {
+                    Some(r) => format!("reg={}", r.0),
+                    None => String::from("SLOT"),
+                };
+                eprintln!(
+                    "[RA-IV] fn={} v{} [{},{}] len={} callspan={} uses={} {}",
+                    func.name,
+                    vid,
+                    s,
+                    e,
+                    e.saturating_sub(s),
+                    spans,
+                    uses,
+                    home
+                );
+            }
+        }
     }
 
     apply_phi_coalesce_assignments(func, &liveness, &iv_map, &phi_coalesce, &mut assignments);
@@ -2335,6 +2377,34 @@ fn remove_ineligible_operands(
     }
 }
 
+/// Debug helper: short kind name of an instruction (CCC_DEBUG_HAZARDS).
+fn inst_kind_name(inst: &Instruction) -> &'static str {
+    match inst {
+        Instruction::BinOp { .. } => "BinOp",
+        Instruction::Cmp { .. } => "Cmp",
+        Instruction::Load { .. } => "Load",
+        Instruction::Store { .. } => "Store",
+        Instruction::Copy { .. } => "Copy",
+        Instruction::Cast { .. } => "Cast",
+        Instruction::Phi { .. } => "Phi",
+        Instruction::Select { .. } => "Select",
+        Instruction::ParamRef { .. } => "ParamRef",
+        Instruction::GetElementPtr { .. } => "GEP",
+        Instruction::Alloca { .. } => "Alloca",
+        Instruction::GlobalAddr { .. } => "GlobalAddr",
+        Instruction::LabelAddr { .. } => "LabelAddr",
+        Instruction::Call { .. } => "Call",
+        Instruction::CallIndirect { .. } => "CallIndirect",
+        Instruction::InlineAsm { .. } => "InlineAsm",
+        Instruction::UnaryOp { .. } => "UnaryOp",
+        Instruction::StackRestore { .. } => "StackRestore",
+        Instruction::Memcpy { .. } => "Memcpy",
+        Instruction::Intrinsic { .. } => "Intrinsic",
+        Instruction::PgoCounterInc { .. } => "PgoCounterInc",
+        _ => "Other",
+    }
+}
+
 /// i686 scratch-hazard scan for the ecx/edx caller-saved pool.
 ///
 /// Returns, for (%ecx, %edx), the sorted list of program points at which
@@ -2459,9 +2529,15 @@ fn collect_i686_scratch_hazard_points(
             };
             if !ecx_clean {
                 ecx.push(point);
+                if env_on("CCC_DEBUG_HAZARDS") {
+                    eprintln!("[HZ] fn={} pt={} ECX-DIRTY {:?}", func.name, point, inst_kind_name(inst));
+                }
             }
             if !edx_clean {
                 edx.push(point);
+                if env_on("CCC_DEBUG_HAZARDS") {
+                    eprintln!("[HZ] fn={} pt={} EDX-DIRTY {:?}", func.name, point, inst_kind_name(inst));
+                }
             }
             point += 1;
         }
@@ -2478,9 +2554,15 @@ fn collect_i686_scratch_hazard_points(
         };
         if !t_ecx_clean {
             ecx.push(point);
+            if env_on("CCC_DEBUG_HAZARDS") {
+                eprintln!("[HZ] fn={} pt={} ECX-DIRTY term", func.name, point);
+            }
         }
         if !t_edx_clean {
             edx.push(point);
+            if env_on("CCC_DEBUG_HAZARDS") {
+                eprintln!("[HZ] fn={} pt={} EDX-DIRTY term", func.name, point);
+            }
         }
         point += 1;
     }

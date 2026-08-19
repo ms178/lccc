@@ -664,6 +664,26 @@ impl Driver {
             self.process_force_includes(&mut preprocessor)
                 .map_err(|e| format!("Preprocessing {} failed: {}", input_file, e))?;
             let preprocessed = preprocessor.preprocess(&source);
+
+            // A missing #include in a .S file is fatal (GCC aborts).  Without
+            // this, header.S once preprocessed with an EMPTY voffset.h and the
+            // VO_* `#if` guards silently went false.  Emit the output only when
+            // preprocessing succeeded.
+            let pp_errors = preprocessor.errors();
+            if !pp_errors.is_empty() {
+                for err in pp_errors {
+                    eprintln!(
+                        "{}:{}:{}: error: {}",
+                        err.file, err.line, err.col, err.message
+                    );
+                }
+                return Err(format!(
+                    "{} preprocessor error(s) in {}",
+                    pp_errors.len(),
+                    input_file
+                ));
+            }
+
             let output = if self.suppress_line_markers {
                 Self::strip_line_markers(&preprocessed)
             } else {
