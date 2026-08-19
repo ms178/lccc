@@ -853,14 +853,14 @@ mod tests {
     }
 
     fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Load {
+        Instruction::Load { volatile: false,
             dest: Value(dest), ptr: Value(ptr), ty,
             seg_override: AddressSpace::Default,
         }
     }
 
     fn store_val(val: u32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Store {
+        Instruction::Store { volatile: false,
             val: Operand::Value(Value(val)), ptr: Value(ptr), ty,
             seg_override: AddressSpace::Default,
         }
@@ -1164,7 +1164,7 @@ mod tests {
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
-            Instruction::Store {
+            Instruction::Store { volatile: false,
                 val: Operand::Value(Value(2)),   // phi stored as DATA!
                 ptr: Value(11),
                 ty: IrType::Ptr,

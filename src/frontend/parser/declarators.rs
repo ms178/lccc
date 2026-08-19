@@ -358,6 +358,7 @@ impl Parser {
                 // Capture whether the base type (before pointer declarators) was const.
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
+                let param_is_volatile = self.attrs.parsing_volatile();
                 let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls, inner_ptr_depth, param_is_restrict) =
                     self.parse_param_declarator_full();
                 self.skip_gcc_extensions();
@@ -396,7 +397,7 @@ impl Parser {
 
                 self.attrs.set_const(saved_const);
                 self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_restrict: param_is_restrict, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
+                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_volatile: param_is_volatile, is_restrict: param_is_restrict, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
             } else {
                 self.attrs.set_const(saved_const);
                 self.attrs.set_noreturn(saved_noreturn);
@@ -423,6 +424,7 @@ impl Parser {
                 name: Some(n),
                 fptr_params: None,
                 is_const: false,
+                is_volatile: false,
                 is_restrict: false,
                 vla_size_exprs: Vec::new(),
                 fptr_inner_ptr_depth: 0,

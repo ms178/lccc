@@ -1691,6 +1691,30 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 LineKind::Move { dst, .. } if dst == src_reg => break,
                 LineKind::SetCC { reg } if reg == src_reg => break,
                 LineKind::LoadEbp { reg, .. } if reg == src_reg => break,
+                // Two-operand 32-bit ALU op reading the stored slot as a
+                // full-width SOURCE operand: `op DISP(%esp), %dst` becomes
+                // `op %src_reg, %dst`. Same proof obligations as the reload
+                // forwarding above — the window guarantees %src_reg still
+                // holds the stored value (any explicit or implicit write
+                // broke the window before this line) and nothing else has
+                // touched the slot bytes. This is the `define in %eax ->
+                // store to home slot -> use as memory operand` idiom the
+                // accumulator lowering emits constantly at -Os; forwarding
+                // turns a 6-7 byte memory-operand form into a 2-3 byte
+                // register form and lets eliminate_dead_stores drop the
+                // store itself once no reader remains.
+                LineKind::Other { dest_reg: dst_reg } if dst_reg <= REG_GP_MAX => {
+                    if let Some(new_line) =
+                        rewrite_alu_slot_source(trimmed(store, &infos[j], j), slot, src_reg)
+                    {
+                        store.replace(j, new_line);
+                        infos[j] = classify_line(store.get(j));
+                        changed = true;
+                        j += 1;
+                        count += 1;
+                        continue;
+                    }
+                }
                 _ => {}
             }
             if infos[j].has_indirect_mem { break; }
@@ -1717,6 +1741,48 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         }
     }
     changed
+}
+
+/// Canonical operand text for an ebp-space slot offset: esp-relative slots
+/// are encoded as ESP_SLOT_BIAS + disp, plain frame slots as %ebp offsets.
+fn slot_operand_text(slot: i32) -> String {
+    if slot >= ESP_SLOT_BIAS {
+        format!("{}(%esp)", slot - ESP_SLOT_BIAS)
+    } else {
+        format!("{}(%ebp)", slot)
+    }
+}
+
+/// Rewrite `OP DISP(%esp|%ebp), %dst` — a two-operand 32-bit ALU op whose
+/// FIRST operand is exactly the stored slot and whose SECOND operand is a
+/// plain general-purpose register — into `OP %src, %dst`.
+///
+/// Returns None for every other shape: immediate-first forms (`imull $4,
+/// slot` writes the slot), address takes (`leal slot, %r`), x87/SSE memory
+/// ops, scaled-index accesses, and non-ALU mnemonics. Callers must
+/// independently prove %src still holds the stored value at this line.
+fn rewrite_alu_slot_source(s: &str, slot: i32, src_reg: RegId) -> Option<String> {
+    const ALU_OPS: &[&str] = &[
+        "addl", "subl", "andl", "orl", "xorl", "cmpl", "testl", "imull",
+    ];
+    let (mn, rest) = s.split_once(' ')?;
+    if !ALU_OPS.contains(&mn) {
+        return None;
+    }
+    let (op1, op2) = rest.split_once(',')?;
+    let op1 = op1.trim();
+    let op2 = op2.trim();
+    if op1 != slot_operand_text(slot) {
+        return None;
+    }
+    if !op2.starts_with('%')
+        || op2.contains('(')
+        || op2.starts_with('$')
+        || register_family(op2) > REG_GP_MAX
+    {
+        return None;
+    }
+    Some(format!("    {} {}, {}", mn, reg32_name(src_reg), op2))
 }
 
 /// Instructions with IMPLICIT register writes that parse_dest_reg misses
@@ -4362,7 +4428,105 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
 mod tests {
     use super::*;
 
+    
     #[test]
+    fn alu_slot_use_forwards_to_register() {
+        // `movl %eax,32(%esp); imull 32(%esp),%edx` with no other reader:
+        // the imul must take %eax directly and the store must die.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $40, %esp\n",
+            "    movl $7, %eax\n",
+            "    movl %eax, 32(%esp)\n",
+            "    imull 32(%esp), %edx\n",
+            "    addl $40, %esp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("imull %eax, %edx"), "imul not forwarded:\n{result}");
+        assert!(!result.contains("32(%esp)"), "store/load survived:\n{result}");
+    }
+
+    #[test]
+    fn alu_slot_use_not_forwarded_when_src_rewritten() {
+        // %eax is redefined between store and use: forwarding would use the
+        // stale register. The memory-operand imul must survive.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $40, %esp\n",
+            "    movl $7, %eax\n",
+            "    movl %eax, 32(%esp)\n",
+            "    movl $9, %eax\n",
+            "    imull 32(%esp), %edx\n",
+            "    addl $40, %esp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("imull 32(%esp), %edx"),
+            "imul must stay a memory op when %eax is rewritten:\n{result}");
+    }
+
+    #[test]
+    fn alu_slot_use_not_forwarded_across_partial_reader() {
+        // A LIVE movzbl of the slot keeps the full-width store alive and
+        // blocks register forwarding past it (the sub-word read must come
+        // from the slot, and the store therefore survives the DSE).
+        // The blocker reads the slot's HIGH half (16(%esp) overlaps the
+        // 4 bytes at 12(%esp)): no register substitution can express it, so
+        // the store stays and the memory-operand imul must stay too.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $40, %esp\n",
+            "    movl $7, %eax\n",
+            "    movl %eax, 12(%esp)\n",
+            "    movzwl 14(%esp), %ecx\n",
+            "    imull 12(%esp), %edx\n",
+            "    addl %ecx, %edx\n",
+            "    addl $40, %esp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("imull 12(%esp), %edx"),
+            "imul must survive behind a mid-slot reader:\n{result}");
+        assert!(result.contains("movzwl 14(%esp), %ecx"), "{result}");
+    }
+
+    #[test]
+    fn alu_slot_forward_handles_negative_ebp_slots() {
+        // ebp-based frames encode slots as plain negative offsets.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebp\n",
+            "    movl %esp, %ebp\n",
+            "    subl $8, %esp\n",
+            "    movl $7, %eax\n",
+            "    movl %eax, -8(%ebp)\n",
+            "    addl -8(%ebp), %edx\n",
+            "    movl %ebp, %esp\n",
+            "    popl %ebp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("addl %eax, %edx"), "addl not forwarded:\n{result}");
+        assert!(!result.contains("-8(%ebp)"), "store survived:\n{result}");
+    }
+#[test]
     fn cmp_with_memory_folds_when_register_dies_at_branch() {
         // `movl SLOT,%eax; testl %eax,%eax; je` with %eax dead on both
         // paths -> `cmpl $0, SLOT; je`. Needs CFG liveness (consumer is a

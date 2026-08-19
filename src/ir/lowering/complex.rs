@@ -89,7 +89,7 @@ impl Lowerer {
         let comp_size = Self::complex_component_size(ctype);
 
         // Store real part at offset 0
-        self.emit(Instruction::Store {
+        self.emit(Instruction::Store { volatile: false,
             val: real,
             ptr,
             ty: comp_ty,
@@ -104,7 +104,7 @@ impl Lowerer {
             offset: Operand::Const(IrConst::ptr_int(comp_size as i64)),
             ty: IrType::I8, // byte offset
         });
-        self.emit(Instruction::Store { val: imag, ptr: imag_ptr, ty: comp_ty,
+        self.emit(Instruction::Store { volatile: false, val: imag, ptr: imag_ptr, ty: comp_ty,
          seg_override: AddressSpace::Default });
     }
 
@@ -112,7 +112,7 @@ impl Lowerer {
     pub(super) fn load_complex_real(&mut self, ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
         let dest = self.fresh_value();
-        self.emit(Instruction::Load {
+        self.emit(Instruction::Load { volatile: false,
             dest,
             ptr,
             ty: comp_ty,
@@ -133,7 +133,7 @@ impl Lowerer {
             ty: IrType::I8,
         });
         let dest = self.fresh_value();
-        self.emit(Instruction::Load {
+        self.emit(Instruction::Load { volatile: false,
             dest,
             ptr: imag_ptr,
             ty: comp_ty,
@@ -869,12 +869,12 @@ impl Lowerer {
                 let packed = self.fresh_value();
                 if packs_cf_variadic && is_variadic_arg && !uses_packed_cf {
                     // RISC-V variadic: load as I64 (two packed F32s in one GP register)
-                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load { volatile: false, dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::I64);
                 } else {
                     // x86-64: load as F64 (two packed F32s in one XMM register)
-                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load { volatile: false, dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::F64);
                 }

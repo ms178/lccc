@@ -97,6 +97,11 @@ pub(super) struct LocalInfo {
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`,
     /// since CType does not track const/volatile qualifiers.
     pub is_const: bool,
+    /// Whether the declared base type was `volatile`-qualified (see
+    /// DeclAnalysis::base_type_volatile).  For scalar/array locals the
+    /// variable's own accesses are volatile; for pointer locals the pointee
+    /// accesses are (when the pointee is not itself a pointer).
+    pub base_type_volatile: bool,
 }
 
 impl std::ops::Deref for LocalInfo {
@@ -117,6 +122,10 @@ pub(super) struct GlobalInfo {
     /// For global register variables declared with `register <type> <name> __asm__("reg")`.
     /// When set, no storage is emitted; reads/writes map directly to the named register.
     pub asm_register: Option<String>,
+    /// Whether the declared base type was `volatile`-qualified (see
+    /// DeclAnalysis::base_type_volatile).  `volatile` globals (jiffies, MMIO
+    /// descriptors) must perform every load and store.
+    pub base_type_volatile: bool,
 }
 
 impl std::ops::Deref for GlobalInfo {
@@ -163,7 +172,13 @@ pub(super) struct DeclAnalysis {
     pub pointee_type: Option<IrType>,
     /// Full C type for multi-level pointer resolution.
     pub c_type: Option<CType>,
-    /// Whether this is a _Bool variable (not pointer or array of _Bool).
+   
+    /// Whether the declared BASE type carries a C `volatile` qualifier
+    /// (e.g. `volatile int x`, `volatile int *p`, `volatile T a[N]`).
+    /// Governs access volatility: for scalar/array declarations the object
+    /// accesses are volatile; for pointer declarations the POINTEE accesses
+    /// (deref) are volatile when exactly one pointer level was added.
+    pub base_type_volatile: bool, /// Whether this is a _Bool variable (not pointer or array of _Bool).
     pub is_bool: bool,
     /// The element IR type for arrays (accounts for typedef'd arrays).
     pub elem_ir_ty: IrType,
@@ -209,13 +224,32 @@ pub(super) struct VlaDimInfo {
 
 /// Represents an lvalue - something that can be assigned to.
 /// Contains the address (as an IR Value) where the data resides.
-#[derive(Debug, Clone)]
-pub(super) enum LValue {
+#[derive(Debug, Clone, Copy)]
+pub(super) enum LValueKind {
     /// A direct variable: the alloca is the address.
     Variable(Value),
     /// An address computed at runtime (e.g., arr[i], *ptr).
     /// The AddressSpace tracks segment overrides (e.g., __seg_gs for per-CPU vars).
     Address(Value, AddressSpace),
+}
+
+/// An lvalue access: its address plus whether the ACCESS is C-`volatile`.
+/// Volatile loads/stores are observable side effects (C11 5.1.2.3): they must
+/// be performed exactly as written and are exempt from forwarding, CSE,
+/// hoisting, and dead-access elimination.
+#[derive(Clone, Copy)]
+pub(super) struct LValue {
+    pub kind: LValueKind,
+    pub volatile: bool,
+}
+
+impl LValue {
+    pub(super) fn variable(v: Value, volatile: bool) -> Self {
+        LValue { kind: LValueKind::Variable(v), volatile }
+    }
+    pub(super) fn address(v: Value, seg: AddressSpace, volatile: bool) -> Self {
+        LValue { kind: LValueKind::Address(v, seg), volatile }
+    }
 }
 
 /// A single level of switch statement context, pushed/popped as switches nest.
@@ -422,7 +456,7 @@ impl VarInfo {
 impl GlobalInfo {
     /// Construct a GlobalInfo from a DeclAnalysis, avoiding repeated field construction.
     pub(super) fn from_analysis(da: &DeclAnalysis) -> Self {
-        GlobalInfo { var: VarInfo::from_analysis(da), asm_register: None }
+        GlobalInfo { var: VarInfo::from_analysis(da), asm_register: None, base_type_volatile: da.base_type_volatile }
     }
 }
 
@@ -441,6 +475,7 @@ impl LocalInfo {
             asm_register_has_init: false,
             cleanup_fn: None,
             is_const,
+            base_type_volatile: da.base_type_volatile,
         }
     }
 
@@ -458,6 +493,7 @@ impl LocalInfo {
             asm_register_has_init: false,
             cleanup_fn: None,
             is_const,
+            base_type_volatile: da.base_type_volatile,
         }
     }
 }

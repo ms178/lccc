@@ -116,7 +116,7 @@ impl Lowerer {
                 );
 
                 // Store the truncated result
-                self.emit(Instruction::Store { val: Operand::Value(truncated), ptr: result_ptr, ty: result_ir_ty,
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(truncated), ptr: result_ptr, ty: result_ir_ty,
                  seg_override: AddressSpace::Default });
 
                 Some(Operand::Value(overflow))
@@ -160,7 +160,7 @@ impl Lowerer {
 
                 // Store the result (reinterpreted as unsigned)
                 let unsigned_result = self.emit_cast_val(Operand::Value(signed_result), compute_ty, result_ir_ty);
-                self.emit(Instruction::Store { val: Operand::Value(unsigned_result), ptr: result_ptr, ty: result_ir_ty,
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(unsigned_result), ptr: result_ptr, ty: result_ir_ty,
                  seg_override: AddressSpace::Default });
 
                 Some(Operand::Value(overflow))
@@ -186,7 +186,7 @@ impl Lowerer {
                     self.compute_unsigned_overflow(op, lhs_result, rhs_result, result, result_ir_ty)
                 };
 
-                self.emit(Instruction::Store { val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
                  seg_override: AddressSpace::Default });
 
                 Some(Operand::Value(overflow))
@@ -207,7 +207,7 @@ impl Lowerer {
             };
 
             // Store the result
-            self.emit(Instruction::Store { val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
+            self.emit(Instruction::Store { volatile: false, val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
              seg_override: AddressSpace::Default });
 
             Some(Operand::Value(overflow))

@@ -1345,7 +1345,7 @@ impl Lowerer {
                     semantic_volatile: false,
                 });
                 let store_ty = arg_types.get(i).copied().unwrap_or(IrType::U128);
-                self.emit(Instruction::Store {
+                self.emit(Instruction::Store { volatile: false,
                     val: args[i].clone(),
                     ptr: tmp,
                     ty: store_ty,
@@ -1566,7 +1566,7 @@ impl Lowerer {
             offset: Operand::Const(IrConst::ptr_int(byte_offset as i64)),
             ty,
         });
-        self.emit(Instruction::Store { val, ptr: addr, ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val, ptr: addr, ty , seg_override: AddressSpace::Default });
     }
 
     /// Lower an expression, cast to target type, then store at base + byte_offset.
@@ -1748,7 +1748,7 @@ impl Lowerer {
             self.emit(Instruction::GetElementPtr {
                 dest: addr, base: alloca, offset, ty: IrType::I8,
             });
-            self.emit(Instruction::Store { val, ptr: addr, ty: IrType::I8 , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val, ptr: addr, ty: IrType::I8 , seg_override: AddressSpace::Default });
         }
         // Null terminator -- only write if there's room within max_bytes
         let null_pos = str_bytes.len();
@@ -1758,7 +1758,7 @@ impl Lowerer {
             self.emit(Instruction::GetElementPtr {
                 dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
             });
-            self.emit(Instruction::Store { val: Operand::Const(IrConst::I8(0)), ptr: null_addr, ty: IrType::I8,
+            self.emit(Instruction::Store { volatile: false, val: Operand::Const(IrConst::I8(0)), ptr: null_addr, ty: IrType::I8,
              seg_override: AddressSpace::Default });
         }
     }
@@ -1773,7 +1773,7 @@ impl Lowerer {
             self.emit(Instruction::GetElementPtr {
                 dest: addr, base: alloca, offset, ty: IrType::I8,
             });
-            self.emit(Instruction::Store { val, ptr: addr, ty: IrType::I32 , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val, ptr: addr, ty: IrType::I32 , seg_override: AddressSpace::Default });
         }
         // Null terminator
         let null_byte_offset = base_offset + s.chars().count() * 4;
@@ -1782,7 +1782,7 @@ impl Lowerer {
         self.emit(Instruction::GetElementPtr {
             dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
         });
-        self.emit(Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: null_addr, ty: IrType::I32,
+        self.emit(Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(0)), ptr: null_addr, ty: IrType::I32,
          seg_override: AddressSpace::Default });
     }
 
@@ -1796,7 +1796,7 @@ impl Lowerer {
             self.emit(Instruction::GetElementPtr {
                 dest: addr, base: alloca, offset, ty: IrType::I8,
             });
-            self.emit(Instruction::Store { val, ptr: addr, ty: IrType::U16, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val, ptr: addr, ty: IrType::U16, seg_override: AddressSpace::Default });
         }
         // Null terminator
         let null_byte_offset = base_offset + s.chars().count() * 2;
@@ -1805,7 +1805,7 @@ impl Lowerer {
         self.emit(Instruction::GetElementPtr {
             dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
         });
-        self.emit(Instruction::Store { val: Operand::Const(IrConst::I16(0)), ptr: null_addr, ty: IrType::U16,
+        self.emit(Instruction::Store { volatile: false, val: Operand::Const(IrConst::I16(0)), ptr: null_addr, ty: IrType::U16,
          seg_override: AddressSpace::Default });
     }
 
@@ -1818,7 +1818,7 @@ impl Lowerer {
         self.emit(Instruction::GetElementPtr {
             dest: elem_addr, base: alloca, offset: offset_val, ty,
         });
-        self.emit(Instruction::Store { val, ptr: elem_addr, ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val, ptr: elem_addr, ty , seg_override: AddressSpace::Default });
     }
 
     /// Zero-initialize a region of memory within an alloca at the given byte offset.
@@ -1833,7 +1833,7 @@ impl Lowerer {
                 offset: Operand::Const(IrConst::ptr_int(offset as i64)),
                 ty: IrType::I64,
             });
-            self.emit(Instruction::Store { val: Operand::Const(IrConst::I64(0)), ptr: addr, ty: IrType::I64,
+            self.emit(Instruction::Store { volatile: false, val: Operand::Const(IrConst::I64(0)), ptr: addr, ty: IrType::I64,
              seg_override: AddressSpace::Default });
             offset += 8;
         }
@@ -1845,7 +1845,7 @@ impl Lowerer {
                 offset: Operand::Const(IrConst::ptr_int(offset as i64)),
                 ty: IrType::I8,
             });
-            self.emit(Instruction::Store { val: Operand::Const(IrConst::I8(0)), ptr: addr, ty: IrType::I8,
+            self.emit(Instruction::Store { volatile: false, val: Operand::Const(IrConst::I8(0)), ptr: addr, ty: IrType::I8,
              seg_override: AddressSpace::Default });
             offset += 1;
         }

@@ -476,8 +476,14 @@ impl GvnState {
                 ptr,
                 ty,
                 seg_override,
+                volatile,
             } => {
                 if *seg_override != AddressSpace::Default {
+                    return None;
+                }
+                // Volatile loads are observable side effects: no CSE, no
+                // forwarding (each access must execute exactly once).
+                if *volatile {
                     return None;
                 }
                 if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
@@ -1788,13 +1794,13 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1831,19 +1837,19 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1870,7 +1876,7 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1895,7 +1901,7 @@ mod tests {
                             ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,},
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(3),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1921,7 +1927,7 @@ mod tests {
             vec![
                 BasicBlock {
                     label: BlockId(0),
-                    instructions: vec![Instruction::Load {
+                    instructions: vec![Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1932,7 +1938,7 @@ mod tests {
                 },
                 BasicBlock {
                     label: BlockId(1),
-                    instructions: vec![Instruction::Load {
+                    instructions: vec![Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1967,7 +1973,7 @@ mod tests {
                 // block0: entry, load and branch
                 BasicBlock {
                     label: BlockId(0),
-                    instructions: vec![Instruction::Load {
+                    instructions: vec![Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1983,7 +1989,7 @@ mod tests {
                 // block1: stores to memory
                 BasicBlock {
                     label: BlockId(1),
-                    instructions: vec![Instruction::Store {
+                    instructions: vec![Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2002,7 +2008,7 @@ mod tests {
                 // block3: merge point - loads from same pointer
                 BasicBlock {
                     label: BlockId(3),
-                    instructions: vec![Instruction::Load {
+                    instructions: vec![Instruction::Load { volatile: false,
                         dest: Value(3),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2035,13 +2041,13 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2077,13 +2083,13 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Value(Value(1)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2119,7 +2125,7 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2144,7 +2150,7 @@ mod tests {
                             ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,},
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2170,19 +2176,19 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(99)),
                         ptr: Value(1),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2210,19 +2216,19 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(99)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,

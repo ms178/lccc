@@ -691,7 +691,7 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
             insert_entry_alloca(func, alloca_val, ty, true);
 
             {
-                let store = Instruction::Store {
+                let store = Instruction::Store { volatile: false,
                     val: Operand::Value(Value(vid)),
                     ptr: alloca_val,
                     ty,
@@ -703,7 +703,7 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
             }
 
             {
-                let load = Instruction::Load {
+                let load = Instruction::Load { volatile: false,
                     dest: new_val,
                     ptr: alloca_val,
                     ty,
@@ -930,7 +930,7 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         insert_instruction(
             &mut func.blocks[site_block],
             ci + 1,
-            Instruction::Load {
+            Instruction::Load { volatile: false,
                 dest: new_val,
                 ptr: alloca_val,
                 ty,
@@ -940,7 +940,7 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         insert_instruction(
             &mut func.blocks[site_block],
             ci,
-            Instruction::Store {
+            Instruction::Store { volatile: false,
                 val: Operand::Value(Value(vid)),
                 ptr: alloca_val,
                 ty,

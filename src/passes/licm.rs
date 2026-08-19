@@ -959,8 +959,12 @@ fn hoist_loop_invariants(
                         }
                     }
                     all_invariant
-                } else if let Instruction::Load { ptr, .. } = inst {
-                    is_load_hoistable(
+                } else if let Instruction::Load { ptr, volatile, .. } = inst {
+                    // Volatile loads must execute exactly as written: hoisting
+                    // one out of its loop changes the number of observable
+                    // accesses (C11 5.1.2.3).
+                    !*volatile
+                        && is_load_hoistable(
                         ptr,
                         alloca_info,
                         &loop_mem,
@@ -1327,7 +1331,7 @@ mod tests {
                     volatile: false,
                     semantic_volatile: false,
                 },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Const(IrConst::I32(42)),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1354,7 +1358,7 @@ mod tests {
                         (Operand::Value(Value(5)), BlockId(2)),
                     ],
                 },
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(3),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1436,7 +1440,7 @@ mod tests {
                     volatile: false,
                     semantic_volatile: false,
                 },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Const(IrConst::I32(0)),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1451,7 +1455,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(1),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1484,7 +1488,7 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
                 },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Value(Value(3)),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1577,7 +1581,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(1),
                     ptr: Value(0),
                     ty: IrType::I32,

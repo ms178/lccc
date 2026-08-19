@@ -2779,21 +2779,21 @@ fn insert_remainder_loop(
                 ty: IrType::F64,  // Element type, not pointer type
             },
             // Load C[i][j]
-            Instruction::Load {
+            Instruction::Load { volatile: false,
                 dest: c_rem_load,
                 ptr: c_rem_gep,
                 ty: IrType::F64,
                 seg_override: AddressSpace::Default,
             },
             // Load A[i][k]
-            Instruction::Load {
+            Instruction::Load { volatile: false,
                 dest: a_rem_load,
                 ptr: a_ptr,
                 ty: IrType::F64,
                 seg_override: AddressSpace::Default,
             },
             // Load B[k][j]
-            Instruction::Load {
+            Instruction::Load { volatile: false,
                 dest: b_rem_load,
                 ptr: b_rem_gep,
                 ty: IrType::F64,
@@ -2816,7 +2816,7 @@ fn insert_remainder_loop(
                 ty: IrType::F64,
             },
             // Store result back to C[i][j]
-            Instruction::Store {
+            Instruction::Store { volatile: false,
                 val: Operand::Value(add_result),
                 ptr: c_rem_gep,
                 ty: IrType::F64,
@@ -4096,7 +4096,7 @@ fn insert_reduction_remainder_loop(
             ty: pattern.element_type,
         },
         // Load array_a[i]
-        Instruction::Load {
+        Instruction::Load { volatile: false,
             dest: load_rem_a,
             ptr: gep_rem_a,
             ty: pattern.element_type,
@@ -4147,7 +4147,7 @@ fn insert_reduction_remainder_loop(
                     ty: pattern.element_type,
                 },
                 // Load array_b[i]
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: load_rem_b,
                     ptr: gep_rem_b,
                     ty: pattern.element_type,
@@ -6325,7 +6325,7 @@ fn insert_map_remainder_loop(
         offset: Operand::Value(offset_v),
         ty: pattern.elem_ty,
     });
-    remainder_insts.push(Instruction::Load {
+    remainder_insts.push(Instruction::Load { volatile: false,
         dest: load_v,
         ptr: gep_src,
         ty: pattern.elem_ty,
@@ -6354,7 +6354,7 @@ fn insert_map_remainder_loop(
         });
         scalar_result = value;
     }
-    remainder_insts.push(Instruction::Store {
+    remainder_insts.push(Instruction::Store { volatile: false,
         val: Operand::Value(scalar_result),
         ptr: gep_dst,
         ty: pattern.elem_ty,
@@ -6798,7 +6798,7 @@ mod fixed_distance_slp_tests {
                 ty: IrType::F64,
             });
             let a = fresh();
-            instructions.push(Instruction::Load {
+            instructions.push(Instruction::Load { volatile: false,
                 dest: a,
                 ptr: a_ptr,
                 ty: IrType::F64,
@@ -6812,7 +6812,7 @@ mod fixed_distance_slp_tests {
                 ty: IrType::F64,
             });
             let b = fresh();
-            instructions.push(Instruction::Load {
+            instructions.push(Instruction::Load { volatile: false,
                 dest: b,
                 ptr: b_ptr,
                 ty: IrType::F64,
@@ -6861,7 +6861,7 @@ mod fixed_distance_slp_tests {
             ty: IrType::F64,
         });
         if trailing_store {
-            instructions.push(Instruction::Store {
+            instructions.push(Instruction::Store { volatile: false,
                 val: Operand::Const(IrConst::F64(0.0)),
                 ptr: Value(0),
                 ty: IrType::F64,

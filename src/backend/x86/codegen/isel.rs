@@ -677,7 +677,7 @@ pub fn lower_instruction_ctx(
             lower_binop(dest, *op, lhs, rhs, *ty, ra, out);
             true
         }
-        Instruction::Load { dest, ptr, ty, seg_override } => {
+        Instruction::Load { dest, ptr, ty, seg_override , ..} => {
             if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
             if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
             if *seg_override != AddressSpace::Default { return false; }
@@ -715,7 +715,7 @@ pub fn lower_instruction_ctx(
             });
             true
         }
-        Instruction::Store { val, ptr, ty, seg_override } => {
+        Instruction::Store { val, ptr, ty, seg_override , ..} => {
             if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
             if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
             if *seg_override != AddressSpace::Default { return false; }

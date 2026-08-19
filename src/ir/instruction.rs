@@ -143,6 +143,10 @@ pub enum Instruction {
         ptr: Value,
         ty: IrType,
         seg_override: AddressSpace,
+        /// C `volatile` store: the write itself is an observable side effect
+        /// (C11 5.1.2.3).  Optimizations must not eliminate, forward, sink,
+        /// or merge it.
+        volatile: bool,
     },
 
     /// Load from memory: %dest = load ptr
@@ -152,6 +156,10 @@ pub enum Instruction {
         ptr: Value,
         ty: IrType,
         seg_override: AddressSpace,
+        /// C `volatile` load: the read itself is an observable side effect
+        /// (C11 5.1.2.3).  Optimizations must not eliminate, forward, hoist,
+        /// or CSE it, even when the result is unused.
+        volatile: bool,
     },
 
     /// Binary operation: %dest = op lhs, rhs

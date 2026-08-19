@@ -777,7 +777,7 @@ fn run_function(func: &mut IrFunction) -> usize {
                     }
                     let ld = next;
                     next += 1;
-                    new_insts.push(Instruction::Load {
+                    new_insts.push(Instruction::Load { volatile: false,
                         dest: Value(ld),
                         ptr: Value(a),
                         ty,
@@ -791,7 +791,7 @@ fn run_function(func: &mut IrFunction) -> usize {
                         offset: Operand::Const(IrConst::ptr_int(off)),
                         ty: IrType::Ptr,
                     });
-                    new_insts.push(Instruction::Store {
+                    new_insts.push(Instruction::Store { volatile: false,
                         val: Operand::Value(Value(ld)),
                         ptr: Value(gd),
                         ty,

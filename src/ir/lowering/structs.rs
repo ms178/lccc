@@ -373,7 +373,7 @@ impl Lowerer {
                     }
                     // It's a pointer to struct: load the pointer
                     let loaded = self.fresh_value();
-                    self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default });
                     return loaded;
                 }
                 if self.globals.contains_key(name) {
@@ -519,7 +519,7 @@ impl Lowerer {
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
                     self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                     alloca
                 }
             }
@@ -535,7 +535,7 @@ impl Lowerer {
                         let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                         let store_ty = Self::packed_store_type(alloc_size);
                         self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                        self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
                         alloca
                     } else {
                         // Struct returned by address: copy to a fresh temporary
@@ -569,7 +569,7 @@ impl Lowerer {
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
                     self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                     alloca
                 } else {
                     let val = self.lower_expr(expr);

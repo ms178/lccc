@@ -158,6 +158,11 @@ pub struct ParamDecl {
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
+    /// Whether this parameter's base type has a `volatile` qualifier.
+    /// `volatile T *p` decays to a pointer whose POINTEE is volatile: every
+    /// `*p` access is an observable side effect (C11 5.1.2.3).  CType does
+    /// not track qualifiers, so the flag rides on ParamDecl.
+    pub is_volatile: bool,
     /// Whether the adjusted pointer parameter is restrict-qualified. Unlike
     /// const, this is an optimization contract: accesses based on distinct
     /// restrict parameters may be proven non-aliasing within the function.

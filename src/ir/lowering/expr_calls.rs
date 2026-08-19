@@ -333,7 +333,7 @@ impl Lowerer {
         // Extract low 8 bytes (rax)
         let lo = self.fresh_value();
         self.emit(Instruction::Cast { dest: lo, src: Operand::Value(dest), from_ty: IrType::I128, to_ty: IrType::I64 });
-        self.emit(Instruction::Store { val: Operand::Value(lo), ptr: alloca, ty: IrType::I64 , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: Operand::Value(lo), ptr: alloca, ty: IrType::I64 , seg_override: AddressSpace::Default });
         // Extract high bytes (rdx): shift right by 64
         let shifted = self.fresh_value();
         self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::LShr, lhs: Operand::Value(dest), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
@@ -341,7 +341,7 @@ impl Lowerer {
         self.emit(Instruction::Cast { dest: hi, src: Operand::Value(shifted), from_ty: IrType::I128, to_ty: IrType::I64 });
         let hi_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: alloca, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
-        self.emit(Instruction::Store { val: Operand::Value(hi), ptr: hi_ptr, ty: IrType::I64 , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: Operand::Value(hi), ptr: hi_ptr, ty: IrType::I64 , seg_override: AddressSpace::Default });
         Operand::Value(alloca)
     }
 
@@ -357,14 +357,14 @@ impl Lowerer {
                     // Store the raw 8 bytes (two F32s) into an alloca
                     let alloca = self.fresh_value();
                     self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
                     Some(Operand::Value(alloca))
                 } else if !self.decomposes_complex_float() {
                     // i686: two packed F32 returned in eax:edx as I64
                     // Store the raw 8 bytes (two F32s) into an alloca
                     let alloca = self.fresh_value();
                     self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::I64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(dest), ptr: alloca, ty: IrType::I64 , seg_override: AddressSpace::Default });
                     Some(Operand::Value(alloca))
                 } else {
                     // ARM/RISC-V: real F32 in first FP reg (dest), imag F32 in second FP reg
@@ -373,7 +373,7 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 8, align: 0, volatile: false, semantic_volatile: false });
                     // Store real part (F32) at offset 0
-                    self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F32 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(dest), ptr: alloca, ty: IrType::F32 , seg_override: AddressSpace::Default });
                     // Store imag part (F32) at offset 4
                     let imag_ptr = self.fresh_value();
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
@@ -382,7 +382,7 @@ impl Lowerer {
                         lhs: Operand::Value(alloca), rhs: Operand::Const(IrConst::ptr_int(4)),
                         ty: ptr_int_ty,
                     });
-                    self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F32 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F32 , seg_override: AddressSpace::Default });
                     Some(Operand::Value(alloca))
                 }
             }
@@ -393,7 +393,7 @@ impl Lowerer {
                 self.emit(Instruction::GetReturnF64Second { dest: imag_val });
                 let alloca = self.fresh_value();
                 self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
-                self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(dest), ptr: alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
                 let imag_ptr = self.fresh_value();
                 let ptr_int_ty = crate::common::types::target_int_ir_type();
                 self.emit(Instruction::BinOp {
@@ -401,7 +401,7 @@ impl Lowerer {
                     lhs: Operand::Value(alloca), rhs: Operand::Const(IrConst::ptr_int(8)),
                     ty: ptr_int_ty,
                 });
-                self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F64 , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F64 , seg_override: AddressSpace::Default });
                 Some(Operand::Value(alloca))
             }
             CType::ComplexLongDouble if self.returns_complex_long_double_in_regs() => {
@@ -413,7 +413,7 @@ impl Lowerer {
                 let alloca = self.fresh_value();
                 self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: 32, align: 16, volatile: false, semantic_volatile: false });
                 // Store real part (F128) at offset 0
-                self.emit(Instruction::Store { val: Operand::Value(dest), ptr: alloca, ty: IrType::F128, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(dest), ptr: alloca, ty: IrType::F128, seg_override: AddressSpace::Default });
                 // Store imag part (F128) at offset 16
                 let imag_ptr = self.fresh_value();
                 let ptr_int_ty = crate::common::types::target_int_ir_type();
@@ -422,7 +422,7 @@ impl Lowerer {
                     lhs: Operand::Value(alloca), rhs: Operand::Const(IrConst::ptr_int(16)),
                     ty: ptr_int_ty,
                 });
-                self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F128, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { volatile: false, val: Operand::Value(imag_val), ptr: imag_ptr, ty: IrType::F128, seg_override: AddressSpace::Default });
                 Some(Operand::Value(alloca))
             }
             _ => None,
@@ -511,7 +511,7 @@ impl Lowerer {
                             let slot = self.fresh_value();
                             self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
                             let v = self.operand_to_value(val);
-                            self.emit(Instruction::Store { val: Operand::Value(v), ptr: slot, ty: IrType::I128, seg_override: crate::common::types::AddressSpace::Default });
+                            self.emit(Instruction::Store { volatile: false, val: Operand::Value(v), ptr: slot, ty: IrType::I128, seg_override: crate::common::types::AddressSpace::Default });
                             val = Operand::Value(slot);
                             arg_ty = IrType::Ptr;
                         }
@@ -572,7 +572,7 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(alloc_size);
                     self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
                     val = Operand::Value(alloca);
                 }
             }
@@ -969,7 +969,7 @@ impl Lowerer {
             addr
         };
         let ptr_val = self.fresh_value();
-        self.emit(Instruction::Load { dest: ptr_val, ptr: base_addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: ptr_val, ptr: base_addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
         ptr_val
     }
 

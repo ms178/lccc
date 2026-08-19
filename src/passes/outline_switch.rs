@@ -944,7 +944,9 @@ fn remap_instruction(
             ptr,
             ty,
             seg_override,
+            volatile,
         } => Instruction::Store {
+            volatile: *volatile,
             val: remap_op(val),
             ptr: remap_val(*ptr),
             ty: *ty,
@@ -955,7 +957,9 @@ fn remap_instruction(
             ptr,
             ty,
             seg_override,
+            volatile,
         } => Instruction::Load {
+            volatile: *volatile,
             dest: *dest,
             ptr: remap_val(*ptr),
             ty: *ty,

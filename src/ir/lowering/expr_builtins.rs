@@ -896,14 +896,14 @@ impl Lowerer {
         };
         let alloca = self.fresh_value();
         self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 16, volatile: false, semantic_volatile: false });
-        self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
         let imag_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
             dest: imag_ptr, base: alloca,
             offset: Operand::Const(IrConst::I64(comp_size as i64)),
             ty: IrType::I8,
         });
-        self.emit(Instruction::Store { val: imag_val, ptr: imag_ptr, ty: comp_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: imag_val, ptr: imag_ptr, ty: comp_ty, seg_override: AddressSpace::Default });
         Some(Operand::Value(alloca))
     }
 
@@ -932,7 +932,7 @@ impl Lowerer {
         let slot = self.fresh_value();
         self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
         let val = self.operand_to_value(op);
-        self.emit(Instruction::Store { val: Operand::Value(val), ptr: slot, ty: IrType::I128, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: Operand::Value(val), ptr: slot, ty: IrType::I128, seg_override: AddressSpace::Default });
         Operand::Value(slot)
     }
 
@@ -941,7 +941,7 @@ impl Lowerer {
     /// expression uses in lccc.
     fn pack_vec128_from_slot(&mut self, slot: crate::ir::reexports::Value) -> Operand {
         let lo = self.fresh_value();
-        self.emit(Instruction::Load { dest: lo, ptr: slot, ty: IrType::I64, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: lo, ptr: slot, ty: IrType::I64, seg_override: AddressSpace::Default });
         let hi_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
             dest: hi_ptr,
@@ -950,7 +950,7 @@ impl Lowerer {
             ty: IrType::I8,
         });
         let hi = self.fresh_value();
-        self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: AddressSpace::Default });
         let lo128 = self.fresh_value();
         self.emit(Instruction::Cast { dest: lo128, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
         let hi128 = self.fresh_value();
@@ -998,10 +998,10 @@ impl Lowerer {
             let src_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr { dest: src_ptr, base: src, offset: Operand::Const(IrConst::I64(off)), ty: IrType::I8 });
             let lane_val = self.fresh_value();
-            self.emit(Instruction::Load { dest: lane_val, ptr: src_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { volatile: false, dest: lane_val, ptr: src_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
             let dst_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr { dest: dst_ptr, base: result, offset: Operand::Const(IrConst::I64((lane * 4) as i64)), ty: IrType::I8 });
-            self.emit(Instruction::Store { val: Operand::Value(lane_val), ptr: dst_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val: Operand::Value(lane_val), ptr: dst_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
         }
         // Raw builtin: return the vector BY VALUE (packed I128).
         Some(self.pack_vec128_from_slot(result))
@@ -1081,7 +1081,7 @@ impl Lowerer {
                 self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
                 // lo half
                 let lo = self.fresh_value();
-                self.emit(Instruction::Load { dest: lo, ptr: result_alloca, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
+                self.emit(Instruction::Load { volatile: false, dest: lo, ptr: result_alloca, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
                 // hi half: result_alloca + 8 (GEP so analyses see a proper derived pointer)
                 let hi_ptr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
@@ -1091,7 +1091,7 @@ impl Lowerer {
                     ty: IrType::I8,
                 });
                 let hi = self.fresh_value();
-                self.emit(Instruction::Load { dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
+                self.emit(Instruction::Load { volatile: false, dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
                 let lo128 = self.fresh_value();
                 self.emit(Instruction::Cast { dest: lo128, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
                 let hi128 = self.fresh_value();

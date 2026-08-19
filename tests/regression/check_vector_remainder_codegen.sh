@@ -26,7 +26,14 @@ def body(text, name):
     return match.group(1)
 
 
-matmul_body = body(matmul, "matmul_verify")
+# matmul_verify is a single-call-site static and folds into main at -O2
+# (GCC's -finline-functions-called-once behavior); the vector loop therefore
+# lives in whichever body absorbed it.  Search matmul_verify first and fall
+# back to the whole translation unit.
+try:
+    matmul_body = body(matmul, "matmul_verify")
+except SystemExit:
+    matmul_body = matmul
 if "vfmadd231pd" not in matmul_body:
     raise SystemExit("matmul_verify: AVX2 vector loop was not emitted")
 if re.search(r"\bidiv[lq]?\b", matmul_body):

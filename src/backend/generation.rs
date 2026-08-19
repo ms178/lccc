@@ -1337,7 +1337,19 @@ fn detect_load_cmp_mem_fold(
                 ptr,
                 ty,
                 seg_override,
-            } => (dest.0, ptr.0, *ty, *seg_override),
+                volatile,
+            } => {
+                if *volatile {
+                    // A volatile load must reach the backend as a real load
+                    // instruction; folding it into a memory compare would
+                    // still read memory once, BUT the folded form bypasses
+                    // the Load emission path the dead-load peepholes key on,
+                    // and single-use adjacency is not a sound proxy for the
+                    // access contract.  Keep it simple and honest: no fold.
+                    continue;
+                }
+                (dest.0, ptr.0, *ty, *seg_override)
+            }
             _ => continue,
         };
         if seg != AddressSpace::Default {
@@ -2723,6 +2735,7 @@ pub(super) fn generate_instruction(
             ptr,
             ty,
             seg_override,
+                volatile,
         } => {
             generate_load(
                 cg,
@@ -2816,6 +2829,7 @@ pub(super) fn generate_instruction(
             ptr,
             ty,
             seg_override,
+            ..
         } => {
             generate_store(
                 cg,

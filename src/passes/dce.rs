@@ -373,7 +373,10 @@ fn dump_dead_instructions(func: &IrFunction, live: &[Vec<u8>]) {
 /// that is why the historically missing `PgoCounterInc` never caused a
 /// deletion; it is now listed anyway so the predicate is truthful.)
 fn has_side_effects(inst: &Instruction) -> bool {
+    // A volatile load is an observable side effect (C11 5.1.2.3) even when
+    // its result is unused: it must never be dead-code eliminated.
     matches!(inst,
+        Instruction::Load { volatile: true, .. } |
         // Alloca must never be removed: codegen uses positional indexing
         // (`find_param_alloca`) to map function parameters to their stack
         // slots. Removing unused parameter allocas shifts indices and
@@ -443,8 +446,8 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(4)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
-                Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
