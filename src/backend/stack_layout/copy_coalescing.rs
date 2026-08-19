@@ -1325,7 +1325,7 @@ pub(super) fn build_copy_alias_map(
 /// source is excluded from the skip set only when some dest still needs the
 /// home — if every dest is itself skipped, the whole rename chain stays in
 /// the accumulator (0 stores).
-pub(super) fn compute_immediately_consumed(
+pub(crate) fn compute_immediately_consumed(
     func: &IrFunction,
     lhs_first_binop: bool,
 ) -> FxHashSet<u32> {
@@ -1510,13 +1510,18 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
 }
 
 fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
-    // A value whose single use is `Return` must NOT be skipped: the return
-    // emitter materialises it through the normal location machinery (ABI
-    // return register / slot), and a skipped home breaks the contract on
-    // backends whose accumulator cache is not the return-value path. Only
-    // fused-consume terminators (CondBranch condition, indirect-jump target,
-    // switch operand) consume a value without materialising it.
-    if matches!(term, Terminator::Return(_)) {
+    // A value whose single use is `Return` must NOT be skipped on backends
+    // whose return path materialises through the normal location machinery
+    // (ABI return register / slot) — a skipped home breaks the contract
+    // there.  i686 is the exception: its scalar-int return path IS the
+    // accumulator (emit_return_default → operand_to_eax → int-to-reg no-op),
+    // and the acc-preserving producer (the gate in compute_immediately_
+    // consumed) already left the value in %eax with a live cache entry —
+    // the Return consumes it with zero instructions and no home.  strlen's
+    // `p - s` tail, every leaf computation returning a folded expression.
+    // Wide/float returns are safe too: their types fail the producer gate
+    // (ty_lives_in_gpr_cache) long before reaching this point.
+    if matches!(term, Terminator::Return(_)) && !crate::common::types::target_is_32bit() {
         return false;
     }
     let mut saw = false;
