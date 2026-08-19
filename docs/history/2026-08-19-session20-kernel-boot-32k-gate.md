@@ -110,3 +110,100 @@ i686 until the emitter grows span save/restore. Documented, not shipped.
    gain at ≤ −193 corpus-wide; implement only after #1/#2.
 4. Leaf-param ABI homes on i686 (x86-64 has CCC_NO_LEAF_PARAM_GPR; i686
    prologue captures params to callee-saved/slot homes today).
+
+## Session 20 continued — landed fixes (each fully validated)
+
+### S02: redundant `testl` elimination (−57 B boot text)
+`andl`/`orl`/`xorl %R,%R` set exactly the flags `testl %R,%R` would produce
+(ZF/SF/PF from result, CF=OF=0). A directly following self-test is pure
+overhead → deleted (2 B/site, 29 sites in the corpus: cpucheck's
+`andl $536870912,%eax; testl %eax,%eax; je` etc.). Flag contract verified
+for the sign-flag consumer too (`js`-style). Gated regression check:
+`check_redundant_test_elimination.sh`.
+
+### S03: missing `#include` in `.S` is now fatal (GCC parity, correctness)
+The assembly preprocess paths (both `run_preprocess_only` and the `-c`
+builtin path in `external_tools.rs`) dropped preprocessor errors on the
+floor: `arch/x86/boot/header.S` compiled happily against an EMPTY
+`voffset.h`, silently evaluating the `VO_*` `#if` guards to 0. Both paths
+now emit the diagnostics and fail. Regression:
+`check_asm_missing_include_fatal.sh`. Kernel stubs documented:
+`arch/x86/boot/{zoffset.h,voffset.h}` must exist (stubs provided in the
+kernel-work tree; values are immediates → size-neutral).
+
+### S05/S06: CRITICAL — unary RMW classification fix (silent miscompile)
+`classify_line` gave single-operand unary RMWs (`notl %eax`, `negl %eax`,
+`incl %eax`, `decl %eax`) `dest_reg = REG_NONE` (no comma → parse_dest_reg
+fails). `propagate_reg_copies` then let a `movl %edx,%eax` alias SURVIVE
+`notl %eax` and rewrote the consumer back to the pre-not register:
+`v0 = ~v0` returned the OLD v0 — at every -O level, because the PEEPHOLE
+(not codegen) introduced it (`LCCC_NO_PEEPHOLE=1` hid it). Pre-existing on
+upstream `53b4254` (PR #136 head), confirmed by clean-worktree build.
+Fix: unary RMWs on a register operand now classify with their register as
+dest (memory operands keep REG_NONE). Found by the NEW differential fuzzer
+`tests/fuzz/slot_rmw_differential.py` (address-escaped locals + RMW shapes;
+the m32 fuzz never covered unary ops): 126 mismatches → 0 (750/750 cases).
+Pinning regression: `check_unary_rmw_copy_propagation.sh`.
+
+### S05 also: slot-RMW collapse peephole (−22 B corpus)
+`movl S,%R; OP %R; movl %R,S` → `OP S` when %R is provably dead before its
+next read (forward scan; barrier = label/jump/call/ret/push/directive;
+`popl %R` counts as a pure def, `popl %other` is skipped). Soundness hinge
+is the dead-register proof — the corpus's 8 surviving sites all keep %eax
+live after the store (result reused), so they correctly do NOT collapse;
+the fired sites are the dead-result shapes (printf/video counters).
+
+### Reverted experiment (documented, §69): leaf-param relax + Cast-clean
+Two allocator changes intended to put params/long-lived values in %ecx/%edx:
+(i) lift `param_restricted` for call-free i686 functions, (ii) mark ≤32-bit
+int/ptr Casts clean in the scratch-hazard scan. A/B matrix (corpus bytes):
+baseline 31966 / leaf-only 32013 (+47) / cast-only 32063 (+97) / both
+32154 (+188). Mechanism: register homes whose CONSUMERS stage through %eax
+pay a home→%eax relay that outweighs the saved slot traffic (check_cpu:
+`movl err_flags,%edx; movl %edx,%eax`; frame +24 B elsewhere). **Reverted
+completely.** Lesson: home selection must be consumer-shape-aware; this is
+the design core of the remaining −10 KB (§ "Remaining levers").
+
+### Re-base on PR #136 (S04)
+Upstream moved `b03191f → 53b4254` ("Preserve volatile memory semantics").
+Session commits rebased cleanly; full re-validation green: 931 unit, 50/50
+correctness, 350 + 6 known-gcc14 regression, boot corpus base now 32007
+(+98 B from PR #136's own volatile conservatism), boot objects 33492.
+
+### Gate status after session 20 (final)
+boot object text **33450** (33492 baseline: −57 redundant-test already in,
+−42 directive-aware slot-RMW collapse). Budget ≤ **23330**. Gap
+**≈ −10.1 KB (−30 %)**. GCC corpus reference 12846 (fits pecompat @ 0x4000).
+
+Note: the slot-RMW collapse initially only fired without `-g` because `.loc`
+directives broke the load/op/store adjacency; the final version skips
+NOP/Directive lines between the three instructions and in the dead-register
+forward scan (labels still block — single-block invariant preserved).
+
+## Validation ledger (session 20 final)
+- unit: 931/931 (fastbuild, -D warnings clean)
+- correctness: 50/50
+- regression --compare-gcc: 350 passed + 6 known gcc-14 oracle mismatches
+  (byte-identical set to session 19)
+- m32 differential fuzz: 900/900 (seeds 0:300 × O0/O2/Os)
+- slot_rmw differential fuzz (NEW): 750/750 (seeds 0:250 × O0/O2/Os)
+- boot build pipeline: 23 objects compile, lccc-ld evaluates setup.ld
+  asserts faithfully ("at most 64 sectors" = the live gate)
+
+## Remaining levers (updated evidence, ranked)
+1. **Consumer-shape-aware home selection** — the reverted experiment proved
+   the win exists but needs the emitter's consumer shape in the cost model
+   (register home only pays if the consumer reads the register directly:
+   memory-folded cmp, direct-dest ALU, register-source binop). Design:
+   classify each value's consumers at allocation time; gate ecx/edx homes
+   on ≥1 register-friendly consumer; else keep the acc-cache flow.
+2. **CFG-aware phi-web coalescing** — switch-state webs (cpucheck
+   `__cmdline_find_option` v103–v106 class) each take a slot; merging
+   copies of ONE C variable collapses N slots to 1. Needs the deferred-slot
+   machinery respected (session 16 root cause).
+3. **%eax allocatable** — +1 register; every accumulator path must tolerate
+   %eax live. Biggest structural change; prototype behind a flag.
+4. **Load ecx-hazard refinement** — Load is ecx-dirty unless ptr is a direct
+   alloca; when the ptr is register-resident at emit time no %ecx staging
+   happens. Two-pass allocation (ptrs first, hazards recomputed) could
+   unlock ecx across loops. Soundness hinges on allocation-aware staging.

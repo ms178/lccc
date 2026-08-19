@@ -544,7 +544,28 @@ fn classify_line(raw: &str) -> LineInfo {
     }
 
     // Other instruction
-    let dest_reg = parse_dest_reg(s);
+    let mut dest_reg = parse_dest_reg(s);
+    // Single-operand unary RMWs (`incl %eax`, `notl %ebx`, ...) write their
+    // only register operand, but `parse_dest_reg` finds no comma and returns
+    // REG_NONE.  Without the dest, copy propagation lets a `movl %edx,%eax`
+    // alias SURVIVE `notl %eax` and rewrites the result's consumer back to
+    // the pre-not register — silently discarding the operation (v0 = ~v0
+    // returned the old v0; slot_rmw_differential seed 2).  Memory operands
+    // (`incl -8(%ebp)`) keep REG_NONE: they write memory, not a register.
+    if dest_reg == REG_NONE {
+        if let Some((mnem, operand)) = s.split_once(char::is_whitespace) {
+            let op = operand.trim();
+            let is_unary_rmw = matches!(
+                mnem,
+                "incl" | "incw" | "incb" | "decl" | "decw" | "decb"
+                    | "notl" | "notw" | "notb"
+                    | "negl" | "negw" | "negb"
+            );
+            if is_unary_rmw && op.starts_with('%') && !op.contains('(') {
+                dest_reg = register_family(op);
+            }
+        }
+    }
     let has_indirect = has_indirect_memory_access(s);
     let ebp_off = if has_indirect { EBP_OFFSET_NONE } else { parse_ebp_offset_in_line(s) };
     LineInfo {
@@ -3103,6 +3124,191 @@ fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
     changed
 }
 
+// ── Pass: slot read-modify-write collapse ────────────────────────────────────
+
+/// Collapse `movl S,%eax; OP %eax; movl %eax,S` (S = N(%esp)) into a single
+/// memory-destination `OP S`.  The register round-trip is pure staging: the
+/// value lives in the slot, the op touches it once, and it goes straight back
+/// (boot corpus examples: a20's retry counter `incl`, cpu's `addl $4`,
+/// printf's width `decl`).  Savings 5-7 bytes per site.
+///
+/// Soundness: the memory form writes the same value and sets the IDENTICAL
+/// flags (incl/decl leave CF alone in both forms).  The ONLY semantic
+/// difference is that %eax no longer holds the result afterwards — the
+/// collapse is therefore gated on a forward scan proving %eax is not read
+/// before its next pure write.  Any barrier (label/branch/call/ret/push/
+/// pop/esp-arithmetic/directive) stops the scan conservatively.
+fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var("CCC_NO_SLOT_RMW").is_ok() {
+        return false;
+    }
+    /// Next line index that is neither a NOP nor a (code-less) directive —
+    /// `-g` interleaves `.loc` markers between instructions, and they must
+    /// not break the load/op/store adjacency.
+    fn next_code_line(infos: &[LineInfo], start: usize) -> usize {
+        let mut k = start;
+        while k < infos.len() && (infos[k].is_nop() || infos[k].kind == LineKind::Directive) {
+            k += 1;
+        }
+        k
+    }
+    /// Parse an op line that reads and writes %REG and has a valid
+    /// memory-destination form: returns (mnemonic, optional source operand).
+    fn parse_rmw_op<'a>(s: &'a str, reg_name: &str) -> Option<(&'a str, Option<&'a str>)> {
+        let (mnem, rest) = s.split_once(char::is_whitespace)?;
+        match mnem {
+            "incl" | "decl" | "negl" | "notl" => {
+                if rest.trim() == reg_name {
+                    return Some((mnem, None));
+                }
+                return None;
+            }
+            "addl" | "subl" | "andl" | "orl" | "xorl" => {}
+            _ => return None,
+        }
+        // "SRC, %REG"
+        let (src, dst) = rest.rsplit_once(',')?;
+        if dst.trim() != reg_name {
+            return None;
+        }
+        let src = src.trim();
+        // Immediate or a different 32-bit register only: memory sources
+        // cannot pair with a memory destination, and %esp is never data.
+        if src.starts_with('$') {
+            return Some((mnem, Some(src)));
+        }
+        const GPR32: &[&str] = &[
+            "%eax", "%ebx", "%ecx", "%edx", "%esi", "%edi", "%ebp",
+        ];
+        if GPR32.contains(&src) && src != reg_name {
+            return Some((mnem, Some(src)));
+        }
+        None
+    }
+
+    let mut changed = false;
+    let len = infos.len();
+    let mut i = 0;
+    while i + 2 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Line i: movl SLOT, %REG
+        let (reg, load) = match infos[i].kind {
+            LineKind::LoadEbp { reg, .. }
+                if reg != REG_ESP && reg != REG_EBP && reg <= REG_GP_MAX =>
+            {
+                (reg, trimmed(store, &infos[i], i))
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let reg_name = reg32_name(reg);
+        let load_suffix = format!(", {}", reg_name);
+        let slot = load
+            .strip_prefix("movl ")
+            .and_then(|r| r.strip_suffix(load_suffix.as_str()))
+            .map(str::trim);
+        let slot = match slot {
+            Some(s)
+                if (s.ends_with("(%esp)") || s.ends_with("(%ebp)")) && !s.starts_with('(') =>
+            {
+                s
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Line i+1: the RMW op on %REG (directives between are skipped)
+        let op_idx = next_code_line(infos, i + 1);
+        if op_idx >= len {
+            break;
+        }
+        let op = trimmed(store, &infos[op_idx], op_idx);
+        let (mnem, src) = match parse_rmw_op(op, reg_name) {
+            Some(p) => p,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        // Line i+2: movl %REG, SAME slot
+        let st_idx = next_code_line(infos, op_idx + 1);
+        if st_idx >= len {
+            break;
+        }
+        let store_line = match infos[st_idx].kind {
+            LineKind::StoreEbp { reg: sr, .. } if sr == reg => {
+                trimmed(store, &infos[st_idx], st_idx)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let store_prefix = format!("movl {}, ", reg_name);
+        let store_slot = store_line.strip_prefix(store_prefix.as_str()).map(str::trim);
+        if store_slot != Some(slot) {
+            i += 1;
+            continue;
+        }
+        // Forward scan: %REG must not be read before its next pure write.
+        let reg_bit: u16 = 1 << reg;
+        let mut k = st_idx + 1;
+        let mut reg_dead = false;
+        while k < len {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                k += 1;
+                continue;
+            }
+            // `popl %REG` in the epilogue is a pure restore (def) of the
+            // register — the stale collapsed value is overwritten, never
+            // read.  Pops of OTHER registers leave %REG untouched (they do
+            // shift %esp, but no slot reasoning happens after the collapse).
+            if let LineKind::Pop { reg: popped } = infos[k].kind {
+                if popped == reg {
+                    reg_dead = true;
+                    break;
+                }
+                k += 1;
+                continue;
+            }
+            if infos[k].is_barrier() {
+                break;
+            }
+            let (uses, defs) = line_reg_use_def(store, infos, k);
+            if uses & reg_bit != 0 {
+                break; // stale value would be read
+            }
+            if defs & reg_bit != 0 {
+                reg_dead = true; // overwritten before any read
+                break;
+            }
+            k += 1;
+        }
+        if !reg_dead {
+            i += 1;
+            continue;
+        }
+        // Collapse.
+        let mem_op = match src {
+            Some(src) => format!("    {} {}, {}", mnem, src, slot),
+            None => format!("    {} {}", mnem, slot),
+        };
+        store.replace(i, mem_op);
+        infos[i] = classify_line(store.get(i));
+        infos[op_idx].kind = LineKind::Nop;
+        infos[st_idx].kind = LineKind::Nop;
+        changed = true;
+        i = st_idx + 1;
+    }
+    changed
+}
+
 // ── Pass: Memory operand folding ─────────────────────────────────────────────
 
 /// True when `s` is a genuine 32-bit `movl` load whose memory operand is a
@@ -4050,6 +4256,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
+    let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
 
     // Phase 3: Local cleanup after global passes
     if global_changed {
