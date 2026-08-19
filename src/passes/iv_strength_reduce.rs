@@ -981,7 +981,7 @@ mod tests {
                     offset: Operand::Value(Value(6)),
                     ty: IrType::I32,
                 },
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(8),
                     ptr: Value(7),
                     ty: IrType::I32,
@@ -1003,7 +1003,7 @@ mod tests {
                     offset: Operand::Value(Value(11)),
                     ty: IrType::I32,
                 },
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(13),
                     ptr: Value(12),
                     ty: IrType::I32,

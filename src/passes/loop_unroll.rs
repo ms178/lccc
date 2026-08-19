@@ -1622,7 +1622,7 @@ mod tests {
                     offset: Operand::Const(IrConst::I32(0)),
                     ty: IrType::I32,
                 },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Const(IrConst::I32(0)),
                     ptr: Value(4),
                     ty: IrType::I32,

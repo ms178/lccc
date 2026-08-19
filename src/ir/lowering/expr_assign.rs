@@ -95,7 +95,7 @@ impl Lowerer {
             let rhs_val = self.lower_expr(rhs);
             if let Some(lv) = self.lower_lvalue(lhs) {
                 let dest_addr = self.lvalue_addr(&lv);
-                self.emit(Instruction::Store { val: rhs_val, ptr: dest_addr, ty: Self::packed_store_type(struct_size) , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { volatile: lv.volatile, val: rhs_val, ptr: dest_addr, ty: Self::packed_store_type(struct_size) , seg_override: AddressSpace::Default });
                 return Operand::Value(dest_addr);
             }
             return rhs_val;
@@ -183,7 +183,7 @@ impl Lowerer {
         } else {
             rhs_val
         };
-        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, store_val);
+        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, store_val, self.expr_access_is_volatile(lhs));
         Some(self.truncate_to_bitfield_value(store_val, bit_width, storage_ty.is_signed()))
     }
 
@@ -209,13 +209,13 @@ impl Lowerer {
             Operand::Value(result)
         };
 
-        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, store_val);
+        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, store_val, self.expr_access_is_volatile(lhs));
         Some(self.truncate_to_bitfield_value(store_val, bit_width, storage_ty.is_signed()))
     }
 
     /// Store a value into a bitfield: load storage unit, clear field bits, OR in new value, store back.
     /// Handles packed bitfields that span beyond the storage type (bit_offset + bit_width > storage_bits).
-    pub(super) fn store_bitfield(&mut self, addr: Value, storage_ty: IrType, bit_offset: u32, bit_width: u32, val: Operand) {
+    pub(super) fn store_bitfield(&mut self, addr: Value, storage_ty: IrType, bit_offset: u32, bit_width: u32, val: Operand, volatile: bool) {
         if bit_width >= 64 && bit_offset == 0 {
             // Ensure the value is widened to the storage type (e.g., I32 -> I64)
             // so that on i686 the backend doesn't store a truncated 32-bit value
@@ -240,7 +240,7 @@ impl Lowerer {
                     }
                 }
             };
-            self.emit(Instruction::Store { val: widened, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val: widened, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
             return;
         }
 
@@ -248,7 +248,7 @@ impl Lowerer {
 
         // Check if the bitfield spans beyond the storage type boundary (packed bitfields)
         if storage_bits > 0 && bit_offset + bit_width > storage_bits {
-            self.store_bitfield_split(addr, storage_ty, storage_bits, bit_offset, bit_width, val);
+            self.store_bitfield_split(addr, storage_ty, storage_bits, bit_offset, bit_width, val, volatile);
             return;
         }
 
@@ -266,18 +266,18 @@ impl Lowerer {
         };
 
         let old_val = self.fresh_value();
-        self.emit(Instruction::Load { dest: old_val, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile, dest: old_val, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
 
         let clear_mask = if bit_width >= op_bits { 0u64 } else { !(mask << bit_offset) };
         let cleared = self.emit_binop_val(IrBinOp::And, Operand::Value(old_val), Operand::Const(IrConst::I64(clear_mask as i64)), op_ty);
         let new_val = self.emit_binop_val(IrBinOp::Or, Operand::Value(cleared), Operand::Value(shifted_val), op_ty);
 
-        self.emit(Instruction::Store { val: Operand::Value(new_val), ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile, val: Operand::Value(new_val), ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
     }
 
     /// Store a bitfield that spans across two storage units (packed bitfields).
     /// Splits the value into low and high parts and does two read-modify-write operations.
-    fn store_bitfield_split(&mut self, addr: Value, storage_ty: IrType, storage_bits: u32, bit_offset: u32, bit_width: u32, val: Operand) {
+    fn store_bitfield_split(&mut self, addr: Value, storage_ty: IrType, storage_bits: u32, bit_offset: u32, bit_width: u32, val: Operand, volatile: bool) {
         let low_bits = storage_bits - bit_offset;
         let high_bits = bit_width - low_bits;
 
@@ -299,11 +299,11 @@ impl Lowerer {
 
         // Read-modify-write low storage unit
         let old_low = self.fresh_value();
-        self.emit(Instruction::Load { dest: old_low, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: old_low, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
         let low_clear = !(low_mask << bit_offset);
         let cleared_low = self.emit_binop_val(IrBinOp::And, Operand::Value(old_low), Operand::Const(IrConst::I64(low_clear as i64)), op_ty);
         let new_low = self.emit_binop_val(IrBinOp::Or, Operand::Value(cleared_low), Operand::Value(shifted_low), op_ty);
-        self.emit(Instruction::Store { val: Operand::Value(new_low), ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: Operand::Value(new_low), ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
 
         // High part: take remaining bits from masked_val >> low_bits, store at bit 0 of next unit
         let high_val = self.emit_binop_val(IrBinOp::LShr, Operand::Value(masked_val), Operand::Const(IrConst::I64(low_bits as i64)), op_ty);
@@ -314,11 +314,11 @@ impl Lowerer {
 
         // Read-modify-write high storage unit
         let old_high = self.fresh_value();
-        self.emit(Instruction::Load { dest: old_high, ptr: high_addr, ty: storage_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: old_high, ptr: high_addr, ty: storage_ty , seg_override: AddressSpace::Default });
         let high_clear = !high_mask;
         let cleared_high = self.emit_binop_val(IrBinOp::And, Operand::Value(old_high), Operand::Const(IrConst::I64(high_clear as i64)), op_ty);
         let new_high = self.emit_binop_val(IrBinOp::Or, Operand::Value(cleared_high), Operand::Value(masked_high), op_ty);
-        self.emit(Instruction::Store { val: Operand::Value(new_high), ptr: high_addr, ty: storage_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: Operand::Value(new_high), ptr: high_addr, ty: storage_ty , seg_override: AddressSpace::Default });
     }
 
     /// Extract a bitfield value from a loaded storage unit.
@@ -388,7 +388,7 @@ impl Lowerer {
 
             // Load low part, shift right by bit_offset to get low_bits at bit 0
             let low_loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: low_loaded, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { volatile: false, dest: low_loaded, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
             let low_val = if bit_offset > 0 {
                 
                 self.emit_binop_val(IrBinOp::LShr, Operand::Value(low_loaded), Operand::Const(IrConst::I64(bit_offset as i64)), op_ty)
@@ -401,7 +401,7 @@ impl Lowerer {
             // Load high part from next storage unit
             let high_addr = self.emit_gep_offset(addr, storage_ty.size(), IrType::I8);
             let high_loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: high_loaded, ptr: high_addr, ty: storage_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { volatile: false, dest: high_loaded, ptr: high_addr, ty: storage_ty , seg_override: AddressSpace::Default });
             let high_mask = if high_bits >= op_bits { u64::MAX } else { (1u64 << high_bits) - 1 };
             let masked_high = self.emit_binop_val(IrBinOp::And, Operand::Value(high_loaded), Operand::Const(IrConst::I64(high_mask as i64)), op_ty);
 
@@ -421,7 +421,7 @@ impl Lowerer {
         } else {
             // Normal case: load single storage unit and extract
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: addr, ty: storage_ty , seg_override: AddressSpace::Default });
             self.extract_bitfield(loaded, storage_ty, bit_offset, bit_width)
         }
     }
@@ -715,7 +715,7 @@ impl Lowerer {
             let alloca = self.fresh_value();
             let store_ty = Self::packed_store_type(total_size);
             self.emit(Instruction::Alloca { dest: alloca, size: total_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-            self.emit(Instruction::Store { val: rhs_val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val: rhs_val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
             alloca
         } else {
             self.operand_to_value(rhs_val)
@@ -799,7 +799,7 @@ impl Lowerer {
             };
             // Load LHS element
             let lhs_elem = self.fresh_value();
-            self.emit(Instruction::Load { dest: lhs_elem, ptr: lhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { volatile: false, dest: lhs_elem, ptr: lhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
             // Get RHS element: splatted scalar or loaded from vector
             let rhs_elem_op = if let Some(ref scalar_op) = rhs_scalar {
                 *scalar_op
@@ -810,13 +810,13 @@ impl Lowerer {
                     rhs_val
                 };
                 let rhs_elem = self.fresh_value();
-                self.emit(Instruction::Load { dest: rhs_elem, ptr: rhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Load { volatile: false, dest: rhs_elem, ptr: rhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
                 Operand::Value(rhs_elem)
             };
             // Compute result
             let result_elem = self.emit_binop_val(ir_op, Operand::Value(lhs_elem), rhs_elem_op, elem_ir_ty);
             // Store back to LHS
-            self.emit(Instruction::Store { val: Operand::Value(result_elem), ptr: lhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val: Operand::Value(result_elem), ptr: lhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
         }
 
         Operand::Value(lhs_ptr_val)
@@ -881,7 +881,7 @@ impl Lowerer {
                     lhs_val
                 };
                 let lhs_elem = self.fresh_value();
-                self.emit(Instruction::Load { dest: lhs_elem, ptr: lhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Load { volatile: false, dest: lhs_elem, ptr: lhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
                 Operand::Value(lhs_elem)
             };
 
@@ -895,7 +895,7 @@ impl Lowerer {
                     rhs_val
                 };
                 let rhs_elem = self.fresh_value();
-                self.emit(Instruction::Load { dest: rhs_elem, ptr: rhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Load { volatile: false, dest: rhs_elem, ptr: rhs_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
                 Operand::Value(rhs_elem)
             };
 
@@ -908,7 +908,7 @@ impl Lowerer {
             // Compute result
             let result_elem = self.emit_binop_val(ir_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
             // Store to result
-            self.emit(Instruction::Store { val: Operand::Value(result_elem), ptr: result_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { volatile: false, val: Operand::Value(result_elem), ptr: result_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
         }
 
         Operand::Value(result_alloca)

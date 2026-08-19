@@ -1160,7 +1160,7 @@ fn dump_helper(
             offset: Operand::Const(IrConst::I64((*entry_slot * 8) as i64)),
             ty: IrType::I64,
         });
-        is.push(Instruction::Load {
+        is.push(Instruction::Load { volatile: false,
             dest: fcnt,
             ptr: fg,
             ty: IrType::I64,
@@ -1195,7 +1195,7 @@ fn dump_helper(
                 offset: Operand::Const(IrConst::I64((*slot * 8) as i64)),
                 ty: IrType::I64,
             });
-            is.push(Instruction::Load {
+            is.push(Instruction::Load { volatile: false,
                 dest: fmt,
                 ptr: lp,
                 ty: IrType::I64,
@@ -1244,7 +1244,7 @@ fn dump_helper(
                     offset: Operand::Const(IrConst::I64(64)),
                     ty: IrType::I64,
                 });
-                is.push(Instruction::Load {
+                is.push(Instruction::Load { volatile: false,
                     dest: tot,
                     ptr: totp,
                     ty: IrType::I64,
@@ -1281,7 +1281,7 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64((slot * 8) as i64)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load {
+                    is.push(Instruction::Load { volatile: false,
                         dest: av,
                         ptr: ap,
                         ty: IrType::I64,
@@ -1293,7 +1293,7 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64((32 + slot * 8) as i64)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load {
+                    is.push(Instruction::Load { volatile: false,
                         dest: cv,
                         ptr: cp,
                         ty: IrType::I64,
@@ -1317,7 +1317,7 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64(8)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load {
+                    is.push(Instruction::Load { volatile: false,
                         dest: nm2,
                         ptr: nm2,
                         ty: IrType::I64,
@@ -1329,7 +1329,7 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64(16)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load {
+                    is.push(Instruction::Load { volatile: false,
                         dest: fl,
                         ptr: fl2,
                         ty: IrType::I64,
@@ -1586,13 +1586,13 @@ fn push_helper_fn(
             param_idx: i,
             ty,
         });
-        entry_is.push(Instruction::Store {
+        entry_is.push(Instruction::Store { volatile: false,
             val: Operand::Value(Value(i as u32)),
             ptr: a,
             ty,
             seg_override: crate::common::types::AddressSpace::Default,
         });
-        entry_is.push(Instruction::Load {
+        entry_is.push(Instruction::Load { volatile: false,
             dest: l,
             ptr: a,
             ty,
@@ -1621,7 +1621,7 @@ fn push_helper_fn(
             for inst in b.instructions.iter_mut() {
                 match inst {
                     Instruction::Store {
-                        val, ptr, ty, seg_override,
+                        val, ptr, ty, seg_override, ..
                     } => {
                         let _ = ty;
                         let _ = seg_override;
@@ -1805,7 +1805,7 @@ impl VpBuilder {
     }
     fn load(&mut self, ptr: Value) -> Value {
         let d = self.v();
-        self.push(Instruction::Load {
+        self.push(Instruction::Load { volatile: false,
             dest: d,
             ptr,
             ty: IrType::I64,
@@ -1814,7 +1814,7 @@ impl VpBuilder {
         d
     }
     fn store(&mut self, ptr: Value, val: Operand) {
-        self.push(Instruction::Store {
+        self.push(Instruction::Store { volatile: false,
             val,
             ptr,
             ty: IrType::I64,

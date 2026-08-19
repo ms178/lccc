@@ -669,16 +669,16 @@ mod tests {
             instructions: vec![
                 Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false, semantic_volatile: false },
                 Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 4, volatile: false, semantic_volatile: false },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Const(IrConst::I32(1)), ptr: Value(0), ty: IrType::I32,
                     seg_override: AddressSpace::Default,
                 },
                 Instruction::Memcpy { dest: Value(1), src: Value(0), size: 4 },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Const(IrConst::I32(2)), ptr: Value(0), ty: IrType::I32,
                     seg_override: AddressSpace::Default,
                 },
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(2), ptr: Value(1), ty: IrType::I32,
                     seg_override: AddressSpace::Default,
                 },

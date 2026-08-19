@@ -1931,7 +1931,7 @@ mod tests {
                     rhs: Operand::Const(IrConst::I64(4)),
                     ty: IrType::Ptr,
                 },
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(2),
                     ptr: Value(1),
                     ty: IrType::U8,

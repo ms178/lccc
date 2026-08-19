@@ -1035,6 +1035,13 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
         for &bi in &lp.body {
             for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
                 match inst {
+                    // Volatile accesses are observable side effects: promoting
+                    // them to a register preheader load + epilogue store
+                    // collapses N observable accesses into 2 (C11 5.1.2.3).
+                    Instruction::Load { volatile: true, .. }
+                    | Instruction::Store { volatile: true, .. } => {
+                        has_unknown_mem = true;
+                    }
                     Instruction::Load {
                         dest,
                         ptr,
@@ -1201,7 +1208,7 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     insert_inst(
         &mut func.blocks[plan.preheader],
         preheader_end,
-        Instruction::Load {
+        Instruction::Load { volatile: false,
             dest: init,
             ptr: plan.ptr,
             ty: plan.load_ty,
@@ -1250,7 +1257,7 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     insert_inst(
         &mut func.blocks[plan.exit_block],
         exit_insert,
-        Instruction::Store {
+        Instruction::Store { volatile: false,
             val: exit_val,
             ptr: plan.ptr,
             ty: plan.load_ty,
@@ -1641,7 +1648,7 @@ mod tests {
                         volatile: false,
                         semantic_volatile: false,
                     },
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Const(IrConst::I32(0)),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1653,7 +1660,7 @@ mod tests {
             block(
                 1,
                 vec![
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1666,7 +1673,7 @@ mod tests {
                         rhs: Operand::Const(IrConst::I32(1)),
                         ty: IrType::I32,
                     },
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: Operand::Value(Value(2)),
                         ptr: Value(0),
                         ty: IrType::I32,

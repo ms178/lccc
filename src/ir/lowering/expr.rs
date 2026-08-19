@@ -362,7 +362,7 @@ impl Lowerer {
         });
         // Load the result from the alloca
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default });
         Operand::Value(result)
     }
 
@@ -383,7 +383,9 @@ impl Lowerer {
             }
         }
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.address_space });
+        let is_vol = ginfo.base_type_volatile
+            && !matches!(ginfo.var.c_type.as_ref(), Some(CType::Pointer(..)));
+        self.emit(Instruction::Load { volatile: is_vol, dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.address_space });
         Operand::Value(dest)
     }
 
@@ -405,6 +407,8 @@ impl Lowerer {
             let is_struct = info.is_struct;
             let is_complex = info.c_type.as_ref().is_some_and(|ct| ct.is_complex());
             let is_vector = info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+            let is_vol = info.base_type_volatile
+                && !matches!(info.var.c_type.as_ref(), Some(CType::Pointer(..)));
             let static_global_name = info.static_global_name.clone();
             let asm_register = info.asm_register.clone();
             let asm_register_has_init = info.asm_register_has_init;
@@ -433,7 +437,7 @@ impl Lowerer {
                     return Operand::Value(addr);
                 }
                 let dest = self.fresh_value();
-                self.emit(Instruction::Load { dest, ptr: addr, ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Load { volatile: is_vol, dest, ptr: addr, ty , seg_override: AddressSpace::Default });
                 return Operand::Value(dest);
             }
             if is_array || is_struct {
@@ -443,7 +447,7 @@ impl Lowerer {
                 return Operand::Value(alloca);
             }
             let dest = self.fresh_value();
-            self.emit(Instruction::Load { dest, ptr: alloca, ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { volatile: is_vol, dest, ptr: alloca, ty , seg_override: AddressSpace::Default });
             return Operand::Value(dest);
         }
 

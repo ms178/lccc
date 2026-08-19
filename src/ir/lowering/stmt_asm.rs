@@ -67,8 +67,9 @@ impl Lowerer {
             // Detect address space for memory operands (e.g., __seg_gs pointer dereferences)
             let out_seg = self.get_asm_operand_addr_space(&out.expr);
             let ptr = if let Some(lv) = self.lower_lvalue(&out.expr) {
-                match lv {
-                    LValue::Variable(v) | LValue::Address(v, _) => v,
+                match lv.kind {
+                    crate::ir::lowering::definitions::LValueKind::Variable(v)
+                    | crate::ir::lowering::definitions::LValueKind::Address(v, _) => v,
                 }
             } else if let Expr::Identifier(ref var_name, _) = out.expr {
                 // Global register variables are pinned to specific hardware registers
@@ -155,7 +156,7 @@ impl Lowerer {
                     Operand::Value(ptr)
                 } else {
                     let cur_val = self.fresh_value();
-                    self.emit(Instruction::Load { dest: cur_val, ptr, ty: out_ty, seg_override: out_seg });
+                    self.emit(Instruction::Load { volatile: false, dest: cur_val, ptr, ty: out_ty, seg_override: out_seg });
                     Operand::Value(cur_val)
                 };
                 ir_inputs.push((constraint.replace('+', "").to_string(), input_operand, name.clone()));
@@ -242,8 +243,9 @@ impl Lowerer {
                     sym_name = self.extract_mem_operand_symbol(&inp.expr);
                 }
                 if let Some(lv) = self.lower_lvalue(&inp.expr) {
-                    let ptr = match lv {
-                        LValue::Variable(v) | LValue::Address(v, _) => v,
+                    let ptr = match lv.kind {
+                        crate::ir::lowering::definitions::LValueKind::Variable(v)
+                        | crate::ir::lowering::definitions::LValueKind::Address(v, _) => v,
                     };
                     Operand::Value(ptr)
                 } else {
@@ -261,7 +263,7 @@ impl Lowerer {
                     if let Some(alloca) = self.get_local_alloca(var_name) {
                         if self.get_asm_register(var_name).is_some() {
                             let dest = self.fresh_value();
-                            self.emit(Instruction::Load { dest, ptr: alloca, ty: inp_ty, seg_override: inp_seg });
+                            self.emit(Instruction::Load { volatile: false, dest, ptr: alloca, ty: inp_ty, seg_override: inp_seg });
                             Operand::Value(dest)
                         } else {
                             self.lower_expr(&inp.expr)

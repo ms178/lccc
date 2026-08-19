@@ -641,7 +641,7 @@ impl Lowerer {
                     // load the packed data to match the other packed-data branch
                     if let Operand::Value(ptr) = then_val {
                         let loaded = s.fresh_value();
-                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
+                        s.emit(Instruction::Load { volatile: false, dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
                         Operand::Value(loaded)
                     } else {
                         then_val
@@ -657,7 +657,7 @@ impl Lowerer {
                     // load the packed data to match the other packed-data branch
                     if let Operand::Value(ptr) = else_val {
                         let loaded = s.fresh_value();
-                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
+                        s.emit(Instruction::Load { volatile: false, dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
                         Operand::Value(loaded)
                     } else {
                         else_val
@@ -749,17 +749,17 @@ impl Lowerer {
 
         self.start_block(then_label);
         let then_val = then_fn(self);
-        self.emit(Instruction::Store { val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(else_label);
         let else_val = else_fn(self);
-        self.emit(Instruction::Store { val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
         Operand::Value(result)
     }
 
@@ -796,17 +796,17 @@ impl Lowerer {
 
         self.start_block(then_label);
         let then_val = then_fn(self);
-        self.emit(Instruction::Store { val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(else_label);
         let else_val = else_fn(self);
-        self.emit(Instruction::Store { val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
         Operand::Value(result)
     }
 
@@ -887,7 +887,7 @@ impl Lowerer {
         let end_label = self.fresh_label();
 
         let default_val = if is_and { 0 } else { 1 };
-        self.emit(Instruction::Store { val: Operand::Const(make_int_const(default_val)), ptr: result_alloca, ty: int_ty,
+        self.emit(Instruction::Store { volatile: false, val: Operand::Const(make_int_const(default_val)), ptr: result_alloca, ty: int_ty,
          seg_override: AddressSpace::Default });
 
         let n = kept.len();
@@ -904,12 +904,12 @@ impl Lowerer {
         }
 
         let last_bool = lower_last_bool(self);
-        self.emit(Instruction::Store { val: last_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { volatile: false, val: last_bool, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { volatile: false, dest: result, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
         Operand::Value(result)
     }
 
@@ -976,7 +976,7 @@ impl Lowerer {
         let one = if wt == IrType::I32 { IrConst::I32(1) } else { IrConst::I64(1) };
         let result = self.emit_binop_val(ir_op, current_val, Operand::Const(one), wt);
 
-        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result));
+        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result), self.expr_access_is_volatile(inner));
 
         let ret_val = if return_new { Operand::Value(result) } else { current_val };
         Some(self.truncate_to_bitfield_value(ret_val, bit_width, storage_ty.is_signed()))

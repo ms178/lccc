@@ -174,7 +174,7 @@ fn apply_inst(
     changed: &mut usize,
 ) {
     match inst {
-        Instruction::Store { val, ptr, ty, seg_override, .. } => {
+        Instruction::Store { val, ptr, ty, seg_override, volatile, .. } => {
             if *seg_override != AddressSpace::Default {
                 // Segment-relative store: target unknown, kill everything.
                 map.clear();
@@ -197,8 +197,13 @@ fn apply_inst(
                 map.clear();
             }
         }
-        Instruction::Load { dest, ptr, ty, seg_override, .. } => {
+        Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
             if *seg_override != AddressSpace::Default {
+                return;
+            }
+            // Volatile loads are observable side effects (C11 5.1.2.3):
+            // the memory read must actually happen.
+            if *volatile {
                 return;
             }
             if let Some(fp) = paths.get(&ptr.0) {
@@ -327,7 +332,7 @@ mod tests {
     }
 
     fn store(val: u32, ptr: u32) -> Instruction {
-        Instruction::Store {
+        Instruction::Store { volatile: false,
             val: Operand::Value(Value(val)),
             ptr: Value(ptr),
             ty: IrType::I64,
@@ -336,7 +341,7 @@ mod tests {
     }
 
     fn load(dest: u32, ptr: u32) -> Instruction {
-        Instruction::Load {
+        Instruction::Load { volatile: false,
             dest: Value(dest),
             ptr: Value(ptr),
             ty: IrType::I64,
@@ -422,7 +427,7 @@ mod tests {
             vec![
                 alloca(1),
                 alloca(3),
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Value(Value(1)), // address escapes!
                     ptr: Value(3),
                     ty: IrType::Ptr,
@@ -527,7 +532,7 @@ mod tests {
                 alloca(1),
                 store(7, 1),
                 gep3,
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Value(Value(9)),
                     ptr: Value(10),
                     ty: IrType::I8,
@@ -549,7 +554,7 @@ mod tests {
             vec![
                 alloca(1),
                 store(7, 1),
-                Instruction::Load {
+                Instruction::Load { volatile: false,
                     dest: Value(2),
                     ptr: Value(1),
                     ty: IrType::I32,
@@ -576,7 +581,7 @@ mod tests {
                     offset: Operand::Value(Value(99)),
                     ty: IrType::I8,
                 },
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Value(Value(9)),
                     ptr: Value(10),
                     ty: IrType::I8,

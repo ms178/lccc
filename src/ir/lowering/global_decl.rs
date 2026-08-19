@@ -279,6 +279,7 @@ impl Lowerer {
     /// array fixup, and scalar size adjustment.
     fn prepare_global_analysis(&self, decl: &Declaration, declarator: &InitDeclarator) -> DeclAnalysis {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        da.base_type_volatile = decl.is_volatile();
         let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
         if let Some(vs) = decl.resolve_vector_size(elem_size) {
             da.apply_vector_size(vs);
@@ -533,6 +534,7 @@ impl Lowerer {
             array_dim_strides, is_array_of_pointers, is_array_of_func_ptrs,
             struct_layout, is_struct, actual_alloc_size, pointee_type, c_type,
             is_bool, elem_ir_ty, is_ptr_to_func_ptr,
+            base_type_volatile: false,
         }
     }
 

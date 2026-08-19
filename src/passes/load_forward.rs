@@ -50,8 +50,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut pred_load: Option<(u32, u32, crate::common::types::IrType)> = None; // (ptr id, dest id, ty)
         for inst in pred_block.instructions.iter().rev() {
             match inst {
-                Instruction::Load { dest, ptr, ty, seg_override } => {
-                    if *seg_override == AddressSpace::Default && !ty.is_float() && !ty.is_128bit() && !ty.is_long_double() {
+                Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
+                    if *seg_override == AddressSpace::Default && !*volatile && !ty.is_float() && !ty.is_128bit() && !ty.is_long_double() {
                         pred_load = Some((ptr.0, dest.0, *ty));
                     }
                     break;
@@ -73,8 +73,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         // Find the first Load in this block with no memory clobber before it.
         for (ii, inst) in block.instructions.iter().enumerate() {
             match inst {
-                Instruction::Load { dest, ptr, ty, seg_override } => {
+                Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
                     if *seg_override == AddressSpace::Default
+                        && !*volatile
                         && ptr.0 == pred_ptr
                         && *ty == pred_ty
                         && dest.0 != pred_dest

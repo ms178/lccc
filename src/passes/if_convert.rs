@@ -140,7 +140,7 @@ fn rewrite_covered_arm_loads(
         // preds hold only a handful of loads.
         let mut pred_loads: Vec<(Value, IrType, AddressSpace, Value)> = Vec::new();
         for inst in &func.blocks[pred_idx].instructions {
-            if let Instruction::Load { dest, ptr, ty, seg_override } = inst {
+            if let Instruction::Load { dest, ptr, ty, seg_override , ..} = inst {
                 let root = resolve(ptr);
                 // On a duplicate, keep the last load (same value either way).
                 if let Some(entry) = pred_loads.iter_mut().find(|(p, t, s, _)| {
@@ -171,7 +171,7 @@ fn rewrite_covered_arm_loads(
             // Collect rewrites first (immutable), then apply.
             let mut pending: Vec<(usize, Value, Value)> = Vec::new();
             for (inst_pos, inst) in func.blocks[arm_idx].instructions.iter().enumerate() {
-                if let Instruction::Load { dest, ptr, ty, seg_override } = inst {
+                if let Instruction::Load { dest, ptr, ty, seg_override , ..} = inst {
                     let root = resolve(ptr);
                     if let Some((_, _, _, covering)) = pred_loads.iter().find(|(p, t, s, _)| {
                         *p == root && *t == *ty && *s == *seg_override
@@ -1272,7 +1272,7 @@ mod tests {
             label: BlockId(1),
             instructions: vec![
                 // Side-effecting store!
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(10), ty: IrType::I32, seg_override: AddressSpace::Default },
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(10), ty: IrType::I32, seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),

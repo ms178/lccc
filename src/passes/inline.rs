@@ -161,21 +161,42 @@ const MAX_STATIC_NONINLINE_INSTRUCTIONS: usize = 30;
 /// Maximum blocks for a `static` (non-`inline`) function to be eligible.
 const MAX_STATIC_NONINLINE_BLOCKS: usize = 4;
 
-/// Maximum instructions for a `static` (non-`inline`) function that has exactly
-/// one call site in the whole module. GCC at -O2 inlines such functions almost
-/// unconditionally: after inlining, the callee is dead (net code shrink), so
-/// even moderately-sized bodies are worth inlining. This matters for hot
-/// benchmarks where helpers like clz32 (72 inst, 14 blocks) or reverse_bits
-/// (102 inst) exceed the multi-call-site static limits but are only called
-/// once. Limits are still bounded (unlike always_inline) so that pathological
-/// single-call-site statics in huge translation units (e.g., the SQLite
-/// amalgamation) cannot inline unbounded bodies into their caller.
-const MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS: usize = 300;
+/// Compile-time bounds for inlining a `static` (non-`inline`) function that
+/// has exactly ONE direct call site in the whole module and whose address is
+/// never taken anywhere (see `collect_value_referenced_functions`).
+///
+/// These are NOT size heuristics. A single-call-site static whose address is
+/// not taken is DEAD after inlining its one site: the outlined body, its
+/// prologue/epilogue, and the call sequence all disappear, so the net size
+/// delta is a win essentially by construction (this is GCC's
+/// `-finline-functions-called-once`, enabled at -O2+). The kernel's real-mode
+/// boot corpus depends on it: `display_menu` (41 blocks, 98 instructions) and
+/// `get_entry` (28 blocks) are kept outlined purely by the former 24-block /
+/// 300-instruction caps while GCC folds them away and ends up 1.9 KB smaller
+/// on arch/x86/boot/video.c alone.
+///
+/// The only true hazards are (a) unbounded compile time in huge translation
+/// units (each such function is inlined at most once, so the work is linear,
+/// but cloning a pathologically large body is still wasteful) and (b) stack
+/// growth when the merged live set spills. Both are bounded below at levels
+/// far above any sane function (the previous multi-site caps stay unchanged
+/// for functions that SURVIVE inlining, where cloning is repeated size cost).
+const MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS: usize = 4000;
 
-/// Maximum blocks for a `static` function with a single call site (see above).
-/// High enough to cover if/else chains like clz32 (14 blocks) and small loops
-/// like struct-building helpers (13 blocks).
-const MAX_SINGLE_CALL_SITE_STATIC_BLOCKS: usize = 24;
+/// Block counterpart of the compile-time bound above.
+const MAX_SINGLE_CALL_SITE_STATIC_BLOCKS: usize = 800;
+
+/// Cost ceiling for the two LOOP-NEST exemptions granted to single-call-site
+/// statics (the -Os nested-loop veto and the loop_nest_merge caller-cap
+/// veto).  The exemptions are otherwise unbounded because the callee dies at
+/// its one site, but a large loop body merged into a hot outer loop can spill
+/// more than the eliminated outline saves — measured on the zlib-ng Adler-32
+/// corpus: `zlib_ng_adler32_c` costs 262 instructions after its own callees
+/// expand, and inlining its final remaining site (after the cold validation
+/// site folded) into the hot len-loop was a reproducible runtime regression.
+/// The kernel boot corpus cases the exemption exists for all measure well
+/// under this ceiling: display_menu 98, parse_earlyprintk 100, get_entry 41.
+const MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST: usize = 160;
 
 /// Budget for always_inline callees per caller. This budget is ONLY consumed
 /// by true __attribute__((always_inline)) callees that exceed the "small"
@@ -395,6 +416,14 @@ fn select_inline_site(
         let size_inline_cost = callee_data.size_inline_cost;
         if size_optimized
             && !callee_data.is_always_inline
+            // Single-call-site statics are exempt up to the measured loop-
+            // nest ceiling: their outlined body disappears at this one site,
+            // so cloning it into a loop nest still shrinks total size (the
+            // veto exists for callees whose bodies survive and are re-cloned
+            // per site).  Above the ceiling the merge's spill cost can
+            // dominate (see MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST).
+            && !(callee_data.is_single_call_site_static
+                && size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST)
             && call_is_in_loop
             && callee_data.has_loops
             && size_inline_cost > MAX_SIZE_NESTED_LOOP_INLINE_INSTRUCTIONS
@@ -443,14 +472,20 @@ fn select_inline_site(
             // Exception: inlining a loop-containing callee into a caller that
             // already has loops merges two hot loop nests into one function,
             // and the combined register pressure forces the loop variables to
-            // spill. Such callees may not use the single-call-site exemption
-            // once the caller is large — keep them as calls (matching GCC).
+            // spill. That veto is for callees that SURVIVE the inline (their
+            // body is cloned per site, so spills are pure loss). A
+            // single-call-site static whose address is not taken dies at its
+            // one site: the outlined body, prologue/epilogue and call sequence
+            // all disappear, which dominates bounded spill growth in the
+            // merged nest — GCC applies the same reasoning via
+            // -finline-functions-called-once. Keep such callees exempt, up
+            // to the same measured loop-nest ceiling as the -Os veto.
             let in_loop = loop_blocks.contains(&site.block_idx);
             let loop_nest_merge = callee_data.has_loops
                 && caller_has_loops
                 && callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS;
-            let size_cap_exempt =
-                callee_data.is_single_call_site_static && !loop_nest_merge;
+            let size_cap_exempt = callee_data.is_single_call_site_static
+                && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
             if caller_too_large
                 && !callee_data.is_always_inline
                 && !size_cap_exempt
@@ -1632,9 +1667,86 @@ fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
     counts
 }
 
+/// Names of functions referenced as VALUES anywhere in the module outside of
+/// direct `Call` instructions: via `&func` (`GlobalAddr`), in global
+/// initializer tables (`GlobalInit::GlobalAddr...`), as an inline-asm "i"
+/// constraint symbol, inside an inline-asm template string, as an alias
+/// target, or as a constructor/destructor.
+///
+/// This is the soundness precondition for the single-call-site-static
+/// exemption: a function referenced as a value SURVIVES the inlining of its
+/// one direct call (the reference still needs the outlined body), so the
+/// "callee is dead after inlining, net code shrink" argument does not apply,
+/// and neither the budget exemption nor the uncapped admission may fire.
+/// Inline-asm input operands that name symbols directly are covered through
+/// `input_symbols`; the template text itself can still name a symbol
+/// (`asm("call foo")`), hence the conservative substring scan over the
+/// (typically very few) templates.
+fn collect_value_referenced_functions(module: &IrModule) -> (FxHashSet<String>, Vec<String>) {
+    let mut names: FxHashSet<String> = FxHashSet::default();
+    let mut asm_templates: Vec<String> = Vec::new();
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::GlobalAddr { name, .. } => {
+                        names.insert(name.clone());
+                    }
+                    Instruction::InlineAsm {
+                        template,
+                        input_symbols,
+                        ..
+                    } => {
+                        asm_templates.push(template.clone());
+                        for sym in input_symbols {
+                            if let Some(s) = sym {
+                                names.insert(s.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for global in &module.globals {
+        global.init.for_each_ref(&mut |r| {
+            names.insert(r.to_string());
+        });
+    }
+    for (_, target, _) in &module.aliases {
+        names.insert(target.clone());
+    }
+    for ctor in &module.constructors {
+        names.insert(ctor.clone());
+    }
+    for dtor in &module.destructors {
+        names.insert(dtor.clone());
+    }
+    (names, asm_templates)
+}
+
+/// Whether `name` is referenced as a value (see
+/// `collect_value_referenced_functions` for what counts).
+fn function_referenced_as_value(
+    name: &str,
+    referenced: &FxHashSet<String>,
+    asm_templates: &[String],
+) -> bool {
+    if referenced.contains(name) {
+        return true;
+    }
+    asm_templates.iter().any(|t| t.contains(name))
+}
+
 fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
     let call_counts = direct_call_counts(module);
     let mut map = FxHashMap::default();
+
+    // One linear scan: which functions are referenced as values anywhere?
+    // Needed before the per-function loop below (see the soundness note on
+    // `is_single_call_site_static`).
+    let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
 
     // Count direct call sites per callee across the whole module. A static
     // function with exactly one call site is dead after inlining (net code
@@ -1767,29 +1879,22 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // module is dead after inlining (net code shrink), so GCC -O2 inlines
         // it even when it exceeds the multi-call-site static limits above.
         // Admit these with the more generous single-call-site limits.
+        // Soundness: the callee only dies if its address is never taken as a
+        // value anywhere (function-pointer table, alias, constructor, asm
+        // template or "i"-constraint symbol); otherwise the outlined body
+        // survives and the exemption must not apply.
         let has_single_call_site =
             call_site_counts.get(&func.name).copied().unwrap_or(0) == 1;
-        // A single-call-site static leaf function whose body is a switch
-        // dispatcher (no further calls) is a prime inline candidate even past
-        // the generic block cap: the switch merges into the caller and the
-        // call/return per dispatch disappears (VM interpreter loops).
-        let is_leaf_switch_dispatch = func
-            .blocks
-            .iter()
-            .any(|block| matches!(block.terminator, Terminator::Switch { .. }))
-            && !func.blocks.iter().any(|block| {
-                block.instructions.iter().any(|inst| {
-                    matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. })
-                })
-            });
+        let survives_via_reference = has_single_call_site
+            && function_referenced_as_value(&func.name, &value_referenced, &asm_templates);
         let fits_single_call_site_static = func.is_static
             && !func.is_inline
             && !is_small_static
             && !is_medium_static
             && has_single_call_site
-            && ((inst_count_for_static <= MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS
-                && func.blocks.len() <= MAX_SINGLE_CALL_SITE_STATIC_BLOCKS)
-                || (is_leaf_switch_dispatch && func.blocks.len() <= 64));
+            && !survives_via_reference
+            && (inst_count_for_static <= MAX_SINGLE_CALL_SITE_STATIC_INSTRUCTIONS
+                && func.blocks.len() <= MAX_SINGLE_CALL_SITE_STATIC_BLOCKS);
         if !is_always_inline
             && !is_trivially_empty
             && !is_small_static
@@ -1799,7 +1904,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         {
             if debug_callee {
                 eprintln!(
-                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, blocks={}, inst_count={}, has_loops={}, direct_calls={}, medium_block_limit={}, single_site={}, leaf_switch={}, is_declaration={}",
+                    "[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, blocks={}, inst_count={}, has_loops={}, direct_calls={}, medium_block_limit={}, single_site={}, survives_via_reference={}, is_declaration={}",
                     func.name,
                     func.is_static,
                     func.is_inline,
@@ -1809,7 +1914,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     direct_call_count,
                     medium_block_limit,
                     has_single_call_site,
-                    is_leaf_switch_dispatch,
+                    survives_via_reference,
                     func.is_declaration,
                 );
             }
@@ -1962,7 +2067,8 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 // (regardless of which size bucket above admitted it).
                 is_single_call_site_static: func.is_static
                     && !func.is_inline
-                    && has_single_call_site,
+                    && has_single_call_site
+                    && !survives_via_reference,
                 has_loops,
                 is_recursive,
                 has_vector_intrinsics: func_has_vector_intrinsics(func),
@@ -2457,7 +2563,7 @@ fn inline_call_site(
                 let store_ty = param_alloca_info[i].1;
                 entry_block.instructions.insert(
                     insert_pos,
-                    Instruction::Store {
+                    Instruction::Store { volatile: false,
                         val: site.args[i],
                         ptr: param_alloca_info[i].0,
                         ty: store_ty,
@@ -2497,7 +2603,7 @@ fn inline_call_site(
                 paramref_next_value += 1;
                 entry_block.instructions.insert(
                     materialize_pos,
-                    Instruction::Load {
+                    Instruction::Load { volatile: false,
                         dest: v,
                         ptr: home,
                         ty: home_ty,
@@ -2882,7 +2988,9 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             ptr,
             ty,
             seg_override,
+            volatile,
         } => Instruction::Store {
+            volatile: *volatile,
             val: remap_operand(val, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
@@ -2893,7 +3001,9 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             ptr,
             ty,
             seg_override,
+            volatile,
         } => Instruction::Load {
+            volatile: *volatile,
             dest: remap_value(*dest, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
@@ -3465,5 +3575,145 @@ mod inline_limit_tests {
         assert!(!fits_normal_inline_limits(201, 12, true, true, true, 6));
         assert!(!fits_normal_inline_limits(150, 25, true, true, true, 6));
         assert!(!fits_normal_inline_limits(150, 12, true, true, false, 6));
+    }
+}
+
+#[cfg(test)]
+mod value_reference_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::module::{GlobalInit, IrGlobal, IrModule};
+    use crate::ir::reexports::{BasicBlock, Instruction, Terminator};
+
+    fn user_function(instructions: Vec<Instruction>) -> IrFunction {
+        IrFunction {
+            name: "user".into(),
+            return_type: IrType::Void,
+            params: vec![],
+            blocks: vec![BasicBlock {
+                label: BlockId(1),
+                instructions,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }],
+            is_variadic: false,
+            is_declaration: false,
+            is_static: false,
+            is_inline: false,
+            is_always_inline: false,
+            is_noinline: false,
+            next_value_id: 2,
+            next_label: 2,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: vec![],
+            uses_sret: false,
+            is_fastcall: false,
+            is_naked: false,
+            global_init_label_blocks: vec![],
+            ret_eightbyte_classes: vec![],
+            ret_is_f128_sse: false,
+            is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
+        }
+    }
+
+    fn module_with_global_addr_to(target: &str) -> IrModule {
+        let mut module = IrModule::default();
+        module.functions = vec![user_function(vec![Instruction::GlobalAddr {
+            dest: Value(1),
+            name: target.into(),
+        }])];
+        module
+    }
+
+    #[test]
+    fn global_addr_reference_blocks_single_site_exemption() {
+        let module = module_with_global_addr_to("callee");
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(function_referenced_as_value("callee", &referenced, &asm));
+        assert!(!function_referenced_as_value("other", &referenced, &asm));
+    }
+
+    #[test]
+    fn global_initializer_table_reference_counts() {
+        let mut module = module_with_global_addr_to("unrelated");
+        module.globals = vec![IrGlobal {
+            name: "table".into(),
+            ty: IrType::Ptr,
+            size: 4,
+            align: 4,
+            init: GlobalInit::GlobalAddr("callee".into()),
+            is_static: true,
+            is_extern: false,
+            is_common: false,
+            section: None,
+            is_weak: false,
+            visibility: None,
+            has_explicit_align: false,
+            is_const: false,
+            is_used: false,
+            is_thread_local: false,
+        }];
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(function_referenced_as_value("callee", &referenced, &asm));
+    }
+
+    #[test]
+    fn plain_direct_call_is_not_a_value_reference() {
+        let mut module = module_with_global_addr_to("unrelated");
+        module.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::Call {
+                func: "callee".into(),
+                info: CallInfo::default(),
+            });
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        // A direct call alone must NOT mark the callee as referenced-as-value:
+        // the callee still dies when its only call site is inlined.
+        assert!(!function_referenced_as_value("callee", &referenced, &asm));
+    }
+
+    #[test]
+    fn inline_asm_template_reference_counts() {
+        let mut module = module_with_global_addr_to("unrelated");
+        module.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::InlineAsm {
+                template: "call callee".into(),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: Vec::new(),
+                operand_types: Vec::new(),
+                goto_labels: Vec::new(),
+                input_symbols: Vec::new(),
+                seg_overrides: Vec::new(),
+            });
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(function_referenced_as_value("callee", &referenced, &asm));
+    }
+
+    #[test]
+    fn inline_asm_input_symbol_reference_counts() {
+        // `asm("... %P0 ..." :: "i"(func))` records the symbol in
+        // input_symbols — the outlined body must survive this reference.
+        let mut module = module_with_global_addr_to("unrelated");
+        module.functions[0].blocks[0]
+            .instructions
+            .push(Instruction::InlineAsm {
+                template: "jmp %P0".into(),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: Vec::new(),
+                operand_types: Vec::new(),
+                goto_labels: Vec::new(),
+                input_symbols: vec![Some("callee".into())],
+                seg_overrides: Vec::new(),
+            });
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(function_referenced_as_value("callee", &referenced, &asm));
     }
 }

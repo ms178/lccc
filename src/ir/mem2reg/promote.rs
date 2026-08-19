@@ -544,7 +544,7 @@ fn rename_block(
     let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
     for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
         match inst {
-            Instruction::Load { dest, ptr, ty, seg_override } => {
+            Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
                     // Replace load with copy from current SSA value
                     let current_val = def_stacks[alloca_idx].last().cloned()
@@ -555,11 +555,11 @@ fn rename_block(
                     });
                     if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
                 } else {
-                    new_instructions.push(Instruction::Load { dest, ptr, ty, seg_override });
+                    new_instructions.push(Instruction::Load { volatile, dest, ptr, ty, seg_override });
                     if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
                 }
             }
-            Instruction::Store { val, ptr, ty, seg_override } => {
+            Instruction::Store { val, ptr, ty, seg_override, volatile, .. } => {
                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
                     // Push the stored value onto the def stack.
                     // Narrow constants to match the alloca type: the IR lowering
@@ -577,7 +577,7 @@ fn rename_block(
                     // Remove the store (it's now represented by the SSA def)
                     // (span is dropped along with the instruction)
                 } else {
-                    new_instructions.push(Instruction::Store { val, ptr, ty, seg_override });
+                    new_instructions.push(Instruction::Store { volatile, val, ptr, ty, seg_override });
                     if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
                 }
             }
@@ -848,10 +848,10 @@ mod tests {
                 // %0 = alloca i32
                 Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 // store 42, %0
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
                 // %1 = load %0
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -899,7 +899,7 @@ mod tests {
                 // %1 = alloca i32 (x)
                 Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
                 // %2 = load %0 (read param)
-                Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(2), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
                 // %3 = cmp ne %2, 0
                 Instruction::Cmp {
                     dest: Value(3), op: IrCmpOp::Ne,
@@ -920,7 +920,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![
-                Instruction::Store { val: Operand::Const(IrConst::I32(1)), ptr: Value(1), ty: IrType::I32,
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(1)), ptr: Value(1), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(3)),
@@ -931,7 +931,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
-                Instruction::Store { val: Operand::Const(IrConst::I32(2)), ptr: Value(1), ty: IrType::I32,
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(2)), ptr: Value(1), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(3)),
@@ -942,7 +942,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![
-                Instruction::Load { dest: Value(4), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(4), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
@@ -972,7 +972,7 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
                 // Pass address to a function (address-taken)
                 Instruction::Call {
@@ -994,7 +994,7 @@ mod tests {
                         ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,},
                 },
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1023,8 +1023,8 @@ mod tests {
             instructions: vec![
                 Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false }, // sum
                 Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false }, // i
-                Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
-                Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(0)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1034,7 +1034,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![
-                Instruction::Load { dest: Value(2), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(2), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
                 Instruction::Cmp {
                     dest: Value(3), op: IrCmpOp::Slt,
                     lhs: Operand::Value(Value(2)),
@@ -1054,22 +1054,22 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
-                Instruction::Load { dest: Value(4), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
-                Instruction::Load { dest: Value(5), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(4), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(5), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
                 Instruction::BinOp {
                     dest: Value(6), op: IrBinOp::Add,
                     lhs: Operand::Value(Value(4)),
                     rhs: Operand::Value(Value(5)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { val: Operand::Value(Value(6)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Store { volatile: false, val: Operand::Value(Value(6)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
                 Instruction::BinOp {
                     dest: Value(7), op: IrBinOp::Add,
                     lhs: Operand::Value(Value(5)),
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { val: Operand::Value(Value(7)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Store { volatile: false, val: Operand::Value(Value(7)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1079,7 +1079,7 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(3),
             instructions: vec![
-                Instruction::Load { dest: Value(8), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(8), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: Vec::new(),
@@ -1108,9 +1108,9 @@ mod tests {
             instructions: vec![
                 // %0 = alloca i32 (volatile)
                 Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: true, semantic_volatile: true },
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
                 seg_override: AddressSpace::Default },
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1211,7 +1211,7 @@ mod tests {
                     seg_overrides: vec![AddressSpace::Default],
                 },
                 // %1 = load %0
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I64,
+                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I64,
                     seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
@@ -1274,7 +1274,7 @@ mod tests {
                 // %0 = alloca i64
                 Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false, semantic_volatile: false },
                 // store 42, %0
-                Instruction::Store {
+                Instruction::Store { volatile: false,
                     val: Operand::Const(IrConst::I64(42)),
                     ptr: Value(0),
                     ty: IrType::I64,
@@ -1293,7 +1293,7 @@ mod tests {
                     seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
                 },
                 // %1 = load %0
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I64,
+                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I64,
                     seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
@@ -1340,7 +1340,7 @@ mod tests {
                     seg_overrides: vec![AddressSpace::Default],
                 },
                 // %1 = load %0
-                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
+                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32,
                     seg_override: AddressSpace::Default },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
