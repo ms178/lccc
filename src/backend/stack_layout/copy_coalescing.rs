@@ -2094,23 +2094,17 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
         });
     }
 
-    let is_vec_invalidator = |inst: &Instruction| -> bool {
-        match inst {
-            Instruction::Call { .. }
-            | Instruction::CallIndirect { .. }
-            | Instruction::InlineAsm { .. }
-            | Instruction::Memcpy { .. }
-            | Instruction::DynAlloca { .. }
-            | Instruction::Store { .. }
-            | Instruction::AtomicLoad { .. }
-            | Instruction::AtomicStore { .. }
-            | Instruction::AtomicRmw { .. }
-            | Instruction::AtomicCmpxchg { .. }
-            | Instruction::AtomicInc { .. } => true,
-            Instruction::Intrinsic { op, .. } => is_raw_reader_intrinsic(op),
-            _ => false,
-        }
-    };
+    // A deferred result lives only in an x86 SIMD scratch register until its
+    // consuming intrinsic. Do not carry it across an unrelated instruction
+    // that can use the same scratch registers. This is deliberately a
+    // whitelist: Copy has no type field and can be a vector/FP copy, while
+    // FP operations spill through xmm0/xmm1 under register pressure. Integer
+    // address/arithmetic instructions and integer loads are safe to cross.
+    // FP/vector loads are not: their generic lowering can use the same scratch
+    // registers. Candidates are non-escaping allocas, so the alias checks
+    // below independently reject derivations or non-intrinsic slot uses.
+    let is_vec_invalidator =
+        crate::backend::generation::instruction_may_clobber_vector_scratch;
 
     let mut defs: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
     let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();

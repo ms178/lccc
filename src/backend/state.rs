@@ -598,7 +598,12 @@ impl CodegenState {
     /// Invalidate the vector-register peephole state. Called at every emission
     /// that may clobber %ymm0/%xmm0 or break straight-line guarantees: calls,
     /// inline asm, atomics, memcpy, and block boundaries.
-    pub fn invalidate_vec_peephole(&mut self) {
+    /// Invalidate scratch-register forwarding without discarding vector values
+    /// held in allocator-managed registers. Scalar FP emission can overwrite
+    /// xmm0/xmm1 while xmm3+ vector homes remain valid, so a deferred value
+    /// pending in the scratch registers must be flushed but the allocator
+    /// homes must stay live.
+    pub fn invalidate_vec_scratch_peephole(&mut self) {
         self.vec_last_store_slot = None;
         self.vec_last_store_val = None;
         self.vec_last_store_reg = false;
@@ -608,6 +613,12 @@ impl CodegenState {
         self.sse_last_store_reg = false;
         self.sse_last_store_reg_name = None;
         self.direct_fp_result = None;
+    }
+
+    /// Invalidate all vector-register peephole state. Called when control flow
+    /// or an ABI/asm clobber also makes allocator-managed vector homes unsafe.
+    pub fn invalidate_vec_peephole(&mut self) {
+        self.invalidate_vec_scratch_peephole();
         self.vec_live_regs.clear();
     }
 

@@ -61,6 +61,12 @@ pub struct LivenessResult {
     pub block_ends: Vec<u32>,
     /// One past the last assigned program point.
     pub num_points: u32,
+    /// Values whose liveness was extended past their direct uses because they
+    /// are GEP bases folded into Load/Store addressing. Each folded access
+    /// reads the base register at the access point, so these values are used
+    /// far more often than the raw operand walk records; the allocator must
+    /// not rank them by that under-count (see regalloc's priority boost).
+    pub gep_base_values: FxHashSet<u32>,
     id_to_dense: FxHashMap<u32, usize>,
     live_in: Vec<BitSet>,
     live_out: Vec<BitSet>,
@@ -267,6 +273,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             block_starts: Vec::new(),
             block_ends: Vec::new(),
             num_points: 0,
+            gep_base_values: FxHashSet::default(),
             id_to_dense: FxHashMap::default(),
             live_in: Vec::new(),
             live_out: Vec::new(),
@@ -278,7 +285,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
 
-    extend_gep_base_liveness(
+    let gep_base_values = extend_gep_base_liveness(
         func,
         &alloca_set,
         &id_to_dense,
@@ -387,6 +394,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         block_starts: ps.block_start_points,
         block_ends: ps.block_end_points,
         num_points: ps.num_points,
+        gep_base_values,
         id_to_dense,
         live_in,
         live_out,
@@ -687,7 +695,7 @@ fn extend_gep_base_liveness(
     copy_src: &FxHashMap<u32, Vec<u32>>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
-) {
+) -> FxHashSet<u32> {
     let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default();
 
     for block in &func.blocks {
@@ -760,7 +768,7 @@ fn extend_gep_base_liveness(
     }
 
     if gep_info.is_empty() {
-        return;
+        return FxHashSet::default();
     }
 
     // A GEP dest used as anything other than a (non-i128) Load/Store pointer
@@ -812,8 +820,15 @@ fn extend_gep_base_liveness(
         gep_info.remove(id);
     }
     if gep_info.is_empty() {
-        return;
+        return FxHashSet::default();
     }
+
+    // Collect the folded base/index values: every folded Load/Store reads
+    // them at its own program point, so their effective use count is far
+    // higher than the raw operand walk records. The allocator uses this set
+    // to rank them fairly (otherwise a hot-loop base with one recorded use
+    // loses its register and every folded access reloads it).
+    let mut folded_bases: FxHashSet<u32> = FxHashSet::default();
 
     let mut block_point: u32 = 0;
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -834,6 +849,7 @@ fn extend_gep_base_liveness(
                         last_use_points,
                         block_gen,
                     );
+                    folded_bases.insert(base_id);
                     if let GepOffset::Index(idx_id) = *offset {
                         extend_use_following_copies(
                             idx_id,
@@ -845,6 +861,7 @@ fn extend_gep_base_liveness(
                             last_use_points,
                             block_gen,
                         );
+                        folded_bases.insert(idx_id);
                     }
                 }
             }
@@ -852,6 +869,7 @@ fn extend_gep_base_liveness(
         }
         block_point = block_point.saturating_add(1);
     }
+    folded_bases
 }
 
 /// Extend `start_id` and every Copy-chain source (all phi-elim preds) to `point`.
@@ -867,12 +885,10 @@ fn extend_use_following_copies(
 ) {
     let mut stack = vec![start_id];
     let mut seen: FxHashSet<u32> = FxHashSet::default();
-    let mut hops = 0u32;
     while let Some(id) = stack.pop() {
-        if hops >= 16 || !seen.insert(id) {
+        if !seen.insert(id) {
             continue;
         }
-        hops += 1;
         if alloca_set.contains(&id) {
             continue;
         }
