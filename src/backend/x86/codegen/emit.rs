@@ -341,6 +341,13 @@ pub struct X86Codegen {
     pub(super) reg_save_area_offset: i64,
     /// Whether the current function is variadic
     pub(super) is_variadic: bool,
+    /// Whether the register save area must preserve GP argument registers:
+    /// true when any va_arg in the body reads INTEGER class, or the va_list
+    /// escapes to a callee (which may read any class).
+    pub(super) vararg_gp_save: bool,
+    /// Whether the register save area must preserve SSE argument registers:
+    /// true when any va_arg in the body reads SSE class, or the va_list escapes.
+    pub(super) vararg_fp_save: bool,
     /// Scratch register index for inline asm allocation (GP registers)
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm allocation (XMM registers)
@@ -602,6 +609,8 @@ impl X86Codegen {
             num_named_stack_bytes: 0,
             reg_save_area_offset: 0,
             is_variadic: false,
+            vararg_gp_save: true,
+            vararg_fp_save: true,
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),

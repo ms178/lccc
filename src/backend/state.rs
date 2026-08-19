@@ -227,6 +227,12 @@ pub struct CodegenState {
     /// When true, %rbp is not used for stack frame addressing and can be
     /// used as a general-purpose register. Stack slots use %rsp-relative addressing.
     pub omit_frame_pointer: bool,
+    /// The user's `-fomit-frame-pointer` / `-fno-omit-frame-pointer` request.
+    /// Module-wide: NOT cleared by `reset_for_function` (unlike
+    /// `omit_frame_pointer`, which is derived per function from this flag plus
+    /// the function's own constraints). Without this the CLI flag was dropped
+    /// entirely and `-fno-omit-frame-pointer` silently did nothing.
+    pub fpo_requested: bool,
     /// Total frame size (for RSP-relative addressing when omit_frame_pointer is true).
     /// Set after calculate_stack_space completes.
     pub frame_size: i64,
@@ -423,6 +429,7 @@ impl CodegenState {
             tls_symbols: FxHashSet::default(),
             has_dyn_alloca: false,
             omit_frame_pointer: false,
+            fpo_requested: true, // -fomit-frame-pointer is the default at -O1+
             frame_size: 0,
             reg_cache: RegCache::default(),
             gep_base_offset: FxHashMap::default(),

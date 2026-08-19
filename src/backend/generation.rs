@@ -2253,8 +2253,18 @@ fn generate_function(
             ))
         })
     });
-    cg.state().omit_frame_pointer =
-        !has_dyn_alloca && !func.is_variadic && !has_inline_asm_fp && !has_vector_intrinsics;
+    // Frame-pointer omission is only legal when the function body can be
+    // addressed purely %rsp-relative: no dynamic alloca (the frame size is no
+    // longer a compile-time constant), no inline asm that reads %rbp-relative
+    // operands, and no vector intrinsics that rely on the frame pointer. The
+    // user's `-fomit-frame-pointer`/`-fno-omit-frame-pointer` request is the
+    // gate; previously the CLI flag was dropped entirely (so
+    // `-fno-omit-frame-pointer` silently did nothing) and variadic functions
+    // were unconditionally pinned to a frame pointer.
+    cg.state().omit_frame_pointer = cg.state().fpo_requested
+        && !has_dyn_alloca
+        && !has_inline_asm_fp
+        && !has_vector_intrinsics;
 
     cg.state().current_func_name = func.name.clone();
     let raw_space = cg.calculate_stack_space(func);

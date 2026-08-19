@@ -108,6 +108,13 @@ struct StackLayoutContext {
     used_values: FxHashSet<u32>,
     /// Dead parameter allocas (unused params, skip slot allocation).
     dead_param_allocas: FxHashSet<u32>,
+    /// ABI alignment of each struct/union parameter alloca (value id ->
+    /// alignment), taken from the authoritative `IrParam.struct_align`. Used to
+    /// recover over-aligned (>16) parameter allocas whose `Alloca.align` was
+    /// dropped by a later pass — the slot must still honor the param's declared
+    /// `_Alignas(32)` etc. so `&s` (and vector accesses on the param) are
+    /// correctly aligned.
+    param_aligns: FxHashMap<u32, usize>,
     /// Alloca coalescing analysis results.
     coalescable_allocas: CoalescableAllocas,
     /// Values that are produced and immediately consumed by the next instruction,
@@ -450,6 +457,17 @@ fn build_layout_context(
     // Detect dead parameter allocas.
     let dead_param_allocas = analysis::find_dead_param_allocas(func, &used_values, reg_assigned, callee_saved_regs);
 
+    // Authoritative ABI alignment of struct/union parameter allocas (the
+    // Alloca.align may have been dropped by a pass; IrParam.struct_align is not).
+    // `param_alloca_values` and `params` are index-aligned (both include the
+    // sret pointer at index 0 when present).
+    let param_aligns: FxHashMap<u32, usize> = func
+        .params
+        .iter()
+        .zip(func.param_alloca_values.iter())
+        .filter_map(|(p, v)| p.struct_align.map(|a| (v.0, a)))
+        .collect();
+
     // Alloca coalescability analysis.
     let coalescable_allocas = if coalesce {
         alloca_coalescing::compute_coalescable_allocas(func, &dead_param_allocas, &func.param_alloca_values)
@@ -616,6 +634,7 @@ fn build_layout_context(
         loop_phi_aliases,
         used_values,
         dead_param_allocas,
+        param_aligns,
         coalescable_allocas,
         immediately_consumed,
         vector_defer_values,
