@@ -107,10 +107,19 @@ impl I686Codegen {
                 emit!(self.state, "    {} {}, %{}", load_instr, sr, d);
             }
             SlotAddr::Indirect(slot) => {
-                // Pointer may be register-resident: emit_load_ptr_from_slot
-                // copies %reg → %ecx when so, or dereferences the slot.
-                self.emit_load_ptr_from_slot(slot, ptr.0);
-                emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+                // Pointer register-resident: dereference it DIRECTLY. The
+                // %ecx staging below is only needed for slot-resident
+                // pointers; routing a register pointer through %ecx costs an
+                // extra mov AND clobbers %ecx (which the register allocator's
+                // load-hazard refinement relies on NOT happening — see
+                // Phase 2d in regalloc.rs).
+                if let Some(phys) = self.reg_assignments.get(&ptr.0).copied() {
+                    let p = phys_reg_name(phys);
+                    emit!(self.state, "    {} (%{}), %{}", load_instr, p, d);
+                } else {
+                    self.emit_load_ptr_from_slot(slot, ptr.0);
+                    emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+                }
             }
             SlotAddr::OverAligned(slot, id) => {
                 self.emit_alloca_aligned_addr(slot, id);

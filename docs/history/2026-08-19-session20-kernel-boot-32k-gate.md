@@ -207,3 +207,10 @@ forward scan (labels still block — single-block invariant preserved).
    alloca; when the ptr is register-resident at emit time no %ecx staging
    happens. Two-pass allocation (ptrs first, hazards recomputed) could
    unlock ecx across loops. Soundness hinges on allocation-aware staging.
+
+---
+**Session 21 executed this roadmap** — see
+`2026-08-19-session21-lever-implementation.md`: L1 shipped (−592 B boot),
+L4 shipped (−200 B corpus), L2 machinery shipped (0 delta, root cause
+documented), L3 ceiling proven (~0.8 KB bound; deferred with evidence).
+Gate now: boot text 32 858 vs budget 23 330.

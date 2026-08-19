@@ -159,7 +159,7 @@ impl I686Codegen {
         // keep them out of the allocator so a dead address cannot occupy a
         // register the live loaded value needs. Mirrors the fold conditions:
         // non-PIC, non-TLS, non-wide type, default address space.
-        let never_materialized = if !self.state.pic_mode {
+        let mut never_materialized = if !self.state.pic_mode {
             let gmap = crate::backend::generation::build_global_addr_map_for(
                 func, &self.state.tls_symbols);
             let mut set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
@@ -180,6 +180,74 @@ impl I686Codegen {
         } else {
             None
         };
+
+        // Return-consumed accumulator flow: a value whose SOLE use is the
+        // Return terminator and whose producer preserves the accumulator
+        // (compute_immediately_consumed enforces both, plus producer/terminator
+        // adjacency) is consumed by emit_return_default via operand_to_eax —
+        // a cache hit, zero instructions.  Give it NO home: the producer
+        // leaves the result in %eax (store_eax_to emits nothing without a
+        // home and keeps the cache entry), and the ret reads it there.
+        // strlen's `p - s` tail stops paying `movl %edi,%eax` + a register
+        // home.  Kept out of the PIC-only set above because it applies
+        // regardless of PIC mode; state.never_materialized_values (the
+        // emitter's fold set) is deliberately NOT extended — these values DO
+        // emit their producer.
+        {
+            let mut ret_operands: crate::common::fx_hash::FxHashSet<u32> =
+                crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                if let crate::ir::reexports::Terminator::Return(Some(op)) = &block.terminator {
+                    if let crate::ir::reexports::Operand::Value(v) = op {
+                        ret_operands.insert(v.0);
+                    }
+                }
+            }
+            // On i686 EVERY immediately-consumed value is read through the
+            // accumulator (operand_to_eax checks the acc cache first): Store
+            // val, Cast/UnaryOp/Copy src, BinOp/Cmp lhs, and fused-consume
+            // terminators all stage via %eax.  Giving them a register home
+            // only adds a `movl %R,%eax` relay (and a callee-save push for
+            // the home).  Deny them registers as well as slots; the
+            // direct-dest binop path then declines (no home) and the
+            // accumulator path takes over, which is the shape the consumer
+            // expects.  compute_immediately_consumed already proves the
+            // consumer is adjacent (no cache-invalidation window) and the
+            // producer accumulator-preserving.
+            //
+            // EXCEPTION — CondBranch conditions: the truthy test of a
+            // register-resident condition emits `testl %R,%R` IN PLACE, but
+            // a home-less condition pays `movl %src,%eax; testl %eax,%eax`
+            // (the no-op-coalesced producer sets no acc-cache entry).  Keep
+            // their homes (check_load_widen_cast_no_relay regression).
+            let mut cond_values: crate::common::fx_hash::FxHashSet<u32> =
+                crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                if let crate::ir::reexports::Terminator::CondBranch { cond, .. } =
+                    &block.terminator
+                {
+                    if let crate::ir::reexports::Operand::Value(v) = cond {
+                        cond_values.insert(v.0);
+                    }
+                }
+            }
+            let _ = &ret_operands; // (ret_operands kept for the PIC-free path)
+            let skip = crate::backend::stack_layout::copy_coalescing
+                ::compute_immediately_consumed(func, false);
+            let extra: Vec<u32> = skip
+                .iter()
+                .copied()
+                .filter(|v| !cond_values.contains(v))
+                .collect();
+            if !extra.is_empty() {
+                match never_materialized.as_mut() {
+                    Some(set) => set.extend(extra),
+                    None => {
+                        never_materialized = Some(extra.into_iter().collect());
+                    }
+                }
+            }
+        }
 
         let (reg_assigned, cached_liveness, _caller_save_spans) =
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(

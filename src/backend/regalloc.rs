@@ -251,6 +251,67 @@ fn build_coalesce_groups(
     // a register (the cast emits nothing) — the strict non-overlap check that
     // guards general Copy coalescing does not apply.
     let mut same_value_edges: FxHashSet<(u32, u32)> = FxHashSet::default();
+    // Phi-web detection: a Copy whose DEST feeds a Phi (loop-latch / switch-arm
+    // state transport) or whose SRC is a Phi result moves a bit-IDENTICAL
+    // value — the same SSA renaming argument as the no-op casts above, so the
+    // edge may overlap and still share one home. This is what collapses
+    // switch-state webs (cpucheck/cmdline `state` machines: N overlapping
+    // copies of ONE C variable, each with its own slot) into a single home.
+    let mut phi_dests: FxHashSet<u32> = FxHashSet::default();
+    let mut phi_operands: FxHashSet<u32> = FxHashSet::default();
+    // Phi-congruence classes (the CFG-aware lever): a Phi's dest and every
+    // incoming value are the SAME source-level variable observed on mutually
+    // exclusive control-flow paths — on any real execution exactly one
+    // predecessor runs, so exactly one of them is live at the merge.  Linear
+    // scan sees their intervals overlap (the linearisation spans blocks), but
+    // they may safely share ONE home.  Union-find each phi's dest with its
+    // incoming GPR values; the accept loop below treats members of one class
+    // as same-value even when intervals overlap.  This is what collapses
+    // switch-state / loop-carried webs (cpucheck & cmdline `state` machines:
+    // N overlapping SSA copies of ONE C variable, each with its own slot)
+    // onto a single register/slot.
+    let mut web_parent: FxHashMap<u32, u32> = FxHashMap::default();
+    fn wfind(wp: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
+        let mut root = x;
+        while wp.get(&root).copied() != Some(root) {
+            root = wp.get(&root).copied().unwrap_or(root);
+        }
+        let mut c = x;
+        while wp.get(&c).copied().is_some_and(|p| p != root) {
+            let next = wp[&c];
+            wp.insert(c, root);
+            c = next;
+        }
+        root
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                phi_dests.insert(dest.0);
+                for (op, _) in incoming {
+                    if let Operand::Value(v) = op {
+                        phi_operands.insert(v.0);
+                        if eligible.contains(&dest.0) && eligible.contains(&v.0) {
+                            web_parent.entry(dest.0).or_insert(dest.0);
+                            web_parent.entry(v.0).or_insert(v.0);
+                            let rd = wfind(&mut web_parent, dest.0);
+                            let rv = wfind(&mut web_parent, v.0);
+                            if rd != rv {
+                                web_parent.insert(rv, rd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Flatten to a direct value -> class-rep map for O(1) accept-loop lookup.
+    let mut phi_web_class: FxHashMap<u32, u32> = FxHashMap::default();
+    let web_keys: Vec<u32> = web_parent.keys().copied().collect();
+    for v in web_keys {
+        let rep = wfind(&mut web_parent, v);
+        phi_web_class.insert(v, rep);
+    }
     fn find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
         let mut root = x;
         while parent.get(&root).copied() != Some(root) {
@@ -291,6 +352,14 @@ fn build_coalesce_groups(
                     let rs = find(&mut parent, s);
                     if rd != rs {
                         parent.insert(rs, rd);
+                    }
+                    // Phi-transport copies move a bit-identical value (the
+                    // dest feeds a Phi, or the src IS a Phi result), so the
+                    // edge may overlap and still share one home — exactly the
+                    // no-op-cast relaxation. This collapses switch-state and
+                    // loop-carried webs onto a single register/slot.
+                    if phi_operands.contains(&d) || phi_dests.contains(&s) {
+                        same_value_edges.insert((d, s));
                     }
                 }
             }
@@ -381,6 +450,11 @@ fn build_coalesce_groups(
                             // emits nothing.
                             || same_value_edges.contains(&(m, *a))
                             || same_value_edges.contains(&(*a, m))
+                            // Phi-congruence: dest/incomings of a phi are one
+                            // variable on exclusive CFG paths (see the
+                            // web_parent construction above).
+                            || phi_web_class.get(&m).zip(phi_web_class.get(a))
+                                .is_some_and(|(cm, ca)| cm == ca)
                     })
                 }),
             };
@@ -706,7 +780,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if !config.caller_saved_regs.is_empty() {
         let i686_pool = config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5));
         let hazards: Option<(Vec<u32>, Vec<u32>)> = if i686_pool {
-            Some(collect_i686_scratch_hazard_points(func, &non_gpr_values))
+            Some(collect_i686_scratch_hazard_points(
+                func,
+                &non_gpr_values,
+                &FxHashSet::default(),
+            ))
         } else {
             None
         };
@@ -934,6 +1012,119 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
     propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+
+    // Phase 2d (i686): load-hazard refinement.  Phase 2 treated every
+    // non-alloca Load as a %ecx hazard because a slot-resident pointer must
+    // be staged through %ecx to be dereferenced.  Loads whose pointer value
+    // actually got a REGISTER home — or never materialise at all (folded
+    // absolute globals) — emit direct `movX (%ptr),…` / absolute addressing
+    // and never touch %ecx.  Now that assignments exist, recompute the hazard
+    // set with the real pointer homes and hand the newly hazard-free
+    // caller-saved registers to the values Phase 2 had to refuse.
+    if !env_on("CCC_NO_LOAD_HAZARD_REFINE")
+        && config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5))
+    {
+        let mut ecx_clean_ptrs: FxHashSet<u32> = FxHashSet::default();
+        {
+            // Alloca destinations resolve through slot/alignment machinery
+            // (OverAligned stages via %ecx) — never direct-dereferenceable.
+            let mut alloca_dests: FxHashSet<u32> = FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Alloca { dest, .. } = inst {
+                        alloca_dests.insert(dest.0);
+                    }
+                }
+            }
+            // A pointer is ecx-clean only if EVERY load using it takes the
+            // direct-dereference path: the pointer must be register-resident
+            // AND the load's DEST must be register-resident (that is what
+            // routes emission through try_emit_load_direct's `movX (%ptr),%d`
+            // form).  One slot-dest load with the same pointer would stage
+            // through %ecx, so all loads must qualify.
+            let mut ptr_all_clean: FxHashMap<u32, bool> = FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Load { ptr, dest, ty, .. } = inst {
+                        let gpr32 = matches!(
+                            ty,
+                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+                                | IrType::I32 | IrType::U32 | IrType::Ptr
+                        );
+                        if !gpr32 {
+                            continue;
+                        }
+                        let clean_here = assignments.contains_key(&ptr.0)
+                            && !alloca_dests.contains(&ptr.0)
+                            && assignments.contains_key(&dest.0);
+                        *ptr_all_clean.entry(ptr.0).or_insert(true) &= clean_here;
+                    }
+                }
+            }
+            for (ptr, clean) in ptr_all_clean {
+                if clean {
+                    ecx_clean_ptrs.insert(ptr);
+                }
+            }
+            // Never-materialised pointers (folded absolute globals) emit
+            // absolute addressing and touch no scratch register at all.
+            for &v in &config.never_materialized {
+                ecx_clean_ptrs.insert(v);
+            }
+        }
+        if !ecx_clean_ptrs.is_empty() {
+            let (ecx_hazards2, edx_hazards2) = collect_i686_scratch_hazard_points(
+                func,
+                &non_gpr_values,
+                &ecx_clean_ptrs,
+            );
+            for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards2), (PhysReg(4), &ecx_hazards2)] {
+                if !config.caller_saved_regs.contains(&reg) {
+                    continue;
+                }
+                // Unlike Phases 1/2/2c — which draw from mutually DISJOINT
+                // register pools — this refinement re-enters caller-saved
+                // registers already handed out by Phase 2.  A candidate must
+                // therefore not overlap ANY existing holder of the register,
+                // not just its fellow candidates (without this, a loop
+                // counter and its bound landed in %edx simultaneously and
+                // the bound's leal clobbered the counter).
+                let holders: Vec<(u32, u32)> = assignments
+                    .iter()
+                    .filter(|(_, &r)| r == reg)
+                    .filter_map(|(&v, _)| iv_map.get(&v).copied())
+                    .collect();
+                let intervals: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| {
+                        !assignments.contains_key(&iv.value_id)
+                            && !call_spanning.contains(&iv.value_id)
+                            && (x86_ordered_param_copies
+                                || !param_restricted.contains(&iv.value_id))
+                    })
+                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
+                    .filter(|iv| {
+                        !holders
+                            .iter()
+                            .any(|&h| intervals_overlap((iv.start, iv.end), h))
+                    })
+                    .collect();
+                if intervals.is_empty() {
+                    continue;
+                }
+                let ranges =
+                    live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
+                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+                alloc.run();
+                for (vid, r) in alloc.assignments {
+                    assignments.insert(vid, r);
+                    caller_used_regs_set.insert(r.0);
+                }
+            }
+            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+        }
+    }
 
     // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
     // x86 stays out — same eviction already lost gzip inside the scan.
@@ -2416,6 +2607,7 @@ fn inst_kind_name(inst: &Instruction) -> &'static str {
 fn collect_i686_scratch_hazard_points(
     func: &IrFunction,
     wide: &FxHashSet<u32>,
+    ecx_clean_load_ptrs: &FxHashSet<u32>,
 ) -> (Vec<u32>, Vec<u32>) {
     use crate::ir::reexports::{IrBinOp, IrUnaryOp};
     let mut ecx: Vec<u32> = Vec::new();
@@ -2503,7 +2695,17 @@ fn collect_i686_scratch_hazard_points(
                     seg_override,
                     ..
                 } if is_gpr32(ty) => {
-                    let clean = direct_allocas.contains(&ptr.0)
+                    // A Load stages its pointer through %ecx ONLY when the
+                    // pointer has no register home (it must be loaded into a
+                    // scratch to dereference).  When the pointer value is
+                    // register-resident — or never materialised at all
+                    // (folded absolute global) — the emitter uses direct
+                    // `movX (%ptr),…` / absolute addressing and never touches
+                    // %ecx.  First pass conservatively assumes slot-resident
+                    // pointers; the Phase-2d refinement re-runs with the
+                    // actually-assigned pointer set (see allocate_registers).
+                    let clean = (direct_allocas.contains(&ptr.0)
+                        || ecx_clean_load_ptrs.contains(&ptr.0))
                         && *seg_override == crate::common::types::AddressSpace::Default;
                     (clean, true)
                 }

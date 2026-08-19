@@ -1832,3 +1832,12 @@ any linker-driven kernel flow: a missing `#include` in `.S` input is now
 fatal (GCC parity). Previously `header.S` preprocessed against an EMPTY
 `voffset.h` and the `VO_*` `#if` guards silently went false — a wrong
 setup header would have reached lccc-ld without any diagnostic.
+
+## Session-21 addendum (2026-08-19) — lever push
+Session 21 implemented the session-20 lever roadmap (see
+`docs/history/2026-08-19-session21-lever-implementation.md`). No
+linker-side changes were needed: lccc-ld evaluates setup.ld's five ASSERTs
+faithfully and the gate remains codegen-bound (boot object text 32 858 vs
+the `_end ≤ 0x8000`-derived budget of 23 330). Oracle preferences
+(mold `-DMOLD_TARGETS='X86_64;I386'`, binutils 2.47 pin, git-HEAD builds)
+re-verified unchanged.
