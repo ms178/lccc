@@ -245,6 +245,18 @@ impl I686Codegen {
                 } else {
                     emit!(self.state, "    cmpl ${}, %eax", imm);
                 }
+            } else if let Operand::Value(rv) = rhs {
+                // A REGISTER-resident rhs compares in place (`cmpl %reg,%eax`);
+                // the read is identical to the `movl %reg,%ecx` staging it
+                // replaces. Slot values keep staging (deferred-slot safety;
+                // the peephole folds them post-materialization).
+                match self.direct_reg_src_ref(rv) {
+                    Some(r) => emit!(self.state, "    cmpl {}, %eax", r),
+                    None => {
+                        self.operand_to_ecx(rhs);
+                        self.state.emit("    cmpl %ecx, %eax");
+                    }
+                }
             } else {
                 self.operand_to_ecx(rhs);
                 self.state.emit("    cmpl %ecx, %eax");
@@ -294,6 +306,18 @@ impl I686Codegen {
                     self.state.emit("    testl %eax, %eax");
                 } else {
                     emit!(self.state, "    cmpl ${}, %eax", imm);
+                }
+            } else if let Operand::Value(rv) = rhs {
+                // A REGISTER-resident rhs compares in place (`cmpl %reg,%eax`);
+                // the read is identical to the `movl %reg,%ecx` staging it
+                // replaces. Slot values keep staging (deferred-slot safety;
+                // the peephole folds them post-materialization).
+                match self.direct_reg_src_ref(rv) {
+                    Some(r) => emit!(self.state, "    cmpl {}, %eax", r),
+                    None => {
+                        self.operand_to_ecx(rhs);
+                        self.state.emit("    cmpl %ecx, %eax");
+                    }
                 }
             } else {
                 self.operand_to_ecx(rhs);

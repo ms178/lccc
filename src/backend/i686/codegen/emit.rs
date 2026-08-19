@@ -227,6 +227,29 @@ impl I686Codegen {
         self.reg_assignments.get(&dest.0).copied()
     }
 
+    /// Direct REGISTER source reference for a 32-bit ALU/cmp operand. Returns
+    /// `Some("%reg")` when the value is register-allocated — authoritative
+    /// (the linear scan guarantees the register holds the value throughout its
+    /// range), so `op %reg, %eax` replaces the `movl %reg,%ecx; op %ecx,%eax`
+    /// staging with an identical read. Returns `None` otherwise (including
+    /// when the accumulator cache holds the value, whose slot may be stale or
+    /// not-yet-materialized): the caller stages via operand_to_ecx. Slot
+    /// values are deliberately NOT folded here — their slots are finalized
+    /// lazily (deferred/coalesced), so a direct slot read at emission time can
+    /// hit a stale location; the peephole folds those after materialization.
+    pub(super) fn direct_reg_src_ref(&self, v: &Value) -> Option<String> {
+        if self.state.wide_values.contains(&v.0)
+            || self.state.is_alloca(v.0)
+            || self.state.f128_direct_slots.contains(&v.0)
+        {
+            return None;
+        }
+        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+            return Some(format!("%{}", phys_reg_name(phys)));
+        }
+        None
+    }
+
     /// Load the address of va_list storage into %edx.
     ///
     /// va_list_ptr is an IR value that holds a pointer to the va_list storage.

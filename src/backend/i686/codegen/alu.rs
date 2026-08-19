@@ -207,36 +207,65 @@ impl I686Codegen {
             }
         }
 
-        // General case: load lhs to eax, rhs to ecx
+        // General case: load lhs to eax; a REGISTER-resident rhs is used in
+        // place (`op %reg,%eax` — the read is identical to the `movl
+        // %reg,%ecx` staging it replaces), anything else stages through %ecx.
+        // Variable shifts need the count in %cl, and div/idiv must not take
+        // its divisor from %edx (the high half of the dividend), so those two
+        // shapes always stage. Slot values deliberately stage too: their slots
+        // are finalized lazily (see direct_reg_src_ref); the peephole folds
+        // them after materialization.
         self.operand_to_eax(lhs);
-        self.operand_to_ecx(rhs);
+        let var_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
+        let div_like = matches!(
+            op,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        );
+        let rhs_ref: String = if let Operand::Value(rv) = rhs {
+            let direct = self.direct_reg_src_ref(rv);
+            if var_shift || (div_like && matches!(&direct, Some(r) if r == "%edx")) {
+                self.operand_to_ecx(rhs);
+                "%ecx".to_string()
+            } else {
+                match direct {
+                    Some(r) => r,
+                    None => {
+                        self.operand_to_ecx(rhs);
+                        "%ecx".to_string()
+                    }
+                }
+            }
+        } else {
+            self.operand_to_ecx(rhs);
+            "%ecx".to_string()
+        };
 
         match op {
-            IrBinOp::Add => self.state.emit("    addl %ecx, %eax"),
-            IrBinOp::Sub => self.state.emit("    subl %ecx, %eax"),
-            IrBinOp::Mul => self.state.emit("    imull %ecx, %eax"),
-            IrBinOp::And => self.state.emit("    andl %ecx, %eax"),
-            IrBinOp::Or => self.state.emit("    orl %ecx, %eax"),
-            IrBinOp::Xor => self.state.emit("    xorl %ecx, %eax"),
+            IrBinOp::Add => emit!(self.state, "    addl {}, %eax", rhs_ref),
+            IrBinOp::Sub => emit!(self.state, "    subl {}, %eax", rhs_ref),
+            IrBinOp::Mul => emit!(self.state, "    imull {}, %eax", rhs_ref),
+            IrBinOp::And => emit!(self.state, "    andl {}, %eax", rhs_ref),
+            IrBinOp::Or => emit!(self.state, "    orl {}, %eax", rhs_ref),
+            IrBinOp::Xor => emit!(self.state, "    xorl {}, %eax", rhs_ref),
             IrBinOp::Shl => self.state.emit("    shll %cl, %eax"),
             IrBinOp::AShr => self.state.emit("    sarl %cl, %eax"),
             IrBinOp::LShr => self.state.emit("    shrl %cl, %eax"),
             IrBinOp::SDiv => {
                 self.state.emit("    cltd");
-                self.state.emit("    idivl %ecx");
+                emit!(self.state, "    idivl {}", rhs_ref);
             }
             IrBinOp::UDiv => {
                 self.state.emit("    xorl %edx, %edx");
-                self.state.emit("    divl %ecx");
+                emit!(self.state, "    divl {}", rhs_ref);
             }
             IrBinOp::SRem => {
                 self.state.emit("    cltd");
-                self.state.emit("    idivl %ecx");
+                emit!(self.state, "    idivl {}", rhs_ref);
                 self.state.emit("    movl %edx, %eax");
             }
             IrBinOp::URem => {
                 self.state.emit("    xorl %edx, %edx");
-                self.state.emit("    divl %ecx");
+                emit!(self.state, "    divl {}", rhs_ref);
                 self.state.emit("    movl %edx, %eax");
             }
         }
