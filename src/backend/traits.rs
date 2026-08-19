@@ -318,6 +318,18 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether a `Load` whose single use is an adjacent `Cmp { Eq|Ne, rhs=0 }`
+    /// may be folded into a memory compare (`cmpb/cmpw/cmpl $0, (mem)`), which
+    /// the generation pass detects per block and hands to the backend via
+    /// `state().pending_load_cmp`. Default false; only the i686 backend opts
+    /// in, where the accumulator-based codegen otherwise spills the loaded
+    /// byte into a register just to `testl` it. Sound for Eq/Ne because the
+    /// memory compare and the load+test agree exactly on ZF (and SF/CF/OF/PF)
+    /// for both zero- and sign-extending sub-word loads.
+    fn supports_load_cmp_mem_fold(&self) -> bool {
+        false
+    }
+
     /// Emit a load using indexed addressing: dest = [base + (index << shift)].
     /// Returns false if it cannot be emitted (caller falls back to unfolding).
     fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {

@@ -1584,6 +1584,13 @@ impl ArchCodegen for I686Codegen {
         !self.state.pic_mode
     }
 
+    fn supports_load_cmp_mem_fold(&self) -> bool {
+        // The accumulator-based i686 codegen otherwise loads a byte/word into
+        // a register just to `testl` it; folding `*p != 0` into `cmpb $0,(mem)`
+        // is the single biggest source of string-loop bloat vs GCC.
+        true
+    }
+
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).

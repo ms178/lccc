@@ -252,6 +252,13 @@ pub struct CodegenState {
     /// Use counts within the current block (set before block codegen).
     /// Compared with value_use_counts to detect live-out values.
     pub block_use_counts: FxHashMap<u32, u32>,
+    /// Loads whose single use is an adjacent `Cmp { Eq|Ne, rhs = imm }` and
+    /// that are therefore folded into a memory compare (`cmpb/cmpw/cmpl $imm,
+    /// (mem)`) by the backend. Keyed by the Load's dest value id; the value
+    /// maps to (pointer value id, loaded type, compare immediate) so the Cmp
+    /// can re-stage the address and emit the immediate. Cleared per block.
+    /// Only the i686 backend sets `supports_load_cmp_mem_fold`.
+    pub pending_load_cmp: FxHashMap<u32, (u32, IrType, i64)>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern).
     /// Used by the Linux kernel for Spectre v2 (retbleed) mitigation.
     pub function_return_thunk: bool,
@@ -424,6 +431,7 @@ impl CodegenState {
             current_func_name: String::new(),
             value_use_counts: Vec::new(),
             block_use_counts: FxHashMap::default(),
+            pending_load_cmp: FxHashMap::default(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
             indirect_branch_thunk_inline: false,

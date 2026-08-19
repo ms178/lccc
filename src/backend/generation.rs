@@ -1277,6 +1277,104 @@ fn detect_cmp_branch_fusion(
     Some((cmp_idx, chain_end))
 }
 
+/// `rhs` is a zero constant of any integer width (or the canonical Zero).
+pub(crate) fn cmp_rhs_is_zero(rhs: &Operand) -> bool {
+    matches!(rhs, Operand::Const(IrConst::Zero))
+        || matches!(
+            rhs,
+            Operand::Const(IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0))
+        )
+}
+
+/// The immediate a `Cmp { Eq|Ne }` may be folded with a sub-word load into
+/// `cmp{b,w} $imm, (mem)`. For `Eq`/`Ne` the memory compare agrees with the
+/// load+register-compare exactly on ZF whenever the constant is in a range
+/// where both sign- and zero-extending the sub-word value keep `== imm` and
+/// `byte/word == imm` equivalent: `[0, 127]` for bytes, `[0, 32767]` for
+/// words (the constant is then non-negative, so a match can only occur for
+/// values whose extension equals the value itself). Full 32-bit loads accept
+/// any i32. Returns `None` when the operand is not such a constant.
+pub(crate) fn cmp_fold_imm(rhs: &Operand, load_ty: IrType) -> Option<i64> {
+    let v = match rhs {
+        Operand::Const(IrConst::Zero) => 0,
+        Operand::Const(IrConst::I8(v)) => *v as i64,
+        Operand::Const(IrConst::I16(v)) => *v as i64,
+        Operand::Const(IrConst::I32(v)) => *v as i64,
+        _ => return None,
+    };
+    match load_ty {
+        IrType::I8 | IrType::U8 => (0..128).contains(&v).then_some(v),
+        IrType::I16 | IrType::U16 => (0..32768).contains(&v).then_some(v),
+        IrType::I32 | IrType::U32 | IrType::Ptr => Some(v),
+        _ => None,
+    }
+}
+
+/// Adjacent `load; cmp { Eq | Ne, rhs = imm }` pairs where the load's single
+/// use is the compare. The backend folds these into `cmpb/cmpw/cmpl $imm,
+/// (mem)`, eliminating a sub-word load + register-compare pair (and the
+/// register that held the loaded value, which on the accumulator-based i686
+/// backend is the dominant string-loop bloat vs GCC). Returns a map from the
+/// Load's dest value id to (pointer value id, loaded type, compare immediate).
+///
+/// Soundness: for `Eq`/`Ne` only the ZF flag is consumed, and
+/// `cmp{b,w,l} $imm, (mem)` agrees exactly with the folded `movX + cmpl` on ZF
+/// for the immediates admitted by `cmp_fold_imm` (see there). The adjacency
+/// requirement guarantees the pointer is still live at the compare site (no
+/// instruction can redefine it in between), and `use_count == 1` guarantees no
+/// other consumer reads the skipped load's value.
+fn detect_load_cmp_mem_fold(
+    block: &BasicBlock,
+    use_counts: &[u32],
+) -> FxHashMap<u32, (u32, IrType, i64)> {
+    use crate::ir::reexports::IrCmpOp;
+    let mut out = FxHashMap::default();
+    let n = block.instructions.len();
+    for i in 0..n.saturating_sub(1) {
+        let (load_dest, ptr, ty, seg) = match &block.instructions[i] {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+            } => (dest.0, ptr.0, *ty, *seg_override),
+            _ => continue,
+        };
+        if seg != AddressSpace::Default {
+            continue;
+        }
+        // Foldable widths map 1:1 onto cmpb/cmpw/cmpl; anything else (wide
+        // pairs, floats, vectors, i128) is excluded.
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 | IrType::Ptr => {}
+            _ => continue,
+        }
+        // The load's only consumer is the compare.
+        if use_counts.get(load_dest as usize).copied().unwrap_or(u32::MAX) != 1 {
+            continue;
+        }
+        let (op, lhs, rhs, cmp_ty) = match &block.instructions[i + 1] {
+            Instruction::Cmp {
+                op, lhs, rhs, ty, ..
+            } => (*op, lhs, rhs, *ty),
+            _ => continue,
+        };
+        if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            continue;
+        }
+        if !matches!(lhs, Operand::Value(v) if v.0 == load_dest) {
+            continue;
+        }
+        let Some(imm) = cmp_fold_imm(rhs, ty) else { continue };
+        match cmp_ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 | IrType::Ptr => {}
+            _ => continue,
+        }
+        out.insert(load_dest, (ptr, ty, imm));
+    }
+    out
+}
+
 /// Adjacent `cmp; select` / `cmp; copy|zcast; select`.
 /// Returns `(select_idx, cmp_idx, dead_mid_idx)`.
 fn detect_cmp_select_fusion(
@@ -2194,10 +2292,16 @@ fn generate_function(
         } else {
             FxHashSet::default()
         };
+        let load_cmp_folds = if cg.supports_load_cmp_mem_fold() {
+            detect_load_cmp_mem_fold(block, &value_use_counts)
+        } else {
+            FxHashMap::default()
+        };
         let mut fused_add_skip: FxHashSet<usize> = FxHashSet::default();
         let mut skip_fused_logical = false;
 
         cg.state().block_use_counts.clear();
+        cg.state().pending_load_cmp.clear();
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
@@ -2421,6 +2525,25 @@ fn generate_function(
                 continue;
             }
             cg.flush_machinst();
+
+            // Fold `load; cmp { Eq|Ne, 0 }` into a memory compare: skip the
+            // load and hand its (ptr, ty) to the Cmp, which emits
+            // `cmp{b,w,l} $0, (mem)`. The detection already proved the load's
+            // single use is the adjacent Cmp; only skip plain value pointers
+            // (a folded GEP / global-addr / indexed base is emitted through
+            // generate_load and is not resolvable by the memory-compare path).
+            if let Instruction::Load { dest, ptr, ty, .. } = inst {
+                if let Some((_, _, imm)) = load_cmp_folds.get(&dest.0) {
+                    if !gep_fold_map.contains_key(&ptr.0)
+                        && !indexed_gep_map.contains_key(&ptr.0)
+                        && !global_addr_map.contains_key(&ptr.0)
+                    {
+                        cg.state().pending_load_cmp.insert(dest.0, (ptr.0, *ty, *imm));
+                        cg.state().current_program_point += 1;
+                        continue;
+                    }
+                }
+            }
 
             generate_instruction(
                 cg,

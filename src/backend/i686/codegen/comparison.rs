@@ -2,6 +2,7 @@
 
 use crate::ir::reexports::{IrCmpOp, Operand, Value};
 use crate::common::types::IrType;
+use crate::backend::state::SlotAddr;
 use crate::emit;
 use crate::backend::traits::ArchCodegen;
 use super::emit::{I686Codegen, phys_reg_name};
@@ -168,11 +169,67 @@ impl I686Codegen {
         }
     }
 
+    /// Emit `cmp{b,w,l} $imm, (ptr)` staging the pointer exactly like an
+    /// indirect load. Returns false when the pointer has no resolvable
+    /// slot/register home (the caller re-materializes the skipped load).
+    pub(super) fn emit_mem_cmp_imm(&mut self, ptr: u32, ty: IrType, imm: i64) -> bool {
+        let mnemonic = match ty {
+            IrType::I8 | IrType::U8 => "cmpb",
+            IrType::I16 | IrType::U16 => "cmpw",
+            IrType::I32 | IrType::U32 | IrType::Ptr => "cmpl",
+            _ => return false,
+        };
+        let Some(addr) = self.state.resolve_slot_addr(ptr) else { return false };
+        match addr {
+            SlotAddr::Direct(slot) => {
+                let sr = self.slot_ref(slot);
+                emit!(self.state, "    {} ${}, {}", mnemonic, imm, sr);
+            }
+            SlotAddr::Indirect(slot) => {
+                self.emit_load_ptr_from_slot(slot, ptr);
+                emit!(self.state, "    {} ${}, (%ecx)", mnemonic, imm);
+            }
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr(slot, id);
+                emit!(self.state, "    {} ${}, (%ecx)", mnemonic, imm);
+            }
+        }
+        true
+    }
+
+    /// Consume a pending load→memory-compare fold (see
+    /// `generation::detect_load_cmp_mem_fold`): when `lhs` is a Load whose
+    /// single use is this `Eq`/`Ne`-vs-imm compare, emit
+    /// `cmp{b,w,l} $imm,(mem)` and report success so the caller skips the
+    /// register-resident compare.
+    fn take_load_cmp_fold(&mut self, lhs: &Operand, rhs: &Operand, op: IrCmpOp) -> bool {
+        let Operand::Value(lv) = lhs else { return false };
+        let Some((ptr, lty, imm)) = self.state.pending_load_cmp.remove(&lv.0) else { return false };
+        if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
+            || crate::backend::generation::cmp_fold_imm(rhs, lty) != Some(imm)
+        {
+            // Detection guarantees this cannot happen; re-materialize the load
+            // so the compare sees a real value instead of garbage.
+            crate::backend::traits::emit_load_default(self, &Value(lv.0), &Value(ptr), lty);
+            return false;
+        }
+        if !self.emit_mem_cmp_imm(ptr, lty, imm) {
+            // Pointer is not resolvable (e.g. a global address): fall back to
+            // the materialized load + normal compare.
+            crate::backend::traits::emit_load_default(self, &Value(lv.0), &Value(ptr), lty);
+            return false;
+        }
+        true
+    }
+
     pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        // Load→memory-compare fold: `movsbl (mem),%r; testl %r,%r` collapses
+        // to `cmpb $0,(mem)`, freeing the register and the push/pop pair.
+        let folded = self.take_load_cmp_fold(lhs, rhs, op);
         // Accumulator-bypass: compare a register-resident LHS in place
         // (`testl %R,%R` / `cmpl $imm,%R` / `cmpl %R,%L`) instead of the
         // `movl %R,%eax; cmpl …, %eax` round-trip.
-        if !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
+        if !folded && !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
             self.operand_to_eax(lhs);
             // Constant rhs: compare against the immediate directly instead of
             // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
@@ -221,9 +278,13 @@ impl I686Codegen {
         true_label: &str,
         false_label: &str,
     ) {
+        // Load→memory-compare fold (see emit_int_cmp_impl): the branch path
+        // fuses the Cmp into the CondBranch terminator, so the fold must be
+        // taken here too or the skipped load never materializes.
+        let folded = self.take_load_cmp_fold(lhs, rhs, op);
         // Accumulator-bypass: compare a register-resident LHS in place; the
         // direct flag emitter leaves %eax untouched (see emit_int_cmp_impl).
-        if !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
+        if !folded && !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
             self.operand_to_eax(lhs);
             // Same immediate forms as emit_int_cmp_impl (see there for the
             // testl flags argument); keeps %ecx clean across fused compares.

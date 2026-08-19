@@ -3844,7 +3844,12 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 3.5: redundant zero-extension elimination (may expose dead
     // stores and moves by shortening def-use chains, so it runs before DSE
     // and the liveness cleanup).
-    if eliminate_redundant_zext_i686(&mut store, &mut infos) {
+    let zext_changed = eliminate_redundant_zext_i686(&mut store, &mut infos);
+    // Redundant SIGN-extension elimination runs right after: it turns
+    // `movsbl %al,%REG` into a `movl` copy or a no-op, which the cleanup
+    // loop below then propagates/deletes like any other move.
+    let sext_changed = eliminate_redundant_sign_ext_i686(&mut store, &mut infos);
+    if zext_changed || sext_changed {
         let mut changed3 = true;
         let mut pass_count3 = 0;
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
@@ -4015,6 +4020,139 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
                 {
                     is_byte = [false; 8];
                     is_16 = [false; 8];
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+// ── Pass: redundant sign-extension elimination (i686) ────────────────────────
+
+/// Track which GP register families provably hold sign-extended byte values
+/// (bits 8..31 equal bit 7), and remove redundant re-sign-extensions:
+///   * `movsbl %al, %eax` when %eax is already sign-extended  -> removed
+///   * `movsbl %al, %REG` when %eax is already sign-extended  -> `movl` copy
+///
+/// The accumulator-based i686 codegen re-sign-extends after every sub-int
+/// path: `movsbl (%esi),%eax; movsbl %al,%eax` (the load already sign-extends)
+/// and `setbe %al; movzbl %al,%eax; movsbl %al,%eax` (a bool is its own sign
+/// extension). Same fail-closed state machine as `eliminate_redundant_zext_i686`:
+/// flags cleared at every barrier, updated by extensions, copies, and setcc;
+/// anything else clears the written family.
+fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = infos.len();
+    let mut sign_ext = [false; 8]; // per family: bits 8..31 == sign(bit7)
+    let mut is_bool = [false; 8]; // per family: low byte is 0/1 (setcc)
+
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_barrier() {
+            sign_ext = [false; 8];
+            is_bool = [false; 8];
+            i += 1;
+            continue;
+        }
+        let t = trimmed(store, &infos[i], i).to_string();
+
+        // movsbl SRC, %DST
+        if let Some(rest) = t.strip_prefix("movsbl ") {
+            if let Some((src, dst)) = rest.split_once(',') {
+                let src = src.trim();
+                let dst = dst.trim();
+                let df = register_family(dst);
+                if df <= REG_GP_MAX {
+                    if !src.contains('(') && src.starts_with('%') {
+                        let sf = register_family(src);
+                        if sf <= REG_GP_MAX && sign_ext[sf as usize] {
+                            if sf == df {
+                                // Re-sign-extending an already-sign-extended
+                                // value: pure no-op.
+                                infos[i].kind = LineKind::Nop;
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                            // Cross-register: a plain 32-bit copy suffices.
+                            store.replace(i, format!(
+                                "    movl {}, {}", reg32_name(sf), reg32_name(df)));
+                            infos[i] = classify_line(store.get(i));
+                            sign_ext[df as usize] = true;
+                            is_bool[df as usize] = is_bool[sf as usize];
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    // Genuine sign extension of a non-sign-extended source.
+                    sign_ext[df as usize] = true;
+                    is_bool[df as usize] = false;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        // movzbl SRC, %DST : a zero extension is its own sign extension only
+        // when the source is a bool (0/1 == sign-extended 0/1).
+        if let Some(rest) = t.strip_prefix("movzbl ") {
+            if let Some((src, dst)) = rest.split_once(',') {
+                let src = src.trim();
+                let dst = dst.trim();
+                let df = register_family(dst);
+                if df <= REG_GP_MAX {
+                    let src_bool = !src.contains('(') && src.starts_with('%') && {
+                        let sf = register_family(src);
+                        sf <= REG_GP_MAX && is_bool[sf as usize]
+                    };
+                    sign_ext[df as usize] = src_bool;
+                    is_bool[df as usize] = src_bool;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Flag propagation / invalidation for everything else.
+        match infos[i].kind {
+            LineKind::Move { dst, src } => {
+                sign_ext[dst as usize] = sign_ext[src as usize];
+                is_bool[dst as usize] = is_bool[src as usize];
+            }
+            LineKind::LoadEbp { reg, .. } | LineKind::Pop { reg } => {
+                if reg <= REG_GP_MAX {
+                    sign_ext[reg as usize] = false;
+                    is_bool[reg as usize] = false;
+                }
+            }
+            LineKind::StoreEbp { .. } | LineKind::Push { .. }
+            | LineKind::Cmp | LineKind::Empty | LineKind::SelfMove => {}
+            LineKind::SetCC { reg } => {
+                // setCC writes the low byte only; the value is a bool (0/1).
+                if reg <= REG_GP_MAX {
+                    sign_ext[reg as usize] = false;
+                    is_bool[reg as usize] = true;
+                }
+            }
+            _ => {
+                let d = parse_dest_reg(&t);
+                if d <= REG_GP_MAX {
+                    sign_ext[d as usize] = false;
+                    is_bool[d as usize] = false;
+                }
+                // Implicit multi-register writers: fail closed on all flags.
+                if t.starts_with("mul") || t.starts_with("imul")
+                    || t.starts_with("div") || t.starts_with("idiv")
+                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
+                    || t.starts_with("rep") || t.starts_with("lods")
+                    || t.starts_with("stos") || t.starts_with("movs")
+                    || t.starts_with("cmps") || t.starts_with("scas")
+                {
+                    sign_ext = [false; 8];
+                    is_bool = [false; 8];
                 }
             }
         }
@@ -4712,6 +4850,84 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(!result.contains("movl %eax, %ecx"));
         assert!(result.contains("movsbl (%eax), %eax"));
+    }
+
+    #[test]
+    fn redundant_sign_ext_after_byte_load_removed() {
+        // `movsbl (%esi),%eax` already sign-extends; the trailing
+        // `movsbl %al,%eax` is a pure no-op.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsbl (%esi), %eax\n",
+            "    movsbl %al, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsbl (%esi), %eax"));
+        assert!(!result.contains("movsbl %al"), "{result}");
+    }
+
+    #[test]
+    fn redundant_sign_ext_after_setcc_movzbl_removed() {
+        // `setbe %al; movzbl %al,%eax` leaves a bool (0/1 == its own sign
+        // extension) in %eax; the trailing `movsbl %al,%eax` is a no-op.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    cmpl $9, %edx\n",
+            "    setbe %al\n",
+            "    movzbl %al, %eax\n",
+            "    movsbl %al, %eax\n",
+            "    movl %eax, 4(%esp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("setbe %al"));
+        assert!(result.contains("movzbl %al, %eax"));
+        assert!(!result.contains("movsbl %al"), "{result}");
+    }
+
+    #[test]
+    fn sign_ext_not_removed_after_zero_extend_of_high_byte() {
+        // `movzbl (%esi),%eax` zero-extends: bits 8..31 are 0, NOT the sign of
+        // bit 7. A following `movsbl %al,%eax` is a REAL change (e.g. 0xFF ->
+        // 0xFFFFFFFF) and must survive.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%esi), %eax\n",
+            "    movsbl %al, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movzbl (%esi), %eax"));
+        assert!(result.contains("movsbl %al"), "{result}");
+    }
+
+    #[test]
+    fn sign_ext_cross_register_becomes_movl_copy() {
+        // %eax already sign-extended: `movsbl %al,%ecx` is a plain copy.
+        // %ecx is consumed by `addl` so the copy cannot be DSE'd away.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsbl (%esi), %eax\n",
+            "    movsbl %al, %ecx\n",
+            "    addl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(!result.contains("movsbl %al"), "{result}");
+        assert!(result.contains("movl %eax, %ecx"), "{result}");
     }
 
     #[test]
