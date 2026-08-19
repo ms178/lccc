@@ -1807,3 +1807,28 @@ each rewrite, and continue file-level BFD comparison after every linked-layout
 change. lld, mold, and wild were lost with the interrupted workspace and must
 be restored before claiming renewed four-linker coverage; GNU BFD is the
 current ELF32 setup oracle.
+
+---
+
+## Session-20 addendum (2026-08-19) — oracle preference audit + setup.ld fidelity
+
+Build/version preferences re-verified in `tests/linker/setup_oracles.sh`:
+
+| preference | status |
+|---|---|
+| mold from git HEAD, never release tarballs | ✅ encoded |
+| mold targets restricted to `-DMOLD_TARGETS='X86_64;I386'` (the i686 preset the user requires to keep build time viable on the 2-core box) | ✅ encoded |
+| wild from git HEAD, `-march=native`, binary-only | ✅ encoded |
+| GAS/bfd pinned to **2.47** (built locally when system bfd ≠ 2.47) | ✅ encoded (`BINUTILS_VERSION=2.47`) |
+
+`lccc-ld` boot-gate behaviour (kernel setup.ld) re-confirmed faithful this
+session: all five ASSERTs evaluate, the live failure is "The setup must be
+at most 64 sectors in size" (setup_size = ALIGN(.,4096) at .signature), and
+`_end <= 0x8000` is the binding gate once setup_size passes (bss counts;
+see session-20 history doc for the exact arithmetic: text budget ≤ 23330).
+
+One assembler/driver correctness fix landed this session that matters for
+any linker-driven kernel flow: a missing `#include` in `.S` input is now
+fatal (GCC parity). Previously `header.S` preprocessed against an EMPTY
+`voffset.h` and the `VO_*` `#if` guards silently went false — a wrong
+setup header would have reached lccc-ld without any diagnostic.
