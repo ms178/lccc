@@ -3280,6 +3280,16 @@ impl ArchCodegen for X86Codegen {
             if self.folded_cast_dests.contains(&dest.0) {
                 return false;
             }
+            // Float casts (and F128) stay on the mature path. The MachInst
+            // lower_cast only knows integer size-moves: a same-size
+            // Ptr(8) -> F64 cast would be emitted as `movq %reg, %xmm0` — a
+            // BITCAST of the address, not a cvtsi2sdq value conversion
+            // (`(double)ptr` printed 0.0 for a 0x55… address). Mirrors
+            // isel::can_lower, which already excludes floats; this gate used
+            // a coarser size/sign classification and missed them.
+            if from_ty.is_float() || to_ty.is_float() {
+                return false;
+            }
             // Signed widening remains on the mature path. Although the raw
             // movsx selection is straightforward, SQLite's optimized VDBE has
             // overlapping allocator locations where the mature cast emitter's

@@ -58,14 +58,19 @@ pub enum CastKind {
 /// that all four backends use identically. Backends then match on the returned
 /// `CastKind` to emit architecture-specific instructions.
 ///
-/// Handles Ptr normalization (Ptr treated as U64) and F128 reduction (F128 treated
-/// as F64 for computation purposes on x86) before classification.
+/// Handles Ptr normalization (Ptr treated as unsigned pointer-width integer) and
+/// F128 reduction (F128 treated as F64 for computation purposes on x86) before
+/// classification.
 ///
 /// `f128_is_native`: true on ARM/RISC-V where F128 is IEEE binary128 and requires
 /// softfloat library calls for conversions. false on x86 where F128 is x87 80-bit
 /// and is approximated as F64.
 pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: bool) -> CastKind {
     if from_ty == to_ty {
+        return CastKind::Noop;
+    }
+    // Void (and any zero-size type) has no meaningful conversion.
+    if from_ty == IrType::Void || to_ty == IrType::Void || from_ty.size() == 0 || to_ty.size() == 0 {
         return CastKind::Noop;
     }
 
@@ -85,7 +90,9 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
         return classify_cast(effective_from, effective_to);
     }
 
-    // Ptr is equivalent to U64 on LP64 targets, U32 on ILP32 targets.
+    // Ptr is equivalent to U64 on LP64 targets, U32 on ILP32 targets. This block
+    // handles Ptr <-> integer casts (both sides non-float). Ptr <-> float is
+    // handled in the float paths below, where Ptr must also be unsigned.
     if (from_ty == IrType::Ptr || to_ty == IrType::Ptr) && !from_ty.is_float() && !to_ty.is_float() {
         let ptr_int_ty = if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 };
         let effective_from = if from_ty == IrType::Ptr { ptr_int_ty } else { from_ty };
@@ -102,7 +109,11 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
         let is_unsigned_dest = to_ty.is_unsigned() || to_ty == IrType::Ptr;
         let from_f64 = from_ty == IrType::F64;
         if is_unsigned_dest {
-            let to_u64 = to_ty == IrType::U64 || to_ty == IrType::Ptr;
+            // Ptr is unsigned of pointer width: to_u64 is true only when the
+            // destination is a full 64-bit value (U64, or Ptr on LP64), which
+            // is the only shape that needs the >= 2^63 adjustment.
+            let to_u64 = to_ty == IrType::U64
+                || (to_ty == IrType::Ptr && !crate::common::types::target_is_32bit());
             return CastKind::FloatToUnsigned { from_f64, to_u64 };
         } else {
             return CastKind::FloatToSigned { from_f64 };
@@ -111,10 +122,18 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
 
     // Int-to-float
     if !from_ty.is_float() && to_ty.is_float() {
-        let is_unsigned_src = from_ty.is_unsigned();
+        let is_unsigned_src = from_ty.is_unsigned() || from_ty == IrType::Ptr;
         let to_f64 = to_ty == IrType::F64;
         if is_unsigned_src {
-            return CastKind::UnsignedToFloat { to_f64, from_ty };
+            // Ptr normalizes to its unsigned pointer-width integer so the
+            // backend's U64 path (with the >= 2^63 adjustment) is taken for
+            // high-bit kernel addresses instead of the signed convert.
+            let from_n = if from_ty == IrType::Ptr {
+                if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 }
+            } else {
+                from_ty
+            };
+            return CastKind::UnsignedToFloat { to_f64, from_ty: from_n };
         } else {
             return CastKind::SignedToFloat { to_f64, from_ty };
         }
@@ -171,8 +190,16 @@ fn classify_f128_cast_native(from_ty: IrType, to_ty: IrType) -> CastKind {
             // F128 -> F128: should not happen (handled by from_ty == to_ty check)
             return CastKind::Noop;
         }
-        if from_ty.is_unsigned() {
-            return CastKind::UnsignedToF128 { from_ty };
+        if from_ty.is_unsigned() || from_ty == IrType::Ptr {
+            // Ptr normalizes to its unsigned pointer-width integer (same
+            // signedness fix as the plain int->float path: a high-bit kernel
+            // address must be converted as unsigned).
+            let from_n = if from_ty == IrType::Ptr {
+                if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 }
+            } else {
+                from_ty
+            };
+            return CastKind::UnsignedToF128 { from_ty: from_n };
         }
         return CastKind::SignedToF128 { from_ty };
     }
@@ -189,7 +216,12 @@ fn classify_f128_cast_native(from_ty: IrType, to_ty: IrType) -> CastKind {
         return CastKind::Noop;
     }
     if to_ty.is_unsigned() || to_ty == IrType::Ptr {
-        return CastKind::F128ToUnsigned { to_ty };
+        let to_n = if to_ty == IrType::Ptr {
+            if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 }
+        } else {
+            to_ty
+        };
+        return CastKind::F128ToUnsigned { to_ty: to_n };
     }
     CastKind::F128ToSigned { to_ty }
 }
@@ -249,11 +281,15 @@ pub fn f128_cmp_libcall(op: IrCmpOp) -> (&'static str, F128CmpKind) {
 
 /// Extract the IEEE f128 low/high u64 halves from an F128 constant operand.
 /// The f128 bytes are already in IEEE binary128 format.
-/// Returns None for non-constant operands (caller must use runtime conversion).
+/// Returns None for non-constant operands or malformed byte arrays (the caller
+/// falls back to runtime conversion) — never panics.
 pub fn f128_const_halves(op: &Operand) -> Option<(u64, u64)> {
     if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = op {
-        let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().unwrap());
-        let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().unwrap());
+        if f128_bytes.len() < 16 {
+            return None;
+        }
+        let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().ok()?);
+        let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().ok()?);
         Some((lo, hi))
     } else {
         None
