@@ -1375,6 +1375,54 @@ fn detect_load_cmp_mem_fold(
     out
 }
 
+/// Whole-function set of values that the codegen loop folds away entirely —
+/// they emit no code and write no value, so they must not occupy a register or
+/// a stack slot (the register allocator otherwise parks the dead value in a
+/// caller-saved register, stealing it from a live loop pointer). Two cases:
+///
+/// 1. Loads whose single use is a foldable adjacent `Cmp { Eq|Ne, imm }` AND
+///    whose pointer is a plain value (not a folded GEP / indexed GEP / global
+///    address) — folded into `cmp{b,w,l} $imm,(mem)`.
+/// 2. Cmp results (plus their Copy/Cast chain) fused into a CondBranch — the
+///    boolean is never materialized.
+///
+/// Mirrors the generation-loop skip conditions exactly.
+pub(crate) fn build_folded_value_set(
+    func: &IrFunction,
+    tls_symbols: &FxHashSet<String>,
+    absolute_symbols: &FxHashSet<String>,
+) -> FxHashSet<u32> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let gep_fold_map = build_gep_fold_map(func, &use_counts, &stab);
+    let indexed_gep_map = build_indexed_gep_map(func, &use_counts, &stab);
+    let global_addr_map = build_global_addr_map(func, tls_symbols, Some(absolute_symbols));
+    let mut set = FxHashSet::default();
+    for block in &func.blocks {
+        // (1) load → memory compare.
+        for (dest, (ptr, _ty, _imm)) in detect_load_cmp_mem_fold(block, &use_counts) {
+            if !gep_fold_map.contains_key(&ptr)
+                && !indexed_gep_map.contains_key(&ptr)
+                && !global_addr_map.contains_key(&ptr)
+            {
+                set.insert(dest);
+            }
+        }
+        // (2) fused compare-and-branch: the boolean (and any Copy/Cast chain)
+        // feeding the CondBranch never materializes. Integer compares only —
+        // FP fusion is backend-gated (false on i686, where this set is used).
+        if let Some((cmp_idx, chain_end)) = detect_cmp_branch_fusion(block, &use_counts, false) {
+            let end = chain_end.unwrap_or(cmp_idx);
+            for inst in &block.instructions[cmp_idx..=end] {
+                if let Some(dest) = inst.dest() {
+                    set.insert(dest.0);
+                }
+            }
+        }
+    }
+    set
+}
+
 /// Adjacent `cmp; select` / `cmp; copy|zcast; select`.
 /// Returns `(select_idx, cmp_idx, dead_mid_idx)`.
 fn detect_cmp_select_fusion(

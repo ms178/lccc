@@ -198,6 +198,48 @@ fn bump_gep_base_priority(
     }
 }
 
+/// For each value with exactly one definition that is a `Load`, the loaded
+/// type. Values with multiple defs (phis) or non-load defs are absent.
+/// A sub-word load (I8/U8/I16/U16) sign/zero-extends into its register
+/// (`movsbl`/`movzbl`/`movswl`/`movzwl`), so a widening cast of that load is
+/// a bit-preserving no-op and may coalesce exactly like a Copy.
+/// For each value with exactly one definition that is a `Load`, the loaded
+/// type, paired with the value's operand-use count. Values with multiple defs
+/// (phis) or non-load defs are absent. A sub-word load (I8/U8/I16/U16)
+/// sign/zero-extends into its register (`movsbl`/`movzbl`/`movswl`/`movzwl`),
+/// so a widening cast of that load is a bit-preserving no-op and may coalesce
+/// exactly like a Copy.
+fn unique_load_def_types(func: &IrFunction) -> FxHashMap<u32, (IrType, u32)> {
+    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut load_ty: FxHashMap<u32, IrType> = FxHashMap::default();
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *def_count.entry(dest.0).or_insert(0) += 1;
+                if let Instruction::Load { ty, .. } = inst {
+                    load_ty.insert(dest.0, *ty);
+                }
+            }
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_count.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+    load_ty.retain(|k, _| def_count.get(k).copied() == Some(1));
+    load_ty
+        .into_iter()
+        .map(|(k, ty)| (k, (ty, use_count.get(&k).copied().unwrap_or(0))))
+        .collect()
+}
+
 fn build_coalesce_groups(
     func: &IrFunction,
     iv_map: &FxHashMap<u32, (u32, u32)>,
@@ -205,6 +247,14 @@ fn build_coalesce_groups(
     param_ref_values: &FxHashSet<u32>,
 ) -> FxHashMap<u32, Vec<u32>> {
     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    let load_def_types = unique_load_def_types(func);
+    // (cast dest, cast src) edges where the cast is a bit-preserving no-op on
+    // the register: same-width U32<->I32, or a widening of a sub-word load
+    // whose register already holds the extended value. For these, dest and src
+    // hold IDENTICAL values, so their live ranges may overlap and still share
+    // a register (the cast emits nothing) — the strict non-overlap check that
+    // guards general Copy coalescing does not apply.
+    let mut same_value_edges: FxHashSet<(u32, u32)> = FxHashSet::default();
     fn find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
         let mut root = x;
         while parent.get(&root).copied() != Some(root) {
@@ -248,6 +298,63 @@ fn build_coalesce_groups(
                     }
                 }
             }
+            // A same-width 32-bit int cast (U32<->I32) is a bit-preserving
+            // no-op on 32-bit targets: the register contents are identical, so
+            // dest and src may share a register exactly like a Copy. Without
+            // this, `cpu_vendor[0] == 'Genu'` (a u32 global compared as I32)
+            // materializes as `movl sym,%edx; movl %edx,%ebx; cmpl ...,%ebx`
+            // — the no-op cast relay that dominates global-load compare sites.
+            if let Instruction::Cast {
+                dest,
+                src: Operand::Value(v),
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                let noop32 = crate::common::types::target_is_32bit()
+                    && matches!(
+                        (from_ty, to_ty),
+                        (IrType::I32, IrType::U32)
+                            | (IrType::U32, IrType::I32)
+                            | (IrType::I32, IrType::I32)
+                            | (IrType::U32, IrType::U32)
+                    );
+                // A widening cast of a sub-word load is a no-op: the load
+                // already sign/zero-extends into its register (`movsbl
+                // (%mem),%r`), so `(I32)(I8)*p` may share the load's register.
+                // Fixes strchr's `movsbl (%ebx),%esi; movl %esi,%eax; movl
+                // %eax,%edi; cmpl %ebp,%edi` relay: the cast and the load
+                // collapse, leaving `movsbl (%ebx),%esi; cmpl %ebp,%esi`.
+                //
+                // Gate on `uses >= 2`: when the load feeds ONLY the cast
+                // (single use), the load was likely to spill anyway, and
+                // merging it into the cast drags the cast's register down
+                // with it (skip_atoi: the cast lost %edi and the whole pair
+                // spilled). When the load has another use, it needs a
+                // register regardless, so coalescing is a pure win.
+                let (_, load_uses) = load_def_types.get(&v.0).copied().unwrap_or((IrType::I32, 0));
+                let widen_from_load = crate::common::types::target_is_32bit()
+                    && matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+                    && matches!(to_ty, IrType::I32 | IrType::U32)
+                    && load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
+                    && load_uses >= 2;
+                let (d, s) = (dest.0, v.0);
+                if (noop32 || widen_from_load)
+                    && d != s
+                    && eligible.contains(&d)
+                    && eligible.contains(&s)
+                    && !param_ref_values.contains(&s)
+                {
+                    parent.entry(d).or_insert(d);
+                    parent.entry(s).or_insert(s);
+                    let rd = find(&mut parent, d);
+                    let rs = find(&mut parent, s);
+                    if rd != rs {
+                        parent.insert(rs, rd);
+                        same_value_edges.insert((d, s));
+                    }
+                }
+            }
         }
     }
     if parent.is_empty() {
@@ -268,9 +375,18 @@ fn build_coalesce_groups(
         for m in members {
             let ok = match iv_map.get(&m) {
                 None => true,
-                Some(&mi) => accepted
-                    .iter()
-                    .all(|a| iv_map.get(a).is_none_or(|&ai| !intervals_overlap(mi, ai))),
+                Some(&mi) => accepted.iter().all(|a| {
+                    iv_map.get(a).is_none_or(|&ai| {
+                        !intervals_overlap(mi, ai)
+                            // A same-value cast edge (no-op U32<->I32 or a
+                            // widening of a sub-word load) may overlap: dest
+                            // and src hold identical register contents, so
+                            // sharing the register is sound and the cast
+                            // emits nothing.
+                            || same_value_edges.contains(&(m, *a))
+                            || same_value_edges.contains(&(*a, m))
+                    })
+                }),
             };
             if ok {
                 accepted.push(m);

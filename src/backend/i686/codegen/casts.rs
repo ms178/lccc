@@ -23,6 +23,35 @@ impl I686Codegen {
     pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
         use crate::backend::cast::{CastKind, classify_cast_with_f128};
 
+        // Register-preserving no-op: when dest and src share a register and the
+        // cast does not change the 32-bit register contents, emit nothing.
+        // Sub-word values are ALWAYS extended in their register (movsbl/movzbl
+        // loads, store_eax_to of the extended %eax), so same-width U32<->I32
+        // and sub-word-widening casts are no-ops on a coalesced pair. The
+        // coalescer merges exactly these edges (including overlapping ones),
+        // so this fires for `(I32)(I8)*p` after a sign-extending load and for
+        // `(I32)(I8)c` after the narrowing already masked into the register.
+        if let Operand::Value(sv) = src {
+            if let (Some(&dp), Some(&sp)) = (
+                self.reg_assignments.get(&dest.0),
+                self.reg_assignments.get(&sv.0),
+            ) {
+                if dp == sp {
+                    let noop = matches!(
+                        (from_ty, to_ty),
+                        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, IrType::I32 | IrType::U32)
+                            | (IrType::I32, IrType::U32)
+                            | (IrType::U32, IrType::I32)
+                            | (IrType::I32, IrType::I32)
+                            | (IrType::U32, IrType::U32)
+                    );
+                    if noop {
+                        return;
+                    }
+                }
+            }
+        }
+
         // Let the default handle i128 conversions
         if crate::backend::generation::is_i128_type(from_ty) || crate::backend::generation::is_i128_type(to_ty) {
             crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
