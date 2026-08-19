@@ -162,7 +162,18 @@ impl I686Codegen {
         let never_materialized = if !self.state.pic_mode {
             let gmap = crate::backend::generation::build_global_addr_map_for(
                 func, &self.state.tls_symbols);
-            let set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+            // Loads folded into `cmp{b,w,l} $imm,(mem)` and fused
+            // compare-and-branch booleans emit no code and write no value, so
+            // they must not grab a caller-saved register that the live loop
+            // pointer needs (strlen/strchr/strstr used to park the dead byte
+            // or boolean in %edx, forcing the pointer into a push/pop-paying
+            // callee-saved home).
+            set.extend(crate::backend::generation::build_folded_value_set(
+                func,
+                &self.state.tls_symbols,
+                &self.state.absolute_symbols,
+            ));
             // Also deny stack slots: these values produce no code at all.
             self.state.never_materialized_values = set.clone();
             Some(set)

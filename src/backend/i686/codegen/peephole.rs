@@ -4140,8 +4140,26 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
             _ => {
                 let d = parse_dest_reg(&t);
                 if d <= REG_GP_MAX {
-                    sign_ext[d as usize] = false;
-                    is_bool[d as usize] = false;
+                    // `movl $imm, %reg`: the 32-bit value is its own sign
+                    // extension exactly when imm fits in a sign-extended byte
+                    // ([-128,127]); it is a bool only for 0/1.
+                    if let Some(imm) = t.strip_prefix("movl $").and_then(|r| {
+                        r.split(',').next().and_then(|v| v.trim().parse::<i64>().ok())
+                    }) {
+                        sign_ext[d as usize] = (-128..=127).contains(&imm);
+                        is_bool[d as usize] = matches!(imm, 0 | 1);
+                    } else if let Some(imm) = t.strip_prefix("andl $").and_then(|r| {
+                        r.split(',').next().and_then(|v| v.trim().parse::<i64>().ok())
+                    }) {
+                        // `andl $imm, %reg`: result is in [0, imm], so for
+                        // imm <= 127 it is non-negative and hence its own sign
+                        // extension; bool only for 0/1.
+                        sign_ext[d as usize] = (0..=127).contains(&imm);
+                        is_bool[d as usize] = matches!(imm, 0 | 1);
+                    } else {
+                        sign_ext[d as usize] = false;
+                        is_bool[d as usize] = false;
+                    }
                 }
                 // Implicit multi-register writers: fail closed on all flags.
                 if t.starts_with("mul") || t.starts_with("imul")
@@ -4913,8 +4931,6 @@ mod tests {
 
     #[test]
     fn sign_ext_cross_register_becomes_movl_copy() {
-        // %eax already sign-extended: `movsbl %al,%ecx` is a plain copy.
-        // %ecx is consumed by `addl` so the copy cannot be DSE'd away.
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -4928,6 +4944,79 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(!result.contains("movsbl %al"), "{result}");
         assert!(result.contains("movl %eax, %ecx"), "{result}");
+    }
+
+    #[test]
+    fn sign_ext_removed_after_movl_small_positive_imm() {
+        // `movl $32,%eax` leaves a sign-extended value (bits 8..31 == sign of
+        // bit 7); the trailing `movsbl %al,%eax` is a no-op.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl $32, %eax\n",
+            "    movsbl %al, %eax\n",
+            "    movl %eax, 4(%esp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(!result.contains("movsbl %al"), "{result}");
+    }
+
+    #[test]
+    fn sign_ext_removed_after_andl_small_imm() {
+        // `andl $32,%eax` yields 0..32 (non-negative, sign-extended); the
+        // trailing `movsbl %al,%eax` is a no-op.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    andl $32, %eax\n",
+            "    movsbl %al, %eax\n",
+            "    movl %eax, 4(%esp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(!result.contains("movsbl %al"), "{result}");
+    }
+
+    #[test]
+    fn sign_ext_kept_after_movl_negative_beyond_byte() {
+        // `movl $-129,%eax` is 0xFFFFFF7F: bit 7 is 0 but bits 8..31 are 1,
+        // so it is NOT its own sign extension and `movsbl %al,%eax` (0x7F ->
+        // 0x0000007F) is a real change that must survive.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl $-129, %eax\n",
+            "    movsbl %al, %eax\n",
+            "    movl %eax, 4(%esp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsbl %al"), "{result}");
+    }
+
+    #[test]
+    fn sign_ext_kept_after_andl_wide_imm() {
+        // `andl $255,%eax` can leave 0x80..0xFF (bit 7 set, bits 8..31 zero),
+        // so the value is not sign-extended; `movsbl %al,%eax` must survive.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    andl $255, %eax\n",
+            "    movsbl %al, %eax\n",
+            "    movl %eax, 4(%esp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsbl %al"), "{result}");
     }
 
     #[test]

@@ -425,7 +425,11 @@ impl I686Codegen {
         if let Some(phys) = self.dest_reg(dest) {
             let reg = phys_reg_name(phys);
             emit!(self.state, "    movl %eax, %{}", reg);
-            self.state.reg_cache.invalidate_acc();
+            // `movl %eax,%reg` leaves %eax unchanged, so the accumulator still
+            // holds the value. Keep the cache entry (mirror the slot path's
+            // set_acc below) so a later operand_to_eax / cast skips the reload;
+            // the cache is invalidated by any real %eax clobber anyway.
+            self.state.reg_cache.set_acc(dest.0, false);
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             let sr = self.slot_ref(slot);
             emit!(self.state, "    movl %eax, {}", sr);
