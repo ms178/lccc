@@ -196,9 +196,20 @@ impl Lowerer {
             return self.emit_bool_normalize_typed(src, from_ty);
         }
 
+        // A pointer reinterpretation is only free when the target is an
+        // INTEGER of pointer width (bit-identical). A pointer cast to a
+        // float of the same size (Ptr -> F64, both 8 bytes on LP64) is a
+        // VALUE conversion, not a reinterpretation: dropping it returned the
+        // raw address as a double (`(double)p` printed 0.0 for a 0x55…
+        // address because the return path bitcast the pointer). `to_ty == Ptr`
+        // stays a no-op only for pointer/pointer-width-integer sources; a
+        // float -> Ptr cast is a C constraint violation that GCC rejects, and
+        // we leave that historical behaviour untouched here.
         if to_ty == from_ty
             || to_ty == IrType::Ptr
-            || (from_ty == IrType::Ptr && to_ty.size() == crate::common::types::target_ptr_size())
+            || (from_ty == IrType::Ptr
+                && to_ty.is_integer()
+                && to_ty.size() == crate::common::types::target_ptr_size())
         {
             return src;
         }

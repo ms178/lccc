@@ -200,6 +200,12 @@ impl X86Codegen {
         if !from_ty.is_float()
             && (to_ty == IrType::F64 || to_ty == IrType::F32)
             && from_ty != IrType::U64
+            // Ptr normalizes to U64: a high-bit address must take the U64
+            // shift+round dance below, not the plain signed cvtsi2sdq this
+            // fast path emits (`(double)(void*)0xffffffff80000000` was
+            // -2^31 instead of 1.8e19). Ptr == U64 semantically, so exclude
+            // it here exactly like U64.
+            && from_ty != IrType::Ptr
             && !is_i128_type(from_ty)
         {
             if let Some(dest_phys) = self.dest_reg(dest) {
