@@ -19,12 +19,23 @@ impl RiscvCodegen {
         }
     }
 
-    pub(super) fn emit_int_neg_impl(&mut self, _ty: IrType) {
+    pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
         self.state.emit("    neg t0, t0");
+        // Zero-extend to 32 bits for 32-bit types, matching the convention
+        // used by emit_bswap/clz (the upper half of a 64-bit neg on a
+        // zero-extended U32 is 0xFFFFFFFF — x86-64 audit, claim 1).
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32) {
+            self.state.emit("    slli t0, t0, 32");
+            self.state.emit("    srli t0, t0, 32");
+        }
     }
 
-    pub(super) fn emit_int_not_impl(&mut self, _ty: IrType) {
+    pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
         self.state.emit("    not t0, t0");
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32) {
+            self.state.emit("    slli t0, t0, 32");
+            self.state.emit("    srli t0, t0, 32");
+        }
     }
 
     // ---- Integer binop ----

@@ -6,6 +6,7 @@ mod intrinsics;
 mod prologue;
 mod memory;
 mod alu;
+mod magic_div;
 mod comparison;
 mod calls;
 mod globals;

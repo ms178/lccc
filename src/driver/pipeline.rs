@@ -1833,6 +1833,10 @@ impl Driver {
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,
+            // opt_level 0..=3 = speed/size-balanced or speed; 4 (-Os) / 5 (-Oz)
+            // = optimize for size. Codegen uses this to pick the shorter
+            // sequence (idiv/imul) over the faster one (magic mul, LEA chains).
+            optimize_for_size: self.opt_level >= 4,
         };
         let asm = self.target.generate_assembly_with_opts_and_debug(
             &module,

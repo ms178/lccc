@@ -32,6 +32,7 @@ use crate::ir::reexports::{IrBinOp, Operand, Value};
 use crate::common::types::IrType;
 use crate::emit;
 use super::emit::{I686Codegen, alu_mnemonic, shift_mnemonic};
+use super::magic_div::{magic_s32, magic_u32};
 
 /// Location of a 32-bit binop operand for the direct-to-dest path.
 enum BinopLoc {
@@ -213,9 +214,157 @@ impl I686Codegen {
                 emit!(self.state, "    leal (%{}, %{}, 8), %{}", src, src, dest);
                 true
             }
+            // Two-instruction scratch-free chains — one cycle faster than
+            // `imull` (which is 3c latency), only when NOT optimizing for
+            // size (`imull` is a single 3-byte instruction). Both chains
+            // reuse dest in place, so no scratch register is clobbered and
+            // the direct path's no-clobber contract holds.
+            6 if !self.optimize_for_size => {
+                // x*3 then *2
+                emit!(self.state, "    leal (%{}, %{}, 2), %{}", src, src, dest);
+                emit!(self.state, "    addl %{}, %{}", dest, dest);
+                true
+            }
+            10 if !self.optimize_for_size => {
+                // x*5 then *2
+                emit!(self.state, "    leal (%{}, %{}, 4), %{}", src, src, dest);
+                emit!(self.state, "    addl %{}, %{}", dest, dest);
+                true
+            }
+            12 if !self.optimize_for_size => {
+                // x*3 then *4
+                emit!(self.state, "    leal (%{}, %{}, 2), %{}", src, src, dest);
+                emit!(self.state, "    shll $2, %{}", dest);
+                true
+            }
             _ => false,
         };
         handled
+    }
+
+    // ── Constant division / remainder strength reduction ──────────────────
+    // The IR-level div_by_const pass is disabled on i686 (it emits 64-bit
+    // mulhi sequences), so the codegen folds constant division itself with
+    // 32-bit `mull`/`imull` mulhi — the exact sequences GCC/Clang/ICX emit
+    // (verified against the godbolt oracle). Gated by !optimize_for_size:
+    // `idiv` is shorter, so -Os/-Oz keep it. n is in %eax on entry; q/r is
+    // left in %eax. Clobbers %ecx/%edx.
+
+    /// `q = n / d` (unsigned), n in %eax, d >= 2.
+    fn emit_udiv_const_in_eax(&mut self, d: u32) {
+        if d == 1 {
+            return; // n / 1 == n
+        }
+        if d.is_power_of_two() {
+            let k = d.trailing_zeros();
+            if k != 0 {
+                emit!(self.state, "    shrl ${}, %eax", k);
+            }
+            return;
+        }
+        let (m, s, add) = magic_u32(d);
+        if add {
+            // q = ((n - mulhi) >> 1 + mulhi) >> (s-1)
+            self.state.emit("    movl %eax, %ecx"); // n
+            emit!(self.state, "    movl ${}, %eax", m as i32);
+            self.state.emit("    mull %ecx"); // edx = mulhi
+            self.state.emit("    subl %edx, %ecx"); // n - q
+            self.state.emit("    shrl $1, %ecx");
+            emit!(self.state, "    leal (%edx, %ecx), %eax"); // q + t
+            if s > 1 {
+                emit!(self.state, "    shrl ${}, %eax", s - 1);
+            }
+        } else {
+            emit!(self.state, "    movl ${}, %ecx", m as i32);
+            self.state.emit("    mull %ecx"); // edx = mulhi
+            self.state.emit("    movl %edx, %eax");
+            if s > 0 {
+                emit!(self.state, "    shrl ${}, %eax", s);
+            }
+        }
+    }
+
+    /// `r = n % d` (unsigned), n in %eax, d >= 2.
+    fn emit_urem_const_in_eax(&mut self, d: u32) {
+        if d == 1 {
+            self.state.emit("    xorl %eax, %eax");
+            return;
+        }
+        if d.is_power_of_two() {
+            emit!(self.state, "    andl ${}, %eax", (d - 1) as i32);
+            return;
+        }
+        // r = n - (n/d)*d ; q*d < 2^32 (q <= n/d), so no overflow.
+        self.state.emit("    pushl %eax"); // save n
+        self.emit_udiv_const_in_eax(d);
+        emit!(self.state, "    imull ${}, %eax, %eax", d as i32);
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    popl %eax"); // n
+        self.state.emit("    subl %ecx, %eax");
+    }
+
+    /// `q = n / d` (signed, trunc toward zero), n in %eax, d != 0, ±1.
+    fn emit_sdiv_const_in_eax(&mut self, d: i32) {
+        debug_assert!(d != 0 && d != 1 && d != -1);
+        let ad = d.unsigned_abs();
+        if ad.is_power_of_two() {
+            let k = ad.trailing_zeros();
+            // Sign-splat bias (shorter than the cmov form GCC uses):
+            //   q = sar(n + (n<0 ? 2^k-1 : 0), k)
+            self.state.emit("    cltd"); // edx = sign(n)
+            emit!(self.state, "    shrl ${}, %edx", 32 - k);
+            self.state.emit("    addl %edx, %eax");
+            emit!(self.state, "    sarl ${}, %eax", k);
+            if d < 0 {
+                self.state.emit("    negl %eax");
+            }
+            return;
+        }
+        let (m, s) = magic_s32(ad as i32);
+        // q = mulhs(n, m) [+ n if m < 0] >> s - sign(n); negate if d < 0.
+        self.state.emit("    movl %eax, %ecx"); // save n
+        emit!(self.state, "    movl ${}, %eax", m);
+        self.state.emit("    imull %ecx"); // edx = mulhs
+        if m < 0 {
+            self.state.emit("    addl %ecx, %edx"); // q += n
+        }
+        if s > 0 {
+            emit!(self.state, "    sarl ${}, %edx", s);
+        }
+        self.state.emit("    movl %ecx, %eax");
+        // Arithmetic shift: 0 for n >= 0, -1 for n < 0. The sign correction
+        // subtracts this mask, so a LOGICAL shift (0/1) here would make every
+        // negative dividend come out one low (sd3(-9) == -5 instead of -3).
+        self.state.emit("    sarl $31, %eax"); // sign mask
+        self.state.emit("    subl %eax, %edx"); // q -= sign
+        self.state.emit("    movl %edx, %eax");
+        if d < 0 {
+            self.state.emit("    negl %eax");
+        }
+    }
+
+    /// `r = n % d` (signed), n in %eax, d != 0, ±1. Remainder sign follows
+    /// the dividend, so `n % -d == n % d` and |d| is used throughout.
+    fn emit_srem_const_in_eax(&mut self, d: i32) {
+        debug_assert!(d != 0 && d != 1 && d != -1);
+        let ad = d.unsigned_abs();
+        if ad.is_power_of_two() {
+            let k = ad.trailing_zeros();
+            // Sign-splat trick (matches GCC): r = (n + bias) & mask - bias.
+            self.state.emit("    cltd");
+            emit!(self.state, "    shrl ${}, %edx", 32 - k);
+            self.state.emit("    addl %edx, %eax");
+            emit!(self.state, "    andl ${}, %eax", (ad - 1) as i32);
+            self.state.emit("    subl %edx, %eax");
+            return;
+        }
+        // r = n - (n/|d|)*|d| ; (n/|d|)*|d| fits in 32 bits.
+        self.state.emit("    pushl %eax"); // save n
+        self.emit_sdiv_const_in_eax(ad as i32);
+        emit!(self.state, "    imull ${}, %eax, %eax", ad as i32);
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    popl %eax");
+        self.state.emit("    subl %ecx, %eax");
     }
 
     /// Compute a 32-bit int binop straight into the destination's register,
@@ -438,6 +587,56 @@ impl I686Codegen {
                 self.state.reg_cache.invalidate_acc();
                 self.store_eax_to(dest);
                 return;
+            }
+        }
+
+        // Constant division/remainder strength reduction (magic numbers and
+        // signed power-of-two bias) — the sequences GCC/Clang/ICX emit, and
+        // far faster than idiv/div. Skipped at -Os/-Oz where idiv is shorter.
+        if !self.optimize_for_size
+            && matches!(
+                op,
+                IrBinOp::UDiv | IrBinOp::SDiv | IrBinOp::URem | IrBinOp::SRem
+            )
+        {
+            if let Some(imm) = Self::const_as_imm32(rhs) {
+                // imm == 0 is UB for both div and rem: fall through so the
+                // general path emits `divl $0` (traps, matching C semantics).
+                let handled = match op {
+                    IrBinOp::UDiv if imm > 0 => {
+                        self.operand_to_eax(lhs);
+                        self.emit_udiv_const_in_eax(imm as u32);
+                        true
+                    }
+                    IrBinOp::URem if imm > 0 => {
+                        self.operand_to_eax(lhs);
+                        self.emit_urem_const_in_eax(imm as u32);
+                        true
+                    }
+                    IrBinOp::SDiv if imm != 0 => {
+                        self.operand_to_eax(lhs);
+                        match imm {
+                            1 => {} // x/1 == x
+                            -1 => self.state.emit("    negl %eax"),
+                            d => self.emit_sdiv_const_in_eax(d as i32),
+                        }
+                        true
+                    }
+                    IrBinOp::SRem if imm != 0 => {
+                        self.operand_to_eax(lhs);
+                        match imm {
+                            1 | -1 => self.state.emit("    xorl %eax, %eax"),
+                            d => self.emit_srem_const_in_eax(d as i32),
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    self.state.reg_cache.invalidate_acc();
+                    self.store_eax_to(dest);
+                    return;
+                }
             }
         }
 

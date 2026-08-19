@@ -92,12 +92,26 @@ impl ArmCodegen {
         }
     }
 
-    pub(super) fn emit_int_neg_impl(&mut self, _ty: IrType) {
-        self.state.emit("    neg x0, x0");
+    pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
+        // 32-bit forms operate on w0 and zero-extend into x0, matching the
+        // I32 home convention used by clz/rev elsewhere in this backend. A
+        // 64-bit `neg x0,x0` on a zero-extended U32 would leave 0xFFFFFFFF
+        // in the upper half (x86-64 audit, claim 1 — same bug class).
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                self.state.emit("    neg w0, w0");
+            }
+            _ => self.state.emit("    neg x0, x0"),
+        }
     }
 
-    pub(super) fn emit_int_not_impl(&mut self, _ty: IrType) {
-        self.state.emit("    mvn x0, x0");
+    pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                self.state.emit("    mvn w0, w0");
+            }
+            _ => self.state.emit("    mvn x0, x0"),
+        }
     }
 
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
