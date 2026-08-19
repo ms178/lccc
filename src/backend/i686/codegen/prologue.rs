@@ -559,11 +559,12 @@ impl I686Codegen {
                 }
             }
             // Phase 2: register-target captures form a parallel move: a target
-            // (%ecx/%edx are allocatable on i686) can be another move's still-
-            // unread source. Standard resolution: repeatedly emit a move whose
-            // target is not a pending source; a stuck state is a swap cycle
-            // among {%edx, %ecx} (%eax is never an allocation target), broken
-            // with xchg.
+            // (%ecx/%edx — and since Phase 2e also %eax — are allocatable on
+            // i686) can be another move's still-unread source. Standard
+            // resolution: repeatedly emit a move whose target is not a pending
+            // source; a stuck state is a swap cycle, broken with xchg. (In
+            // practice a param never lands an %eax home — any real use spans
+            // an eax hazard — so cycles stay within {%ecx, %edx}.)
             while !reg_moves.is_empty() {
                 let pending_srcs: Vec<&str> = reg_moves.iter().map(|m| m.1).collect();
                 if let Some(pos) = reg_moves.iter().position(|&(_, src, dst)| {

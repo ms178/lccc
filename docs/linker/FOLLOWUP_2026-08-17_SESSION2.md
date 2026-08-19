@@ -1841,3 +1841,13 @@ faithfully and the gate remains codegen-bound (boot object text 32 858 vs
 the `_end ≤ 0x8000`-derived budget of 23 330). Oracle preferences
 (mold `-DMOLD_TARGETS='X86_64;I386'`, binutils 2.47 pin, git-HEAD builds)
 re-verified unchanged.
+
+## Session-22 addendum (2026-08-19) — lever 3 shipped
+Session 22 shipped LEVER 3 (%eax as an allocatable home; see
+`docs/history/2026-08-19-session22-eax-alloc.md`): boot object text
+32 858 → 32 576 (−282 B). No linker-side change required — lccc-ld continues
+to evaluate setup.ld's ASSERTs faithfully and the gate remains
+codegen-bound (text 32 576 vs the `_end ≤ 0x8000`-derived budget 23 330).
+Added `tests/fuzz/regparm_differential.py` (450/450) covering the
+`-mregparm=3` boot ABI. Oracle preferences (mold `-DMOLD_TARGETS='X86_64;I386'`,
+binutils 2.47 pin, git-HEAD builds) unchanged and re-verified.

@@ -112,6 +112,11 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
         3 => "ebp",
         4 => "ecx",
         5 => "edx",
+        // The accumulator as an allocatable home (Phase 2e; see the
+        // eax-hazard wave in regalloc.rs). Every emitter path that uses
+        // %eax as scratch is an eax hazard point, so a homed value here is
+        // never spanned by an unstaged accumulator use.
+        6 => "eax",
         _ => panic!("invalid i686 phys reg: {:?}", reg),
     }
 }
@@ -337,9 +342,16 @@ impl I686Codegen {
                 let is_alloca = self.state.is_alloca(v.0);
                 // Check if value is in a callee-saved register (allocas are never register-allocated)
                 if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
-                    let reg = phys_reg_name(phys);
-                    emit!(self.state, "    movl %{}, %eax", reg);
-                    self.state.reg_cache.set_acc(v.0, false);
+                    if phys.0 == 6 {
+                        // Value is homed in %eax itself (Phase 2e): it is
+                        // already where the caller wants it. Refresh the
+                        // cache entry and emit nothing.
+                        self.state.reg_cache.set_acc(v.0, false);
+                    } else {
+                        let reg = phys_reg_name(phys);
+                        emit!(self.state, "    movl %{}, %eax", reg);
+                        self.state.reg_cache.set_acc(v.0, false);
+                    }
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot);
                     if is_alloca {
@@ -451,6 +463,12 @@ impl I686Codegen {
     /// Store %eax to a value's destination (callee-saved register or stack slot).
     pub(super) fn store_eax_to(&mut self, dest: &Value) {
         if let Some(phys) = self.dest_reg(dest) {
+            if phys.0 == 6 {
+                // Destination homed in %eax (Phase 2e): the result is already
+                // home. Keep the cache entry, emit nothing.
+                self.state.reg_cache.set_acc(dest.0, false);
+                return;
+            }
             let reg = phys_reg_name(phys);
             emit!(self.state, "    movl %eax, %{}", reg);
             // `movl %eax,%reg` leaves %eax unchanged, so the accumulator still

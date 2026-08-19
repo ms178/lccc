@@ -1126,6 +1126,137 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // Phase 2e (i686): %eax as a HOME (lever 3).  The accumulator is a valid
+    // register home across straight-line corridors that provably never use
+    // %eax as scratch — collect_i686_eax_hazard_points whitelists exactly
+    // Phi instructions and Branch/Unreachable terminators, every other
+    // emission point is a hazard.  Soundness model:
+    //
+    //  * DEF POINT: the producer leaves the value in %eax (store_eax_to on an
+    //    eax home keeps the cache entry; direct-dest producers write %eax
+    //    itself), so a hazard at the def point is birth, not clobber.
+    //  * LAST-USE POINT: a hazard there is only safe when the consumer reads
+    //    the value from the accumulator BEFORE reusing it — i.e. the value
+    //    sits in an accumulator-first operand slot (BinOp/Cmp LHS, Store
+    //    val, Cast/UnaryOp/Copy src, Load ptr, Phi incoming, Return
+    //    operand).  A binop RHS is read AFTER the LHS is staged through
+    //    %eax — homing the RHS in %eax made `xorl %eax,%eax` zero the
+    //    accumulator (m32 fuzz seed 0).  `acc_first_uses` records exactly
+    //    the values whose EVERY use is such a position.
+    //  * any hazard strictly between def and last use destroys the value.
+    if !env_on("CCC_NO_EAX_ALLOC")
+        && config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5))
+    {
+        let eax_hazards = collect_i686_eax_hazard_points(func);
+
+        // Values whose every operand occurrence is consumed
+        // accumulator-first (read from %eax before the consumer reuses it).
+        let mut acc_first_uses: FxHashSet<u32> = FxHashSet::default();
+        let mut non_acc_first: FxHashSet<u32> = FxHashSet::default();
+        let mut mark = |op: &Operand, acc_first: bool| {
+            if let Operand::Value(v) = op {
+                if acc_first {
+                    if !non_acc_first.contains(&v.0) {
+                        acc_first_uses.insert(v.0);
+                    }
+                } else {
+                    non_acc_first.insert(v.0);
+                    acc_first_uses.remove(&v.0);
+                }
+            }
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp { lhs, rhs, .. }
+                    | Instruction::Cmp { lhs, rhs, .. } => {
+                        mark(lhs, true);
+                        mark(rhs, false);
+                    }
+                    Instruction::Store { val, ptr, .. } => {
+                        mark(val, true);
+                        mark(&Operand::Value(*ptr), false);
+                    }
+                    Instruction::Load { ptr, .. } => {
+                        // The pointer is read first (direct dereference or
+                        // %ecx staging); the dest cannot share %eax with it
+                        // (overlapping intervals), so eax survives to the read.
+                        mark(&Operand::Value(*ptr), true);
+                    }
+                    Instruction::Cast { src, .. }
+                    | Instruction::UnaryOp { src, .. } => {
+                        mark(src, true);
+                    }
+                    Instruction::Copy { src, .. } => {
+                        mark(src, true);
+                    }
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, _) in incoming {
+                            mark(op, true);
+                        }
+                    }
+                    _ => {
+                        // GEP/Select/Call args/atomics/intrinsics/inline asm:
+                        // operand ordering is not accumulator-first-proven.
+                        for_each_operand_in_instruction(inst, |op| mark(op, false));
+                    }
+                }
+            }
+            match &block.terminator {
+                Terminator::Return(Some(op)) => mark(op, true),
+                Terminator::CondBranch { cond, .. } => mark(cond, true),
+                _ => for_each_operand_in_terminator(&block.terminator, |op| {
+                    mark(op, false)
+                }),
+            }
+        }
+
+        let reg = PhysReg(6);
+        let holders: Vec<(u32, u32)> = assignments
+            .iter()
+            .filter(|(_, &r)| r == reg)
+            .filter_map(|(&v, _)| iv_map.get(&v).copied())
+            .collect();
+        let intervals: Vec<LiveInterval> = scan_ivs
+            .iter()
+            .copied()
+            .filter(|iv| {
+                !assignments.contains_key(&iv.value_id)
+                    && !call_spanning.contains(&iv.value_id)
+                    && (x86_ordered_param_copies || !param_restricted.contains(&iv.value_id))
+            })
+            .filter(|iv| {
+                let idx = eax_hazards.partition_point(|&p| p <= iv.start);
+                if idx >= eax_hazards.len() {
+                    return true;
+                }
+                let p = eax_hazards[idx];
+                if p > iv.end {
+                    return true;
+                }
+                // A hazard exactly at the last use survives only for
+                // accumulator-first consumers (read-then-clobber).
+                p == iv.end && acc_first_uses.contains(&iv.value_id)
+            })
+            .filter(|iv| {
+                !holders
+                    .iter()
+                    .any(|&h| intervals_overlap((iv.start, iv.end), h))
+            })
+            .collect();
+        if !intervals.is_empty() {
+            let ranges =
+                live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
+            let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+            alloc.run();
+            for (vid, r) in alloc.assignments {
+                assignments.insert(vid, r);
+                caller_used_regs_set.insert(r.0);
+            }
+            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+        }
+    }
+
     // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
     // x86 stays out — same eviction already lost gzip inside the scan.
     if !env_on("CCC_NO_LOOP_PIN") && arm_fp_pool && !all_phi_pairs.is_empty() {
@@ -2769,6 +2900,43 @@ fn collect_i686_scratch_hazard_points(
         point += 1;
     }
     (ecx, edx)
+}
+
+/// i686 %eax-as-home hazard scan (Phase 2e).
+///
+/// The accumulator is a valid register HOME only across program points where
+/// the emitted code provably does not use %eax as scratch. On i686 that set
+/// is tiny — every binop/cast/load/store/call/div/asm stages through %eax —
+/// so this is a WHITELIST of the emitters known to leave %eax untouched:
+///   * `Phi`               — emits no code;
+///   * `Branch`/`Unreachable` terminators — emit no code.
+/// Everything else (including `Return` — its operand staging writes %eax —
+/// `CondBranch`/`Switch` condition consumption, copies, GEP/GlobalAddr/
+/// LabelAddr materialisation, and all ALU/memory ops) is a hazard point.
+/// A value homed in %eax therefore only spans straight-line phi/branch
+/// corridors between its (excluded) definition point and its use.
+///
+/// Point numbering MUST match collect_i686_scratch_hazard_points (and thus
+/// the liveness intervals): one point per instruction, one per terminator.
+fn collect_i686_eax_hazard_points(func: &IrFunction) -> Vec<u32> {
+    let mut hazards: Vec<u32> = Vec::new();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if !matches!(inst, Instruction::Phi { .. }) {
+                hazards.push(point);
+            }
+            point += 1;
+        }
+        if !matches!(
+            &block.terminator,
+            Terminator::Branch(_) | Terminator::Unreachable
+        ) {
+            hazards.push(point);
+        }
+        point += 1;
+    }
+    hazards
 }
 
 /// Exclude every 3rd fusible multiply temp from register allocation.
