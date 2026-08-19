@@ -2986,6 +2986,123 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
     changed
 }
 
+// ── Pass: redundant testl-after-logical elimination ─────────────────────────
+
+/// `andl`/`orl` (any operand form) and the `xorl %R,%R` zero idiom set
+/// ZF/SF/PF from the result and clear CF/OF — the EXACT flag state that a
+/// following `testl %R, %R` would produce.  The test is therefore pure
+/// overhead: delete it (2 bytes per site; 29 sites in the kernel boot
+/// corpus, e.g. cpucheck's `andl $536870912,%eax; testl %eax,%eax; je`).
+///
+/// Only AND/OR/XOR-self qualify: shifts leak CF/OF from the operand, and
+/// ADD/SUB/NEG set CF/OF from carry — neither matches TEST's flag contract.
+/// The producer and the test must be adjacent (nothing may perturb flags
+/// or the register between them), and the test's size must match.
+fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    /// If `s` is an AND/OR with any source, or a same-register XOR zero
+    /// idiom, writing a result of `size` to `dest` — i.e. an instruction
+    /// whose flags are exactly `test dest,dest` over that result — return
+    /// (size, dest).
+    fn flag_equiv_producer(s: &str) -> Option<(MoveSize, RegId)> {
+        let candidates: &[(&str, MoveSize)] = &[
+            ("andl", MoveSize::L),
+            ("orl", MoveSize::L),
+            ("xorl", MoveSize::L),
+            ("andw", MoveSize::W),
+            ("orw", MoveSize::W),
+            ("xorw", MoveSize::W),
+            ("andb", MoveSize::B),
+            ("orb", MoveSize::B),
+        ];
+        for (mnem, size) in candidates {
+            if let Some(rest) = s.strip_prefix(mnem) {
+                if !rest.starts_with(' ') && !rest.starts_with('\t') {
+                    continue;
+                }
+                let dest = parse_dest_reg(s);
+                if dest == REG_NONE || dest > REG_GP_MAX {
+                    return None;
+                }
+                if mnem.starts_with("xor") {
+                    // Only the zero idiom `xor R, R` writes a result whose
+                    // flags equal test R, R; `xor A, B` with A != B reads B
+                    // before writing, and the flag state still matches, but
+                    // the DEST register held a different value beforehand —
+                    // irrelevant for flags, yet keep the strict form: the
+                    // corpus only ever contains the idiom.
+                    let lhs = rest
+                        .trim_start()
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    let rhs = s.rsplit(',').next().unwrap_or("").trim();
+                    if lhs != rhs {
+                        return None;
+                    }
+                }
+                return Some((*size, dest));
+            }
+        }
+        None
+    }
+
+    /// Parse `test{l,w,b} %R, %R` (same register twice) -> (size, R).
+    fn self_test(s: &str) -> Option<(MoveSize, RegId)> {
+        let (mnem, size) = if let Some(r) = s.strip_prefix("testl ") {
+            (r, MoveSize::L)
+        } else if let Some(r) = s.strip_prefix("testw ") {
+            (r, MoveSize::W)
+        } else if let Some(r) = s.strip_prefix("testb ") {
+            (r, MoveSize::B)
+        } else {
+            return None;
+        };
+        let mut parts = mnem.split(',');
+        let a = parts.next()?.trim();
+        let b = parts.next()?.trim();
+        if parts.next().is_some() || a != b || !a.starts_with('%') {
+            return None;
+        }
+        let reg = register_family(a);
+        if reg == REG_NONE || reg > REG_GP_MAX {
+            return None;
+        }
+        Some((size, reg))
+    }
+
+    let mut changed = false;
+    let len = infos.len();
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let (psize, preg) = match flag_equiv_producer(trimmed(store, &infos[i], i)) {
+            Some(p) => p,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let j = next_non_nop(infos, i + 1);
+        if j >= len {
+            break;
+        }
+        if let Some((tsize, treg)) = self_test(trimmed(store, &infos[j], j)) {
+            if tsize == psize && treg == preg {
+                infos[j].kind = LineKind::Nop;
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
 // ── Pass: Memory operand folding ─────────────────────────────────────────────
 
 /// True when `s` is a genuine 32-bit `movl` load whose memory operand is a
@@ -3932,6 +4049,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
+    let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
 
     // Phase 3: Local cleanup after global passes
     if global_changed {
@@ -3945,6 +4063,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= eliminate_dead_stores(&store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
+            changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
             pass_count2 += 1;
         }
     }

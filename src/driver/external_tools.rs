@@ -243,7 +243,27 @@ impl Driver {
             preprocessor.set_filename(input_file);
             self.process_force_includes(&mut preprocessor)
                 .map_err(|e| format!("Preprocessing {} failed: {}", input_file, e))?;
-            preprocessor.preprocess(&source)
+            let preprocessed = preprocessor.preprocess(&source);
+            // A missing #include in a .S file is fatal — GCC aborts the
+            // assembly with "No such file or directory".  Silently
+            // continuing once let the kernel's header.S compile with an
+            // EMPTY voffset.h, turning the VO_* `#if` guards false and
+            // emitting a subtly wrong setup header.  Match GCC.
+            let pp_errors = preprocessor.errors();
+            if !pp_errors.is_empty() {
+                for err in pp_errors {
+                    eprintln!(
+                        "{}:{}:{}: error: {}",
+                        err.file, err.line, err.col, err.message
+                    );
+                }
+                return Err(format!(
+                    "{} preprocessor error(s) in {}",
+                    pp_errors.len(),
+                    input_file
+                ));
+            }
+            preprocessed
         } else {
             // .s files are pure assembly - read directly
             Self::read_source(input_file)?
