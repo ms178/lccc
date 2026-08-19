@@ -3541,6 +3541,17 @@ impl ArchCodegen for X86Codegen {
             // GEP folding is a pure optimization — an empty fold map keeps the
             // default path semantics-identical.
             let ir = std::mem::take(&mut self.machinst_buf_ir);
+            // The main dispatch loop already advanced once for each buffered
+            // instruction. Replay at those original points, then finish at
+            // exactly the same point; advancing from the current endpoint
+            // would double-count the whole fallback window and misalign later
+            // call-spanning save/restore intervals.
+            let replay_endpoint = self.state.current_program_point;
+            let replay_len = u32::try_from(ir.len())
+                .expect("MachInst replay window exceeds u32 program-point space");
+            self.state.current_program_point = replay_endpoint
+                .checked_sub(replay_len)
+                .expect("MachInst replay exceeds emitted IR program points");
             for inst in ir {
                 crate::backend::generation::generate_instruction(
                     self,
@@ -3551,11 +3562,13 @@ impl ArchCodegen for X86Codegen {
                     &crate::common::fx_hash::FxHashSet::default(),
                     &crate::common::fx_hash::FxHashSet::default(),
                 );
-                // Mirror the main loop's program-point accounting so any
-                // call-spanning save/restore decisions after the fallback
-                // stay aligned with the IR positions they were computed for.
                 self.state.current_program_point += 1;
             }
+            assert_eq!(
+                self.state.current_program_point,
+                replay_endpoint,
+                "MachInst replay changed the IR program-point endpoint"
+            );
             self.machinst_buf.clear();
             return;
         }
