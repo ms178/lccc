@@ -2964,6 +2964,48 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // Pattern: load into %ecx, then `addl %ecx, %eax` etc.
             let s = trimmed(store, &infos[j], j);
             if let Some(folded) = try_fold_memory_operand(s, load_reg, offset, size) {
+                // Soundness: the fold deletes the load, so the loaded register
+                // must be DEAD after the folded consumer. Copy propagation can
+                // extend a slot load's register across several consumers
+                // (`movl SLOT,%eax; movl %eax,%edx; cmpl %edx,%edi; subl
+                // %edx,%ebp` -> `...; cmpl %eax,%edi; subl %eax,%ebp`), so a
+                // later read of load_reg would see a stale value once the load
+                // is gone. Scan forward: a read of load_reg (explicit or
+                // implicit) before the next pure write to it is unsafe. A
+                // label/call/ret invalidates the accumulator cache (the emitter
+                // reloads afterwards), so the loaded value is provably dead
+                // there — but a CONDITIONAL jump does NOT invalidate: its
+                // fallthrough (e.g. a select arm) may still read the register.
+                let mut safe = true;
+                let mut k = j + 1;
+                while k < len {
+                    if infos[k].is_nop() { k += 1; continue; }
+                    let lk = trimmed(store, &infos[k], k);
+                    if infos[k].is_barrier() { break; }
+                    // A pure write to load_reg ends its liveness. `movl $imm,%reg`
+                    // and `leal ADDR,%reg` write without reading %reg; a generic
+                    // read-modify-write (addl/subl/…) READS its destination and
+                    // is correctly treated as a read below.
+                    let pure_write = match infos[k].kind {
+                        LineKind::Move { dst, src } => dst == load_reg && src != load_reg,
+                        LineKind::LoadEbp { reg, .. } => reg == load_reg,
+                        LineKind::Pop { reg } => reg == load_reg,
+                        LineKind::SetCC { reg } => reg == load_reg,
+                        LineKind::Other { dest_reg } => {
+                            dest_reg == load_reg && (lk.starts_with("movl $") || lk.starts_with("leal "))
+                        }
+                        _ => false,
+                    } || (line_writes_reg_implicitly(lk, load_reg)
+                        && !line_references_reg(lk, load_reg));
+                    if pure_write { break; }
+                    if line_references_reg(lk, load_reg) {
+                        safe = false;
+                        break;
+                    }
+                    k += 1;
+                }
+                if !safe { i += 1; continue; }
+
                 store.replace(j, format!("    {}", folded));
                 let dest_reg = parse_dest_reg(&folded);
                 infos[j] = LineInfo {
