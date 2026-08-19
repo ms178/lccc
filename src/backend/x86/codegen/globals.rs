@@ -74,7 +74,25 @@ impl X86Codegen {
     pub(super) fn emit_global_load_rip_rel_impl(&mut self, dest: &Value, sym: &str, ty: IrType) {
         // Register-direct: load directly to dest register.
         if let Some(d_reg) = self.dest_reg(dest) {
-            if !is_xmm_reg(d_reg) {
+            if is_xmm_reg(d_reg) {
+                // Scalar FP straight into the XMM home. `mov_load_for_type`
+                // returns the INTEGER form (movq/movl) for F64/F32, and the
+                // old path routed them through %rax: `movq sym(%rip), %rax;
+                // movq %rax, %xmmN` — two instructions and a GPR shuttle
+                // (nbody's `bodies[i].x` loads, +258 bytes). Emit the native
+                // memory→XMM form instead.
+                let d_name = phys_reg_name(d_reg);
+                if ty == IrType::F64 {
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %{}", sym, d_name));
+                    return;
+                }
+                if ty == IrType::F32 {
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %{}", sym, d_name));
+                    return;
+                }
+            } else {
                 let load_instr = Self::mov_load_for_type(ty);
                 // The MNEMONIC decides the destination width, not the source
                 // type. `mov_load_for_type` returns movzbl/movzwl/movl for
@@ -92,6 +110,20 @@ impl X86Codegen {
                 return;
             }
         }
+        // No register home: scalar FP still loads memory→%xmm0 (native) and
+        // stores to the slot/register via the XMM-aware store path.
+        if ty == IrType::F64 {
+            self.state
+                .emit_fmt(format_args!("    movsd {}(%rip), %xmm0", sym));
+            self.store_xmm_to(dest, "xmm0", IrType::F64);
+            return;
+        }
+        if ty == IrType::F32 {
+            self.state
+                .emit_fmt(format_args!("    movss {}(%rip), %xmm0", sym));
+            self.store_xmm_to(dest, "xmm0", IrType::F32);
+            return;
+        }
         let load_instr = Self::mov_load_for_type(ty);
         let dest_reg = Self::load_dest_reg(ty);
         self.state.emit_fmt(format_args!("    {} {}(%rip), {}", load_instr, sym, dest_reg));
@@ -102,13 +134,41 @@ impl X86Codegen {
         // Register-direct: store directly from val register, skip operand_to_rax.
         if let Operand::Value(v) = val {
             if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
-                if !is_xmm_reg(v_reg) {
+                if is_xmm_reg(v_reg) {
+                    // Scalar FP straight out of the XMM home (`movsd %xmmN,
+                    // sym(%rip)`) instead of the %rax shuttle.
+                    let v_name = phys_reg_name(v_reg);
+                    if ty == IrType::F64 {
+                        self.state
+                            .emit_fmt(format_args!("    movsd %{}, {}(%rip)", v_name, sym));
+                        return;
+                    }
+                    if ty == IrType::F32 {
+                        self.state
+                            .emit_fmt(format_args!("    movss %{}, {}(%rip)", v_name, sym));
+                        return;
+                    }
+                } else {
                     let store_instr = Self::mov_store_for_type(ty);
                     let v_name = typed_phys_reg_name(v_reg, ty);
                     self.state.emit_fmt(format_args!("    {} %{}, {}(%rip)", store_instr, v_name, sym));
                     return;
                 }
             }
+        }
+        // No register home: stage scalar FP through %xmm0 (native) and store
+        // memory→memory via the XMM form instead of the %rax shuttle.
+        if ty == IrType::F64 {
+            self.emit_fp_operand_to_xmm(val, IrType::F64, "xmm0");
+            self.state
+                .emit_fmt(format_args!("    movsd %xmm0, {}(%rip)", sym));
+            return;
+        }
+        if ty == IrType::F32 {
+            self.emit_fp_operand_to_xmm(val, IrType::F32, "xmm0");
+            self.state
+                .emit_fmt(format_args!("    movss %xmm0, {}(%rip)", sym));
+            return;
         }
         self.emit_load_operand_impl(val);
         let store_instr = Self::mov_store_for_type(ty);

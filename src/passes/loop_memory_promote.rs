@@ -15,9 +15,10 @@
 //!   The latch store writes `store_val`. If the unique exit leaves from the
 //!   latch, memory must receive `store_val`, not `phi`. Storing `phi` on a
 //!   do-while is a one-iteration-stale write.
-//! - **Must-execute / speculation.** The load is hoisted to the preheader.
-//!   Allowed only when the address is alloca-derived (function-local,
-//!   non-faulting) **or** the load block dominates the unique exit source.
+//! - **Must-execute / speculation.** The load is hoisted and the final store
+//!   may be newly executed on a zero-trip exit. This is allowed only for a
+//!   proven in-bounds, naturally aligned local alloca access, or when both the
+//!   original load and store dominate the unique exit source.
 //! - **The load dominates the latch.** Otherwise a path to the store skips
 //!   the load and the phi would invent a value.
 //! - **Alias.** Distinct *allocas* and distinct *globals* are different
@@ -189,17 +190,90 @@ fn pointer_paths(defs: &FxHashMap<u32, &Instruction>) -> FxHashMap<u32, Path> {
 }
 
 fn byte_size(ty: IrType) -> Option<i64> {
-    Some(match ty {
-        IrType::I8 | IrType::U8 => 1,
-        IrType::I16 | IrType::U16 => 2,
-        IrType::I32 | IrType::U32 | IrType::F32 => 4,
-        IrType::I64 | IrType::U64 | IrType::F64 | IrType::Ptr => 8,
+    let size = match ty {
+        IrType::I8
+        | IrType::U8
+        | IrType::I16
+        | IrType::U16
+        | IrType::I32
+        | IrType::U32
+        | IrType::I64
+        | IrType::U64
+        | IrType::F32
+        | IrType::F64
+        | IrType::Ptr => ty.size(),
         _ => return None,
-    })
+    };
+    i64::try_from(size).ok()
 }
 
 fn is_promotable_type(ty: IrType) -> bool {
     byte_size(ty).is_some()
+}
+
+/// Prove that speculatively loading and redundantly storing this access cannot
+/// fault. Merely being alloca-derived is not enough: a constant offset may be
+/// out of bounds or under-aligned, and either access may be absent in a
+/// zero-trip loop in the source program.
+fn alloca_access_is_nonfaulting(
+    defs: &FxHashMap<u32, &Instruction>,
+    path: Path,
+    access_ty: IrType,
+    segment: AddressSpace,
+) -> bool {
+    if segment != AddressSpace::Default || !is_alloca_root(path.root) {
+        return false;
+    }
+    let Ok(root_id) = u32::try_from(path.root & !TAG_MASK) else {
+        return false;
+    };
+    let Some(Instruction::Alloca {
+        dest,
+        ty: object_ty,
+        size,
+        align,
+        volatile,
+        semantic_volatile,
+    }) = defs.get(&root_id).copied()
+    else {
+        return false;
+    };
+    if dest.0 != root_id || *volatile || *semantic_volatile {
+        return false;
+    }
+    let (Ok(offset), Some(access_size)) = (
+        usize::try_from(path.offset),
+        byte_size(access_ty).and_then(|n| usize::try_from(n).ok()),
+    ) else {
+        return false;
+    };
+    let Some(end) = offset.checked_add(access_size) else {
+        return false;
+    };
+    if end > *size {
+        return false;
+    }
+
+    let required_align = access_ty.align();
+    let object_align = if *align == 0 { object_ty.align() } else { *align };
+    object_align % required_align == 0 && offset % required_align == 0
+}
+
+fn accesses_may_be_speculated(
+    defs: &FxHashMap<u32, &Instruction>,
+    paths: &FxHashMap<u32, Path>,
+    ptr: Value,
+    ty: IrType,
+    segment: AddressSpace,
+    idom: &[usize],
+    load_block: usize,
+    store_block: usize,
+    exit_from: usize,
+) -> bool {
+    paths
+        .get(&ptr.0)
+        .is_some_and(|path| alloca_access_is_nonfaulting(defs, *path, ty, segment))
+        || (dominates(idom, exit_from, load_block) && dominates(idom, exit_from, store_block))
 }
 
 /// True only when the two accesses are **proved** to never overlap.
@@ -1025,10 +1099,20 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
                 continue;
             }
 
-            // Speculative preheader load: only for alloca roots, or when the
-            // original load already executes on every path to the unique exit.
-            let alloca_backed = paths.get(&ptr_id).is_some_and(|p| is_alloca_root(p.root));
-            if !alloca_backed && !dominates(&cfg.idom, exit_from, load_b) {
+            // The transformation may execute both a preheader load and an exit
+            // store on a source-level zero-trip path. Require either a proved
+            // safe local access or must-execute proofs for both operations.
+            if !accesses_may_be_speculated(
+                &defs,
+                &paths,
+                ptr,
+                load_ty,
+                load_seg,
+                &cfg.idom,
+                load_b,
+                *store_b,
+                exit_from,
+            ) {
                 continue;
             }
 
@@ -1267,11 +1351,115 @@ mod tests {
     }
 
     #[test]
-    fn byte_size_unknown_is_none() {
+    fn byte_size_uses_target_pointer_width() {
+        struct RestorePointerSize(usize);
+        impl Drop for RestorePointerSize {
+            fn drop(&mut self) {
+                crate::common::types::set_target_ptr_size(self.0);
+            }
+        }
+
+        let _restore = RestorePointerSize(crate::common::types::target_ptr_size());
         assert_eq!(byte_size(IrType::I32), Some(4));
+        let mut paths = FxHashMap::default();
+        paths.insert(1, Path { root: TAG_ALLOCA | 1, offset: 0 });
+        paths.insert(2, Path { root: TAG_ALLOCA | 1, offset: 4 });
+
+        crate::common::types::set_target_ptr_size(4);
+        assert_eq!(byte_size(IrType::Ptr), Some(4));
+        assert!(disjoint(&paths, Value(1), IrType::Ptr, Value(2), IrType::Ptr));
+        crate::common::types::set_target_ptr_size(8);
         assert_eq!(byte_size(IrType::Ptr), Some(8));
+        assert!(!disjoint(&paths, Value(1), IrType::Ptr, Value(2), IrType::Ptr));
         assert!(!is_promotable_type(IrType::I128));
         assert!(!is_promotable_type(IrType::F128));
+    }
+
+    #[test]
+    fn speculative_alloca_access_requires_bounds_and_alignment() {
+        let alloca = Instruction::Alloca {
+            dest: Value(7),
+            ty: IrType::I32,
+            size: 16,
+            align: 4,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let mut defs = FxHashMap::default();
+        defs.insert(7, &alloca);
+        let path = |offset| Path {
+            root: TAG_ALLOCA | 7,
+            offset,
+        };
+
+        assert!(alloca_access_is_nonfaulting(
+            &defs,
+            path(12),
+            IrType::I32,
+            AddressSpace::Default,
+        ));
+        assert!(!alloca_access_is_nonfaulting(
+            &defs,
+            path(-4),
+            IrType::I32,
+            AddressSpace::Default,
+        ));
+        assert!(!alloca_access_is_nonfaulting(
+            &defs,
+            path(13),
+            IrType::I32,
+            AddressSpace::Default,
+        ));
+        assert!(!alloca_access_is_nonfaulting(
+            &defs,
+            path(2),
+            IrType::I32,
+            AddressSpace::Default,
+        ));
+        assert!(!alloca_access_is_nonfaulting(
+            &defs,
+            path(0),
+            IrType::I32,
+            AddressSpace::SegFs,
+        ));
+    }
+
+    #[test]
+    fn speculative_external_store_must_dominate_exit() {
+        // 0 -> header 1 -> body 2 or exit 3. The header load executes on
+        // the zero-trip path, but the body store does not.
+        let idom = [0, 0, 1, 1];
+        let defs = FxHashMap::default();
+        let mut paths = FxHashMap::default();
+        paths.insert(
+            9,
+            Path {
+                root: TAG_GLOBAL | 9,
+                offset: 0,
+            },
+        );
+        assert!(!accesses_may_be_speculated(
+            &defs,
+            &paths,
+            Value(9),
+            IrType::I32,
+            AddressSpace::Default,
+            &idom,
+            1,
+            2,
+            3,
+        ));
+        assert!(accesses_may_be_speculated(
+            &defs,
+            &paths,
+            Value(9),
+            IrType::I32,
+            AddressSpace::Default,
+            &idom,
+            1,
+            1,
+            3,
+        ));
     }
 
     #[test]

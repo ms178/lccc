@@ -161,7 +161,7 @@ fn live_span(start: u32, end: u32) -> f64 {
 /// `10^min(depth, 4)`. Cap keeps the ranking strict: depths 5+ must not
 /// collapse into one saturated weight and flatten eviction.
 #[inline]
-fn loop_depth_weight(loop_depth: u32) -> u64 {
+pub(crate) fn loop_depth_weight(loop_depth: u32) -> u64 {
     10u64.pow(loop_depth.min(4) as u32)
 }
 

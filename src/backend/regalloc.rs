@@ -139,10 +139,70 @@ fn evict_group(
 
 /// Union-find over eligible `Copy dest, Value(src)`. Kept iff members'
 /// intervals are pairwise disjoint. Representative is always an accepted member.
+/// Re-weight coalesced group leaders by the group's total loop-weighted use
+/// count. `build_live_ranges` keys its metadata by the leader's value id, so a
+/// leader that is a ParamRef or an entry-block Copy carries only its own
+/// single use and would be ranked below the hot loop temps it actually feeds
+/// (through its members) — the parameters then lose their callee-saved home
+/// in Phase 2c and round-trip through stack slots. The sum of the members'
+/// `use_count` (already loop-depth-weighted) is the correct ranking weight.
+fn bump_coalesce_group_priority(
+    ranges: &mut [crate::backend::live_range::LiveRange],
+    groups: &FxHashMap<u32, Vec<u32>>,
+    use_count: &FxHashMap<u32, u64>,
+) {
+    if groups.is_empty() {
+        return;
+    }
+    for r in ranges {
+        if let Some(members) = groups.get(&r.value_id) {
+            let total: u64 = members
+                .iter()
+                .map(|m| use_count.get(m).copied().unwrap_or(0))
+                .sum();
+            if total > r.priority {
+                r.priority = total;
+                r.calculate_spill_weight();
+            }
+        }
+    }
+}
+
+/// GEP bases folded into Load/Store addressing are read at every folded access
+/// point, but `build_live_ranges` only counts their direct operand uses (the
+/// GEP instructions themselves), so a hot-loop base carries priority 1 while
+/// its live interval spans the whole loop. The eviction scan then treats the
+/// base as dead-past-its-one-use and evicts it, turning every folded access
+/// into a reload of the base register (memcmp/adler32 spilled their pointer
+/// params, +35/+40 bytes). Rank these values by the largest loop weight their
+/// interval touches instead — the fold makes them live-and-read throughout.
+fn bump_gep_base_priority(
+    ranges: &mut [crate::backend::live_range::LiveRange],
+    liveness: &LivenessResult,
+) {
+    if liveness.gep_base_values.is_empty() {
+        return;
+    }
+    for r in ranges {
+        if !liveness.gep_base_values.contains(&r.value_id) {
+            continue;
+        }
+        // `loop_depth` is the max of the def block and use-block depths; a
+        // base folded across an inner loop is read every iteration there.
+        let weight = crate::backend::live_range::loop_depth_weight(r.loop_depth);
+        let boosted = r.priority.max(weight);
+        if boosted > r.priority {
+            r.priority = boosted;
+            r.calculate_spill_weight();
+        }
+    }
+}
+
 fn build_coalesce_groups(
     func: &IrFunction,
     iv_map: &FxHashMap<u32, (u32, u32)>,
     eligible: &FxHashSet<u32>,
+    param_ref_values: &FxHashSet<u32>,
 ) -> FxHashMap<u32, Vec<u32>> {
     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
     fn find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
@@ -167,7 +227,18 @@ fn build_coalesce_groups(
             } = inst
             {
                 let (d, s) = (dest.0, v.0);
-                if d != s && eligible.contains(&d) && eligible.contains(&s) {
+                // Do NOT coalesce a ParamRef with its loop-carried Copy: the
+                // param's ABI home dies at the Copy, while the loop copy wants
+                // its own caller-saved register. Merging them forces one
+                // register to hold the value across the whole loop, stealing a
+                // callee-saved register from the hot-loop overflow temps
+                // (adler32/memcmp spilt the parameters; the pre-rework
+                // allocator never coalesced them).
+                if d != s
+                    && eligible.contains(&d)
+                    && eligible.contains(&s)
+                    && !param_ref_values.contains(&s)
+                {
                     parent.entry(d).or_insert(d);
                     parent.entry(s).or_insert(s);
                     let rd = find(&mut parent, d);
@@ -272,17 +343,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
 
-    // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
-    // a callee-saved home only when a call point falls INSIDE one of its live
-    // segments (and after its def). A call strictly between two segments of a
-    // diamond (in the gap) is on the dead arm and can never reach a use, so a
-    // caller-saved home is sound there. A call AT a segment boundary is NOT in
-    // a gap: a loop re-entry segment (like the `.Lstr0` format string used
-    // every iteration) starts exactly at the call that re-clobbers its
-    // register, so `seg.start <= cp < seg.end` must be inclusive on the left.
-    // `cp > def` keeps a value born at its own call (retval) non-spanning.
-    // `segments` covers non-alloca SSA values only; the synthetic alloca
-    // vector intervals keep the fat `spans_any_call` check.
     let arm_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !env_on("CCC_NO_VECREG");
     let x86_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 20);
     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
@@ -411,7 +471,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     let coalesce_groups: FxHashMap<u32, Vec<u32>> = if !env_on("CCC_NO_COALESCE") {
-        build_coalesce_groups(func, &iv_map, &eligible)
+        build_coalesce_groups(func, &iv_map, &eligible, &param_ref_values)
     } else {
         FxHashMap::default()
     };
@@ -441,6 +501,63 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // A coalesce group containing a ParamRef must not take a caller-saved home
+    // in Phase 2: the param's range spans the whole function and would evict
+    // the hot loop's caller-saved temps. The baseline kept multi-block params
+    // in callee-saved registers (Phase 2c); with coalescing ON the param is
+    // merged into a group whose leader is a loop-carried copy, and the merged
+    // leader interval is what the scan sees. Propagate the restriction to the
+    // group leader so the whole group is excluded from the caller-saved pool.
+    let mut param_restricted: FxHashSet<u32> = param_ref_values.clone();
+    for (leader, members) in &coalesce_groups {
+        if members.iter().any(|m| param_ref_values.contains(m)) {
+            param_restricted.insert(*leader);
+        }
+    }
+
+    // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
+    // a callee-saved home only when a call point falls INSIDE one of its live
+    // segments (and after its def). A call strictly between two segments of a
+    // diamond (in the gap) is on the dead arm and can never reach a use, so a
+    // caller-saved home is sound there. A call AT a segment boundary is NOT in
+    // a gap: a loop re-entry segment (the `.Lstr0` format string used every
+    // iteration) starts exactly at the call that re-clobbers its register, so
+    // `seg.start <= cp < seg.end` must be inclusive on the left. `cp > def`
+    // keeps a value born at its own call (retval) non-spanning. Coalesced
+    // members attribute their segments to the group leader so a call spanned
+    // by the merged interval (but not by any member alone) still forces a
+    // callee-saved home — the merged leader interval is what the scan sees.
+    // `segments` covers non-alloca SSA values only; the synthetic alloca
+    // vector intervals keep the fat `spans_any_call` check.
+    let call_spanning: FxHashSet<u32> = {
+        let mut acc: FxHashMap<u32, Vec<(u32, u32, u32)>> = FxHashMap::default();
+        for seg in &liveness.segments {
+            let def = iv_map.get(&seg.value_id).map(|&(s, _)| s).unwrap_or(seg.start);
+            let owner = coalesce_member_of
+                .get(&seg.value_id)
+                .copied()
+                .unwrap_or(seg.value_id);
+            acc.entry(owner).or_default().push((seg.start, seg.end, def));
+        }
+        let mut set = FxHashSet::default();
+        for (owner, entries) in &acc {
+            for &(s, e, def) in entries {
+                let mut idx = call_points.partition_point(|&cp| cp < s);
+                while idx < call_points.len() && call_points[idx] < e {
+                    if call_points[idx] > def {
+                        set.insert(*owner);
+                        break;
+                    }
+                    idx += 1;
+                }
+                if set.contains(owner) {
+                    break;
+                }
+            }
+        }
+        set
+    };
+
     let scan_ivs = collect_gpr_scan_intervals(
         &liveness,
         &eligible,
@@ -457,20 +574,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let phase1_intervals: Vec<LiveInterval> = scan_ivs
         .iter()
         .copied()
-        .filter(|iv| spans_any_call(iv, call_points))
+        .filter(|iv| call_spanning.contains(&iv.value_id))
         .collect();
     let mut phase1_ranges =
         live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
-    if !coalesce_groups.is_empty() {
-        for r in phase1_ranges.iter_mut() {
-            if let Some(members) = coalesce_groups.get(&r.value_id) {
-                r.priority = r
-                    .priority
-                    .saturating_mul((members.len().max(1) as u64).min(8));
-                r.calculate_spill_weight();
-            }
-        }
-    }
+    bump_coalesce_group_priority(&mut phase1_ranges, &coalesce_groups, &use_count);
+    bump_gep_base_priority(&mut phase1_ranges, &liveness);
     let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
     allocator.run();
     let mut assignments = allocator.assignments;
@@ -492,8 +601,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
         let base_ok = |assignments: &FxHashMap<u32, PhysReg>, iv: &LiveInterval| {
             !assignments.contains_key(&iv.value_id)
-                && !spans_any_call(iv, call_points)
-                && (x86_ordered_param_copies || !param_ref_values.contains(&iv.value_id))
+                && !call_spanning.contains(&iv.value_id)
+                && (x86_ordered_param_copies || !param_restricted.contains(&iv.value_id))
         };
 
         if let Some((ecx_hazards, edx_hazards)) = hazards {
@@ -669,7 +778,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .copied()
             .filter(|iv| {
                 !assignments.contains_key(&iv.value_id)
-                    && !spans_any_call(iv, call_points)
+                    && !call_spanning.contains(&iv.value_id)
             })
             .collect();
         if !phase2c_intervals.is_empty() {
@@ -680,11 +789,19 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .copied()
                 .collect();
             if !free_callee.is_empty() {
-                let phase2c_ranges = live_range::build_live_ranges(
+                let mut phase2c_ranges = live_range::build_live_ranges(
                     &phase2c_intervals,
                     &liveness.block_loop_depth,
                     func,
                 );
+                // A coalesced leader carries only its own uses in the range
+                // metadata, so a param merged with a loop-carried copy would
+                // look like a single-use value and lose the callee-saved
+                // register to the hot loop temps (adler32/memcmp spilled the
+                // parameters). Re-weight by the group's total loop-weighted
+                // uses before the spill allocator ranks them.
+                bump_coalesce_group_priority(&mut phase2c_ranges, &coalesce_groups, &use_count);
+                bump_gep_base_priority(&mut phase2c_ranges, &liveness);
                 let mut spill_allocator = LinearScanAllocator::new(phase2c_ranges, free_callee);
                 spill_allocator.run();
                 for (vid, reg) in spill_allocator.assignments {
@@ -860,7 +977,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| non_gpr_values.contains(&iv.value_id))
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
-            .filter(|iv| !spans_any_call(iv, call_points))
+            .filter(|iv| !call_spanning.contains(&iv.value_id))
             .filter(|iv| !(arm_fp_pool || x86_fp_pool) || real_use.contains(&iv.value_id))
             .filter(|iv| {
                 vector_values.contains(&iv.value_id) || f64_value_set.contains(&iv.value_id)
@@ -972,7 +1089,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .iter()
                 .copied()
                 .filter(|iv| {
-                    !assignments.contains_key(&iv.value_id) && spans_any_call(iv, call_points)
+                    !assignments.contains_key(&iv.value_id) && call_spanning.contains(&iv.value_id)
                 })
                 .collect();
             phase2b_intervals.sort_by(|a, b| {

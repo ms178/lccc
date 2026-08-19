@@ -51,6 +51,73 @@ fn env_flag_set(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
 
+/// Whether generic lowering may overwrite a vector/SSE scratch register.
+///
+/// Intrinsics are deliberately excluded: their consumers maintain a tightly
+/// scoped forwarding chain of their own. Calls and other opaque operations
+/// are conservatively classified as clobbers. Kept shared with deferred-store
+/// analysis so eligibility and emission cannot drift.
+pub(crate) fn instruction_may_clobber_vector_scratch(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Intrinsic { .. } => false,
+
+        Instruction::Load { ty, .. }
+        | Instruction::BinOp { ty, .. }
+        | Instruction::UnaryOp { ty, .. }
+        | Instruction::Cmp { ty, .. }
+        | Instruction::ParamRef { ty, .. } => {
+            ty.is_float() || ty.is_128bit() || ty.is_long_double()
+        }
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            from_ty.is_float()
+                || from_ty.is_128bit()
+                || from_ty.is_long_double()
+                || to_ty.is_float()
+                || to_ty.is_128bit()
+                || to_ty.is_long_double()
+        }
+
+        // Copy lacks type information, and Select can absorb a floating-point
+        // comparison during fused lowering. Treat both conservatively.
+        Instruction::Copy { .. }
+        | Instruction::Select { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::Store { .. }
+        | Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::Memcpy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicLoad { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::Fence { .. }
+        | Instruction::GetReturnF64Second { .. }
+        | Instruction::SetReturnF64Second { .. }
+        | Instruction::GetReturnF32Second { .. }
+        | Instruction::SetReturnF32Second { .. }
+        | Instruction::GetReturnF128Second { .. }
+        | Instruction::SetReturnF128Second { .. } => true,
+
+        // These lower entirely through integer/address machinery or emit no
+        // machine operation at their IR position.
+        Instruction::Alloca { .. }
+        | Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::PgoCounterInc { .. }
+        | Instruction::Phi { .. }
+        | Instruction::LabelAddr { .. }
+        | Instruction::StackSave { .. }
+        | Instruction::StackRestore { .. } => false,
+    }
+}
+
 /// Strip every trailing `+digits` / `-digits` suffix (`foo+4+8` → `foo`).
 fn asm_symbol_basename(sym: &str) -> &str {
     let mut s = sym;
@@ -2244,6 +2311,15 @@ fn generate_function(
                         &mut last_debug_line,
                     );
                 }
+            }
+
+            // A deferred vector result lives only in a SIMD scratch register
+            // until its consuming intrinsic. Materialise it before an unrelated
+            // instruction that can reuse those scratch registers, and drop only
+            // scratch aliases (allocator-managed xmm/ymm homes stay live).
+            if instruction_may_clobber_vector_scratch(inst) {
+                cg.flush_pending_vec_store();
+                cg.state().invalidate_vec_scratch_peephole();
             }
 
             if let Instruction::BinOp {
