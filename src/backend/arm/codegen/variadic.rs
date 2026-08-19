@@ -195,7 +195,7 @@ impl ArmCodegen {
     ///
     /// __gr_offs starts negative and advances toward 0. When it would become >= 0
     /// for the struct, we use the stack path instead.
-    pub(super) fn emit_va_arg_struct_impl(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize) {
+    pub(super) fn emit_va_arg_struct_impl(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, _align: usize) {
         let num_slots = size.div_ceil(8);
         let total_reg_bytes = num_slots * 8;
 

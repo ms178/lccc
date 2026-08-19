@@ -1586,12 +1586,12 @@ impl ArchCodegen for I686Codegen {
         if indirect {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
         }
-        let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes_vec, arg_types);
+        let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes_vec, arg_types, struct_arg_aligns);
         let f128_temp_space = self.emit_call_f128_pre_convert(args, &arg_classes_vec, arg_types, stack_arg_space);
         self.state().reg_cache.invalidate_acc();
         let total_sp_adjust = self.emit_call_stack_args(args, &arg_classes_vec, arg_types, stack_arg_space,
                                                         if indirect { self.emit_call_fptr_spill_size() } else { 0 },
-                                                        f128_temp_space);
+                                                        f128_temp_space, struct_arg_aligns);
         self.state().reg_cache.invalidate_acc();
         self.emit_call_reg_args(args, &arg_classes_vec, arg_types, total_sp_adjust, f128_temp_space, stack_arg_space, &[]);
         self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
@@ -1998,8 +1998,8 @@ impl ArchCodegen for I686Codegen {
         // calls
         fn call_abi_config(&self) -> call_abi::CallAbiConfig => call_abi_config_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
-        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType]) -> usize => emit_call_compute_stack_space_impl;
-        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize) -> i64 => emit_call_stack_args_impl;
+        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize => emit_call_compute_stack_space_impl;
+        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>]) -> i64 => emit_call_stack_args_impl;
         fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
@@ -2021,7 +2021,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) => emit_va_arg_impl;
         fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
         fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
-        fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize) => emit_va_arg_struct_impl;
+        fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
         // returns
         fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) => emit_return_impl;
         fn emit_return_i128_to_regs(&mut self) => emit_return_i128_to_regs_impl;

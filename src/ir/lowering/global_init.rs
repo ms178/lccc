@@ -111,6 +111,15 @@ impl Lowerer {
 
         // Scalar constant
         if let Some(val) = self.eval_const_expr(expr) {
+            // _Float128 (binary128): the initializer must become the IEEE
+            // binary128 BIT PATTERN (via the exact long_double-module
+            // conversions), never an integer/float bit-cast of the U128
+            // carrier (`_Float128 g = 100.0` used to emit the I128 {100,0}).
+            if self.type_spec_to_ctype(type_spec) == CType::Float128 {
+                if let Some(bits) = Self::const_to_f128_bits(&val) {
+                    return GlobalInit::Scalar(IrConst::I128(bits as i128));
+                }
+            }
             return GlobalInit::Scalar(
                 self.coerce_scalar_const(val, expr, base_ty, is_long_double_target, is_bool_target)
             );
@@ -244,6 +253,30 @@ impl Lowerer {
 
     /// Coerce a scalar constant to the target type, handling bool normalization
     /// and long double promotion.
+    /// Convert a const-evaluated scalar to the IEEE binary128 (u128) bit
+    /// pattern of `_Float128`. Uses the exact widening conversions from the
+    /// long_double module (f64 → binary128 is lossless; i64/u64/i128 are exact).
+    /// An `I128` source is taken as an existing binary128 payload (e.g. a
+    /// `1.5F128` literal or a `_Float128`-typed constant).
+    fn const_to_f128_bits(val: &IrConst) -> Option<u128> {
+        use crate::common::long_double::{
+            f64_to_f128_bytes_lossless, i128_to_f128_bytes, i64_to_f128_bytes,
+            u128_to_f128_bytes, u64_to_f128_bytes,
+        };
+        let le = |b: [u8; 16]| u128::from_le_bytes(b);
+        Some(match val {
+            IrConst::F64(v) => le(f64_to_f128_bytes_lossless(*v)),
+            IrConst::F32(v) => le(f64_to_f128_bytes_lossless(*v as f64)),
+            IrConst::LongDouble(v, _) => le(f64_to_f128_bytes_lossless(*v)),
+            IrConst::I64(v) => le(i64_to_f128_bytes(*v)),
+            IrConst::I32(v) => le(i64_to_f128_bytes(*v as i64)),
+            IrConst::I16(v) => le(i64_to_f128_bytes(*v as i64)),
+            IrConst::I8(v) => le(i64_to_f128_bytes(*v as i64)),
+            IrConst::I128(v) => *v as u128, // already a binary128 payload
+            IrConst::Zero => le(i64_to_f128_bytes(0)),
+        })
+    }
+
     fn coerce_scalar_const(
         &self,
         val: IrConst,

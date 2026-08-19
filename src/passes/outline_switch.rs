@@ -1070,11 +1070,13 @@ fn remap_instruction(
             dest_ptr,
             va_list_ptr,
             size,
+            align,
             eightbyte_classes,
         } => Instruction::VaArgStruct {
             dest_ptr: remap_val(*dest_ptr),
             va_list_ptr: remap_val(*va_list_ptr),
             size: *size,
+            align: *align,
             eightbyte_classes: eightbyte_classes.clone(),
         },
         Instruction::VaStart { va_list_ptr } => Instruction::VaStart {
@@ -1243,11 +1245,12 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
         struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
-        struct_arg_is_f128_sse: Vec::new(),
+        // Preserve the _Float128 ABI markers (see inline.rs remap_call_info).
+        struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
-        ret_is_f128_sse: false,
+        ret_is_f128_sse: info.ret_is_f128_sse,
     }
 }
 

@@ -2915,9 +2915,10 @@ pub(super) fn generate_instruction(
             dest_ptr,
             va_list_ptr,
             size,
+            align,
             ref eightbyte_classes,
         } => {
-            cg.emit_va_arg_struct_ex(dest_ptr, va_list_ptr, *size, eightbyte_classes);
+            cg.emit_va_arg_struct_ex(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
             clobber_after_call_like(cg);
         }
         Instruction::AtomicRmw {

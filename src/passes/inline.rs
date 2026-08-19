@@ -2836,11 +2836,16 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         struct_arg_aligns: info.struct_arg_aligns.clone(),
         struct_arg_classes: info.struct_arg_classes.clone(),
         struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
-        struct_arg_is_f128_sse: Vec::new(),
+        // MUST be cloned, not cleared: an inlined _Float128 soft-float call
+        // (e.g. __extenddftf2) keeps its single-XMM return convention and its
+        // 16-byte XMM argument markers. Clearing them re-classified the
+        // inlined call as an [Sse,Sse] i128-style return (xmm0:xmm1 pair),
+        // silently corrupting the binary128 payload.
+        struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
-        ret_is_f128_sse: false,
+        ret_is_f128_sse: info.ret_is_f128_sse,
     }
 }
 
@@ -2992,11 +2997,13 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             dest_ptr,
             va_list_ptr,
             size,
+            align,
             ref eightbyte_classes,
         } => Instruction::VaArgStruct {
             dest_ptr: remap_value(*dest_ptr, vo),
             va_list_ptr: remap_value(*va_list_ptr, vo),
             size: *size,
+            align: *align,
             eightbyte_classes: eightbyte_classes.clone(),
         },
         Instruction::AtomicRmw {

@@ -93,6 +93,8 @@ pub(super) struct FunctionBuildState {
     pub return_type: IrType,
     /// Whether the current function returns _Bool
     pub return_is_bool: bool,
+    /// C type of the current function's return value (for _Float128 routing).
+    pub return_ctype: Option<CType>,
     /// sret pointer alloca for current function (struct returns > 16 bytes)
     pub sret_ptr: Option<Value>,
     /// Variable -> alloca mapping with metadata
@@ -173,6 +175,7 @@ impl FunctionBuildState {
             name,
             return_type,
             return_is_bool,
+            return_ctype: None,
             sret_ptr: None,
             locals: FxHashMap::default(),
             break_labels: Vec::new(),

@@ -23,12 +23,12 @@ impl X86Codegen {
         }
     }
 
-    pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[CallArgClass], _arg_types: &[IrType]) -> usize {
-        compute_stack_push_bytes(arg_classes)
+    pub(super) fn emit_call_compute_stack_space_impl(&self, arg_classes: &[CallArgClass], _arg_types: &[IrType], struct_arg_aligns: &[Option<usize>]) -> usize {
+        compute_stack_push_bytes(arg_classes, struct_arg_aligns)
     }
 
     pub(super) fn emit_call_stack_args_impl(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
-                            _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize) -> i64 {
+                            _arg_types: &[IrType], stack_arg_space: usize, _fptr_spill: usize, _f128_temp_space: usize, struct_arg_aligns: &[Option<usize>]) -> i64 {
         let need_align_pad = stack_arg_space % 16 != 0;
         let mut sp_adjust: i64 = 0;
         if need_align_pad {
@@ -40,7 +40,7 @@ impl X86Codegen {
                 self.state.out.rsp_frame_size += 8;
             }
         }
-        let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(arg_classes);
+        let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(arg_classes, struct_arg_aligns);
         let stack_indices: Vec<usize> = (0..args.len())
             .filter(|&i| arg_classes[i].is_stack())
             .collect();

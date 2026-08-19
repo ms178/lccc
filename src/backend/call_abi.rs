@@ -219,6 +219,26 @@ impl ParamClass {
             _ => 0, // FP regs and stack don't consume GP regs
         }
     }
+
+    /// Returns the number of SSE/FP argument registers consumed by this
+    /// parameter classification. Used by variadic `va_start` to compute the
+    /// correct `fp_offset` (the register save area starts AFTER the named
+    /// parameters' SSE registers).
+    ///
+    /// Unlike the older `FloatReg`-only counting, this includes every class
+    /// that occupies an XMM argument register: `_Float128` (F128SseReg), a
+    /// struct whose eightbytes are SSE (StructSseReg, 1-2 registers), and a
+    /// mixed struct's SSE eightbyte (StructMixed*).
+    pub fn fp_reg_count(&self) -> usize {
+        match self {
+            ParamClass::FloatReg { .. } => 1,
+            ParamClass::F128SseReg { .. } => 1,
+            ParamClass::F128FpReg { .. } => 1,
+            ParamClass::StructSseReg { hi_fp_idx, .. } => 1 + usize::from(hi_fp_idx.is_some()),
+            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
+            _ => 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -967,16 +987,36 @@ pub fn compute_stack_arg_space(arg_classes: &[CallArgClass]) -> usize {
 
 /// Compute per-stack-arg alignment padding needed in the forward layout.
 /// Returns a Vec with one entry per `arg_classes` element. Non-stack args get 0.
-/// F128Stack and I128Stack args get padding to align to 16 bytes in the overflow area.
-pub fn compute_stack_arg_padding(arg_classes: &[CallArgClass]) -> Vec<usize> {
+/// F128Stack and I128Stack args get padding to align to 16 bytes in the overflow
+/// area; struct args whose alignment exceeds 8 (`struct_arg_aligns`) get padding
+/// to their alignment (capped at 16 — the pushq scheme's base is only guaranteed
+/// 16-aligned; `>16`-aligned args additionally need dynamic `%rsp` alignment).
+pub fn compute_stack_arg_padding(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+) -> Vec<usize> {
     let mut padding = vec![0usize; arg_classes.len()];
     let mut offset: usize = 0;
     for (i, cls) in arg_classes.iter().enumerate() {
-        if !cls.is_stack() { continue; }
-        if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
-            let align_pad = (16 - (offset % 16)) % 16;
-            padding[i] = align_pad;
-            offset += align_pad;
+        if !cls.is_stack() {
+            continue;
+        }
+        let align = match cls {
+            CallArgClass::F128Stack | CallArgClass::I128Stack => Some(16),
+            CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::StructSplitRegStack { .. } => {
+                struct_arg_aligns.get(i).copied().flatten()
+            }
+            _ => None,
+        };
+        if let Some(a) = align {
+            if a > 8 {
+                let a = a.min(16);
+                let align_pad = (a - (offset % a)) % a;
+                padding[i] = align_pad;
+                offset += align_pad;
+            }
         }
         offset += cls.stack_bytes();
     }
@@ -986,12 +1026,17 @@ pub fn compute_stack_arg_padding(arg_classes: &[CallArgClass]) -> Vec<usize> {
 /// Compute the raw bytes that will be pushed onto the stack for stack arguments.
 /// Unlike `compute_stack_arg_space`, this does NOT apply final 16-byte alignment,
 /// because x86 uses individual `pushq` instructions and handles alignment separately.
-/// This includes alignment padding for F128/I128 args.
-pub fn compute_stack_push_bytes(arg_classes: &[CallArgClass]) -> usize {
-    let padding = compute_stack_arg_padding(arg_classes);
+/// This includes alignment padding for F128/I128 and over-aligned struct args.
+pub fn compute_stack_push_bytes(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+) -> usize {
+    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns);
     let mut total: usize = 0;
     for (i, cls) in arg_classes.iter().enumerate() {
-        if !cls.is_stack() { continue; }
+        if !cls.is_stack() {
+            continue;
+        }
         total += padding[i] + cls.stack_bytes();
     }
     total

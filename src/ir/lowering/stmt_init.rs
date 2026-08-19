@@ -563,7 +563,15 @@ impl Lowerer {
         } else {
             let val = self.lower_expr(expr);
             let expr_ty = self.value_ir_type(expr);
-            self.emit_implicit_cast(val, expr_ty, da.var_ty)
+            match &da.c_type {
+                // _Float128 (and its U128 carrier) must route through the
+                // soft-float helpers; a plain F64/F32->U128 bit-cast would
+                // store an integer bit pattern instead of binary128 bytes.
+                Some(target_ct) if *target_ct == CType::Float128 || rhs_ctype == CType::Float128 => {
+                    self.convert_scalar_ctype(val, expr_ty, &rhs_ctype, target_ct)
+                }
+                _ => self.emit_implicit_cast(val, expr_ty, da.var_ty),
+            }
         };
         self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
     }

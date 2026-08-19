@@ -693,7 +693,8 @@ pub trait ArchCodegen {
         }
 
         // Compute stack space needed for overflow args.
-        let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes, arg_types);
+        let stack_arg_space =
+            self.emit_call_compute_stack_space(&arg_classes, arg_types, struct_arg_aligns);
 
         // Phase 1: Pre-convert F128 values that need helper calls (before stack args clobber regs).
         let f128_temp_space =
@@ -715,6 +716,7 @@ pub trait ArchCodegen {
                 0
             },
             f128_temp_space,
+            struct_arg_aligns,
         );
 
         self.state().reg_cache.invalidate_acc();
@@ -775,10 +777,12 @@ pub trait ArchCodegen {
     /// Compute how much stack space to allocate for overflow arguments.
     /// x86 returns raw push bytes; ARM/RISC-V return pre-allocated SP space.
     /// `arg_types` is provided so that i686 can account for F64 taking 8 bytes on the stack.
+    /// `struct_arg_aligns` lets the x86 backend 16-align over-aligned stack struct args.
     fn emit_call_compute_stack_space(
         &self,
         arg_classes: &[super::call_abi::CallArgClass],
         arg_types: &[IrType],
+        struct_arg_aligns: &[Option<usize>],
     ) -> usize;
 
     /// Spill an indirect function pointer to a safe location before stack manipulation.
@@ -813,6 +817,7 @@ pub trait ArchCodegen {
         stack_arg_space: usize,
         fptr_spill: usize,
         f128_temp_space: usize,
+        struct_arg_aligns: &[Option<usize>],
     ) -> i64;
 
     /// Load arguments into registers (GP, FP, i128, struct-by-val, F128).
@@ -1130,7 +1135,11 @@ pub trait ArchCodegen {
 
     /// Emit va_arg for struct types: read `size` bytes of struct data from the
     /// va_list and store them at `dest_ptr`. The va_list is advanced appropriately.
-    fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize);
+    ///
+    /// `align` is the struct's alignment in bytes. Backends that fetch the
+    /// struct from the overflow area must align it to `align` when `align > 8`
+    /// (System V AMD64 psABI §3.5.7).
+    fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize);
 
     /// Emit va_arg for struct types with eightbyte classification info.
     ///
@@ -1146,9 +1155,10 @@ pub trait ArchCodegen {
         dest_ptr: &Value,
         va_list_ptr: &Value,
         size: usize,
+        align: usize,
         _eightbyte_classes: &[crate::common::types::EightbyteClass],
     ) {
-        self.emit_va_arg_struct(dest_ptr, va_list_ptr, size);
+        self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
     }
 
     /// Emit an atomic read-modify-write operation.

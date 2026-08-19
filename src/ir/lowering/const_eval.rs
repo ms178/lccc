@@ -270,6 +270,22 @@ impl Lowerer {
     /// Evaluate a cast expression at compile time.
     fn eval_const_cast(&self, target_type: &TypeSpecifier, inner: &Expr) -> Option<IrConst> {
         let target_ir_ty = self.type_spec_to_ir(target_type);
+
+        // _Float128 (IEEE binary128, carried as IrType::U128) cannot be produced
+        // by the integer/float bit-cast machinery: the 16 bytes ARE the binary128
+        // payload, and double→_Float128 must go through __extenddftf2 (and
+        // _Float128→double through __trunctfdf2). Folding either direction here
+        // as an integer or f64 cast produced garbage (`_Float128 a = 100.0`
+        // stored the I128 bit pattern {100,0} instead of calling __extenddftf2,
+        // and `(double)1.5F128` folded the binary128 bits as an integer).
+        // Decline both directions so the runtime soft-float call path handles
+        // them exactly like GCC.
+        let target_ct = self.type_spec_to_ctype(target_type);
+        let src_ct = self.get_expr_ctype(inner);
+        if target_ct == CType::Float128 || src_ct == Some(CType::Float128) {
+            return None;
+        }
+
         let src_val = self.eval_const_expr(inner)?;
 
         // Handle float source types: use value-based conversion, not bit manipulation

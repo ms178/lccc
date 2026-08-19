@@ -240,10 +240,15 @@ pub enum Instruction {
     ///
     /// This ensures the ABI rule that multi-eightbyte structs must be entirely
     /// in registers or entirely on the stack is respected.
+    ///
+    /// `align` is the struct's alignment in bytes. When the struct is fetched
+    /// from the overflow area and `align > 8`, the overflow pointer must be
+    /// aligned up to a multiple of 16 first (psABI §3.5.7).
     VaArgStruct {
         dest_ptr: Value,
         va_list_ptr: Value,
         size: usize,
+        align: usize,
         eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     },
 

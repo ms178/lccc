@@ -62,9 +62,18 @@ impl Lowerer {
         let val = self.lower_expr(e);
         let ret_ty = self.func_mut().return_type;
         let expr_ty = self.value_ir_type(e);
+        let expr_ct = self.expr_ctype(e);
         if self.func_mut().return_is_bool {
             // For _Bool return, normalize at the source type before any truncation.
             self.emit_bool_normalize_typed(val, expr_ty)
+        } else if let Some(ret_ct) = self.func_mut().return_ctype.clone() {
+            if ret_ct == CType::Float128 || expr_ct == CType::Float128 {
+                // _Float128 return conversions route through the soft-float
+                // helpers (__extenddftf2/__trunctfdf2), not the bit-cast IR path.
+                self.convert_scalar_ctype(val, expr_ty, &expr_ct, &ret_ct)
+            } else {
+                self.emit_implicit_cast(val, expr_ty, ret_ty)
+            }
         } else {
             self.emit_implicit_cast(val, expr_ty, ret_ty)
         }
