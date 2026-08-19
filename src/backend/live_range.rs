@@ -632,6 +632,16 @@ impl LinearScanAllocator {
     /// unsorted worklist. Tie-break `value_id` keeps the assignment
     /// deterministic across equal start+priority.
     pub fn run(&mut self) {
+        self.run_with_seed(&FxHashMap::default());
+    }
+
+    /// Like [`Self::run`], but the given `(register, free-until)` pairs are
+    /// applied on top of the cleared occupancy BEFORE the allocation loop.
+    /// Lets a second allocation wave see the homes already handed out by an
+    /// earlier wave (e.g. Phase 2's arg-register-free pass for call-argument
+    /// values) so it cannot reuse a register that is still occupied by one of
+    /// those values.
+    pub fn run_with_seed(&mut self, seed: &FxHashMap<PhysReg, u32>) {
         self.active.clear();
         self.handled.clear();
         self.assignments.clear();
@@ -639,6 +649,10 @@ impl LinearScanAllocator {
         self.next_spill_slot = 0;
         self.next_reg_idx = 0;
         self.init_registers();
+        for (reg, until) in seed {
+            let cur = self.reg_free_until.entry(*reg).or_insert(0);
+            *cur = (*cur).max(*until);
+        }
 
         let mut ranges = std::mem::take(&mut self.ranges);
         ranges.sort_by(|a, b| {

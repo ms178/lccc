@@ -73,10 +73,21 @@ impl ArmCodegen {
             }
         }
 
-        let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        // AArch64 x4..x7 are argument registers 4..7 and x8 is the indirect-
+        // result register; all are in the caller-saved pool. A value consumed
+        // as a call argument must not be homed there (the staging writes them
+        // in order before reading the value).
+        let call_arg_regs = vec![
+            crate::backend::regalloc::PhysReg(4),
+            crate::backend::regalloc::PhysReg(5),
+            crate::backend::regalloc::PhysReg(6),
+            crate::backend::regalloc::PhysReg(7),
+            crate::backend::regalloc::PhysReg(8),
+        ];
+        let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false,
+            false, None, call_arg_regs, Vec::new(),
         );
 
         // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by
