@@ -31,11 +31,13 @@ pub fn run_regalloc_and_merge_clobbers(
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
     run_regalloc_and_merge_clobbers_ex(
         func, available_regs, caller_saved_regs, asm_clobbered_regs,
-        reg_assignments, used_callee_saved, allow_inline_asm_regalloc, None)
+        reg_assignments, used_callee_saved, allow_inline_asm_regalloc, None, Vec::new(), Vec::new())
 }
 
 /// Extended variant taking the set of values codegen will never materialize
-/// (folded global addresses); see RegAllocConfig::never_materialized.
+/// (folded global addresses) and the ABI argument registers present in the
+/// caller-saved pool; see RegAllocConfig::never_materialized /
+/// RegAllocConfig::call_arg_regs / RegAllocConfig::indirect_target_regs.
 #[allow(clippy::too_many_arguments)]
 pub fn run_regalloc_and_merge_clobbers_ex(
     func: &IrFunction,
@@ -46,6 +48,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     used_callee_saved: &mut Vec<PhysReg>,
     allow_inline_asm_regalloc: bool,
     never_materialized: Option<crate::common::fx_hash::FxHashSet<u32>>,
+    call_arg_regs: Vec<PhysReg>,
+    indirect_target_regs: Vec<PhysReg>,
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
@@ -182,7 +186,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         Vec::new()
     };
     let config = super::super::regalloc::RegAllocConfig {
-        available_regs, caller_saved_regs, allow_inline_asm_regalloc, xmm_regs,
+        available_regs, caller_saved_regs, call_arg_regs, indirect_target_regs,
+        allow_inline_asm_regalloc, xmm_regs,
         never_materialized: never_materialized.unwrap_or_default(),
     };
     // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).

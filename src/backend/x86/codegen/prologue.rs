@@ -58,6 +58,7 @@ impl X86Codegen {
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
         let mut has_indirect_call = false;
+        let mut has_calls = false;
         let mut has_i128_ops = false;
         let mut has_atomic_rmw = false;
         // Track rdx-clobbering patterns for conditional rdx allocation
@@ -70,7 +71,11 @@ impl X86Codegen {
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::CallIndirect { .. } => { has_indirect_call = true; }
+                    Instruction::Call { .. } => { has_calls = true; }
+                    Instruction::CallIndirect { .. } => {
+                        has_calls = true;
+                        has_indirect_call = true;
+                    }
                     Instruction::BinOp { op, ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
@@ -134,6 +139,7 @@ impl X86Codegen {
                 has_switch = true;
             }
         }
+        self.func_has_calls = has_calls;
         // r10: use call *%rax instead of call *%r10 (frees r10 for non-call-spanning).
         // Exception: indirect branch thunks still use r10 (rare).
         if has_i128_ops {
@@ -598,11 +604,29 @@ impl X86Codegen {
             set
         };
 
+        // SysV AMD64 argument registers present in the caller-saved pool
+        // (r8, r9, rdi, rsi and — when enabled — rdx). A value consumed as a
+        // call argument must not be homed in one of these: the staging writes
+        // them in order before reading the value (`printf("%d %d", add(3,4),
+        // mul(3,4))` read the mul result out of the format-string register).
+        let call_arg_regs = vec![
+            crate::backend::regalloc::PhysReg(12), // r8
+            crate::backend::regalloc::PhysReg(13), // r9
+            crate::backend::regalloc::PhysReg(14), // rdi
+            crate::backend::regalloc::PhysReg(15), // rsi
+            crate::backend::regalloc::PhysReg(16), // rdx
+        ];
+        // The indirect-call staging keeps the callee address in %r10 from
+        // emit_call_spill_fptr until the `call *%r10`. NOTE the historical
+        // x86-64 regalloc numbering swap in phys_reg_name(): PhysReg(10) is
+        // named "r11" and PhysReg(11) is named "r10". The indirect target is
+        // the literal "%r10", i.e. PhysReg(11).
+        let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
         let (reg_assigned, cached_liveness, caller_save_spans) =
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false, Some(never_materialized),
+            false, Some(never_materialized), call_arg_regs, indirect_target_regs,
         );
 
         // MachInst is profitable on straight-line and modest-CFG code, but its
@@ -837,17 +861,28 @@ impl X86Codegen {
     }
 
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
-        if raw_space <= 0 { return 0; }
-        let aligned = (raw_space + 15) & !15;
         if self.state.omit_frame_pointer {
             // With frame pointer omission, there's no `push %rbp` to absorb the
             // 8-byte return address misalignment. The frame size must be ≡ 8 (mod 16)
             // so that RSP is 16-byte aligned at subsequent CALL instructions.
             // At function entry: RSP ≡ 8 (mod 16) due to the caller's CALL.
             // subq $(8 mod 16), %rsp → RSP ≡ 8 - 8 = 0 (mod 16) ✓
+            if raw_space <= 0 {
+                // Frame-less function: without any pushes the %rsp stays ≡ 8
+                // (mod 16). A call from such a function would push a misaligned
+                // %rsp (movaps in the callee faults — float_special/main segv).
+                // Emit an 8-byte pad iff the function actually calls out.
+                return if self.func_has_calls { 8 } else { 0 };
+            }
+            let aligned = (raw_space + 15) & !15;
             if aligned % 16 == 0 { aligned + 8 } else { aligned }
         } else {
-            aligned
+            if raw_space <= 0 {
+                // Frame-pointer path: `push %rbp` already realigns entry
+                // %rsp ≡ 8 → ≡ 0 (mod 16); no pad needed.
+                return 0;
+            }
+            (raw_space + 15) & !15
         }
     }
 

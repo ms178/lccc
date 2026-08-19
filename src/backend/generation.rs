@@ -929,6 +929,7 @@ fn build_foldable_global_addr_set(
                     Instruction::Cast {
                         dest,
                         src: Operand::Value(_),
+                        ..
                     } if live.contains(&dest.0) => {}
                     _ => {
                         for v in inst.used_values() {
@@ -1023,7 +1024,11 @@ fn build_global_addr_ptr_set(func: &IrFunction) -> FxHashSet<u32> {
                         ptr_uses.push(v.0);
                     }
                 }
-                Instruction::AtomicInc { ptr, .. } => ptr_uses.push(ptr.0),
+                Instruction::AtomicInc { ptr, .. } => {
+                    if let Operand::Value(v) = ptr {
+                        ptr_uses.push(v.0);
+                    }
+                }
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                     for arg in &info.args {
                         if let Operand::Value(v) = arg {
@@ -2152,7 +2157,9 @@ fn generate_function(
                     }
                 }
                 Instruction::AtomicInc { ptr, .. } => {
-                    *cg.state().block_use_counts.entry(ptr.0).or_insert(0) += 1;
+                    if let Operand::Value(v) = ptr {
+                        *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
+                    }
                 }
                 _ => {}
             }
@@ -2783,8 +2790,17 @@ pub(super) fn generate_instruction(
             dest_ptr,
             args,
         } => {
+            // Intrinsics are the PRODUCERS of the vector-peephole state, not
+            // clobberers of it: the individual emitters flush the pending
+            // vector store and invalidate the peephole at their START, and a
+            // scalar-in-XMM result producer (FixedDistance*, VecHorizontalAdd*)
+            // records itself in `direct_fp_result` at its END for the return
+            // path to consume. Running clobber_after_call_like() here cleared
+            // direct_fp_result right after it was set, so the F32/F64 result
+            // was re-materialised from its never-written home slot (the
+            // FixedDistance SLP kernels returned 0).
             cg.emit_intrinsic(dest, op, dest_ptr, args);
-            clobber_after_call_like(cg);
+            cg.state().reg_cache.invalidate_all();
         }
         Instruction::StackSave { dest } => {
             cg.emit_stack_save(dest);
@@ -3032,5 +3048,5 @@ pub fn is_wide_int_type(ty: IrType) -> bool {
 pub use super::stack_layout::{
     calculate_stack_space_common, collect_inline_asm_callee_saved,
     collect_inline_asm_callee_saved_with_generic, filter_available_regs, find_param_alloca,
-    run_regalloc_and_merge_clobbers,
+    run_regalloc_and_merge_clobbers, run_regalloc_and_merge_clobbers_ex,
 };

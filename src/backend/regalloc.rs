@@ -30,6 +30,22 @@ pub struct RegAllocResult {
 pub struct RegAllocConfig {
     pub available_regs: Vec<PhysReg>,
     pub caller_saved_regs: Vec<PhysReg>,
+    /// Subset of `caller_saved_regs` that a call's argument staging writes
+    /// (SysV AMD64: rdi/rsi/rdx/r8/r9; AArch64: x4..x7 and the x8 indirect
+    /// result). A value used as a call argument must never be homed here:
+    /// the staging materialises earlier arguments into those exact registers
+    /// before reading this value, so its home would already be clobbered
+    /// (`printf("%d %d", add(3,4), mul(3,4))` read the mul result out of the
+    /// format-string register). Empty on backends with no arg-register caller-
+    /// saved pool (i686, RISC-V).
+    pub call_arg_regs: Vec<PhysReg>,
+    /// Caller-saved registers the INDIRECT-call staging additionally writes
+    /// before reading arguments (SysV AMD64: r10 holds the callee address from
+    /// `emit_call_spill_fptr` until the `call *%r10`). A value used as an
+    /// argument to a `CallIndirect` must avoid these too — otherwise the
+    /// function-pointer spill clobbers its home before it is staged
+    /// (`ops[op](a+i)` passed the callee address as its own argument).
+    pub indirect_target_regs: Vec<PhysReg>,
     pub allow_inline_asm_regalloc: bool,
     pub xmm_regs: Vec<PhysReg>,
     pub never_materialized: FxHashSet<u32>,
@@ -108,7 +124,10 @@ fn evict_group(
     groups: &FxHashMap<u32, Vec<u32>>,
 ) {
     let leader = member_of.get(&vid).copied().unwrap_or(vid);
-    let members: &[u32] = groups.get(&leader).map(|m| m.as_slice()).unwrap_or(&[vid]);
+    // `&[vid]` is a temporary that cannot outlive this statement; bind it so
+    // the borrow checker sees a stable slice for the unwrap_or fallback.
+    let solo = [vid];
+    let members: &[u32] = groups.get(&leader).map(|m| m.as_slice()).unwrap_or(&solo);
     for &m in members {
         if let Some(reg) = assignments.remove(&m) {
             if let Some(h) = holders_by_reg.get_mut(&reg.0) {
@@ -116,23 +135,6 @@ fn evict_group(
             }
         }
     }
-}
-
-/// `lea symbol` / label — remat is cheaper than occupying a callee-saved
-/// across a call (LLVM remat; this is why cold bases steal rbx from IVs).
-fn collect_cheap_remat(func: &IrFunction) -> FxHashSet<u32> {
-    let mut ids = FxHashSet::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            match inst {
-                Instruction::GlobalAddr { dest, .. } | Instruction::LabelAddr { dest, .. } => {
-                    ids.insert(dest.0);
-                }
-                _ => {}
-            }
-        }
-    }
-    ids
 }
 
 /// Union-find over eligible `Copy dest, Value(src)`. Kept iff members'
@@ -269,11 +271,27 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let liveness = compute_live_intervals(func);
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
-    let cheap_remat = collect_cheap_remat(func);
 
+    // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
+    // a callee-saved home only when a call point falls INSIDE one of its live
+    // segments (and after its def). A call strictly between two segments of a
+    // diamond (in the gap) is on the dead arm and can never reach a use, so a
+    // caller-saved home is sound there. A call AT a segment boundary is NOT in
+    // a gap: a loop re-entry segment (like the `.Lstr0` format string used
+    // every iteration) starts exactly at the call that re-clobbers its
+    // register, so `seg.start <= cp < seg.end` must be inclusive on the left.
+    // `cp > def` keeps a value born at its own call (retval) non-spanning.
+    // `segments` covers non-alloca SSA values only; the synthetic alloca
+    // vector intervals keep the fat `spans_any_call` check.
     let arm_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !env_on("CCC_NO_VECREG");
     let x86_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 20);
     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
+    // Values consumed as call arguments: their last read happens in the call's
+    // argument staging, which writes the ABI arg registers in order. A home in
+    // one of those registers (rdi/rsi/rdx/r8/r9 on x86-64) is clobbered by an
+    // earlier argument before this value is read. Exclude arg registers from
+    // the Phase-2 pool for exactly these values (see RegAllocConfig::call_arg_regs).
+    let (later_arg_values, indirect_arg_values) = collect_call_arg_values(func);
 
     let block_loop_weight: Vec<u64> = liveness
         .block_loop_depth
@@ -430,11 +448,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         &coalesce_member_of,
     );
 
-    // Phase 1: callee-saved, live across a call, not rematable addresses.
+    // Phase 1: callee-saved for values live across a call. GlobalAddr /
+    // LabelAddr addresses are NOT excluded: codegen has no rematerialisation
+    // path for them (the GlobalAddr instruction is emitted once and later uses
+    // reload from the value's home), so excluding them from Phase 1 merely
+    // turns a callee-saved home into a stack slot reloaded on every use
+    // (nbody's `bodies` base: +274 bytes). Matches the pre-rework allocator.
     let phase1_intervals: Vec<LiveInterval> = scan_ivs
         .iter()
         .copied()
-        .filter(|iv| spans_any_call(iv, call_points) && !cheap_remat.contains(&iv.value_id))
+        .filter(|iv| spans_any_call(iv, call_points))
         .collect();
     let mut phase1_ranges =
         live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
@@ -467,7 +490,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             None
         };
 
-        let base_ok = |iv: &LiveInterval| {
+        let base_ok = |assignments: &FxHashMap<u32, PhysReg>, iv: &LiveInterval| {
             !assignments.contains_key(&iv.value_id)
                 && !spans_any_call(iv, call_points)
                 && (x86_ordered_param_copies || !param_ref_values.contains(&iv.value_id))
@@ -481,7 +504,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 let intervals: Vec<LiveInterval> = scan_ivs
                     .iter()
                     .copied()
-                    .filter(base_ok)
+                    .filter(|iv| base_ok(&assignments, iv))
                     .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
                     .collect();
                 if intervals.is_empty() {
@@ -497,26 +520,149 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
             }
         } else {
-            let phase2_intervals: Vec<LiveInterval> =
-                scan_ivs.iter().copied().filter(base_ok).collect();
-            if !phase2_intervals.is_empty() {
-                let phase2_ranges = live_range::build_live_ranges(
-                    &phase2_intervals,
-                    &liveness.block_loop_depth,
-                    func,
-                );
-                let mut caller_allocator =
-                    LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
-                caller_allocator.run();
-                for (vid, reg) in caller_allocator.assignments {
-                    assignments.insert(vid, reg);
-                    caller_used_regs_set.insert(reg.0);
+            // Split Phase 2 so values consumed as call arguments never take an
+            // ABI argument-register home (their home would be clobbered by the
+            // staging of an earlier argument). They still get r10/r11-class
+            // caller-saved registers; everything else uses the full pool.
+            if config.call_arg_regs.is_empty() {
+                let phase2_intervals: Vec<LiveInterval> =
+                    scan_ivs.iter().copied().filter(|iv| base_ok(&assignments, iv)).collect();
+                if !phase2_intervals.is_empty() {
+                    let phase2_ranges = live_range::build_live_ranges(
+                        &phase2_intervals,
+                        &liveness.block_loop_depth,
+                        func,
+                    );
+                    let mut caller_allocator =
+                        LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
+                    caller_allocator.run();
+                    for (vid, reg) in caller_allocator.assignments {
+                        assignments.insert(vid, reg);
+                        caller_used_regs_set.insert(reg.0);
+                    }
+                }
+            } else {
+                let arg_reg_set: FxHashSet<u8> =
+                    config.call_arg_regs.iter().map(|r| r.0).collect();
+                let indirect_set: FxHashSet<u8> =
+                    config.indirect_target_regs.iter().map(|r| r.0).collect();
+                let no_arg_pool: Vec<PhysReg> = config
+                    .caller_saved_regs
+                    .iter()
+                    .copied()
+                    .filter(|r| !arg_reg_set.contains(&r.0))
+                    .collect();
+                let no_arg_no_indirect_pool: Vec<PhysReg> = no_arg_pool
+                    .iter()
+                    .copied()
+                    .filter(|r| !indirect_set.contains(&r.0))
+                    .collect();
+                let no_indirect_pool: Vec<PhysReg> = config
+                    .caller_saved_regs
+                    .iter()
+                    .copied()
+                    .filter(|r| !indirect_set.contains(&r.0))
+                    .collect();
+
+                // The waves must not reuse each other's registers while a value
+                // still lives there: each wave's homes are seeded into the next
+                // (a naive split once gave the format string and a div-by-const
+                // sign temp the same %r11). Most-constrained wave first so its
+                // values are not starved by the later, freer waves.
+                let mut seeded: FxHashMap<PhysReg, u32> = FxHashMap::default();
+
+                // Wave 1: indirect-call args at index ≥ 1 — avoid the arg
+                // registers AND the indirect-target register (r10).
+                let w1: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| base_ok(&assignments, iv))
+                    .filter(|iv| indirect_arg_values.contains(&iv.value_id))
+                    .filter(|iv| later_arg_values.contains(&iv.value_id))
+                    .collect();
+                if !w1.is_empty() && !no_arg_no_indirect_pool.is_empty() {
+                    let ranges = live_range::build_live_ranges(&w1, &liveness.block_loop_depth, func);
+                    let mut alloc = LinearScanAllocator::new(ranges, no_arg_no_indirect_pool);
+                    alloc.run();
+                    for (vid, reg) in &alloc.assignments {
+                        assignments.insert(*vid, *reg);
+                        caller_used_regs_set.insert(reg.0);
+                        if let Some(&(_, end)) = iv_map.get(vid) {
+                            let cur = seeded.entry(*reg).or_insert(0);
+                            *cur = (*cur).max(end);
+                        }
+                    }
+                }
+
+                // Wave 2: indirect-call args at index 0 — avoid the indirect-
+                // target register only; argument registers are still safe.
+                let w2: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| base_ok(&assignments, iv))
+                    .filter(|iv| indirect_arg_values.contains(&iv.value_id))
+                    .filter(|iv| !later_arg_values.contains(&iv.value_id))
+                    .collect();
+                if !w2.is_empty() && !no_indirect_pool.is_empty() {
+                    let ranges = live_range::build_live_ranges(&w2, &liveness.block_loop_depth, func);
+                    let mut alloc = LinearScanAllocator::new(ranges, no_indirect_pool);
+                    alloc.run_with_seed(&seeded);
+                    for (vid, reg) in &alloc.assignments {
+                        assignments.insert(*vid, *reg);
+                        caller_used_regs_set.insert(reg.0);
+                        if let Some(&(_, end)) = iv_map.get(vid) {
+                            let cur = seeded.entry(*reg).or_insert(0);
+                            *cur = (*cur).max(end);
+                        }
+                    }
+                }
+
+                // Wave 3: direct-call args at index ≥ 1 — avoid the arg
+                // registers; the indirect-target register is safe here.
+                let w3: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| base_ok(&assignments, iv))
+                    .filter(|iv| later_arg_values.contains(&iv.value_id))
+                    .filter(|iv| !indirect_arg_values.contains(&iv.value_id))
+                    .collect();
+                if !w3.is_empty() && !no_arg_pool.is_empty() {
+                    let ranges = live_range::build_live_ranges(&w3, &liveness.block_loop_depth, func);
+                    let mut alloc = LinearScanAllocator::new(ranges, no_arg_pool);
+                    alloc.run_with_seed(&seeded);
+                    for (vid, reg) in &alloc.assignments {
+                        assignments.insert(*vid, *reg);
+                        caller_used_regs_set.insert(reg.0);
+                        if let Some(&(_, end)) = iv_map.get(vid) {
+                            let cur = seeded.entry(*reg).or_insert(0);
+                            *cur = (*cur).max(end);
+                        }
+                    }
+                }
+
+                // Wave 4: the rest (non-call-args and direct arg-0 values) —
+                // full caller-saved pool.
+                let w4: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| base_ok(&assignments, iv))
+                    .filter(|iv| !later_arg_values.contains(&iv.value_id))
+                    .filter(|iv| !indirect_arg_values.contains(&iv.value_id))
+                    .collect();
+                if !w4.is_empty() {
+                    let ranges = live_range::build_live_ranges(&w4, &liveness.block_loop_depth, func);
+                    let mut alloc = LinearScanAllocator::new(ranges, config.caller_saved_regs.clone());
+                    alloc.run_with_seed(&seeded);
+                    for (vid, reg) in alloc.assignments {
+                        assignments.insert(vid, reg);
+                        caller_used_regs_set.insert(reg.0);
+                    }
                 }
             }
         }
     }
 
-    // Phase 2c: leftover callee-saved for call-free overflow (not remats).
+    // Phase 2c: leftover callee-saved for call-free overflow.
     {
         let phase2c_intervals: Vec<LiveInterval> = scan_ivs
             .iter()
@@ -524,7 +670,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| {
                 !assignments.contains_key(&iv.value_id)
                     && !spans_any_call(iv, call_points)
-                    && !cheap_remat.contains(&iv.value_id)
             })
             .collect();
         if !phase2c_intervals.is_empty() {
@@ -614,7 +759,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
             }
             if let Some((reg_id, evict, _)) = best {
-                for v in &evict {
+                for &v in &evict {
                     evict_group(
                         &mut assignments,
                         &mut holders_by_reg,
@@ -663,15 +808,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if !config.xmm_regs.is_empty() {
         let mut real_use: FxHashSet<u32> = FxHashSet::default();
         if arm_fp_pool || x86_fp_pool {
-            let mut copy_src_of: FxHashMap<u32, u32> = FxHashMap::default();
             for block in &func.blocks {
                 for inst in &block.instructions {
-                    if let Instruction::Copy {
-                        dest,
-                        src: Operand::Value(src_val),
-                    } = inst
-                    {
-                        copy_src_of.insert(dest.0, src_val.0);
+                    if matches!(inst, Instruction::Copy { .. }) {
                         continue;
                     }
                     for_each_operand_in_instruction(inst, |op| {
@@ -686,12 +825,31 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     }
                 });
             }
-            let mut work: Vec<u32> = real_use.iter().copied().collect();
-            while let Some(id) = work.pop() {
-                if let Some(&src) = copy_src_of.get(&id) {
-                    if real_use.insert(src) {
-                        work.push(src);
+            // Fixed-point backward propagation through Copy webs. Must be a
+            // fixpoint over ALL copies, not a single-source map: a loop-carried
+            // accumulator is defined by one Copy per block (the entry zero AND
+            // the backedge FMA result), so a `copy_src_of: dest → src` map keeps
+            // only the last edge and strands the entry producer — the pre-loop
+            // `VecZero*` lost its YMM home and round-tripped through the stack
+            // (p17_dot_f32 / p18_dot_f64 structural regressions).
+            loop {
+                let mut changed = false;
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Copy {
+                            dest,
+                            src: Operand::Value(src_val),
+                        } = inst
+                        {
+                            if real_use.contains(&dest.0) && !real_use.contains(&src_val.0) {
+                                real_use.insert(src_val.0);
+                                changed = true;
+                            }
+                        }
                     }
+                }
+                if !changed {
+                    break;
                 }
             }
         }
@@ -1370,6 +1528,54 @@ fn propagate_copy_web(succs: &FxHashMap<u32, Vec<u32>>, seed: &mut FxHashSet<u32
             }
         }
     }
+}
+
+/// Values whose (last) use is as an operand of a `Call` / `CallIndirect`.
+///
+/// The call's argument staging materialises each argument into the ABI arg
+/// registers in order; a value homed in one of those registers (x86-64:
+/// rdi/rsi/rdx/r8/r9) is read only AFTER an earlier argument's staging already
+/// wrote that register. Phase 2 therefore allocates these values from the
+/// arg-register-free subset of the caller-saved pool. The second set is the
+/// subset used as arguments to a `CallIndirect`, whose staging also writes the
+/// indirect-target register (r10) before reading them.
+/// Values whose (last) use is as an operand of a `Call` / `CallIndirect`.
+///
+/// Returns `(later, indirect)`:
+/// * `later` — values used as a call argument at ABI index ≥ 1 (i.e. NOT the
+///   first argument). Their home is read only after the staging has written
+///   the argument register(s) that come before them in the ABI order, so those
+///   registers must not be their home.
+/// * `indirect` — values used as an argument of a `CallIndirect`, whose
+///   staging additionally writes the indirect-target register (x86: `%r10`)
+///   before reading any argument.
+///
+/// A value used as argument 0 of a DIRECT call is deliberately absent from
+/// both: argument 0 is read first, so every argument register (and r10/r11)
+/// is still safe as its home.
+fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>) {
+    let mut later = FxHashSet::default();
+    let mut indirect = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let (args, is_indirect) = match inst {
+                Instruction::Call { info, .. } => (&info.args, false),
+                Instruction::CallIndirect { info, .. } => (&info.args, true),
+                _ => continue,
+            };
+            for (idx, arg) in args.iter().enumerate() {
+                if let Operand::Value(v) = arg {
+                    if idx >= 1 {
+                        later.insert(v.0);
+                    }
+                    if is_indirect {
+                        indirect.insert(v.0);
+                    }
+                }
+            }
+        }
+    }
+    (later, indirect)
 }
 
 /// Values that do not fit in a single GPR (floats, i128, 32-bit i64/u64),

@@ -1773,11 +1773,19 @@ mod tests {
         crate::ir::reexports::CallInfo {
             dest,
             args: Vec::new(),
+            arg_types: Vec::new(),
             return_type: IrType::I32,
             is_variadic: false,
-            param_types: Vec::new(),
-            calling_conv: Default::default(),
-            attributes: Default::default(),
+            num_fixed_args: 0,
+            struct_arg_sizes: Vec::new(),
+            struct_arg_aligns: Vec::new(),
+            struct_arg_classes: Vec::new(),
+            struct_arg_riscv_float_classes: Vec::new(),
+            struct_arg_is_f128_sse: Vec::new(),
+            ret_is_f128_sse: false,
+            is_sret: false,
+            is_fastcall: false,
+            ret_eightbyte_classes: Vec::new(),
         }
     }
 

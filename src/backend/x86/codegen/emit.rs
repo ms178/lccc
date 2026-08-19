@@ -354,6 +354,11 @@ pub struct X86Codegen {
     /// XMM saves and va_start sets fp_offset to overflow immediately.
     pub(super) function_alignment: u32,
     pub(super) skip_rax_setup: bool,
+    /// The current function contains a Call/CallIndirect. With frame-pointer
+    /// omission a frame-less (raw_space == 0) function still needs an 8-byte
+    /// pad so %rsp is 16-byte aligned at each call (entry %rsp ≡ 8 mod 16).
+    /// Set by calculate_stack_space_impl, read by aligned_frame_size_impl.
+    pub(super) func_has_calls: bool,
     /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
     /// scalar mul+add -> vfmadd231 fusion.
     pub(super) fp_contract_fast: bool,
@@ -600,6 +605,7 @@ impl X86Codegen {
             used_callee_saved: Vec::new(),
             function_alignment: 0,
             skip_rax_setup: false,
+            func_has_calls: false,
             fp_contract_fast: false,
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),

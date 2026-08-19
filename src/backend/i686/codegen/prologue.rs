@@ -174,7 +174,7 @@ impl I686Codegen {
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false, never_materialized,
+            false, never_materialized, Vec::new(), Vec::new(),
         );
 
         // %ebx must be saved/restored only when it really holds the GOT base.
