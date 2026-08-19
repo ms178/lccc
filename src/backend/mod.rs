@@ -140,6 +140,12 @@ pub(crate) struct CodegenOptions {
     /// Many programs (LuaJIT, libunwind users) require .eh_frame for exception
     /// handling and stack unwinding.
     pub(crate) emit_cfi: bool,
+    /// Whether to optimize for size (-Os/-Oz). When true, codegen prefers the
+    /// shorter sequence over the faster one (e.g. `idiv` over a magic-number
+    /// multiply for constant division, `imul` over a multi-instruction LEA
+    /// chain). When false (-O1/-O2/-O3), codegen uses the fastest sequence
+    /// even if it is a few bytes longer. Mirrors GCC/Clang's -Os behaviour.
+    pub(crate) optimize_for_size: bool,
 }
 
 /// Target architecture.

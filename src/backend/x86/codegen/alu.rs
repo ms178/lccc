@@ -8,60 +8,97 @@ impl X86Codegen {
     // ---- Unary ----
 
     pub(super) fn emit_float_neg_impl(&mut self, ty: IrType) {
+        // The value lives in the GPR accumulator as its IEEE-754 bit pattern,
+        // so the sign is a single bit flip — no GPR<->XMM domain crossings and
+        // no movabsq-to-xmm shuttle. F32: bit 31 of %eax (xorl zero-extends).
+        // F64: bit 63 of %rax; xorq has no imm64 form, so the mask is moved
+        // through %rcx (the secondary scratch) first.
         if ty == IrType::F32 {
-            self.state.emit("    movd %eax, %xmm0");
-            self.state.emit("    movl $0x80000000, %ecx");
-            self.state.emit("    movd %ecx, %xmm1");
-            self.state.emit("    xorps %xmm1, %xmm0");
-            self.state.emit("    movd %xmm0, %eax");
+            self.state.emit("    xorl $0x80000000, %eax");
         } else {
-            self.state.emit("    movq %rax, %xmm0");
             self.state.emit("    movabsq $-9223372036854775808, %rcx");
-            self.state.emit("    movq %rcx, %xmm1");
-            self.state.emit("    xorpd %xmm1, %xmm0");
-            self.state.emit("    movq %xmm0, %rax");
+            self.state.emit("    xorq %rcx, %rax");
+            self.state.reg_cache.invalidate_sec();
         }
     }
 
-    pub(super) fn emit_int_neg_impl(&mut self, _ty: IrType) {
-        self.state.emit("    negq %rax");
+    pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
+        // Width-correct: 32-bit forms zero-extend the upper half (the SysV
+        // i32-home invariant); negq on a zero-extended U32 would produce
+        // 0xFFFFFFFF00000001 instead of 1.
+        match ty {
+            IrType::I8 | IrType::U8 => self.state.emit("    negb %al"),
+            IrType::I16 | IrType::U16 => self.state.emit("    negw %ax"),
+            IrType::I32 | IrType::U32 => self.state.emit("    negl %eax"),
+            _ => self.state.emit("    negq %rax"),
+        }
     }
 
-    pub(super) fn emit_int_not_impl(&mut self, _ty: IrType) {
-        self.state.emit("    notq %rax");
+    pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
+        match ty {
+            IrType::I8 | IrType::U8 => self.state.emit("    notb %al"),
+            IrType::I16 | IrType::U16 => self.state.emit("    notw %ax"),
+            IrType::I32 | IrType::U32 => self.state.emit("    notl %eax"),
+            _ => self.state.emit("    notq %rax"),
+        }
     }
 
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
-        if ty == IrType::I32 || ty == IrType::U32 {
-            self.state.emit("    lzcntl %eax, %eax");
-        } else {
-            self.state.emit("    lzcntq %rax, %rax");
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                // clz8(x) = lzcnt32(zext(x)) - 24.
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    lzcntl %eax, %eax");
+                self.state.emit("    subl $24, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    lzcntl %eax, %eax");
+                self.state.emit("    subl $16, %eax");
+            }
+            IrType::I32 | IrType::U32 => self.state.emit("    lzcntl %eax, %eax"),
+            _ => self.state.emit("    lzcntq %rax, %rax"),
         }
     }
 
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-        if ty == IrType::I32 || ty == IrType::U32 {
-            self.state.emit("    tzcntl %eax, %eax");
-        } else {
-            self.state.emit("    tzcntq %rax, %rax");
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                // Zero-extend so only the real low byte's trailing zeros count.
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    tzcntl %eax, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    tzcntl %eax, %eax");
+            }
+            IrType::I32 | IrType::U32 => self.state.emit("    tzcntl %eax, %eax"),
+            _ => self.state.emit("    tzcntq %rax, %rax"),
         }
     }
 
     pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {
-        if ty == IrType::I16 || ty == IrType::U16 {
-            self.state.emit("    rolw $8, %ax");
-        } else if ty == IrType::I32 || ty == IrType::U32 {
-            self.state.emit("    bswapl %eax");
-        } else {
-            self.state.emit("    bswapq %rax");
+        match ty {
+            // Byte-swap of a single byte is the identity.
+            IrType::I8 | IrType::U8 => {}
+            IrType::I16 | IrType::U16 => self.state.emit("    rolw $8, %ax"),
+            IrType::I32 | IrType::U32 => self.state.emit("    bswapl %eax"),
+            _ => self.state.emit("    bswapq %rax"),
         }
     }
 
     pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
-        if ty == IrType::I32 || ty == IrType::U32 {
-            self.state.emit("    popcntl %eax, %eax");
-        } else {
-            self.state.emit("    popcntq %rax, %rax");
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    popcntl %eax, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    popcntl %eax, %eax");
+            }
+            IrType::I32 | IrType::U32 => self.state.emit("    popcntl %eax, %eax"),
+            _ => self.state.emit("    popcntq %rax, %rax"),
         }
     }
 
@@ -119,7 +156,12 @@ impl X86Codegen {
                                     let rhs_64 = super::emit::phys_reg_name(rhs_phys);
                                     self.state.emit_fmt(format_args!("    {}q %{}, {}", mnem, rhs_64, sref));
                                 }
-                                // NO cache invalidation — op %reg,mem doesn't modify any register
+                                // The MEMORY holding dest/lhs changed; a prior
+                                // `store_rax_to` may have cached dest/lhs in the
+                                // accumulator, which now holds a stale value.
+                                // The register source is untouched, so only the
+                                // memory-backed ids are invalidated.
+                                self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
                                 return;
                             }
                             // Try immediate source: op $imm, mem
@@ -129,7 +171,7 @@ impl X86Codegen {
                                 } else {
                                     self.state.emit_fmt(format_args!("    {}q ${}, {}", mnem, imm, sref));
                                 }
-                                // NO cache invalidation — op $imm,mem doesn't modify any register
+                                self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
                                 return;
                             }
                         }
@@ -280,6 +322,23 @@ impl X86Codegen {
         if use_32bit { self.store_eax_to(dest); } else { self.store_rax_to(dest); }
     }
 
+    /// Invalidate acc/sec cache entries that claim to hold one of `ids`. Used
+    /// after in-place memory updates (`op %reg/imm, mem`): the registers are
+    /// unchanged, but the memory those ids live in is now different, so a
+    /// cached register copy of them is stale.
+    fn invalidate_cache_for_values(&mut self, ids: &[u32]) {
+        if let Some(e) = self.state.reg_cache.acc {
+            if ids.contains(&e.value_id) {
+                self.state.reg_cache.invalidate_acc();
+            }
+        }
+        if let Some(e) = self.state.reg_cache.sec {
+            if ids.contains(&e.value_id) {
+                self.state.reg_cache.invalidate_sec();
+            }
+        }
+    }
+
     /// Fused multiply-add: add_dest = acc + (mul_lhs * mul_rhs).
     ///
     /// Emits a 3-instruction sequence: load one mul operand to %eax, multiply
@@ -300,9 +359,12 @@ impl X86Codegen {
         // Strategy: load one operand to %eax, imul the other (prefer memory-source).
         if use_32bit { self.operand_to_eax(mul_lhs); } else { self.operand_to_rax(mul_lhs); }
 
-        // Try memory-source multiply for rhs
+        // Try memory-source multiply for rhs. An alloca's VALUE is its ADDRESS
+        // (a pointer), so folding it as a memory source would read the array's
+        // first element instead of multiplying by the base address — the same
+        // alloca guard the plain binop mem-source path has.
         if let Operand::Value(rhs_val) = mul_rhs {
-            if self.dest_reg(rhs_val).is_none() {
+            if self.dest_reg(rhs_val).is_none() && !self.state.is_alloca(rhs_val.0) {
                 if let Some(slot) = self.state.get_slot(rhs_val.0) {
                     let sref = self.slot_ref(slot.0);
                     if use_32bit {

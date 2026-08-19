@@ -372,6 +372,9 @@ pub struct X86Codegen {
     pub(super) vec_const_counter: u32,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
+    /// -Os/-Oz: prefer the shorter sequence over the faster one (codegen-side
+    /// strength reduction for constant mul/div is skipped in favour of imul/idiv).
+    pub(super) optimize_for_size: bool,
     /// Current function being generated (needed for indexed addressing detection).
     pub(super) current_func: Option<*const IrFunction>,
     /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
@@ -611,6 +614,7 @@ impl X86Codegen {
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
             avx512_enabled: false,
+            optimize_for_size: false,
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
@@ -699,6 +703,7 @@ impl X86Codegen {
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;
         self.fp_contract_fast = opts.fp_contract_fast;
+        self.optimize_for_size = opts.optimize_for_size;
     }
 
     /// Reserve (or reuse) a .rodata label holding `value` as `width` bytes for a
