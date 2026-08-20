@@ -166,7 +166,13 @@ pub struct JumpDetection {
 #[derive(Clone, Debug)]
 struct JumpInfo {
     offset: usize,
+    /// Current encoded length (2 after relaxation).
     len: usize,
+    /// Architecture/mode-specific near form length.  This is 6/5 bytes for
+    /// jcc/jmp with rel32, but 4/3 bytes in `.code16` with rel16.  Retaining
+    /// it is essential: an optimistically shortened branch may later need to
+    /// grow after alignment reaches its fixed point.
+    long_len: usize,
     target: String,
     is_conditional: bool,
     /// Whether the jump currently uses its short form.
@@ -1293,23 +1299,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     self.sections[sec_idx].jumps.push(JumpInfo {
                         offset: base_offset as usize,
                         len: instr_len,
+                        long_len: instr_len,
                         target: label.clone(),
                         is_conditional: jump_det.is_conditional,
                         relaxed: true,
                         can_grow: false,
                     });
-                } else {
-                    let expected_len = if jump_det.is_conditional { 6 } else { 5 };
-                    if instr_len == expected_len {
-                        self.sections[sec_idx].jumps.push(JumpInfo {
-                            offset: base_offset as usize,
-                            len: expected_len,
-                            target: label.clone(),
-                            is_conditional: jump_det.is_conditional,
-                            relaxed: false,
-                            can_grow: false,
-                        });
-                    }
+                } else if instr_len > 2 {
+                    // The architecture has already identified this as a near
+                    // branch. Do not re-impose x86 rel32 lengths here:
+                    // `.code16` jcc/jmp are 4/3-byte rel16 instructions.
+                    self.sections[sec_idx].jumps.push(JumpInfo {
+                        offset: base_offset as usize,
+                        len: instr_len,
+                        long_len: instr_len,
+                        target: label.clone(),
+                        is_conditional: jump_det.is_conditional,
+                        relaxed: false,
+                        can_grow: false,
+                    });
                 }
             }
         }
@@ -2246,11 +2254,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 for &(j_idx, ref action) in &actions {
                     // Snapshot every field the transition needs so the
                     // immutable borrow ends before the mutable section edits.
-                    let (offset, old_len, is_conditional, target) = {
+                    let (offset, old_len, long_len, is_conditional, target) = {
                         let jump = &self.sections[sec_idx].jumps[j_idx];
                         (
                             jump.offset,
                             jump.len,
+                            jump.long_len,
                             jump.is_conditional,
                             jump.target.clone(),
                         )
@@ -2325,23 +2334,26 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             self.sections[sec_idx].jumps[j_idx].len = new_len;
                         }
                         Action::Grow => {
-                            let new_len = if is_conditional { 6usize } else { 5usize };
+                            let new_len = long_len;
                             let grow = new_len - old_len;
                             let data = &mut self.sections[sec_idx].data;
                             if is_conditional {
-                                // short 0x7x disp8 -> long 0x0f 0x8x disp32
+                                // short 0x7x disp8 -> near 0x0f 0x8x rel16/32
                                 let cc = data[offset] - 0x70;
                                 let insert = vec![0u8; grow];
                                 data.splice(offset + 2..offset + 2, insert);
                                 data[offset] = 0x0f;
                                 data[offset + 1] = 0x80 + cc;
                             } else {
-                                // short 0xeb disp8 -> long 0xe9 disp32
+                                // short 0xeb disp8 -> near 0xe9 rel16/32
                                 let insert = vec![0u8; grow];
                                 data.splice(offset + 2..offset + 2, insert);
                                 data[offset] = 0xE9;
                             }
-                            // Re-record the rel32 relocation for the grown jump.
+                            // Restore the original mode's relocation width. A
+                            // `.code16` near branch owns a two-byte rel16 field;
+                            // writing rel32 would overwrite the next instruction.
+                            let rel16 = long_len == if is_conditional { 4 } else { 3 };
                             let reloc_pos = (if is_conditional {
                                 offset + 2
                             } else {
@@ -2350,10 +2362,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             self.sections[sec_idx].relocations.push(ElfRelocation {
                                 offset: reloc_pos,
                                 symbol: target.clone(),
-                                reloc_type: A::reloc_pc32(),
-                                addend: -4,
+                                reloc_type: if rel16 {
+                                    A::reloc_pc16().expect("rel16 branch without architecture relocation")
+                                } else {
+                                    A::reloc_pc32()
+                                },
+                                addend: if rel16 { -2 } else { -4 },
                                 diff_symbol: None,
-                                patch_size: 4,
+                                patch_size: if rel16 { 2 } else { 4 },
                             });
                             // Shift everything at or after the insertion point.
                             for (_, pos) in self.label_positions.iter_mut() {
