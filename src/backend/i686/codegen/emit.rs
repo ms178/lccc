@@ -1434,6 +1434,41 @@ impl ArchCodegen for I686Codegen {
         }
     }
 
+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
+        // Register-resident base + constant offset → `leal off(%base), %dest`.
+        // Without this hook the default emit_gep silently drops the base for
+        // slot-less bases (both branches key on resolve_slot_addr), so a
+        // rematerialised folded GEP computed `offset + stale scratch`.
+        let Some(&br) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
+            return false;
+        }
+        let b_name = phys_reg_name(br);
+        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
+            let d_name = phys_reg_name(dr);
+            if offset == 0 {
+                if br != dr {
+                    emit!(self.state, "    movl %{}, %{}", b_name, d_name);
+                }
+            } else {
+                emit!(self.state, "    leal {}(%{}), %{}", offset as i32, b_name, d_name);
+            }
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Slot-only dest: stage through %eax, then store to the home.
+        if offset == 0 {
+            emit!(self.state, "    movl %{}, %eax", b_name);
+        } else {
+            emit!(self.state, "    leal {}(%{}), %eax", offset as i32, b_name);
+        }
+        self.state.reg_cache.set_acc(dest.0, false);
+        self.emit_store_result(dest);
+        true
+    }
+
     // ---- Standard trait methods (kept inline - arch-specific) ----
     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_eax(op); }
     fn emit_store_result(&mut self, dest: &Value) { self.store_eax_to(dest); }
@@ -1639,6 +1674,24 @@ impl ArchCodegen for I686Codegen {
         // a register just to `testl` it; folding `*p != 0` into `cmpb $0,(mem)`
         // is the single biggest source of string-loop bloat vs GCC.
         true
+    }
+
+    fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
+        // Register-base const-offset folds consume the base at the Load/Store
+        // position (RA-invisible): sound only with the folded-base liveness
+        // links wired into register allocation (prologue passes
+        // collect_gep_fold_base_links).  When that extension is disabled the
+        // folds must be refused too — the two are one contract.
+        if std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_some() {
+            return false;
+        }
+        match self.reg_assignments.get(&base.0) {
+            // Safe homes: %ebx/%esi/%edi/%ebp — callee-saved, never touched
+            // by the %eax:%edx accumulator staging or the %ecx address
+            // scratch the fold paths use.
+            Some(&phys) => matches!(phys.0, 0 | 1 | 2 | 3),
+            None => false,
+        }
     }
 
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {

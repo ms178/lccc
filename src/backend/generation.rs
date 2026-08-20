@@ -197,20 +197,52 @@ fn filter_rip_legal_symbols(cg: &dyn ArchCodegen, map: &mut FxHashMap<u32, Strin
 }
 
 fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
-    // Only fold when the base is an alloca: a stack address is always
-    // re-computable (lea) at the use site.  A base that merely sits in a
-    // register is NOT safe: an intervening call clobbers caller-saved
-    // registers, so folding the GEP into a store AFTER the call would
-    // dereference a dead register (zlib-ng gz_write_init stored
-    // `strm->next_in = NULL` through %r8 which deflateInit2_ had clobbered).
-    // With a register base the GEP is instead generated at its definition
-    // point, where the base pointer is still live.
-    cg.state_ref().is_alloca(info.base.0)
+    // A/B gate: force the pre-session-25 alloca-only contract.
+    if env_flag_set("CCC_NO_REGBASE_FOLD") {
+        return cg.state_ref().is_alloca(info.base.0);
+    }
+    // Alloca bases are always foldable: a stack address is re-computable
+    // (lea / slot-relative) at every use site, independent of registers.
+    if cg.state_ref().is_alloca(info.base.0) {
+        return true;
+    }
+    // REGISTER-RESIDENT bases fold only on backends that (a) extend the
+    // base's live interval to the consuming Load/Store — the backend passes
+    // collect_gep_fold_base_links(func) into register allocation — and
+    // (b) keep the fold paths complete for register bases.  Without (a) the
+    // allocator reuses the base register for the stored value (zlib-ng
+    // gz_reset `movl %r15d,(%r15)` NULL store); without (b) the access can
+    // silently fall through.  The backend hook performs the per-value
+    // physical-register sanity check (emitter scratch exclusion).
+    cg.const_offset_fold_reg_base_ok(&info.base)
 }
 
-fn can_indexed_addr_fold(cg: &dyn ArchCodegen, info: &IndexedGepInfo) -> bool {
-    cg.get_phys_reg_for_value(info.base.0).is_some()
-        && cg.get_phys_reg_for_value(info.index.0).is_some()
+fn can_indexed_addr_fold(
+    cg: &dyn ArchCodegen,
+    info: &IndexedGepInfo,
+    global_addr_map: &FxHashMap<u32, String>,
+) -> bool {
+    // The index is consumed at the access in every indexed form; it must be
+    // register-resident (the RA link extension keeps it live to there).
+    if cg.get_phys_reg_for_value(info.index.0).is_none() {
+        return false;
+    }
+    if cg.get_phys_reg_for_value(info.base.0).is_some() {
+        return true;
+    }
+    // Symbol-base indexed addressing (`sym(,%idx,scale)`): the GlobalAddr
+    // base was never materialised and has no register home.  Only backends
+    // that emit the symbol form may take this path — otherwise the skipped
+    // producer would rematerialise against an uncomputed GlobalAddr.
+    // GOT/TLS/absolute symbols cannot be a bare memory-operand symbol on PIC
+    // targets, so refuse them here (the consumer re-checks).
+    if !cg.supports_indexed_sym_base() {
+        return false;
+    }
+    if let Some(sym) = global_addr_map.get(&info.base.0) {
+        return !rip_rel_blocked(cg, sym);
+    }
+    false
 }
 
 /// Per-function def / alloca / param facts used by GEP-fold soundness.
@@ -582,6 +614,42 @@ pub(crate) fn collect_folded_index_links(func: &IrFunction) -> FxHashMap<u32, Ve
     out
 }
 
+/// Map of CONST-FOLDED-GEP BASE value ids to their consumer GEP-dest value
+/// ids. `emit_{load,store}_with_const_offset` consumes `gep_info.base` at
+/// the Load/Store position while the IR records the base's last use at the
+/// (folded-away) GEP — the same RA-invisible-consumption family as the
+/// indexed form, but for the BASE of a constant-offset fold. Without the
+/// interval extension the allocator may reuse the base's register for the
+/// stored value: zlib-ng gz_reset `state->x.have = 0` compiled to
+/// `mov %r14,%r15; xorl %r15d,%r15d; movl %r15d,(%r15)` — the zero
+/// materialisation (value homed r15) destroyed the base (also homed r15,
+/// legal by IR liveness because the base "died" at the folded GEP), and the
+/// store went through NULL.
+pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let m = build_gep_fold_map(func, &use_counts, &stab);
+    let mut out: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (dest, info) in &m {
+        out.entry(info.base.0).or_default().push(*dest);
+    }
+    out
+}
+
+/// Union of the per-kind folded-GEP consumption links (index + base) for
+/// backends that fold BOTH forms. Each backend must pass exactly the links
+/// for the forms its emitter actually consumes at the access position;
+/// extending intervals for a form the emitter re-materialises only adds
+/// register pressure (x86-64 `check_gpr_leaf_param_codegen::pointer_mix`
+/// regressed +2 callee-saves when the INDEX extension was applied blindly).
+pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
+    let mut out = collect_gep_fold_base_links(func);
+    for (k, vs) in collect_folded_index_links(func) {
+        out.entry(k).or_default().extend(vs);
+    }
+    out
+}
+
 fn build_indexed_gep_map(
     func: &IrFunction,
     use_counts: &[u32],
@@ -783,19 +851,48 @@ fn build_gep_fold_map(
     }
     let original_count = gep_map.len();
 
+    // Compose const chains and propagate Copy/Cast aliases INTERLEAVED, to a
+    // bounded fixed point.  Composing only once before propagating left
+    // entries whose base was a later-propagated stable alias pointing at the
+    // alias (e.g. `GEP(var_idx); Copy V25; GEP V27 = V25+16` composed with
+    // base = V25) while V25's producer is absorbed (skipped, never emitted):
+    // the consumer then read V25's stale register home — the variable index
+    // silently dropped (sqlite ExprListSetSortOrder stored through &p->a
+    // instead of &p->a[nExpr-1]; openDatabase SIGSEGV at -O0).  Session-24
+    // fixed this with a single re-compose after propagate; the interleaved
+    // fixed point additionally resolves deeper alias chains (each round can
+    // expose one more link), and the safety net below catches anything the
+    // bound leaves behind.
+    for _ in 0..8 {
+        compose_const_gep_folds(&mut gep_map);
+        propagate_stable_aliases(func, stab, &mut gep_map);
+    }
     compose_const_gep_folds(&mut gep_map);
     retain_stable_bases(func, use_counts, stab, &mut gep_map);
     propagate_stable_aliases(func, stab, &mut gep_map);
-    // propagate_stable_aliases inserts NEW fold entries (Copy/Cast aliases of
-    // stable folds).  A GEP whose base is one of those newly-added aliases
-    // (e.g. GEP(copy_of_stable, 0) inserted with base = the alias) was not
-    // composed, because composition ran BEFORE the alias existed.  The store
-    // then dereferenced the alias value, which was itself skipped as a folded
-    // address and never materialised -> unmaterialised base register ->
-    // SIGSEGV (zlib-ng gz_write_init `strm->next_in = NULL`).  Re-compose so
-    // every fold's base is a terminal (materialised) value.
     compose_const_gep_folds(&mut gep_map);
     retain_ptr_only_uses(func, &mut gep_map);
+    // SAFETY NET: a fold entry whose base is STILL a map key would read a
+    // register (or slot) its skipped producer never wrote.  Composition
+    // removes all such edges when the offsets fit; overflow-truncated
+    // compositions are the only survivors — drop them (conservative, always
+    // sound: the producer is emitted instead).  Removal re-exposes the
+    // dropped dest's base as a real (non-fold) use, so re-run the
+    // retain_ptr_only_uses fixed point after each round.
+    loop {
+        let bad: Vec<u32> = gep_map
+            .iter()
+            .filter(|(_, info)| gep_map.contains_key(&info.base.0))
+            .map(|(dest, _)| *dest)
+            .collect();
+        if bad.is_empty() {
+            break;
+        }
+        for d in bad {
+            gep_map.remove(&d);
+        }
+        retain_ptr_only_uses(func, &mut gep_map);
+    }
     retain_used(&mut gep_map, use_counts);
 
     if env_flag_set("CCC_DEBUG_GEPFOLD") {
@@ -2490,7 +2587,7 @@ fn generate_function(
                     }
                 }
                 if let Some(info) = indexed_gep_map.get(&dest.0) {
-                    if can_indexed_addr_fold(cg, info) {
+                    if can_indexed_addr_fold(cg, info, &global_addr_map) {
                         cg.state().folded_gep_values.insert(dest.0);
                         cg.state().current_program_point += 1;
                         continue;
@@ -3243,9 +3340,17 @@ fn generate_load(
         rematerialize_const_addr(cg, ptr, gep_info);
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info) {
+        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
             if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, ty) {
                 return;
+            }
+            // Symbol-base form: the GlobalAddr base has no register home.
+            if let Some(sym) = global_addr_map.get(&info.base.0) {
+                if !rip_rel_blocked(cg, sym)
+                    && cg.emit_load_indexed_sym(dest, sym, &info.index, info.shift, ty)
+                {
+                    return;
+                }
             }
         }
         rematerialize_skipped_indexed(cg, ptr, info);
@@ -3297,9 +3402,17 @@ fn generate_store(
         rematerialize_const_addr(cg, ptr, gep_info);
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info) {
+        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
             if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, ty) {
                 return;
+            }
+            // Symbol-base form: the GlobalAddr base has no register home.
+            if let Some(sym) = global_addr_map.get(&info.base.0) {
+                if !rip_rel_blocked(cg, sym)
+                    && cg.emit_store_indexed_sym(val, sym, &info.index, info.shift, ty)
+                {
+                    return;
+                }
             }
         }
         rematerialize_skipped_indexed(cg, ptr, info);

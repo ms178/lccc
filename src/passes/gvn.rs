@@ -486,21 +486,20 @@ impl GvnState {
                 if *volatile {
                     return None;
                 }
-                // Agent-B/levkropp audit (session 23): enabling F32/F64 load
-                // CSE here was REVERTED. The created FP Copies break the
-                // die-at-birth FP coalescing chain on x86-64: fp_die_at_birth
-                // miscompiles (chain_div returns chain_neg's value). The
-                // exclusion stays until the backend FP copy/coalesce paths are
-                // proven for GVN-created FP copies under the full battery.
-                // Session-23 revert, session-24 root cause: F32/F64 load CSE
-                // creates FP Copy instructions that perturb the die-at-birth
-                // FP register coalescing of UNRELATED functions/blocks:
-                // fp_die_at_birth's pure-computation chain_div loop loses its
-                // accumulator register to copies CSE-created in the load-heavy
-                // energy loop (chain_div returned chain_neg's value). A proper
-                // fix needs copy-aware FP chain coalescing (design item in the
-                // session-24 audit doc); until then FP loads stay out of CSE.
-                if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
+                // F32/F64 load CSE is ENABLED (session-25).  The session-23
+                // revert blamed GVN-created FP Copies for the fp_die_at_birth
+                // miscompile (chain_div returning chain_neg's value), but the
+                // true root cause was `folded_gep_values` leaking across
+                // functions in CodegenState::reset_for_function: skipped-GEP
+                // IDs from a load-heavy function collided with value IDs of a
+                // LATER function and fired spurious rematerialisations there
+                // — which is why the symptom looked like "unrelated
+                // functions" perturbing each other.  With the per-function
+                // reset in place, FP copies created by CSE are safe.
+                // Long double (x87) and 128-bit loads stay excluded: their
+                // lowering uses multi-register/x87 paths that CSE's plain
+                // Copy does not model.
+                if ty.is_long_double() || ty.is_128bit() {
                     return None;
                 }
                 // Never CSE/forward loads from parameter allocas (see the

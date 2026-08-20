@@ -3788,6 +3788,82 @@ impl ArchCodegen for X86Codegen {
     fn supports_global_addr_fold(&self) -> bool {
         true
     }
+
+    fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
+        // Register-base const-offset folds consume the base at the Load/Store
+        // position (RA-invisible): sound only with the folded-base liveness
+        // links wired into register allocation (prologue passes
+        // collect_gep_fold_base_links).  When that extension is disabled the
+        // folds must be refused too — the two are one contract.
+        if std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_some() {
+            return false;
+        }
+        match self.reg_assignments.get(&base.0) {
+            Some(&phys) if !is_xmm_reg(phys) => {
+                // Exclude the emitter's private scratch set for the fold
+                // paths: %rdx (PhysReg 16, emit_save_acc staging) and %r11
+                // (PhysReg 10, operand_to_rax staging / indirect-target
+                // scratch).  %rax/%rcx are not allocatable homes to begin
+                // with.  Every other GPR home is safe: the operand staging
+                // (operand_to_rax, xmm staging) only touches that set.
+                !matches!(phys.0, 10 | 16)
+            }
+            _ => false,
+        }
+    }
+
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+        // The trait DEFAULT for this hook is a NO-OP ("backends override").
+        // Without the override, default emit_gep fallbacks that stage a
+        // register-resident base through the accumulator silently emit
+        // nothing and the address math reads a stale scratch (the exact i686
+        // emit_leaq_base_index bug class, fixed there in session 20).
+        let name = phys_reg_name(reg);
+        self.state.emit_fmt(format_args!("    movq %{}, %rax", name));
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
+        // Register-resident base + constant offset → `leaq off(%base), %dest`.
+        // Without this hook the default emit_gep silently drops the base for
+        // slot-less bases: both its const and general branches key on
+        // resolve_slot_addr(base), so a rematerialised folded GEP computed
+        // `offset + stale scratch` (zlib-ng gen_bitlen corrupt-pointer crash:
+        // tree/bl_count fields read and written through garbage addresses).
+        let Some(&br) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if is_xmm_reg(br) || offset < i32::MIN as i64 || offset > i32::MAX as i64 {
+            return false;
+        }
+        let b_name = phys_reg_name(br);
+        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
+            if !is_xmm_reg(dr) {
+                let d_name = phys_reg_name(dr);
+                if offset == 0 {
+                    if br != dr {
+                        self.state.emit_fmt(format_args!("    movq %{}, %{}", b_name, d_name));
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    leaq {}(%{}), %{}", offset, b_name, d_name));
+                }
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+        // Slot-only dest: stage through %rax, then store to the home.
+        if offset == 0 {
+            self.state.emit_fmt(format_args!("    movq %{}, %rax", b_name));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    leaq {}(%{}), %rax", offset, b_name));
+        }
+        self.state.reg_cache.set_acc(dest.0, false);
+        self.emit_store_result(dest);
+        true
+    }
+
     fn emit_call_store_f128_result(&mut self, _dest: &Value) {
         unreachable!("x86 uses custom emit_call_store_result for F128")
     }

@@ -608,6 +608,18 @@ impl CodegenState {
         self.vec_live_regs.clear();
         self.uses_sret = false;
         self.next_block_label = None;
+        // GEP-fold bookkeeping is function-local too: `folded_gep_values`
+        // holds the value IDs of skipped address producers, and value IDs
+        // restart at 0 in every function.  Without this clear, IDs leaked
+        // from function A made `rematerialize_const_addr` fire spuriously in
+        // function B on a colliding ID (emitting a stray lea over B's live
+        // accumulator / rematerialising a GEP that was never skipped there) —
+        // zlib-ng gen_bitlen corruption once the register-base fold
+        // relaxation flooded the set, making collisions deterministic.
+        // `gep_base_offset` is the same class (per-function GEP base/index
+        // cache keyed by value ID).
+        self.folded_gep_values.clear();
+        self.gep_base_offset.clear();
     }
 
     /// Invalidate the vector-register peephole state. Called at every emission

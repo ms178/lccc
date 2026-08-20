@@ -243,7 +243,132 @@ impl X86Codegen {
         }
         let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
         let mut float_count = 0usize;
+
+        // ---- Staging-hazard pre-spill (session 25) ----
+        // Die-at-birth register coalescing can home a still-needed value in
+        // an argument register that an EARLIER argument's staging overwrites:
+        // fp_die_at_birth's `cd` accumulator was homed in xmm3 (sharing with
+        // the dying `cn`), and staging emitted `movsd %xmm7,%xmm3` (cn, arg4)
+        // BEFORE reading cd for arg5 — arg5 then read cn's value ("chain_div
+        // returned chain_neg's value").  Detect every argument whose source
+        // home is an argument register already written by an earlier-staged
+        // argument, and pre-spill those values to a transient stack area
+        // BEFORE any staging write.  Symmetric for GPR argument registers.
+        let mut written_xmm: [bool; 8] = [false; 8];
+        let mut written_gpr: [bool; 6] = [false; 6];
+        // (arg index, phys home, is_fp)
+        let mut hazards: Vec<(usize, crate::backend::regalloc::PhysReg, bool)> = Vec::new();
         for (i, arg) in args.iter().enumerate() {
+            if let Operand::Value(v) = arg {
+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    if super::emit::is_xmm_reg(phys) {
+                        // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
+                        let src_idx = phys.0 as i64 - 18;
+                        if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
+                            hazards.push((i, phys, true));
+                        }
+                    } else {
+                        // Allocatable GPR homes that double as SysV arg regs:
+                        // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
+                        // r9=13→arg5 (rcx/rax are not allocatable homes).
+                        let src_idx: Option<usize> = match phys.0 {
+                            14 => Some(0),
+                            15 => Some(1),
+                            16 => Some(2),
+                            12 => Some(4),
+                            13 => Some(5),
+                            _ => None,
+                        };
+                        if let Some(si) = src_idx {
+                            if written_gpr[si] {
+                                hazards.push((i, phys, false));
+                            }
+                        }
+                    }
+                }
+            }
+            // Mark the targets THIS argument writes (after its own check).
+            match &arg_classes[i] {
+                CallArgClass::FloatReg { reg_idx } => {
+                    if *reg_idx < 8 {
+                        written_xmm[*reg_idx] = true;
+                    }
+                }
+                CallArgClass::IntReg { reg_idx } => {
+                    if *reg_idx < 6 {
+                        written_gpr[*reg_idx] = true;
+                    }
+                }
+                CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, .. } => {
+                    if *lo_fp_idx < 8 {
+                        written_xmm[*lo_fp_idx] = true;
+                    }
+                    if let Some(hi) = hi_fp_idx {
+                        if *hi < 8 {
+                            written_xmm[*hi] = true;
+                        }
+                    }
+                }
+                CallArgClass::F128SseReg { reg_idx } => {
+                    if *reg_idx < 8 {
+                        written_xmm[*reg_idx] = true;
+                    }
+                }
+                CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. }
+                | CallArgClass::StructMixedSseIntReg { int_reg_idx, fp_reg_idx, .. } => {
+                    if *fp_reg_idx < 8 {
+                        written_xmm[*fp_reg_idx] = true;
+                    }
+                    if *int_reg_idx < 6 {
+                        written_gpr[*int_reg_idx] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut hazard_slot: crate::common::fx_hash::FxHashMap<usize, i64> =
+            crate::common::fx_hash::FxHashMap::default();
+        let hazard_area = ((hazards.len() * 8 + 15) / 16) * 16;
+        if hazard_area > 0 {
+            self.state
+                .emit_fmt(format_args!("    subq ${}, %rsp", hazard_area));
+            for (k, (arg_i, phys, is_fp)) in hazards.iter().enumerate() {
+                let off = (k * 8) as i64;
+                hazard_slot.insert(*arg_i, off);
+                let name = super::emit::phys_reg_name(*phys);
+                if *is_fp {
+                    self.state
+                        .emit_fmt(format_args!("    movsd %{}, {}(%rsp)", name, off));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, {}(%rsp)", name, off));
+                }
+            }
+        }
+
+        for (i, arg) in args.iter().enumerate() {
+            // Hazard arguments read their pre-spilled slot instead of the
+            // (already-overwritten) argument-register home.
+            if let Some(&off) = hazard_slot.get(&i) {
+                match &arg_classes[i] {
+                    CallArgClass::FloatReg { reg_idx } => {
+                        self.state.emit_fmt(format_args!(
+                            "    movsd {}(%rsp), %{}",
+                            off, xmm_regs[*reg_idx]
+                        ));
+                        float_count += 1;
+                        continue;
+                    }
+                    CallArgClass::IntReg { reg_idx } => {
+                        self.state.emit_fmt(format_args!(
+                            "    movq {}(%rsp), %{}",
+                            off, X86_ARG_REGS[*reg_idx]
+                        ));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match arg_classes[i] {
                 CallArgClass::I128RegPair { base_reg_idx } => {
                     let lo_reg = X86_ARG_REGS[base_reg_idx];
@@ -446,6 +571,12 @@ impl X86Codegen {
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
+        // Release the staging-hazard pre-spill area (all hazard args have
+        // been staged from it; nothing beyond this point reads it).
+        if hazard_area > 0 {
+            self.state
+                .emit_fmt(format_args!("    addq ${}, %rsp", hazard_area));
+        }
         // Restore the original RSP frame size.
         if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
             self.state.out.rsp_frame_size -= total_sp_adjust;
