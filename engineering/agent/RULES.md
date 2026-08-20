@@ -5,7 +5,7 @@
 3. After every codegen change:  
    `python3 scripts/godbolt.py compile gcc16.2 tests/benchmark/programs/KERNEL.c --flags '-O2 -march=x86-64-v3'`
 4. Copy **ICX** `vfmadd231pd` YMM accumulators. Do not copy GCC 16.2's per-iteration horizontal add on reductions.
-5. Do not force MachInst on large loops (`CCC_MI_MAX_LOOP_INSTS`; gzip −3%). The `machinst_regalloc.rs` module is dead code — delete it (P0-01), do not wire it up.
+5. Do not force MachInst on large loops (`CCC_MI_MAX_LOOP_INSTS`; gzip −3%). The `machinst_regalloc.rs` module is dead code — delete it (P0-01a), do not wire it up. Keep the MachInst ISel/emit path.
 6. Do not enable `CCC_SROA_COPYOUT` without a dominator proof (hangs `structs_bitfields`, `simd_sse_float`).
 7. Do not set `CCC_EVICT_MODE=5` or `CCC_PGO_WEIGHT_MAX>1` (gzip regressions).
 8. PhysReg(11)=`%r10`, PhysReg(10)=`%r11`.
@@ -17,7 +17,9 @@
 14. **Do not refactor `immediately_consumed` (RA-23) or `SlotAddr::Indirect(StackSlot(0))` (RA-24) without full differential testing** — they are hard blockers that will miscompile silently if the accumulator load order or `reg_assignments` convention is violated.
 15. **Do not re-enable `bytes[i] as char` in `peephole_common.rs`** — it corrupts UTF-8. The `find_whole_word` + `from_utf8_unchecked` path is the only safe one.
 16. **Do not re-introduce `MAX_ITERATIONS` in liveness** — the worklist dataflow is provably terminating (monotonic). A cap is a silent miscompile.
-17. **`__builtin_cpu_supports` must fold from an exact allowlist** — the old "return 1 for everything except avx512" produced SIGILL paths on non-v3 CPUs.
-18. **`usual_arithmetic_conversion` else-arm must use `size` comparison** — `signed_ty.size() > unsigned_ty.size() ? signed : signed.to_unsigned_version()`. The old "return signed" was wrong for `1LL + 1UL`.
+17. **`__builtin_cpu_supports` must fold from an exact allowlist** (`PRESENT` const at `expr_builtins.rs:453`) — the old "return 1 for everything except avx512" produced SIGILL paths on non-v3 CPUs.
+18. **`usual_arithmetic_conversion` else-arm must use `size` comparison** (`types.rs:1586`) — `signed_ty.size() > unsigned_ty.size() ? signed : signed.to_unsigned_version()`. The old "return signed" was wrong for `1LL + 1UL`.
+19. **Do not delete `graph_coloring.rs`** — it is sound infrastructure blocked by RA-23. Wire it into Tier 2 after the accumulator blocker is fixed (P0-01b).
+20. **Do not delete `reg_hint`/`enable_splitting`/`handled` fields** — `reg_hint` wires up as RA-26 (ABI hints), `enable_splitting` is the RA-06 stub, `handled` wires into RA-13 verification.
 
 Kill-switches: `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`, `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`, `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`, `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_LOOP_PIN`, `CCC_NO_VECREG`, `CCC_PGO_WEIGHT_MAX`, `CCC_TRACE_ALLOC`, `CCC_X64_NOHOME_CLASSES`, `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`.
