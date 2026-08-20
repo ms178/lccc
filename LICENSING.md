@@ -34,13 +34,13 @@ See [`LICENSE-CC0-CCC`](./LICENSE-CC0-CCC) for full text.
 **Licensed under**: MIT OR Apache-2.0 OR BSD-2-Clause (your choice)
 
 All code authored as part of LCCC optimization efforts:
-- Register allocation improvements (Phase 1)
-- Optimization tier implementation (Phase 2)
-- Code size reduction passes (Phase 3)
-- DWARF debug information improvements (Phase 4)
-- Linker relocation fixes (Phase 5)
-- Performance benchmarking tools
+- `src/backend/live_range.rs`, RA policy in `src/backend/regalloc.rs`
+- Optimizer / PGO / SIMD / linker work under `src/`
+- `tests/benchmark/` runners (not third-party kernel *bodies*)
+- Documentation under `docs/` and `lccc-improvements/`
 - Any new modules or major rewrites
+
+Paths are `src/…`. There is no `ccc/` submodule and no `linear_scan.rs`.
 
 **What this means**:
 - You pick ONE of three licenses for each contribution
@@ -88,15 +88,11 @@ When you modify existing CCC files to add improvements:
 
 **Example structure**:
 ```rust
-// File: ccc/src/backend/regalloc.rs
+// File: src/backend/regalloc.rs
 //
-// Original CCC code: Lines 1-247, 318-573
-// Licensed under: CC0 1.0 Universal
-//
-// LCCC improvements: Lines 248-317 (linear scan integration)
-// Licensed under: MIT (or your choice)
-
-// ... code ...
+// Original CCC code: CC0 1.0 Universal
+// LCCC waves / coalescing / XMM / i686 policy: MIT (or your choice)
+// See `git log --follow` — line numbers from 2026-03 are obsolete.
 ```
 
 ## How to Determine Which License Applies
@@ -140,60 +136,29 @@ For any code in LCCC, ask these questions in order:
 
 ### Example 1: Creating a New Module (Pure LCCC Code)
 
-File: `ccc/src/backend/linear_scan.rs`
+File: `src/backend/live_range.rs`
 
 ```rust
-// NEW MODULE: Linear Scan Register Allocator
+// Linear Scan Register Allocator (scan kernel)
 // Licensed under: MIT
-// 
-// Part of LCCC Phase 1: Register Allocation Improvements
+//
+// Production allocator — not a Week-2 prototype.
 
 pub struct LinearScanAllocator {
     // ...
 }
 ```
 
-**Git commit**:
-```
-[LCCC] Phase 1: Implement linear scan register allocator
-
-New module implementing linear scan allocation algorithm.
-Replaces overly conservative 3-phase allocator.
-
-License: MIT
-```
-
 ### Example 2: Modifying Existing CCC File
 
-File: `ccc/src/backend/regalloc.rs` (originally CC0, now with LCCC modifications)
+File: `src/backend/regalloc.rs` (CCC origin + LCCC policy)
 
 ```rust
-// ORIGINAL CCC CODE (CC0 1.0 Universal)
-// Lines 1-247: Value eligibility checks
-// Lines 318-573: Support functions
-
-// LCCC ADDITION (MIT)
-// Lines 248-317: Linear scan integration
-// 
-// New code to hook linear scan allocator while keeping
-// compatibility with existing 3-phase algorithm.
-// Can be disabled via feature flag.
-
-fn run_linear_scan_allocator(...) {
-    // ...
-}
+// ORIGINAL CCC CODE (CC0 1.0 Universal): eligibility helpers, PhysReg
+// LCCC ADDITION (MIT): allocate_registers waves, coalescing, XMM, i686
 ```
 
-**Git commit**:
-```
-[LCCC] Phase 1: Integrate linear scan allocator into regalloc.rs
-
-Added linear scan integration point in existing regalloc.rs.
-Original CCC code remains CC0, new integration code MIT.
-Feature flag allows fallback to original 3-phase algorithm.
-
-License: MIT (for new code only)
-```
+There is **no** feature-flag fallback to the 574-line 3-phase greedy allocator.
 
 ### Example 3: Major Rewrite of Existing File
 
@@ -210,7 +175,7 @@ Option A - Keep both licenses:
 Option B - Replace entirely with new module:
 ```rust
 // This module was deprecated and replaced by:
-// ccc/src/backend/new_improved_module.rs
+// src/backend/<new_module>.rs
 // 
 // If you need original CCC code, see git history
 ```
@@ -317,11 +282,10 @@ license = "MIT OR Apache-2.0 OR BSD-2-Clause"
 **A**: Document in commit messages and file headers:
 
 ```rust
-// File: ccc/src/backend/regalloc.rs
+// File: src/backend/regalloc.rs
 //
 // Original CCC code: CC0 1.0 Universal
-// LCCC additions by Alice (2026): MIT
-// LCCC improvements by Bob (2026): MIT
+// LCCC additions: MIT (or Apache/BSD)
 // See git log for detailed attribution
 ```
 

@@ -32,6 +32,16 @@ are documented in [`tests/benchmark/WORKLOAD_PROVENANCE.md`](tests/benchmark/WOR
 
 See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
 
+## Current documentation
+
+Live docs (August 2026): `docs/getting-started.md`, `docs/architecture.md`,
+`docs/register-allocator.md`, `lccc-improvements/register-allocation/`
+(including `VALIDATION_ZLIB_GZIP_EXPAT.md`). `docs/history/` and
+`lccc-improvements/benchmarks/BENCHMARK_RESULTS*.md` are archives.
+Canonical bench: `tests/benchmark/run_benchmarks.py`. Repo:
+https://github.com/ms178/lccc
+
+
 # LCCC Performance Report
 
 > **Screening evidence.** Wall-clock, best-of-3, checksums verified against a

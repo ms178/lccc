@@ -16,9 +16,9 @@ LCCC uses a dual-license model to clearly separate original contributions from C
 
 All code authored as part of LCCC — new files, substantial rewrites, benchmark tools, documentation — is licensed under your choice of:
 
-- **MIT** — [`LICENSE-MIT`](https://github.com/levkropp/lccc/blob/master/LICENSE-MIT)
-- **Apache 2.0** — [`LICENSE-APACHE`](https://github.com/levkropp/lccc/blob/master/LICENSE-APACHE)
-- **BSD 2-Clause** — [`LICENSE-BSD`](https://github.com/levkropp/lccc/blob/master/LICENSE-BSD)
+- **MIT** — [`LICENSE-MIT`](https://github.com/ms178/lccc/blob/master/LICENSE-MIT)
+- **Apache 2.0** — [`LICENSE-APACHE`](https://github.com/ms178/lccc/blob/master/LICENSE-APACHE)
+- **BSD 2-Clause** — [`LICENSE-BSD`](https://github.com/ms178/lccc/blob/master/LICENSE-BSD)
 
 This includes:
 - `src/backend/live_range.rs` — `LinearScanAllocator` / `LiveRange`
