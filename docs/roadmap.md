@@ -12,7 +12,11 @@ next_page:
 
 # Roadmap
 {:.doc-subtitle}
-LCCC improves CCC in twenty phases. Phases 1–20 are complete.
+LCCC improves CCC in twenty numbered phases (1–20 + PGO8–11 **complete** as history). **That is not “done vs GCC.”**
+
+**Current (2026-08-20):** linear-scan RA is production; gzip `longest_match` still **118 vs 0** stack-mem vs GCC; Adler kernel **1.49×**; Expat scan **1.95×**. See `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md` and `hotspots/RESEARCH_BACKLOG.md`.
+
+Geomean-on-micros faster than GCC does **not** imply codecs/parsers are won.
 
 ## Status Overview
 
@@ -342,7 +346,7 @@ kernels). The A/B methodology, raw numbers, and per-kernel ratios live in
 | Source | Gap | Addressable? |
 |--------|-----|-------------|
 | Accumulator-based codegen | ~1.2–1.5× on ALU-heavy code | Partial — MachInst ISel expansion narrowed it; full block-level MachInst remains |
-| Graph-coloring register allocation | ~1.1× on register-pressure code | Future (regalloc rewrite) |
+| Register allocation quality (remat, segments, second-chance) | gzip `longest_match` 118 vs 0 stack-mem; inflate 15× | **Open** — not a from-scratch rewrite; see RA backlog |
 | Call-heavy / outlined-code overhead | ~1.2× where the base inliner is conservative | In progress — PGO force-inline + inlining cost-model refinements |
 | Link-time optimization (LTO) | ~1.1× general | Future |
 | Instruction scheduling | ~1.1× on latency-bound code | Future |

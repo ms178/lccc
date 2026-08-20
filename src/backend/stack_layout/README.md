@@ -1,5 +1,10 @@
 # stack_layout/
 
+Homes for values the **register allocator did not assign**. RA itself is
+`regalloc.rs` / `live_range.rs`; live docs:
+`lccc-improvements/register-allocation/`. `graph_coloring.rs` is greedy
+interval coloring of **8-byte stack slots**, not Chaitin GPRs.
+
 Stack frame layout: determines which IR values get stack slots and where.
 
 ## Why this exists

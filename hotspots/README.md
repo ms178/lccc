@@ -50,6 +50,10 @@ to regenerate them must stay in the repository.
 
 ## Current entries
 
+- [`../lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`](../lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md)
+  — 2026-08-20 screening: gzip `longest_match` 118 vs 0 stack-mem; Adler 1.49×;
+  Expat scan 1.95×; inflate 15× stack-mem. Status: `screening` / `root-caused`
+  for remat+GOT and Adler DO8 spills.
 - [`RESEARCH_BACKLOG.md`](RESEARCH_BACKLOG.md) — prioritized, evidence-linked
   optimization queue (now including the integrated profile-guided optimization
   items and new

@@ -1,13 +1,11 @@
 # CCC Design Document
 
-> **Scope note (2026-08-15):** this document describes the architecture of
-> the CCC BASE that LCCC forked from. It is kept as the reference for the
-> shared pipeline structure; LCCC-specific subsystems added since the fork
-> (PGO, MachInst lowering, SIMD infrastructure, the multi-phase register
-> allocator, the GNU-linker-script engine / `lccc-ld`) are documented in
-> `docs/` (architecture.md, optimization-passes.md, register-allocator.md,
-> simd-audit.md) and the per-module `src/**/README.md` files, which are the
-> authoritative, maintained sources.
+> **Scope note (2026-08-20):** this document describes the **CCC base
+> pipeline**. It is not a live map of LCCC RA (waves, segments, XMM,
+> split_ranges) or of `-O` tiers. Authoritative:
+> `docs/architecture.md`, `docs/register-allocator.md`,
+> `src/passes/README.md`, `src/backend/README.md` (RA subsection lags;
+> prefer `lccc-improvements/register-allocation/`).
 
 This document describes the architecture and implementation of CCC
 (Claude's C Compiler). For building, usage, and status information, see

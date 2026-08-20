@@ -1,23 +1,30 @@
-Register Allocator Improvements
-===============================
+Register allocator (current vs remaining)
+=========================================
 
-The three-phase linear scan allocator is implemented on all four backends:
-- x86-64: rbx, r12-r15 (callee) + r11, r10, r8, r9 (caller) = 9 registers
-- AArch64: x20-x28 (callee) + x13, x14 (caller) = 11 registers
-- RISC-V: s1, s7-s11 (callee) = 6 registers
-- i686: ebx, esi, edi (callee) = 3 registers
+Shipped (do not re-implement March 2026 linear-scan-from-scratch):
+- live_range.rs LinearScanAllocator + eviction modes 0/1/2/3/5
+- Hole-aware call-span (segments)
+- Copy-group + phi latch coalescing
+- Multi-wave caller-saved + call_arg / r10 exclusion
+- i686 ecx/edx/eax homes
+- XMM/NEON second class + fail-closed 128-bit vecreg
+- split_ranges IR pre-pass (timid, fail-closed)
+- AArch64 folded-index liveness + loop-pin
 
-Liveness analysis uses backward dataflow iteration with loop awareness.
-ARM skips variadic functions to avoid callee-save/VA-save area conflicts.
+Validated 2026-08-20 vs GCC -O2 (see VALIDATION_ZLIB_GZIP_EXPAT.md):
+- gzip longest_match: 118 stack-mem vs 0 (GOT + 248 B frame)
+- zlib-ng Adler kernel 1.49× (sum2/n spilled in DO8)
+- Expat xmltok 12× stack-mem; inflate 15×
+- gzip CRC 1.47× is NOT a spill problem (2 vs 0 stack-mem)
 
-Remaining improvements:
-1. Eliminate write-through: skip the stack store when the value is
-   register-allocated and has no other readers.
-2. Register-to-register operations: emit ops directly on callee-saved
-   registers instead of routing through the accumulator.
-3. Spill/reload insertion: move values between registers and stack at
-   optimal points instead of falling back to the stack slot.
-4. Call-clobber handling: insert saves around clobbering instructions
-   instead of bailing out for functions with inline asm or atomics.
-5. ARM variadic support: handle callee-save area placement relative
-   to VA register save areas.
+Remaining (ranked):
+1. Remat + RIP-relative file-scope (window, prev, strstart, CRC tables).
+2. Next-use eviction: keep loop-carried sums; kill consumed byte temps.
+3. Segment-aware scan / stronger split_ranges (tokenizer, inflate).
+4. Call-site save/restore vs always callee-saved (doProlog).
+5. Reload-at-next-use (Wimmer). future_uses exists; codegen does not insert reloads.
+6. Affinity coalescing instead of disjoint-only merge.
+7. Residual Briggs coloring; GPR→XMM spill cache (ICX-class).
+8. Write-through skip; pressure feedback to inliner.
+
+Do not enable CCC_EVICT_MODE=5 or CCC_PGO_WEIGHT_MAX>1 without gzip numbers.

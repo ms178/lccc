@@ -21,9 +21,9 @@ All code authored as part of LCCC — new files, substantial rewrites, benchmark
 - **BSD 2-Clause** — [`LICENSE-BSD`](https://github.com/levkropp/lccc/blob/master/LICENSE-BSD)
 
 This includes:
-- `ccc/src/backend/live_range.rs` — the `LinearScanAllocator` and `LiveRange` data structures
-- Changes to `ccc/src/backend/regalloc.rs` — the two-pass activation
-- `lccc-improvements/benchmarks/bench.py` and benchmark C sources
+- `src/backend/live_range.rs` — `LinearScanAllocator` / `LiveRange`
+- Changes to `src/backend/regalloc.rs` — waves, coalescing, XMM, i686
+- `tests/benchmark/` kernels and `lccc-improvements/register-allocation/` docs
 - All documentation (`docs/`, `index.html`, `_layouts/`, etc.)
 
 ## CCC-Derived Code
@@ -40,7 +40,7 @@ CCC was itself released as CC0 by Anthropic.
 
 ## Mixed Files
 
-Some files in `ccc/src/backend/regalloc.rs` contain both CCC-original code and LCCC additions. In these files:
+Some files in `src/backend/regalloc.rs` contain both CCC-original code and LCCC additions. In these files:
 - Code present before LCCC's first commit is CC0
 - Code added or substantially rewritten by LCCC is MIT/Apache/BSD
 

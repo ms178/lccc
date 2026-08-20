@@ -1,3 +1,5 @@
+> **Archive.** Point-in-time write-up. Not current architecture, RA, or benchmark policy. See `docs/architecture.md`, `docs/register-allocator.md`, `lccc-improvements/register-allocation/`, `docs/history/README.md`.
+
 ---
 layout: doc
 title: "Phase 5: Floating-Point Peephole Optimization"

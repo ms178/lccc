@@ -12,13 +12,17 @@ next_page:
 
 # Optimization Passes
 {:.doc-subtitle}
-LCCC inherits CCC's full optimizer. All optimization levels (`-O0` through `-O3`, `-Os`, `-Oz`) run the same pipeline — by design.
+LCCC inherits CCC's optimizer. **Tiers are real** (authoritative: `src/passes/README.md`):
 
-## Why One Pipeline?
+- `-O0`: skip the pipeline except mandatory inline-asm symbol resolution
+- `-O1`: mem2reg, constant folding, copy-prop, DCE
+- `-O2`: full scalar/IPO pipeline
+- `-O3`: `-O2` plus size-increasing unroll
+- `-Os` / `-Oz`: size; `-Oz` also disables inlining
 
-Having separate optimization tiers creates distinct code paths through the optimizer. Bugs that only appear at `-O2` can hide for months if most testing uses `-O0`. CCC and LCCC prioritize correctness over partial speedups: by always running all passes, every test exercises the full optimizer, and divergences are caught early.
+Older text that claimed “all `-O` levels run the same pipeline” is **obsolete**.
 
-The `-O` flags still control the `__OPTIMIZE__` and `__OPTIMIZE_SIZE__` preprocessor macros, which some projects (like the Linux kernel) use for conditional compilation.
+The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `#ifdef`s.
 
 ## Pass Order
 
@@ -114,8 +118,8 @@ Replaces `idiv`/`div` instructions (20–90 cycle latency on modern CPUs) with m
 For debugging, individual passes can be disabled:
 
 ```bash
-CCC_DISABLE_PASSES="gvn,licm" ./target/release/ccc input.c -o output
-CCC_DISABLE_PASSES="all"      ./target/release/ccc input.c -o output
+CCC_DISABLE_PASSES="gvn,licm" ./target/fastbuild/lccc input.c -o output
+CCC_DISABLE_PASSES="all"      ./target/fastbuild/lccc input.c -o output
 ```
 
 Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`.
@@ -123,7 +127,7 @@ Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`,
 Timing data is available via:
 
 ```bash
-CCC_TIME_PASSES=1 ./target/release/ccc input.c -o output 2>&1 | grep PASS
+CCC_TIME_PASSES=1 ./target/fastbuild/lccc input.c -o output 2>&1 | grep PASS
 ```
 
 ## LCCC-Specific Passes
@@ -153,7 +157,7 @@ TCE runs once after inlining, before the main optimization loop, so that LICM, I
 
 **Pass name:** `tce` (disable with `CCC_DISABLE_PASSES=tce`)
 
-**Implementation:** [`src/passes/tail_call_elim.rs`](https://github.com/levkropp/lccc/blob/master/src/passes/tail_call_elim.rs)
+**Implementation:** [`src/passes/tail_call_elim.rs`](https://github.com/ms178/lccc/blob/main/src/passes/tail_call_elim.rs)
 
 ### Phi-Copy Stack Slot Coalescing (backend)
 

@@ -4,7 +4,8 @@ Developer and research tooling. None of these are needed to build LCCC.
 
 | Script | Purpose |
 |---|---|
-| `build_lccc_o1_j2.sh` | Build the compiler under the project policy: Rust opt-level 1, exactly two Cargo jobs, swap active. |
+| `build_lccc_fast.sh` | Incremental `fastbuild` profile (opt-level 1, no LTO). Use for RA/codegen loops. |
+| `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active. |
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 4 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
