@@ -39,6 +39,68 @@ pub fn run_regalloc_and_merge_clobbers(
 /// (folded global addresses) and the ABI argument registers present in the
 /// caller-saved pool; see RegAllocConfig::never_materialized /
 /// RegAllocConfig::call_arg_regs / RegAllocConfig::indirect_target_regs.
+fn collect_abi_reg_hints(
+    func: &IrFunction,
+    available_regs: &[PhysReg],
+    caller_saved_regs: &[PhysReg],
+) -> FxHashMap<u32, PhysReg> {
+    let mut hints = FxHashMap::default();
+    if std::env::var_os("CCC_NO_ABI_REG_HINTS").is_some() {
+        return hints;
+    }
+    if func.uses_sret
+        || func.params.iter().any(|param| {
+            param.struct_size.is_some()
+                || param.ty.is_float()
+                || param.ty.is_long_double()
+                || matches!(param.ty, IrType::I128 | IrType::U128)
+        })
+    {
+        return hints;
+    }
+
+    // Restrict this first implementation to signatures where parameter index
+    // equals integer ABI-slot index. Mixed FP/aggregate signatures require the
+    // full call-ABI classifier and deliberately receive no hint.
+    let mapping: Vec<Option<PhysReg>> = if !crate::common::types::target_is_32bit()
+        && available_regs.iter().any(|r| r.0 == 1)
+        && caller_saved_regs.iter().any(|r| r.0 == 10)
+    {
+        // SysV AMD64: rcx is intentionally unavailable to the allocator.
+        vec![
+            Some(PhysReg(14)), // rdi
+            Some(PhysReg(15)), // rsi
+            Some(PhysReg(16)), // rdx, when the function's scratch audit admits it
+            None,              // rcx
+            Some(PhysReg(12)), // r8
+            Some(PhysReg(13)), // r9
+        ]
+    } else if available_regs.iter().any(|r| r.0 == 19)
+        && caller_saved_regs.iter().any(|r| r.0 == 4)
+    {
+        // AArch64's current caller pool opens x4..x8. x0..x3 remain scratch.
+        vec![None, None, None, None, Some(PhysReg(4)), Some(PhysReg(5)),
+             Some(PhysReg(6)), Some(PhysReg(7))]
+    } else {
+        return hints;
+    };
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::ParamRef { dest, param_idx, .. } = inst else {
+                continue;
+            };
+            let Some(Some(reg)) = mapping.get(*param_idx) else {
+                continue;
+            };
+            if available_regs.contains(reg) || caller_saved_regs.contains(reg) {
+                hints.insert(dest.0, *reg);
+            }
+        }
+    }
+    hints
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_regalloc_and_merge_clobbers_ex(
     func: &IrFunction,
@@ -187,11 +249,13 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     } else {
         Vec::new()
     };
+    let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
     let config = super::super::regalloc::RegAllocConfig {
         available_regs, caller_saved_regs, call_arg_regs, indirect_target_regs,
         allow_inline_asm_regalloc, xmm_regs,
         never_materialized: never_materialized.unwrap_or_default(),
         folded_index_uses,
+        reg_hints,
     };
     // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).
     let alloc_result = if std::env::var("CCC_NO_REGALLOC").is_ok() {

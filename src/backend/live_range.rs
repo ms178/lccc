@@ -177,6 +177,12 @@ fn debug_assert_uses_sorted(uses: &[u32]) {
 #[derive(Debug, Clone)]
 pub struct ActiveInterval {
     pub range: LiveRange,
+    /// Physical register occupied by this interval. Retained after eviction so
+    /// `handled` can verify the complete assignment history.
+    pub phys_reg: PhysReg,
+    /// Last program point for which this interval occupied `phys_reg`. This is
+    /// shortened to the incoming range's start when the value is evicted.
+    pub occupancy_end: u32,
     /// First use at or after the assignment point. Informational / API;
     /// eviction recomputes against the *current* scan position.
     pub next_use: Option<u32>,
@@ -580,8 +586,11 @@ impl LinearScanAllocator {
         // First point at which the register is free again. Saturating:
         // a range ending at u32::MAX must not wrap to 0 and look free.
         self.occupy_register(reg, range.end.saturating_add(1));
+        let occupancy_end = range.end;
         self.active.push(ActiveInterval {
             range,
+            phys_reg: reg,
+            occupancy_end,
             next_use: Some(next),
         });
     }
@@ -621,7 +630,8 @@ impl LinearScanAllocator {
 
         let mut incoming = incoming;
         incoming.cascade = evicted_cascade.saturating_add(1);
-        let evicted = self.active.swap_remove(evict_idx);
+        let mut evicted = self.active.swap_remove(evict_idx);
+        evicted.occupancy_end = incoming.start;
         self.handled.push(evicted);
         self.commit_assignment(incoming, reg);
         true
@@ -663,6 +673,50 @@ impl LinearScanAllocator {
         });
         for range in ranges {
             self.allocate_range(range);
+        }
+        if std::env::var_os("CCC_VERIFY_REGALLOC").is_some() {
+            self.verify_handled_history();
+        }
+    }
+
+    /// Validate the actual register-occupancy history, including ranges that
+    /// expired or were evicted and therefore disappeared from final
+    /// `assignments`. `occupancy_end` records the eviction cut point, so legal
+    /// lifetime demotion is distinguished from a true overlapping assignment.
+    fn verify_handled_history(&self) {
+        let mut by_reg: FxHashMap<PhysReg, Vec<(u32, u32, u32)>> = FxHashMap::default();
+        for interval in self.handled.iter().chain(self.active.iter()) {
+            if interval.occupancy_end <= interval.range.start {
+                continue;
+            }
+            by_reg.entry(interval.phys_reg).or_default().push((
+                interval.range.start,
+                interval.occupancy_end,
+                interval.range.value_id,
+            ));
+        }
+        for (reg, intervals) in &mut by_reg {
+            intervals.sort_unstable();
+            let mut previous: Option<(u32, u32, u32)> = None;
+            for &(start, end, value) in intervals.iter() {
+                if let Some((prev_start, prev_end, prev_value)) = previous {
+                    assert!(
+                        start >= prev_end,
+                        "linear-scan history overlap: r{} v{}[{}, {}) vs v{}[{}, {})",
+                        reg.0,
+                        prev_value,
+                        prev_start,
+                        prev_end,
+                        value,
+                        start,
+                        end
+                    );
+                    if end <= prev_end {
+                        continue;
+                    }
+                }
+                previous = Some((start, end, value));
+            }
         }
     }
 }
@@ -1195,10 +1249,14 @@ mod tests {
         a.occupy_register(PhysReg(1), 101);
         a.active.push(ActiveInterval {
             range: lr(1, 0, 100, vec![0, 15, 100], 1),
+            phys_reg: PhysReg(0),
+            occupancy_end: 100,
             next_use: None,
         });
         a.active.push(ActiveInterval {
             range: lr(2, 0, 100, vec![0, 80, 100], 2),
+            phys_reg: PhysReg(1),
+            occupancy_end: 100,
             next_use: None,
         });
         let incoming = lr(3, 10, 50, vec![10, 50], 100);

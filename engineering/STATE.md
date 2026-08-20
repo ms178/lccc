@@ -1,14 +1,14 @@
 # Current compiler state
 
-SHA at last doc refresh: **`35a6b88`** (`ms178/lccc` main, PR #154). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
+SHA at last doc refresh: **`50e7ac83`** (`ms178/lccc` main, PR #155; current patch rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
 
 ## What is production
 
 - **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full / `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md`).
-- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). Not a 3-phase greedy allocator. No `linear_scan.rs`.
+- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). Session 31 adds i686 residual segment coloring, ABI physical hints, safe masked-index homes, spill explain output, and hard final/history verification. No `linear_scan.rs`.
 - **Liveness** `src/backend/liveness.rs` — worklist backward dataflow (no `MAX_ITERATIONS` cap). Produces both fat `intervals` and hole-aware `segments`. `segments` is consumed by `regalloc.rs` for call-spanning detection and interval extension (lines 571, 785); the linear scan itself still runs on fat `intervals`.
 - **SROA** `aggregate_sroa.rs` load-forward + chain collapse **on**. Copy-out **off** (`CCC_SROA_COPYOUT` hangs tests).
-- **Alias** `alias.rs` (128 LOC) — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` only. LICM does **not** yet use it for GEP loads (`licm.rs:750` TODO).
+- **Alias** `alias.rs` — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` and now LICM; the shared resolver supports checked Shl scaling. LICM models ordinary stores and fails closed on calls, atomics, memcpy, inline asm, intrinsic writes, or unresolved forms.
 - **FMA** scalar `vfmadd231sd` and vector `vfmadd231pd` **emitters exist**. Auto-vectorize of non-reduction loops and FMA-in-vector-body are the remaining gaps.
 - **YMM memcpy** exists in `memory.rs`. By-value struct ABI still shuttles `double` through `%rax` (`struct_copy` 21× vs GCC).
 - **MachInst** ISel/emit path exists; **disabled** when loop insts > 32 (`CCC_MI_MAX_LOOP_INSTS`) because the local scheduler **regressed gzip ~3%**. The `machinst_regalloc.rs` module (635 LOC) is **dead code** (zero callers, soundness bug in `rewrite_machinsts` RAX-clobber) — delete only this file (P0-01).
@@ -42,18 +42,18 @@ Not all dead code should be deleted. Some is sound infrastructure blocked by a h
 
 | Item | LOC | Verdict | Rationale |
 |---|---|---|---|
-| `machinst_regalloc.rs` | 635 | **DELETE (P0-01a)** | Zero callers; `rewrite_machinsts` routes all spills through RAX (clobbers if both src+dst spilled — soundness bug); two-RAs-fighting design — MachInst path piggy-backs on main RA via `resolve_stack_vregs` (`emit.rs:2998`) |
-| `graph_coloring.rs` | 131 | **KEEP — wire after RA-23 (P0-01b)** | Sound interval-graph-coloring algorithm; blocked by `immediately_consumed` accumulator cache; real win for switch-heavy code (sqlite VdbeExec: O(N)→O(1) slots); upgrade to `liveness.segments` for hole-aware coloring |
-| `reg_hint: Option<PhysReg>` | field | **WIRE UP as RA-26** | `follow_value` can't cover ABI-mandated registers (ParamRef→%rdi, sret→%rdi, return→%rax); field + read path (`find_free_register:295`) + `register_compatible` all exist — just needs populator in `build_live_ranges` |
-| `enable_splitting: bool` | field | **KEEP (RA-06 stub)** | Not dead code — unimplemented feature stub; becomes the gate when reload-at-next-use (RA-06) lands |
-| `handled: Vec<ActiveInterval>` | field | **WIRE INTO RA-13** | Eviction-chain verification; write O(1) per expiry/eviction, read only in debug; `verify_no_overlap` should check `handled` for co-holder overlaps |
+| `machinst_regalloc.rs` | 635 | **DELETED (P0-01a DONE)** | Zero callers and unsound RAX-only spill rewrite; live MachInst ISel/emit remains on main RA |
+| `graph_coloring.rs` | rewritten | **KEPT/PERFECTED, BLOCKED** | Exact-size hole-aware segment coloring with conservative closed boundaries, wired under `CCC_ENABLE_TIER2_GRAPH`; broad fuzz proves RA-23 must land before default enable |
+| `reg_hint: Option<PhysReg>` | field | **WIRED (RA-26 DONE)** | Conservative scalar non-sret SysV/AArch64 ParamRef hints; mixed ABI signatures fail closed and `follow_value` wins |
+| `enable_splitting: bool` | field | **KEPT (RA-06 stub)** | Gate remains for reload-at-next-use implementation |
+| `handled: Vec<ActiveInterval>` | field | **WIRED (RA-13 DONE)** | Records physical register and eviction cut point; full occupancy history hard-verifies under `CCC_VERIFY_REGALLOC` |
 
 ## Hard blockers for RA improvements
 
 1. **`immediately_consumed`** (`stack_layout/copy_coalescing.rs:1328` `compute_immediately_consumed` + `is_safe_sole_consumer`) hard-codes the accumulator codegen's operand load order. Any RA change placing a "would-be immediately consumed" value in a non-accumulator register will miscompile. Must be refactored to RA-owned accumulator hint before RA can own placement (RA-23).
 2. **`SlotAddr::Indirect(StackSlot(0))` dummy** (`state.rs:844`) for register-homed values. Every Indirect codepath must check `reg_assignments` first — convention, not enforced. New codepaths that forget silently read offset 0 (return address / saved RBP). Add `SlotAddr::Reg(PhysReg)` variant (RA-24).
 3. **Lifetime demotion** (`live_range.rs:26-27`): "There is no reload-at-next-use in this module." 3-5× spill traffic vs LLVM. `segments` infrastructure is built but the scan doesn't use it for splitting (RA-05/RA-06).
-4. **`verify_no_overlap` is `eprintln!`-only** (`regalloc.rs:1757`) — non-aborting, O(n²), uses fat `intervals` not `segments`. Promote to `debug_assert!` (RA-13).
+4. **RA-13 DONE:** final assignments are verified with coalesce/phi equivalence classes and hole-aware O(n log n) sweeps; `handled` additionally verifies actual register occupancy through expiration/eviction cut points. `CCC_VERIFY_REGALLOC` hard-aborts.
 
 ## Dual pipelines (do not "just enable")
 

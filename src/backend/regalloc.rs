@@ -15,7 +15,7 @@ use super::liveness::{
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PhysReg(pub u8);
@@ -66,6 +66,10 @@ pub struct RegAllocConfig {
     /// check_gpr_leaf_param_codegen::pointer_mix when applied globally —
     /// session-23 audit of the Agent-B patch).
     pub folded_index_uses: FxHashMap<u32, Vec<u32>>,
+    /// ABI-preferred homes (e.g. an incoming ParamRef already in `%rdi`).
+    /// Hints never override `follow_value` and are honored only when the
+    /// physical register belongs to the current allocation wave.
+    pub reg_hints: FxHashMap<u32, PhysReg>,
 }
 
 fn env_on(name: &'static str) -> bool {
@@ -83,6 +87,50 @@ fn interval_map(liveness: &LivenessResult) -> FxHashMap<u32, (u32, u32)> {
 
 fn intervals_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
     a.0 < b.1 && b.0 < a.1
+}
+
+/// Linear merge-style interference test for sorted hole-aware segment sets.
+/// Uses the allocator's half-open boundary convention: one value dying at the
+/// exact point another is born may hand the register directly to it.
+fn segment_sets_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (mut ai, mut bi) = (0usize, 0usize);
+    while ai < a.len() && bi < b.len() {
+        if intervals_overlap(a[ai], b[bi]) {
+            return true;
+        }
+        if a[ai].1 <= b[bi].0 {
+            ai += 1;
+        } else {
+            bi += 1;
+        }
+    }
+    false
+}
+
+/// Merge two sorted segment sets into a normalized union. Adjacent pieces are
+/// combined: no candidate can use the zero-width boundary between them.
+fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
+    let mut all: Vec<(u32, u32)> = Vec::with_capacity(into.len() + added.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < into.len() || j < added.len() {
+        let next = if j == added.len() || (i < into.len() && into[i] <= added[j]) {
+            let value = into[i];
+            i += 1;
+            value
+        } else {
+            let value = added[j];
+            j += 1;
+            value
+        };
+        if let Some(last) = all.last_mut() {
+            if next.0 <= last.1 {
+                last.1 = last.1.max(next.1);
+                continue;
+            }
+        }
+        all.push(next);
+    }
+    *into = all;
 }
 
 /// Live *across* a clobber: defined before it, used after it.
@@ -193,6 +241,86 @@ fn bump_coalesce_group_priority(
 /// into a reload of the base register (memcmp/adler32 spilled their pointer
 /// params, +35/+40 bytes). Rank these values by the largest loop weight their
 /// interval touches instead — the fold makes them live-and-read throughout.
+fn apply_physical_reg_hints(
+    ranges: &mut [crate::backend::live_range::LiveRange],
+    hints: &FxHashMap<u32, PhysReg>,
+) {
+    for range in ranges {
+        // Dataflow coalescing is stronger than an ABI preference: overwriting
+        // `follow_value` would reintroduce producer/consumer copies.
+        if range.follow_value.is_none() {
+            range.reg_hint = hints.get(&range.value_id).copied();
+        }
+    }
+}
+
+fn collect_safe_folded_index_homes(
+    func: &IrFunction,
+    folded_index_uses: &FxHashMap<u32, Vec<u32>>,
+) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ty: IrType::I32 | IrType::U32,
+            } = inst
+            else {
+                continue;
+            };
+            if !folded_index_uses.contains_key(&dest.0) {
+                continue;
+            }
+            let mask = match (lhs, rhs) {
+                (Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64(),
+                _ => None,
+            };
+            // Byte-table indexes are canonicalized by the mask itself and
+            // have no Copy/phi materialization ambiguity. Broader hidden-index
+            // homes remain blocked on RA-23 (phi_cfg_fuzz catches them).
+            if mask.is_some_and(|value| (0..=255).contains(&value)) {
+                result.insert(dest.0);
+            }
+        }
+    }
+    result
+}
+
+fn bump_folded_index_priority(
+    ranges: &mut [crate::backend::live_range::LiveRange],
+    folded_index_uses: &FxHashMap<u32, Vec<u32>>,
+    safe_homes: &FxHashSet<u32>,
+) {
+    if env_on("CCC_NO_INDEX_HOME") {
+        return;
+    }
+    for range in ranges {
+        if !safe_homes.contains(&range.value_id) {
+            continue;
+        }
+        let Some(consumers) = folded_index_uses.get(&range.value_id) else {
+            continue;
+        };
+        // The folded Load/Store reads the index outside the visible IR use
+        // chain. Rank it by loop frequency and number of folded consumers so a
+        // one-use mask/index does not lose its home to transient temporaries.
+        // One indexed home removes the complete scale/address materialization
+        // chain (typically Cast+Shl+LEA) in addition to the memory access. Give
+        // it a 64x structural benefit multiplier, analogous to a multi-use hot
+        // value rather than a one-use temporary.
+        let weight = live_range::loop_depth_weight(range.loop_depth)
+            .saturating_mul(consumers.len().max(1) as u64)
+            .saturating_mul(64);
+        if weight > range.priority {
+            range.priority = weight;
+            range.calculate_spill_weight();
+        }
+    }
+}
+
 fn bump_gep_base_priority(
     ranges: &mut [crate::backend::live_range::LiveRange],
     liveness: &LivenessResult,
@@ -685,8 +813,19 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     remove_ineligible_operands(func, &mut eligible, config);
+    let safe_folded_index_homes =
+        collect_safe_folded_index_homes(func, &config.folded_index_uses);
     for v in &config.never_materialized {
-        eligible.remove(v);
+        // A value that is immediately consumed by a Cast/Copy may also be the
+        // natural index of a later backend-folded memory access. That hidden
+        // use is absent from the immediate-consumer analysis: denying a home
+        // forces the backend to rematerialize shift+LEA+load and prevents SIB/
+        // indexed addressing. Keep it eligible; folded-index liveness extends
+        // the value to the actual access and the emitter folds only when a
+        // physical home was assigned.
+        if env_on("CCC_NO_INDEX_HOME") || !safe_folded_index_homes.contains(v) {
+            eligible.remove(v);
+        }
     }
 
     let x86_ordered_param_copies = !is_32bit
@@ -815,6 +954,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         &merged_of,
         &coalesce_member_of,
     );
+    let build_gpr_ranges = |intervals: &[LiveInterval]| {
+        let mut ranges =
+            live_range::build_live_ranges(intervals, &liveness.block_loop_depth, func);
+        apply_physical_reg_hints(&mut ranges, &config.reg_hints);
+        bump_folded_index_priority(
+            &mut ranges,
+            &config.folded_index_uses,
+            &safe_folded_index_homes,
+        );
+        ranges
+    };
 
     // Phase 1: callee-saved for values live across a call. GlobalAddr /
     // LabelAddr addresses are NOT excluded: codegen has no rematerialisation
@@ -870,8 +1020,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .copied()
         .filter(|iv| call_spanning.contains(&iv.value_id) || hot_loop_home(iv))
         .collect();
-    let mut phase1_ranges =
-        live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
+    let mut phase1_ranges = build_gpr_ranges(&phase1_intervals);
     bump_coalesce_group_priority(&mut phase1_ranges, &coalesce_groups, &use_count);
     bump_gep_base_priority(&mut phase1_ranges, &liveness);
     let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
@@ -928,7 +1077,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges =
-                    live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
+                    build_gpr_ranges(&intervals);
                 let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
@@ -945,11 +1094,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 let phase2_intervals: Vec<LiveInterval> =
                     scan_ivs.iter().copied().filter(|iv| base_ok(&assignments, iv)).collect();
                 if !phase2_intervals.is_empty() {
-                    let phase2_ranges = live_range::build_live_ranges(
-                        &phase2_intervals,
-                        &liveness.block_loop_depth,
-                        func,
-                    );
+                    let phase2_ranges = build_gpr_ranges(&phase2_intervals);
                     let mut caller_allocator =
                         LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
                     caller_allocator.run();
@@ -998,7 +1143,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| later_arg_values.contains(&iv.value_id))
                     .collect();
                 if !w1.is_empty() && !no_arg_no_indirect_pool.is_empty() {
-                    let ranges = live_range::build_live_ranges(&w1, &liveness.block_loop_depth, func);
+                    let ranges = build_gpr_ranges(&w1);
                     let mut alloc = LinearScanAllocator::new(ranges, no_arg_no_indirect_pool);
                     alloc.run();
                     for (vid, reg) in &alloc.assignments {
@@ -1021,7 +1166,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| !later_arg_values.contains(&iv.value_id))
                     .collect();
                 if !w2.is_empty() && !no_indirect_pool.is_empty() {
-                    let ranges = live_range::build_live_ranges(&w2, &liveness.block_loop_depth, func);
+                    let ranges = build_gpr_ranges(&w2);
                     let mut alloc = LinearScanAllocator::new(ranges, no_indirect_pool);
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in &alloc.assignments {
@@ -1044,7 +1189,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| !indirect_arg_values.contains(&iv.value_id))
                     .collect();
                 if !w3.is_empty() && !no_arg_pool.is_empty() {
-                    let ranges = live_range::build_live_ranges(&w3, &liveness.block_loop_depth, func);
+                    let ranges = build_gpr_ranges(&w3);
                     let mut alloc = LinearScanAllocator::new(ranges, no_arg_pool);
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in &alloc.assignments {
@@ -1067,7 +1212,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| !indirect_arg_values.contains(&iv.value_id))
                     .collect();
                 if !w4.is_empty() {
-                    let ranges = live_range::build_live_ranges(&w4, &liveness.block_loop_depth, func);
+                    let ranges = build_gpr_ranges(&w4);
                     let mut alloc = LinearScanAllocator::new(ranges, config.caller_saved_regs.clone());
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in alloc.assignments {
@@ -1097,11 +1242,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .copied()
                 .collect();
             if !free_callee.is_empty() {
-                let mut phase2c_ranges = live_range::build_live_ranges(
-                    &phase2c_intervals,
-                    &liveness.block_loop_depth,
-                    func,
-                );
+                let mut phase2c_ranges = build_gpr_ranges(&phase2c_intervals);
                 // A coalesced leader carries only its own uses in the range
                 // metadata, so a param merged with a loop-carried copy would
                 // look like a single-use value and lose the callee-saved
@@ -1222,7 +1363,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges =
-                    live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
+                    build_gpr_ranges(&intervals);
                 let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
@@ -1354,7 +1495,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         if !intervals.is_empty() {
             let ranges =
-                live_range::build_live_ranges(&intervals, &liveness.block_loop_depth, func);
+                build_gpr_ranges(&intervals);
             let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
             alloc.run();
             for (vid, r) in alloc.assignments {
@@ -1362,6 +1503,155 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 caller_used_regs_set.insert(r.0);
             }
             propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+        }
+    }
+
+    // Phase 2f (i686): fill holes in ALREADY-SAVED callee registers using the
+    // CFG-aware liveness segments. The primary scan deliberately retains one
+    // fat [def,last_use] interval per value, which is simple but makes values
+    // on mutually-exclusive diamond/switch arms interfere. Liveness already
+    // computes exact conservative segments for call classification; use those
+    // segments here as a no-eviction residual coloring step.
+    //
+    // This phase cannot add a callee-save push/pop: its pool is restricted to
+    // registers already present in used_regs_set. It cannot displace an
+    // existing home either. A previously slotted value gets a register only
+    // when none of its segments intersects current occupancy. Thus the
+    // treatment is monotonic in register capacity and fail-closed when a value
+    // lacks segment data (its fat interval is used as fallback).
+    if !env_on("CCC_NO_SEGMENT_FILL")
+        && is_32bit
+        && config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5))
+        && !used_regs_set.is_empty()
+    {
+        let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
+
+        let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        for seg in &liveness.segments {
+            let owner = owner_of(seg.value_id);
+            owned_segments.entry(owner).or_default().push((seg.start, seg.end));
+        }
+        // Coalesced members can contribute overlapping/adjacent pieces. Merge
+        // them so the interference test remains linear and deterministic.
+        for pieces in owned_segments.values_mut() {
+            pieces.sort_unstable();
+            let source = std::mem::take(pieces);
+            insert_segment_union(pieces, &source);
+        }
+        for iv in &scan_ivs {
+            owned_segments
+                .entry(iv.value_id)
+                .or_insert_with(|| vec![(iv.start, iv.end)]);
+        }
+
+        // Collapse current holders to one sorted occupancy set per register.
+        // Testing candidates against owner-by-owner vectors is quadratic on
+        // sqlite-sized CFGs; the union makes each query independent of the
+        // number of SSA holders.
+        let mut occupied_by_reg: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut seen_holders: FxHashSet<(u8, u32)> = FxHashSet::default();
+        for (&value, &reg) in &assignments {
+            if !used_regs_set.contains(&reg.0) {
+                continue;
+            }
+            let owner = owner_of(value);
+            if seen_holders.insert((reg.0, owner)) {
+                if let Some(segments) = owned_segments.get(&owner) {
+                    occupied_by_reg.entry(reg.0).or_default().extend(segments);
+                }
+            }
+        }
+        for occupied in occupied_by_reg.values_mut() {
+            occupied.sort_unstable();
+            let source = std::mem::take(occupied);
+            insert_segment_union(occupied, &source);
+        }
+
+        let group_pressure = |value: u32| -> u64 {
+            let own = use_count.get(&value).copied().unwrap_or(0);
+            let group = coalesce_groups.get(&value).map_or(0, |members| {
+                members
+                    .iter()
+                    .map(|m| use_count.get(m).copied().unwrap_or(0))
+                    .sum()
+            });
+            own.max(group)
+        };
+
+        // Stack-layout copy aliases may intentionally suppress a Copy's
+        // materialization. Assigning such a destination only at this late RA
+        // phase creates a register home the alias layer never populates
+        // (alias_fuzz_m32 seed 3 caught exactly this). Ordinary producers are
+        // authoritative; defer Copy webs to the dedicated coalescers until the
+        // location model is unified.
+        let copy_dests: FxHashSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| match inst {
+                Instruction::Copy { dest, .. } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
+        let mut candidates: Vec<(u64, u32, u32)> = scan_ivs
+            .iter()
+            .filter(|iv| !assignments.contains_key(&iv.value_id))
+            .filter(|iv| !copy_dests.contains(&iv.value_id))
+            .map(|iv| {
+                (
+                    group_pressure(iv.value_id),
+                    iv.end.saturating_sub(iv.start),
+                    iv.value_id,
+                )
+            })
+            .collect();
+        // Hot/high-use values first; for equal pressure prefer shorter
+        // envelopes because they consume fewer holes and admit more followers.
+        candidates.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+        });
+
+        let pool: Vec<PhysReg> = config
+            .available_regs
+            .iter()
+            .copied()
+            .filter(|r| used_regs_set.contains(&r.0))
+            .collect();
+        let mut added = 0usize;
+        for (_, _, value) in candidates {
+            let Some(candidate_segments) = owned_segments.get(&value) else {
+                continue;
+            };
+            let Some(reg) = pool.iter().copied().find(|reg| {
+                occupied_by_reg
+                    .get(&reg.0)
+                    .is_none_or(|occupied| !segment_sets_overlap(candidate_segments, occupied))
+            }) else {
+                continue;
+            };
+            if env_on("CCC_DEBUG_SEGMENT_FILL") {
+                eprintln!(
+                    "[RA-SEGMENT-FILL] fn={} v{} group={:?} segs={:?} -> r{} occupied={:?}",
+                    func.name,
+                    value,
+                    coalesce_groups.get(&value),
+                    candidate_segments,
+                    reg.0,
+                    occupied_by_reg.get(&reg.0)
+                );
+            }
+            assignments.insert(value, reg);
+            insert_segment_union(
+                occupied_by_reg.entry(reg.0).or_default(),
+                candidate_segments,
+            );
+            added += 1;
+        }
+        if added != 0 {
+            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+        }
+        if env_on("CCC_DEBUG_SEGMENT_FILL") {
+            eprintln!("[RA-SEGMENT-FILL] fn={} added={}", func.name, added);
         }
     }
 
@@ -1721,7 +2011,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     used_regs.sort_by_key(|r| r.0);
 
     if env_on("CCC_VERIFY_REGALLOC") {
-        verify_no_overlap(&liveness, &assignments);
+        verify_no_overlap(
+            &liveness,
+            &assignments,
+            &coalesce_member_of,
+            &all_phi_pairs,
+        );
     }
 
     // Session-28 debug: per-value home census (register vs slot) for one
@@ -1746,6 +2041,46 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    if let Ok(filter) = std::env::var("CCC_RA_EXPLAIN") {
+        if filter.is_empty() || filter == "*" || func.name.contains(&filter) {
+            let mut segment_count: FxHashMap<u32, usize> = FxHashMap::default();
+            for segment in &liveness.segments {
+                *segment_count.entry(segment.value_id).or_insert(0) += 1;
+            }
+            let mut spills: Vec<LiveInterval> = scan_ivs
+                .iter()
+                .copied()
+                .filter(|iv| !assignments.contains_key(&iv.value_id))
+                .collect();
+            spills.sort_unstable_by_key(|iv| (iv.start, iv.value_id));
+            eprintln!(
+                "[RA-EXPLAIN] fn={} spills={} assigned={} fat-values={}",
+                func.name,
+                spills.len(),
+                assignments.len(),
+                scan_ivs.len()
+            );
+            for iv in spills {
+                let reason = if call_spanning.contains(&iv.value_id) {
+                    "callee-pressure"
+                } else if param_restricted.contains(&iv.value_id) {
+                    "parameter-restricted"
+                } else {
+                    "hazard-or-register-pressure"
+                };
+                eprintln!(
+                    "[RA-EXPLAIN] spill v{} range=[{},{}] segments={} uses={} reason={}",
+                    iv.value_id,
+                    iv.start,
+                    iv.end,
+                    segment_count.get(&iv.value_id).copied().unwrap_or(0),
+                    use_count.get(&iv.value_id).copied().unwrap_or(0),
+                    reason
+                );
+            }
+        }
+    }
+
     RegAllocResult {
         assignments,
         used_regs,
@@ -1754,28 +2089,111 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 }
 
-fn verify_no_overlap(liveness: &LivenessResult, assignments: &FxHashMap<u32, PhysReg>) {
-    let mut reg_intervals: FxHashMap<u8, Vec<(u32, u32, u32)>> = FxHashMap::default();
-    for iv in &liveness.intervals {
-        if let Some(&reg) = assignments.get(&iv.value_id) {
-            reg_intervals
-                .entry(reg.0)
-                .or_default()
-                .push((iv.start, iv.end, iv.value_id));
+/// Verify the final assignment against hole-aware liveness in O(n log n).
+///
+/// Copy/coalesce and proven phi-destructive-update classes intentionally share
+/// one register even where their raw SSA ranges touch; collapse each such
+/// equivalence class before checking. Every other overlap is a hard allocator
+/// bug. This runs only under `CCC_VERIFY_REGALLOC`, so a failure must abort
+/// rather than print a warning that automated validation can miss.
+fn verify_no_overlap(
+    liveness: &LivenessResult,
+    assignments: &FxHashMap<u32, PhysReg>,
+    coalesce_member_of: &FxHashMap<u32, u32>,
+    phi_pairs: &[PhiCoalesceCandidate],
+) {
+    fn find(parent: &mut FxHashMap<u32, u32>, value: u32) -> u32 {
+        let mut root = value;
+        while parent.get(&root).copied().is_some_and(|p| p != root) {
+            root = parent[&root];
+        }
+        let mut current = value;
+        while parent.get(&current).copied().is_some_and(|p| p != root) {
+            let next = parent[&current];
+            parent.insert(current, root);
+            current = next;
+        }
+        root
+    }
+    fn unite(parent: &mut FxHashMap<u32, u32>, a: u32, b: u32) {
+        parent.entry(a).or_insert(a);
+        parent.entry(b).or_insert(b);
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent.insert(rb, ra);
         }
     }
-    for (&reg_id, intervals) in &reg_intervals {
-        for i in 0..intervals.len() {
-            for j in (i + 1)..intervals.len() {
-                let (s1, e1, v1) = intervals[i];
-                let (s2, e2, v2) = intervals[j];
-                if s1 < e2 && s2 < e1 {
-                    eprintln!(
-                        "[REGALLOC-OVERLAP] reg={} val{}[{}-{}] overlaps val{}[{}-{}]",
-                        reg_id, v1, s1, e1, v2, s2, e2
-                    );
+
+    let mut parent: FxHashMap<u32, u32> = assignments.keys().map(|&v| (v, v)).collect();
+    for (&member, &leader) in coalesce_member_of {
+        unite(&mut parent, member, leader);
+    }
+    for pair in phi_pairs {
+        unite(&mut parent, pair.phi_dest, pair.backedge_src);
+    }
+
+    let mut group_segments: FxHashMap<(u8, u32), Vec<(u32, u32)>> = FxHashMap::default();
+    let mut segmented: FxHashSet<u32> = FxHashSet::default();
+    for segment in &liveness.segments {
+        let Some(&reg) = assignments.get(&segment.value_id) else {
+            continue;
+        };
+        segmented.insert(segment.value_id);
+        let rep = find(&mut parent, segment.value_id);
+        group_segments
+            .entry((reg.0, rep))
+            .or_default()
+            .push((segment.start, segment.end));
+    }
+    // Synthetic values can be absent from `segments`; preserve the verifier's
+    // fail-closed behavior with their fat interval.
+    for interval in &liveness.intervals {
+        if segmented.contains(&interval.value_id) {
+            continue;
+        }
+        let Some(&reg) = assignments.get(&interval.value_id) else {
+            continue;
+        };
+        let rep = find(&mut parent, interval.value_id);
+        group_segments
+            .entry((reg.0, rep))
+            .or_default()
+            .push((interval.start, interval.end));
+    }
+
+    let mut by_reg: FxHashMap<u8, Vec<(u32, u32, u32)>> = FxHashMap::default();
+    for ((reg, rep), pieces) in &mut group_segments {
+        pieces.sort_unstable();
+        let source = std::mem::take(pieces);
+        insert_segment_union(pieces, &source);
+        by_reg
+            .entry(*reg)
+            .or_default()
+            .extend(pieces.iter().map(|&(start, end)| (start, end, *rep)));
+    }
+
+    for (reg, events) in &mut by_reg {
+        events.sort_unstable();
+        let mut previous: Option<(u32, u32, u32)> = None;
+        for &(start, end, rep) in events.iter() {
+            if let Some((prev_start, prev_end, prev_rep)) = previous {
+                assert!(
+                    start >= prev_end,
+                    "register-allocation overlap: r{} class v{}[{}, {}) vs class v{}[{}, {})",
+                    reg,
+                    prev_rep,
+                    prev_start,
+                    prev_end,
+                    rep,
+                    start,
+                    end
+                );
+                if end <= prev_end {
+                    continue;
                 }
             }
+            previous = Some((start, end, rep));
         }
     }
 }
@@ -3415,6 +3833,18 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
 mod phi_coalesce_tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+
+    #[test]
+    fn segment_interference_preserves_holes_and_half_open_handoffs() {
+        assert!(!segment_sets_overlap(&[(1, 3), (8, 10)], &[(3, 8)]));
+        assert!(!segment_sets_overlap(&[(1, 5)], &[(5, 9)]));
+        assert!(segment_sets_overlap(&[(1, 5), (9, 12)], &[(4, 7)]));
+        assert!(segment_sets_overlap(&[(1, 2), (6, 9)], &[(3, 7)]));
+
+        let mut occupied = vec![(1, 3), (8, 10)];
+        insert_segment_union(&mut occupied, &[(3, 5), (6, 8), (12, 14)]);
+        assert_eq!(occupied, vec![(1, 5), (6, 10), (12, 14)]);
+    }
 
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock {

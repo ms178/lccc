@@ -27,7 +27,7 @@
 //! Address-taken allocas (used in GEP, passed to calls, etc.) are never hoisted
 //! because stores through derived pointers may not be tracked in `stored_allocas`.
 
-use super::loop_analysis::{self, NaturalLoop};
+use super::{alias, loop_analysis::{self, NaturalLoop}};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
@@ -673,6 +673,80 @@ fn analyze_loop_memory(
     }
 }
 
+struct LoopAliasInfo {
+    forms: FxHashMap<u32, alias::LinForm>,
+    stores: Vec<(alias::LinForm, i64)>,
+    complete: bool,
+}
+
+fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopAliasInfo {
+    let mut def_block = FxHashMap::default();
+    let mut defs = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                def_block.insert(dest.0, block_idx);
+                defs.insert(dest.0, inst);
+            }
+        }
+    }
+    let frames = alias::LoopFrames {
+        def_block,
+        frames: vec![(natural_loop.header, natural_loop.body.clone())],
+        block_frame: vec![alias::NO_FRAME; func.blocks.len()],
+    };
+
+    let mut pointer_values = FxHashSet::default();
+    let mut store_specs = Vec::new();
+    let mut complete = true;
+    for &block_idx in &natural_loop.body {
+        for inst in &func.blocks[block_idx].instructions {
+            match inst {
+                Instruction::Load { ptr, .. } => {
+                    pointer_values.insert(*ptr);
+                }
+                Instruction::Store { ptr, ty, .. } => {
+                    pointer_values.insert(*ptr);
+                    store_specs.push((*ptr, ty.size() as i64));
+                }
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::AtomicRmw { .. }
+                | Instruction::AtomicCmpxchg { .. }
+                | Instruction::AtomicStore { .. }
+                | Instruction::Memcpy { .. }
+                | Instruction::InlineAsm { .. }
+                | Instruction::Intrinsic { dest_ptr: Some(_), .. } => {
+                    complete = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut forms = FxHashMap::default();
+    for pointer in pointer_values {
+        if let Some(form) = alias::resolve_in_frame(func, &defs, &frames, 0, pointer) {
+            forms.insert(pointer.0, form);
+        }
+    }
+    let mut stores = Vec::new();
+    for (pointer, size) in store_specs {
+        let Some(form) = forms.get(&pointer.0).cloned() else {
+            complete = false;
+            continue;
+        };
+        stores.push((form, size));
+    }
+    if std::env::var_os("CCC_DEBUG_LICM_ALIAS").is_some() {
+        eprintln!(
+            "[LICM-ALIAS] fn={} header={} forms={:?} stores={:?} complete={}",
+            func.name, natural_loop.header, forms, stores, complete
+        );
+    }
+    LoopAliasInfo { forms, stores, complete }
+}
+
 /// Check if a Load instruction is safe to hoist from a loop.
 ///
 /// A load is safe to hoist if:
@@ -690,6 +764,8 @@ fn is_load_hoistable(
     invariant: &FxHashSet<u32>,
     global_addr_values: &FxHashSet<u32>,
     value_to_base_global: &FxHashMap<u32, u32>,
+    alias_info: &LoopAliasInfo,
+    load_size: i64,
 ) -> bool {
     let ptr_id = ptr.0;
 
@@ -745,10 +821,22 @@ fn is_load_hoistable(
         return true;
     }
 
-    // For other non-alloca pointers (e.g., GEP results), we cannot easily
-    // determine safety without alias analysis. Be conservative.
-    // TODO: Implement alias analysis for GEP-based loads
-    false
+    // GEP/derived pointer: use the shared loop-linear-form engine. Every
+    // memory write in the loop must be modeled, and each modeled store must be
+    // provably disjoint in this exact loop frame. An empty store set is safe
+    // when there are no calls/unmodeled writes.
+    if std::env::var_os("CCC_NO_LICM_ALIAS").is_some()
+        || !alias_info.complete
+        || loop_mem.has_calls
+    {
+        return false;
+    }
+    let Some(load_form) = alias_info.forms.get(&ptr_id) else {
+        return false;
+    };
+    alias_info.stores.iter().all(|(store_form, store_size)| {
+        alias::forms_disjoint(load_form, load_size, store_form, *store_size, true)
+    })
 }
 
 /// Hoist loop-invariant instructions from a natural loop to a preheader.
@@ -859,6 +947,7 @@ fn hoist_loop_invariants(
         &global_addr_values,
         &value_to_base_alloca,
     );
+    let alias_info = build_loop_alias_info(func, natural_loop);
 
     // Iteratively identify loop-invariant instructions.
     // An instruction is loop-invariant if:
@@ -959,7 +1048,7 @@ fn hoist_loop_invariants(
                         }
                     }
                     all_invariant
-                } else if let Instruction::Load { ptr, volatile, .. } = inst {
+                } else if let Instruction::Load { ptr, ty, volatile, .. } = inst {
                     // Volatile loads must execute exactly as written: hoisting
                     // one out of its loop changes the number of observable
                     // accesses (C11 5.1.2.3).
@@ -972,6 +1061,8 @@ fn hoist_loop_invariants(
                         &invariant,
                         &global_addr_values,
                         &value_to_base_global,
+                        &alias_info,
+                        ty.size() as i64,
                     )
                 } else {
                     false
