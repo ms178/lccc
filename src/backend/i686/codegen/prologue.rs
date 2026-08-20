@@ -254,14 +254,15 @@ impl I686Codegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, never_materialized, Vec::new(), Vec::new(),
-            // i686 re-materialises skipped indexed GEPs (default
-            // emit_load_indexed = false): no RA-invisible index consumption.
-            // It DOES fold constant-offset GEPs with register bases
-            // (const_offset_fold_reg_base_ok), whose base is consumed at the
-            // Load/Store position: extend the base's interval to the
-            // consumer so the address register survives intervening calls
-            // and value staging.
-            crate::backend::generation::collect_gep_fold_base_links(func),
+            // i686 emits SIB indexed addressing directly at the Load/Store
+            // (session 27) AND folds constant-offset GEPs with register
+            // bases (const_offset_fold_reg_base_ok): BOTH forms consume
+            // address registers RA-invisibly at the access position.
+            // collect_folded_gep_links_all extends the base intervals of
+            // const-offset folds plus base AND index intervals of indexed
+            // folds to their consumers, so the address registers survive
+            // intervening calls and accumulator staging.
+            crate::backend::generation::collect_folded_gep_links_all(func),
         );
 
         // %ebx must be saved/restored only when it really holds the GOT base.
