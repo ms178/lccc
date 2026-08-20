@@ -10,8 +10,11 @@
 #     /home/user/artifacts (persisted).
 #   * Writes are atomic (write to .tmp, fsync, rename) so a wipe/kill in the
 #     middle of a save can never leave a truncated deliverable.
-#   * The canonical deliverable /home/user/ms178-1.patch is refreshed on every
-#     call, so at any instant the workspace holds the complete session work.
+#   * The canonical deliverable /home/user/ms178-1.patch and independent root
+#     mirror /home/user/ms178-1.latest.patch are refreshed on every call.
+#   * /home/user/ms178-1.manifest pins base/head/size/SHA-256/apply verdict.
+#   * The latest upstream/main base is enforced, and an invalid/empty patch is
+#     a hard error rather than a misleading successful snapshot.
 #   * A machine-readable ledger records what each save contains.
 #
 # Usage:  ./lccc-snapshot.sh "<slug>" "<one-line description>"
@@ -22,6 +25,8 @@ REPO=${LCCC_REPO:-/home/user/lccc}
 ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BASE_REF_FILE="$ART/.base_ref"
 DELIVERABLE=/home/user/ms178-1.patch
+ROOT_MIRROR=/home/user/ms178-1.latest.patch
+MANIFEST=/home/user/ms178-1.manifest
 LEDGER="$ART/SNAPSHOT_LEDGER.md"
 
 slug=${1:-snapshot}
@@ -43,6 +48,21 @@ if [[ -f "$BASE_REF_FILE" ]]; then
 else
   BASE=$(git rev-parse HEAD)
   printf '%s\n' "$BASE" > "$BASE_REF_FILE"
+fi
+
+# Refuse to manufacture a patch against a stale base. This fetch is cheap and
+# turns the user's "latest main" requirement into an enforced invariant rather
+# than a session convention. Set LCCC_SNAPSHOT_SKIP_FETCH=1 only for an
+# explicitly offline recovery.
+if [[ ${LCCC_SNAPSHOT_SKIP_FETCH:-0} != 1 ]]; then
+  git fetch -q upstream main
+fi
+if git rev-parse --verify -q refs/remotes/upstream/main >/dev/null; then
+  upstream=$(git rev-parse refs/remotes/upstream/main)
+  if [[ $BASE != "$upstream" ]]; then
+    echo "error: snapshot base $BASE is not latest upstream/main $upstream; rebase first" >&2
+    exit 1
+  fi
 fi
 
 # ---- commit any pending work ------------------------------------------------
@@ -70,6 +90,7 @@ if [[ "$HEAD_SHA" != "$BASE" ]]; then
 else
   : | atomic_write "$DELIVERABLE"
 fi
+cp -f "$DELIVERABLE" "$ROOT_MIRROR"
 cp -f "$DELIVERABLE" "$ART/ms178-1.patch"
 cp -f "$DELIVERABLE" "$ART/ms178-1.${tag}.patch"
 
@@ -119,6 +140,35 @@ if [[ "$bytes" -gt 0 ]]; then
   rm -rf "$tmpd"
 fi
 
+# A snapshot that cannot restore is worse than no snapshot because it creates
+# false confidence. Fail hard after preserving the evidence for diagnosis.
+if [[ $verdict != APPLIES-CLEAN ]]; then
+  echo "error: refusing invalid snapshot: $verdict ($bytes bytes)" >&2
+  exit 1
+fi
+
+sha256=$(sha256sum "$DELIVERABLE" | awk '{print $1}')
+{
+  printf 'schema=1\n'
+  printf 'utc=%s\n' "$stamp"
+  printf 'tag=%s\n' "$tag"
+  printf 'base=%s\n' "$BASE"
+  printf 'head=%s\n' "$HEAD_SHA"
+  printf 'bytes=%s\n' "$bytes"
+  printf 'sha256=%s\n' "$sha256"
+  printf 'verdict=%s\n' "$verdict"
+} | atomic_write "$MANIFEST"
+cp -f "$MANIFEST" "$ART/ms178-1.manifest"
+
+# Arena persists at most roughly 10k files. Generated kernel/fuzz trees are
+# reproducible and must not crowd the canonical patch out of the snapshot.
+# This warning is intentionally visible on every save above the safety margin.
+persist_files=$(find /home/user -xdev -type f \
+  ! -path '/home/user/lccc/target/*' ! -path '/home/user/.cache/*' 2>/dev/null | wc -l)
+if (( persist_files > 8000 )); then
+  echo "warning: workspace has $persist_files persistable files (8k safety limit); prune generated kernel/fuzz outputs" >&2
+fi
+
 # Flush only the snapshot products. A process-wide `sync` also waits for every
 # dirty incremental-build object under target/; on this VM that turned a 20 MB
 # snapshot into a 20-minute stall after each build. fsyncing the deliverables
@@ -134,7 +184,8 @@ finally:
     os.close(fd)
 PY
 }
-for saved in "$DELIVERABLE" "$ART/ms178-1.patch" \
+for saved in "$DELIVERABLE" "$ROOT_MIRROR" "$MANIFEST" \
+             "$ART/ms178-1.patch" "$ART/ms178-1.manifest" \
              "$ART/ms178-1.${tag}.patch" "$ART/lccc-src.tar.gz" \
              "$ART/lccc.bundle" "$LEDGER" "$seq_file"; do
   [[ -e "$saved" ]] && fsync_path "$saved"
@@ -146,4 +197,8 @@ echo "SNAPSHOT $tag"
 echo "  base       : $BASE"
 echo "  head       : $HEAD_SHA"
 echo "  deliverable: $DELIVERABLE ($bytes bytes) [$verdict]"
+echo "  sha256     : $sha256"
+echo "  mirror     : $ROOT_MIRROR"
+echo "  manifest   : $MANIFEST"
+echo "  files      : $persist_files persistable"
 echo "  artifacts  : $ART"

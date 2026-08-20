@@ -82,7 +82,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 11. Do not delete `graph_coloring.rs` — it is sound infrastructure blocked by RA-23 (wire after P0-01b).
 12. Do not delete `reg_hint`/`enable_splitting`/`handled` fields — wire them up (RA-26/RA-06/RA-13).
 
-Kill-switches: `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`, `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`, `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`, `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_LOOP_PIN`, `CCC_NO_VECREG`, `CCC_PGO_WEIGHT_MAX`, `CCC_TRACE_ALLOC`, `CCC_X64_NOHOME_CLASSES`, `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`.
+Kill-switches: `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`, `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`, `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`, `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_SEGMENT_FILL`, `CCC_NO_INDEX_HOME`, `CCC_NO_ABI_REG_HINTS`, `CCC_NO_LICM_ALIAS`, `CCC_ENABLE_TIER2_GRAPH`, `CCC_NO_LOOP_PIN`, `CCC_NO_VECREG`, `CCC_PGO_WEIGHT_MAX`, `CCC_TRACE_ALLOC`, `CCC_X64_NOHOME_CLASSES`, `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`.
 
 ---
 
@@ -94,11 +94,11 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
-| 1 | P0-01a | P0 | **Delete `machinst_regalloc.rs` only** (635 LOC, 0 callers, RAX-clobber soundness bug in `rewrite_machinsts`). Two-RAs-fighting design — MachInst path piggy-backs on main RA via `resolve_stack_vregs` (`emit.rs:2998`) | `x86/codegen/machinst_regalloc.rs`, `x86/codegen/mod.rs` | **C** verified 0 callers at `35a6b88`; `rewrite_machinsts` routes all spills through RAX (clobbers if both src+dst spilled) | `rg "machinst_regalloc" src/backend/` returns 0 | delete `graph_coloring.rs` (blocked on RA-23, keep — P0-01b) |
-| 2 | P0-01b | P1 | **Keep `graph_coloring.rs`** — wire into Tier 2 after RA-23 (when `immediately_consumed` no longer holds a value liveness thinks is dead). Upgrade to `liveness.segments` for hole-aware coloring | `stack_layout/graph_coloring.rs`, `stack_layout/slot_assignment.rs:803` | **C** sound algorithm, 0 callers; blocked by accumulator cache | sqlite VdbeExec: O(N)→O(1) slots | wire before RA-23 lands |
-| 3 | P0-02 | P0 | **Switch `live_range.rs` scan from `intervals` to `segments`** | `live_range.rs`, `regalloc.rs` | **C** `segments` exists, consumed for call-span only (lines 571, 785); scan still fat | xmltok/inflate TU stack-mem drops | change eviction semantics yet |
-| 4 | P0-03 | P0 | **Re-measure gzip `longest_match` stack-mem on `35a6b88`** | `engineering/evidence/` | **C** STATE.md SHA was `b6d0a30` | number in STATE.md | cite older SHA |
-| 5 | P0-04 | P0 | **Wire `alias.rs` into `licm.rs:750`** (replace TODO with `forms_disjoint`) | `licm.rs:750`, `alias.rs` | **C** TODO at line 750 | more hoists, no alias miscompile | invent a second alias engine |
+| 1 | P0-01a | DONE | Deleted only `machinst_regalloc.rs` (635 LOC, zero callers, RAX spill-clobber bug); live MachInst ISel/emit remains on main RA | module + declaration | **C** zero-reference audit | 962 unit tests | delete live MachInst path or graph colorer |
+| 2 | P0-01b | BLOCKED | Resurrected and upgraded `graph_coloring.rs` to exact-size, hole-aware segment coloring with closed spill boundaries; wired under `CCC_ENABLE_TIER2_GRAPH` | graph colorer + Tier 2 | **M** default experiment: huft/sqlite crashes + 166/450 phi mismatches, proving RA-23 blocker | enable by default only after RA-23 + full fuzz | ship enabled now |
+| 3 | P0-02 | PARTIAL | i686 residual segment coloring now fills holes in already-saved callee regs without eviction/new saves; full split scan remains RA-05/06 | `regalloc.rs` | **M** boot C text -1,573 B, stack refs -13.1% | full xmltok/inflate treatment after RA-23 | pretend residual fill is reload-at-next-use |
+| 4 | P0-03 | DONE | Re-measured pinned gzip 1.14 on `50e7ac83` + patch | workload artifacts | **M** 30/30 tests; longest_match LCCC 303 insn/119 stack-mem vs GCC 114/0; treatment equals kill-switch control | numbers recorded in session doc | cite old 118 |
+| 5 | P0-04 | DONE | LICM now uses shared `LinForm`/`forms_disjoint`; resolver gains checked Shl scaling; calls/atomics/unresolved stores fail closed | `licm.rs`, `loop_memory_promote.rs`, `alias.rs` | **M** invariant `a[0]` hoisted across marching `a[i+1]` store; 720 alias + 600 phi cases clean | targeted regression | invent second engine |
 | 6 | P0-05 | P0 | **Sema type-checking** (was FE-01 P1; reprioritized P0 for correctness — "does NOT reject type errors" at `analysis.rs:15` is a silent-wrong-code risk) | `sema/analysis.rs` | **C** line 15 TODO; 13 diagnostics vs ~382 in lowerer | incompatible assignments, wrong arg counts, missing returns rejected in sema | silence lowerer checks first |
 
 ### 5.1 Register allocation — RA-01 … RA-26
@@ -108,7 +108,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 7 | RA-01 | P0 | Remat file-scope `window`/`prev`/`strstart` as `sym(%rip)` / `sym(%rip,idx,1)` not GOT+stack | `globals.rs`, `live_range.rs`, `generation.rs` | **M** 118 stk; **G** gcc `window(%r9,%rcx)` | match-mini CE: 0 GOT, ≤1 push | PIC/TLS still GOT |
 | 8 | RA-02 | P0 | Keep match IVs (`scan`,`best`,`chain`) in GPR | `live_range.rs` next-use | **M** 248 B frame | stack-mem <20 on gzip `longest_match` | eviction mode 5 global |
 | 9 | RA-03 | P0 | Adler DO8: evict dead bytes not `sum2`/`n` | `live_range.rs` `future_uses` | **M** 72(%rsp) in loop; **G** icx 0 stk | Adler kernel ≤1.15× GCC | unify incoming/victim cost blindly |
-| 10 | RA-04 | P0 | `CCC_RA_EXPLAIN=fn` spill dump | `regalloc.rs` | **C** | one line per spill | dump that changes allocation |
+| 10 | RA-04 | DONE | `CCC_RA_EXPLAIN=fn` deterministic spill report: range, segments, weighted uses, reason class | `regalloc.rs` | **C/M** used on current gzip | one line per spill | dump that changes allocation |
 | 11 | RA-05 | P0 | Segment-aware interference (was P1 — `segments` now exists, wire it) | `liveness.rs` segments → scan | **M** xmltok 12× inflate 15× | those ratios <4× | one-home codegen without reloads |
 | 12 | RA-06 | P0 | Reload-at-next-use + in-place splitting (was P1 — #1 perf gap, `segments` unblocks). Gate on `enable_splitting` field (P0-01d — keep, don't delete) | `live_range.rs`, codegen reload | **C** `live_range.rs:26` "no reload-at-next-use" | gzip unregressed, spill traffic -40% | IR volatile alloca dance only |
 | 13 | RA-07 | P1 | Call-site caller-saved save vs always r12 | `regalloc.rs` `caller_save_spans` | **C** Phase 2b slots | use spans more; prologue stk down | promote r11 to callee-saved |
@@ -117,7 +117,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 16 | RA-10 | P2 | GPR spill to XMM | new class | ICX/ICC | gzip gate | clobber SSE ABI |
 | 17 | RA-11 | P1 | One `RangeMetadata` per function | `live_range.rs` | **C** walk × waves | compile time | change eviction semantics |
 | 18 | RA-12 | P1 | Set or delete `exchange_eviction` on 2c | `regalloc.rs` vs `live_range.rs` | **C** drift | gzip A/B | default mode 5 |
-| 19 | RA-13 | P0 | `verify_no_overlap` → `debug_assert!` (was P1 — non-aborting verification is a correctness risk). Also check `handled` (P0-01e) for eviction-chain overlaps | `regalloc.rs:1757` | **C** `eprintln!`-only, O(n²), uses fat `intervals` | debug assert on overlap, abort in debug; `handled`-based eviction-chain check | ship as silent skip |
+| 19 | RA-13 | DONE | Hard hole-aware final verifier plus `handled` occupancy history (`phys_reg`, eviction cut point), O(n log n) | `regalloc.rs`, `live_range.rs` | **C** old print-only verifier missed evicted history | full suites under `CCC_VERIFY_REGALLOC` | ship silent warning |
 | 20 | RA-14 | P2 | Stronger `split_ranges` (phis, multi-exit) — **call-split now works** [DONE] | `split_ranges.rs` | **C** fail-closed | more splits, gzip gate | mem2reg on split slots |
 | 21 | RA-15 | P1 | Param group priority remaining holes | `bump_coalesce_group_priority` | **C** adler/memcmp history | fewer param spills | break SysV arg regs |
 | 22 | RA-16 | P2 | Recalibrate PGO RA weights **after** RA-01 | `pgo_weight_max` | **C** +4.7% gzip at 4 | gzip + kernels | raise max first |
@@ -129,13 +129,13 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 28 | RA-23 | P0 | **Eliminate `immediately_consumed` blocker** — refactor to RA-owned accumulator hint | `stack_layout/copy_coalescing.rs:1328` (`compute_immediately_consumed` + `is_safe_sole_consumer`), `state.rs` | **C** hard-codes accumulator load order; `is_safe_sole_consumer` whitelist (`Store,Cast,UnaryOp,Copy` always; `BinOp,Cmp` only when `lhs_first_binop`) | RA owns accumulator placement; whitelist deleted; unblocks P0-01b (graph_coloring) | break accumulator codegen without differential test |
 | 29 | RA-24 | P0 | **Eliminate `SlotAddr::Indirect(StackSlot(0))` dummy** — add `SlotAddr::Reg(PhysReg)` variant | `state.rs:844` | **C** silent corruption if Indirect codepath forgets `reg_assignments` check | exhaustive match catches misses | migrate all backends at once without tests |
 | 30 | RA-25 | P1 | **Unify `loop_memory_promote`'s `affine_disjoint` with `alias.rs::forms_disjoint`** | `loop_memory_promote.rs`, `alias.rs` | **C** duplicated SCEV-lite engine (1712 LOC + 128 LOC) | one alias engine | break sqlite `sqlite3FpDecode` fix |
-| 31 | RA-26 | P1 | **Wire up `reg_hint` for ABI-mandated registers** (P0-01c) — populate in `build_live_ranges` for `ParamRef`→SysV arg reg, `sret`→`%rdi`, return→`%rax` | `live_range.rs` (`build_live_ranges`), `regalloc.rs` | **C** field (`live_range.rs:73`) + read path (`find_free_register:295`) + `register_compatible` all exist, never populated; `follow_value` can't cover ABI constraints | fewer parameter-copy movs at entry/exit | override `follow_value` hints |
+| 31 | RA-26 | DONE | ABI physical hints populated for provably scalar, non-sret SysV/AArch64 signatures; mixed FP/aggregate signatures fail closed; never override `follow_value` | config + range construction | **M** 180-function sweep -32 text B; best kernel -9 B/3 entry shuffles | regression + kill switch | guess aggregate ABI slots |
 
 ### 5.2 x86 ISel / peephole / MachInst — IS-01 … IS-28
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
-| 32 | IS-01 | P0 | CRC `xor table(,%rcx,4), %eax` | `memory.rs` / ALU | **G** gcc; **M** 1.47× 2 vs 0 stk | SIB in crc kernel | emit `crc32` insn (oracles do not at -O2) |
+| 32 | IS-01 | DONE | Masked byte-table indexes retain a safe hidden home; x86 emits scale-4 SIB table loads | RA hidden-index priority + existing indexed emitters | **M** CRC -12 B/-7 insn, 1.34x vs control, now 1.07x behind GCC | SIB regression + 600 phi fuzz | broad hidden homes before RA-23 |
 | 33 | IS-02 | P0 | Keep `double` fields in XMM; ban `movq %xmm,%rax` roundtrip | `float_ops.rs`, `memory.rs` | **S** 21× struct_copy | mov count ≤40 | keep rax shuttle |
 | 34 | IS-03 | P0 | 64 B assignment → 2× `vmovdqu ymm` | memcpy path **exists**; assignment may not | **G** gcc 7 insns | `copy_s` matches gcc/icx | claim memcpy missing |
 | 35 | IS-04 | P0 | Vectorizer emit `vfmadd231pd` into YMM acc **once** horiz | `vectorize.rs` + `intrinsics.rs` | **G** **icx** not gcc16; spectral ICX FMA 10 | `dot`/spectral CE vs icx | copy gcc16 per-iter hadd |
@@ -168,7 +168,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
-| 60 | OP-01 | P0 | LICM GEP loads via `alias.rs` `forms_disjoint` (merged with P0-04) | `licm.rs:750` | **C** TODO at line 750 vs existing engine | more hoists, no alias miscompile | invent second alias |
+| 60 | OP-01 | DONE | Shared linear-form alias proof wired into LICM with fail-closed store modeling | `licm.rs`, `alias.rs`, `loop_memory_promote.rs` | **M** targeted hoist; full differential clean | regression | model unknown writes |
 | 61 | OP-02 | P1 | Dominator-aware SROA copy-out | `aggregate_sroa.rs` `CCC_SROA_COPYOUT` | **C** hangs 2 tests | those tests + struct_copy | enable flag without proof |
 | 62 | OP-03 | P1 | SROA cross-block memcpy (same-block only now) | same | **C** | more scalarized fields | ignore dominance |
 | 63 | OP-04 | P0 | `vectorize_gate` real cost (trip, size, PGO) | `unroll_pgo.rs:122` | **C** `return true`; **G** clang sieve 365 ymm vs gcc 45 | no 4-iter vec; **no clang-sieve** | copy clang sieve |

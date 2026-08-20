@@ -463,6 +463,28 @@ pub(crate) fn resolve_lin_form(
             _ => None,
         },
         Instruction::BinOp {
+            op: IrBinOp::Shl,
+            lhs: Operand::Value(value),
+            rhs: Operand::Const(amount),
+            ..
+        } => {
+            let shift = amount.to_i64()?;
+            if !(0..64).contains(&shift) {
+                return None;
+            }
+            let scale = 1i64.checked_shl(shift as u32)?;
+            let mut f = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *value, fuel)?;
+            if f.root != 0 {
+                return None;
+            }
+            f.konst = f.konst.checked_mul(scale)?;
+            f.march = f.march.checked_mul(scale)?;
+            for symbol in &mut f.syms {
+                symbol.1 = symbol.1.checked_mul(scale)?;
+            }
+            Some(f)
+        }
+        Instruction::BinOp {
             op: IrBinOp::Mul,
             lhs,
             rhs,

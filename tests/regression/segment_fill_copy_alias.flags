@@ -1,0 +1,1 @@
+-m32 -fno-PIE -no-pie -mno-sse -mno-mmx -O0

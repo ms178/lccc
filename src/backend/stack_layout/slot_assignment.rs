@@ -802,12 +802,15 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         return;
     }
 
-    // Disable Tier 2 liveness-packed slot sharing — always use permanent slots.
-    // The liveness intervals from compute_live_intervals don't perfectly model
-    // the accumulator-based codegen's spill ordering, causing slot collisions
-    // in large functions like SQLite's. Using permanent (non-shared) slots for
-    // multi-block values is safe and the extra stack space is manageable.
-    {
+    // The old implementation permanently disabled Tier-2 sharing because
+    // fat intervals allowed accumulator spill stores to collide in SQLite.
+    // The live graph colorer uses hole-aware segments and conservative CLOSED
+    // boundaries, so same-point hidden stores can never alias. It still cannot
+    // model the accumulator's non-IR materialization lifetime (RA-23): broad
+    // differential testing found huft/sqlite crashes and phi-CFG mismatches.
+    // Keep the improved colorer wired for research, but fail closed by default
+    // until RA-23 makes those hidden lifetimes explicit.
+    if !coalesce || std::env::var_os("CCC_ENABLE_TIER2_GRAPH").is_none() {
         for mbv in multi_block_values {
             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
@@ -816,102 +819,18 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         return;
     }
 
-    // Reuse liveness data from register allocation when available.
     let liveness = cached_liveness.unwrap_or_else(|| compute_live_intervals(func));
-
-    let mut interval_map: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
-    for iv in &liveness.intervals {
-        interval_map.insert(iv.value_id, (iv.start, iv.end));
-    }
-
-    // Separate by slot size for packing (8-byte and 16-byte pools).
-    let mut values_8: Vec<(u32, u32, u32)> = Vec::new();
-    let mut values_16: Vec<(u32, u32, u32)> = Vec::new();
-    let mut no_interval: Vec<(u32, i64)> = Vec::new();
-
-    let mut values_32: Vec<(u32, u32, u32)> = Vec::new();
-    for mbv in multi_block_values {
-        if let Some(&(start, end)) = interval_map.get(&mbv.dest_id) {
-            if mbv.slot_size >= 32 {
-                values_32.push((mbv.dest_id, start, end));
-            } else if mbv.slot_size == 16 {
-                values_16.push((mbv.dest_id, start, end));
-            } else {
-                values_8.push((mbv.dest_id, start, end));
-            }
-        } else {
-            no_interval.push((mbv.dest_id, mbv.slot_size));
-        }
-    }
-
-    pack_values_into_slots(&mut values_8, state, non_local_space, 8, assign_slot);
-    pack_values_into_slots(&mut values_16, state, non_local_space, 16, assign_slot);
-    pack_values_into_slots(&mut values_32, state, non_local_space, 32, assign_slot);
-
-    // Assign permanent slots for values without interval info.
-    for (dest_id, size) in no_interval {
-        let (slot, new_space) = assign_slot(*non_local_space, size, 0);
-        state.value_locations.insert(dest_id, StackSlot(slot));
-        *non_local_space = new_space;
-    }
-}
-
-/// Pack values with known live intervals into shared stack slots using a min-heap.
-/// O(N log S) where N = values and S = slots.
-fn pack_values_into_slots(
-    values: &mut [(u32, u32, u32)],
-    state: &mut crate::backend::state::CodegenState,
-    non_local_space: &mut i64,
-    slot_size: i64,
-    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
-) {
-    if values.is_empty() {
-        return;
-    }
-
-    values.sort_by_key(|&(_, start, _)| start);
-
-    use std::collections::BinaryHeap;
-    use std::cmp::Reverse;
-
-    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
-    let mut slot_offsets: Vec<i64> = Vec::new();
-
-    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
-    for &(dest_id, start, end) in values.iter() {
-        // Protected values (DynAlloca results, vector temps) must get unique slots.
-        // These values hold critical pointers or data that must not be overwritten
-        // by slot reuse, even if liveness analysis suggests they're dead.
-        let can_reuse = !state.protected_slot_values.contains(&dest_id);
-
-        if debug_protect && !can_reuse {
-            eprintln!("[PROTECT-T2] SSA {} is protected, forcing new slot (size={})", dest_id, slot_size);
-        }
-
-        if can_reuse {
-            if let Some(&Reverse((slot_end, slot_idx))) = heap.peek() {
-                if slot_end <= start {
-                    heap.pop();
-                    let slot_offset = slot_offsets[slot_idx];
-                    heap.push(Reverse((end, slot_idx)));
-                    state.value_locations.insert(dest_id, StackSlot(slot_offset));
-                    if debug_protect {
-                        eprintln!("[PROTECT-T2] SSA {} reused slot {}", dest_id, slot_offset);
-                    }
-                    continue;
-                }
-            }
-        }
-        let slot_idx = slot_offsets.len();
-        let (slot, new_space) = assign_slot(*non_local_space, slot_size, 0);
-        state.value_locations.insert(dest_id, StackSlot(slot));
-        if debug_protect {
-            eprintln!("[PROTECT-T2] SSA {} assigned new slot {} (protected={})", dest_id, slot, !can_reuse);
-        }
-        *non_local_space = new_space;
-        slot_offsets.push(slot);
-        heap.push(Reverse((end, slot_idx)));
-    }
+    let values: Vec<(u32, i64)> = multi_block_values
+        .iter()
+        .map(|value| (value.dest_id, value.slot_size))
+        .collect();
+    super::graph_coloring::color_stack_slots(
+        state,
+        &liveness,
+        &values,
+        non_local_space,
+        assign_slot,
+    );
 }
 
 /// Assign final offsets for deferred block-local values. All deferred values
