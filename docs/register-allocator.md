@@ -16,7 +16,7 @@ next_page:
 {:.doc-subtitle}
 Production RA is a **policy-heavy linear scan**, not CCC’s 574-line 3-phase greedy allocator and not the March 2026 “Week 2 plan.”
 
-**Canonical write-up:** [`lccc-improvements/register-allocation/`](https://github.com/ms178/lccc/tree/main/lccc-improvements/register-allocation) — especially `CURRENT_ALLOCATOR_ANALYSIS.md`, `CODE_AUDIT.md`, `WEAKNESSES_AND_BACKLOG.md`, and `VALIDATION_ZLIB_GZIP_EXPAT.md`.
+**Canonical write-up:** [`engineering/subsystems/register-allocation.md`](https://github.com/ms178/lccc/blob/main/engineering/subsystems/register-allocation.md). Work items: [`engineering/agent/BACKLOG.md`](https://github.com/ms178/lccc/blob/main/engineering/agent/BACKLOG.md) (150 highest-ROI). Measurements: [`engineering/evidence/workloads/gzip-zlib-expat.md`](https://github.com/ms178/lccc/blob/main/engineering/evidence/workloads/gzip-zlib-expat.md). `lccc-improvements/register-allocation/` is a stub pointer only.
 
 ## Modules
 
