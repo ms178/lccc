@@ -197,7 +197,15 @@ fn filter_rip_legal_symbols(cg: &dyn ArchCodegen, map: &mut FxHashMap<u32, Strin
 }
 
 fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
-    cg.state_ref().is_alloca(info.base.0) || cg.get_phys_reg_for_value(info.base.0).is_some()
+    // Only fold when the base is an alloca: a stack address is always
+    // re-computable (lea) at the use site.  A base that merely sits in a
+    // register is NOT safe: an intervening call clobbers caller-saved
+    // registers, so folding the GEP into a store AFTER the call would
+    // dereference a dead register (zlib-ng gz_write_init stored
+    // `strm->next_in = NULL` through %r8 which deflateInit2_ had clobbered).
+    // With a register base the GEP is instead generated at its definition
+    // point, where the base pointer is still live.
+    cg.state_ref().is_alloca(info.base.0)
 }
 
 fn can_indexed_addr_fold(cg: &dyn ArchCodegen, info: &IndexedGepInfo) -> bool {
@@ -206,13 +214,13 @@ fn can_indexed_addr_fold(cg: &dyn ArchCodegen, info: &IndexedGepInfo) -> bool {
 }
 
 /// Per-function def / alloca / param facts used by GEP-fold soundness.
-struct BaseStability {
+pub(crate) struct BaseStability {
     is_alloca: FxHashSet<u32>,
     is_param: FxHashSet<u32>,
     def_count: FxHashMap<u32, u32>,
 }
 
-fn analyze_base_stability(func: &IrFunction) -> BaseStability {
+pub(crate) fn analyze_base_stability(func: &IrFunction) -> BaseStability {
     let mut stab = BaseStability {
         is_alloca: FxHashSet::default(),
         is_param: FxHashSet::default(),
@@ -558,6 +566,22 @@ fn retain_used(map: &mut FxHashMap<u32, impl Sized>, use_counts: &[u32]) {
 }
 
 /// Variable-offset GEPs foldable into indexed addressing.
+
+/// Map of folded-GEP INDEX value ids to their consumer GEP-dest value ids
+/// (see RegAllocConfig::folded_index_uses). Derived from the SAME
+/// build_indexed_gep_map the emitter uses, so allocator and emitter can
+/// never disagree about which indices are consumed where.
+pub(crate) fn collect_folded_index_links(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    let mut out: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (dest, info) in &m {
+        out.entry(info.index.0).or_default().push(*dest);
+    }
+    out
+}
+
 fn build_indexed_gep_map(
     func: &IrFunction,
     use_counts: &[u32],
@@ -762,6 +786,15 @@ fn build_gep_fold_map(
     compose_const_gep_folds(&mut gep_map);
     retain_stable_bases(func, use_counts, stab, &mut gep_map);
     propagate_stable_aliases(func, stab, &mut gep_map);
+    // propagate_stable_aliases inserts NEW fold entries (Copy/Cast aliases of
+    // stable folds).  A GEP whose base is one of those newly-added aliases
+    // (e.g. GEP(copy_of_stable, 0) inserted with base = the alias) was not
+    // composed, because composition ran BEFORE the alias existed.  The store
+    // then dereferenced the alias value, which was itself skipped as a folded
+    // address and never materialised -> unmaterialised base register ->
+    // SIGSEGV (zlib-ng gz_write_init `strm->next_in = NULL`).  Re-compose so
+    // every fold's base is a terminal (materialised) value.
+    compose_const_gep_folds(&mut gep_map);
     retain_ptr_only_uses(func, &mut gep_map);
     retain_used(&mut gep_map, use_counts);
 
@@ -1143,7 +1176,7 @@ fn build_global_addr_ptr_set(func: &IrFunction) -> FxHashSet<u32> {
 
 /// Use counts indexed by Value ID. Sized from both defs *and* uses so an
 /// out-of-range operand cannot silently report 0.
-fn count_value_uses(func: &IrFunction) -> Vec<u32> {
+pub(crate) fn count_value_uses(func: &IrFunction) -> Vec<u32> {
     let mut max_id: u32 = 0;
     let bump = |max_id: &mut u32, id: u32| {
         if id > *max_id {
@@ -2440,9 +2473,18 @@ fn generate_function(
             // operand) so GEP(GEP(alloca,c1),c2) is skipped iff the load
             // can fold against alloca+c1+c2.
             if let Some(dest) = inst.dest() {
+                if std::env::var_os("LCCC_DBG_FOLD").is_some() {
+                    eprintln!("[FOLD] inst dest={} in_gep_map={} in_idx_map={} dead_gaddr={}",
+                        dest.0, gep_fold_map.get(&dest.0).is_some(),
+                        indexed_gep_map.get(&dest.0).is_some(),
+                        dead_global_addrs.contains(&dest.0));
+                }
                 if let Some(info) = gep_fold_map.get(&dest.0) {
                     if can_const_addr_fold(cg, info) {
                         cg.state().folded_gep_values.insert(dest.0);
+                        if std::env::var_os("LCCC_DBG_FOLD").is_some() {
+                            eprintln!("[FOLD] SKIPPED dest={} base={} off={}", dest.0, info.base.0, info.offset);
+                        }
                         cg.state().current_program_point += 1;
                         continue;
                     }

@@ -1851,3 +1851,25 @@ codegen-bound (text 32 576 vs the `_end ≤ 0x8000`-derived budget 23 330).
 Added `tests/fuzz/regparm_differential.py` (450/450) covering the
 `-mregparm=3` boot ABI. Oracle preferences (mold `-DMOLD_TARGETS='X86_64;I386'`,
 binutils 2.47 pin, git-HEAD builds) unchanged and re-verified.
+
+## Session-23 addendum (2026-08-20) — Agent-B audit + cross-backend port
+Session 23 audited the Agent-B patch (verdicts in
+`docs/history/2026-08-20-session23-agentB-audit.md`) and shipped the
+lever-1 cross-backend port (x86-64, Return-consumer scope). No linker-side
+changes required this session: lccc-ld's setup.ld ASSERT handling remains
+faithful, boot gate still codegen-bound (text 32 579 vs budget 23 330).
+Oracle preferences re-verified intact: mold `-DMOLD_TARGETS='X86_64;I386'`
+(the user-mandated i686 build preset), binutils pinned to 2.47, git-HEAD
+mold/wild builds with `-march=native`.
+
+## Session-24 addendum (2026-08-20) — Agent-B v2 red-team audit
+Session 24 audited Agent B's v2 revision head-to-head (full audit:
+`docs/history/2026-08-20-session24-agentBv2-redteam-audit.md`). Size
+outcomes are byte-identical on identical scripts (corpus 31 218 B, boot
+32 579 B both trees; v2's "30003/13327" headline uses a different corpus).
+This revision wins on soundness: v2 ships a live fp_die_at_birth miscompile
+(GVN FP CSE) and a PhysReg-id-sniffing ARM gate that overlaps x86-64's XMM
+pool; this revision's per-class x64 nohome audit enables six consumer
+classes (ret/store/copy/cast/unary/binop) with cmp scoped by root cause.
+Linker-side unchanged: lccc-ld setup.ld handling faithful, gate codegen-bound.
+Oracle preferences intact (mold X86_64;I386, binutils 2.47, git-HEAD builds).

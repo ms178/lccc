@@ -58,3 +58,5 @@ lccc_bench_*
 __pycache__/
 *.py[cod]
 /.godbolt-cache/
+agentB*.patch
+agentB*.txt

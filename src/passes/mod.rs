@@ -32,6 +32,9 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_memory_promote;
+pub(crate) mod alias;
+pub(crate) mod redundant_loads;
+pub(crate) mod quadratic_sr;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
@@ -1126,6 +1129,22 @@ macro_rules! preloop_dump {
     if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
         module.for_each_function(loop_memory_promote::run);
         module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+    }
+    // Late redundant-load elimination: post-IVSR field accesses have constant
+    // offsets, so same-address loads merge when intervening stores are
+    // provably non-aliasing (volatile loads are exempt by construction).
+    if !disabled.contains("redundantloads") {
+        module.for_each_function(redundant_loads::run);
+        // Merged loads orphan their (now dead) address computations.
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+    // Second-order strength reduction for slope-1 triangular loop indices
+    // (t(t+1)/2 recurrences): carries the index as two counters instead of
+    // recomputing mul+corrected-div every iteration. Exact: t(t+1) is always
+    // even, so the accumulator is bit-identical including wraparound.
+    if !disabled.contains("quadsr") {
+        module.for_each_function(quadratic_sr::run);
+        module.for_each_function(dce::eliminate_dead_code);
     }
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can

@@ -189,7 +189,7 @@ fn pointer_paths(defs: &FxHashMap<u32, &Instruction>) -> FxHashMap<u32, Path> {
     paths
 }
 
-fn byte_size(ty: IrType) -> Option<i64> {
+pub(crate) fn byte_size(ty: IrType) -> Option<i64> {
     let size = match ty {
         IrType::I8
         | IrType::U8
@@ -298,7 +298,7 @@ fn disjoint(paths: &FxHashMap<u32, Path>, a: Value, a_ty: IrType, b: Value, b_ty
     ae <= pb.offset || be <= pa.offset
 }
 
-fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Value) -> Option<(u32, i64)> {
+pub(crate) fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Value) -> Option<(u32, i64)> {
     let mut cur = start;
     let mut off: i64 = 0;
     let mut seen = FxHashSet::default();
@@ -346,14 +346,14 @@ fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Value) -> Optio
 /// `t` counts iterations of the *current* loop. Checked arithmetic; overflow
 /// refuses the proof (never wraps into a false disjoint).
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct LinForm {
-    root: u64,
-    syms: Vec<(u32, i64)>,
-    konst: i64,
-    march: i64,
+pub(crate) struct LinForm {
+    pub(crate) root: u64,
+    pub(crate) syms: Vec<(u32, i64)>,
+    pub(crate) konst: i64,
+    pub(crate) march: i64,
 }
 
-fn striding_phi(defs: &FxHashMap<u32, &Instruction>, phi_v: Value) -> Option<(Operand, i64)> {
+pub(crate) fn striding_phi(defs: &FxHashMap<u32, &Instruction>, phi_v: Value) -> Option<(Operand, i64)> {
     let Instruction::Phi { incoming, .. } = *defs.get(&phi_v.0)? else {
         return None;
     };
@@ -382,7 +382,7 @@ fn striding_phi(defs: &FxHashMap<u32, &Instruction>, phi_v: Value) -> Option<(Op
     Some((init?, stride))
 }
 
-fn resolve_lin_form(
+pub(crate) fn resolve_lin_form(
     func: &IrFunction,
     defs: &FxHashMap<u32, &Instruction>,
     lp_body: &FxHashSet<usize>,
@@ -566,7 +566,7 @@ fn resolve_lin_form(
     }
 }
 
-fn merge_forms(mut a: LinForm, b: LinForm) -> Option<LinForm> {
+pub(crate) fn merge_forms(mut a: LinForm, b: LinForm) -> Option<LinForm> {
     if a.root != 0 && b.root != 0 {
         return None;
     }
