@@ -1347,8 +1347,20 @@ impl X86Codegen {
                     self.value_to_reg(v, "rax");
                     self.state.reg_cache.set_acc(v.0, is_alloca);
                 } else {
-                    self.state.emit("    xorl %eax, %eax");
-                    self.state.reg_cache.invalidate_acc();
+                    // HARD GATE (session 26): a live operand value with no
+                    // register home, no stack slot and no accumulator-cache
+                    // entry cannot be materialised — this spot used to emit a
+                    // silent `xorl %eax,%eax`, fabricating zero and corrupting
+                    // whatever consumed it (sqlite -O2 sqlite3KeyInfoAlloc:
+                    // p->aSortFlags stored as NULL → SIGSEGV in
+                    // sqlite3KeyInfoFromExprList).  Reaching here means a
+                    // producer/consumer handoff is broken; fail loudly.
+                    panic!(
+                        "x86 codegen: operand_to_rax: value {} in function '{}' \
+                         has no register home, no stack slot and no acc-cache \
+                         entry — refusing to fabricate a value",
+                        v.0, self.state.current_func_name
+                    );
                 }
             }
         }

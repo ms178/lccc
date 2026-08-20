@@ -1506,11 +1506,17 @@ impl X86Codegen {
         if let Some(dp) = dest_phys {
             let dest_name = phys_reg_name(dp);
             self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %{}", base_name, index_name, dest_name));
+            self.state.reg_cache.invalidate_acc();
         } else {
             self.state.emit_fmt(format_args!("    leaq (%{}, %{}), %rax", base_name, index_name));
+            // store_rax_to establishes the acc-cache handoff (it marks dest
+            // as the accumulator content, including the immediately-consumed
+            // no-home case).  Invalidating AFTER it strands the value: the
+            // consumer then finds no cache entry, no register, no slot and
+            // fabricates a value (sqlite -O2 sqlite3KeyInfoAlloc: the
+            // `p->aSortFlags = &p->aColl[N+X]` store read a fabricated 0).
             self.store_rax_to(dest);
         }
-        self.state.reg_cache.invalidate_acc();
     }
 
     pub(super) fn emit_gep_add_const_to_acc_impl(&mut self, offset: i64) {

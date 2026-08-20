@@ -369,6 +369,18 @@ impl I686Codegen {
                         emit!(self.state, "    movl {}, %eax", sr);
                     }
                     self.state.reg_cache.set_acc(v.0, is_alloca);
+                } else {
+                    // i686 acc-flow contract: the accumulator-centric backend
+                    // has paths where a no-home value is consumed DIRECTLY
+                    // from %eax without a cache entry (the producer staged it
+                    // there outside the cache-tracked flow).  The legacy
+                    // behavior is to emit nothing and let the consumer read
+                    // %eax as-is.  (x86-64 has a HARD panic gate in the same
+                    // situation — session 26 — because its cache contract is
+                    // complete; there it caught the sqlite3KeyInfoAlloc and
+                    // sqlite3VdbeExec corruptions.  i686's cache contract is
+                    // not yet complete enough for the gate; hardening it is
+                    // tracked as the i686 acc-cache audit.)
                 }
             }
         }
