@@ -342,9 +342,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     macro_rules! iphase_dump {
         ($name:expr) => {
             if dump_pre {
-                eprintln!("==== IR pre-loop: {} ====", $name);
-                eprintln!("{:#?}", module);
-                eprintln!("==== END IR pre-loop: {} ====", $name);
+                dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
         };
     }
@@ -385,9 +383,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
         }
     }
     if std::env::var("CCC_DUMP_IR").is_ok() || std::env::var("CCC_DUMP_EACH_PASS").is_ok() {
-        eprintln!("==== IR pre-loop: after inliner ====");
-        eprintln!("{:#?}", module);
-        eprintln!("==== END IR pre-loop: after inliner ====");
+        dump_ir_filtered(module, "pre-loop after inliner");
     }
 
     // After inlining, convert extern inline gnu_inline functions to declarations —
@@ -670,17 +666,13 @@ macro_rules! preloop_dump {
                         iter, $name, elapsed, n
                     );
                     if dump_each_pass {
-                        eprintln!("==== IR after iter={} {} ====", iter, $name);
-                        eprintln!("{:#?}", module);
-                        eprintln!("==== END IR after iter={} {} ====", iter, $name);
+                        dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
                     }
                     n
                 } else {
                     let n = $body;
                     if dump_each_pass {
-                        eprintln!("==== IR after iter={} {} ====", iter, $name);
-                        eprintln!("{:#?}", module);
-                        eprintln!("==== END IR after iter={} {} ====", iter, $name);
+                        dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
                     }
                     n
                 }

@@ -472,8 +472,19 @@ impl X86Codegen {
             for block in &func.blocks {
                 let insts = &block.instructions;
                 for (ii, inst) in insts.iter().enumerate() {
-                    if let Instruction::Cmp { dest, .. } = inst {
+                    if let Instruction::Cmp { dest, ty, .. } = inst {
                         if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
+                            continue;
+                        }
+                        // Only scalar-integer compares fuse: emit_cmp routes
+                        // I128/U128 to emit_i128_cmp and floats to
+                        // emit_float_cmp — neither participates in the
+                        // pending_cmp handshake, so fusing them would strand
+                        // the forward chain (consumer reads a boolean that was
+                        // never materialized).
+                        if !ty.is_integer()
+                            || crate::backend::generation::is_wide_int_type(*ty)
+                        {
                             continue;
                         }
                         // Walk forward over Copies that forward the cmp value.
@@ -593,7 +604,13 @@ impl X86Codegen {
                     // ucomisd with a different flag contract (PF for NaN, the
                     // setnp/sete dance) — replaying them as integer cmps
                     // produces wrong selects (simd_sse2_arith regression).
-                    if !cty.is_integer() {
+                    // WIDE (I128) compares are excluded too: emit_cmp routes
+                    // them to emit_i128_cmp, which ignores cmp_replay AND
+                    // could not be replayed by emit_int_cmp_replay_insn
+                    // (multi-instruction 128-bit compare).
+                    if !cty.is_integer()
+                        || crate::backend::generation::is_wide_int_type(cty)
+                    {
                         continue;
                     }
                     // Replay soundness: the operands are re-materialized at the
