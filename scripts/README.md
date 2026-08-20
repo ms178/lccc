@@ -6,7 +6,10 @@ Developer and research tooling. None of these are needed to build LCCC.
 |---|---|
 | `build_lccc_fast.sh` | Incremental `fastbuild` profile (opt-level 1, no LTO). Use for RA/codegen loops. |
 | `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active. |
-| `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 4 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
+| `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
+| `prepare_kernel_tree.sh` | Recreate Linux 6.18.44 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
+| `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC, link with `lccc-ld`, and report the exact 32 KiB `_end` overflow through a non-bootable diagnostic link when the real ASSERT fires. |
+| `realmode_corpus.sh` | Compare LCCC/GCC executable text per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
 | `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Judges LCCC against the *shortest legal encoding any oracle produced*, not against GAS alone. |

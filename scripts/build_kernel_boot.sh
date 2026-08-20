@@ -58,15 +58,49 @@ SETUP_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck early_serial_console
 OBJS=()
 for o in "${SETUP_OBJS[@]}"; do OBJS+=("$OUT/$o.o"); done
 
-echo "LD   setup.elf (lccc-ld)"
-"$LCCC_LD" -m elf_i386 -z noexecstack -T arch/x86/boot/setup.ld \
-    "${OBJS[@]}" -o "$OUT/setup.elf"
+report_layout() { # report_layout <elf>
+  local elf=$1 end_hex end_dec delta
+  echo
+  echo "=== $(basename "$elf") section sizes (bytes) ==="
+  size -A "$elf"
+  echo
+  nm -n "$elf" | grep -E ' (_end|setup_size|setup_sects|__bss_start|__bss_end)$' || true
+  end_hex=$(nm -n "$elf" | awk '$3 == "_end" { print $1; exit }')
+  if [[ -n $end_hex ]]; then
+    end_dec=$((16#$end_hex))
+    delta=$((end_dec - 0x8000))
+    if (( delta <= 0 )); then
+      printf '32 KiB gate: PASS (_end=%d, headroom=%d bytes)\n' "$end_dec" "$((-delta))"
+    else
+      printf '32 KiB gate: FAIL (_end=%d, overflow=%d bytes)\n' "$end_dec" "$delta"
+    fi
+  fi
+}
 
-echo
-echo "=== setup.elf section sizes (bytes) ==="
-size -A "$OUT/setup.elf" 2>/dev/null || true
-end=$(objdump -h "$OUT/setup.elf" 2>/dev/null | awk '/\.text|\.data|\.bss|\.rodata/{s+=$3} END{print s}')
-echo
-echo "NOTE: 32 KiB gate is ASSERT(_end <= 0x8000 = 32768). If lccc-ld emitted no"
-echo "\"Setup too big!\" error above, the gate passed; otherwise the _end value is"
-echo "the overflow to close."
+echo "LD   setup.elf (lccc-ld)"
+if "$LCCC_LD" -m elf_i386 -z noexecstack -T arch/x86/boot/setup.ld \
+    "${OBJS[@]}" -o "$OUT/setup.elf"; then
+  report_layout "$OUT/setup.elf"
+  exit 0
+else
+  link_status=$?
+fi
+
+# A size ASSERT aborts before an ELF exists, which used to leave the developer
+# with no `_end` value and encouraged misleading sums of input sections.  Link
+# a diagnostic artifact after removing ONLY the two size guards; every ABI,
+# header-offset and init-section ASSERT remains active.  This artifact is never
+# a boot candidate.  It exists solely to expose the exact linker-script layout
+# and alignment cliffs (notably `.pecompat` at 4 KiB alignment).
+diag_script="$OUT/setup-size-diagnostic.ld"
+sed -e '/ASSERT(setup_sects <= 64,/d' \
+    -e '/ASSERT(_end <= 0x8000,/d' \
+    arch/x86/boot/setup.ld > "$diag_script"
+echo "LD   setup-size-diagnostic.elf (size ASSERTs removed for measurement only)"
+if "$LCCC_LD" -m elf_i386 -z noexecstack -T "$diag_script" \
+    "${OBJS[@]}" -o "$OUT/setup-size-diagnostic.elf"; then
+  report_layout "$OUT/setup-size-diagnostic.elf"
+else
+  echo "error: diagnostic link also failed; this is not solely a size-gate failure" >&2
+fi
+exit "$link_status"
