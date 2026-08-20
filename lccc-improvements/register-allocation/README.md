@@ -1,352 +1,122 @@
-# Phase 1: Register Allocation Improvements
-
-**Status:** Week 1 Analysis & Design Complete ✓ | Week 2-3 Implementation In Progress
-
-## Executive Summary
-
-Phase 1 replaces LCCC's conservative 3-phase register allocator with a modern linear scan allocator with interval splitting and coalescing. Expected improvement: **3-4x speedup** on register-heavy code.
-
-**Key Achievement:** 11KB stack footprint reduced to <256B for 32-variable function.
-
-## Quick Navigation
-
-### Understanding the Current Problem
-- [`CURRENT_ALLOCATOR_ANALYSIS.md`](CURRENT_ALLOCATOR_ANALYSIS.md) - Why current allocator is conservative
-- [`WEEK_1_COMPLETION_REPORT.md`](WEEK_1_COMPLETION_REPORT.md) - Week 1 analysis summary
-
-### New Design & Implementation
-- [`LINEAR_SCAN_DESIGN.md`](LINEAR_SCAN_DESIGN.md) - Complete algorithm specification (500+ lines)
-- [`INTEGRATION_POINTS.md`](INTEGRATION_POINTS.md) - Exact integration points in codebase
-- [`PHASE_1_IMPLEMENTATION_PLAN.md`](PHASE_1_IMPLEMENTATION_PLAN.md) - Detailed week-by-week roadmap
-
-## The Problem in Numbers
-
-### Current Allocator Behavior
-```
-Stack frame (32 variables):  11,264 bytes
-Register assignments:        ~0 (only ~5% of values eligible)
-Memory ops per compute:      3x (load + shuttle + load)
-Performance vs GCC -O2:      41.6x slower ❌
-```
-
-### Why It's Bad
-
-The current 3-phase allocator:
-1. **Too conservative** - Only ~5% of values qualify for registers
-   - Excludes all floats, i128/u128, i64 on 32-bit
-   - Excludes many pointer values
-   - Copy chains propagate non-GPR status aggressively
-
-2. **No interval splitting** - All-or-nothing allocation
-   - Values either get entire interval or none
-   - Can't split value across registers and stack
-
-3. **No coalescing** - Redundant copy instructions
-   - Copy between two stack slots not eliminated
-   - Doesn't leverage register hints
-
-4. **Greedy heuristics** - No cost analysis
-   - Doesn't consider spill costs properly
-   - Doesn't account for loop depth/importance
-
-### Example: The "Shuttle Pattern"
-```asm
-; Current (bad): 32 variables, 11KB stack
-movq    -0x1580(%rbp), %rax      ; Load from deep stack
-movq    %rax, -0x2ae8(%rbp)      ; Store to even deeper
-movq    -0x1588(%rbp), %rax      ; Load next value
-movq    %rax, -0x2af0(%rbp)      ; Store to deep stack
-; ... millions of memory ops ...
-
-; After improvement (good): 32 variables in registers
-movq    $42, %r12d               ; Direct register arithmetic
-addq    %r12, %r13
-addq    %r14, %r15
-; ... pure register operations ...
-```
-
-## The Solution: Linear Scan Register Allocator
-
-### Algorithm Overview
-
-**Linear Scan** (classic, mature algorithm):
-
-1. **Build live ranges** - For each value, compute [start, end] program points
-2. **Sort by start position** - Process intervals in program order (single pass)
-3. **Assign registers greedily** - Give each value a register if available
-4. **Spill on conflict** - If no register available, use stack
-5. **Interval splitting** - Split long intervals to reduce spills
-6. **Register coalescing** - Merge unnecessary copies
-
-### Key Improvements
-
-| Feature | Current | New | Impact |
-|---------|---------|-----|--------|
-| **Interval Splitting** | ❌ All-or-nothing | ✓ Split at use points | 2-3x fewer spills |
-| **Coalescing** | ❌ None | ✓ Merge copy chains | Eliminates copies |
-| **Spill Cost** | ❌ Greedy | ✓ Loop-weighted | Better decisions |
-| **Dead Code** | ❌ None | ✓ Remove before allocation | Fewer intervals |
-| **Eligibility** | ❌ ~5% | ✓ ~40-50% | More registers |
-
-### Expected Impact
-
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Stack frame (32-var) | 11,264B | <256B | **44x** |
-| Register assignments | ~0 | 28-32 | **∞** |
-| Memory ops per op | 3x | 1x | **3x** |
-| Compute performance | baseline | 3-4x faster | **3-4x** |
-
-## Week 1: Analysis & Design (Complete ✓)
-
-### Completed Tasks
-
-| Task | Document | Status |
-|------|----------|--------|
-| Analyze current 3-phase algorithm | `CURRENT_ALLOCATOR_ANALYSIS.md` | ✓ |
-| Design replacement algorithm | `LINEAR_SCAN_DESIGN.md` | ✓ |
-| Map integration points | `INTEGRATION_POINTS.md` | ✓ |
-| Create implementation plan | `PHASE_1_IMPLEMENTATION_PLAN.md` | ✓ |
-| Document Week 1 completion | `WEEK_1_COMPLETION_REPORT.md` | ✓ |
-
-### Key Findings
-
-**Current Allocator (regalloc.rs:574 lines)**
-- Three-phase strategy: callee → caller → spillover
-- Loop-aware prioritization (10^depth weighting)
-- Conservative eligibility filtering (~5% only)
-- Simple greedy allocation (no splitting/coalescing)
-
-**Integration Points (prologue.rs, 4 architectures)**
-- Call: `prologue.rs:81-85` → `generation.rs:run_regalloc_and_merge_clobbers()`
-- Core: `regalloc.rs:80-324` (allocate_registers function)
-- Interface: Stable (no changes needed to call sites)
-
-**New Algorithm (LINEAR_SCAN_DESIGN.md)**
-- Data structures: LiveRange, ActiveInterval, LinearScanAllocator
-- Main loop with 4 steps: expire → find_free → assign → spill
-- Interval splitting for reduced spills
-- Register coalescing for copy elimination
-- 15-hour implementation breakdown
-
-### Deliverables
-
-```
-lccc-improvements/register-allocation/
-├── CURRENT_ALLOCATOR_ANALYSIS.md     (350 lines) Current 3-phase algorithm
-├── LINEAR_SCAN_DESIGN.md              (500 lines) New algorithm specification
-├── INTEGRATION_POINTS.md              (350 lines) Integration requirements
-├── PHASE_1_IMPLEMENTATION_PLAN.md     (existing) Week-by-week roadmap
-├── WEEK_1_COMPLETION_REPORT.md        (new)      Analysis summary
-└── README.md                          (this file)
-```
-
-## Week 2: Core Implementation (In Progress 🔄)
-
-### Tasks
-
-- [ ] **Phase 2a: Data Structures** (3 hours)
-  - Create `ccc/src/backend/live_range.rs`
-  - Implement `LiveRange`, `ActiveInterval`, `LinearScanAllocator`
-  - Comparison and sorting traits
-
-- [ ] **Phase 2b: Helper Functions** (3 hours)
-  - `build_live_ranges()` - convert LiveInterval to LiveRange
-  - `collect_uses()` - find use points within intervals
-  - `find_reg_hint()` - extract register preferences from copies
-
-- [ ] **Phase 2c: Main Algorithm** (6 hours)
-  - `expire_old_intervals()` - remove intervals no longer active
-  - `find_free_register()` - register selection with heuristics
-  - `find_best_spill_candidate()` - choose what to spill
-  - `allocate_range()` - main loop body
-
-- [ ] **Phase 2d: Integration** (3 hours)
-  - Wire into `regalloc.rs` (replace current `allocate_registers`)
-  - Update `prologue.rs` call sites (no changes needed)
-  - Unit tests on simple functions
-
-### Total Effort: ~15 hours
-
-## Week 3: Validation & Benchmarking (Planned ⏳)
-
-### Tasks
-
-- [ ] **Micro-benchmarks** (2 hours)
-  - 32-variable function test
-  - Measure stack frame reduction
-  - Verify register assignments
-
-- [ ] **Real-world tests** (3 hours)
-  - SQLite compilation and runtime
-  - Other LCCC test suite
-  - Regression testing
-
-- [ ] **All-architecture validation** (2 hours)
-  - x86-64, i686, AArch64, RISC-V
-  - Verify no crashes or regressions
-
-- [ ] **Performance measurement** (2 hours)
-  - Baseline vs new allocator
-  - 3-4x speedup validation
-  - Documentation
-
-- [ ] **Final documentation** (1 hour)
-  - Update README with results
-  - Add success metrics
-  - Create phase completion report
-
-### Total Effort: ~10 hours
-
-## Implementation Details
-
-### Current Architecture Integration
-
-```
-regalloc.rs:allocate_registers(func, config)
-├── Current: 3-phase algorithm (lines 248-317)
-│   ├── Phase 1: Callee-saved for call-spanning values
-│   ├── Phase 2: Caller-saved for non-call values
-│   └── Phase 3: Spillover callee for high-priority values
-│
-└── New: Linear scan with interval splitting
-    ├── Build live ranges from liveness analysis
-    ├── Sort by start point (linear order)
-    ├── Main loop: allocate each range
-    │   ├── Expire old intervals
-    │   ├── Find free register or spill candidate
-    │   ├── Split interval if needed
-    │   └── Assign or record spill
-    ├── Register coalescing for copies
-    └── Return assignments & used_regs (same interface)
-```
-
-### File Structure
-
-```
-ccc/src/backend/
-├── regalloc.rs          (current: 574 lines → new: ~800 lines)
-├── liveness.rs          (unchanged: provides LiveInterval)
-├── live_range.rs        (new: ~200 lines for enhanced structures)
-└── prologue.rs          (unchanged: call site)
-```
-
-### Register Numbering (x86-64 Example)
-
-```
-PhysReg(0)  = rax (implicit accumulator)
-PhysReg(1)  = rbx (callee-saved)
-PhysReg(2-5) = rcx, rdx, rsi, rdi (caller-saved, params)
-PhysReg(6-7) = r8, r9 (caller-saved, params)
-PhysReg(8-9) = r10, r11 (caller-saved, scratch)
-PhysReg(10-13) = r12-r15 (callee-saved)
-```
-
-All architectures supported:
-- x86-64: 16 GPR (0-15)
-- i686: 8 GPR (0-7)
-- AArch64: 32 GPR (0-31)
-- RISC-V 64: 32 GPR (0-31)
-
-## Testing Strategy
-
-### Unit Tests (Week 2)
-```rust
-#[test]
-fn test_two_var_allocation() {
-    // Two values, two registers → both get registers
-}
-
-#[test]
-fn test_spill_priority() {
-    // Ten values, two registers → high-priority get regs, others spill
-}
-
-#[test]
-fn test_loop_weighting() {
-    // Values in loops get priority over outer values
-}
-```
-
-### Integration Tests (Week 3)
-```bash
-# Compile 32-variable function
-./ccc -S -O2 test_32_vars.c -o test.s
-
-# Verify:
-# - All 32 params in registers (not stack)
-# - Stack frame <256B (not 11KB)
-# - No register clobbering issues
-```
-
-### Benchmarks (Week 3)
-```bash
-# Measure compilation and runtime
-time ./ccc sqlite3.c -O2
-# Compare vs baseline
-
-# Run SQLite query benchmark
-time ./a.out < queries.sql
-# Measure 3-4x speedup
-```
-
-## Success Criteria
-
-- [x] Analysis & design complete (Week 1)
-- [ ] All values in 32-var function allocated to registers
-- [ ] Stack frame reduced from 11KB to <256B
-- [ ] No regression on other test files
-- [ ] Compilation speed unchanged
-- [ ] 3-4x speedup on compute benchmarks
-- [ ] Validated on all 4 architectures
-
-## Architecture-Specific Notes
-
-The allocator is **completely architecture-agnostic** because:
-- Register lists come from `RegAllocConfig` (configured per-arch)
-- `LiveInterval` is ISA-independent
-- `PhysReg` is just an ID number
-
-Each prologue.rs:
-- Provides appropriate register lists for its architecture
-- No changes to allocator needed for multi-arch support
-
-## References
-
-### Current Implementation
-- `ccc/src/backend/regalloc.rs` (574 lines) - 3-phase allocator
-- `ccc/src/backend/liveness.rs` (~400 lines) - Liveness analysis
-
-### Design & Algorithm
-- `LINEAR_SCAN_DESIGN.md` - Complete specification (500+ lines)
-- LLVM RegAllocLinearScan.cpp - Reference implementation
-- Poletto/Sarkar (2000) - "Linear Scan Register Allocation" paper
-
-### Integration Points
-- `ccc/src/backend/x86/codegen/prologue.rs:81-92`
-- `ccc/src/backend/i686/codegen/prologue.rs` (similar)
-- `ccc/src/backend/arm/codegen/prologue.rs` (similar)
-- `ccc/src/backend/riscv/codegen/prologue.rs` (similar)
-
-## Contributing
-
-When working on this phase:
-
-1. **Start with:** [`LINEAR_SCAN_DESIGN.md`](LINEAR_SCAN_DESIGN.md) for algorithm details
-2. **Reference:** [`INTEGRATION_POINTS.md`](INTEGRATION_POINTS.md) for where code goes
-3. **Test:** Unit test each phase before integration
-4. **Benchmark:** Measure performance improvements
-5. **Document:** Update this README with progress
-
-## Questions?
-
-- **Algorithm details?** See `LINEAR_SCAN_DESIGN.md`
-- **Integration?** See `INTEGRATION_POINTS.md`
-- **Current behavior?** See `CURRENT_ALLOCATOR_ANALYSIS.md`
-- **Implementation roadmap?** See `PHASE_1_IMPLEMENTATION_PLAN.md`
+# Register Allocation — Current State (August 2026)
+
+**Status:** Linear-scan GPR allocator **shipped and iterated**. Docs in this
+directory dated March 2026 described a *planned* 574-line 3-phase greedy
+allocator. That design is obsolete. This file is the index for the **live**
+system as of `ms178/lccc` main (audit date 2026-08-20).
+
+**Mission:** generated-code performance on real hardware (i7-14700KF / Raptor
+Lake). Correctness is a hard constraint. LCCC must beat GCC, Clang, and ICX
+on representative C workloads — register allocation is a first-class lever.
+
+## What actually exists
+
+| Module | Lines (approx) | Role |
+|--------|----------------|------|
+| `src/backend/regalloc.rs` | 3612 | Policy: eligibility, 2c/2d/2e waves, coalescing, XMM/NEON, i686 hazards, loop-pin |
+| `src/backend/live_range.rs` | 1261 | Poletto–Sarkar scan, eviction modes, hints, PGO weights, unit tests |
+| `src/backend/liveness.rs` | 2163 | Backward dataflow, hole-aware **segments**, GEP-base / f128 / setjmp |
+| `src/backend/split_ranges.rs` | 1377 | IR pre-pass: call-split, loop-transparent split, edge-copy layout |
+| `src/backend/stack_layout/` | ~2100 | Slot packing, copy coalescing, greedy interval coloring for *stack* |
+| `src/backend/stack_layout/graph_coloring.rs` | ~130 | Stack-slot coloring (not a Chaitin GPR allocator) |
+
+There is **no** `linear_scan.rs` / `register_pool.rs`. The scan lives in
+`live_range.rs`; the policy wrapper is `allocate_registers`.
+
+## Algorithm in one paragraph
+
+1. `split_ranges` optionally rewrites IR so fat intervals die at calls / loop
+   exits (volatile spill allocas; fail-closed).
+2. `compute_live_intervals` produces contiguous intervals **and** hole-aware
+   `segments`.
+3. Eligibility whitelist (GPR integer/ptr ops) minus never-materialized,
+   inline-asm, memcpy pointers, etc.
+4. Copy-group coalescing (pairwise-disjoint intervals) + phi latch coalescing.
+5. **Hole-aware call-spanning:** a value needs callee-saved only if a call
+   sits *inside a live segment*, not merely in a diamond gap.
+6. **Phase 1** linear-scan on callee-saved for spanning values.
+7. **Phase 2** caller-saved in constraint waves (call-arg regs, indirect
+   target, i686 `%ecx`/`%edx` scratch, then leftover).
+8. **Phase 2c** leftover callee-saved overflow (optional exchange eviction).
+9. **Phase 2d/2e** i686 load-hazard refine + `%eax` homes.
+10. AArch64 loop-pin steal for hot phis. XMM/NEON second class for scalars
+    and a fail-closed 128-bit vecreg whitelist.
+11. Stack layout assigns slots to unallocated values (3-tier packing).
+
+Default eviction mode is **3** (hotter incoming, victim next-use after
+incoming end). Mode 5 (exchange) is **not** the default: measured gzip
+regression on Raptor Lake (`longest_match`).
+
+## Progress since the March 2026 docs
+
+The old documents claimed:
+
+- 574-line 3-phase allocator, ~5% eligibility, 11 KB frames, Week 2 not started.
+
+**Shipped since then (non-exhaustive):**
+
+- Full `LinearScanAllocator` with die-at-birth sharing, cascade eviction,
+  rotation for ILP, `run_with_seed` multi-wave occupancy.
+- Copy-group coalescing + group-priority reweight (adler32/memcmp param homes).
+- GEP-base priority (folded addressing).
+- Hole-aware segments vs fat `spans_any_call`.
+- Call-arg / indirect-target register exclusion (printf / fptr clobber bugs).
+- i686 `%ecx`/`%edx`/`%eax` hazard model + load-hazard refinement.
+- XMM scalar + 128-bit vecreg (fail-closed intrinsic whitelist).
+- AArch64 folded-index liveness + loop-pin.
+- `split_ranges` IR pre-pass.
+- PGO hooks (`CCC_PGO_WEIGHT_MAX` default **1** — 4× cap regressed gzip +4.7%).
+- Debug: `CCC_DEBUG_RA`, `CCC_TRACE_ALLOC`, `CCC_EVICT_MODE`, many kill-switches.
+
+The 11 KB / 0-register story is **historical**. Leaf integer functions already
+home many values in GPRs. Remaining gaps vs GCC/Clang/ICX are **quality**,
+not “does linear scan exist?”.
+
+## Documents in this directory
+
+| File | Role |
+|------|------|
+| [CURRENT_ALLOCATOR_ANALYSIS.md](CURRENT_ALLOCATOR_ANALYSIS.md) | Live architecture, phases, env knobs |
+| [LINEAR_SCAN_DESIGN.md](LINEAR_SCAN_DESIGN.md) | Implemented scan (not a Week-2 plan) |
+| [INTEGRATION_POINTS.md](INTEGRATION_POINTS.md) | Call sites, `RegAllocConfig` as it is |
+| [WEAKNESSES_AND_BACKLOG.md](WEAKNESSES_AND_BACKLOG.md) | Defects, cost-model holes, ideas |
+| [CODE_AUDIT.md](CODE_AUDIT.md) | File-by-file audit 2026-08-20 |
+| [RESEARCH_REPORT.md](RESEARCH_REPORT.md) | Literature → LCCC, milestones vs ICX/GCC/Clang |
+| [COMPETITIVE_STRATEGY.md](COMPETITIVE_STRATEGY.md) | How to win the next 1% |
+| [VALIDATION_ZLIB_GZIP_EXPAT.md](VALIDATION_ZLIB_GZIP_EXPAT.md) | 2026-08-20 compile+asm vs GCC `-O2` |
+| [PHASE_1_IMPLEMENTATION_PLAN.md](PHASE_1_IMPLEMENTATION_PLAN.md) | Historical Week 1–3 + **Phase 2+ roadmap** |
+| [BASELINE_ANALYSIS.md](BASELINE_ANALYSIS.md) | March baseline, annotated |
+| [WEEK_1_COMPLETION_REPORT.md](WEEK_1_COMPLETION_REPORT.md) | Historical; do not treat as current |
+
+## Kill-switches (non-exhaustive)
+
+| Env | Effect |
+|-----|--------|
+| `CCC_NO_COALESCE` | Disable copy groups |
+| `CCC_NO_PHI_COALESCE` | Disable latch coalescing |
+| `CCC_NO_LEAF_PARAM_GPR` | Disable x86 leaf param copies |
+| `CCC_NO_FOLDED_INDEX_LIVENESS` | Skip AArch64 index interval stretch |
+| `CCC_NO_LOAD_HAZARD_REFINE` | Skip i686 2d |
+| `CCC_NO_EAX_ALLOC` | Skip i686 `%eax` homes |
+| `CCC_NO_LOOP_PIN` | Skip AArch64 phi steal |
+| `CCC_NO_VECREG` | Skip NEON/XMM vector homes |
+| `CCC_EVICT_MODE` | 0 off, 1–3 greedy windows, 5 exchange |
+| `CCC_PGO_WEIGHT_MAX` | Default 1 (neutral) |
+| `CCC_DEBUG_RA` / `CCC_TRACE_ALLOC` | Assignment / overlap traces |
+
+## Success criteria (updated)
+
+- [x] Linear scan exists and is the production allocator
+- [x] Interval splitting as IR pre-pass (limited, fail-closed)
+- [x] Copy coalescing (disjoint groups)
+- [x] Loop-weighted spill / eviction
+- [x] XMM/NEON second class (scalar + whitelist vec)
+- [ ] Live-range **splitting inside the scan** (reload at next use) — **not** implemented (`enable_splitting` is a stub)
+- [ ] Chaitin/Briggs or PBQP GPR coloring — **not** implemented
+- [ ] Rematerialization of GlobalAddr/const as first-class — **not** implemented
+- [ ] Beat GCC/Clang/ICX geomean on zlib-ng, zstd, SQLite, gzip — **open**
 
 ---
 
-**Phase 1 Timeline:** March 19 - March 31, 2026  
-**Expected Delivery:** Drop-in replacement allocator with 3-4x speedup  
-**Impact:** Major performance improvement for register-heavy code
+**Do not** implement from the March 2026 “Week 2 checklist”. Implement from
+`regalloc.rs` + `live_range.rs` + the backlog in `WEAKNESSES_AND_BACKLOG.md`.
