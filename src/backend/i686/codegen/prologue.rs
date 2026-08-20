@@ -256,7 +256,12 @@ impl I686Codegen {
             false, never_materialized, Vec::new(), Vec::new(),
             // i686 re-materialises skipped indexed GEPs (default
             // emit_load_indexed = false): no RA-invisible index consumption.
-            crate::common::fx_hash::FxHashMap::default(),
+            // It DOES fold constant-offset GEPs with register bases
+            // (const_offset_fold_reg_base_ok), whose base is consumed at the
+            // Load/Store position: extend the base's interval to the
+            // consumer so the address register survives intervening calls
+            // and value staging.
+            crate::backend::generation::collect_gep_fold_base_links(func),
         );
 
         // %ebx must be saved/restored only when it really holds the GOT base.

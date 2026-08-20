@@ -1151,6 +1151,26 @@ impl X86Codegen {
                     }
                 }
             }
+        } else if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
+            // Register-resident base with no slot home (fold accepted through
+            // const_offset_fold_reg_base_ok).  The old code staged the value
+            // into %rax and emitted NO store.  operand_to_rax only touches
+            // %rax plus the %r11/%rdx staging scratches — the base was
+            // verified to sit outside that set by the fold predicate.
+            if !is_xmm_reg(b_reg) {
+                self.operand_to_rax(val);
+                let b_name = phys_reg_name(b_reg);
+                let store_instr = Self::mov_store_for_type(ty);
+                let store_reg = Self::reg_for_type("rax", ty);
+                if offset != 0 {
+                    self.state.emit_fmt(format_args!("    {} %{}, {}(%{})", store_instr, store_reg, offset, b_name));
+                } else {
+                    self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, store_reg, b_name));
+                }
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+            }
         } else {
             // No addr resolution — fall back
             self.operand_to_rax(val);
@@ -1210,7 +1230,25 @@ impl X86Codegen {
                     self.emit_add_offset_to_addr_reg_impl(offset);
                     self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
                 }
-                None => return, // no address resolution — nothing to do
+                None => {
+                    // Register-resident base with no slot home (fold accepted
+                    // through const_offset_fold_reg_base_ok).  Dropping the
+                    // load here silently read garbage; load through the base.
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!("{} {}(%{}), %{}", load_instr, offset, reg_name, target));
+                            } else {
+                                self.state.emit_fmt(format_args!("{} (%{}), %{}", load_instr, reg_name, target));
+                            }
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
             }
             if dest_xmm.is_none() {
                 self.store_xmm_to(dest, "xmm0", ty);
@@ -1282,6 +1320,40 @@ impl X86Codegen {
                 }
             }
             self.store_rax_to(dest);
+        } else if let Some(&reg) = self.reg_assignments.get(&base.0) {
+            // Register-resident base with no slot home (fold accepted through
+            // const_offset_fold_reg_base_ok): load through the base register.
+            // Previously this shape fell out with no instruction emitted.
+            if !is_xmm_reg(reg) {
+                let load_instr = Self::mov_load_for_type(ty);
+                let reg_name = phys_reg_name(reg);
+                if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+                    if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+                        if !is_xmm_reg(d_reg) {
+                            let use_32bit_dest =
+                                matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                            let d_name = if use_32bit_dest {
+                                phys_reg_name_32(d_reg)
+                            } else {
+                                phys_reg_name(d_reg)
+                            };
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!("    {} {}(%{}), %{}", load_instr, offset, reg_name, d_name));
+                            } else {
+                                self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg_name, d_name));
+                            }
+                            return;
+                        }
+                    }
+                }
+                let dest_reg = Self::load_dest_reg(ty);
+                if offset != 0 {
+                    self.state.emit_fmt(format_args!("    {} {}(%{}), {}", load_instr, offset, reg_name, dest_reg));
+                } else {
+                    self.state.emit_fmt(format_args!("    {} (%{}), {}", load_instr, reg_name, dest_reg));
+                }
+                self.store_rax_to(dest);
+            }
         }
     }
 

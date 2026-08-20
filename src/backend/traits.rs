@@ -342,6 +342,49 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether the backend emits indexed addressing with a GLOBAL SYMBOL base
+    /// (`sym(,%idx,scale)`), folding a never-materialised GlobalAddr straight
+    /// into the memory operand.  Gates `can_indexed_addr_fold`'s symbol-base
+    /// branch; without it a skipped producer would rematerialise against an
+    /// uncomputed GlobalAddr.  Default: unsupported.
+    fn supports_indexed_sym_base(&self) -> bool {
+        false
+    }
+
+    /// Whether the backend emits indexed addressing with a GLOBAL SYMBOL base
+    /// (`sym(,%idx,scale)` / `sym(%base,%idx,scale)` variants), folding a
+    /// never-materialised GlobalAddr straight into the memory operand. Only
+    /// consulted when the plain-register indexed fold was refused because the
+    /// base has no register home. Default: unsupported.
+    fn emit_load_indexed_sym(&mut self, _dest: &Value, _sym: &str, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Store dual of [`Self::emit_load_indexed_sym`].
+    fn emit_store_indexed_sym(&mut self, _val: &Operand, _sym: &str, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Constant-offset GEP folds with a REGISTER-RESIDENT base (non-alloca).
+    ///
+    /// Sound only when ALL of the following hold on the backend:
+    ///  1. the backend passes `collect_gep_fold_base_links(func)` into
+    ///     register allocation, so the base's live interval is extended to
+    ///     the consuming Load/Store (the IR records the base's last use at
+    ///     the folded-away GEP; without the extension the allocator reuses
+    ///     the register for the stored value — zlib-ng gz_reset NULL store);
+    ///  2. every register-base path in emit_{load,store}_with_const_offset is
+    ///     complete (no silent fall-through that drops the access);
+    ///  3. the base's physical register is outside the emitter's private
+    ///     scratch set for these paths (accumulator, address scratch,
+    ///     staging registers), which the caller checks per value.
+    /// Alloca bases never need this: stack addresses are re-derivable at the
+    /// use site. Default false keeps slot-only backends (arm, riscv) on the
+    /// proven alloca-only contract.
+    fn const_offset_fold_reg_base_ok(&self, _base: &Value) -> bool {
+        false
+    }
+
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
     /// (or appropriate variant). Default: panics.
@@ -987,6 +1030,18 @@ pub trait ArchCodegen {
                     self.emit_store_result(dest);
                     return;
                 }
+                // SOUNDNESS FALLBACK: slot-less REGISTER-resident base.  The
+                // old code fell through here and never loaded the base, so
+                // the result was `offset + stale scratch` — rematerialised
+                // folded GEPs then read/wrote through garbage addresses
+                // (zlib-ng gen_bitlen corruption).  Stage the base through
+                // the accumulator and add the constant.
+                if let Some(br) = self.get_phys_reg_for_value(base.0) {
+                    self.emit_reg_to_acc(br);
+                    self.emit_gep_add_const_to_acc(off);
+                    self.emit_store_result(dest);
+                    return;
+                }
             }
         }
         // Optimized path: if both base and offset are register-allocated,
@@ -1012,6 +1067,12 @@ pub trait ArchCodegen {
                 SlotAddr::Direct(slot) => self.emit_slot_addr_to_secondary(slot, true, base.0),
                 SlotAddr::Indirect(slot) => self.emit_slot_addr_to_secondary(slot, false, base.0),
             }
+        } else if let Some(br) = self.get_phys_reg_for_value(base.0) {
+            // SOUNDNESS FALLBACK: slot-less register-resident base — move it
+            // into the secondary register; without this the add below would
+            // read a stale scratch (same class as the const-offset case).
+            self.emit_reg_to_acc(br);
+            self.emit_acc_to_secondary();
         }
         self.emit_load_operand(offset);
         self.emit_add_secondary_to_acc();

@@ -321,6 +321,32 @@ impl I686Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
+        // Register-resident 64-bit-pair base store: stage the value into the
+        // %eax:%edx accumulator pair, then `movl %eax,off(%base);
+        // movl %edx,off+4(%base)`.  Must precede the slot-based pair branch,
+        // which silently emits nothing for a slot-less base.  The base is
+        // callee-saved by the fold predicate, so the staging cannot clobber
+        // it.
+        if (ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64)
+            && !self.state.is_alloca(base.0)
+        {
+            if let Some(&phys) = self.reg_assignments.get(&base.0) {
+                if matches!(phys.0, 0 | 1 | 2 | 3) {
+                    let base_name = phys_reg_name(phys);
+                    let mem0 = if offset != 0 {
+                        format!("{}(%{})", offset, base_name)
+                    } else {
+                        format!("(%{})", base_name)
+                    };
+                    let mem4 = format!("{}(%{})", offset + 4, base_name);
+                    self.emit_load_acc_pair(val);
+                    emit!(self.state, "    movl %eax, {}", mem0);
+                    emit!(self.state, "    movl %edx, {}", mem4);
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
             self.emit_load_acc_pair(val);
             let addr = self.state.resolve_slot_addr(base.0);
@@ -372,10 +398,11 @@ impl I686Codegen {
         }
         // Register-resident base: single-instruction store to offset(%reg).
         // Mirrors the load path (GCC: `movl %eax, 40(%ebx)`); the value is
-        // staged in %eax first — the base register itself is never %eax
-        // (allocator hands out %ebx/%esi/%edi/%ebp/%ecx/%edx only).
+        // staged in %eax first — the fold predicate keeps the base out of
+        // %eax/%edx/%ecx (callee-saved homes only), so staging never
+        // destroys the address.
         if let Some(&phys) = self.reg_assignments.get(&base.0) {
-            if !self.state.is_alloca(base.0) {
+            if !self.state.is_alloca(base.0) && matches!(phys.0, 0 | 1 | 2 | 3) {
                 let store_instr = self.store_instr_for_type(ty);
                 let base_name = phys_reg_name(phys);
                 let dst = if offset != 0 {
@@ -490,6 +517,31 @@ impl I686Codegen {
             }
             return;
         }
+        // Register-resident 64-bit-pair base load: `movl off(%base),%eax;
+        // movl off+4(%base),%edx`.  Must precede the slot-based pair branch,
+        // which silently emits nothing for a slot-less base.  The fold
+        // predicate (const_offset_fold_reg_base_ok) guarantees the base sits
+        // in a callee-saved register, never the %eax:%edx accumulator pair.
+        if (ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64)
+            && !self.state.is_alloca(base.0)
+        {
+            if let Some(&phys) = self.reg_assignments.get(&base.0) {
+                if matches!(phys.0, 0 | 1 | 2 | 3) {
+                    let base_name = phys_reg_name(phys);
+                    let mem0 = if offset != 0 {
+                        format!("{}(%{})", offset, base_name)
+                    } else {
+                        format!("(%{})", base_name)
+                    };
+                    let mem4 = format!("{}(%{})", offset + 4, base_name);
+                    emit!(self.state, "    movl {}, %eax", mem0);
+                    emit!(self.state, "    movl {}, %edx", mem4);
+                    self.emit_store_acc_pair(dest);
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
             let addr = self.state.resolve_slot_addr(base.0);
             if let Some(addr) = addr {
@@ -527,8 +579,12 @@ impl I686Codegen {
         // This is the whole point of the GEP fold — GCC emits
         // `movl 40(%ebx), %eax`; the old path re-materialized the address
         // (movl %ebx,%ecx; addl $40,%ecx; movl (%ecx),%eax) every time.
+        // The fold predicate (const_offset_fold_reg_base_ok) restricts the
+        // base to callee-saved homes (%ebx/%esi/%edi/%ebp): never the
+        // %eax/%edx accumulator staging registers and never the %ecx address
+        // scratch, and folded-base liveness links keep it live to here.
         if let Some(&phys) = self.reg_assignments.get(&base.0) {
-            if !self.state.is_alloca(base.0) {
+            if !self.state.is_alloca(base.0) && matches!(phys.0, 0 | 1 | 2 | 3) {
                 let load_instr = self.load_instr_for_type(ty);
                 let base_name = phys_reg_name(phys);
                 let mem = if offset != 0 {

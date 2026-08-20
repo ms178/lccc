@@ -782,9 +782,14 @@ impl X86Codegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, Some(never_materialized), call_arg_regs, indirect_target_regs,
-            // x86-64 re-materialises skipped indexed GEPs (default
+            // x86-64 re-materialises skipped INDEXED GEPs (default
             // emit_load_indexed = false): no RA-invisible index consumption.
-            crate::common::fx_hash::FxHashMap::default(),
+            // It DOES fold constant-offset GEPs with register bases
+            // (const_offset_fold_reg_base_ok), whose base is consumed at the
+            // Load/Store position: extend the base's interval to the
+            // consumer, else the allocator reuses the base register for the
+            // stored value (zlib-ng gz_reset NULL-store crash).
+            crate::backend::generation::collect_gep_fold_base_links(func),
         );
 
         // MachInst is profitable on straight-line and modest-CFG code, but its
