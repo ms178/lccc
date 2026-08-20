@@ -486,6 +486,20 @@ impl GvnState {
                 if *volatile {
                     return None;
                 }
+                // Agent-B/levkropp audit (session 23): enabling F32/F64 load
+                // CSE here was REVERTED. The created FP Copies break the
+                // die-at-birth FP coalescing chain on x86-64: fp_die_at_birth
+                // miscompiles (chain_div returns chain_neg's value). The
+                // exclusion stays until the backend FP copy/coalesce paths are
+                // proven for GVN-created FP copies under the full battery.
+                // Session-23 revert, session-24 root cause: F32/F64 load CSE
+                // creates FP Copy instructions that perturb the die-at-birth
+                // FP register coalescing of UNRELATED functions/blocks:
+                // fp_die_at_birth's pure-computation chain_div loop loses its
+                // accumulator register to copies CSE-created in the load-heavy
+                // energy loop (chain_div returned chain_neg's value). A proper
+                // fix needs copy-aware FP chain coalescing (design item in the
+                // session-24 audit doc); until then FP loads stay out of CSE.
                 if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
                     return None;
                 }
@@ -904,6 +918,9 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 if let VNOperand::ValueNum(pvn) = pv {
                     match state.ptr_global_base.get(&pvn) {
                         Some(sym) => {
+                            if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+                                eprintln!("[GVNDBG] store bumps epoch of {}", sym);
+                            }
                             let sym = sym.clone();
                             state.next_base_epoch = state.next_base_epoch.saturating_add(1);
                             let old = state
@@ -911,9 +928,17 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                                 .insert(sym.clone(), state.next_base_epoch);
                             state.base_epoch_log.push((sym, old));
                         }
-                        None => state.load_generation += 1,
+                        None => {
+                            if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+                                eprintln!("[GVNDBG] store UNKNOWN base -> global gen++");
+                            }
+                            state.load_generation += 1;
+                        }
                     }
                 } else {
+                    if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+                        eprintln!("[GVNDBG] store CONST base -> global gen++");
+                    }
                     state.load_generation += 1;
                 }
             }
@@ -970,8 +995,14 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                             ty,
                         };
                         if let Some((stored_op, version)) = state.store_fwd_map.get(&fwd_key) {
+                            if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+                                eprintln!("[GVNDBG] fwd cand ptr_vn={:?} valid={}", ptr_vn, state.entry_valid_for(ptr_vn, *version));
+                            }
                             if state.entry_valid_for(ptr_vn, *version) {
                                 let stored_op = *stored_op;
+                                if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+                                    eprintln!("[GVNDBG] FORWARD store->load dest={} stored={:?}", dest.0, stored_op);
+                                }
                                 // Forward the stored value to the load destination.
                                 // Assign the dest a VN matching the stored value.
                                 let dest_idx = dest.0 as usize;
@@ -1038,6 +1069,9 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 // their registers reused by the allocator before the Copy executes.
                 let same_block_existing = existing.filter(|ev| block_defs.contains(&ev.0));
                 if let Some(existing_value) = same_block_existing {
+                    if std::env::var_os("CCC_DEBUG_GVN").is_some() {
+                        eprintln!("[GVNDBG] CSE load dest={} <- {}", dest.0, existing_value.0);
+                    }
                     let idx = existing_value.0 as usize;
                     let existing_vn = if idx < state.value_numbers.len()
                         && state.value_numbers[idx] != u32::MAX

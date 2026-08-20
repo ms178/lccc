@@ -689,6 +689,76 @@ impl X86Codegen {
             set
         };
 
+        // Lever-1 port from i686 (session 23, extended session 24):
+        // immediately-consumed values flow through the accumulator WITHOUT a
+        // home. x86-64's store_rax_to has the immediately_consumed skip
+        // branch and operand_to_rax / operand_to_callee_reg consult the acc
+        // cache, so denying the home removes the `movq %rax,%reg`
+        // materialisation + the consumer's home read, freeing a register.
+        //
+        // SOUNDNESS (why this is scoped per consumer class): unlike i686,
+        // x86-64 codegen is NOT uniformly accumulator-centric — BinOps take a
+        // register-direct path, and the acc cache holds only ONE value, so a
+        // consumer that reads a home register instead of the accumulator
+        // would read garbage for a home-less value (session 23: the full set
+        // corrupted live pointers, simd_sse2_arith SIGSEGV).  Each consumer
+        // class is therefore enabled only after its emission path is proven
+        // to read through the accumulator.  Classes are selected via
+        // CCC_X64_NOHOME_CLASSES (comma-separated subset of
+        // ret,store,copy,cast,unary,binop,cmp); default "ret" (the proven
+        // class).  "all" enables every class (for auditing only).
+        //
+        // DEFAULT (session-24 per-class audit on the 352-test battery):
+        //   ret, store, copy, cast, unary, binop  — each 352+6 clean.
+        //   cmp  — EXCLUDED: the COMPARE-REPLAY mechanism re-emits a skipped
+        //          Cmp at its (possibly later) consumer; a home-less LHS only
+        //          lives in %rax at the original point, so a replayed compare
+        //          reads a clobbered accumulator (simd_sse2_arith SIGSEGV).
+        let never_materialized = if std::env::var_os("CCC_NO_X64_IMMED_NOHOME").is_some() {
+            never_materialized
+        } else {
+            let classes = std::env::var("CCC_X64_NOHOME_CLASSES").unwrap_or_else(|_| "ret,store,copy,cast,unary,binop".into());
+            let has = |c: &str| classes == "all" || classes.split(',').any(|x| x.trim() == c);
+            let skip = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
+                func, true,
+            );
+            if skip.is_empty() {
+                never_materialized
+            } else {
+                use crate::ir::reexports::{Instruction, Operand, Terminator};
+                // Classify every value by its (single) consumer instruction.
+                let mut cls_of: crate::common::fx_hash::FxHashMap<u32, &'static str> =
+                    crate::common::fx_hash::FxHashMap::default();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        let mut mark = |op: &Operand, cls: &'static str| {
+                            if let Operand::Value(v) = op {
+                                cls_of.insert(v.0, cls);
+                            }
+                        };
+                        match inst {
+                            Instruction::Store { val, .. } => mark(val, "store"),
+                            Instruction::Cast { src, .. } => mark(src, "cast"),
+                            Instruction::UnaryOp { src, .. } => mark(src, "unary"),
+                            Instruction::Copy { src, .. } => mark(src, "copy"),
+                            Instruction::BinOp { lhs, .. } => mark(lhs, "binop"),
+                            Instruction::Cmp { lhs, .. } => mark(lhs, "cmp"),
+                            _ => {}
+                        }
+                    }
+                    if let Terminator::Return(Some(Operand::Value(v))) = &block.terminator {
+                        cls_of.insert(v.0, "ret");
+                    }
+                }
+                let mut set = never_materialized;
+                set.extend(
+                    skip.into_iter()
+                        .filter(|v| cls_of.get(v).is_some_and(|c| has(c))),
+                );
+                set
+            }
+        };
+
         // SysV AMD64 argument registers present in the caller-saved pool
         // (r8, r9, rdi, rsi and — when enabled — rdx). A value consumed as a
         // call argument must not be homed in one of these: the staging writes
@@ -712,6 +782,9 @@ impl X86Codegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, Some(never_materialized), call_arg_regs, indirect_target_regs,
+            // x86-64 re-materialises skipped indexed GEPs (default
+            // emit_load_indexed = false): no RA-invisible index consumption.
+            crate::common::fx_hash::FxHashMap::default(),
         );
 
         // MachInst is profitable on straight-line and modest-CFG code, but its

@@ -560,6 +560,16 @@ fn classify_line(raw: &str) -> LineInfo {
                 "incl" | "incw" | "incb" | "decl" | "decw" | "decb"
                     | "notl" | "notw" | "notb"
                     | "negl" | "negw" | "negb"
+                    // bswap writes its single operand (Agent-B audit found it
+                    // missing from the original list); single-operand
+                    // shifts/rotates mean shift-by-1 and write the operand
+                    // (defensive: the emitter always prints an explicit $1,
+                    // but hand-written asm and foreign emitters may not).
+                    | "bswapl" | "bswapw"
+                    | "sall" | "salw" | "salb" | "shll" | "shlw" | "shlb"
+                    | "shrl" | "shrw" | "shrb" | "sarl" | "sarw" | "sarb"
+                    | "roll" | "rolw" | "rolb" | "rorl" | "rorw" | "rorb"
+                    | "rcll" | "rclw" | "rclb" | "rcrl" | "rcrw" | "rcrb"
             );
             if is_unary_rmw && op.starts_with('%') && !op.contains('(') {
                 dest_reg = register_family(op);
@@ -1846,6 +1856,22 @@ fn line_writes_reg_implicitly(s: &str, reg: RegId) -> bool {
         "divl" | "idivl" => reg == REG_EAX || reg == REG_EDX,
         "cltd" | "cdq" => reg == REG_EDX,
         "xchgl" | "xchgw" | "xchgb" => line_references_reg(s, reg),
+        // Single-operand read-modify-write forms (`negl %eax`, `incl %ecx`,
+        // `bswapl %eax`): classify_line derives the destination from the
+        // operand AFTER the last comma — these have none, so they classify
+        // as Other{dest_reg: REG_NONE} and their overwrite was invisible.
+        // Missing them let `movl %edi,%eax`-aliases survive `negl %eax` and
+        // rewrite later %eax readers to the un-negated %edi (alias-fuzz
+        // scenario 7, struct-copy loops): lccc computed 0x10 where gcc
+        // computed 0x04.
+        "negl" | "negw" | "negb"
+        | "notl" | "notw" | "notb"
+        | "incl" | "incw" | "incb"
+        | "decl" | "decw" | "decb"
+        | "bswapl" | "bswapw" => {
+            let rest = s[mn.len()..].trim();
+            !rest.contains(',') && rest.starts_with('%') && register_family(rest) == reg
+        }
         _ if is_implicit_string_op(s) => {
             matches!(reg, REG_ECX | REG_ESI | REG_EDI | REG_EAX)
         }
@@ -4227,6 +4253,9 @@ fn next_non_nop(infos: &[LineInfo], start: usize) -> usize {
 /// Run peephole optimization on i686 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
+    if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
+        return asm;
+    }
     let mut store = LineStore::new(asm);
     let line_count = store.len();
     let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
@@ -4755,6 +4784,40 @@ mod tests {
     use super::*;
 
     
+    #[test]
+    fn unary_rmw_breaks_copy_alias() {
+        // `movl %edi,%eax; negl %eax; movl %eax,(%esi)` must NOT become
+        // `movl %edi,(%esi)`: the single-operand RMW (negl) overwrites %eax,
+        // and classify_line sees no destination for it (no second operand).
+        // Found by the alias differential fuzz (struct-copy loops).
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $8, %esp\n",
+            "    movl $5, %edi\n",
+            "    movl %edi, %eax\n",
+            "    negl %eax\n",
+            "    movl 4(%esp), %esi\n",
+            "    movl %eax, (%esi)\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("negl %eax"), "negl must survive:\n{result}");
+        // The store must still read the NEGATED register, not %edi.
+        assert!(
+            result.contains("movl %eax, (%esi)") || result.contains("movl %eax,(%esi)"),
+            "store must keep the negated %eax:\n{result}"
+        );
+        assert!(
+            !result.contains("movl %edi, (%esi)") && !result.contains("movl %edi,(%esi)"),
+            "store must not use the stale alias %edi:\n{result}"
+        );
+    }
+
     #[test]
     fn alu_slot_use_forwards_to_register() {
         // `movl %eax,32(%esp); imull 32(%esp),%edx` with no other reader:

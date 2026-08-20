@@ -206,13 +206,13 @@ fn can_indexed_addr_fold(cg: &dyn ArchCodegen, info: &IndexedGepInfo) -> bool {
 }
 
 /// Per-function def / alloca / param facts used by GEP-fold soundness.
-struct BaseStability {
+pub(crate) struct BaseStability {
     is_alloca: FxHashSet<u32>,
     is_param: FxHashSet<u32>,
     def_count: FxHashMap<u32, u32>,
 }
 
-fn analyze_base_stability(func: &IrFunction) -> BaseStability {
+pub(crate) fn analyze_base_stability(func: &IrFunction) -> BaseStability {
     let mut stab = BaseStability {
         is_alloca: FxHashSet::default(),
         is_param: FxHashSet::default(),
@@ -558,6 +558,22 @@ fn retain_used(map: &mut FxHashMap<u32, impl Sized>, use_counts: &[u32]) {
 }
 
 /// Variable-offset GEPs foldable into indexed addressing.
+
+/// Map of folded-GEP INDEX value ids to their consumer GEP-dest value ids
+/// (see RegAllocConfig::folded_index_uses). Derived from the SAME
+/// build_indexed_gep_map the emitter uses, so allocator and emitter can
+/// never disagree about which indices are consumed where.
+pub(crate) fn collect_folded_index_links(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    let mut out: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (dest, info) in &m {
+        out.entry(info.index.0).or_default().push(*dest);
+    }
+    out
+}
+
 fn build_indexed_gep_map(
     func: &IrFunction,
     use_counts: &[u32],
@@ -1143,7 +1159,7 @@ fn build_global_addr_ptr_set(func: &IrFunction) -> FxHashSet<u32> {
 
 /// Use counts indexed by Value ID. Sized from both defs *and* uses so an
 /// out-of-range operand cannot silently report 0.
-fn count_value_uses(func: &IrFunction) -> Vec<u32> {
+pub(crate) fn count_value_uses(func: &IrFunction) -> Vec<u32> {
     let mut max_id: u32 = 0;
     let bump = |max_id: &mut u32, id: u32| {
         if id > *max_id {
