@@ -10,6 +10,8 @@ next_page:
   url: /docs/optimization-passes
 ---
 
+**Engineering index:** [`engineering/subsystems/register-allocation.md`](https://github.com/ms178/lccc/blob/main/engineering/subsystems/register-allocation.md) · backlog [`engineering/agent/BACKLOG.md`](https://github.com/ms178/lccc/blob/main/engineering/agent/BACKLOG.md)
+
 # Register Allocator
 {:.doc-subtitle}
 Production RA is a **policy-heavy linear scan**, not CCC’s 574-line 3-phase greedy allocator and not the March 2026 “Week 2 plan.”

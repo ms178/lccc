@@ -32,6 +32,11 @@ are documented in [`tests/benchmark/WORKLOAD_PROVENANCE.md`](tests/benchmark/WOR
 
 See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
 
+## Engineering docs
+
+All live performance/RA/codegen research lives in [`engineering/`](engineering/README.md).
+Start at [`engineering/agent/README.md`](engineering/agent/README.md).
+
 ## Current documentation
 
 Live docs (August 2026): `docs/getting-started.md`, `docs/architecture.md`,

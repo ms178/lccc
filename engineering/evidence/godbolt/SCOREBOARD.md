@@ -76,7 +76,7 @@ python3 scripts/godbolt.py compile gcc16.2 tests/benchmark/programs/KERNEL.c \
 # aliases: gcc16.2=cg162 clang=cclang2210 icx=cicxlatest
 ```
 
-Asm dumps: `hotspots/godbolt-corpus/KERNEL_{gcc16.2,clang,icx}.s`
+Asm dumps: `engineering/evidence/godbolt/corpus/KERNEL_{gcc16.2,clang,icx}.s`
 
 ## Implications for LCCC (precise)
 

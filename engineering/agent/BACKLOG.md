@@ -1,44 +1,14 @@
-> **Companion (this SHA):** [`GODBOLT_CORPUS_SCOREBOARD.md`](GODBOLT_CORPUS_SCOREBOARD.md)
-> 84 CE compiles of **every** `tests/benchmark/programs/*.c` vs gcc16.2/clang22/icx.
-> Asm: `hotspots/godbolt-corpus/`. Extra ISel items: `andn` (find_bit), `popcntl` (bitops),
-> do **not** chase clang sieve ymm, copy **ICX FMA counts** on nbody/matmul/spectral.
+# Work backlog
 
-# Agent briefing — 150 highest-ROI work items
+Ranked items for generated-code performance vs GCC 16.2 / Clang 22.1 / ICC 2021.10 / ICX.
+Evidence tags: **M** measured LCCC vs GCC14; **G** Compiler Explorer this corpus; **C** code fact; **S** screening suite.
 
-**For the next implementation agent. Do not re-derive from March 2026 RA docs.**
-
-| Field | Value |
-|-------|--------|
-| Tree | `ms178/lccc` **`ef6511e`** (2026-08-20, PR #148) |
-| Prior 100-item audit | **Never landed** on this SHA. This file supersedes it. |
-| RA docs | `lccc-improvements/register-allocation/` **is** current |
-| Mission | Generated-code performance vs **GCC 16.2 / Clang 22.1 / ICC 2021.10 / ICX latest**, then Raptor Lake PMU |
-
----
-
-## 0. Corrections to the previous 100-item list (audit of our own choices)
-
-| Previous claim | Verdict on `ef6511e` | Action |
-|----------------|----------------------|--------|
-| `outline_switch` MIN_CASES=999999 | **FALSE.** `src/passes/outline_switch.rs:37` is **`40`** | Drop that item |
-| No FMA on x86 | **FALSE.** `float_ops.rs` `vfmadd231sd/ss`; vector `vfmadd231pd` in `intrinsics.rs` | Gap is **auto-vectorize of non-reduction loops** + using FMA there, not “add FMA” |
-| No YMM memcpy | **FALSE.** `memory.rs` `emit_memcpy_impl_impl` uses `vmovdqu %ymm0` with measured comments on `struct_copy` | Gap is **by-value ABI + XMM↔RAX field churn**, not memcpy of 32 B |
-| No alias analysis | **Partial.** `src/passes/alias.rs` + `loop_memory_promote.rs` exist. **LICM still TODOs GEP-load alias** (`licm.rs:750`) | Wire LICM to `LoopFrames`/`forms_disjoint` |
-| SROA missing | **FALSE.** `aggregate_sroa.rs` (~1010 lines) **on by default** for load-forward + chain collapse. **Copy-out OFF** (`CCC_SROA_COPYOUT`) — hangs `structs_bitfields` / `simd_sse_float` | Dominator-aware copy-out is the remaining SROA ticket |
-| MachInst missing | **FALSE.** `machinst.rs` + `machinst_regalloc.rs`. **Disabled on large loops** (`CCC_MI_MAX_LOOP_INSTS` default 32) because scheduler **regressed gzip ~3%** (`prologue.rs:812`) | Do not “turn MachInst on globally” |
-| `vectorize_gate` unused | **TRUE.** `pgo/unroll_pgo.rs:122` **`return true`** | Cost model still missing |
-| `enable_splitting` live | **FALSE.** Still `false`, unused | In-scan split still not implemented |
-| ICX CRC on zero `crc_table` | **Invalid CE artifact** (loads deleted) | Never cite |
-| Geomean 0.92× vs GCC | **Micros only** (fib/TCE). Codecs lose | Never use as ICX win |
-
-**Keep (still true):** gzip `longest_match` 118 vs 0 stack-mem; Adler 1.49× with `sum2`/`n` on stack; xmltok 12× / inflate 15× stack-mem; CRC 1.47× is **ISel SIB**; GCC 16.2 `btq` name classify; ICX `dot` uses `vfmadd231pd` YMM acc (GCC 16.2 horizontalizes every iter — **do not copy GCC**).
-
----
+IDs: RA / IS / OP / FE / AB / PG / LK / MS plus IS-ANDN, IS-POPCNT, OP-NO-SIEVE-VEC, …
 
 ## 1. How to gather data (mandatory procedure)
 
 ```text
-1. Reproducer C (≤80 lines) in tests/benchmark/programs/ or hotspots/godbolt-kernels/
+1. Reproducer C (≤80 lines) in tests/benchmark/programs/ or engineering/evidence/godbolt/
 2. scripts/godbolt.py compare FILE --local target/fastbuild/lccc \
      --oracles gcc16.2,clang,icc,icx --function NAME \
      --flags '-O2 -march=x86-64-v3' --artifact-dir results/NAME
@@ -112,7 +82,7 @@ Lowering TODOs: ExprId = pointer; const-eval and typeof diagnostics suffer.
 | `dot` | vectorizer reduction exists | **ICX FMA YMM acc**; gcc16.2 worse than ICX | **copy ICX not GCC** |
 | nbody/spectral/mandelbrot | **2.9–3.8× / 9.3× S** | **non-reduction vectorize** | — |
 | sqlite varint | **~2× S**; 189-inst inline **rejected** (+1119 B, 1.00×) | **ISel branches**, not inline | — |
-| linux_find_bit | **1.85× S** | BMI `tzcnt` | — |
+| linux_find_bit | **1.85× S** | ISel: gcc uses **`andn`+`cmov`** on the C ffs tree, not tzcnt | CE corpus |
 | geomean micros | 0.92× | **fib TCE** — ignore for codecs | — |
 
 ---
@@ -225,7 +195,7 @@ Each item: `ID | ROI | files | evidence | acceptance | do-not`.
 | OP-21 | P2 | `quadratic_sr` | | | |
 | OP-22 | P1 | `redundant_loads` | | | |
 | OP-23 | P2 | `block_layout` vs PGO conservative | **M** expat | don’t reorder | |
-| OP-24 | P2 | `outline_switch` 40 — measure | not 999999 | | |
+| OP-24 | P2 | `outline_switch` threshold is 40; measure size vs gcc | `outline_switch.rs` | | |
 | OP-25 | P1 | Inline `name_cont` | `inline.rs` | **G** gcc inlines | |
 | OP-26 | P1 | Pressure-aware inline | | sqlite | |
 | OP-27 | P2 | IPCP function cloning | `ipcp.rs` | | |
@@ -326,13 +296,26 @@ Each item: `ID | ROI | files | evidence | acceptance | do-not`.
 | MS-04 | P1 | OnceLock env knobs break parameterized tests | live_range.rs |
 | MS-05 | P2 | Compile-time: pass rescans | use-def |
 | MS-06 | P1 | Document PhysReg map once | RA-19 |
-| MS-07 | P0 | Re-run Adler/CRC/Expat/gzip -S on **this SHA** (validation was pre-#148) | **must** |
+| MS-07 | P0 | Re-run Adler/CRC/Expat/gzip -S on current `main` | **must** |
 
 ---
 
+
+### Extra ISel tickets (full-corpus CE)
+
+| ID | ROI | Item | Evidence | Accept |
+|----|-----|------|----------|--------|
+| IS-ANDN | P0 | `a & ~b` → `andn` | find_bit gcc `andn` / icx `andnq` | CE find_bit |
+| IS-CMOV-FFS | P1 | C `__ffs` if-tree → gcc `cmov` chain or `tzcnt` if cheaper | gcc cmov×11, **not** tzcnt | 1.85× kernel |
+| IS-POPCNT | P0 | Hand-rolled popcount → `UnaryOp::Popcount` (`alu.rs` already emits `popcntl`) | bitops gcc/clang `popcntl` | bitops uses insn |
+| OP-NO-SIEVE-VEC | P0 | Do not vectorize sieve fill like clang (365 ins vs gcc 45) | CE sieve | no size explosion |
+| OP-NBODY-YMM | P0 | nbody: ICX 97 ymm / 58 FMA vs gcc 0 ymm / 24 FMA | CE | ymm+FMA |
+| OP-SPECTRAL-FMA | P0 | spectral: gcc already ymm; ICX adds FMA 10 | CE | vfmadd in vector body |
+| RA-ARITH-STK | P1 | arith_loop gcc 107 stack refs | CE | ≤ gcc |
+
 ## 6. First 10 tickets for the next agent (sequence)
 
-1. **MS-07** re-measure `longest_match` stack-mem on `ef6511e` (SROA/MachInst may have moved numbers).
+1. **MS-07** re-measure `longest_match` stack-mem on `0cbdc40` (SROA/MachInst may have moved numbers).
 2. **RA-04** explain dump.
 3. **RA-01 + IS-26** RIP-relative `window` (CE match-mini vs gcc16.2).
 4. **RA-02 + RA-03** next-use (Adler + match).
@@ -364,8 +347,8 @@ src/passes/alias.rs              loop SCEV-lite
 src/passes/licm.rs:750           TODO GEP alias
 src/pgo/unroll_pgo.rs:122        vectorize_gate = true
 scripts/godbolt.py               CE oracle
-lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md
-hotspots/struct_copy_aggregate_abi.md
+engineering/evidence/workloads/gzip-zlib-expat.md
+engineering/evidence/workloads/struct-copy.md
 ```
 
 ## 8. What “beat ICX” means here

@@ -5,6 +5,8 @@ Point-in-time status documents, phase summaries, and benchmark snapshots.
 numbers, gap analyses, and TODO lists here are superseded. Do not implement
 from a May/June “next steps” file.
 
+**Live engineering (RA, backlog, Godbolt):** [`../../engineering/README.md`](../../engineering/README.md)
+
 Authoritative, maintained documentation:
 
 | Topic | Location |
