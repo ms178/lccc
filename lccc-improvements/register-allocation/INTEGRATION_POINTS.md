@@ -1,236 +1,91 @@
-# Register Allocator Integration Points
+# Register Allocator Integration Points (August 2026)
 
-## Summary
+Paths are `src/backend/...` (the crate is no longer `ccc/src`).
 
-The register allocator is called from `prologue.rs` (architecture-specific) and must integrate seamlessly with:
-1. Stack space calculation
-2. Prologue/epilogue generation
-3. Code generation
-
-This document maps exact integration points and defines the interface for replacing the allocator.
-
-## Current Integration Flow
-
-### 1. Call Site: `prologue.rs:81-85` (x86 example)
-
-```rust
-let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-    func, available_regs, caller_saved_regs, &asm_clobbered_regs,
-    &mut self.reg_assignments, &mut self.used_callee_saved,
-    false,
-);
-```
-
-**Location:** `ccc/src/backend/x86/codegen/prologue.rs:81-85`
-
-**Similar locations:**
-- `ccc/src/backend/i686/codegen/prologue.rs` (32-bit x86)
-- `ccc/src/backend/arm/codegen/prologue.rs` (AArch64)
-- `ccc/src/backend/riscv/codegen/prologue.rs` (RISC-V 64)
-
-### 2. Wrapper Function: `generation.rs:run_regalloc_and_merge_clobbers()`
-
-**Location:** `ccc/src/backend/generation.rs` (to find exact line, search for this function)
-
-**Purpose:** Calls the core allocator and merges inline asm clobbered registers.
-
-### 3. Core Allocator Entry: `regalloc.rs:80-324`
-
-**Function:** `pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllocResult`
-
-**Inputs:**
-```rust
-pub struct RegAllocConfig {
-    pub available_regs: Vec<PhysReg>,              // Callee-saved (x86: rbx, r12-r15)
-    pub caller_saved_regs: Vec<PhysReg>,          // Caller-saved (x86: r11, r10, r8, r9)
-    pub allow_inline_asm_regalloc: bool,          // Only RISC-V = true
-}
-```
-
-**Output:**
-```rust
-pub struct RegAllocResult {
-    pub assignments: FxHashMap<u32, PhysReg>,     // Value ID → physical register
-    pub used_regs: Vec<PhysReg>,                  // Registers actually used (for prologue/epilogue)
-    pub liveness: Option<super::liveness::LivenessResult>,  // Cached for stack layout
-}
-```
-
-### 4. Stack Space Calculation: `prologue.rs:87-92`
-
-```rust
-let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size, align| {
-    let effective_align = if align > 0 { align.max(8) } else { 8 };
-    let alloc = (alloc_size + 7) & !7;
-    let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
-    (-new_space, new_space)
-}, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, false);
-```
-
-**Key parameter:** `&reg_assigned` (values that got registers) — these skip stack allocation.
-
-### 5. Prologue/Epilogue Emission: `prologue.rs:111-149` and beyond
-
-```rust
-pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
-    // ...
-    let used_regs = self.used_callee_saved.clone();
-    for (i, &reg) in used_regs.iter().enumerate() {
-        let offset = -frame_size + (i as i64 * 8);
-        let reg_name = phys_reg_name(reg);
-        self.state.out.emit_instr_reg_rbp("    movq", reg_name, offset);
-    }
-    // ...
-}
-```
-
-**Key field:** `self.used_callee_saved` (populated from `RegAllocResult::used_regs`)
-
-### 6. Code Generation: References `self.reg_assignments`
-
-During instruction emission, codegen checks `self.reg_assignments` to see if a value is assigned a register.
-
-**Example (pseudo-code):**
-```rust
-if let Some(reg) = self.reg_assignments.get(&value_id) {
-    emit_register_access(reg);  // Use register instead of stack
-} else {
-    emit_stack_access(value_id);  // Fall back to stack slot
-}
-```
-
-## Data Flow
+## Call flow
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ allocate_registers(func, config) → RegAllocResult            │
-│   Input: IrFunction, available_regs, caller_saved_regs      │
-│   Output: assignments (Value→PhysReg), used_regs, liveness  │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-        ┌──────────────┼──────────────┐
-        │              │              │
-        ▼              ▼              ▼
-  Stack layout   Prologue/Epilogue  Codegen
-  (skip stack    (save/restore      (emit reg
-   slots for     regs for           accesses)
-   allocated     allocated vars)
-   values)
+arch codegen calculate_stack_space / prologue
+  → generation::run_regalloc_and_merge_clobbers(...)
+       → regalloc::allocate_registers(func, &RegAllocConfig)
+            → liveness::compute_live_intervals
+            → live_range::build_live_ranges + LinearScanAllocator::run[_with_seed]
+       → merge inline-asm clobbers into used_regs
+  → stack_layout::calculate_stack_space_common(..., &reg_assigned, cached_liveness)
+  → emit_prologue uses used_callee_saved
+  → emit uses state.reg_assignments
 ```
 
-## Register Numbering (x86-64 Example)
+IR pre-pass (earlier in the pipeline, gated by `max_splits`):
 
-**PhysReg IDs:**
-
-| PhysReg(n) | Register | Type | ABI |
-|-----------|----------|------|-----|
-| 0 | rax | Caller-saved (implicit) | Accumulator |
-| 1 | rbx | Callee-saved | General |
-| 2 | rcx | Caller-saved | arg3 |
-| 3 | rdx | Caller-saved | arg2 |
-| 4 | rsi | Caller-saved | arg1 |
-| 5 | rdi | Caller-saved | arg0 |
-| 6 | r8 | Caller-saved | arg4 |
-| 7 | r9 | Caller-saved | arg5 |
-| 8 | r10 | Caller-saved | Scratch |
-| 9 | r11 | Caller-saved | Scratch |
-| 10 | r12 | Callee-saved | General |
-| 11 | r13 | Callee-saved | General |
-| 12 | r14 | Callee-saved | General |
-| 13 | r15 | Callee-saved | General |
-
-**Configured in:**
-- `X86_CALLEE_SAVED` = [rbx, r12, r13, r14, r15] = [PhysReg(1), PhysReg(10), PhysReg(11), PhysReg(12), PhysReg(13)]
-- `X86_CALLER_SAVED` = [r11, r10, r8, r9] = [PhysReg(9), PhysReg(8), PhysReg(6), PhysReg(7)] (filtered based on function characteristics)
-
-## Configuration Pre-Processing
-
-Before calling allocator, prologue.rs filters caller-saved registers based on function characteristics:
-
-```rust
-if has_indirect_call {
-    caller_saved_regs.retain(|r| r.0 != 11);  // Remove r10
-}
-if has_i128_ops {
-    caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15);
-    // Remove r8, r9, rdi, rsi (used by i128 operations)
-}
-if has_atomic_rmw {
-    caller_saved_regs.retain(|r| r.0 != 12);  // Remove r8
-}
+```
+split_ranges::split_call_spanning_ranges
+split_ranges::split_loop_transparent_ranges
+split_ranges::place_edge_copy_blocks
 ```
 
-## Interface Stability
+## Config fields the March docs missed
 
-**The interface that replacement allocator must maintain:**
+Call sites **must** fill:
 
-```rust
-pub fn allocate_registers(
-    func: &IrFunction,
-    config: &RegAllocConfig,
-) -> RegAllocResult
-```
+- `call_arg_regs` — SysV AMD64 rdi/rsi/rdx/r8/r9 (not rcx? check backend);
+  AArch64 x4–x7 + x8 indirect result; empty i686/RISC-V
+- `indirect_target_regs` — AMD64 r10
+- `xmm_regs` — XMM ids (~20+) or AArch64 starting at PhysReg(40)
+- `never_materialized`
+- `folded_index_uses` — **AArch64 only**; x86 must stay empty (session-23
+  `pointer_mix` regression)
 
-**No changes needed to:**
-- `PhysReg` struct
-- `RegAllocConfig` struct
-- `RegAllocResult` struct
-- Call sites in prologue.rs
-- Code generation sites
+## PhysReg map (x86-64)
 
-## Performance Expectations
+| id | reg | notes |
+|----|-----|--------|
+| 0 | rax | accumulator; i686 Phase 2e uses PhysReg(6) as eax on that backend |
+| 1 | rbx | callee-saved |
+| 2–5 | rcx rdx rsi rdi | |
+| 6–7 | r8 r9 | |
+| 8–9 | r10 r11 | r10 = indirect target |
+| 10–13 | r12–r15 | callee-saved |
 
-### Current Behavior
-- Returns ~5% of values with registers
-- Typical function: 0-4 values allocated
-- Stack frame: varies, but often 1KB+
+i686: smaller file; PhysReg(4/5) = ecx/edx scratch hazards; PhysReg(6) = eax home wave.
 
-### Expected After Improvement
-- Returns ~50% of eligible values with registers
-- Better register packing (especially in loops)
-- Stack frame: only for truly uncovered values + alloca'd variables
+AArch64: x0–x30; NEON pool advertised as xmm_regs with first id 40.
 
-## Testing Approach
+## Interface is **not** frozen
 
-1. **Compile test function:**
-   ```c
-   int compute_32(int a, int b, ..., int f2) {
-       return a + b + ... + f2;
-   }
-   ```
+March claimed “no struct changes”. Reality: `RegAllocResult` gained
+`caller_save_spans`; `RegAllocConfig` grew six fields. New features
+(remat, split children, hint physregs from ABI) **will** extend these
+structs. Keep call sites compiling; do not treat the March signature as
+sacred.
 
-2. **Generate assembly:**
-   ```bash
-   ./ccc -S test.c -o test.s
-   ```
+## Stack layout coupling
 
-3. **Compare register assignments:**
-   - Before: stack only
-   - After: registers for all parameters
+Unassigned values get slots via `stack_layout` three-tier packing +
+`graph_coloring.rs` for 8-byte multi-block values. Copy coalescing there
+is **independent** of RA copy groups — two systems can disagree. Audit
+before changing either.
 
-4. **Measure stack frame:**
-   - Before: ~11KB
-   - After: minimal (only alignment padding)
+`regalloc_helpers.rs` filters callee-saved lists per function (i128,
+atomics, indirect calls). That filtering is **before** `allocate_registers`;
+the allocator must not assume a full architectural file.
 
-## Next Steps
+## Codegen coupling (miscompile surface)
 
-1. **Design new allocator** with interval splitting and coalescing (WEEK 1)
-2. **Implement LiveInterval tracking** with split points (WEEK 2)
-3. **Test on 32-variable function** (WEEK 2-3)
-4. **Validate on SQLite benchmark** (WEEK 3)
-5. **Compare register assignments** to baseline
+Homes are **whole-interval**. Codegen assumes a value in `%r12` is in
+`%r12` at every use. Introducing in-scan split **requires** reload/spill
+insertion or SSA rename — cannot be local to `live_range.rs`.
 
-## Architecture-Specific Notes
+Die-at-birth sharing requires the **emitter** to read the dying operand
+before writing the dest. Hints are restricted to those emitters.
 
-The allocator is **architecture-agnostic** because:
-- `RegAllocConfig` provides available registers per-arch
-- `LiveInterval` is arch-independent
-- `PhysReg` is a simple ID number
+Folded GEP: AArch64 emits `[base, index, lsl #N]` with **no** IR use of
+index at the load. RA must extend index liveness via `folded_index_uses`.
 
-Each architecture passes its own register lists:
-- **x86-64:** 16 GPR (0-15)
-- **i686:** 8 GPR (0-7)
-- **AArch64:** 32 GPR (0-31)
-- **RISC-V 64:** 32 GPR (0-31)
+## Testing hooks
 
-New allocator must respect these boundaries and not make arch-specific assumptions.
+- `CCC_DEBUG_RA` — final assignment dump
+- `CCC_DEBUG_RA_INTERVALS`
+- `CCC_TRACE_ALLOC` — overlapping-assignment asserts
+- `verify_no_overlap` — fat-interval overlap print (does not understand
+  die-at-birth; expect false positives at `end == start`)
