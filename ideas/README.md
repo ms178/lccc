@@ -1,3 +1,7 @@
+# ideas/
+
+Ranked notes. **Authoritative backlog:** [`../engineering/agent/BACKLOG.md`](../engineering/agent/BACKLOG.md).
+
 # Improvement backlog (not yet scheduled)
 
 Ranked ideas with evidence. Naming: `<priority>_<topic>.txt` for
