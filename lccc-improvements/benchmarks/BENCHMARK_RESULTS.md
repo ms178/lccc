@@ -1,3 +1,5 @@
+> **Archive (2026-03).** Not current performance or RA status. Canonical: `tests/benchmark/run_benchmarks.py`, `docs/benchmarks.md`, `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`.
+
 # LCCC Benchmark Results — Phase 2 Status & Performance Report
 
 **Date:** 2026-03-19
