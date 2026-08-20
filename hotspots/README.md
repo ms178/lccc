@@ -50,6 +50,10 @@ to regenerate them must stay in the repository.
 
 ## Current entries
 
+- [`UNIFIED_AGENT_HANDOFF.md`](UNIFIED_AGENT_HANDOFF.md) — **start here** for the next agent (`ef6511e`).
+- [`AGENT_BRIEFING_150.md`](AGENT_BRIEFING_150.md) — 150 ROI items by subsystem.
+- [`GODBOLT_CORPUS_SCOREBOARD.md`](GODBOLT_CORPUS_SCOREBOARD.md) — gcc16.2/clang22/icx on all 28 bench programs.
+- [`godbolt-corpus/`](godbolt-corpus/) — CE assembly dumps.
 - [`../lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`](../lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md)
   — 2026-08-20 screening: gzip `longest_match` 118 vs 0 stack-mem; Adler 1.49×;
   Expat scan 1.95×; inflate 15× stack-mem. Status: `screening` / `root-caused`
