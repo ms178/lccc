@@ -4,7 +4,7 @@ Re-oracle and check gzip `longest_match` stack-mem after **each** item.
 
 | Step | ID | Work |
 |------|-----|------|
-| 1 | MS-07 | LCCC `-S` of gzip `deflate.c` `longest_match` on **this SHA** (prior −S was an older revision). |
+| 1 | MS-07 | LCCC `-S` of gzip `deflate.c` `longest_match` on **this SHA** (`3e0ab3e` or newer). Do not reuse 118-stack-mem without re-measure. |
 | 2 | RA-04 | `CCC_RA_EXPLAIN=fn` spill dump. |
 | 3 | RA-01 | RIP-relative `window`/`prev`/`strstart` (not GOT+stack). CE: gcc `window(%r9,%rcx)`. |
 | 4 | RA-02, RA-03 | Next-use: match IVs in GPR; Adler DO8 keep `sum2`/`n`. CE Adler ~0 stack. |

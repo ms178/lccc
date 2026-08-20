@@ -1,6 +1,6 @@
 # Current compiler state
 
-SHA at last doc refresh: **`0cbdc40`** (`ms178/lccc` main). Re-verify line numbers before editing.
+SHA at last doc refresh: **`3e0ab3e`** (`ms178/lccc` main, PR #150). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (RA-01…MS-07).
 
 ## What is production
 

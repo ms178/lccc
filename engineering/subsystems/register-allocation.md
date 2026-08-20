@@ -23,7 +23,7 @@ PhysReg **(11) = %r10**, (10) = %r11.
 
 ## Open quality gaps
 
-Remat of file-scope arrays; next-use (Adler `sum2`); segment scan (xmltok/inflate); second-chance; affinity vs disjoint merge. See `engineering/agent/BACKLOG.md` RA-*.
+Remat of file-scope arrays; next-use (Adler `sum2`); segment scan (xmltok/inflate); second-chance; affinity vs disjoint merge. Catalog: [`../agent/BACKLOG.md`](../agent/BACKLOG.md) items **RA-01 … RA-22** (part of the 150).
 
 ## Kill-switches
 
