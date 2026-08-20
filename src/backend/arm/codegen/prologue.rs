@@ -88,6 +88,10 @@ impl ArmCodegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, None, call_arg_regs, Vec::new(),
+            // ARM emits indexed addressing [base, index, lsl #N] directly at
+            // the Load/Store with no IR-visible use of the index there; the
+            // allocator must keep the index live to the consumer's end.
+            crate::backend::generation::collect_folded_index_links(func),
         );
 
         // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by

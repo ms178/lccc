@@ -31,7 +31,8 @@ pub fn run_regalloc_and_merge_clobbers(
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
     run_regalloc_and_merge_clobbers_ex(
         func, available_regs, caller_saved_regs, asm_clobbered_regs,
-        reg_assignments, used_callee_saved, allow_inline_asm_regalloc, None, Vec::new(), Vec::new())
+        reg_assignments, used_callee_saved, allow_inline_asm_regalloc, None, Vec::new(), Vec::new(),
+        crate::common::fx_hash::FxHashMap::default())
 }
 
 /// Extended variant taking the set of values codegen will never materialize
@@ -50,6 +51,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     never_materialized: Option<crate::common::fx_hash::FxHashSet<u32>>,
     call_arg_regs: Vec<PhysReg>,
     indirect_target_regs: Vec<PhysReg>,
+    folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
@@ -189,6 +191,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         available_regs, caller_saved_regs, call_arg_regs, indirect_target_regs,
         allow_inline_asm_regalloc, xmm_regs,
         never_materialized: never_materialized.unwrap_or_default(),
+        folded_index_uses,
     };
     // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).
     let alloc_result = if std::env::var("CCC_NO_REGALLOC").is_ok() {

@@ -254,6 +254,9 @@ impl I686Codegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, never_materialized, Vec::new(), Vec::new(),
+            // i686 re-materialises skipped indexed GEPs (default
+            // emit_load_indexed = false): no RA-invisible index consumption.
+            crate::common::fx_hash::FxHashMap::default(),
         );
 
         // %ebx must be saved/restored only when it really holds the GOT base.

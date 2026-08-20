@@ -49,6 +49,23 @@ pub struct RegAllocConfig {
     pub allow_inline_asm_regalloc: bool,
     pub xmm_regs: Vec<PhysReg>,
     pub never_materialized: FxHashSet<u32>,
+    /// Backend-folded GEP index consumers: map of `index value id` → the
+    /// GEP-dest value ids whose Load/Store consumes the index through an
+    /// indexed addressing form. The IR records no use of the index at that
+    /// point (the offset computation was folded away), so the allocator must
+    /// extend the index's live interval to the consumer's own interval end —
+    /// otherwise the index's register is free for reuse and the emitted
+    /// `[base, index, lsl #N]` reads whatever moved in (reproduced: fa[i]
+    /// stores landing on fa[seed] on aarch64 -O0/-O2).
+    ///
+    /// ONLY backends that actually EMIT the indexed form (overriding
+    /// emit_load_indexed/emit_store_indexed — currently arm alone) may pass a
+    /// non-empty map. x86-64/i686 return false from the default hooks and
+    /// re-materialise the skipped GEP at the load (IR-visible uses intact);
+    /// extending there only adds register pressure (it regressed
+    /// check_gpr_leaf_param_codegen::pointer_mix when applied globally —
+    /// session-23 audit of the Agent-B patch).
+    pub folded_index_uses: FxHashMap<u32, Vec<u32>>,
 }
 
 fn env_on(name: &'static str) -> bool {
@@ -525,7 +542,45 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     let is_32bit = crate::common::types::target_is_32bit();
-    let liveness = compute_live_intervals(func);
+    let mut liveness = compute_live_intervals(func);
+    // Extend live intervals for backend-folded index consumers BEFORE any
+    // interval map is derived (see RegAllocConfig::folded_index_uses).
+    if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
+        // value_id -> interval end, from the consumer GEP-dest intervals.
+        let mut end_of: FxHashMap<u32, u32> = FxHashMap::default();
+        for iv in &liveness.intervals {
+            end_of.insert(iv.value_id, iv.end);
+        }
+        for (idx, dests) in &config.folded_index_uses {
+            let mut new_end: Option<u32> = None;
+            for d in dests {
+                if let Some(&e) = end_of.get(d) {
+                    new_end = Some(new_end.map_or(e, |x: u32| x.max(e)));
+                }
+            }
+            if let Some(e) = new_end {
+                for iv in &mut liveness.intervals {
+                    if iv.value_id == *idx && iv.end < e {
+                        iv.end = e;
+                    }
+                }
+                // Hole-aware segments: stretch the last segment to the new end
+                // (conservative — a contiguous live range can only over-
+                // constrain, never under-constrain).
+                let mut last_seg: Option<usize> = None;
+                for (si, seg) in liveness.segments.iter().enumerate() {
+                    if seg.value_id == *idx {
+                        last_seg = Some(si);
+                    }
+                }
+                if let Some(si) = last_seg {
+                    if liveness.segments[si].end < e {
+                        liveness.segments[si].end = e;
+                    }
+                }
+            }
+        }
+    }
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
 
