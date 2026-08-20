@@ -656,6 +656,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         eligible.insert(dest.0);
                     }
                 }
+                // Session 28: PHI destinations are real values with real live
+                // intervals (loop-carried state: switch machines, running
+                // pointers).  Without a register home every use reloads them
+                // from a stack slot — the dominant slot traffic in the boot
+                // corpus (cmdline_find_option's `state` machine: gcc keeps it
+                // in a register across the whole loop).  The phi-coalesce
+                // machinery propagates the assigned register to the backedge
+                // sources (apply_phi_coalesce_assignments expects the phi
+                // dest to hold one), so this composes with the existing
+                // coalesce contract instead of bypassing it.
                 _ => {}
             }
             for_each_operand_in_instruction(inst, |op| {
@@ -812,10 +822,53 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // reload from the value's home), so excluding them from Phase 1 merely
     // turns a callee-saved home into a stack slot reloaded on every use
     // (nbody's `bodies` base: +274 bytes). Matches the pre-rework allocator.
+    //
+    // Session 28: HOT LOOP-CARRIED values join Phase 1 even without a call.
+    // A long-lived value used on every loop iteration pays a slot reload on
+    // EVERY use when spilled — the dominant slot traffic of the boot corpus
+    // (cmdline_find_option's state machine, uses=71/81 loop-weighted, all
+    // slotted while span-1 temps took caller-saved registers).  Giving them
+    // callee-saved homes is exactly what gcc does on the same 6-register
+    // budget.  Candidates: loop-depth ≥ 1 at their start, heavily used, and
+    // long-lived (short temps are Phase-2 fodder, not loop state).
+    let hot_loop_home = |iv: &LiveInterval| -> bool {
+        if env_on("CCC_NO_HOT_LOOP") {
+            return false;
+        }
+        if call_spanning.contains(&iv.value_id) {
+            return false;
+        }
+        if iv.end.saturating_sub(iv.start) < 10 {
+            return false;
+        }
+        // Use pressure: the value's own uses, or — for a coalesce-group
+        // leader (phi webs) — the group total.  The leader's raw count only
+        // reflects the phi's own incoming edges (cmdline's state machine:
+        // leader shows 10, the web totals 71+).
+        let mut uc = use_count.get(&iv.value_id).copied().unwrap_or(0);
+        if let Some(members) = coalesce_groups.get(&iv.value_id) {
+            let total: u64 = members
+                .iter()
+                .map(|m| use_count.get(m).copied().unwrap_or(0))
+                .sum();
+            uc = uc.max(total);
+        }
+        if uc < 12 {
+            return false;
+        }
+        // Start point inside a loop block?
+        match liveness.block_starts.partition_point(|&s| s <= iv.start) {
+            0 => false,
+            idx => {
+                let b = idx - 1;
+                b < liveness.block_loop_depth.len() && liveness.block_loop_depth[b] >= 1
+            }
+        }
+    };
     let phase1_intervals: Vec<LiveInterval> = scan_ivs
         .iter()
         .copied()
-        .filter(|iv| call_spanning.contains(&iv.value_id))
+        .filter(|iv| call_spanning.contains(&iv.value_id) || hot_loop_home(iv))
         .collect();
     let mut phase1_ranges =
         live_range::build_live_ranges(&phase1_intervals, &liveness.block_loop_depth, func);
@@ -1669,6 +1722,28 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     if env_on("CCC_VERIFY_REGALLOC") {
         verify_no_overlap(&liveness, &assignments);
+    }
+
+    // Session-28 debug: per-value home census (register vs slot) for one
+    // function, to analyze spill/slot-traffic decisions.
+    if std::env::var_os("LCCC_DBG_RA").is_some() {
+        let filter = std::env::var("LCCC_DBG_RA_FUNC").unwrap_or_default();
+        if filter.is_empty() || func.name.contains(&filter) {
+            let mut rows: Vec<(u32, u32, u32, String)> = Vec::new();
+            for iv in &liveness.intervals {
+                let home = match assignments.get(&iv.value_id) {
+                    Some(r) => format!("r{}", r.0),
+                    None => "slot".to_string(),
+                };
+                let uc = use_count.get(&iv.value_id).copied().unwrap_or(0);
+                rows.push((iv.start, iv.end, iv.value_id, format!("{} uses={} elig={}", home, uc, eligible.contains(&iv.value_id))));
+            }
+            rows.sort();
+            eprintln!("[RA] fn={} values={} assigned={}", func.name, rows.len(), assignments.len());
+            for (s, e, vid, info) in rows {
+                eprintln!("[RA]   v{:>5} [{:>5}, {:>5}] {}", vid, s, e, info);
+            }
+        }
     }
 
     RegAllocResult {

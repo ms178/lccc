@@ -1357,6 +1357,247 @@ impl X86Codegen {
         }
     }
 
+    // ---- SIB indexed addressing (session 28): mem(,%idx,scale) ----
+    //
+    // Mirrors the session-27 i686 emitters on the 64-bit backend: a
+    // variable-offset GEP `base + idx<<shift` becomes one SIB memory operand
+    // instead of shift+add+lea+access.  Soundness contract: the prologue
+    // wires collect_folded_gep_links_all (base AND index) into register
+    // allocation, so both address registers survive to the access.  %rax is
+    // not allocatable on x86-64, so rax staging can never collide with the
+    // base/index registers.
+
+    fn sib_mem64(base_reg: &str, index_reg: &str, shift: u8) -> String {
+        if shift == 0 {
+            format!("(%{}, %{})", base_reg, index_reg)
+        } else {
+            format!("(%{}, %{}, {})", base_reg, index_reg, 1u32 << shift)
+        }
+    }
+
+    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8) -> String {
+        if shift == 0 {
+            format!("{}(, %{})", sym, index_reg)
+        } else {
+            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
+        }
+    }
+
+    fn emit_load_indexed_common(
+        &mut self,
+        dest: &Value,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+        mem: String,
+    ) -> bool {
+        if shift > 3 {
+            return false;
+        }
+        // FP loads stay in the SSE domain.
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            let instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+            let dest_xmm = match self.reg_assignments.get(&dest.0) {
+                Some(&r) if is_xmm_reg(r) => Some(phys_reg_name(r)),
+                _ => None,
+            };
+            let target = dest_xmm.unwrap_or("xmm0");
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}", instr, mem, target));
+            if dest_xmm.is_none() {
+                self.store_xmm_to(dest, "xmm0", ty);
+            }
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // I64/U64 included: on x86-64 they are everyday scalar loads.  The
+        // dead-producer skip in generation.rs assumes every consumer of a
+        // foldable indexed GEP IS folded — a type the emitter rejects would
+        // fall back to rematerialisation and read the skipped offset chain.
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let _ = index; // liveness handled by the RA link wiring
+        if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+            if !is_xmm_reg(d_reg) {
+                let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                let d_name = if use_32bit_dest {
+                    phys_reg_name_32(d_reg)
+                } else {
+                    phys_reg_name(d_reg)
+                };
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %{}", load_instr, mem, d_name));
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+        let acc_reg = if matches!(load_instr, "movl" | "movzbl" | "movzwl") {
+            "%eax"
+        } else {
+            "%rax"
+        };
+        self.state
+            .emit_fmt(format_args!("    {} {}, {}", load_instr, mem, acc_reg));
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+        true
+    }
+
+    fn emit_store_indexed_common(
+        &mut self,
+        val: &Operand,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+        mem: String,
+    ) -> bool {
+        if shift > 3 {
+            return false;
+        }
+        // FP stores straight from the XMM home.
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            let instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+            let src = self.fp_store_value_xmm(val, ty);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, {}", instr, src, mem));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // I64/U64 included (see emit_load_indexed_common).
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        let store_instr = Self::mov_store_for_type(ty);
+        let _ = index; // liveness handled by the RA link wiring
+        // Immediate-direct: one instruction, no rax staging.
+        if let Operand::Const(c) = val {
+            if let Some(imm) = c.to_i64() {
+                if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                    let imm_out = match ty {
+                        IrType::I8 | IrType::U8 => imm & 0xff,
+                        IrType::I16 | IrType::U16 => imm & 0xffff,
+                        _ => imm,
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, {}",
+                        store_instr, imm_out, mem
+                    ));
+                    return true;
+                }
+            }
+        }
+        self.operand_to_rax(val);
+        let src = Self::reg_for_type("rax", ty);
+        self.state
+            .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, mem));
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        true
+    }
+
+    pub(super) fn emit_load_indexed_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        let Some(&b) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if is_xmm_reg(b) || self.reg_assignments.get(&index.0).copied().map_or(true, is_xmm_reg) {
+            return false;
+        }
+        let mem = Self::sib_mem64(phys_reg_name(b), phys_reg_name(self.reg_assignments[&index.0]), shift);
+        self.emit_load_indexed_common(dest, index, shift, ty, mem)
+    }
+
+    pub(super) fn emit_store_indexed_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        let Some(&b) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if is_xmm_reg(b) || self.reg_assignments.get(&index.0).copied().map_or(true, is_xmm_reg) {
+            return false;
+        }
+        let mem = Self::sib_mem64(phys_reg_name(b), phys_reg_name(self.reg_assignments[&index.0]), shift);
+        self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
+    pub(super) fn emit_load_indexed_sym_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        if self.state.pic_mode {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) {
+            return false;
+        }
+        let mem = Self::sib_mem64_sym(sym, phys_reg_name(x), shift);
+        self.emit_load_indexed_common(dest, index, shift, ty, mem)
+    }
+
+    pub(super) fn emit_store_indexed_sym_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        if self.state.pic_mode {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) {
+            return false;
+        }
+        let mem = Self::sib_mem64_sym(sym, phys_reg_name(x), shift);
+        self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
     pub(super) fn emit_typed_store_to_slot_impl(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) {
         let reg = Self::reg_for_type("rax", ty);
         let out = &mut self.state.out;
