@@ -799,14 +799,16 @@ impl X86Codegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, Some(never_materialized), call_arg_regs, indirect_target_regs,
-            // x86-64 re-materialises skipped INDEXED GEPs (default
-            // emit_load_indexed = false): no RA-invisible index consumption.
-            // It DOES fold constant-offset GEPs with register bases
-            // (const_offset_fold_reg_base_ok), whose base is consumed at the
-            // Load/Store position: extend the base's interval to the
-            // consumer, else the allocator reuses the base register for the
-            // stored value (zlib-ng gz_reset NULL-store crash).
-            crate::backend::generation::collect_gep_fold_base_links(func),
+            // Session 28: x86-64 emits SIB indexed addressing directly at
+            // the Load/Store (emit_load_indexed/emit_store_indexed) AND
+            // folds constant-offset GEPs with register bases
+            // (const_offset_fold_reg_base_ok): BOTH forms consume address
+            // registers RA-invisibly at the access position.
+            // collect_folded_gep_links_all extends const-fold base intervals
+            // plus indexed-fold base AND index intervals to their consumers,
+            // so every address register survives intervening calls and value
+            // staging (zlib-ng gz_reset NULL-store crash class).
+            crate::backend::generation::collect_folded_gep_links_all(func),
         );
 
         // MachInst is profitable on straight-line and modest-CFG code, but its

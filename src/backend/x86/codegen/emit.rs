@@ -3801,6 +3801,18 @@ impl ArchCodegen for X86Codegen {
         true
     }
 
+    /// Session 28: x86-64 SIB indexed addressing (mirrors session-27 i686):
+    /// `off(%base,%idx,scale)` / `sym(,%idx,scale)` fold variable-offset GEPs
+    /// into one memory operand.  The prologue wires base AND index liveness
+    /// (collect_folded_gep_links_all) so both registers survive to the access.
+    fn supports_indexed_addr(&self) -> bool {
+        std::env::var_os("CCC_NO_X64_SIB").is_none()
+    }
+
+    fn supports_indexed_sym_base(&self) -> bool {
+        std::env::var_os("CCC_NO_X64_SIB").is_none() && !self.state.pic_mode
+    }
+
     fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
         // Register-base const-offset folds consume the base at the Load/Store
         // position (RA-invisible): sound only with the folded-base liveness
@@ -4132,6 +4144,10 @@ impl ArchCodegen for X86Codegen {
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
         fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) => emit_store_with_const_offset_impl;
         fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) => emit_load_with_const_offset_impl;
+        fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool => emit_load_indexed_impl;
+        fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool => emit_store_indexed_impl;
+        fn emit_load_indexed_sym(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, ty: IrType) -> bool => emit_load_indexed_sym_impl;
+        fn emit_store_indexed_sym(&mut self, val: &Operand, sym: &str, index: &Value, shift: u8, ty: IrType) -> bool => emit_store_indexed_sym_impl;
         fn emit_typed_store_to_slot(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) => emit_typed_store_to_slot_impl;
         fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
         fn emit_save_acc(&mut self) => emit_save_acc_impl;
