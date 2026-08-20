@@ -644,8 +644,17 @@ pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, V
 /// regressed +2 callee-saves when the INDEX extension was applied blindly).
 pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
     let mut out = collect_gep_fold_base_links(func);
-    for (k, vs) in collect_folded_index_links(func) {
-        out.entry(k).or_default().extend(vs);
+    // Indexed folds consume BOTH the base and the index at the Load/Store
+    // access position (the IR records their last uses at the folded-away
+    // GEP).  Extending only the index leaves the base register free for
+    // reuse between the GEP and the access on backends that emit the
+    // indexed memory operand directly (arm, i686 SIB).
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    for (dest, info) in &m {
+        out.entry(info.base.0).or_default().push(*dest);
+        out.entry(info.index.0).or_default().push(*dest);
     }
     out
 }
@@ -664,58 +673,85 @@ fn build_indexed_gep_map(
     // Resolve offset → (index, shift). Multi-def offsets are a plain index
     // (shift 0); we refuse to inspect a non-unique definition.
     let resolve_index = |off_id: u32| -> Option<(Value, u8)> {
-        let mut cur = defs.get(&off_id).copied();
+        // Peel power-of-2 scalings and widening integer casts RECURSIVELY
+        // (session 27): `p[i*8]` lowers to Shl(Shl(i,1),2) / Mul(i,8) chains
+        // whose intermediates are accumulator-flow values with no register
+        // home.  Peeling to the natural index (typically the loop IV, which
+        // IS homed) enables `mem(%base,%iv,8)` instead of materialising the
+        // scaled offset (5-insn lea chain → 1 SIB access).  The accumulated
+        // shift must fit the SIB scale field (≤3); when it does not, stop
+        // peeling and use the current value as the index.
+        let mut id = off_id;
+        let mut shift: u8 = 0;
         loop {
-            match cur {
-                Some(Instruction::Cast {
+            let Some(inst) = defs.get(&id).copied() else {
+                break;
+            };
+            match inst {
+                Instruction::Cast {
                     src: Operand::Value(v),
                     from_ty,
                     to_ty,
                     ..
-                }) if from_ty.is_integer()
+                } if from_ty.is_integer()
                     && to_ty.is_integer()
                     && to_ty.size() >= from_ty.size() =>
                 {
-                    cur = defs.get(&v.0).copied();
+                    id = v.0;
+                }
+                Instruction::BinOp {
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(idx),
+                    rhs: Operand::Const(c),
+                    ..
+                } => {
+                    let k = c.to_i64()?;
+                    if k < 0 || (shift as i64) + k > 3 {
+                        break;
+                    }
+                    shift += k as u8;
+                    id = idx.0;
+                }
+                Instruction::BinOp {
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(idx),
+                    rhs: Operand::Const(c),
+                    ..
+                }
+                | Instruction::BinOp {
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Const(c),
+                    rhs: Operand::Value(idx),
+                    ..
+                } => {
+                    let n = c.to_i64()?;
+                    if n <= 0 || !(n as u64).is_power_of_two() {
+                        break;
+                    }
+                    let z = (n as u64).trailing_zeros();
+                    if (shift as u32) + z > 3 {
+                        break;
+                    }
+                    shift += z as u8;
+                    id = idx.0;
+                }
+                // Self-addition doubling: the frontend strength-reduces
+                // `i*2` to `Add(i,i)`; peeling it as one more scale bit
+                // reaches the homed loop IV underneath (`p[i*2]` int loads
+                // arrive as Shl(Add(i,i),2) = shift 3).
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(a),
+                    rhs: Operand::Value(b),
+                    ..
+                } if a == b && shift < 3 => {
+                    shift += 1;
+                    id = a.0;
                 }
                 _ => break,
             }
         }
-        match cur {
-            Some(Instruction::BinOp {
-                op: IrBinOp::Shl,
-                lhs: Operand::Value(idx),
-                rhs: Operand::Const(c),
-                ..
-            }) => {
-                let k = c.to_i64()?;
-                if (0..=3).contains(&k) {
-                    Some((*idx, k as u8))
-                } else {
-                    None
-                }
-            }
-            Some(Instruction::BinOp {
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(idx),
-                rhs: Operand::Const(c),
-                ..
-            })
-            | Some(Instruction::BinOp {
-                op: IrBinOp::Mul,
-                lhs: Operand::Const(c),
-                rhs: Operand::Value(idx),
-                ..
-            }) => {
-                let n = c.to_i64()?;
-                if n > 0 && (n as u64).is_power_of_two() && n <= 8 {
-                    Some((*idx, n.trailing_zeros() as u8))
-                } else {
-                    None
-                }
-            }
-            _ => Some((Value(off_id), 0)),
-        }
+        Some((Value(id), shift))
     };
 
     let mut map: FxHashMap<u32, IndexedGepInfo> = FxHashMap::default();
@@ -1541,12 +1577,12 @@ pub(crate) fn build_folded_value_set(
     let global_addr_map = build_global_addr_map(func, tls_symbols, Some(absolute_symbols));
     let mut set = FxHashSet::default();
     for block in &func.blocks {
-        // (1) load → memory compare.
+        // (1) load → memory compare.  Indexed GEPs feeding these loads are
+        // never skipped at generation (the load_cmp_ptrs priority guard), so
+        // they do not block the fold; const-folded / global ptrs are still
+        // skipped producers the memory compare cannot resolve.
         for (dest, (ptr, _ty, _imm)) in detect_load_cmp_mem_fold(block, &use_counts) {
-            if !gep_fold_map.contains_key(&ptr)
-                && !indexed_gep_map.contains_key(&ptr)
-                && !global_addr_map.contains_key(&ptr)
-            {
+            if !gep_fold_map.contains_key(&ptr) && !global_addr_map.contains_key(&ptr) {
                 set.insert(dest);
             }
         }
@@ -2454,6 +2490,92 @@ fn generate_function(
         FxHashSet::default()
     };
 
+    // Indexed-fold guaranteed-offset-producer skipping (session 27): when an
+    // indexed GEP folds into a Load's SIB memory operand, the GEP's offset
+    // chain (the Shl/Mul/Add-doubling scaling composition) loses its only
+    // use — yet the IR still holds it, so the backend would emit the whole
+    // 3-5 instruction offset materialisation inside the hot loop.  Skip those
+    // single-use producers here.
+    //
+    // SOUNDNESS GUARD: only GEPs consumed EXCLUSIVELY by LOADs qualify.  The
+    // indexed STORE hook can still refuse emission at the access site (the
+    // value-staging class: accumulator staging would clobber the base/index),
+    // in which case `rematerialize_skipped_indexed` re-emits the GEP from
+    // `base + orig_offset` — the offset producers must exist for that.
+    //
+    // Load→cmp-mem priority: an indexed GEP that feeds a load→cmp-mem
+    // candidate must be kept OUT of both the skip set and the dead-producer
+    // set, because the memory-compare fold needs the pointer materialised in
+    // a register/slot to emit `cmpX $imm,(ptr)`.  cmp-mem outranks SIB.
+    let load_cmp_ptrs_func: FxHashSet<u32> = if cg.supports_load_cmp_mem_fold() {
+        let mut s: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for (_dest, (ptr, _ty, _imm)) in detect_load_cmp_mem_fold(block, &value_use_counts) {
+                s.insert(ptr);
+            }
+        }
+        s
+    } else {
+        FxHashSet::default()
+    };
+    let mut idx_dead_producers: FxHashSet<u32> = FxHashSet::default();
+    if cg.supports_indexed_addr() && !indexed_gep_map.is_empty() {
+        let mut foldable_folds: FxHashSet<u32> = FxHashSet::default();
+        for (dest, info) in indexed_gep_map.iter() {
+            if load_cmp_ptrs_func.contains(dest) {
+                continue; // pointer needed materialised by a cmp-mem fold
+            }
+            if can_indexed_addr_fold(cg, info, &global_addr_map) {
+                foldable_folds.insert(*dest);
+            }
+        }
+        let mut has_store_consumer: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Store { ptr, .. } = inst {
+                    if foldable_folds.contains(&ptr.0) {
+                        has_store_consumer.insert(ptr.0);
+                    }
+                }
+            }
+        }
+        let single_defs = index_single_defs(func, &stab);
+        for (dest, info) in indexed_gep_map.iter() {
+            if !foldable_folds.contains(dest) || has_store_consumer.contains(dest) {
+                continue;
+            }
+            // Walk the offset's single-use producer chain; every node whose
+            // only use is within this dead chain is skipped.  Nodes with
+            // other uses (loop IVs, shared subexpressions) stop the walk.
+            // CRITICAL: the walk must stop AT the fold's index value —
+            // resolve_index may return an UNPEELED terminal (e.g. a
+            // const-materialised offset: `movl $132,%edi; leal (%esi,%edi)`
+            // folds to `movl (%esi,%edi)` and READS the index at the
+            // access).  Peeling intermediates are dead; the terminal index
+            // is live by construction.
+            let index_val = info.index.0;
+            let mut stack = vec![info.orig_offset.0];
+            while let Some(v) = stack.pop() {
+                if v == index_val {
+                    continue;
+                }
+                if value_use_counts.get(v as usize).copied() != Some(1) {
+                    continue;
+                }
+                if !idx_dead_producers.insert(v) {
+                    continue;
+                }
+                if let Some(inst) = single_defs.get(&v) {
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(x) = op {
+                            stack.push(x.0);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
     let mut last_debug_file: u32 = 0;
     let mut last_debug_line: u32 = 0;
@@ -2497,6 +2619,14 @@ fn generate_function(
         } else {
             FxHashMap::default()
         };
+        // Pointer ids of load→cmp-mem candidates.  An indexed GEP that feeds
+        // such a load must NOT be skipped: the memory-compare fold needs the
+        // pointer materialised (the cmp emits `cmpX $imm,(ptr)` directly and
+        // cannot resolve a folded-away address).  cmp-mem outranks SIB
+        // indexing — `cmpb $imm,(mem)` beats `movsbl+cmpl` by more than the
+        // SIB fold saves (early_serial_console boot corpus).
+        let load_cmp_ptrs: FxHashSet<u32> =
+            load_cmp_folds.values().map(|(ptr, _, _)| *ptr).collect();
         let mut fused_add_skip: FxHashSet<usize> = FxHashSet::default();
         let mut skip_fused_logical = false;
 
@@ -2587,7 +2717,9 @@ fn generate_function(
                     }
                 }
                 if let Some(info) = indexed_gep_map.get(&dest.0) {
-                    if can_indexed_addr_fold(cg, info, &global_addr_map) {
+                    if !load_cmp_ptrs.contains(&dest.0)
+                        && can_indexed_addr_fold(cg, info, &global_addr_map)
+                    {
                         cg.state().folded_gep_values.insert(dest.0);
                         cg.state().current_program_point += 1;
                         continue;
@@ -2610,6 +2742,12 @@ fn generate_function(
                         }
                         _ => {}
                     }
+                }
+                // Dead offset producers of guaranteed-folded indexed GEPs
+                // (load-only consumers; see idx_dead_producers above).
+                if idx_dead_producers.contains(&dest.0) {
+                    cg.state().current_program_point += 1;
+                    continue;
                 }
             }
 
@@ -2743,8 +2881,13 @@ fn generate_function(
             // generate_load and is not resolvable by the memory-compare path).
             if let Instruction::Load { dest, ptr, ty, .. } = inst {
                 if let Some((_, _, imm)) = load_cmp_folds.get(&dest.0) {
+                    // Indexed GEPs feeding this load were kept un-skipped
+                    // (load_cmp_ptrs guard at the GEP skip site), so they do
+                    // not block the fold; const-folded / global ptrs are
+                    // still skipped producers the cmp cannot resolve.
                     if !gep_fold_map.contains_key(&ptr.0)
-                        && !indexed_gep_map.contains_key(&ptr.0)
+                        && (!indexed_gep_map.contains_key(&ptr.0)
+                            || load_cmp_ptrs.contains(&ptr.0))
                         && !global_addr_map.contains_key(&ptr.0)
                     {
                         cg.state().pending_load_cmp.insert(dest.0, (ptr.0, *ty, *imm));

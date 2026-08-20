@@ -664,6 +664,176 @@ impl I686Codegen {
         }
     }
 
+    // ---- SIB indexed addressing (session 27): mem(,%idx,scale) ----
+    //
+    // Soundness contract: both the base and the index registers are consumed
+    // at the Load/Store position — the prologue wires
+    // collect_folded_gep_links_all into register allocation, so both live
+    // intervals extend to the access.  Every path below either emits a
+    // single instruction (no staging → any base/index registers are safe) or
+    // stages the value through %eax first, in which case base and index must
+    // sit in callee-saved GPRs (staging never touches ebx/esi/edi/ebp).
+
+    /// Types addressable by a single SIB load/store (no pair/x87 handling).
+    fn sib_scalar_ty(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
+    }
+
+    fn sib_mem(base_reg: &str, index_reg: &str, shift: u8) -> String {
+        if shift == 0 {
+            format!("(%{}, %{})", base_reg, index_reg)
+        } else {
+            format!("(%{}, %{}, {})", base_reg, index_reg, 1u32 << shift)
+        }
+    }
+
+    fn sib_mem_sym(sym: &str, index_reg: &str, shift: u8) -> String {
+        if shift == 0 {
+            format!("{}(, %{})", sym, index_reg)
+        } else {
+            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
+        }
+    }
+
+    pub(super) fn emit_load_indexed_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        if !Self::sib_scalar_ty(ty) || shift > 3 {
+            return false;
+        }
+        let Some(&b) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift);
+        let load_instr = self.load_instr_for_type(ty);
+        // Single instruction — no staging, so dest may alias base/index
+        // (x86 computes the address before writing the destination).
+        if let Some(&d) = self.reg_assignments.get(&dest.0) {
+            emit!(self.state, "    {} {}, %{}", load_instr, mem, phys_reg_name(d));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        emit!(self.state, "    {} {}, %eax", load_instr, mem);
+        self.state.reg_cache.invalidate_acc();
+        self.emit_store_result(dest);
+        true
+    }
+
+    pub(super) fn emit_store_indexed_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        if !Self::sib_scalar_ty(ty) || shift > 3 {
+            return false;
+        }
+        let Some(&b) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift);
+        let store_instr = self.store_instr_for_type(ty);
+        // Immediate or register-resident value: single instruction, no
+        // staging.  A register source equal to the index register can only
+        // be the SAME value (`a[i] = i`) — the single instruction reads it
+        // for the address and the data consistently.
+        if let Some(src) = self.direct_store_src(val, ty) {
+            emit!(self.state, "    {} {}, {}", store_instr, src, mem);
+            return true;
+        }
+        // Value must be staged through %eax: require base and index in
+        // callee-saved GPRs (PhysReg 0..=3 = ebx/esi/edi/ebp), which the
+        // staging paths never touch.
+        if !matches!(b.0, 0 | 1 | 2 | 3) || !matches!(x.0, 0 | 1 | 2 | 3) {
+            return false;
+        }
+        self.operand_to_eax(val);
+        let src = self.eax_for_type(ty);
+        emit!(self.state, "    {} {}, {}", store_instr, src, mem);
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    pub(super) fn emit_load_indexed_sym_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
+        let load_instr = self.load_instr_for_type(ty);
+        if let Some(&d) = self.reg_assignments.get(&dest.0) {
+            emit!(self.state, "    {} {}, %{}", load_instr, mem, phys_reg_name(d));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        emit!(self.state, "    {} {}, %eax", load_instr, mem);
+        self.state.reg_cache.invalidate_acc();
+        self.emit_store_result(dest);
+        true
+    }
+
+    pub(super) fn emit_store_indexed_sym_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+    ) -> bool {
+        if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
+        let store_instr = self.store_instr_for_type(ty);
+        if let Some(src) = self.direct_store_src(val, ty) {
+            emit!(self.state, "    {} {}, {}", store_instr, src, mem);
+            return true;
+        }
+        // Staging through %eax: the index must survive it.
+        if !matches!(x.0, 0 | 1 | 2 | 3) {
+            return false;
+        }
+        self.operand_to_eax(val);
+        let src = self.eax_for_type(ty);
+        emit!(self.state, "    {} {}, {}", store_instr, src, mem);
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
     // ---- Typed store/load helpers ----
 
     pub(super) fn emit_typed_store_to_slot_impl(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) {
