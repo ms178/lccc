@@ -2,18 +2,21 @@
 
 Point-in-time status documents, phase summaries, and benchmark snapshots.
 **Nothing in this directory describes the current state of the compiler** —
-numbers, gap analyses, and TODO lists here are superseded.
+numbers, gap analyses, and TODO lists here are superseded. Do not implement
+from a May/June “next steps” file.
 
-Authoritative, maintained documentation lives in:
+Authoritative, maintained documentation:
 
 | Topic | Location |
 |---|---|
-| Current architecture | `../architecture.md`, `../../DESIGN_DOC.md` |
-| Optimization passes | `../optimization-passes.md` |
-| Register allocator | `../register-allocator.md` |
-| Benchmarks (how to run + policy) | `../benchmarks.md`, `tests/benchmark/` |
-| SIMD audit (findings + fixes) | `../simd-audit.md` |
-| Roadmap / open work | `../roadmap.md`, `ideas/`, `hotspots/` |
-| Active bug queue | `current_tasks/` |
+| Getting started / binaries | `../getting-started.md` |
+| Architecture | `../architecture.md` |
+| Register allocator (live) | `../register-allocator.md`, `lccc-improvements/register-allocation/` |
+| RA vs gzip/zlib-ng/expat | `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md` |
+| Optimization passes | `../optimization-passes.md`, **`src/passes/README.md`** (tiers) |
+| Benchmarks | `../benchmarks.md`, `tests/benchmark/` |
+| SIMD | `../simd-audit.md` |
+| Roadmap / backlog | `../roadmap.md`, `ideas/`, `hotspots/RESEARCH_BACKLOG.md` |
+| Active bugs | `current_tasks/` |
 
-Files are prefixed with their approximate date of record.
+`updates/phase*.md` is the same class of archive.

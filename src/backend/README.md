@@ -462,37 +462,31 @@ single-block values.
 
 ---
 
-## Linear Scan Register Allocator (regalloc.rs)
+## Linear Scan Register Allocator (regalloc.rs + live_range.rs)
 
-The register allocator assigns physical registers to IR values based on
-their live intervals, prioritizing values with the most uses and longest
-lifetimes. Values that do not receive a register remain on the stack and
-are accessed through the accumulator load/store path.
+**Live documentation:** `lccc-improvements/register-allocation/`
+(August 2026). The paragraphs below are a sketch; they must not be used
+as a Week-2 implementation plan.
 
-### Three-Phase Allocation
+The scan kernel is `LinearScanAllocator` (`live_range.rs`). Policy
+(eligibility, copy/phi groups, call-arg waves, i686 hazards, XMM/NEON)
+is `allocate_registers` in `regalloc.rs`. Hole-aware **segments** decide
+call-spanning; the scan still uses fat `[start,end]` envelopes.
+`split_ranges.rs` is an IR pre-pass. There is **no** in-scan
+reload-at-next-use.
 
-**Phase 1 -- Callee-saved registers for call-spanning values.**
-Values whose live ranges span function calls are assigned callee-saved
-registers (x86: `rbx`, `r12`--`r15`; ARM: `x20`--`x28`; RISC-V: `s1`,
-`s7`--`s11`). These registers are preserved across calls by the ABI, so no
-per-call save/restore is needed -- only the prologue and epilogue must save
-and restore them. The linear scan walks sorted candidate intervals and
-assigns each to the callee-saved register with the earliest free time.
+### Allocation waves
 
-**Phase 2 -- Caller-saved registers for non-call-spanning values.**
-Values whose live ranges do not cross any call are assigned caller-saved
-registers (x86: `r11`, `r10`, `r8`, `r9`; ARM: `x13`, `x14`). Since
-these values are not live across calls, the registers do not need to be
-saved or restored at all -- neither at call sites nor in the
-prologue/epilogue.
+**Phase 1 -- Callee-saved for values live across a call *inside a live
+segment*.** x86: `rbx`, `r12`--`r15`; ARM: `x20`--`x28`; RISC-V: `s1`,
+`s7`--`s11`.
 
-**Phase 3 -- Callee-saved spillover.**
-After Phases 1 and 2, any remaining callee-saved registers are assigned to
-the highest-priority non-call-spanning values that did not fit in the
-caller-saved pool. This is critical for call-free hot loops (hash
-functions, matrix multiply, sorting kernels) where all values compete for
-only a few caller-saved registers. The one-time prologue/epilogue
-save/restore cost is amortized over many loop iterations.
+**Phase 2 -- Caller-saved for non-spanning leftovers**, split into
+constraint waves (`call_arg_regs`, `indirect_target_regs`, i686
+`%ecx`/`%edx`) with `run_with_seed` occupancy.
+
+**Phase 2c -- leftover unused callee-saved** for call-free overflow
+(hash, match, sort). Then i686 2d/2e, AArch64 loop-pin, XMM class.
 
 ### Priority Scoring
 
@@ -520,8 +514,10 @@ well-understood instructions are eligible. Specifically:
   definition (no benefit from a register); values used as memory pointers
   in instructions whose codegen paths access `resolve_slot_addr` directly.
 
-The allocator does not split live intervals: a value either gets a register
-for its entire lifetime or remains on the stack.
+The allocator does not split live intervals **inside the scan**: a value
+either keeps one home for its remaining lifetime or is demoted. IR-level
+splitting is `split_ranges.rs` (timid). Measured gap: gzip `longest_match`
+still 118 stack-mem vs GCC 0.
 
 ### Integration with Stack Layout
 

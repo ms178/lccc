@@ -23,8 +23,8 @@ GLM-audit review (2026-08-15) and remain the top structural work:
 4. **Vectorizer cost model** — `vectorize_gate` returns `true`
    unconditionally (pgo/unroll_pgo.rs:122); 4-iteration loops get
    vectorized for zero win.
-5. **Reload-at-next-use in regalloc** (`register_allocator.txt`) —
-   infra exists (`future_uses`, `next_use_after`), codegen doesn't use it.
+5. **Reload-at-next-use + remat** (`register_allocator.txt`) —
+   `future_uses` exists; 2026-08-20 gzip `longest_match` is 118 vs 0 stack-mem.
 6. **SCEV** (`optimization_passes_future.txt`) — would subsume both
    IVSR pattern matchers (~2k LOC) and unblock LICM GEP aliasing.
 7. **Parser panic-mode recovery** — one missing `;` still cascades.

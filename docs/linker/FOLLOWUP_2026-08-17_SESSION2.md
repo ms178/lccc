@@ -1,3 +1,5 @@
+> **Archive.** Point-in-time write-up. Not current architecture, RA, or benchmark policy. See `docs/architecture.md`, `docs/register-allocator.md`, `lccc-improvements/register-allocation/`, `docs/history/README.md`.
+
 # LCCC Linker — Follow-Up Plan (Sessions 2–13)
 
 **Date:** 2026-08-17 (second session of the day)

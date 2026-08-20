@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: Getting Started
-description: Build LCCC from source and compile your first C program.
+description: Build LCCC from source and compile a C program.
 prev_page:
 next_page:
   title: Architecture
@@ -10,114 +10,61 @@ next_page:
 
 # Getting Started
 {:.doc-subtitle}
-Build LCCC, compile a C program, and run the benchmark suite in under five minutes.
+Build LCCC and compile C. Canonical repo: [ms178/lccc](https://github.com/ms178/lccc).
 
 ## Prerequisites
 
 | Requirement | Notes |
 |-------------|-------|
-| **Rust stable** (2021 edition) | Install via [rustup](https://rustup.rs/) |
-| **Linux x86-64 host** | Compiler targets Linux ELF; macOS/Windows are untested |
-| **GCC installed** | Needed for built-in headers (`stddef.h`, `stdarg.h`) |
-| **Python 3.9+** | For the benchmark runner (optional) |
+| **Rust stable** | [rustup](https://rustup.rs/) |
+| **Linux x86-64** | ELF targets; macOS/Windows untested |
+| **GCC headers** | `stddef.h` / `stdarg.h` via GCC include dir |
+| **Python 3.9+** | Canonical benchmark runner |
+| **Swap on small VMs** | `scripts/ensure_swap.sh` (Rust build OOMs at ~2 GiB) |
 
-LCCC uses a completely standalone assembler and linker — no external toolchain is needed at compile time, only for the GCC built-in headers at C preprocessing time.
+Assembler and linker are built-in. Cargo features `gcc_assembler` / `gcc_linker` are optional fallbacks.
 
-## Clone and Build
+## Clone and build
 
 ```bash
-git clone --recurse-submodules https://github.com/levkropp/lccc.git
+git clone https://github.com/ms178/lccc.git
 cd lccc
-cargo build --release
+./scripts/ensure_swap.sh          # if RAM is tight
+./scripts/build_lccc_fast.sh      # fastbuild: -O1, no LTO  → target/fastbuild/
+# ship-quality:
+./scripts/build_lccc_o1_j2.sh     # release, thin LTO, 2 jobs
 ```
 
-This produces five binaries in `target/release/`:
+| Binary | Arch |
+|--------|------|
+| `lccc` | x86-64 (default) |
+| `lccc-x86` / `lccc-arm` / `lccc-riscv` / `lccc-i686` | explicit |
+| `lccc-ld` | linker |
 
-| Binary | Target architecture |
-|--------|---------------------|
-| `ccc` | x86-64 (default) |
-| `ccc-x86` | x86-64 (explicit) |
-| `ccc-arm` | AArch64 |
-| `ccc-riscv` | RISC-V 64 |
-| `ccc-i686` | i686 (32-bit x86) |
+The driver still answers GCC-style version probes for autotools.
 
-> **Note:** The binary is named `ccc` for drop-in GCC compatibility. It reports `gcc (GCC) 14.2.0` to build systems.
-
-## Compile Your First Program
+## Hello
 
 ```bash
-# LCCC needs GCC's built-in headers for stddef.h, stdarg.h, etc.
-GCC_INC="-I/usr/lib/gcc/x86_64-linux-gnu/$(gcc -dumpversion)/include"
-
-cat > hello.c <<'EOF'
-#include <stdio.h>
-int main(void) {
-    printf("Hello from LCCC!\n");
-    return 0;
-}
-EOF
-
-./target/release/ccc $GCC_INC -O2 -o hello hello.c
-./hello
-# Hello from LCCC!
+GCC_INC="-I$(gcc -print-file-name=include)"
+./target/fastbuild/lccc $GCC_INC -O2 -o hello hello.c
 ```
 
-## GCC-Compatible Flags
+Flags: `-O0`–`-O3`, `-Os`, `-Oz`, `-S`, `-c`, `-E`, `-g`, `-D`, `-I`, `-fprofile-generate`/`-use`.
 
-LCCC accepts the standard GCC command-line interface:
+## Benchmarks (canonical)
+
+**Not** `lccc-improvements/benchmarks/bench.py` (archive).
 
 ```bash
-# Compile and link
-ccc -O2 -o output input.c
-
-# Emit assembly
-ccc -S -O2 input.c
-
-# Compile to object file only
-ccc -c input.c
-
-# Preprocessor only
-ccc -E input.c
-
-# Debug info
-ccc -g -O2 -o output input.c
-
-# Macros and include paths
-ccc -DFOO=1 -Iinclude/ input.c
-
-# Cross-compile
-ccc-arm   -O2 -o output-arm   input.c   # AArch64
-ccc-riscv -O2 -o output-riscv input.c   # RISC-V 64
+python3 tests/benchmark/run_benchmarks.py
+python3 tests/benchmark/run_benchmarks.py --only gzip_crc32,zlib_ng_adler32,expat_xml_scan
 ```
 
-Unrecognized flags (architecture-specific `-m` flags, unknown `-f` flags) are silently ignored, so LCCC works as a drop-in in most build systems.
+RA validation notes: `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`.
 
-## Use as a Make `CC`
+## Tests
 
 ```bash
-make CC=/path/to/lccc/target/release/ccc CFLAGS="$GCC_INC -O2"
+cargo test --lib
 ```
-
-## Run the Benchmark Suite
-
-```bash
-python3 lccc-improvements/benchmarks/bench.py --reps 5 --md results.md
-```
-
-Options:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--reps N` | 5 | Repetitions per benchmark |
-| `--bench ID` | all | Run only one benchmark (e.g. `01_arith_loop`) |
-| `--md FILE` | — | Write Markdown report |
-| `--json FILE` | — | Write JSON data |
-| `--verbose` | off | Show compile errors |
-
-## Run the Unit Tests
-
-```bash
-cargo test --lib   # 500 tests, ~0.04s
-```
-
-The full test suite runs optimizer passes, IR lowering, and register allocation on synthetic IR functions. Doctests in `if_convert.rs` contain a known Rust syntax quirk — use `--lib` to skip them.

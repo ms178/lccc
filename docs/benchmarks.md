@@ -151,10 +151,23 @@ in a second run on the same corpus and machine (seed `20260813`).
 | tce_sum | 2 | 2 | 0.956× |
 | zlib_ng_adler32 | 61 | 39 | 1.55× |
 
-All 25 outputs matched GCC byte-for-byte. **Geometric mean 0.92×** — LCCC
-is now faster than GCC on the aggregate of this corpus. These are *screening*
-numbers (KVM vCPU, no PMU); a bare-metal Raptor Lake rerun with PMU evidence is
-required before hardware claims.
+All 25 outputs matched GCC byte-for-byte. **Geometric mean 0.92×** on this
+**micro** corpus is screening only: TCE/fib dominate the geomean. Codecs
+and parsers are not won.
+
+### 2026-08-20 RA compile of real TUs + kernels
+
+See `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`.
+LCCC `-O2` vs GCC 14, checksums matched, median of 7 on a 2-core VM:
+
+| Kernel | LCCC/GCC |
+|--------|---------:|
+| zlib-ng Adler-32 | 1.49× |
+| gzip CRC-32 | 1.47× (ISel, not spills) |
+| Expat UTF-8 name scan | 1.95× |
+
+gzip `longest_match`: **118 vs 0** stack-mem, 248 B frame. zlib-ng
+`inflate.c`: **15×** stack-mem. Expat `xmltok.c`: **12×** stack-mem.
 
 ### The improvement chain: original CCC → Lev LCCC → this LCCC
 
