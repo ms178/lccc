@@ -262,14 +262,28 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     // and deletes the copy — the implicit prologue write is lost and the
     // copy destination stays uninitialized (dump128(__m128 v): the
     // `memcpy tmp, v_home` snapshot was deleted outright because v_home has
-    // ZERO IR stores; tmp then fed printf with stack garbage). Exclude the
-    // first params.len() entry allocas as forwarding sources, fail closed.
-    let param_slot_roots: FxHashSet<u32> = func.blocks.first()
-        .map(|b| b.instructions.iter()
-            .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
-            .take(func.params.len())
-            .collect())
-        .unwrap_or_default();
+    // ZERO IR stores; tmp then fed printf with stack garbage).
+    //
+    // The exclusion set is `func.param_alloca_values` — the authoritative
+    // list recorded at lowering (also consumed by stack_layout/analysis).
+    // The old positional rule ("first params.len() entry allocas") went
+    // stale the moment mem2reg promoted scalar param allocas away: in
+    // `fill(ParticleGroup*, int)` both scalar param homes are deleted, so
+    // the position count excluded the first two makeparticle TEMPORARIES
+    // and half the struct-return copies stayed (struct_copy 3.1×). When
+    // the recorded list is empty (tail_call_elim clears it; inliner-built
+    // functions never had one) fall back to the positional rule, fail
+    // closed.
+    let param_slot_roots: FxHashSet<u32> = if !func.param_alloca_values.is_empty() {
+        func.param_alloca_values.iter().map(|v| v.0).collect()
+    } else {
+        func.blocks.first()
+            .map(|b| b.instructions.iter()
+                .filter_map(|i| match i { Instruction::Alloca { dest, .. } => Some(dest.0), _ => None })
+                .take(func.params.len())
+                .collect())
+            .unwrap_or_default()
+    };
     let mut copies: FxHashMap<u32, (usize, usize, Value)> = FxHashMap::default();
     let mut copy_sizes: FxHashMap<u32, i64> = FxHashMap::default();
     let mut duplicate = FxHashSet::default();
@@ -319,6 +333,57 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
             if hit { first_root_use.insert(*root, ii); break; }
         }
     }
+    // HOIST: the copy destination is very often a pure-address GEP emitted
+    // immediately before the memcpy (`g->particles[i]` in
+    // `build(tmp); memcpy(&g->particles[i], tmp)`), i.e. AFTER the first
+    // store into the temporary. That alone made the ordering check below
+    // reject 3 of 4 struct-return copies per make_group (struct_copy 3.1×).
+    // A GetElementPtr with a constant offset has no side effects and reads
+    // only its base, so moving it earlier in the same block is sound
+    // whenever the base is already defined there. Hoist it to just before
+    // the first root use and let the ordering check pass. One hoist per
+    // run() call keeps every recorded index valid (the driver runs this
+    // pass to a fixed point, so all candidates get their turn).
+    {
+        let mut hoist: Option<(usize, usize, usize)> = None; // (block, gep_idx, insert_at)
+        for (root, (copy_b, _copy_i, dest)) in &copies {
+            let Some(&(db, di)) = def_site.get(&dest.0) else { continue };
+            if db != *copy_b { continue; }
+            let first_use = first_root_use.get(root).copied().unwrap_or(usize::MAX);
+            if di < first_use { continue; } // already ordered
+            let inst = &func.blocks[db].instructions[di];
+            let Instruction::GetElementPtr { base, offset: Operand::Const(_), .. } = inst else {
+                continue;
+            };
+            // Base must be defined before the insertion point: an earlier
+            // instruction of this block, an entry-block value when this is
+            // a later block, or a function parameter (no def site).
+            let base_ok = match def_site.get(&base.0) {
+                Some(&(bb, bi)) => (bb == db && bi < first_use) || (bb == 0 && db != 0),
+                None => true,
+            };
+            if !base_ok { continue; }
+            hoist = Some((db, di, first_use));
+            break;
+        }
+        if let Some((bi, gep_idx, insert_at)) = hoist {
+            if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+                eprintln!("[STOREFWD-HOIST] {} b{} gep@{} -> {}", func.name, bi, gep_idx, insert_at);
+            }
+            let block = &mut func.blocks[bi];
+            let inst = block.instructions.remove(gep_idx);
+            block.instructions.insert(insert_at, inst);
+            if !block.source_spans.is_empty() {
+                let span = block.source_spans.remove(gep_idx);
+                block.source_spans.insert(insert_at, span);
+            }
+            // Indices recorded in `copies`/`def_site` for this block are
+            // now stale; count the hoist as a change and let the caller's
+            // fixed-point loop re-run the analysis on fresh indices.
+            return 1;
+        }
+    }
+
     copies.retain(|root, (copy_b, _, dest)| {
         match def_site.get(&dest.0) {
             Some((db, di)) => {
@@ -370,6 +435,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
             }
         }
     }
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for r in &invalid { eprintln!("[STOREFWD-REJ] {} root=v{} invalid-use", func.name, r); }
+    }
     for root in invalid { copies.remove(&root); }
     if copies.is_empty() { return 0; }
 
@@ -401,10 +469,24 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                 }
                 if hit { first_use = ii; break; }
             }
-            // dest's object must be untouched inside the window (the memcpy
-            // itself at copy_i is the legitimate final write).
+            // dest's MEMORY must be untouched inside the window (the memcpy
+            // itself at copy_i is the legitimate final write). Pure address
+            // computations — GetElementPtr / Copy / Phi over pointers rooted
+            // at dest — do not read or write that memory and must not
+            // reject (the hoisted destination GEP itself sits inside the
+            // window by construction). Everything else that references a
+            // dest-rooted value is a read, a write, or an escape
+            // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
+            // fails closed.
             for ii in first_use..copy_i {
                 let inst = &func.blocks[copy_b].instructions[ii];
+                if matches!(inst,
+                    Instruction::GetElementPtr { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::Phi { .. })
+                {
+                    continue;
+                }
                 let mut touches_dest = false;
                 inst.for_each_used_value(|v| {
                     if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
@@ -418,6 +500,9 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                 }
                 if touches_dest { reject.insert(root); break; }
             }
+        }
+        if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+            for r in &reject { eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r); }
         }
         for root in reject { copies.remove(&root); }
     }

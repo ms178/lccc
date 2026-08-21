@@ -58,7 +58,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 | Expat name scan | **1.95×** | **classify + inline** | gcc `btq` |
 | xmltok.c TU | **12×** stack-mem | **RA segments** | — |
 | inflate.c TU | **15×** stack-mem | **RA segments + switch** | — |
-| `struct_copy` | **21.06×** (585 vs 28 ms) | **ABI + XMM field copies** | gcc/icx: 2× ymm for 64 B `*dst=*src` |
+| `struct_copy` | **1.54×** (41 vs 26 ms; was 21.06×, then 3.11×) | aggregate copy-forward fixed (param-set staleness, GEP-hoist, window over-rejection); remainder = scalar movsd chains vs GCC's paired mulpd | gcc/icx: 2× ymm for 64 B `*dst=*src` |
 | `dot` | vectorizer reduction exists | **ICX FMA YMM acc**; gcc16.2 worse | **copy ICX not GCC** |
 | nbody / spectral / mandelbrot | **2.9–3.8× / 9.3× S** | **non-reduction vectorize** | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
 | sqlite varint | **~2× S**; 189-inst inline **rejected** | **ISel branches**, not inline | — |
