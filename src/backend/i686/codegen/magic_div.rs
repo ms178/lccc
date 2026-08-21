@@ -154,7 +154,7 @@ mod tests {
     fn magic_udiv(n: u32, m: u32, s: u32, add: bool) -> u32 {
         let hi = ((n as u64 * m as u64) >> 32) as u32;
         if add {
-            ((((n.wrapping_sub(hi)) >> 1).wrapping_add(hi)) >> (s - 1))
+            (((n.wrapping_sub(hi)) >> 1).wrapping_add(hi)) >> (s - 1)
         } else {
             hi >> s
         }

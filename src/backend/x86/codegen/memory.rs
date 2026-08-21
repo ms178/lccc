@@ -1904,6 +1904,25 @@ impl X86Codegen {
         // x_high from its slot. zlib-ng CRC32 then failed iff (n % 64) ∈ [16,31].
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
+
+        // A complete 64-byte assignment is the profitable boundary for YMM:
+        // four memory instructions replace eight XMM instructions, and an
+        // explicit vzeroupper prevents any later legacy-SSE transition. Smaller
+        // 32/48-byte copies stay XMM (the vzeroupper cost erases their one- or
+        // two-instruction saving in hot struct loops).
+        if size == 64
+            && self.avx2_enabled
+            && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
+        {
+            self.state.emit("    vmovdqu (%rsi), %ymm0");
+            self.state.emit("    vmovdqu %ymm0, (%rdi)");
+            self.state.emit("    vmovdqu 32(%rsi), %ymm1");
+            self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
+            self.state.emit("    vzeroupper");
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
         if size <= 64 {
             let mut offset = 0usize;
             let mut remaining = size;

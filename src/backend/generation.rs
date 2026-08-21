@@ -1819,6 +1819,42 @@ fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxH
     logical_indices
 }
 
+fn detect_and_not_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+    let mut and_indices = FxHashSet::default();
+    for (idx, pair) in block.instructions.windows(2).enumerate() {
+        let (not_dest, not_ty) = match &pair[0] {
+            Instruction::UnaryOp {
+                dest,
+                op: crate::ir::reexports::IrUnaryOp::Not,
+                ty,
+                ..
+            } if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) =>
+                (*dest, *ty),
+            _ => continue,
+        };
+        if use_counts.get(not_dest.0 as usize).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } = &pair[1]
+        else {
+            continue;
+        };
+        if *ty == not_ty
+            && (matches!(lhs, Operand::Value(v) if *v == not_dest)
+                || matches!(rhs, Operand::Value(v) if *v == not_dest))
+        {
+            and_indices.insert(idx + 1);
+        }
+    }
+    and_indices
+}
+
 fn function_text_section(func: &IrFunction, function_sections: bool) -> String {
     if let Some(ref sect) = func.section {
         if !sect.is_empty() {
@@ -2614,6 +2650,11 @@ fn generate_function(
         } else {
             FxHashSet::default()
         };
+        let and_not_fusions = if cg.supports_and_not() {
+            detect_and_not_fusions(block, &value_use_counts)
+        } else {
+            FxHashSet::default()
+        };
         let load_cmp_folds = if cg.supports_load_cmp_mem_fold() {
             detect_load_cmp_mem_fold(block, &value_use_counts)
         } else {
@@ -2629,6 +2670,7 @@ fn generate_function(
             load_cmp_folds.values().map(|(ptr, _, _)| *ptr).collect();
         let mut fused_add_skip: FxHashSet<usize> = FxHashSet::default();
         let mut skip_fused_logical = false;
+        let mut skip_fused_and_not = false;
 
         cg.state().block_use_counts.clear();
         cg.state().pending_load_cmp.clear();
@@ -2691,6 +2733,11 @@ fn generate_function(
             }
             if skip_fused_logical {
                 skip_fused_logical = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if skip_fused_and_not {
+                skip_fused_and_not = false;
                 cg.state().current_program_point += 1;
                 continue;
             }
@@ -2799,6 +2846,44 @@ fn generate_function(
                             cg.state().current_program_point += 1;
                             continue;
                         }
+                    }
+                }
+            }
+
+            if let Instruction::UnaryOp {
+                dest: not_dest,
+                op: crate::ir::reexports::IrUnaryOp::Not,
+                src: not_src,
+                ty,
+            } = inst
+            {
+                if and_not_fusions.contains(&(idx + 1)) {
+                    if let Some(Instruction::BinOp {
+                        dest,
+                        lhs,
+                        rhs,
+                        ..
+                    }) = block.instructions.get(idx + 1)
+                    {
+                        let not_is_lhs = matches!(lhs, Operand::Value(v) if v == not_dest);
+                        let other = if not_is_lhs { rhs } else { lhs };
+                        let direct_return = idx + 2 == block.instructions.len()
+                            && matches!(
+                                &block.terminator,
+                                Terminator::Return(Some(Operand::Value(value))) if value == dest
+                            );
+                        cg.flush_machinst();
+                        cg.emit_and_not(
+                            not_dest,
+                            not_src,
+                            other,
+                            dest,
+                            *ty,
+                            direct_return,
+                        );
+                        skip_fused_and_not = true;
+                        cg.state().current_program_point += 1;
+                        continue;
                     }
                 }
             }

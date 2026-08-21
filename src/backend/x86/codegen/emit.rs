@@ -377,6 +377,10 @@ pub struct X86Codegen {
     /// flushed to .rodata by emit_vector_const_rodata after the function body.
     pub(super) vec_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8), String>,
     pub(super) vec_const_counter: u32,
+    /// True when the target has BMI1; enables scalar ANDN fusion.
+    pub(super) bmi1_enabled: bool,
+    /// True when the target has AVX2; gates YMM constant-size copies.
+    pub(super) avx2_enabled: bool,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
     /// -Os/-Oz: prefer the shorter sequence over the faster one (codegen-side
@@ -622,6 +626,8 @@ impl X86Codegen {
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
+            bmi1_enabled: false,
+            avx2_enabled: false,
             avx512_enabled: false,
             optimize_for_size: false,
             skip_i32_sext: false,
@@ -709,6 +715,8 @@ impl X86Codegen {
         self.set_no_sse(opts.no_sse);
         self.set_code_model_kernel(opts.code_model_kernel);
         self.set_no_jump_tables(opts.no_jump_tables);
+        self.bmi1_enabled = opts.bmi1;
+        self.avx2_enabled = opts.avx2;
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;
         self.fp_contract_fast = opts.fp_contract_fast;
@@ -3270,6 +3278,22 @@ impl ArchCodegen for X86Codegen {
         // the explicit contract; integer mul+add fusion is unaffected (the
         // generation-side detector calls this only for float types).
         self.fp_contract_fast
+    }
+
+    fn supports_and_not(&self) -> bool {
+        self.bmi1_enabled && std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
+    }
+
+    fn emit_and_not(
+        &mut self,
+        _not_dest: &Value,
+        not_src: &Operand,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+        direct_return: bool,
+    ) {
+        self.emit_and_not_impl(not_src, other, dest, ty, direct_return);
     }
 
     fn try_lower_machinst(

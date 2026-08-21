@@ -524,6 +524,26 @@ pub trait ArchCodegen {
 
     fn supports_fused_float_mul_add(&self) -> bool { false }
 
+    /// Whether the target can encode `other & ~value` directly.
+    fn supports_and_not(&self) -> bool { false }
+
+    /// Emit an adjacent, single-use `not` + `and` pair. The default preserves
+    /// semantics as two ordinary operations.
+    fn emit_and_not(
+        &mut self,
+        not_dest: &Value,
+        not_src: &Operand,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+        _direct_return: bool,
+    ) {
+        self.emit_load_operand(not_src);
+        self.emit_int_not(ty);
+        self.emit_store_result(not_dest);
+        self.emit_int_binop(dest, IrBinOp::And, other, &Operand::Value(*not_dest), ty);
+    }
+
     /// Whether the target can encode a shifted register directly as the second
     /// operand of an integer logical instruction (for example AArch64's
     /// `orr w0, w1, w2, lsr #5`).

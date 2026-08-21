@@ -17,9 +17,9 @@ Re-oracle and check gzip `longest_match` stack-mem after **each** item.
 | 4 | RA-01 + IS-26 | RIP-relative `window`/`prev`/`strstart` (not GOT+stack). CE: gcc `window(%r9,%rcx)`. |
 | 5 | RA-02, RA-03 | Next-use: match IVs in GPR; Adler DO8 keep `sum2`/`n`. CE Adler ~0 stack. |
 | 6 | IS-01 | **DONE:** safe masked-index homes produce scale-4 SIB CRC loads; -12 B/-7 instructions, 1.34x faster than control, full differential clean. |
-| 7 | IS-12, IS-28 | `andn` for find_bit; IR Popcount → `popcntl` on bitops. |
+| 7 | IS-12, IS-28 | **DONE:** BMI-gated direct-source ANDN (+4% find-bit vs control); canonical SWAR Popcount already lowers to `popcntl`, revalidated. |
 | 8 | IS-02, AB-01 | `double` stays in XMM; SysV SSE-class aggregates. |
-| 9 | IS-03 | 64-byte assignment → 2× `vmovdqu %ymm`. |
+| 9 | IS-03 | **DONE for isolated assignment:** AVX2 64 B → 2× YMM pairs + vzeroupper, -17 bytes; broader struct SROA remains OP-02. |
 | 10 | IS-04, OP-05 | ICX-style YMM FMA on nbody/matmul/spectral/reduction. |
 | 11 | IS-06, OP-01 | **OP-01 DONE:** shared alias forms wired to LICM with checked Shl and fail-closed writes; `btq` classify remains. |
 

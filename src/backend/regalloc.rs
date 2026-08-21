@@ -3172,6 +3172,15 @@ fn remove_ineligible_operands(
     eligible: &mut FxHashSet<u32>,
     config: &RegAllocConfig,
 ) {
+    let param_refs: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|inst| match inst {
+            Instruction::ParamRef { dest, .. } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -3182,8 +3191,16 @@ fn remove_ineligible_operands(
                     eligible.remove(&v.0);
                 }
                 Instruction::Memcpy { dest, src, .. } => {
-                    eligible.remove(&dest.0);
-                    eligible.remove(&src.0);
+                    // Direct ParamRef pointers are already in ABI registers and
+                    // every backend's memcpy setup checks register assignments.
+                    // Keeping them eligible removes entry spills/reloads for
+                    // wrapper copies such as `*dst = *src`.
+                    if !param_refs.contains(&dest.0) {
+                        eligible.remove(&dest.0);
+                    }
+                    if !param_refs.contains(&src.0) {
+                        eligible.remove(&src.0);
+                    }
                 }
                 Instruction::VaArg { va_list_ptr, .. }
                 | Instruction::VaStart { va_list_ptr }

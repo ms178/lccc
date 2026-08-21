@@ -1842,6 +1842,8 @@ impl Driver {
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
+            bmi1: self.enable_bmi,
+            avx2: self.enable_avx2,
             avx512: self.enable_avx512f,
             no_relax: self.riscv_no_relax,
             debug_info: self.debug_info,
