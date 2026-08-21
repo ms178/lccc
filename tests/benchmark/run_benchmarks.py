@@ -104,6 +104,14 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("constant_recursion.c",), ("synthetic", "recursion", "specialization")),
     Benchmark("bitops", "bit manipulation / integer selection",
               ("bitops.c",), ("synthetic", "bit", "integer")),
+    Benchmark("ascii_case_fold", "ASCII parser case-fold byte loop / branch selection",
+              ("ascii_case_fold.c",), ("synthetic", "parser", "branch", "memory")),
+    Benchmark("binary_search", "sorted-table binary search / branch-heavy lookup",
+              ("binary_search.c",), ("synthetic", "search", "branch")),
+    Benchmark("ring_fifo", "masked ring FIFO enqueue/dequeue / dependent loads",
+              ("ring_fifo.c",), ("synthetic", "queue", "memory", "branch")),
+    Benchmark("histogram", "256-bin histogram / indexed increment and reduction",
+              ("histogram.c",), ("synthetic", "database", "memory", "integer")),
     # Workload-derived corpus.  Licenses and exact extraction records are in
     # WORKLOAD_PROVENANCE.md rather than being hidden in an opaque generator.
     Benchmark("gzip_crc32", "GNU gzip CRC-32 scalar table loop",
