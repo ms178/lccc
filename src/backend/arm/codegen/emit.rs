@@ -279,14 +279,21 @@ impl ArmCodegen {
                 self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
             }
             Operand::Value(v) => {
-                if let Some(&src_reg) = self.reg_assignments.get(&v.0) {
-                    if src_reg.0 != reg.0 {
-                        let src_name = callee_saved_name(src_reg);
-                        self.state.emit_fmt(format_args!("    mov {}, {}", reg_name, src_name));
+                match self.reg_assignments.get(&v.0).copied() {
+                    // An FP-homed source (d8-d14 / d16-d31, possible since
+                    // call-spanning F64 values allocate to the FP pool) has
+                    // no GP alias — callee_saved_name panics on it. Stage
+                    // through x0 (operand_to_x0 fmovs FP homes correctly).
+                    Some(src_reg) if !is_arm_fp_phys(src_reg) => {
+                        if src_reg.0 != reg.0 {
+                            let src_name = callee_saved_name(src_reg);
+                            self.state.emit_fmt(format_args!("    mov {}, {}", reg_name, src_name));
+                        }
                     }
-                } else {
-                    self.operand_to_x0(op);
-                    self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+                    _ => {
+                        self.operand_to_x0(op);
+                        self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+                    }
                 }
             }
         }
@@ -2141,6 +2148,15 @@ impl ArchCodegen for ArmCodegen {
     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mov x1, x0"); }
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         self.state.emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));
+        // x0 no longer holds whatever the cache recorded. x86-64 and i686
+        // both invalidate here; ARM did not, so the default emit_gep's
+        // general path (`emit_reg_to_acc(base); emit_acc_to_secondary();
+        // emit_load_operand(offset)`) hit a stale acc entry for the OFFSET
+        // and skipped its load — the address became base+base and hash_table
+        // dereferenced table[h]+table[h] (SIGSEGV at -O2 once LICM hoisted
+        // the GlobalAddr into a register home). Same bug class as levkropp
+        // f958b6a's emit_load_indexed_impl cache-wipe finding.
+        self.state.reg_cache.invalidate_acc();
     }
     fn emit_reg_to_addr(&mut self, reg: PhysReg) {
         self.state.emit_fmt(format_args!("    mov x9, {}", callee_saved_name(reg)));

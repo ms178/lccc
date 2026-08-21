@@ -486,10 +486,34 @@ pub fn peephole_optimize(asm: String) -> String {
 /// Propagate a register copy used only as a memory-address alias within one
 /// basic block. This handles vector intrinsics where an SSA Copy gives the C
 /// pointer a short-lived register solely for `[xN]` loads/stores.
+/// Propagate a register copy used only as a memory-address alias.
+///
+/// AUDITED ADOPTION of levkropp ed36c44: the previous version deleted the
+/// defining `mov` after scanning only to the first block boundary — a
+/// cross-block use of the alias then read a stale/clobbered register
+/// (hash_table SIGSEGV at -O2, reproduced HERE the moment LICM hoisted
+/// GlobalAddrs to the entry block and made address values multi-use).
+/// The rewrite scans the full function text and deletes the mov only on
+/// proven death of the alias (overwrite without read, or function end),
+/// tracking src liveness so rewritten address uses never read a clobbered
+/// source.
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    fn mention_count(line: &str, reg: u8) -> usize {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
+            .count()
+    }
+    // Column-0 identifier label: the next function or data object, i.e. the
+    // end of the current function's text. Block labels start with '.', and
+    // inline-asm numeric local labels (`1:`) start with a digit — neither
+    // terminates the function's text.
+    fn is_function_boundary(line: &str) -> bool {
+        line.ends_with(':')
+            && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
     }
     let mut changed = false;
     for i in 0..n {
@@ -497,35 +521,74 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         if dst == src || dst >= 29 || src >= 29 { continue; }
         let mut uses = Vec::new();
         let mut valid = true;
+        let mut provably_dead = false;
+        let mut src_alive = true;
         let mut j = i + 1;
         while j < n {
-            if matches!(kinds[j], LineKind::Label | LineKind::Branch | LineKind::CondBranch
-                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret) { break; }
-            if written_gp_register(&lines[j], kinds[j]) == Some(src) {
-                let mut tail = j + 1;
-                while tail < n && !matches!(kinds[tail], LineKind::Label | LineKind::Branch
-                    | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Call | LineKind::Ret)
-                {
-                    if mentions(&lines[tail], dst) { valid = false; }
-                    tail += 1;
-                }
+            if is_function_boundary(&lines[j]) {
+                provably_dead = true;
                 break;
             }
-            if written_gp_register(&lines[j], kinds[j]) == Some(dst) {
-                break;
-            }
-            if mentions(&lines[j], dst) {
-                let address = format!("[{}", xreg_name(dst));
-                if lines[j].contains(&address) {
-                    uses.push(j);
-                } else {
-                    valid = false;
-                    break;
+            match kinds[j] {
+                // No runtime effect. A return ends this path; textually later
+                // lines belong to other paths, so keep scanning.
+                //
+                // Note: an epilogue's `ldp xD, ...` callee-save restore is NOT
+                // treated as proof of death here — it ends the value only on
+                // that return path, and textually later blocks (other paths)
+                // may still use it, so it falls through to the plain-mention
+                // handling and blocks the transform.
+                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
+                // Calls clobber src (x0) and all caller-saved registers. Rather
+                // than reason about save/restore pairs, stop without committing.
+                LineKind::Call => { valid = false; break; }
+                _ => {
+                    // Kinds whose destination register written_gp_register
+                    // models precisely.
+                    let trusted = matches!(kinds[j],
+                        LineKind::Move { .. } | LineKind::MoveImm { .. }
+                        | LineKind::MoveWide { .. } | LineKind::Sxtw { .. }
+                        | LineKind::LoadSp { .. } | LineKind::LoadswSp { .. }
+                        | LineKind::Alu | LineKind::Compare
+                        | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                        | LineKind::StoreSp { .. });
+                    let written = written_gp_register(&lines[j], kinds[j]);
+                    if (trusted && written == Some(src))
+                        || (!trusted && mentions(&lines[j], src))
+                    {
+                        src_alive = false;
+                    }
+                    if mentions(&lines[j], dst) {
+                        if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
+                            // dst overwritten without being read: the mov's
+                            // value is dead past this instruction (register
+                            // assignments are per-value with disjoint live
+                            // intervals, so no later text can use the old value).
+                            provably_dead = true;
+                            break;
+                        }
+                        let address = format!("[{}", xreg_name(dst));
+                        if src_alive && mention_count(&lines[j], dst) == 1
+                            && lines[j].contains(&address)
+                        {
+                            // dst used purely as the address base of a
+                            // load/store while src is alive: rewritable.
+                            uses.push(j);
+                        } else {
+                            // Non-address use, an unmodelled effect, or an
+                            // address use after src died: the mov must stay.
+                            valid = false;
+                            break;
+                        }
+                    }
                 }
             }
             j += 1;
         }
-        if valid && !uses.is_empty() {
+        if j == n {
+            provably_dead = true; // scanned to the end of the file
+        }
+        if valid && provably_dead && !uses.is_empty() {
             for use_idx in uses {
                 lines[use_idx] = replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
                 kinds[use_idx] = classify_line(&lines[use_idx]);
@@ -536,7 +599,6 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
     }
     changed
 }
-
 /// Fold an SSA pointer update that is copied back to its loop-carried register:
 /// `mov x0,xS; add x0,xS,#K; mov xT,x0; ...; mov xS,xT` → `add xS,xS,#K`.
 /// The scan proves neither xS nor xT is referenced in the intervening region.
@@ -656,6 +718,49 @@ fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind],
             if let LineKind::Move { dst, src, is_32bit } = kinds[j] {
                 if src == load_reg {
                     if let Some((_, _, source, source_word)) = old.filter(|entry| entry.3 == is_32bit) {
+                        // NOPing the load is only sound if its register has no
+                        // other readers before it is next fully overwritten —
+                        // copy propagation (which runs BEFORE this pass) can
+                        // move an instruction's reference onto the load's own
+                        // register (rewriting `add x1, x5, x2` to read the
+                        // copy source), and deleting the load would leave
+                        // that read with stale contents. Audited adoption of
+                        // levkropp f958b6a fix (e) (strlen_bench segfault on
+                        // his tree; same pass order hazard exists here).
+                        let xn = xreg_name(load_reg);
+                        let wn = wreg_name(load_reg);
+                        let mut load_dead_after = false;
+                        let mut k = j + 1;
+                        while k < n {
+                            if kinds[k] == LineKind::Nop { k += 1; continue; }
+                            let t = &lines[k];
+                            let mentions = t
+                                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                .any(|tok| tok == xn || tok == wn);
+                            if mentions {
+                                // A pure single-register overwrite ends the
+                                // hazard; anything else (reads, multi-dest
+                                // loads like ldp) keeps the load alive.
+                                load_dead_after = match kinds[k] {
+                                    LineKind::Move { dst, src, .. } => dst == load_reg && src != load_reg,
+                                    LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst == load_reg,
+                                    LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == load_reg,
+                                    _ => false,
+                                };
+                                break;
+                            }
+                            match kinds[k] {
+                                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                                | LineKind::CmpBranch | LineKind::Call | LineKind::Ret
+                                | LineKind::Directive => break,
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        if !load_dead_after {
+                            i += 1;
+                            continue;
+                        }
                         kinds[i] = LineKind::Nop;
                         lines[j] = format!("    mov {}, {}",
                             if is_32bit { wreg_name(dst) } else { xreg_name(dst) },

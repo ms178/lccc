@@ -53,8 +53,6 @@ impl ArmCodegen {
         }
         // Integer dest with a GP register assignment: load straight into it.
         if let Some(dphys) = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r)) {
-            let wide = !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
-            let dname = if wide { callee_saved_name(dphys) } else { callee_saved_name_32(dphys) };
             let instr = match ty {
                 IrType::I8 => "ldrsb",
                 IrType::U8 => "ldrb",
@@ -63,6 +61,13 @@ impl ArmCodegen {
                 IrType::I32 => "ldrsw",
                 _ => "ldr",
             };
+            // ldrsw only accepts an X-register destination (it sign-extends
+            // a word into 64 bits); using the W name is an assembler error.
+            // ldrsb/ldrsh accept W (sign-extend within 32 bits), matching the
+            // unassigned-dest path below (w0 for ldrsb/ldrsh, x0 for ldrsw).
+            let wide = instr == "ldrsw"
+                || !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32);
+            let dname = if wide { callee_saved_name(dphys) } else { callee_saved_name_32(dphys) };
             self.state.emit_fmt(format_args!("    {} {}, {}", instr, dname, addr));
             self.state.reg_cache.invalidate_acc();
             return true;

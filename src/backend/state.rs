@@ -540,7 +540,13 @@ impl CodegenState {
         let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
         entries.sort_by_key(|(_, label)| (*label).clone());
         for (bits, label) in entries {
-            self.out.emit(".align 16");
+            // .p2align, NOT .align: on AArch64/RISC-V gas `.align N` means
+            // 2^N bytes, so `.align 16` silently requested 64KiB alignment
+            // per constant. That bloated .rodata by ~64KiB per entry and
+            // pushed the pool out of the AArch64 ldr-literal ±1MB range
+            // (R_AARCH64_LD_PREL_LO19 truncation at static link). .p2align 4
+            // is 16 bytes on every gas target.
+            self.out.emit(".p2align 4");
             self.out.emit_fmt(format_args!("{}:", label));
             self.out
                 .emit_fmt(format_args!("    .quad {}", *bits as i64));
