@@ -646,14 +646,20 @@ pub(crate) fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32
         }
 
         // ── Inline assembly ──────────────────────────────────────────────
-        Instruction::InlineAsm { inputs, .. } => {
+        Instruction::InlineAsm { outputs, inputs, .. } => {
+            for (_, ptr, _) in outputs {
+                replace_val(ptr, map);
+            }
             for (_, op, _) in inputs {
                 replace_op(op, map);
             }
         }
 
         // ── Intrinsics ───────────────────────────────────────────────────
-        Instruction::Intrinsic { args, .. } => {
+        Instruction::Intrinsic { dest_ptr, args, .. } => {
+            if let Some(ptr) = dest_ptr {
+                replace_val(ptr, map);
+            }
             for arg in args {
                 replace_op(arg, map);
             }
@@ -1017,6 +1023,50 @@ mod tests {
         let n = tail_calls_to_loops(&mut func);
         assert_eq!(n, 0, "non-tail call should not be eliminated");
         assert_eq!(func.blocks.len(), 2);
+    }
+
+    #[test]
+    fn replace_values_rewrites_hidden_memory_operands() {
+        use crate::ir::intrinsics::IntrinsicOp;
+
+        let mut map = FxHashMap::default();
+        map.insert(7, 70);
+        map.insert(8, 80);
+        map.insert(9, 90);
+
+        let mut asm = Instruction::InlineAsm {
+            template: String::new(),
+            outputs: vec![("=m".into(), Value(7), Some("out".into()))],
+            inputs: vec![("r".into(), Operand::Value(Value(8)), Some("in".into()))],
+            clobbers: Vec::new(),
+            operand_types: vec![IrType::I32, IrType::I32],
+            goto_labels: Vec::new(),
+            input_symbols: vec![None],
+            seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
+        };
+        replace_values_in_inst(&mut asm, &map);
+        match asm {
+            Instruction::InlineAsm { outputs, inputs, .. } => {
+                assert_eq!(outputs[0].1, Value(70));
+                assert!(matches!(inputs[0].1, Operand::Value(Value(80))));
+            }
+            _ => unreachable!(),
+        }
+
+        let mut intrinsic = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::Storedqu,
+            dest_ptr: Some(Value(9)),
+            args: vec![Operand::Value(Value(8))],
+        };
+        replace_values_in_inst(&mut intrinsic, &map);
+        match intrinsic {
+            Instruction::Intrinsic { dest_ptr, args, .. } => {
+                assert_eq!(dest_ptr, Some(Value(90)));
+                assert!(matches!(args.as_slice(), [Operand::Value(Value(80))]));
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

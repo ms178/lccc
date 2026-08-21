@@ -767,11 +767,39 @@ impl X86Codegen {
                         cls_of.insert(v.0, "ret");
                     }
                 }
+                // A narrowing cast is a semantic operation even when its only
+                // consumer immediately widens the result again. Its destination
+                // must retain a home: otherwise the cast->cast no-home handoff
+                // can expose the pre-truncation register value to the widening
+                // cast. zlib-ng's bi_reverse hit exactly U32->U8->U64 and used
+                // 8188 instead of (uint8_t)8188, corrupting Huffman codes.
+                let mut narrowing_cast_values = crate::common::fx_hash::FxHashSet::default();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Cast { dest, src, from_ty, to_ty, .. } = inst {
+                            if from_ty.is_integer()
+                                && to_ty.is_integer()
+                                && to_ty.size() < from_ty.size()
+                            {
+                                // Protect both sides. Keeping only the result
+                                // homed fixes optimized register-direct chains;
+                                // keeping the input homed also prevents the O0
+                                // load/cast handoff from redirecting a full-width
+                                // load into the narrow result without emitting
+                                // the truncation.
+                                narrowing_cast_values.insert(dest.0);
+                                if let Operand::Value(src) = src {
+                                    narrowing_cast_values.insert(src.0);
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut set = never_materialized;
-                set.extend(
-                    skip.into_iter()
-                        .filter(|v| cls_of.get(v).is_some_and(|c| has(c))),
-                );
+                set.extend(skip.into_iter().filter(|v| {
+                    !narrowing_cast_values.contains(v)
+                        && cls_of.get(v).is_some_and(|c| has(c))
+                }));
                 set
             }
         };

@@ -22,6 +22,7 @@ pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod fp_const_hoist;
+pub(crate) mod global_addr_cse;
 pub(crate) mod int_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
@@ -629,6 +630,20 @@ macro_rules! preloop_dump {
         module.for_each_function(dce::eliminate_dead_code);
     }
     preloop_dump!("post-structural-inline");
+
+    // Class-aware GlobalAddr CSE. The frontend emits one GlobalAddr per
+    // source-level access, so loops touching several file-scope arrays keep a
+    // distinct SSA address value live for every site. Merging same-symbol
+    // duplicates per use class (foldable vs. must-materialize) cuts register
+    // pressure before the main loop; copy propagation and DCE inside the loop
+    // then clean up the rewired copies. Runs after SROA and the
+    // post-structural inline phase (the final inlining round can clone
+    // callers and duplicate address materializations), before GVN/LICM.
+    // Pass name for CCC_DISABLE_PASSES: "gaddrcse".
+    if !disabled.contains("gaddrcse") {
+        module.for_each_function(global_addr_cse::run);
+        module.for_each_function(dce::eliminate_dead_code);
+    }
 
     let iterations = 3;
     let num_funcs = module.functions.len();

@@ -1502,14 +1502,20 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
         }
 
         // Inline assembly.
-        Instruction::InlineAsm { inputs, .. } => {
+        Instruction::InlineAsm { outputs, inputs, .. } => {
+            for (_, ptr, _) in outputs {
+                replace_val(ptr, map);
+            }
             for (_, op, _) in inputs {
                 replace_op(op, map);
             }
         }
 
         // Intrinsics.
-        Instruction::Intrinsic { args, .. } => {
+        Instruction::Intrinsic { dest_ptr, args, .. } => {
+            if let Some(ptr) = dest_ptr {
+                replace_val(ptr, map);
+            }
             for arg in args {
                 replace_op(arg, map);
             }
