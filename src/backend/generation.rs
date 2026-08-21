@@ -1463,12 +1463,22 @@ pub(crate) fn count_value_uses(func: &IrFunction) -> Vec<u32> {
     counts
 }
 
-/// Cmp (optionally through Copy / integer Cast) used only by CondBranch.
+/// What kind of flag-producing instruction anchors a fused branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FusedBranchKind {
+    Cmp,
+    BitTest,
+}
+
+/// Cmp or BitTest (optionally through Copy / integer Cast) used only by
+/// CondBranch. `fuse_bt` gates the BitTest form on backend support: BT sets
+/// CF directly, so `bt; jc` needs no setc/movzbl/test materialization.
 fn detect_cmp_branch_fusion(
     block: &BasicBlock,
     use_counts: &[u32],
     fuse_fp: bool,
-) -> Option<(usize, Option<usize>)> {
+    fuse_bt: bool,
+) -> Option<(usize, Option<usize>, FusedBranchKind)> {
     let cond = match &block.terminator {
         Terminator::CondBranch { cond, .. } => cond,
         _ => return None,
@@ -1487,13 +1497,20 @@ fn detect_cmp_branch_fusion(
     let mut wanted = cond_val.0;
     let mut scan = n;
     let mut chain_end = None;
-    let cmp_idx = loop {
+    let (cmp_idx, kind) = loop {
         if scan == 0 {
             return None;
         }
         scan -= 1;
         match &block.instructions[scan] {
-            Instruction::Cmp { dest, .. } if dest.0 == wanted => break scan,
+            Instruction::Cmp { dest, .. } if dest.0 == wanted => {
+                break (scan, FusedBranchKind::Cmp)
+            }
+            Instruction::BinOp { dest, op: IrBinOp::BitTest, .. }
+                if fuse_bt && dest.0 == wanted =>
+            {
+                break (scan, FusedBranchKind::BitTest)
+            }
             Instruction::Copy {
                 dest,
                 src: Operand::Value(src),
@@ -1522,6 +1539,7 @@ fn detect_cmp_branch_fusion(
 
     let (cmp_dest, ty) = match &block.instructions[cmp_idx] {
         Instruction::Cmp { dest, ty, .. } => (dest.0, ty),
+        Instruction::BinOp { dest, op: IrBinOp::BitTest, ty, .. } => (dest.0, ty),
         _ => unreachable!(),
     };
     if wanted != cmp_dest
@@ -1545,7 +1563,12 @@ fn detect_cmp_branch_fusion(
     if crate::common::types::target_is_32bit() && matches!(ty, IrType::I64 | IrType::U64) {
         return None;
     }
-    Some((cmp_idx, chain_end))
+    // A float-typed BitTest cannot exist (simplify only builds integer ones);
+    // fail closed if one ever appears.
+    if kind == FusedBranchKind::BitTest && !ty.is_integer() {
+        return None;
+    }
+    Some((cmp_idx, chain_end, kind))
 }
 
 /// `rhs` is a zero constant of any integer width (or the canonical Zero).
@@ -1694,7 +1717,7 @@ pub(crate) fn build_folded_value_set(
         // (2) fused compare-and-branch: the boolean (and any Copy/Cast chain)
         // feeding the CondBranch never materializes. Integer compares only —
         // FP fusion is backend-gated (false on i686, where this set is used).
-        if let Some((cmp_idx, chain_end)) = detect_cmp_branch_fusion(block, &use_counts, false) {
+        if let Some((cmp_idx, chain_end, _)) = detect_cmp_branch_fusion(block, &use_counts, false, true) {
             let end = chain_end.unwrap_or(cmp_idx);
             for inst in &block.instructions[cmp_idx..=end] {
                 if let Some(dest) = inst.dest() {
@@ -2749,8 +2772,12 @@ fn generate_function(
             cg.state().out.emit_block_label(block.label.0);
         }
 
-        let fuse_idx =
-            detect_cmp_branch_fusion(block, &value_use_counts, cg.supports_fused_fp_cmp_branch());
+        let fuse_idx = detect_cmp_branch_fusion(
+            block,
+            &value_use_counts,
+            cg.supports_fused_fp_cmp_branch(),
+            cg.supports_fused_bit_test_branch(),
+        );
         let mul_add_fusions =
             detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
         let cmp_select_fusions =
@@ -3142,15 +3169,28 @@ fn generate_function(
         cg.flush_vecreg_liveout();
 
         cg.state().next_block_label = func.blocks.get(block_idx + 1).map(|b| b.label);
-        if let Some((fi, _)) = fuse_idx {
-            if let Instruction::Cmp { op, lhs, rhs, ty, .. } = &block.instructions[fi] {
-                if let Terminator::CondBranch {
-                    true_label,
-                    false_label,
-                    ..
-                } = &block.terminator
-                {
-                    cg.emit_fused_cmp_branch_blocks(*op, lhs, rhs, *ty, *true_label, *false_label);
+        if let Some((fi, _, kind)) = fuse_idx {
+            if let Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } = &block.terminator
+            {
+                match (kind, &block.instructions[fi]) {
+                    (FusedBranchKind::Cmp, Instruction::Cmp { op, lhs, rhs, ty, .. }) => {
+                        cg.emit_fused_cmp_branch_blocks(
+                            *op, lhs, rhs, *ty, *true_label, *false_label,
+                        );
+                    }
+                    (
+                        FusedBranchKind::BitTest,
+                        Instruction::BinOp { lhs, rhs, ty, .. },
+                    ) => {
+                        cg.emit_fused_bit_test_branch_blocks(
+                            lhs, rhs, *ty, *true_label, *false_label,
+                        );
+                    }
+                    _ => unreachable!("fuse_idx anchored on a non-fusable instruction"),
                 }
             }
         } else {

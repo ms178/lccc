@@ -1690,6 +1690,13 @@ impl ArchCodegen for I686Codegen {
         !self.state.pic_mode
     }
 
+    fn supports_fused_bit_test_branch(&self) -> bool {
+        // btl + jc: CF-consuming branch, same as x86-64. 32-bit masks only
+        // (the simplify/set_membership legality gates never build I64
+        // BitTests for this target).
+        std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
+    }
+
     fn supports_load_cmp_mem_fold(&self) -> bool {
         // The accumulator-based i686 codegen otherwise loads a byte/word into
         // a register just to `testl` it; folding `*p != 0` into `cmpb $0,(mem)`
@@ -2103,6 +2110,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
         fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
+        fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
         fn emit_f128_neg(&mut self, dest: &Value, src: &Operand) => emit_f128_neg_impl;
         // calls

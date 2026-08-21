@@ -1114,13 +1114,24 @@ fn simplify_binop(
                         // narrow/wide mismatch uses the natural 32-bit width so
                         // the backend receives a legal i32 BitTest.
                         let bt_ty = if def.ty == ty { ty } else { IrType::I32 };
-                        return Some(Instruction::BinOp {
-                            dest,
-                            op: IrBinOp::BitTest,
-                            lhs: def.lhs,
-                            rhs: def.rhs,
-                            ty: bt_ty,
-                        });
+                        // LEGALITY: BitTest must fit the native BT width. On a
+                        // 32-bit target an I64/U64 BitTest reaches the wide-int
+                        // pair path, which has no BT lowering — upstream this
+                        // was an ICE ("unhandled i128 binary op: BitTest") for
+                        // `(u64 >> i) & 1` at -m32. Keep the shift+and form
+                        // there; the pair shift lowering handles it correctly.
+                        let native_ok = !crate::common::types::target_is_32bit()
+                            || matches!(bt_ty, IrType::I8 | IrType::U8 | IrType::I16
+                                | IrType::U16 | IrType::I32 | IrType::U32);
+                        if native_ok && !bt_ty.is_128bit() {
+                            return Some(Instruction::BinOp {
+                                dest,
+                                op: IrBinOp::BitTest,
+                                lhs: def.lhs,
+                                rhs: def.rhs,
+                                ty: bt_ty,
+                            });
+                        }
                     }
                 }
             }

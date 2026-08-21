@@ -254,10 +254,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
     }
     // Always-on, provably-safe pass: eliminate redundant pushfq/popfq pairs
     // (flag-neutral window). Runs before the peephole gate.
-    let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
+    if std::env::var("CCC_NO_PUSHF_ELIM").is_err() { let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm); }
     // Always-on, provably-safe pass: eliminate redundant zero-extensions
-    // only when the tracked value already fits the source width. Runs before gate.
-    let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
+    // only when the tracked value already fits the source width. Runs before
+    // gate; CCC_NO_REDUNDANT_EXT=1 disables it for miscompile bisection.
+    if std::env::var("CCC_NO_REDUNDANT_EXT").is_err() { let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm); }
     // the peephole optimizer is now ENABLED BY DEFAULT with a curated,
     // gzip-validated safe subset. The two passes that were proven to miscompile
     // gzip 1.14 (full 30-test suite) are skipped by default: `store_fwd`

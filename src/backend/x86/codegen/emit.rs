@@ -3350,6 +3350,12 @@ impl ArchCodegen for X86Codegen {
         self.bmi1_enabled && std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
     }
 
+    fn supports_fused_bit_test_branch(&self) -> bool {
+        // BT + JC consumes CF directly: no setc/movzx/test materialization.
+        // Kill switch for bisection parity with the other branch fusions.
+        std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
+    }
+
     fn emit_and_not(
         &mut self,
         _not_dest: &Value,
@@ -4312,6 +4318,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_fused_cmp_branch_blocks(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_cmp_branch_blocks_impl;
+        fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
         fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
         // calls

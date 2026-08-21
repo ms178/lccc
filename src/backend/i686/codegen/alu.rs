@@ -691,7 +691,12 @@ impl I686Codegen {
                     let bit = (imm as u32) % 32;
                     self.state.out.emit_instr_imm_reg("    btl", bit as i64, "eax");
                 } else {
-                    self.state.emit("    btl %ecx, %eax");
+                    // The index is wherever the shared staging above put it:
+                    // a direct register home or %ecx. The old hardcoded
+                    // `btl %ecx,%eax` read a STALE %ecx whenever the index
+                    // had a register home (set_membership at -m32: byte '/'
+                    // classified as an XML name char).
+                    emit!(self.state, "    btl {}, %eax", rhs_ref);
                 }
                 self.state.emit("    setc %al");
                 self.state.emit("    movzbl %al, %eax");
