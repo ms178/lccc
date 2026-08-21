@@ -129,7 +129,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 28 | RA-23 | P0 | **Eliminate `immediately_consumed` blocker** — refactor to RA-owned accumulator hint | `stack_layout/copy_coalescing.rs:1328` (`compute_immediately_consumed` + `is_safe_sole_consumer`), `state.rs` | **C** hard-codes accumulator load order; `is_safe_sole_consumer` whitelist (`Store,Cast,UnaryOp,Copy` always; `BinOp,Cmp` only when `lhs_first_binop`) | RA owns accumulator placement; whitelist deleted; unblocks P0-01b (graph_coloring) | break accumulator codegen without differential test |
 | 29 | RA-24 | P0 | **Eliminate `SlotAddr::Indirect(StackSlot(0))` dummy** — add `SlotAddr::Reg(PhysReg)` variant | `state.rs:844` | **C** silent corruption if Indirect codepath forgets `reg_assignments` check | exhaustive match catches misses | migrate all backends at once without tests |
 | 30 | RA-25 | P1 | **Unify `loop_memory_promote`'s `affine_disjoint` with `alias.rs::forms_disjoint`** | `loop_memory_promote.rs`, `alias.rs` | **C** duplicated SCEV-lite engine (1712 LOC + 128 LOC) | one alias engine | break sqlite `sqlite3FpDecode` fix |
-| 31 | RA-26 | DONE | ABI physical hints populated for provably scalar, non-sret SysV/AArch64 signatures; mixed FP/aggregate signatures fail closed; never override `follow_value` | config + range construction | **M** 180-function sweep -32 text B; best kernel -9 B/3 entry shuffles | regression + kill switch | guess aggregate ABI slots |
+| 31 | RA-26 | DONE | ABI physical hints plus ordered caller-home placement now cover scalar call-free x86 CFG leaves with ≤6 register arguments and leading entry ParamRefs; stack-argument/mixed/calling shapes fail closed | RA + x86 prologue | **G/M** branch leaf 16→8 body instructions vs control; CE LCCC 10 vs GCC/ICC 8, Clang/ICX 9; 374 regressions + 50 correctness | `CCC_NO_LEAF_PARAM_GPR` | admit stack args or late ParamRefs |
 
 ### 5.2 x86 ISel / peephole / MachInst — IS-01 … IS-28
 
@@ -241,7 +241,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 120 | AB-06 | P2 | RISC-V va_arg long double struct | current_tasks | **C** | | |
 | 121 | AB-07 | P2 | i686 double param high word | current_tasks | **C** | | |
 | 122 | AB-08 | P2 | ARM KVM VA layout | ideas | **C** | | |
-| 123 | AB-09 | P1 | Callee-save + frame compact offsets | peephole | **C** | smaller frames | |
+| 123 | AB-09 | DONE | Call-free x86 leaves whose layout used only the conservative callee-save collision reserve now elide the duplicate local frame; push/pop and CFA remain correct | x86 prologue | **M** removes `subq/addq $24` from two-exit leaf; targeted runtime/CFI regression; gzip 30/30 | `CCC_NO_EMPTY_LOCAL_FRAME_ELISION` | elide when calls/slots/varargs exist |
 | 124 | AB-10 | P2 | Postgres frame size | ideas | **C** | | |
 | 125 | AB-11 | P1 | Alloca escape analysis more GEP | stack_layout | **C** | | |
 | 126 | AB-12 | P2 | Two coalescers unify | RA vs stack | **C** | one policy | |
@@ -294,12 +294,12 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
 | 160 | MS-01 | P0 | Godbolt compare in CI for 6 kernels | `scripts/godbolt.py` | procedure §1 | CI artifact | skip oracles |
-| 161 | MS-02 | P0 | Spill-count metric `CCC_TRACE_ALLOCSTATS` aggregate | RA | **C** | number in logs | |
+| 161 | MS-02 | DONE | `CCC_TRACE_ALLOCSTATS[=filter]` emits one deterministic aggregate line per selected function: eligible/scan/assigned/spilled/segments/holes/callee/caller homes | RA | **M** structural regression verifies fields, filtering, and byte-identical assembly | number in logs | alter allocation while tracing |
 | 162 | MS-03 | P1 | CI correctness+regression+fuzz smoke | ideas README | **C** | | |
 | 163 | MS-04 | P1 | OnceLock env knobs break parameterized tests | live_range.rs | **C** | tests independent | |
 | 164 | MS-05 | P2 | Compile-time: pass rescans | use-def FE-13 | **C** | | |
 | 165 | MS-06 | P1 | Document PhysReg map once | RA-19 | **C** | | |
-| 166 | MS-07 | P0 | Re-run Adler/CRC/Expat/gzip `-S` on **current `main`** (merged with P0-03) | workloads | **must** | numbers on this SHA | cite older 118 without re-measure |
+| 166 | MS-07 | DONE | Re-ran current patch oracles: gzip 1.14 30/30, `longest_match` 330 instructions/118 stack refs; Expat local 114 vs GCC16.2 78; CRC/Adler artifacts refreshed where externally visible | workloads | **M/G** artifacts `r7-*`; gzip paired VM treatment/control median ratio 0.992 | numbers on this SHA | claim VM timing as hardware |
 | 167 | MS-08 | P1 | **Consolidate 29+ `CCC_` env vars into `RaConfig` struct** | `regalloc.rs` (29), `live_range.rs` (7), `prologue.rs` (16) | **C** 29 in regalloc.rs alone, mixed polarity | `RaConfig` struct, single source of truth | env vars in hot path |
 | 168 | MS-09 | P1 | **Audit `peephole_common.rs` UTF-8 fix impact** — old `bytes[i] as char` corrupted non-ASCII bytes in asm (FIXED in current main); verify no compiled binary shipped with corrupted asm | `engineering/evidence/` | **C** old code corrupted UTF-8 | audit report | re-enable `bytes[i] as char` |
 

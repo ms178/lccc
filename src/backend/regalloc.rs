@@ -27,6 +27,44 @@ pub struct RegAllocResult {
     pub liveness: Option<LivenessResult>,
 }
 
+/// Whether x86 can preserve incoming parameters directly in caller-saved homes.
+/// ParamRefs must execute in the entry prefix before any generated instruction
+/// can clobber ABI argument registers, and the function must be call-free.
+pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
+    if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
+        return false;
+    }
+    // Multi-block expansion is limited to the six SysV register arguments.
+    // Stack arguments need a stable entry-RSP frame model; moving those homes
+    // changes their offsets (the nine-argument regression catches this).
+    if func.blocks.len() > 1 && func.params.len() > 6 {
+        return false;
+    }
+    if func.blocks.iter().any(|b| b.instructions.iter().any(|inst| matches!(
+        inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. }
+    ))) {
+        return false;
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if bi != 0 {
+            if block.instructions.iter().any(|inst| matches!(inst, Instruction::ParamRef { .. })) {
+                return false;
+            }
+            continue;
+        }
+        let mut seen_code = false;
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { .. } | Instruction::ParamRef { .. } if !seen_code => {}
+                Instruction::ParamRef { .. } => return false,
+                _ => seen_code = true,
+            }
+        }
+    }
+    true
+}
+
 pub struct RegAllocConfig {
     pub available_regs: Vec<PhysReg>,
     pub caller_saved_regs: Vec<PhysReg>,
@@ -831,8 +869,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let x86_ordered_param_copies = !is_32bit
         && config.available_regs.iter().any(|r| r.0 == 1)
         && config.caller_saved_regs.iter().any(|r| r.0 == 10)
-        && func.blocks.len() == 1
-        && !env_on("CCC_NO_LEAF_PARAM_GPR");
+        && x86_param_caller_homes_safe(func);
     let mut param_ref_values: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -2038,6 +2075,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             for (s, e, vid, info) in rows {
                 eprintln!("[RA]   v{:>5} [{:>5}, {:>5}] {}", vid, s, e, info);
             }
+        }
+    }
+
+    if let Ok(filter) = std::env::var("CCC_TRACE_ALLOCSTATS") {
+        if filter.is_empty() || filter == "*" || func.name.contains(&filter) {
+            let scan_values: FxHashSet<u32> = scan_ivs.iter().map(|iv| iv.value_id).collect();
+            let assigned_scan = scan_values.iter().filter(|v| assignments.contains_key(v)).count();
+            let spilled = scan_values.len().saturating_sub(assigned_scan);
+            let segment_values: FxHashSet<u32> = liveness.segments.iter().map(|s| s.value_id).collect();
+            let holes = liveness.segments.len().saturating_sub(segment_values.len());
+            let caller_ids: FxHashSet<u8> = config.caller_saved_regs.iter().map(|r| r.0).collect();
+            let callee_ids: FxHashSet<u8> = config.available_regs.iter().map(|r| r.0).collect();
+            let caller_homes = assignments.values().filter(|r| caller_ids.contains(&r.0)).count();
+            let callee_homes = assignments.values().filter(|r| callee_ids.contains(&r.0)).count();
+            eprintln!(
+                "[RA-STATS] fn={} eligible={} scan={} assigned={} spilled={} segments={} holes={} callee-homes={} caller-homes={}",
+                func.name, eligible.len(), scan_values.len(), assigned_scan, spilled,
+                liveness.segments.len(), holes, callee_homes, caller_homes
+            );
         }
     }
 
