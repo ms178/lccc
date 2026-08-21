@@ -30,6 +30,19 @@ impl ArmCodegen {
                     return;
                 }
             }
+            // A non-alloca FP value with a stack home is a value spill (or a
+            // stack-passed FP parameter), not an address. Load its bits
+            // directly into the requested FP register. The generic path below
+            // bounces them through x0 (`ldr x0` + `fmov dN,x0`), adding one
+            // instruction and a cross-domain dependency without changing the
+            // value. Allocas remain on the pointer path. (levkropp 0c5134cc,
+            // Agent B assembly gate.)
+            if !self.state.is_alloca(v.0) {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_load_from_sp(target, slot.0, "ldr");
+                    return;
+                }
+            }
         }
         // FP constants load straight from the .rodata constant pool via a
         // PC-relative literal load (1 instruction vs. a 5-instruction

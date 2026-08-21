@@ -229,13 +229,23 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         // allocator IDs disjoint from x0-x30; the ARM emitter maps 40..47 to
         // d16..d23.
         //
-        // When the function has no loop-promoted F64 values, the dedicated
-        // d24..d31 promotion pool (allocator IDs 48..55) is unused, so open it
-        // up to the general scan — FP-heavy loops easily keep 8+ values live.
-        let mut regs: Vec<PhysReg> = if func.loop_promoted_f64_values.is_empty() {
-            (40..=55).map(PhysReg).collect()
+        // The d24..d31 promotion pool (allocator IDs 48..55) is assigned
+        // 48+i for the first eight loop-promoted F64 values (regalloc.rs).
+        // Reserve only that prefix; the unused tail joins the general scan
+        // so nbody's three velocity accumulators do not idle d27-d31 while
+        // d16-d23 overflow (levkropp 9f304050). CCC_NO_PROMOTED_FP_TAIL
+        // restores the all-or-nothing reservation for A/B.
+        let mut regs: Vec<PhysReg> = if std::env::var_os("CCC_NO_PROMOTED_FP_TAIL").is_some() {
+            if func.loop_promoted_f64_values.is_empty() {
+                (40..=55).map(PhysReg).collect()
+            } else {
+                (40..=47).map(PhysReg).collect()
+            }
         } else {
-            (40..=47).map(PhysReg).collect()
+            let n_promoted = func.loop_promoted_f64_values.len().min(8) as u8;
+            let mut r: Vec<PhysReg> = (40..=47).map(PhysReg).collect();
+            r.extend(((48 + n_promoted)..=55).map(PhysReg));
+            r
         };
         // d8..d14 (allocator IDs 32..38) are the callee-saved FP registers.
         // They are appended last so the cheaper caller-saved pool fills first;

@@ -12,3 +12,7 @@ retain raw individual and aggregate measurements, and label evidence honestly.
 - [`gzip-1.14/`](gzip-1.14/README.md) — full GNU gzip build, 30-test suite,
   deterministic compression/decompression corpora, local disassembly, and
   randomized paired LCCC/GCC VM screening.
+- [`zlib-ng-2.3.3/run.sh`](zlib-ng-2.3.3/run.sh) — pinned upstream tag plus
+  the pinned `ms178/archpkgbuilds` patch, complete bounded CTest suite, and
+  independently validated binary round trips. Every test and the whole suite
+  have hard timeouts so a generated-code hang cannot consume an Arena session.
