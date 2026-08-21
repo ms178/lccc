@@ -22,6 +22,7 @@ Re-oracle and check gzip `longest_match` stack-mem after **each** item.
 | 9 | IS-03 | **DONE for isolated assignment:** AVX2 64 B → 2× YMM pairs + vzeroupper, -17 bytes; broader struct SROA remains OP-02. |
 | 10 | IS-04, OP-05 | ICX-style YMM FMA on nbody/matmul/spectral/reduction. |
 | 11 | IS-06, OP-01 | **OP-01 DONE:** shared alias forms wired to LICM with checked Shl and fail-closed writes; `btq` classify remains. |
+| 11a | OP-34 | **DONE:** GlobalAddr CSE wired pre-GVN/post-inline/post-unroll with oracle-derived cold/loop/branch placement, derived indexed-root protection, and all-backend validation. |
 
 ## Phase 2 — Structural blockers (prerequisites for all subsequent RA work)
 

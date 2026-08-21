@@ -22,7 +22,7 @@
 19. **Do not delete `graph_coloring.rs`** — it is sound infrastructure blocked by RA-23. Wire it into Tier 2 after the accumulator blocker is fixed (P0-01b).
 20. **Do not delete `reg_hint`/`enable_splitting`/`handled` fields** — `reg_hint` wires up as RA-26 (ABI hints), `enable_splitting` is the RA-06 stub, `handled` wires into RA-13 verification.
 21. **Keep register allocation disabled at `-O0` until the scan models non-SSA multi-def values.** Stack homes are the correctness contract; O1+ retains full RA.
-22. **GlobalAddr CSE must not hoist variable-index GEP bases or cross intrinsic-bearing CFGs.** The former destroys symbol+index SIB selection; the latter crosses hidden accumulator/XMM state pending RA-23.
+22. **GlobalAddr CSE placement is dominance/loop constrained.** Never hoist derived variable-index bases, cold non-loop singletons, mutually-exclusive sibling definitions, or create preheader homes across intrinsic-bearing loops. Loop values move only to the innermost preheader; outside loops, reuse only an already-dominating occurrence.
 
 Kill-switches added for CFG-leaf work: `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`, expanded `CCC_NO_LEAF_PARAM_GPR`; diagnostics: `CCC_TRACE_ALLOCSTATS[=filter]`.
 
