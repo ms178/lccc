@@ -207,6 +207,22 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
         });
     }
 
+    // Parameter homes are still identified by nth-Alloca position in every
+    // backend. If parameter k's home survives, every earlier parameter-home
+    // Alloca must survive too or k silently shifts to the wrong ABI argument.
+    if allow_dead_allocas {
+        let param_allocas: Vec<usize> = func.blocks[0].instructions.iter()
+            .enumerate()
+            .filter_map(|(ii, inst)| matches!(inst, Instruction::Alloca { .. }).then_some(ii))
+            .take(func.params.len())
+            .collect();
+        if let Some(last_live) = param_allocas.iter().rposition(|&ii| live[0][ii] != 0) {
+            for &ii in &param_allocas[..=last_live] {
+                mark_site_live(0, ii as u32, &mut live, &mut worklist);
+            }
+        }
+    }
+
     if dce_debug_enabled() {
         dump_dead_instructions(func, &live);
     }
@@ -441,7 +457,7 @@ fn has_side_effects(inst: &Instruction) -> bool {
 mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, Operand, Terminator, Value};
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, IrParam, Operand, Terminator, Value};
 
     fn make_simple_func() -> IrFunction {
         // Function with: %0 = alloca i32, %1 = add 3, 4 (dead), store 42 to %0, load from %0
@@ -531,6 +547,28 @@ mod tests {
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(removed, 4);
         assert!(func.blocks[0].instructions.is_empty())
+    }
+
+    #[test]
+    fn live_later_parameter_home_pins_positional_prefix() {
+        let param = || IrParam {
+            ty: IrType::Ptr, noalias: false, struct_size: None, struct_align: None,
+            struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None,
+        };
+        let mut func = IrFunction::new("param_prefix".to_string(), IrType::Void,
+            vec![param(), param()], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca { dest: Value(0), ty: IrType::Ptr, size: 8, align: 8, volatile: false, semantic_volatile: false },
+                Instruction::Alloca { dest: Value(1), ty: IrType::Ptr, size: 8, align: 8, volatile: false, semantic_volatile: false },
+                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I64(7)), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default },
+            ],
+            terminator: Terminator::Return(None), source_spans: vec![],
+        });
+        assert_eq!(eliminate_dead_code(&mut func), 0);
+        assert!(matches!(func.blocks[0].instructions[0], Instruction::Alloca { dest: Value(0), .. }));
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Alloca { dest: Value(1), .. }));
     }
 
     #[test]

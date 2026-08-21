@@ -1,7 +1,7 @@
 # Register allocation
 
 Production: `src/backend/regalloc.rs` (policy) + `src/backend/live_range.rs` (scan).
-Stack homes: `src/backend/stack_layout/`; register pointers use exact `SlotAddr::Reg(PhysReg)` locations across every backend. The hole-aware graph colorer is research-wired but default-off until RA-23 exposes accumulator lifetimes.
+Stack homes: `src/backend/stack_layout/`; non-stack scalar homes use `ExplicitLocation::{Reg,Accumulator}`, and register pointers resolve through exact `SlotAddr::Reg(PhysReg)` across every backend. The graph colorer remains default-off until accumulator legality moves from the consumer whitelist into RA.
 
 ## Pipeline
 

@@ -1418,7 +1418,7 @@ impl X86Codegen {
             } else {
                 self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
             }
-        } else if self.state.immediately_consumed.contains(&dest.0) {
+        } else if self.state.is_accumulator_location(dest.0) {
             // Value is consumed by the very next instruction — skip the store.
             // The accumulator cache (set below) ensures the consumer finds it in %rax.
         } else {
@@ -1506,7 +1506,7 @@ impl X86Codegen {
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             // No register: store 64 bits to preserve sign extension.
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
-        } else if !self.state.immediately_consumed.contains(&dest.0) {
+        } else if !self.state.is_accumulator_location(dest.0) {
             panic!("x86 codegen: live value {} has no assigned location", dest.0);
         }
         self.state.reg_cache.set_acc(dest.0, false);

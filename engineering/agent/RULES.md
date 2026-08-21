@@ -14,7 +14,7 @@
 11. Nobody used the `crc32` instruction on the gzip kernel at `-O2`. The bar is **SIB table xor**.
 12. Do not vectorize sieve like Clang (365 ins vs gcc 45 scalar).
 13. Binary: `lccc`. Build: `scripts/build_lccc_fast.sh`. Swap: `scripts/ensure_swap.sh` on 2 GiB VMs.
-14. **Do not refactor `immediately_consumed` (RA-23) without full differential testing.** RA-24 is complete: register pointers must remain `SlotAddr::Reg(PhysReg)` and no dummy stack offset may return.
+14. **Preserve `ExplicitLocation::{Reg,Accumulator}` as the single non-stack scalar contract.** RA-23 is not complete until accumulator legality moves into RA; RA-24 forbids dummy stack offsets.
 15. **Do not re-enable `bytes[i] as char` in `peephole_common.rs`** — it corrupts UTF-8. The `find_whole_word` + `from_utf8_unchecked` path is the only safe one.
 16. **Do not re-introduce `MAX_ITERATIONS` in liveness** — the worklist dataflow is provably terminating (monotonic). A cap is a silent miscompile.
 17. **`__builtin_cpu_supports` must fold from an exact allowlist** (`PRESENT` const at `expr_builtins.rs:453`) — the old "return 1 for everything except avx512" produced SIGILL paths on non-v3 CPUs.
