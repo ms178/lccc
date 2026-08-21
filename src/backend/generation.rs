@@ -3472,9 +3472,8 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
                     crate::backend::state::SlotAddr::Direct(slot) => {
                         cg.emit_gep_direct_const(slot, 0);
                     }
-                    crate::backend::state::SlotAddr::Indirect(_) => {
-                        unreachable!("alloca address cannot use an indirect slot");
-                    }
+                    crate::backend::state::SlotAddr::Indirect(_) => { unreachable!("alloca address cannot use an indirect slot"); }
+                    crate::backend::state::SlotAddr::Reg(reg) => cg.emit_reg_to_acc(reg),
                 }
                 cg.state().reg_cache.set_acc(src_val.0, true);
                 cg.emit_store_result(dest);

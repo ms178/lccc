@@ -591,6 +591,8 @@ impl ArchCodegen for RiscvCodegen {
     fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add t0, t1, t0"); }
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }
     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mv t1, t0"); }
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mv t0, {}", callee_saved_name(reg))); }
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mv t5, {}", callee_saved_name(reg))); }
     fn emit_memcpy_store_dest_from_acc(&mut self) { self.state.emit("    mv t1, t5"); }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mv t2, t5"); }
     fn emit_call_store_i128_result(&mut self, _dest: &Value) { unreachable!("RISC-V uses custom emit_call_store_result"); }

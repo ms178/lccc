@@ -25,13 +25,8 @@ impl X86Codegen {
                 }
                 None
             }
-            SlotAddr::Indirect(slot) => {
-                self.emit_load_ptr_from_slot(*slot, ptr_id);
-                if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
-                }
-                None
-            }
+            SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(*slot,ptr_id); if offset!=0 { self.state.out.emit_instr_imm_reg("    addq",offset,"rcx"); } None }
+            SlotAddr::Reg(reg) => { self.emit_reg_to_addr(*reg); if offset!=0 { self.state.out.emit_instr_imm_reg("    addq",offset,"rcx"); } None }
         }
     }
 
@@ -80,20 +75,8 @@ impl X86Codegen {
                 }
                 self.state.emit("    movq %rax, 8(%rcx)");
             }
-            SlotAddr::Indirect(slot) => {
-                self.emit_load_ptr_from_slot(*slot, ptr_id);
-                if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
-                }
-                self.state.out.emit_instr_imm_reg("    movabsq", lo as i64, "rax");
-                self.state.emit("    movq %rax, (%rcx)");
-                if hi != 0 {
-                    self.state.out.emit_instr_imm_reg("    movq", hi as i64, "rax");
-                } else {
-                    self.state.emit("    xorl %eax, %eax");
-                }
-                self.state.emit("    movq %rax, 8(%rcx)");
-            }
+            SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(*slot,ptr_id); if offset!=0 { self.state.out.emit_instr_imm_reg("    addq",offset,"rcx"); } self.state.out.emit_instr_imm_reg("    movabsq",lo as i64,"rax"); self.state.emit("    movq %rax, (%rcx)"); if hi!=0 { self.state.out.emit_instr_imm_reg("    movq",hi as i64,"rax"); } else { self.state.emit("    xorl %eax, %eax"); } self.state.emit("    movq %rax, 8(%rcx)"); }
+            SlotAddr::Reg(reg) => { self.emit_reg_to_addr(*reg); if offset!=0 { self.state.out.emit_instr_imm_reg("    addq",offset,"rcx"); } self.state.out.emit_instr_imm_reg("    movabsq",lo as i64,"rax"); self.state.emit("    movq %rax, (%rcx)"); if hi!=0 { self.state.out.emit_instr_imm_reg("    movq",hi as i64,"rax"); } else { self.state.emit("    xorl %eax, %eax"); } self.state.emit("    movq %rax, 8(%rcx)"); }
         }
     }
 
@@ -120,17 +103,8 @@ impl X86Codegen {
                 self.state.emit("    addq $8, %rsp");
                 self.state.emit("    fstpt (%rcx)");
             }
-            SlotAddr::Indirect(slot) => {
-                self.state.emit("    movq %rax, %rdx");
-                self.emit_load_ptr_from_slot(*slot, ptr_id);
-                if offset != 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
-                }
-                self.state.emit("    pushq %rdx");
-                self.state.emit("    fldl (%rsp)");
-                self.state.emit("    addq $8, %rsp");
-                self.state.emit("    fstpt (%rcx)");
-            }
+            SlotAddr::Indirect(slot) => { self.state.emit("    movq %rax, %rdx"); self.emit_load_ptr_from_slot(*slot,ptr_id); if offset!=0 { self.state.out.emit_instr_imm_reg("    addq",offset,"rcx"); } self.state.emit("    pushq %rdx"); self.state.emit("    fldl (%rsp)"); self.state.emit("    addq $8, %rsp"); self.state.emit("    fstpt (%rcx)"); }
+            SlotAddr::Reg(reg) => { self.state.emit("    movq %rax, %rdx"); self.emit_reg_to_addr(*reg); if offset!=0 { self.state.out.emit_instr_imm_reg("    addq",offset,"rcx"); } self.state.emit("    pushq %rdx"); self.state.emit("    fldl (%rsp)"); self.state.emit("    addq $8, %rsp"); self.state.emit("    fstpt (%rcx)"); }
         }
     }
 
@@ -167,10 +141,8 @@ impl X86Codegen {
                 self.emit_alloca_aligned_addr(*slot, *id);
                 self.state.emit("    fldt (%rcx)");
             }
-            SlotAddr::Indirect(slot) => {
-                self.emit_load_ptr_from_slot(*slot, 0);
-                self.state.emit("    fldt (%rcx)");
-            }
+            SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(*slot,0); self.state.emit("    fldt (%rcx)"); }
+            SlotAddr::Reg(reg) => { self.emit_reg_to_addr(*reg); self.state.emit("    fldt (%rcx)"); }
         }
         // ST0 now has full 80-bit precision value
         self.emit_f128_st0_to_int(to_ty);

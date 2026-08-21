@@ -17,6 +17,7 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
+use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::backend::f128_softfloat::F128SoftFloat;
 use super::emit::{ArmCodegen, callee_saved_name};
@@ -218,6 +219,8 @@ impl F128SoftFloat for ArmCodegen {
             false
         }
     }
+
+    fn f128_move_phys_to_addr_reg(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mov x17, {}", callee_saved_name(reg))); }
 
     fn f128_move_aligned_to_addr_reg(&mut self) {
         // x9 is the alloca-aligned address register, x17 is the F128 addr register

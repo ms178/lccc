@@ -314,9 +314,8 @@ pub fn calculate_stack_space_common(
     //          dead param allocas, alloca coalescability, copy aliases).
     let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop, &cached_liveness);
 
-    // Tell CodegenState which values are register-assigned so that
-    // resolve_slot_addr can return a dummy Indirect slot for them.
-    state.reg_assigned_values = reg_assigned.keys().copied().collect();
+    // Preserve exact physical homes; no fabricated stack address.
+    state.reg_assigned_locations = reg_assigned.clone();
 
     // Propagate the immediately-consumed set to CodegenState so that
     // store_rax_to / store_eax_to can skip the store for these values.

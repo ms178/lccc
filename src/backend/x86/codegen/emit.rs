@@ -4143,6 +4143,11 @@ impl ArchCodegen for X86Codegen {
         self.state.reg_cache.invalidate_all();
     }
 
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) {
+        self.state.reg_cache.invalidate_sec();
+        self.state.out.emit_instr_reg_reg("    movq", phys_reg_name(reg), "rcx");
+    }
+
     fn function_alignment_log2(&self) -> Option<u32> {
         match self.function_alignment {
             0 | 1 => None,

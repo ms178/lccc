@@ -31,7 +31,7 @@ Re-oracle and check gzip `longest_match` stack-mem after **each** item.
 | 12 | P0-02 / RA-05 | Switch `live_range.rs` scan from `intervals` to `segments` (infrastructure built, just wire). |
 | 13 | RA-06 | Reload-at-next-use + in-place splitting (the #1 perf gap — 3-5× spill traffic). Gate on `enable_splitting`. |
 | 14 | RA-23 | Eliminate `immediately_consumed` blocker (RA-owned accumulator hint). Unblocks P0-01b (graph_coloring Tier 2). |
-| 15 | RA-24 | Eliminate `SlotAddr::Indirect(StackSlot(0))` dummy (`SlotAddr::Reg(PhysReg)`). |
+| 15 | RA-24 | **DONE:** exact `SlotAddr::Reg(PhysReg)` migrated through all shared and target-specific address consumers; exhaustive 51-site compile gate plus all-backend tests. |
 | 16 | RA-13 | **DONE:** hard segment/final verifier plus handled eviction-history verifier. |
 | 17 | RA-26 | **DONE and extended:** scalar non-sret hints plus ordered caller homes for call-free x86 CFG leaves with ≤6 register args and leading ParamRefs; stack args/mixed/calling shapes refuse. |
 | 17a | RA-27 | **DONE:** disable one-def linear scan on non-SSA `-O0` IR across all backends; 600/600 phi CFG and 540/540 alias differential. |

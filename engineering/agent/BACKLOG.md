@@ -28,7 +28,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 
 **A. Two codegens, one dead allocator.** Text IR → GNU-as + string peephole, and MachInst ISel/emit + a **dead** second linear scan (`machinst_regalloc.rs`, 635 LOC, zero callers, RAX-clobber soundness bug in `rewrite_machinsts`). The MachInst ISel/emit path is gated off when loop body >32 insts (gzip −3%). Deleting the dead RA (P0-01a) is zero-risk. The MachInst ISel/emit path piggy-backs on the main RA via `resolve_stack_vregs` (`emit.rs:2998`) — it does not need its own RA. Unifying the ISel paths without a cost model repeats the gzip regression.
 
-**B. Location model is a pile of sets.** Homes live in `reg_assignments`, stack slots, `never_materialized`, `immediately_consumed` (hard blocker — RA-23), `param_pre_stored`, `fused_cmp_dests`, `cmp_replay`, `load_cast_fold`, XMM vecreg, MachInst regs. `ValueLocation` never landed. `SlotAddr::Indirect(StackSlot(0))` (`state.rs:844`) is a dummy for register-homed values — convention, not enforced (RA-24).
+**B. Location model is still split, but pointer homes are explicit.** `SlotAddr::Reg(PhysReg)` is production across all backends (RA-24 DONE). Remaining homes live in `immediately_consumed` (RA-23 blocker), `never_materialized`, `param_pre_stored`, fused compare/replay sets, XMM vecreg, and MachInst state; a unified `ValueLocation` remains future work.
 
 **C. RA scans fat intervals.** `liveness.segments` (hole-aware) is consumed by `regalloc.rs` for call-spanning detection and interval extension (lines 571, 785), but the linear scan itself (`live_range.rs`) still runs on fat `intervals` (single `[start,end]`). Diamond CFGs (xmltok/inflate) over-interfere. `split_ranges.rs` is now a correct IR rewrite (rewrites uses, phi-safe), but is not Wimmer-style in-place splitting.
 
@@ -78,7 +78,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 7. Paths are `src/…`. Binary is `lccc`.
 8. Copy **ICX** FMA, not GCC 16.2 per-iter horizontal.
 9. Do not vectorize sieve like Clang.
-10. Do not refactor `immediately_consumed` (RA-23) or `SlotAddr` (RA-24) without full differential testing — they are hard blockers that will miscompile silently.
+10. Do not refactor `immediately_consumed` (RA-23) without full differential testing. Preserve RA-24's exact `SlotAddr::Reg(PhysReg)` contract.
 11. Do not delete `graph_coloring.rs` — it is sound infrastructure blocked by RA-23 (wire after P0-01b).
 12. Do not delete `reg_hint`/`enable_splitting`/`handled` fields — wire them up (RA-26/RA-06/RA-13).
 
@@ -127,7 +127,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 26 | RA-21 | P2 | Vecreg whitelist vs new SIMD ops | `collect_vecreg_candidates` | **C** fail-closed | test per intrinsic | open whitelist |
 | 27 | RA-22 | P3 | PBQP irregular (AArch64) | — | after RA-01–06 | — | before x64 codecs win |
 | 28 | RA-23 | P0 | **Eliminate `immediately_consumed` blocker** — refactor to RA-owned accumulator hint | `stack_layout/copy_coalescing.rs:1328` (`compute_immediately_consumed` + `is_safe_sole_consumer`), `state.rs` | **C** hard-codes accumulator load order; `is_safe_sole_consumer` whitelist (`Store,Cast,UnaryOp,Copy` always; `BinOp,Cmp` only when `lhs_first_binop`) | RA owns accumulator placement; whitelist deleted; unblocks P0-01b (graph_coloring) | break accumulator codegen without differential test |
-| 29 | RA-24 | P0 | **Eliminate `SlotAddr::Indirect(StackSlot(0))` dummy** — add `SlotAddr::Reg(PhysReg)` variant | `state.rs:844` | **C** silent corruption if Indirect codepath forgets `reg_assignments` check | exhaustive match catches misses | migrate all backends at once without tests |
+| 29 | RA-24 | DONE | Replaced fake `Indirect(StackSlot(0))` with exact `SlotAddr::Reg(PhysReg)`; migrated shared memory/GEP/memcpy, soft-F128, x86/x87, i686, AArch64, and RISC-V consumers | state + 18 backend files | **M/C** compiler-enforced 51-site migration; native mixed-width runtime; all-target scalar/F128 compile; 985 unit + 378 regression + 600 phi + 540 alias | exact physical home consumed | reintroduce dummy frame offsets |
 | 30 | RA-25 | P1 | **Unify `loop_memory_promote`'s `affine_disjoint` with `alias.rs::forms_disjoint`** | `loop_memory_promote.rs`, `alias.rs` | **C** duplicated SCEV-lite engine (1712 LOC + 128 LOC) | one alias engine | break sqlite `sqlite3FpDecode` fix |
 | 31 | RA-26 | DONE | ABI physical hints plus ordered caller-home placement now cover scalar call-free x86 CFG leaves with ≤6 register arguments and leading entry ParamRefs; stack-argument/mixed/calling shapes fail closed | RA + x86 prologue | **G/M** branch leaf 16→8 body instructions vs control; CE LCCC 10 vs GCC/ICC 8, Clang/ICX 9; 377 regressions + 50 correctness | `CCC_NO_LEAF_PARAM_GPR` | admit stack args or late ParamRefs |
 | 32 | RA-27 | DONE | `-O0` non-SSA multi-def IR uses canonical stack homes on all backends; production RA remains enabled at O1/O2/O3/Os/Oz | CodegenOptions + all prologues | **M** phi CFG improved 475/600 → 600/600; seed-1 stale loop-carried value fixed; cross-target O0 compile | 600 phi + 540 alias + dedicated runtime | run one-def linear scan on multi-def IR |
@@ -248,7 +248,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 125 | AB-11 | P1 | Alloca escape analysis more GEP | stack_layout | **C** | | |
 | 126 | AB-12 | P2 | Two coalescers unify | RA vs stack | **C** | one policy | |
 | 127 | AB-13 | P2 | i686 boot 32K | external_tools TODO | **C** | | |
-| 128 | AB-14 | P2 | F128 80-bit x86 | ideas | **C** | | |
+| 128 | AB-14 | P1 | F128/80-bit x86 parameter audit: `void f(long double*, long double)` still reloads the pointer home as the long-double argument in the isolated write-through reproducer | x86 prologue/F128 | **M** found during RA-24 cross-class testing; unrelated to register-location change and reproduces with RA disabled | correct stack ABI/runtime | conflate with RA-24 |
 | 129 | AB-15 | P1 | Dead XMM save in integer varargs remaining | vararg_fp_save | **C** | | |
 
 ### 5.6 PGO / IPO / layout — PG-01 … PG-12
@@ -319,7 +319,7 @@ src/backend/stack_layout/graph_coloring.rs  131  KEEP — wire after RA-23 (P0-0
 src/backend/stack_layout/copy_coalescing.rs 2246  immediately_consumed blocker (RA-23)
 src/backend/generation.rs             3622  ISel driver
 src/backend/x86/codegen/prologue.rs   1815  RA call, MachInst gate, folds
-src/backend/state.rs                   850  SlotAddr::Indirect(StackSlot(0)) dummy at :844 (RA-24)
+src/backend/state.rs                        explicit SlotAddr::Reg(PhysReg) (RA-24 DONE)
 src/backend/peephole_common.rs         408  UTF-8 safe, tab-aware (FIXED)
 src/backend/x86/codegen/memory.rs     memcpy ymm
 src/backend/x86/codegen/float_ops.rs  FMA scalar
