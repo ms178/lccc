@@ -43,6 +43,84 @@ impl X86Codegen {
         }
     }
 
+    pub(super) fn emit_and_not_impl(
+        &mut self,
+        not_src: &Operand,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+        direct_return: bool,
+    ) {
+        let narrow = matches!(ty, IrType::I32 | IrType::U32);
+        let home = |this: &Self, operand: &Operand| -> Option<String> {
+            let Operand::Value(value) = operand else { return None; };
+            let reg = this.reg_assignments.get(&value.0).copied()?;
+            if super::emit::is_xmm_reg(reg) || this.state.is_alloca(value.0) {
+                return None;
+            }
+            Some(if narrow {
+                super::emit::phys_reg_name_32(reg).to_string()
+            } else {
+                super::emit::phys_reg_name(reg).to_string()
+            })
+        };
+        let not_name = match home(self, not_src) {
+            Some(name) => name,
+            None => {
+                if narrow { self.operand_to_eax(not_src); }
+                else { self.operand_to_rax(not_src); }
+                if narrow { "eax".into() } else { "rax".into() }
+            }
+        };
+        let other_name = match home(self, other) {
+            Some(name) => name,
+            None => {
+                self.operand_to_rcx(other);
+                if narrow { "ecx".into() } else { "rcx".into() }
+            }
+        };
+
+        if direct_return {
+            let suffix = if narrow { "l" } else { "q" };
+            self.state.emit_fmt(format_args!(
+                "    andn{} %{}, %{}, %{}",
+                suffix,
+                other_name,
+                not_name,
+                if narrow { "eax" } else { "rax" }
+            ));
+            self.state.reg_cache.set_acc(dest.0, false);
+            return;
+        }
+
+        if let Some(reg) = self.dest_reg(dest) {
+            let name = if narrow {
+                super::emit::phys_reg_name_32(reg)
+            } else {
+                super::emit::phys_reg_name(reg)
+            };
+            let suffix = if narrow { "l" } else { "q" };
+            self.state.emit_fmt(format_args!(
+                "    andn{} %{}, %{}, %{}",
+                suffix,
+                other_name,
+                not_name,
+                name
+            ));
+            self.state.reg_cache.invalidate_acc();
+        } else {
+            let suffix = if narrow { "l" } else { "q" };
+            self.state.emit_fmt(format_args!(
+                "    andn{} %{}, %{}, %{}",
+                suffix,
+                other_name,
+                not_name,
+                if narrow { "eax" } else { "rax" }
+            ));
+            self.store_rax_to(dest);
+        }
+    }
+
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
         match ty {
             IrType::I8 | IrType::U8 => {

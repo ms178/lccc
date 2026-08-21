@@ -82,7 +82,7 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 11. Do not delete `graph_coloring.rs` — it is sound infrastructure blocked by RA-23 (wire after P0-01b).
 12. Do not delete `reg_hint`/`enable_splitting`/`handled` fields — wire them up (RA-26/RA-06/RA-13).
 
-Kill-switches: `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`, `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`, `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`, `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_SEGMENT_FILL`, `CCC_NO_INDEX_HOME`, `CCC_NO_ABI_REG_HINTS`, `CCC_NO_LICM_ALIAS`, `CCC_ENABLE_TIER2_GRAPH`, `CCC_NO_LOOP_PIN`, `CCC_NO_VECREG`, `CCC_PGO_WEIGHT_MAX`, `CCC_TRACE_ALLOC`, `CCC_X64_NOHOME_CLASSES`, `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`.
+Kill-switches: `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`, `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`, `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`, `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_SEGMENT_FILL`, `CCC_NO_INDEX_HOME`, `CCC_NO_ABI_REG_HINTS`, `CCC_NO_LICM_ALIAS`, `CCC_NO_ANDN_FUSION`, `CCC_NO_64B_YMM_COPY`, `CCC_ENABLE_TIER2_GRAPH`, `CCC_NO_LOOP_PIN`, `CCC_NO_VECREG`, `CCC_PGO_WEIGHT_MAX`, `CCC_TRACE_ALLOC`, `CCC_X64_NOHOME_CLASSES`, `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`.
 
 ---
 
@@ -137,7 +137,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 |---|----|---|------|-------|----------|--------|--------|
 | 32 | IS-01 | DONE | Masked byte-table indexes retain a safe hidden home; x86 emits scale-4 SIB table loads | RA hidden-index priority + existing indexed emitters | **M** CRC -12 B/-7 insn, 1.34x vs control, now 1.07x behind GCC | SIB regression + 600 phi fuzz | broad hidden homes before RA-23 |
 | 33 | IS-02 | P0 | Keep `double` fields in XMM; ban `movq %xmm,%rax` roundtrip | `float_ops.rs`, `memory.rs` | **S** 21× struct_copy | mov count ≤40 | keep rax shuttle |
-| 34 | IS-03 | P0 | 64 B assignment → 2× `vmovdqu ymm` | memcpy path **exists**; assignment may not | **G** gcc 7 insns | `copy_s` matches gcc/icx | claim memcpy missing |
+| 34 | IS-03 | DONE | AVX2 64-byte assignment → 2 YMM load/store pairs + `vzeroupper`; baseline ISA remains XMM | x86 memcpy + target feature contract | **M** copy kernel 55→38 bytes (-17) after ParamRef memcpy homes, runtime exact | structural/runtime regression | use YMM for 32/48 B (measured slower) |
 | 35 | IS-04 | P0 | Vectorizer emit `vfmadd231pd` into YMM acc **once** horiz | `vectorize.rs` + `intrinsics.rs` | **G** **icx** not gcc16; spectral ICX FMA 10 | `dot`/spectral CE vs icx | copy gcc16 per-iter hadd |
 | 36 | IS-05 | P1 | Mem-op `vmulpd (%rdi),…` | ISel fold | **G** | mem operand in vec loop | fold aliased |
 | 37 | IS-06 | P1 | `btq` / bitset classify | `simplify.rs` + emit | **G** gcc name_scan; **M** 1.95× | `btq` in name_scan | mega-inline varint |
@@ -146,7 +146,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 40 | IS-09 | P1 | Cmp-replay only from **slots** | keep | **C** sqlite `yy_shift` | no sqlite SEGV | replay from physreg |
 | 41 | IS-10 | P1 | Flag fusion Copy/Cast chain | exists; extend carefully | **C** expat accounting SEGV if multi-use | more fused cmp | multi-use flags |
 | 42 | IS-11 | P1 | C `__ffs` if-tree → gcc **`andn`+`cmov` chain** (not tzcnt) | `bit_idioms.rs`, `alu.rs` | **G** gcc cmov×11, **not** tzcnt; 1.85× | find_bit CE vs gcc | blindly emit tzcnt |
-| 43 | IS-12 | P0 | `a & ~b` → `andn` / `andnq` | ALU BMI2 | **G** find_bit gcc `andn` icx `andnq` | CE find_bit | require tzcnt |
+| 43 | IS-12 | DONE | Adjacent single-use `not`+`and` → BMI1 `andn{l,q}`, direct physical sources, baseline ISA gated | CodegenOptions + shared fusion + x86 ALU | **M** linux_find_bit 1.04x faster vs control, 1.42x behind GCC | BMI/no-BMI runtime+assembly regression | emit without BMI contract |
 | 44 | IS-13 | P1 | ALU+mem for spilled | peephole | ICX lookalike | fewer reloads | change RA homes |
 | 45 | IS-14 | P1 | Dead `movq %r,%r` | peephole | **C** | 0 identity mov | delete live copies |
 | 46 | IS-15 | P1 | Redundant `movslq` on indices | narrow vs backend | **C** DOOM −390; rest is GEP | fewer movslq | break GEP signedness |
@@ -162,14 +162,14 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 56 | IS-25 | P2 | 3-channel mul ILP (`exclude_every_third_mul_temp`) document or kill | `regalloc.rs` | **C** magic | documented or gone | silent heuristic |
 | 57 | IS-26 | P1 | GlobalAddr fold vs GOT (`needs_got_for_addr`) | never_materialized | **C** | RIP for file-scope | PIC/TLS |
 | 58 | IS-27 | P2 | i128 through rdx:eax without excluding r8–rsi whole fn | prologue i128 filter | **C** | more GPR | ABI break |
-| 59 | IS-28 | P0 | Hand-rolled popcount → `UnaryOp::Popcount` (`alu.rs` already emits `popcntl`) | `bit_idioms.rs`, `alu.rs` | **G** bitops gcc/clang `popcntl` | bitops uses insn | add a second popcnt emitter |
+| 59 | IS-28 | DONE (pre-existing, revalidated) | Canonical SWAR popcount recognized in `bit_idioms` → `UnaryOp::Popcount`; x86 emits `popcntl` under v3 | optimizer + existing emitter | **G/M** current bitops assembly contains popcntl | unit near-miss + benchmark oracle | add duplicate emitter |
 
 ### 5.3 Optimizer / alias / SROA / vectorize — OP-01 … OP-33
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
 | 60 | OP-01 | DONE | Shared linear-form alias proof wired into LICM with fail-closed store modeling | `licm.rs`, `alias.rs`, `loop_memory_promote.rs` | **M** targeted hoist; full differential clean | regression | model unknown writes |
-| 61 | OP-02 | P1 | Dominator-aware SROA copy-out | `aggregate_sroa.rs` `CCC_SROA_COPYOUT` | **C** hangs 2 tests | those tests + struct_copy | enable flag without proof |
+| 61 | OP-02 | BLOCKED | Dominator-aware SROA copy-out remains default-off | aggregate_sroa | **M** current flag does not transform struct_copy (+2.2% noise) and miscompiles `structs_bitfields` (return 15); attempted loop relaxation reverted | require dominance/ABI proof + full fuzz | enable raw flag |
 | 62 | OP-03 | P1 | SROA cross-block memcpy (same-block only now) | same | **C** | more scalarized fields | ignore dominance |
 | 63 | OP-04 | P0 | `vectorize_gate` real cost (trip, size, PGO) | `unroll_pgo.rs:122` | **C** `return true`; **G** clang sieve 365 ymm vs gcc 45 | no 4-iter vec; **no clang-sieve** | copy clang sieve |
 | 64 | OP-05 | P0 | Non-reduction FP loop vectorize (nbody YMM) | `vectorize.rs` (~6905) | **S** nbody 3.8× spectral 9.3×; **G** ICX nbody 97 ymm / 58 FMA vs gcc 0 ymm / 24 FMA | ymm+FMA vs ICX | copy gcc16 horiz-per-iter |

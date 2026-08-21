@@ -87,6 +87,12 @@ pub(crate) struct CodegenOptions {
     /// with retpoline (-mindirect-branch=thunk-extern) to avoid indirect jumps that
     /// objtool would reject.
     pub(crate) no_jump_tables: bool,
+    /// Whether the target has BMI1 (`-mbmi` or an enabling `-march`).
+    /// Gates scalar ANDN selection; emitting it without this contract would
+    /// introduce SIGILL on baseline x86-64.
+    pub(crate) bmi1: bool,
+    /// Whether the target has AVX2 (`-mavx2` or an enabling `-march`).
+    pub(crate) avx2: bool,
     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
     /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
     pub(crate) avx512: bool,
