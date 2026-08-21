@@ -2671,6 +2671,7 @@ fn generate_function(
         let mut fused_add_skip: FxHashSet<usize> = FxHashSet::default();
         let mut skip_fused_logical = false;
         let mut skip_fused_and_not = false;
+        let mut skip_f128_copy_store = false;
 
         cg.state().block_use_counts.clear();
         cg.state().pending_load_cmp.clear();
@@ -2740,6 +2741,34 @@ fn generate_function(
                 skip_fused_and_not = false;
                 cg.state().current_program_point += 1;
                 continue;
+            }
+            if skip_f128_copy_store {
+                skip_f128_copy_store = false;
+                cg.state().current_program_point += 1;
+                continue;
+            }
+
+            // Exact F128 load->store is a 16-byte copy; bypass x87/f64
+            // approximation and intermediate homes on every backend.
+            if let Instruction::Load { dest, ptr: src, ty: IrType::F128, volatile: false, .. } = inst {
+                if value_use_counts.get(dest.0 as usize).copied() == Some(1) {
+                    if let Some(Instruction::Store {
+                        val: Operand::Value(v), ptr: dst, ty: IrType::F128,
+                        volatile: false, ..
+                    }) = block.instructions.get(idx + 1)
+                    {
+                        if v == dest
+                            && cg.state_ref().resolve_slot_addr(src.0).is_some()
+                            && cg.state_ref().resolve_slot_addr(dst.0).is_some()
+                        {
+                            cg.flush_machinst();
+                            cg.emit_memcpy(dst, src, 16);
+                            skip_f128_copy_store = true;
+                            cg.state().current_program_point += 1;
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Skip address producers whose result is folded. Use the

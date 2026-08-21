@@ -1,6 +1,6 @@
 # 2026-08-21 session 38 — explicit accumulator homes and AB-14 parameter-order fix
 
-Base: `2f81cdce8c4341abc2726cbfce1cfae99d16b9fd` initially, rebased to current main during delivery.
+Base follow-up: `207c26f0f67010e22ebc513c4d31312e34b93bb1` (PR #166).
 
 ## RA-23 structural slice
 
@@ -28,6 +28,8 @@ void wr(long double *p, long double v) { p[1] = v; }
 ```
 
 now writes and reads 7.5L correctly. A unit test pins the dead-param0/live-param1 prefix invariant.
+
+Adjacent non-volatile F128 Load→Store pairs are additionally emitted as an exact 16-byte memcpy on every backend. This removes x87 truncate/reload intermediates and reduces the x86 function from 15 to 8 instructions; GCC/Clang/ICC/ICX emit 3. The remaining gap is the prologue copy of the stack-passed long double into its positional home.
 
 ## Validation
 
