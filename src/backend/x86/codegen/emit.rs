@@ -3289,7 +3289,13 @@ fn is_mi_unsafe_value(
     state: &CodegenState,
     value_types: &FxHashMap<u32, crate::common::types::IrType>,
 ) -> bool {
-    if state.is_i128_value(v) || state.vector_values.contains(&v) {
+    // Accumulator assignments are point-constrained allocator locations. The
+    // mature path consumes them directly; MachInst must not buffer them across
+    // another instruction until its emitter models def/consume points.
+    if state.is_accumulator_location(v)
+        || state.is_i128_value(v)
+        || state.vector_values.contains(&v)
+    {
         return true;
     }
     if let Some(r) = reg_assignments.get(&v) {

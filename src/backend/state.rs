@@ -342,6 +342,8 @@ pub struct CodegenState {
     /// Explicit non-stack homes. Register and accumulator residency share one
     /// location contract rather than parallel convention sets.
     pub explicit_locations: FxHashMap<u32, ExplicitLocation>,
+    /// Allocator-issued accumulator homes for the current function.
+    pub ra_accumulator_values: FxHashSet<u32>,
     /// Values that are promoted InlineAsm output results. Like allocas, their
     /// stack slot holds the value directly (not a pointer). The asm emitter
     /// stores the output register to this slot after the asm, and subsequent
@@ -458,6 +460,7 @@ impl CodegenState {
             weak_extern_symbols: FxHashSet::default(),
             small_slot_values: FxHashSet::default(),
             explicit_locations: FxHashMap::default(),
+            ra_accumulator_values: FxHashSet::default(),
             asm_output_values: FxHashSet::default(),
             protected_slot_values: FxHashSet::default(),
             debug_info: false,
@@ -586,6 +589,7 @@ impl CodegenState {
         self.vector_values.clear();
         self.protected_slot_values.clear();
         self.explicit_locations.clear();
+        self.ra_accumulator_values.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();
         self.vec_last_store_slot = None;

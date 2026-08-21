@@ -169,7 +169,6 @@ pub fn calculate_stack_space_common(
     reg_assigned: &FxHashMap<u32, PhysReg>,
     callee_saved_regs: &[PhysReg],
     cached_liveness: Option<super::liveness::LivenessResult>,
-    lhs_first_binop: bool,
 ) -> i64 {
     let num_blocks = func.blocks.len();
 
@@ -312,7 +311,7 @@ pub fn calculate_stack_space_common(
 
     // Phase 1: Build analysis context (use-blocks, def-blocks, used values,
     //          dead param allocas, alloca coalescability, copy aliases).
-    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop, &cached_liveness);
+    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, &state.ra_accumulator_values, &cached_liveness);
 
     // Publish every explicit non-stack home through one location contract.
     state.explicit_locations.clear();
@@ -425,7 +424,7 @@ fn build_layout_context(
     coalesce: bool,
     reg_assigned: &FxHashMap<u32, PhysReg>,
     callee_saved_regs: &[PhysReg],
-    lhs_first_binop: bool,
+    accumulator_values: &FxHashSet<u32>,
     cached_liveness: &Option<super::liveness::LivenessResult>,
 ) -> StackLayoutContext {
     // Build use-block map
@@ -483,8 +482,8 @@ fn build_layout_context(
         cached_liveness,
     );
 
-    // Immediately-consumed value analysis: identify values that can skip stack slots.
-    let immediately_consumed = copy_coalescing::compute_immediately_consumed(func, lhs_first_binop);
+    // Accumulator homes are selected and verified by register allocation.
+    let immediately_consumed = accumulator_values.clone();
 
     // Deferred-store analysis: vector-intrinsic results whose single use is
     // args[0]/args[1] of the immediately-following intrinsic (accumulator renaming).

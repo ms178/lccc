@@ -736,9 +736,13 @@ impl X86Codegen {
         } else {
             let classes = std::env::var("CCC_X64_NOHOME_CLASSES").unwrap_or_else(|_| "ret,store,copy,cast,unary,binop".into());
             let has = |c: &str| classes == "all" || classes.split(',').any(|x| x.trim() == c);
-            let skip = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
-                func, true,
-            );
+            let skip: crate::common::fx_hash::FxHashSet<u32> = crate::backend::regalloc::analyze_accumulator_assignments(
+                func,
+                crate::backend::regalloc::AccumulatorPolicy {
+                    operand_order: crate::backend::regalloc::AccumulatorOperandOrder::LhsFirst,
+                    return_consumes_accumulator: false,
+                },
+            ).into_iter().map(|a| a.value_id).collect();
             if skip.is_empty() {
                 never_materialized
             } else {
@@ -826,7 +830,7 @@ impl X86Codegen {
         // named "r11" and PhysReg(11) is named "r10". The indirect target is
         // the literal "%r10", i.e. PhysReg(11).
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
-        let (reg_assigned, cached_liveness, caller_save_spans) =
+        let (reg_assigned, cached_liveness, caller_save_spans, accumulator_assignments) =
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
@@ -1044,6 +1048,7 @@ impl X86Codegen {
         let callee_save_reserve = if n_callee > 0 { n_callee * 8 + 8 } else { 0 };
         // Capture before `self.state` is mutably borrowed by the layout closure.
         let fpo = self.state.omit_frame_pointer;
+        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
         let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let alloc = (alloc_size + 7) & !7;
@@ -1060,7 +1065,7 @@ impl X86Codegen {
                 new_space += 8;
             }
             (-new_space, new_space)
-        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness, true);
+        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness);
 
         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
         self.caller_save_spill_slots.clear();

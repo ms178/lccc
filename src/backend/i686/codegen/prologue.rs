@@ -236,8 +236,13 @@ impl I686Codegen {
                 }
             }
             let _ = &ret_operands; // (ret_operands kept for the PIC-free path)
-            let skip = crate::backend::stack_layout::copy_coalescing
-                ::compute_immediately_consumed(func, false);
+            let skip = crate::backend::regalloc::analyze_accumulator_assignments(
+                func,
+                crate::backend::regalloc::AccumulatorPolicy {
+                    operand_order: crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
+                    return_consumes_accumulator: true,
+                },
+            ).into_iter().map(|a| a.value_id).collect::<crate::common::fx_hash::FxHashSet<_>>();
             let extra: Vec<u32> = skip
                 .iter()
                 .copied()
@@ -253,7 +258,7 @@ impl I686Codegen {
             }
         }
 
-        let (reg_assigned, cached_liveness, _caller_save_spans) =
+        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
@@ -289,6 +294,7 @@ impl I686Codegen {
         let omit_fp = self.omit_frame_pointer;
         let alignment_bias: i64 = if omit_fp { 12 } else { 8 };
 
+        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
         calculate_stack_space_common(&mut self.state, func, callee_saved_bytes, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(4) } else { 4 };
             let alloc = (alloc_size + 3) & !3;
@@ -303,7 +309,7 @@ impl I686Codegen {
                 ((required + effective_align - 1) / effective_align) * effective_align
             };
             (-new_space, new_space)
-        }, &reg_assigned, callee_saved_set, cached_liveness, false)
+        }, &reg_assigned, callee_saved_set, cached_liveness)
     }
 
     // ---- aligned_frame_size ----
