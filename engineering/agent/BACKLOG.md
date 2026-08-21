@@ -248,7 +248,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 125 | AB-11 | P1 | Alloca escape analysis more GEP | stack_layout | **C** | | |
 | 126 | AB-12 | P2 | Two coalescers unify | RA vs stack | **C** | one policy | |
 | 127 | AB-13 | P2 | i686 boot 32K | external_tools TODO | **C** | | |
-| 128 | AB-14 | DONE | Preserve the positional parameter-Alloca prefix through the last live home; fixes `void f(long double*, long double)` loading the pointer as the x87 argument while retaining dead-home removal when the whole suffix is dead | DCE + all backend positional lookup | **M** x86 long-double write/read runtime; unit pins dead-param0/live-param1 prefix; copy64 dead suffix unchanged | correct stack ABI/runtime | delete an earlier home while a later one survives |
+| 128 | AB-14 | DONE | Preserve positional parameter-Alloca prefixes and fuse adjacent F128 Load→Store into exact 16-byte backend memcpy; fixes pointer-as-x87-argument corruption and removes approximation/intermediate churn | DCE + shared generation | **G/M** runtime exact; LCCC 15→8 instructions (oracles 3); unit prefix invariant; cross-backend 16-byte copy path | correct stack ABI/runtime | delete earlier live-prefix homes |
 | 129 | AB-15 | P1 | Dead XMM save in integer varargs remaining | vararg_fp_save | **C** | | |
 
 ### 5.6 PGO / IPO / layout — PG-01 … PG-12
