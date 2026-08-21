@@ -89,7 +89,7 @@ impl ArmCodegen {
             crate::backend::regalloc::PhysReg(7),
             crate::backend::regalloc::PhysReg(8),
         ];
-        let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
+        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) = crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false, None, call_arg_regs, Vec::new(),
@@ -113,12 +113,13 @@ impl ArmCodegen {
             v
         };
 
+        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let slot = (space + effective_align - 1) & !(effective_align - 1);
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
             (slot, new_space)
-        }, &reg_assigned, &ARM_CALLEE_SAVED, cached_liveness, false);
+        }, &reg_assigned, &ARM_CALLEE_SAVED, cached_liveness);
 
         if func.is_variadic {
             space = (space + 7) & !7;

@@ -12,20 +12,19 @@ Base: `d57ef0866d68d7290d2bd9225d7dcb9166905c7b`.
 
 ## Dependency-ordered implementation
 
-### A. Allocator-owned accumulator contract
+### A. Allocator-owned accumulator contract — INTEGRATED
 
-- Add `AccumulatorPolicy` to `RegAllocConfig`: operand evaluation order, clobber points, terminator consumption.
-- Move candidate analysis out of stack-layout copy coalescing into `regalloc`.
-- Produce `AccumulatorAssignment { value, def_point, consume_point }` in `RegAllocResult`.
-- Verify adjacency, sole use, type class, and absence of hidden uses against liveness.
-- Delete `compute_immediately_consumed`, `is_safe_sole_consumer`, and `CCC_X64_NOHOME_CLASSES`.
+- `AccumulatorPolicy` is part of `RegAllocConfig`.
+- RA emits verified `{value, def_point, consume_point}` assignments.
+- Every backend passes the allocator result to stack layout; stack layout no longer recomputes candidates.
+- x86/i686 no-home policy consumes the RA analysis API.
+- Remaining deletion step: retire the compatibility implementation in copy_coalescing after its tests move to regalloc.
 
-### B. Unified location consumption
+### B. Unified location consumption — IN PROGRESS
 
-- Publish allocator assignments through `ExplicitLocation` only.
-- Make mature ISel and MachInst resolve every VReg through that table.
-- Teach MachInst stack/reg/accumulator source and destination handling; remove missing-slot inference.
-- Add hard verification that no emitted use lacks a location at its program point.
+- Allocator assignments now publish through `ExplicitLocation`.
+- MachInst explicitly rejects point-constrained accumulator values and falls back to mature ISel, preventing buffered lifetime extension.
+- Next: native MachInst accumulator operands and the program-point location verifier.
 
 ### C. Tier-2 interference correctness
 

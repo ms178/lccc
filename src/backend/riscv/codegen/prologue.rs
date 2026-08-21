@@ -55,12 +55,13 @@ impl RiscvCodegen {
         if self.state.disable_regalloc {
             available_regs.clear();
         }
-        let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             true, // RISC-V asm emitter checks reg_assignments for inline asm operands
         );
 
+        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
         let space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             // RISC-V uses negative offsets from s0 (frame pointer)
             // Honor alignment: round up space to alignment boundary before allocating
@@ -68,7 +69,7 @@ impl RiscvCodegen {
             let alloc = ((alloc_size + 7) & !7).max(8);
             let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
             (-new_space, new_space)
-        }, &reg_assigned, &RISCV_CALLEE_SAVED, cached_liveness, true);
+        }, &reg_assigned, &RISCV_CALLEE_SAVED, cached_liveness);
 
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.

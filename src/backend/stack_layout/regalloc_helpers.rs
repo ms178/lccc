@@ -28,7 +28,7 @@ pub fn run_regalloc_and_merge_clobbers(
     reg_assignments: &mut FxHashMap<u32, PhysReg>,
     used_callee_saved: &mut Vec<PhysReg>,
     allow_inline_asm_regalloc: bool,
-) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
+) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>, Vec<super::super::regalloc::AccumulatorAssignment>) {
     run_regalloc_and_merge_clobbers_ex(
         func, available_regs, caller_saved_regs, asm_clobbered_regs,
         reg_assignments, used_callee_saved, allow_inline_asm_regalloc, None, Vec::new(), Vec::new(),
@@ -114,7 +114,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     call_arg_regs: Vec<PhysReg>,
     indirect_target_regs: Vec<PhysReg>,
     folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
-) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>) {
+) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>, Vec<super::super::regalloc::AccumulatorAssignment>) {
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
     let has_scalar_fp = func.blocks.iter().any(|block| {
@@ -286,7 +286,9 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let alloc_result = if std::env::var("CCC_NO_REGALLOC").is_ok() {
         super::super::regalloc::RegAllocResult {
             assignments: Default::default(),
-            accumulator_assignments: Vec::new(),
+            accumulator_assignments: super::super::regalloc::analyze_accumulator_assignments(
+                func, config.accumulator_policy,
+            ),
             used_regs: Vec::new(),
             caller_save_spans: Default::default(),
             liveness: None,
@@ -296,6 +298,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     };
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;
+    let accumulator_assignments = alloc_result.accumulator_assignments;
     let caller_save_spans = alloc_result.caller_save_spans;
     let cached_liveness = alloc_result.liveness;
 
@@ -310,7 +313,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     used_callee_saved.sort_by_key(|r| r.0);
 
     let reg_assigned: FxHashMap<u32, PhysReg> = reg_assignments.clone();
-    (reg_assigned, cached_liveness, caller_save_spans)
+    (reg_assigned, cached_liveness, caller_save_spans, accumulator_assignments)
 }
 
 /// Filter a callee-saved register list by removing ASM-clobbered entries.

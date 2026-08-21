@@ -39,6 +39,49 @@ pub struct AccumulatorAssignment {
     pub consume_point: u32,
 }
 
+/// Build verified accumulator assignments under the target's evaluation-order
+/// contract. Stack layout no longer owns this decision; it consumes the
+/// allocator result. Program points use the same instruction+terminator order
+/// as liveness.
+pub fn analyze_accumulator_assignments(
+    func: &IrFunction,
+    policy: AccumulatorPolicy,
+) -> Vec<AccumulatorAssignment> {
+    let lhs_first = matches!(policy.operand_order, AccumulatorOperandOrder::LhsFirst);
+    let candidates = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
+        func, lhs_first,
+    );
+    if candidates.is_empty() { return Vec::new(); }
+
+    let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut pp = 0u32;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() { defs.insert(dest.0, pp); }
+            inst.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
+            pp += 1;
+        }
+        block.terminator.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
+        pp += 1;
+    }
+    let mut out = Vec::new();
+    for value_id in candidates {
+        let (Some(&def_point), Some(points)) = (defs.get(&value_id), uses.get(&value_id)) else { continue; };
+        if points.len() != 1 || points[0] != def_point + 1 { continue; }
+        // 64-bit targets do not consume scalar returns from the accumulator.
+        if !policy.return_consumes_accumulator {
+            let is_return = func.blocks.iter().any(|b| {
+                matches!(&b.terminator, Terminator::Return(Some(Operand::Value(v))) if v.0 == value_id)
+            });
+            if is_return { continue; }
+        }
+        out.push(AccumulatorAssignment { value_id, def_point, consume_point: points[0] });
+    }
+    out.sort_unstable_by_key(|a| (a.def_point, a.value_id));
+    out
+}
+
 pub struct RegAllocResult {
     pub assignments: FxHashMap<u32, PhysReg>,
     pub accumulator_assignments: Vec<AccumulatorAssignment>,
@@ -722,7 +765,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() {
         return RegAllocResult {
             assignments: FxHashMap::default(),
-            accumulator_assignments: Vec::new(),
+            accumulator_assignments: analyze_accumulator_assignments(func, config.accumulator_policy),
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
             liveness: None,
@@ -2161,7 +2204,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     RegAllocResult {
         assignments,
-        accumulator_assignments: Vec::new(),
+        accumulator_assignments: analyze_accumulator_assignments(func, config.accumulator_policy),
         used_regs,
         caller_save_spans,
         liveness: Some(liveness),
