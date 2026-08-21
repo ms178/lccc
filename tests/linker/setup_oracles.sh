@@ -85,6 +85,7 @@ else
         -DCMAKE_BUILD_TYPE=Release \
         -DMOLD_TARGETS='X86_64;I386' \
         -DMOLD_USE_MIMALLOC=OFF \
+        -DMOLD_LTO=OFF \
         -DCMAKE_C_FLAGS="-O2 $NATIVE" \
         -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
         -DCMAKE_INSTALL_PREFIX="$SRC/mold-inst"
@@ -156,6 +157,21 @@ else
   log "bfd 2.47: $("$BIN/ld.bfd-2.47" --version | head -1)"
 fi
 
+# Record the resolved oracle revisions so session docs can cite exact
+# versions instead of an unreproducible "HEAD".  mold/wild are built from
+# git HEAD by policy, but WHICH head must be auditable after the fact.
+{
+  echo "# LCCC linker oracle revisions (recorded $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+  if [[ -d "$SRC/mold-src/.git" ]]; then
+    echo "mold:  $(git -C "$SRC/mold-src" rev-parse HEAD 2>/dev/null || echo unknown)"
+  fi
+  if [[ -d "$SRC/wild-src/.git" ]]; then
+    echo "wild:  $(git -C "$SRC/wild-src" rev-parse HEAD 2>/dev/null || echo unknown)"
+  fi
+  echo "binutils (bfd/as reference): $BINUTILS_VERSION"
+  echo "mold build targets: X86_64;I386"
+} > "$BIN/ORACLE_REVISIONS.txt"
+
 cat <<EOF
 
 Oracles ready in $BIN
@@ -168,4 +184,6 @@ Then:
     tests/linker/run_linker_tests.py
     tests/linker/real_workloads.py
     tests/linker/bench_linker.py
+
+Resolved revisions: $BIN/ORACLE_REVISIONS.txt
 EOF

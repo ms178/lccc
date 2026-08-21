@@ -16,7 +16,11 @@ unsigned constbit(unsigned x) { return (x >> 3) & 1u; }
 EOF
 
 "$CCC" -O3 -S "$td/bt.c" -o "$td/x86.s"
-grep -Eq 'btl[[:space:]]+%r[abcd]x, %r[0-9]+' "$td/x86.s"
+# Register-index BT form.  BT's index is an ordinary r/m operand (it has no
+# fixed count register, unlike variable shifts), so the index is consumed
+# straight from its own register (`btl %edx, %r8`) rather than staged through
+# %rcx.  Assert the general register-index shape, not the staging register.
+grep -Eq 'bt[lq][[:space:]]+%[a-z0-9]+,[[:space:]]*%[a-z0-9]+' "$td/x86.s"
 grep -Eq 'btl[[:space:]]+\$3, %' "$td/x86.s"
 # The source has no main; only assemble/codegen is required here. A
 # separate runtime harness links the object below when the host linker is

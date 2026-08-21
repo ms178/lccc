@@ -58,45 +58,71 @@ https://github.com/ms178/lccc
 
 | Compiler | Revision | Notes |
 |---|---|---|
-| **LCCC (ms178)** | [`f874a6fb`](https://github.com/ms178/lccc/commit/f874a6fb) | this fork, `main` after PR #70 (store/load forwarding, ARM memcpy fix, regalloc perf fix) |
-| **LCCC (Lev)** | [`9beb4333`](https://github.com/levkropp/lccc/commit/9beb4333) | [levkropp/lccc](https://github.com/levkropp/lccc) `main` HEAD at measurement time |
+| **LCCC (ms178)** | [`bc992d69`](https://github.com/ms178/lccc/commit/bc992d69) | this fork, `main` `aa8bc98` (PR #178) + session 41/42 codegen fixes (SIB zero-extend tracking, immediate `imul`, BT direct index, 32-bit-write tracking, alias-aware SIMD temp promotion) |
 | **GCC** | 14.2.0 (Debian 14.2.0-19) | external reference |
 
 All compilers at `-O2`, identical sources, identical machine, same run window.
-Driver: `bench/run_bench.sh`-style best-of-3 wall time; every binary's output
-is compared against the GCC baseline (a mismatch disqualifies the number).
+Driver: `tests/benchmark/run_benchmarks.py` (canonical runner). Paired
+median wall time, randomized compiler order, warm-ups excluded; every binary's
+output is checksummed against the GCC baseline (a mismatch disqualifies the
+number). Measured 2026-08-21 in the shared 2-core VM (no PMU); screening
+evidence only.
 
-## Results (seconds, lower is better)
+## Results (ratio = LCCC/GCC; < 1 means LCCC faster)
 
-| Kernel | What it stresses | ms178 `f874a6fb` | GCC 14.2 | Lev `9beb4333` | ms178 vs GCC | ms178 vs Lev |
-|---|---|---:|---:|---:|---:|---:|
-| fib(38) | binary recursion → TCE/rec2iter | **0.003** | 0.068 | 0.352 | **22.7× faster** | **117× faster** |
-| csum (adler-like) | serial dependency chains | 0.192 | 0.104 | 0.215 | 1.8× slower | 1.12× faster |
-| hashloop (FNV) | int mul/xor + table traffic | 0.159 | 0.083 | 3.304 | 1.9× slower | **21× faster** |
-| sieve (3×10M) | branchy int loops, stores | 0.209 | 0.166 | 0.304 | 1.26× slower | 1.45× faster |
-| reduction (dot) | FP reduction vectorization | 1.273 | 0.593 | 1.293 | 2.1× slower | 1.02× faster |
-| nbody (3M steps) | scalar FP, sqrt, locals | 0.984 | 0.260 | 1.147 | 3.8× slower | 1.17× faster |
-| matmul (384³ ikj) | loop-nest FP, addressing | 0.287 | 0.055 | *wrong result* ⚠ | 5.2× slower | n/a ⚠ |
-| spectral (N=800) | FP div/sqrt inner loops | 0.200 | 0.044 | 0.422 | 4.5× slower | 2.11× faster |
+| Kernel | What it stresses | LCCC median | GCC median | LCCC/GCC | Correct |
+|---|---|---:|---:|---:|:---:|
+| `fib` | binary recursion → TCE/rec2iter | 2.52 ms | 173.02 ms | **0.014** (69× faster) | pass |
+| `ackermann` | deep recursion | 2.48 ms | 150.72 ms | **0.016** (61× faster) | pass |
+| `constant_recursion` | constant recursive specialization | 2.51 ms | 150.87 ms | **0.016** (61× faster) | pass |
+| `bitops` | integer selection, popcount idioms | 260.56 ms | 392.50 ms | **0.664** (1.5× faster) | pass |
+| `matmul` | loop-nest FP + reduction FMA | 7.75 ms | 9.71 ms | **0.840** (1.2× faster) | pass |
+| `binary_search` | branch-heavy lookup | 2.28 ms | 2.37 ms | **0.952** | pass |
+| `ascii_case_fold` | parser byte loop | 2.46 ms | 2.41 ms | 0.995 | pass |
+| `ring_fifo` | dependent loads | 2.25 ms | 2.24 ms | 0.997 | pass |
+| `qsort` | libc branches | 127.54 ms | 126.64 ms | 1.010 | pass |
+| `strlen_bench` | byte loops | 235.44 ms | 233.14 ms | 1.013 | pass |
+| `tce_sum` | tail-recursive accumulator | 2.24 ms | 2.14 ms | 1.052 | pass |
+| `switch_dispatch` | switch lowering | 528.84 ms | 504.43 ms | 1.052 | pass |
+| `gzip_crc32` | gzip CRC-32 table loop | 179.92 ms | 168.86 ms | 1.067 | pass |
+| `arith_loop` | 32-variable register pressure | 112.85 ms | 101.74 ms | 1.112 | pass |
+| `histogram` | indexed increment/reduction | 2.88 ms | 2.52 ms | 1.123 | pass |
+| `hash_table` | pointer chasing | 12.23 s | 10.77 s | 1.129 | pass |
+| `binary_trees` | allocation + recursion | 1.639 s | 1.426 s | 1.147 | pass |
+| `sieve` | branchy int stores | 46.26 ms | 37.82 ms | 1.224 | pass |
+| `glibc_memcmp` | aligned-word memcmp path | 11.75 ms | 9.22 ms | 1.275 | pass |
+| `fannkuch` | permutations | 3.314 s | 2.542 s | 1.303 | pass |
+| `mandelbrot` | FP branch-heavy loop | 2.107 s | 1.489 s | 1.418 | pass |
+| `struct_copy` | aggregate copy + ABI | 41.36 ms | 27.42 ms | 1.514 | pass |
+| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 63.07 ms | 39.41 ms | 1.588 | pass |
+| `loop_patterns` | scalar loop transforms | 127.44 ms | 78.21 ms | 1.629 | pass |
+| `linux_find_bit` | sparse bit search | 25.24 ms | 14.78 ms | 1.697 | pass |
+| `sqlite_varint` | varint decoder | 44.92 ms | 26.09 ms | 1.718 | pass |
+| `expat_xml_scan` | XML name-token scan | 78.44 ms | 40.47 ms | 1.962 | pass |
+| `nbody` | N-body FP structs | 984.30 ms | 305.55 ms | 3.221 | pass |
+| `spectral_norm` | dense FP | 791.51 ms | 202.02 ms | 3.908 | pass |
 
-⚠ Lev `9beb4333` **miscompiles** the matmul kernel (checksum 159 ≠ 0): his
-reduction vectorizer lacks this fork's IV-dependent-GEP-base guard, so the
-diagonal-sum consumer reads out-of-bounds-adjacent data. The same latent bug
-class previously **segfaulted** on this fork too and was fixed in PR #69
-(`tests/regression/vectorize_iv_dependent_base.c`).
+**Aggregate (29 correct pairs): geometric mean 0.8205, arithmetic mean 1.2640.**
+Best `fib` 0.0144; worst `spectral_norm` 3.908.
 
 ## Reading the table honestly
 
-- **vs Lev**: this fork is faster on every kernel that Lev compiles correctly
-  (1.02×–117×), and correct where he is not (matmul). The 21×/117× outliers are
-  optimizations Lev's tree lacks entirely (FNV loop codegen, rec2iter + TCE).
-- **vs GCC**: one structural win (recursion folding, 23×), near-parity on
-  branchy int code (sieve 1.26×), and a real 2–5× deficit concentrated in FP
-  code. Root causes are known and unchanged: accumulator round-trips in FP
-  codegen, no x86 FMA contraction, and no general loop-nest vectorization
-  (GCC vectorizes matmul's jk plane; LCCC only the reduction idiom).
+- **Where LCCC wins**: recursion folding (`fib`/`ackermann`/
+  `constant_recursion` — TCE + rec2iter, 60–69× vs GCC's exponential
+  recursion), hand-rolled popcount recognition (`bitops` 1.5× via `popcntl`),
+  and reduction FMA vectorization (`matmul` 1.2×). These lift the geomean
+  below 1.0 even though several codec/parser kernels trail.
+- **Where GCC wins**: dense/non-reduction FP (`spectral_norm` 3.9×,
+  `nbody` 3.2× — no general loop-nest vectorization, no FMA contraction,
+  accumulator round-trips), and a cluster of parser/codec kernels in the
+  1.5–2.0× band (`expat_xml_scan` 1.96×, `sqlite_varint` 1.72×,
+  `linux_find_bit` 1.70×, `loop_patterns` 1.63×, `zlib_ng_adler32` 1.59×).
+  These are the tracked structural gaps — see
+  [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md) (segment
+  register allocation, accumulator-centric ISel, SysV aggregate ABI, Expat
+  single-table classify).
 - Every number above was produced by a **correct** binary; correctness is
-  enforced before speed is recorded.
+  enforced before speed is recorded (checksums byte-identical to GCC).
 
 ## Where LCCC wins
 
