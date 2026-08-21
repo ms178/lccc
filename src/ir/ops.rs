@@ -50,6 +50,12 @@ pub enum IrBinOp {
     Shl,
     AShr,
     LShr,
+    /// Boolean bit test: `(lhs >> rhs) & 1`.  The result is I32 and lhs/rhs are
+    /// always integer.  Backends may lower this to a native BT-family
+    /// instruction or to the portable shift/AND sequence.  This is the
+    /// cross-target canonical form for classifier chains such as Expat name
+    /// scanning, instead of leaving the pattern in text peepholes.
+    BitTest,
 }
 
 impl IrBinOp {
@@ -80,6 +86,11 @@ impl IrBinOp {
             IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
             IrBinOp::LShr => (lhs as u64).wrapping_shr(rhs as u32) as i64,
+            IrBinOp::BitTest => {
+                // The canonical operation is produced by an i32-typed recognizer
+                // after integer promotion; evaluate it as C's `(x >> i) & 1`.
+                (((lhs as u64) >> (rhs as u32)) & 1) as i64
+            }
             IrBinOp::SDiv => {
                 if rhs == 0 { return None; }
                 lhs.wrapping_div(rhs)
@@ -114,6 +125,7 @@ impl IrBinOp {
             IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
             IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
+            IrBinOp::BitTest => (((lhs as u128) >> (rhs as u32)) & 1) as i128,
             IrBinOp::SDiv => {
                 if rhs == 0 { return None; }
                 lhs.wrapping_div(rhs)

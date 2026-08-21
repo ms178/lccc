@@ -371,6 +371,23 @@ impl ArmCodegen {
                     self.state.emit("    asr w0, w1, w2");
                 }
                 IrBinOp::LShr => self.state.emit("    lsr w0, w1, w2"),
+                IrBinOp::BitTest => {
+                    // AArch64 has no BT. UBFX extracts a 1-bit field when the
+                    // index is an in-range immediate; variable and 64-bit cases
+                    // use the canonical shift/AND form. The IR recognizer only
+                    // creates I32 BitTest, so this path remains in w registers.
+                    if let Some(imm) = Self::const_as_imm12(rhs) {
+                        if (0..31).contains(&imm) {
+                            self.state.emit_fmt(format_args!("    ubfx w0, w1, #{imm}, #1"));
+                        } else {
+                            self.state.emit_fmt(format_args!("    lsr w0, w1, #{imm}"));
+                            self.state.emit("    and w0, w0, #1");
+                        }
+                    } else {
+                        self.state.emit("    lsr w0, w1, w2");
+                        self.state.emit("    and w0, w0, #1");
+                    }
+                }
             }
         } else {
             match op {
@@ -393,6 +410,19 @@ impl ArmCodegen {
                 IrBinOp::Shl => self.state.emit("    lsl x0, x1, x2"),
                 IrBinOp::AShr => self.state.emit("    asr x0, x1, x2"),
                 IrBinOp::LShr => self.state.emit("    lsr x0, x1, x2"),
+                IrBinOp::BitTest => {
+                    if let Some(imm) = Self::const_as_imm12(rhs) {
+                        if (0..63).contains(&imm) {
+                            self.state.emit_fmt(format_args!("    ubfx x0, x1, #{imm}, #1"));
+                        } else {
+                            self.state.emit_fmt(format_args!("    lsr x0, x1, #{imm}"));
+                            self.state.emit("    and x0, x0, #1");
+                        }
+                    } else {
+                        self.state.emit("    lsr x0, x1, x2");
+                        self.state.emit("    and x0, x0, #1");
+                    }
+                }
             }
         }
 

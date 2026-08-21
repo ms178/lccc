@@ -683,6 +683,19 @@ impl I686Codegen {
             IrBinOp::Shl => self.state.emit("    shll %cl, %eax"),
             IrBinOp::AShr => self.state.emit("    sarl %cl, %eax"),
             IrBinOp::LShr => self.state.emit("    shrl %cl, %eax"),
+            IrBinOp::BitTest => {
+                // i686 BT stores the selected bit directly in CF and masks the
+                // index modulo 32, exactly matching `(base >> index) & 1` on
+                // an i32 classifier value.
+                if let Some(imm) = Self::const_as_imm32(rhs) {
+                    let bit = (imm as u32) % 32;
+                    self.state.out.emit_instr_imm_reg("    btl", bit as i64, "eax");
+                } else {
+                    self.state.emit("    btl %ecx, %eax");
+                }
+                self.state.emit("    setc %al");
+                self.state.emit("    movzbl %al, %eax");
+            }
             IrBinOp::SDiv => {
                 self.state.emit("    cltd");
                 emit!(self.state, "    idivl {}", rhs_ref);

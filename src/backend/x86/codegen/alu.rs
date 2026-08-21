@@ -3,6 +3,8 @@
 use crate::ir::reexports::{IrBinOp, Operand, Value};
 use crate::common::types::IrType;
 use super::emit::{X86Codegen, shift_mnemonic};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::traits::ArchCodegen;
 
 impl X86Codegen {
     // ---- Unary ----
@@ -180,6 +182,70 @@ impl X86Codegen {
         }
     }
 
+    /// Emit `dest = BT(base, index) & 1` directly to a physical register.
+    /// Returns false only when the result register is BT's fixed count
+    /// register (%rcx) or is not an ordinary GPR; the accumulator fallback
+    /// handles those shapes. SETcc writes an 8-bit GPR directly, and a 32-bit
+    /// result is zero-extended with `movzbl`. For 64-bit results the zero
+    /// extension from 32-bit MOVL is enough.
+    fn emit_bit_test_reg_direct(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+    ) -> bool {
+        let dest64 = super::emit::phys_reg_name(dest_phys);
+        if dest64 == "rcx" {
+            return false;
+        }
+        let dest8 = super::emit::typed_phys_reg_name(dest_phys, IrType::U8);
+        // Put the base into the destination first; BT reads the base and
+        // writes only CF. The index must go to %rcx after this, so it does
+        // not matter whether the base and index source registers alias.
+        match base {
+            Operand::Value(v) => {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let src64 = super::emit::phys_reg_name(reg);
+                    if src64 != dest64 {
+                        if use_32bit {
+                            let src32 = super::emit::phys_reg_name_32(reg);
+                            let dest32 = super::emit::phys_reg_name_32(dest_phys);
+                            self.state.emit_fmt(format_args!("    movl %{src32}, %{dest32}"));
+                        } else {
+                            self.state.emit_fmt(format_args!("    movq %{src64}, %{dest64}"));
+                        }
+                    }
+                } else if use_32bit {
+                    self.value_to_reg(v, dest64);
+                } else {
+                    self.value_to_reg(v, dest64);
+                }
+            }
+            Operand::Const(_) => self.operand_to_reg(base, dest64),
+        }
+        let const_index = match index {
+            Operand::Const(c) => c.to_i64().filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64),
+            _ => None,
+        };
+        if let Some(imm) = const_index {
+            let width = if use_32bit { 32 } else { 64 };
+            let bit = (imm as u32) % width;
+            let bt = if use_32bit { "btl" } else { "btq" };
+            self.state.emit_fmt(format_args!("    {bt} ${bit}, %{dest64}"));
+        } else {
+            self.operand_to_rcx(index);
+            let bt = if use_32bit { "btl" } else { "btq" };
+            self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
+        }
+        self.state.emit_fmt(format_args!("    setc %{dest8}"));
+        if use_32bit {
+            let dest32 = super::emit::phys_reg_name_32(dest_phys);
+            self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
+        }
+        true
+    }
+
     // ---- Binop ----
 
     pub(super) fn emit_int_binop_impl(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
@@ -198,6 +264,36 @@ impl X86Codegen {
                 self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
                 return;
             }
+            if op == IrBinOp::BitTest {
+                if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
+                    return;
+                }
+            }
+        }
+
+        if op == IrBinOp::BitTest {
+            // Use the native BT instruction: base stays in %rax, the index is
+            // moved into %rcx (BT's fixed count register), SETC materializes
+            // CF, and the boolean is stored to the destination.  This is the
+            // cross-cutting canonical lower instead of patching text peepholes.
+            self.emit_load_operand(lhs);
+            self.operand_to_rcx(rhs);
+            if let Some(imm) = Self::const_as_imm32(rhs) {
+                let width = if use_32bit { 32 } else { 64 };
+                let bit = (imm as u32) % width;
+                let bt_line = if use_32bit {
+                    format!("    btl ${bit}, %eax")
+                } else {
+                    format!("    btq ${bit}, %rax")
+                };
+                self.state.emit(&bt_line);
+            } else {
+                self.state.emit(if use_32bit { "    btl %ecx, %eax" } else { "    btq %rcx, %rax" });
+            }
+            self.state.emit("    setc %al");
+            self.state.emit(if use_32bit { "    movzbl %al, %eax" } else { "    movzbq %al, %rax" });
+            self.store_rax_to(dest);
+            return;
         }
 
         // Accumulator-based fallback: try immediate optimizations first
@@ -394,6 +490,7 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("    {} %cl, %rax", mnem64));
                 }
             }
+            IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
         }
 
         self.state.reg_cache.invalidate_acc();

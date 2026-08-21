@@ -133,14 +133,13 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                     }
                 }
                 Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-                    // Track BinOp definitions where at least one operand is a constant.
-                    // This enables constant reassociation: (x + C1) + C2 => x + (C1+C2),
-                    // and multiply reassociation: (x * C1) * C2 => x * (C1*C2).
-                    if matches!(lhs, Operand::Const(_)) || matches!(rhs, Operand::Const(_)) {
-                        set_def(&mut binop_defs, dest.0, BinOpDef {
-                            op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
-                        });
-                    }
+                    // Track all binary definitions. Constant reassociation needs
+                    // the constant-operand subset, but canonical BitTest
+                    // recognition must see variable-index shifts such as
+                    // `(base >> index) & 1`.
+                    set_def(&mut binop_defs, dest.0, BinOpDef {
+                        op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
+                    });
                 }
                 Instruction::UnaryOp { dest, op: IrUnaryOp::Neg, src, .. } => {
                     set_def(&mut neg_defs, dest.0, NegDef { src: *src });
@@ -253,7 +252,7 @@ fn try_simplify_with_types(
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-            simplify_binop(*dest, *op, lhs, rhs, *ty, binop_defs, neg_defs)
+            simplify_binop(*dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs)
         }
         Instruction::Cast { dest, src, from_ty, to_ty } => {
             simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs, value_types)
@@ -912,6 +911,7 @@ fn simplify_binop(
     lhs: &Operand,
     rhs: &Operand,
     ty: IrType,
+    cast_defs: &[Option<CastDef>],
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
 ) -> Option<Instruction> {
@@ -1087,6 +1087,43 @@ fn simplify_binop(
                 // x & x => x
                 return Some(Instruction::Copy { dest, src: *lhs });
             }
+            // Canonicalize `(base >> index) & 1` to a cross-target BitTest.
+            // Both operand orders are accepted; for a signed right shift the
+            // isolated low bit is identical to a logical shift, so AShr is
+            // safe here too.
+            let mask_is_one = is_one(lhs) || is_one(rhs);
+            if mask_is_one && ty.is_integer() {
+                let candidate = if is_one(lhs) { rhs } else { lhs };
+                // Peek through same-width integer casts. They are often
+                // inserted by C integer promotion (`(int)(unsigned)x`) but do
+                // change the isolated low bit.
+                let peeled = match candidate {
+                    Operand::Value(v) => match cast_defs.get(v.0 as usize).copied().flatten() {
+                        Some(CastDef { from_ty, to_ty, src })
+                            if from_ty.is_integer() && to_ty.is_integer()
+                                && from_ty.size() == to_ty.size() => src,
+                        _ => *candidate,
+                    },
+                    _ => *candidate,
+                };
+                if let Some(def) = get_binop_def(&peeled, binop_defs) {
+                    if matches!(def.op, IrBinOp::LShr | IrBinOp::AShr) {
+                        // Isolating the low bit is independent of whether the
+                        // shift was arithmetic or logical; only that bit can
+                        // reach `& 1`. Preserve the source width. A typed
+                        // narrow/wide mismatch uses the natural 32-bit width so
+                        // the backend receives a legal i32 BitTest.
+                        let bt_ty = if def.ty == ty { ty } else { IrType::I32 };
+                        return Some(Instruction::BinOp {
+                            dest,
+                            op: IrBinOp::BitTest,
+                            lhs: def.lhs,
+                            rhs: def.rhs,
+                            ty: bt_ty,
+                        });
+                    }
+                }
+            }
             // Reassociation: (x & C1) & C2 => x & (C1 & C2)
             if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs) {
                 return Some(inst);
@@ -1154,6 +1191,17 @@ fn simplify_binop(
             // Also for >>: (x >> C1) >> C2 => x >> (C1 + C2)
             if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs) {
                 return Some(inst);
+            }
+        }
+        IrBinOp::BitTest => {
+            // `(base >> index) & 1`: a zero base or zero bit index always
+            // yields zero. Do *not* treat index 0 as a copy of base: only bit
+            // zero is returned, and preserving BitTest lets x86 select BT.
+            if rhs_zero || lhs_zero {
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::zero(ty)),
+                });
             }
         }
     }
@@ -3061,6 +3109,84 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn bit_test_canonicalizes_variable_shift_and_one() {
+        let mut binops = vec![None; 8];
+        binops[2] = Some(BinOpDef {
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(3)),
+            ty: IrType::I32,
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::I32,
+        };
+        let got = simplify_binop(
+            Value(4), IrBinOp::And,
+            &Operand::Value(Value(2)), &Operand::Const(IrConst::I64(1)),
+            IrType::I32, &[], &binops, &[],
+        ).unwrap();
+        match got {
+            Instruction::BinOp { op: IrBinOp::BitTest, lhs, rhs, ty, .. } => {
+                assert!(matches!(lhs, Operand::Value(Value(1))));
+                assert!(matches!(rhs, Operand::Value(Value(3))));
+                assert_eq!(ty, IrType::I32);
+            }
+            other => panic!("expected BitTest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bit_test_peels_same_width_integer_cast() {
+        let mut binops = vec![None; 8];
+        let mut casts = vec![None; 8];
+        binops[2] = Some(BinOpDef {
+            op: IrBinOp::AShr,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(3)),
+            ty: IrType::I32,
+        });
+        casts[2] = Some(CastDef {
+            src: Operand::Value(Value(2)),
+            from_ty: IrType::I32,
+            to_ty: IrType::U32,
+        });
+        let got = simplify_binop(
+            Value(4), IrBinOp::And,
+            &Operand::Value(Value(2)), &Operand::Const(IrConst::I64(1)),
+            IrType::U32, &casts, &binops, &[],
+        ).unwrap();
+        match got {
+            Instruction::BinOp { op: IrBinOp::BitTest, lhs, rhs, ty, .. } => {
+                assert!(matches!(lhs, Operand::Value(Value(1))));
+                assert!(matches!(rhs, Operand::Value(Value(3))));
+                assert_eq!(ty, IrType::I32);
+            }
+            other => panic!("expected BitTest through cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bit_test_zero_operand_is_zero() {
+        let inst = Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::BitTest,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        };
+        let got = simplify_binop(
+            Value(4), IrBinOp::BitTest,
+            &Operand::Value(Value(1)), &Operand::Const(IrConst::I32(0)),
+            IrType::I32, &[], &[], &[],
+        ).unwrap();
+        assert!(matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)));
+    }
     #[test]
     fn test_binop_canonicalize_commutative_and() {
         // BinOp(And, Const(0xFF), Value(1)) => BinOp(And, Value(1), Const(0xFF))

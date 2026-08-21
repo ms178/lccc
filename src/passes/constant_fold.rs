@@ -834,10 +834,16 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
         }
         IrBinOp::LShr => {
             if is_32bit {
-                // For 32-bit types, mask to u32 to get correct unsigned bit pattern
                 (lhs as u32).wrapping_shr(rhs as u32) as i64
             } else {
                 (lhs as u64).wrapping_shr(rhs as u32) as i64
+            }
+        }
+        IrBinOp::BitTest => {
+            if is_32bit {
+                (((lhs as u32) >> (rhs as u32)) & 1) as i64
+            } else {
+                (((lhs as u64) >> (rhs as u32)) & 1) as i64
             }
         }
     })
