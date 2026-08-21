@@ -40,6 +40,7 @@ pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
 pub(crate) mod range_check;
+pub(crate) mod set_membership;
 pub(crate) mod reassoc_accum;
 pub(crate) mod recursion_to_iter;
 mod resolve_asm;
@@ -990,6 +991,22 @@ macro_rules! preloop_dump {
             let n = timed_pass!(
                 "range_fold",
                 run_on_visited(module, &dirty, &mut changed, range_check::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Sparse small-set membership: `x==C1 || x==C2 || ...` CondBranch
+        // chains (multi-way OR stays control flow here — if_convert leaves
+        // it, range_fold has already folded contiguous runs) collapse into
+        // sub+range-guard+BitTest. GCC's Expat/SQLite classify idiom;
+        // consumes the BitTest op (IS-06). Runs right after range_fold so
+        // folded ranges join the chain as bit runs.
+        // Pass name for CCC_DISABLE_PASSES: "set_membership".
+        if !disabled.contains("set_membership") {
+            let n = timed_pass!(
+                "set_membership",
+                run_on_visited(module, &dirty, &mut changed, set_membership::run_function)
             );
             total_changes += n;
             total_changes_excl_dce += n;

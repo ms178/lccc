@@ -95,3 +95,94 @@ differential fuzz 200/200**, benchmark output parity vs gcc at -m32 and
 * Kernel tree at /home/user/linux-6.18.44 was wiped mid-session (only
   include/generated survived); re-extract + re-patch per session-5 protocol
   before any realmode measurement.
+
+## Session 7 continuation (post-wipe, same day)
+
+Environment wiped mid-session; re-provisioned, re-based (main still
+8393754), restored both session-7 commits from the snapshot.
+
+### Landed additionally
+
+3. **set_membership pass (OP-15, wiring IS-06)**: folds `x==C1 || x==C2
+   || ...` CondBranch chains (>= 3 members incl. range_fold products,
+   span <= 63) into GCC's classify idiom, final form two-branch:
+   guard `ja miss` + BitTest branch. Kill switch
+   CCC_DISABLE_PASSES=set_membership. 7 unit tests.
+
+4. **THREE pre-existing miscompiles fixed** (all found by this work's
+   validation):
+   * redundant_ext removed byte re-extensions on upper32_zero alone
+     (bits 8..31 not proven) — `(unsigned char)c >= 0xc2U` returned
+     garbage at -O1. Byte form now requires is_byte; 16-bit twin
+     hardened the same way.
+   * redundant_ext movq→movl narrowing gated only on "next insn uses
+     the 32-bit form" — a 32-bit read does not end a 64-bit live range
+     (fuzz seeds 4/9/100: 64-bit hash upper half vanished). Now
+     requires the SOURCE provably upper-32-zero; next-use kept as
+     profitability filter. **Fuzz went 147/150 → 300/300 (O1+O2).**
+   * emit_bit_test_reg_direct (IS-06) never zero-extended above the
+     setc byte in 64-bit mode — result kept mask bits 8..63.
+     Always movzbl now.
+
+### Rebase checklist additions (now 9 reproducers)
+
+8. `f(unsigned char c){return c>=0xc2U;}` at -O1: f(191) must be 0.
+9. differential_fuzz seeds 0:150 at O1,O2 must be 300/300.
+
+### Still open (next session)
+
+* expat_xml_scan 1.87×: the bt clusters landed but the surrounding
+  loop still spills; remaining gap is RA (segments) + the case-fold
+  `andl $-33` trick GCC applies before the alpha range test.
+* struct_copy 1.54×: SLP-pair the x/y field multiplies (OP-05/IS-04).
+* set_membership currently keys on `>= 3` members; GCC also folds 2
+  eq + 1 range. Measure before widening.
+* BitTest emitters: the accumulator fallback path (non reg-direct)
+  still stages mask+rcx with extra moves; only reg-direct was fixed
+  for zero-extension — audit the fallback's movzbq too.
+
+## Session 8 (2026-08-21, post-#175 re-base)
+
+Base 594d1d5 (PR #175 = session-7 aggfwd + i686 pair fixes merged).
+Re-applied patches 3-5 from snapshot cleanly.
+
+### BitTest infrastructure overhaul
+
+* **BitTest→CondBranch fusion** (both x86 backends): the fused-branch
+  detector anchors on `BinOp{BitTest}`; terminators become `bt; jc`
+  with zero materialization. Capability hook
+  `supports_fused_bit_test_branch`, kill switch
+  `CCC_NO_BT_BRANCH_FUSION`. i686 never-materialized mirror included.
+* **4 more latent bugs fixed** (10 total found by this work so far):
+  1. simplify built I64 BitTests on 32-bit targets → wide-int-path ICE
+     (`(u64>>i)&1` at -m32 -O2, reproduced on pristine main). Legality
+     gate; set_membership span cap 31 on -m32.
+  2. i686 accumulator BitTest hardcoded `btl %ecx,%eax`, stale %ecx
+     when the index had a register home ('/'-misclassification, m32).
+  3+4. (session 7) redundant_ext byte/movq narrowing, BT zext.
+
+### set_membership v2
+
+Skip-tolerant clustering, case-fold merge (andl $-33), best-window
+selection, head-prelude suffix parsing. One transform per call; driver
+fixpoint. Tests now include an in-crate IR interpreter running
+exhaustive 0..255 equivalence of the folded Expat chain.
+
+xml_name_continue trajectory: 45 (no pass) → 50 (v1 single-block) →
+42 (two-branch) → **28** (v2). GCC: 20; the remaining 8 are phi-copy
+materialization (`movq $1,%r8` per arm + join copies) — RA/phi
+coalescing, not classify structure. Layout now GCC-shaped:
+case-folded alpha test → one bt cluster → tail compare.
+
+### Process incident
+
+During ICE triage a `git checkout 594d1d5 -- .` silently reverted the
+COMMITTED session-7 fixes in the working tree; caught because the O1
+classify reproducer failed right after. Rule: after any tree-wide
+checkout, re-verify the reproducer sweep before continuing.
+
+### Validation (final)
+
+999/999 unit, 50/50 correctness, 46/46 checks, x64 fuzz 300/300,
+m32 fuzz 200/200, regparm all levels, exhaustive classify parity
+-m64/-m32, nbody -O0 exact, benchmarks output-identical vs gcc.

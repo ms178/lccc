@@ -279,6 +279,64 @@ impl I686Codegen {
         self.store_eax_to(dest);
     }
 
+    /// Fused BitTest→CondBranch: `btl index, base; jc/jnc`. CF holds the
+    /// selected bit; nothing is materialized. Mirrors the x86-64 hook —
+    /// only 32-bit masks reach this target (legality gates in simplify /
+    /// set_membership).
+    pub(super) fn emit_fused_bit_test_branch_blocks_impl(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        _ty: IrType,
+        true_block: crate::ir::reexports::BlockId,
+        false_block: crate::ir::reexports::BlockId,
+    ) {
+        // Stage the BASE (mask) — register home preferred, else %eax.
+        let base_ref: String = match base {
+            Operand::Value(v) => match self.direct_reg_src_ref(v) {
+                Some(r) => r,
+                None => {
+                    self.operand_to_eax(base);
+                    "%eax".to_string()
+                }
+            },
+            Operand::Const(_) => {
+                self.operand_to_eax(base);
+                "%eax".to_string()
+            }
+        };
+        let const_index = match index {
+            Operand::Const(c) => c.to_i64().filter(|v| *v >= 0),
+            _ => None,
+        };
+        if let Some(imm) = const_index {
+            let bit = (imm as u32) % 32;
+            emit!(self.state, "    btl ${}, {}", bit, base_ref);
+        } else {
+            // Variable index: register home or %ecx staging. %ecx is safe —
+            // the base staging above uses %eax only.
+            let idx_ref: String = match index {
+                Operand::Value(v) => match self.direct_reg_src_ref(v) {
+                    Some(r) => r,
+                    None => {
+                        self.operand_to_ecx(index);
+                        "%ecx".to_string()
+                    }
+                },
+                _ => {
+                    self.operand_to_ecx(index);
+                    "%ecx".to_string()
+                }
+            };
+            emit!(self.state, "    btl {}, {}", idx_ref, base_ref);
+        }
+        let true_label = true_block.as_label();
+        let false_label = false_block.as_label();
+        emit!(self.state, "    jc {}", true_label);
+        emit!(self.state, "    jmp {}", false_label);
+        self.state.reg_cache.invalidate_all();
+    }
+
     pub(super) fn emit_fused_cmp_branch_impl(
         &mut self,
         op: IrCmpOp,

@@ -219,10 +219,18 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     if std::env::var("CCC_TRACE_EXT").is_ok() {
                         eprintln!("[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}", t, sf, df, is32, u32z, bytez);
                     }
-                    if is32 && bytez && sf == df {
-                        // Same family and already known to fit in a byte: pure
-                        // no-op. Upper-32-zero alone is not enough because the
-                        // re-extension may still need to clear bits 8..31.
+                    // A BYTE re-extension is a no-op only when bits 8..31
+                    // are already zero (is_byte). upper32_zero alone proves
+                    // bits 32..63 — NOT enough: after the movq→movl copy
+                    // narrowing below, `movl %edi,%eax; movzbl %al,%eax`
+                    // had the movzbl removed on u32z and `f(unsigned char)`
+                    // returned the whole of %edi (O1 miscompile of
+                    // `c >= 0xc2U`, found via the Expat classify corpus;
+                    // upstream fixed the 32-bit form independently). The
+                    // 64-bit destination form (movzbq %al,%rax) is a no-op
+                    // when bits 32..63 are ALSO proven zero (u32z).
+                    if bytez && (is32 || u32z) && sf == df {
+                        // Byte value, required upper bits zero: pure no-op.
                         keep[i] = false;
                         changed = true;
                         continue;
@@ -275,7 +283,12 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 let src_fam = family_of_reg(src);
                 let dst_fam = family_of_reg(dst);
                 if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
-                    let fits16 = (sf as usize).lt(&GP_FAMILIES) && is_16[sf as usize];
+                    // Same hardening as the byte pattern above: is_16 proves
+                    // bits 16..31 zero; the 64-bit form (movzwq) additionally
+                    // requires bits 32..63 zero (upper32_zero).
+                    let fits16 = (sf as usize).lt(&GP_FAMILIES)
+                        && is_16[sf as usize]
+                        && (is_32bit_or_smaller(dst) || upper32_zero[sf as usize]);
                     if std::env::var("CCC_TRACE_EXT").is_ok() {
                         eprintln!("[EXT16] t='{}' src_fam={:?} dst_fam={:?} fits16={}", t, sf, df, fits16);
                     }
@@ -332,36 +345,41 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     if src.starts_with('%') && dst.starts_with('%') {
                         if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
                             if (sf as usize) < GP_FAMILIES && (df as usize) < GP_FAMILIES {
-                                // The text peephole has no IR type information.
-                                // Treat this as a local instruction-selection
-                                // cleanup only when the immediately following
-                                // machine instruction consumes or overwrites
-                                // the 32-bit destination form.  That is exactly
-                                // enough for type-erased RA copies feeding
-                                // `xorl`/`andl` and avoids changing a 64-bit
-                                // pointer/address live range that may cross
-                                // labels/calls/64-bit consumers.  Do not require
-                                // global state: after the first copy is narrowed
-                                // the next copy's source is itself a 32-bit move
-                                // not represented in the historical state.
-                                if let Some(d32) = reg32_name(df) {
-                                    let next = (i + 1..lines.len())
-                                        .map(|j| lines[j].trim())
-                                        .find(|candidate| {
-                                            !candidate.is_empty()
-                                                && !candidate.starts_with('.')
-                                                && !candidate.ends_with(':')
-                                        });
-                                    if next.is_some_and(|candidate| {
-                                        candidate_uses_32bit_dest(candidate, d32)
-                                    }) {
-                                        if let Some(s32) = reg32_name(sf) {
-                                            lines[i] = format!("    movl %{}, %{}", s32, d32);
-                                            changed = true;
-                                            upper32_zero[df as usize] = true;
-                                            is_byte[df as usize] = is_byte[sf as usize];
-                                            is_16[df as usize] = is_16[sf as usize];
-                                            continue;
+                                // SOUNDNESS: `movq %src,%dst` -> `movl` is an
+                                // identity ONLY when the source's upper 32
+                                // bits are provably zero (then both forms
+                                // write the same 64-bit destination value).
+                                // The previous gate — "the next instruction
+                                // consumes the 32-bit destination form" — was
+                                // unsound: a 32-bit READ does not end the
+                                // destination's 64-bit live range. Fuzz seed
+                                // 4 (-O2): `movq %rax,%r15` (rax = 64-bit
+                                // hash) was narrowed because the next line
+                                // read %r15d, but `movq %r15,%rcx` consumed
+                                // the full value 60 lines later — the upper
+                                // half of the hash vanished. The next-use
+                                // check is kept only as a PROFITABILITY
+                                // filter on top of the zero-extension proof.
+                                if upper32_zero[sf as usize] {
+                                    if let Some(d32) = reg32_name(df) {
+                                        let next = (i + 1..lines.len())
+                                            .map(|j| lines[j].trim())
+                                            .find(|candidate| {
+                                                !candidate.is_empty()
+                                                    && !candidate.starts_with('.')
+                                                    && !candidate.ends_with(':')
+                                            });
+                                        if next.is_some_and(|candidate| {
+                                            candidate_uses_32bit_dest(candidate, d32)
+                                        }) {
+                                            if let Some(s32) = reg32_name(sf) {
+                                                lines[i] = format!("    movl %{}, %{}", s32, d32);
+                                                changed = true;
+                                                upper32_zero[df as usize] = true;
+                                                is_byte[df as usize] = is_byte[sf as usize];
+                                                is_16[df as usize] = is_16[sf as usize];
+                                                continue;
+                                            }
                                         }
                                     }
                                 }

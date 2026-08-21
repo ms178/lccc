@@ -183,7 +183,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 71 | OP-12 | P1 | Load CSE / GVN less conservative | `gvn.rs` | **C** | fewer redundant loads | CSE aliased |
 | 72 | OP-13 | P1 | DCE non-escaping dead stores | `dce.rs` all Store live | **C** | dead stores gone | DCE volatile |
 | 73 | OP-14 | P1 | If-convert >8 inst / more diamonds | `if_convert.rs` | **C** | more cmov | convert huge blocks |
-| 74 | OP-15 | P2 | `range_check.rs` → `btq` | range_check | wire to IS-06 | btq classify | |
+| 74 | OP-15 | DONE | `set_membership.rs` v2: skip-tolerant clustering (`\|\|`-commutativity over pure tests), ASCII case-fold merge (`andl $-33`), best-window selection, head-prelude tolerance; BitTest→CondBranch fusion (`bt; jc`, zero materialization, both x86 backends, `CCC_NO_BT_BRANCH_FUSION`); fixed 4 latent BitTest/redundant_ext bugs (2 miscompiles fuzz-found, 1 -m32 ICE, 1 i686 stale-%ecx BT) | set_membership + generation + traits + both comparison.rs + alu.rs + redundant_ext + simplify | **M** xml_name_continue 45→28 insns (gcc 20); exhaustive 0..255 parity -m64/-m32; IR-interpreter unit tests; fuzz 500/500 | btq classify | single-block And materialization (measured +5 insns) |
 | 75 | OP-16 | P1 | `bit_idioms.rs` coverage (popcnt, andn, ffs) | bit_idioms | **G** | IS-11/12/28 fire | |
 | 76 | OP-17 | P2 | `reassoc_accum.rs` vs FMA | reassoc | | FMA-friendly assoc | break fp assoc at -O2 default |
 | 77 | OP-18 | P2 | `fp_const_hoist` / `int_const_hoist` audit | | **C** | | |

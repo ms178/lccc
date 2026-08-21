@@ -249,8 +249,13 @@ impl X86Codegen {
             self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
         }
         self.state.emit_fmt(format_args!("    setc %{dest8}"));
-        // SETcc writes one byte only. Always clear the rest of the destination;
-        // a 32-bit MOVZX also zeroes the upper half for an I64/U64 boolean.
+        // ALWAYS zero-extend: SETcc writes one byte only, and the
+        // destination was staged with the BASE (mask) value. Without the
+        // extension the 64-bit result kept mask bits 8..63 and a later
+        // `testq %dest,%dest` was nonzero for every in-range index
+        // (set_membership two-block form: bytes 59..64 classified as XML
+        // name chars). A 32-bit MOVZX zero-extends the full 64-bit
+        // register on x86-64, so one form covers both widths.
         let dest32 = super::emit::phys_reg_name_32(dest_phys);
         self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
         true

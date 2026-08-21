@@ -245,6 +245,93 @@ impl X86Codegen {
         self.state.reg_cache.invalidate_all();
     }
 
+    /// Fused BitTest→CondBranch: `bt index, base` then `jc/jnc`. CF holds
+    /// the selected bit; nothing is materialized. The base (mask) prefers
+    /// its register home; constants and slot-resident values stage through
+    /// %rax (the accumulator scratch — dead here because the BitTest result
+    /// was never materialized). A variable index stages through %rcx.
+    pub(super) fn emit_fused_bit_test_branch_blocks_impl(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        let use_32bit = ty.size() <= 4;
+        // Stage the BASE for the r/m operand of BT.
+        let base_reg: String = match base {
+            Operand::Value(v) => {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if use_32bit {
+                        format!("%{}", super::emit::phys_reg_name_32(reg))
+                    } else {
+                        format!("%{}", super::emit::phys_reg_name(reg))
+                    }
+                } else {
+                    self.operand_to_rax(base);
+                    if use_32bit { "%eax".to_string() } else { "%rax".to_string() }
+                }
+            }
+            Operand::Const(_) => {
+                self.operand_to_rax(base);
+                if use_32bit { "%eax".to_string() } else { "%rax".to_string() }
+            }
+        };
+        // BT with an immediate index; otherwise index in a register.
+        let const_index = match index {
+            Operand::Const(c) => c.to_i64().filter(|v| *v >= 0 && *v <= i32::MAX as i64),
+            _ => None,
+        };
+        let bt = if use_32bit { "btl" } else { "btq" };
+        if let Some(imm) = const_index {
+            let width: u32 = if use_32bit { 32 } else { 64 };
+            let bit = (imm as u32) % width;
+            self.state.emit_fmt(format_args!("    {bt} ${bit}, {base_reg}"));
+        } else {
+            // The index register: prefer its home when it does not alias the
+            // staged base; otherwise stage through %rcx.
+            let idx_reg: String = match index {
+                Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                    Some(&reg) => {
+                        let name = if use_32bit {
+                            format!("%{}", super::emit::phys_reg_name_32(reg))
+                        } else {
+                            format!("%{}", super::emit::phys_reg_name(reg))
+                        };
+                        if name == base_reg {
+                            // Same register for base and index: bt r,r is
+                            // still well-defined (tests bit idx%width of the
+                            // same value) — keep it.
+                            name
+                        } else {
+                            name
+                        }
+                    }
+                    None => {
+                        self.operand_to_rcx(index);
+                        if use_32bit { "%ecx".to_string() } else { "%rcx".to_string() }
+                    }
+                },
+                _ => {
+                    self.operand_to_rcx(index);
+                    if use_32bit { "%ecx".to_string() } else { "%rcx".to_string() }
+                }
+            };
+            self.state.emit_fmt(format_args!("    {bt} {idx_reg}, {base_reg}"));
+        }
+        // CF = tested bit. jc = branch when set (BitTest result nonzero).
+        if self.state.next_block_label == Some(true_block) {
+            self.state.out.emit_jcc_block("jnc", false_block.0);
+        } else {
+            self.state.out.emit_jcc_block("jc", true_block.0);
+            if self.state.next_block_label != Some(false_block) {
+                self.state.out.emit_jmp_block(false_block.0);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
     /// Map an integer comparison opcode to the jcc mnemonic for the
     /// condition "the comparison is true".
     fn cmp_jcc(op: IrCmpOp) -> &'static str {

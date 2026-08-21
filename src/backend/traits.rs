@@ -1731,6 +1731,29 @@ pub trait ArchCodegen {
         self.emit_fused_cmp_branch(op, lhs, rhs, ty, &true_label, &false_label);
     }
 
+    /// Whether the backend can branch directly on a BitTest result without
+    /// materializing the 0/1 boolean (x86: `bt` sets CF, `jc/jnc` consume
+    /// it). When true, detect_cmp_branch_fusion also anchors on
+    /// `BinOp { op: BitTest }` and the terminator is emitted by
+    /// [`Self::emit_fused_bit_test_branch_blocks`].
+    fn supports_fused_bit_test_branch(&self) -> bool {
+        false
+    }
+
+    /// Emit `if ((base >> index) & 1) goto true_block; else goto false_block`
+    /// as a flag-consuming branch. Only called when
+    /// [`Self::supports_fused_bit_test_branch`] returned true.
+    fn emit_fused_bit_test_branch_blocks(
+        &mut self,
+        _base: &Operand,
+        _index: &Operand,
+        _ty: IrType,
+        _true_block: BlockId,
+        _false_block: BlockId,
+    ) {
+        unreachable!("backend advertised fused bit-test branches but did not implement the hook");
+    }
+
     /// Whether the backend can fuse an integer compare feeding a Select into
     /// compare + conditional-select, skipping the boolean materialization.
     fn supports_fused_cmp_select(&self) -> bool {
