@@ -22,4 +22,6 @@
 19. **Do not delete `graph_coloring.rs`** — it is sound infrastructure blocked by RA-23. Wire it into Tier 2 after the accumulator blocker is fixed (P0-01b).
 20. **Do not delete `reg_hint`/`enable_splitting`/`handled` fields** — `reg_hint` wires up as RA-26 (ABI hints), `enable_splitting` is the RA-06 stub, `handled` wires into RA-13 verification.
 
+Kill-switches added for CFG-leaf work: `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`, expanded `CCC_NO_LEAF_PARAM_GPR`; diagnostics: `CCC_TRACE_ALLOCSTATS[=filter]`.
+
 Kill-switches: `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`, `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`, `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`, `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_SEGMENT_FILL`, `CCC_NO_INDEX_HOME`, `CCC_NO_ABI_REG_HINTS`, `CCC_NO_LICM_ALIAS`, `CCC_NO_ANDN_FUSION`, `CCC_NO_64B_YMM_COPY`, `CCC_ENABLE_TIER2_GRAPH`, `CCC_NO_LOOP_PIN`, `CCC_NO_VECREG`, `CCC_PGO_WEIGHT_MAX`, `CCC_TRACE_ALLOC`, `CCC_X64_NOHOME_CLASSES`, `CCC_NO_MACHINST`, `CCC_RA_EXPLAIN`.

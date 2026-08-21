@@ -246,7 +246,7 @@ impl X86Codegen {
         // RCX remains reserved scratch; remaining homes follow ABI order and
         // the ordered parallel-copy emitter handles overlaps such as rcx->r8
         // while a later argument still arrives in r8.
-        if func.blocks.len() == 1 && std::env::var("CCC_NO_LEAF_PARAM_GPR").is_err() {
+        if crate::backend::regalloc::x86_param_caller_homes_safe(func) {
             let preferred = [14u8, 15, 16, 12, 13, 10, 11];
             caller_saved_regs.sort_by_key(|reg| {
                 preferred.iter().position(|&id| id == reg.0).unwrap_or(preferred.len())
@@ -1079,8 +1079,20 @@ impl X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
-        // `space` includes callee_save_reserve for the save area — return as-is.
-        space
+        // Callee-saved registers in a call-free leaf are already represented
+        // by push/pop. If layout consumed no bytes beyond the conservative
+        // collision reserve, there are no local slots and no call-alignment
+        // obligation, so a second local frame is pure overhead. Keep the reserve
+        // for calls, varargs, and whenever any real slot was allocated.
+        if !func.is_variadic
+            && !self.func_has_calls
+            && space == callee_save_reserve
+            && std::env::var_os("CCC_NO_EMPTY_LOCAL_FRAME_ELISION").is_none()
+        {
+            0
+        } else {
+            space
+        }
     }
 
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
@@ -1157,7 +1169,8 @@ impl X86Codegen {
                 }
             }
             if self.state.emit_cfi {
-                self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", frame_size + 8));
+                let actual_stack = frame_size.max(n_saves * 8);
+                self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", actual_stack + 8));
             }
             self.state.out.use_rsp_addressing = true;
             self.state.out.rsp_frame_size = frame_size;

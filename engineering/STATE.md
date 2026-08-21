@@ -1,11 +1,11 @@
 # Current compiler state
 
-SHA at last doc refresh: **`00321224`** (`ms178/lccc` main, PR #158; round-6 work rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
+SHA at last doc refresh: **`8fb1573b`** (`ms178/lccc` main, PR #159; round-6 work rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
 
 ## What is production
 
 - **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full / `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md`).
-- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). Session 31 adds i686 residual segment coloring, ABI physical hints, safe masked-index homes, spill explain output, and hard final/history verification. No `linear_scan.rs`.
+- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). ABI physical hints now retain leading ParamRefs in caller/ABI homes across safe call-free x86 CFG leaves (≤6 register args), cutting the measured branch leaf from 16 to 8 body instructions. `CCC_TRACE_ALLOCSTATS` reports aggregate pressure without changing allocation. No `linear_scan.rs`.
 - **Liveness** `src/backend/liveness.rs` — worklist backward dataflow (no `MAX_ITERATIONS` cap). Produces both fat `intervals` and hole-aware `segments`. `segments` is consumed by `regalloc.rs` for call-spanning detection and interval extension (lines 571, 785); the linear scan itself still runs on fat `intervals`.
 - **SROA** `aggregate_sroa.rs` load-forward + chain collapse **on**. Copy-out **off** (`CCC_SROA_COPYOUT` hangs tests).
 - **Alias** `alias.rs` — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` and now LICM; the shared resolver supports checked Shl scaling. LICM models ordinary stores and fails closed on calls, atomics, memcpy, inline asm, intrinsic writes, or unresolved forms.
