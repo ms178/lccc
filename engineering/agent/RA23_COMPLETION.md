@@ -26,12 +26,12 @@ Base: `d57ef0866d68d7290d2bd9225d7dcb9166905c7b`.
 - MachInst explicitly rejects point-constrained accumulator values and falls back to mature ISel, preventing buffered lifetime extension.
 - Next: native MachInst accumulator operands and the program-point location verifier.
 
-### C. Tier-2 interference correctness
+### C. Tier-2 interference correctness — IN PROGRESS
 
-- Add definition-store points and closed boundaries to slot interference.
-- Treat accumulator assignments as non-stack, but their durable fallback (when required by replay/calls) as a normal segment.
-- Reproduce and eliminate huft/SQLite collisions before enabling coloring.
-- Enable by default behind `CCC_NO_TIER2_GRAPH` only after differential gates pass.
+- Definition-store points, including post-phi multi-def Copies, are now inserted into every slot occupancy union.
+- Closed boundaries remain mandatory.
+- This removed one missing-interference class, but huft/SQLite still reproduce under the research gate; default remains off.
+- Next isolation step: copy-alias/materialization edges and block-edge live-through occupancy.
 
 ### D. Additional RA structural work
 
