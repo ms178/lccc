@@ -55,10 +55,9 @@
 //!
 //! # Correctness constraints (do not "simplify" these away)
 //!
-//! * `Alloca` is a root. Codegen maps parameter slots by positional alloca
-//!   index (`find_param_alloca`). Deleting an unused alloca shifts that
-//!   numbering and miscompiles the function. Fix the backend before ever
-//!   relaxing this.
+//! * Ordinary `Alloca` is pure only for a proven single-block leaf whose
+//!   ParamRefs execute in the leading prefix. Other functions retain positional
+//!   parameter homes because late ParamRefs need the saved ABI value.
 //! * `DynAlloca` / `StackRestore` adjust the runtime stack pointer.
 //! * Every `Call` / `CallIndirect` is a root until we have trustworthy
 //!   `pure`/`const` attributes. Intrinsics already carry purity and *are*
@@ -128,6 +127,22 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     // Worst case every instruction is a root (pure side-effect soup).
     let mut worklist: Vec<(u32, u32)> = Vec::with_capacity(n_insts);
 
+    // Dead parameter homes are safe only in a single-block leaf whose every
+    // ParamRef executes in the leading declaration/parameter prefix. Then no
+    // call or earlier generated instruction can clobber an incoming ABI
+    // register before ParamRef consumes it.
+    let allow_dead_allocas = func.blocks.len() == 1 && {
+        let mut seen_code = false;
+        func.blocks[0].instructions.iter().all(|inst| match inst {
+            Instruction::Alloca { .. } if !seen_code => true,
+            Instruction::ParamRef { .. } if !seen_code => true,
+            Instruction::ParamRef { .. } => false,
+            Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. } => false,
+            _ => { seen_code = true; true }
+        })
+    };
+
     // ------------------------------------------------------------------
     // Pass 1: record every def site and seed instruction roots.
     // Terminator uses are deliberately NOT seeded here (see module doc:
@@ -157,7 +172,7 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
                     }
                 }
             }
-            if is_dce_root(inst) {
+            if is_dce_root(inst, !allow_dead_allocas) {
                 live[bi][ii] = 1;
                 worklist.push((bi_u, ii as u32));
             }
@@ -273,8 +288,10 @@ fn mark_site_live(dbi: u32, dii: u32, live: &mut [Vec<u8>], worklist: &mut Vec<(
 /// an unknown future IR opcode without a destination cannot be silently
 /// discarded. True no-ops should be given a dest or a dedicated fold.
 #[inline]
-fn is_dce_root(inst: &Instruction) -> bool {
-    has_side_effects(inst) || inst.dest().is_none()
+fn is_dce_root(inst: &Instruction, preserve_allocas: bool) -> bool {
+    (preserve_allocas && matches!(inst, Instruction::Alloca { .. }))
+        || has_side_effects(inst)
+        || inst.dest().is_none()
 }
 
 /// Compact `instructions` (and `source_spans`, when they are a 1:1 map)
@@ -377,12 +394,7 @@ fn has_side_effects(inst: &Instruction) -> bool {
     // its result is unused: it must never be dead-code eliminated.
     matches!(inst,
         Instruction::Load { volatile: true, .. } |
-        // Alloca must never be removed: codegen uses positional indexing
-        // (`find_param_alloca`) to map function parameters to their stack
-        // slots. Removing unused parameter allocas shifts indices and
-        // causes miscompilation. Local unused allocas are collateral.
-        // Do not relax this until the backend names slots explicitly.
-        Instruction::Alloca { .. } |
+        // Ordinary Alloca is conditionally rooted by eliminate_dead_code.
         // DynAlloca modifies the stack pointer at runtime.
         Instruction::DynAlloca { .. } |
         Instruction::Store { .. } |
@@ -517,8 +529,8 @@ mod tests {
         });
 
         let removed = eliminate_dead_code(&mut func);
-        assert_eq!(removed, 3);
-        assert_eq!(func.blocks[0].instructions.len(), 1); // Only alloca remains
+        assert_eq!(removed, 4);
+        assert!(func.blocks[0].instructions.is_empty())
     }
 
     #[test]

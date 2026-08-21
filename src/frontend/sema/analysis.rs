@@ -137,6 +137,8 @@ pub struct SemanticAnalyzer {
     /// check. Uses RefCell for interior mutability since resolve_struct_or_union
     /// takes &self.
     defined_structs: RefCell<FxHashSet<String>>,
+    /// Return type of the function body currently being checked.
+    current_return_type: Option<CType>,
 }
 
 impl SemanticAnalyzer {
@@ -147,6 +149,7 @@ impl SemanticAnalyzer {
             enum_counter: 0,
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
+            current_return_type: None,
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -254,8 +257,10 @@ impl SemanticAnalyzer {
             }
         }
 
-        // Analyze function body
+        // Analyze function body with explicit return-type context.
+        let previous_return_type = self.current_return_type.replace(return_type.clone());
         self.analyze_compound_stmt(&func.body);
+        self.current_return_type = previous_return_type;
 
         // -Wreturn-type: warn if a non-void function can fall through without returning.
         // Skip the check for:
@@ -816,10 +821,30 @@ impl SemanticAnalyzer {
                 self.analyze_expr(expr);
             }
             Stmt::Expr(None) => {}
-            Stmt::Return(Some(expr), _) => {
+            Stmt::Return(Some(expr), span) => {
                 self.analyze_expr(expr);
+                if let Some(expected) = self.current_return_type.clone() {
+                    if matches!(expected, CType::Void) {
+                        self.diagnostics.borrow_mut().error(
+                            "return with a value, in function returning void", *span);
+                    } else {
+                        let checker = super::type_checker::ExprTypeChecker {
+                            symbols: &self.symbol_table, types: &self.result.type_context,
+                            functions: &self.result.functions,
+                            expr_types: Some(&self.result.expr_types),
+                        };
+                        if let Some(actual) = checker.infer_expr_ctype(expr) {
+                            self.check_assignment_compatibility(&actual, &expected, *span);
+                        }
+                    }
+                }
             }
-            Stmt::Return(None, _) => {}
+            Stmt::Return(None, span) => {
+                if self.current_return_type.as_ref().is_some_and(|t| !matches!(t, CType::Void)) {
+                    self.diagnostics.borrow_mut().error(
+                        "return with no value, in function returning non-void", *span);
+                }
+            }
             Stmt::If(cond, then_br, else_br, _) => {
                 self.analyze_expr(cond);
                 self.analyze_stmt(then_br);
@@ -1366,27 +1391,30 @@ impl SemanticAnalyzer {
                 for arg in args {
                     self.analyze_expr(arg);
                 }
-                // Check for invalid pointer <-> float conversions in arguments
-                if let Expr::Identifier(name, _) = callee.as_ref() {
-                    if let Some(func_info) = self.result.functions.get(name) {
-                        // Clone to release borrow on self.result.functions before
-                        // creating ExprTypeChecker which also borrows it
-                        let params = func_info.params.clone();
-                        let checker = super::type_checker::ExprTypeChecker {
-                            symbols: &self.symbol_table,
-                            types: &self.result.type_context,
-                            functions: &self.result.functions,
-                            expr_types: Some(&self.result.expr_types),
-                        };
-                        for (i, arg) in args.iter().enumerate() {
-                            if i < params.len() {
-                                if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
-                                    self.check_pointer_float_conversion(
-                                        &arg_ty, &params[i].0, arg.span(),
-                                    );
-                                }
-                            }
-                        }
+                // Validate real prototypes. Empty parameter lists are kept
+                // permissive because sema also carries legacy `f()` and fallback
+                // libc declarations with unspecified arguments.
+                let direct = if let Expr::Identifier(name, _) = callee.as_ref() {
+                    self.result.functions.get(name).filter(|fi| !fi.params.is_empty())
+                        .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
+                } else { None };
+                if let Some((name, params, variadic)) = direct {
+                    self.check_call_arguments(&name, args, &params, variadic, expr.span());
+                } else if !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name)) {
+                    let checker = super::type_checker::ExprTypeChecker {
+                        symbols: &self.symbol_table, types: &self.result.type_context,
+                        functions: &self.result.functions,
+                        expr_types: Some(&self.result.expr_types),
+                    };
+                    let signature = match checker.infer_expr_ctype(callee) {
+                        Some(CType::Function(ft)) if !ft.params.is_empty() => Some(*ft),
+                        Some(CType::Pointer(inner, _)) => match *inner {
+                            CType::Function(ft) if !ft.params.is_empty() => Some(*ft), _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(ft) = signature {
+                        self.check_call_arguments("function pointer", args, &ft.params, ft.variadic, expr.span());
                     }
                 }
             }
@@ -1419,7 +1447,7 @@ impl SemanticAnalyzer {
                     checker.infer_expr_ctype(lhs),
                     checker.infer_expr_ctype(rhs),
                 ) {
-                    self.check_pointer_float_conversion(&rhs_ty, &lhs_ty, *span);
+                    self.check_assignment_compatibility(&rhs_ty, &lhs_ty, *span);
                 }
             }
             Expr::CompoundAssign(_, lhs, rhs, _) => {
@@ -1668,6 +1696,47 @@ impl SemanticAnalyzer {
                 ),
                 span,
             );
+        }
+    }
+
+    fn check_call_arguments(&self, name: &str, args: &[Expr], params: &[(CType, Option<String>)], variadic: bool, span: Span) {
+        let expected = params.len();
+        if args.len() < expected {
+            self.diagnostics.borrow_mut().error(
+                format!("too few arguments to function '{}' (expected {}, have {})", name, expected, args.len()), span);
+        } else if !variadic && args.len() > expected {
+            self.diagnostics.borrow_mut().error(
+                format!("too many arguments to function '{}' (expected {}, have {})", name, expected, args.len()), span);
+        }
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table, types: &self.result.type_context,
+            functions: &self.result.functions, expr_types: Some(&self.result.expr_types),
+        };
+        for (arg, (param_ty, _)) in args.iter().zip(params) {
+            if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
+                self.check_pointer_float_conversion(&arg_ty, param_ty, arg.span());
+            }
+        }
+    }
+
+    fn check_assignment_compatibility(&self, from_ty: &CType, to_ty: &CType, span: Span) {
+        self.check_pointer_float_conversion(from_ty, to_ty, span);
+        let incompatible = match (from_ty, to_ty) {
+            (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) =>
+                a != b && !a.starts_with("__anon_") && !b.starts_with("__anon_"),
+            (CType::Struct(_), _) | (CType::Union(_), _) | (_, CType::Struct(_)) | (_, CType::Union(_)) => true,
+            _ => false,
+        };
+        if incompatible {
+            self.diagnostics.borrow_mut().error(
+                format!("incompatible types (have '{}' but expected '{}')", from_ty, to_ty), span);
+        }
+        if let (CType::Pointer(from, _), CType::Pointer(to, _)) = (from_ty, to_ty) {
+            if !matches!(from.as_ref(), CType::Void) && !matches!(to.as_ref(), CType::Void)
+                && !Self::pointee_types_compatible(from, to) {
+                self.diagnostics.borrow_mut().error(
+                    format!("incompatible pointer types (have '{}' but expected '{}')", from_ty, to_ty), span);
+            }
         }
     }
 
