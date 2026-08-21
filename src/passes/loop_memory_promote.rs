@@ -647,33 +647,15 @@ fn affine_disjoint(
     let (Some(cf), Some(sf)) = (cf, sf) else {
         return false;
     };
-    if cf.root == 0 || cf.root != sf.root {
-        return false;
-    }
     let (Some(cand_sz), Some(store_sz)) = (byte_size(cand_ty), byte_size(store_ty)) else {
         return false;
     };
-    if sf.march == 0 && cf.march == 0 {
-        if cf.syms != sf.syms {
-            return false;
-        }
-        return ranges_apart(cf.konst, cand_sz, sf.konst, store_sz).unwrap_or(false);
-    }
+    // Promotion requires the candidate to be invariant in this loop. Delegate
+    // all separation arithmetic to the shared checked alias engine.
     if cf.march != 0 {
         return false;
     }
-    if cf.syms != sf.syms {
-        return false;
-    }
-    if sf.march > 0 {
-        cf.konst
-            .checked_add(cand_sz)
-            .is_some_and(|end| sf.konst >= end)
-    } else {
-        sf.konst
-            .checked_add(store_sz)
-            .is_some_and(|end| end <= cf.konst)
-    }
+    super::alias::forms_disjoint(&cf, cand_sz, &sf, store_sz, true)
 }
 
 fn dominates(idom: &[usize], node: usize, anc: usize) -> bool {

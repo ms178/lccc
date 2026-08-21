@@ -213,9 +213,6 @@ pub struct LinearScanAllocator {
     /// Rotation cursor: consecutive unhinted assignments start at different
     /// registers to expose ILP on Raptor Lake's extra integer ports.
     pub next_reg_idx: usize,
-    /// When true, default eviction mode is 5 (exchange) instead of 3.
-    /// Phase 2c sets this for the callee-saved overflow wave.
-    pub exchange_eviction: bool,
 }
 
 impl LinearScanAllocator {
@@ -231,7 +228,6 @@ impl LinearScanAllocator {
             next_spill_slot: 0,
             enable_splitting: false,
             next_reg_idx: 0,
-            exchange_eviction: false,
         }
     }
 
@@ -558,7 +554,7 @@ impl LinearScanAllocator {
             return;
         }
 
-        let mode = evict_mode(self.exchange_eviction);
+        let mode = evict_mode();
         let victim = if mode == 5 {
             self.find_exchange_candidate(&range)
         } else {
@@ -745,14 +741,12 @@ fn allocstats_enabled() -> bool {
 
 /// Cached `CCC_EVICT_MODE`. First parse wins for the process so a large TU
 /// cannot observe a mid-compile env change as two different allocators.
-fn evict_mode(exchange_eviction: bool) -> i32 {
+fn evict_mode() -> i32 {
     static MODE: OnceLock<Option<i32>> = OnceLock::new();
     let parsed = *MODE.get_or_init(|| {
-        std::env::var("CCC_EVICT_MODE")
-            .ok()
-            .and_then(|s| s.parse().ok())
+        std::env::var("CCC_EVICT_MODE").ok().and_then(|s| s.parse().ok())
     });
-    parsed.unwrap_or(if exchange_eviction { 5 } else { 3 })
+    parsed.unwrap_or(3)
 }
 
 /// LiveInterval → LiveRange: one IR walk for defs, uses, loop depth, hints.
