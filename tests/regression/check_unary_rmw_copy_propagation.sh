@@ -31,9 +31,18 @@ int main(void) {
     return rc;
 }
 EOF
+have_i386_loader=0
+for loader in /lib/ld-linux.so.2 /lib32/ld-linux.so.2 /usr/lib32/ld-linux.so.2; do
+    [ -x "$loader" ] && have_i386_loader=1
+done
 for opt in O0 O1 O2 Os; do
     "$CCC" -m32 -fno-pic -$opt "$td/test.c" -o "$td/test_$opt" 2>"$td/err_$opt.txt" || {
         echo "compile failed at -$opt"; cat "$td/err_$opt.txt"; exit 1;
     }
-    "$td/test_$opt" || { echo "runtime mismatch at -$opt (unary RMW result lost)"; exit 1; }
+    if [ "$have_i386_loader" = 1 ]; then
+        "$td/test_$opt" || { echo "runtime mismatch at -$opt (unary RMW result lost)"; exit 1; }
+    fi
 done
+if [ "$have_i386_loader" = 0 ]; then
+    echo "SKIP runtime: all modes compiled; host has no i386 ELF interpreter"
+fi

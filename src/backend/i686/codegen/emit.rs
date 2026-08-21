@@ -178,7 +178,8 @@ impl I686Codegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
-        self.set_pic(opts.pic);
+        self.set_pic(opts.pic || opts.pie);
+        self.state.pie_mode = opts.pie;
         self.set_no_jump_tables(opts.no_jump_tables);
         self.regparm = opts.regparm;
         self.omit_frame_pointer = opts.omit_frame_pointer;

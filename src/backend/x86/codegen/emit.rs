@@ -705,7 +705,8 @@ impl X86Codegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
-        self.set_pic(opts.pic);
+        self.set_pic(opts.pic || opts.pie);
+        self.state.pie_mode = opts.pie;
         self.set_function_return_thunk(opts.function_return_thunk);
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
         self.set_indirect_branch_thunk_inline(opts.indirect_branch_thunk_inline);
@@ -3686,6 +3687,7 @@ impl ArchCodegen for X86Codegen {
                     &crate::common::fx_hash::FxHashMap::default(),
                     &crate::common::fx_hash::FxHashSet::default(),
                     &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
                 );
                 self.state.current_program_point += 1;
             }
@@ -3890,6 +3892,20 @@ impl ArchCodegen for X86Codegen {
         true
     }
 
+    fn supports_global_addr_remat(&self) -> bool {
+        true
+    }
+
+    fn emit_rematerialized_global_addr(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        offset: &Operand,
+        subtract: bool,
+    ) -> bool {
+        self.emit_rematerialized_global_addr_impl(dest, sym, offset, subtract)
+    }
+
     /// Session 28: x86-64 SIB indexed addressing (mirrors session-27 i686):
     /// `off(%base,%idx,scale)` / `sym(,%idx,scale)` fold variable-offset GEPs
     /// into one memory operand.  The prologue wires base AND index liveness
@@ -3899,7 +3915,11 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn supports_indexed_sym_base(&self) -> bool {
-        std::env::var_os("CCC_NO_X64_SIB").is_none() && !self.state.pic_mode
+        // In PIE/PIC x86 cannot combine RIP-relative addressing and an index
+        // in one memory operand. The symbol hook still supports every legal
+        // direct symbol by rebuilding its base in the reserved address scratch
+        // and retaining the scale in the consuming SIB operand.
+        std::env::var_os("CCC_NO_X64_SIB").is_none()
     }
 
     fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {

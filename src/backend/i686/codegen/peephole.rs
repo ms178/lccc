@@ -4344,6 +4344,40 @@ pub fn peephole_optimize(asm: String) -> String {
 
 // ── Pass: redundant zero-extension elimination (i686 redundant_ext port) ────
 
+/// Whether a generic instruction defeats every tracked narrow-value fact.
+///
+/// `parse_dest_reg` is deliberately a comma-form parser. Some real writers
+/// therefore have no parsed destination (single-operand shifts/bswap and
+/// unknown inline-assembly instructions), while atomics such as cmpxchg/xadd
+/// write registers in addition to the last textual operand. Narrow-value
+/// elimination must fail closed for both classes: a stale fact can delete a
+/// required extension and silently change the value.
+fn invalidates_all_narrow_facts(text: &str, parsed_dest: RegId) -> bool {
+    parsed_dest == REG_NONE
+        || text.starts_with("mul")
+        || text.starts_with("imul")
+        || text.starts_with("div")
+        || text.starts_with("idiv")
+        || text == "cltd"
+        || text == "cdq"
+        || text.starts_with("xchg")
+        || text.starts_with("xadd")
+        || text.starts_with("cmpxchg")
+        || text.starts_with("lock xadd")
+        || text.starts_with("lock cmpxchg")
+        || text.starts_with("rep")
+        || text.starts_with("lods")
+        || text.starts_with("stos")
+        || text.starts_with("movs")
+        || text.starts_with("cmps")
+        || text.starts_with("scas")
+}
+
+#[inline]
+fn is_low_byte_register(name: &str) -> bool {
+    matches!(name, "%al" | "%bl" | "%cl" | "%dl")
+}
+
 /// Track which GP register families provably hold byte values (bits 8..31
 /// zero) or 16-bit values (bits 16..31 zero), and remove/rewrite redundant
 /// re-extensions:
@@ -4380,7 +4414,11 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
                 let src = src.trim();
                 let dst = dst.trim();
                 let df = register_family(dst);
-                if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
+                // A full-register byte fact applies to its low byte only.
+                // If EAX < 256 then AH is zero, so deleting
+                // `movzbl %ah,%eax` would leave AL instead of producing 0;
+                // a cross-family movl rewrite is wrong for the same reason.
+                if df <= REG_GP_MAX && is_low_byte_register(src) {
                     let sf = register_family(src);
                     if sf <= REG_GP_MAX && is_byte[sf as usize] {
                         if sf == df {
@@ -4459,28 +4497,19 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
             }
             _ => {
                 let d = parse_dest_reg(&t);
-                if d <= REG_GP_MAX {
-                    if t.starts_with("andl $") {
-                        // andl $imm: result <= imm, so byte/16 flags follow
-                        // the immediate's range regardless of prior state.
-                        let imm = t["andl $".len()..]
-                            .split(',').next()
-                            .and_then(|v| v.trim().parse::<i64>().ok());
-                        is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
-                        is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
-                    } else {
-                        is_byte[d as usize] = false;
-                        is_16[d as usize] = false;
-                    }
+                if d <= REG_GP_MAX && t.starts_with("andl $") {
+                    // andl $imm: result <= imm, so byte/16 flags follow
+                    // the immediate's range regardless of prior state.
+                    let imm = t["andl $".len()..]
+                        .split(',').next()
+                        .and_then(|v| v.trim().parse::<i64>().ok());
+                    is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
+                    is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
+                } else if d <= REG_GP_MAX {
+                    is_byte[d as usize] = false;
+                    is_16[d as usize] = false;
                 }
-                // Implicit multi-register writers: fail closed on all flags.
-                if t.starts_with("mul") || t.starts_with("imul")
-                    || t.starts_with("div") || t.starts_with("idiv")
-                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
-                    || t.starts_with("rep") || t.starts_with("lods")
-                    || t.starts_with("stos") || t.starts_with("movs")
-                    || t.starts_with("cmps") || t.starts_with("scas")
-                {
+                if invalidates_all_narrow_facts(&t, d) {
                     is_byte = [false; 8];
                     is_16 = [false; 8];
                 }
@@ -4528,7 +4557,10 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
                 let dst = dst.trim();
                 let df = register_family(dst);
                 if df <= REG_GP_MAX {
-                    if !src.contains('(') && src.starts_with('%') {
+                    // A sign-extension fact describes the full register's
+                    // low byte. High-byte aliases are different values and
+                    // must never be replaced by a full-register copy.
+                    if is_low_byte_register(src) {
                         let sf = register_family(src);
                         if sf <= REG_GP_MAX && sign_ext[sf as usize] {
                             if sf == df {
@@ -4567,7 +4599,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
                 let dst = dst.trim();
                 let df = register_family(dst);
                 if df <= REG_GP_MAX {
-                    let src_bool = !src.contains('(') && src.starts_with('%') && {
+                    let src_bool = is_low_byte_register(src) && {
                         let sf = register_family(src);
                         sf <= REG_GP_MAX && is_bool[sf as usize]
                     };
@@ -4624,14 +4656,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
                         is_bool[d as usize] = false;
                     }
                 }
-                // Implicit multi-register writers: fail closed on all flags.
-                if t.starts_with("mul") || t.starts_with("imul")
-                    || t.starts_with("div") || t.starts_with("idiv")
-                    || t == "cltd" || t == "cdq" || t.starts_with("xchg")
-                    || t.starts_with("rep") || t.starts_with("lods")
-                    || t.starts_with("stos") || t.starts_with("movs")
-                    || t.starts_with("cmps") || t.starts_with("scas")
-                {
+                if invalidates_all_narrow_facts(&t, d) {
                     sign_ext = [false; 8];
                     is_bool = [false; 8];
                 }
@@ -5525,6 +5550,42 @@ mod tests {
     }
 
     #[test]
+    fn sign_ext_high_byte_is_not_a_full_register_copy() {
+        for dst in ["%eax", "%ecx"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movsbl (%esi), %eax\n    movsbl %ah, {dst}\n    ret\n.cfi_endproc\n"
+            );
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains(&format!("movsbl %ah, {dst}")),
+                "high-byte sign extension must remain:\n{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_byte_zero_extend_does_not_inherit_low_byte_bool_fact() {
+        // setcc proves AL is 0/1, but says nothing about AH. With AH=0x80,
+        // movzbl %ah produces 128 and the following movsbl must produce -128.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl $32768, %eax\n",
+            "    cmpl $0, %edx\n",
+            "    setne %al\n",
+            "    movzbl %ah, %ecx\n",
+            "    movsbl %cl, %ecx\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movzbl %ah, %ecx"), "{result}");
+        assert!(result.contains("movsbl %cl, %ecx"), "{result}");
+    }
+
+    #[test]
     fn sign_ext_cross_register_becomes_movl_copy() {
         let asm = concat!(
             "f:\n",
@@ -5765,6 +5826,41 @@ mod tests {
         let result = peephole_optimize(asm);
         assert_eq!(result.matches("movzbl").count(), 1,
             "andl imm8 preserves byte-ness:\n{}", result);
+    }
+
+    #[test]
+    fn zext_high_byte_is_not_a_full_register_copy() {
+        // EAX < 256 proves AH == 0, not that zero-extending AH is a no-op or
+        // equivalent to copying the full EAX value.
+        for (src, dst) in [("%ah", "%eax"), ("%ah", "%edx")] {
+            let asm = format!(
+                "f:\n    movzbl (%ecx), %eax\n    movzbl {src}, {dst}\n    ret\n"
+            );
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains(&format!("movzbl {src}, {dst}")),
+                "high-byte extension must remain:\n{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_facts_die_at_unparsed_and_atomic_writers() {
+        for writer in [
+            "bswapl %eax",
+            "lock cmpxchgl %edx, (%ecx)",
+            "lock xaddl %eax, (%ecx)",
+        ] {
+            let asm = format!(
+                "f:\n    movzbl (%ecx), %eax\n    {writer}\n    movzbl %al, %eax\n    ret\n"
+            );
+            let result = peephole_optimize(asm);
+            assert_eq!(
+                result.matches("movzbl").count(),
+                2,
+                "{writer} must invalidate byte-ness:\n{result}"
+            );
+        }
     }
 
     #[test]

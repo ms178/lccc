@@ -49,4 +49,8 @@ int main(void)
 }
 EOF
 "$CCC" -m32 -O2 -fno-pic "$td/run.c" -o "$td/run"
-"$td/run"
+if [ -x /lib/ld-linux.so.2 ] || [ -x /lib32/ld-linux.so.2 ] || [ -x /usr/lib32/ld-linux.so.2 ]; then
+    "$td/run"
+else
+    echo "SKIP runtime: compiled; host has no i386 ELF interpreter"
+fi

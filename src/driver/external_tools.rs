@@ -306,7 +306,7 @@ impl Driver {
             // indirection) instead of R_RISCV_PCREL_HI20 (direct PC-relative).
             // The Linux kernel does not have a GOT and expects PCREL relocations,
             // so we must explicitly pass -fno-pic when PIC is not requested.
-            if !self.pic {
+            if !self.pic && !self.pie {
                 args.push("-fno-pic".to_string());
             }
         }

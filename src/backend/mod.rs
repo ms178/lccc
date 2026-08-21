@@ -39,8 +39,13 @@ pub(crate) struct CodegenOptions {
     /// Disable register allocation for non-SSA `-O0` IR. Phi elimination can
     /// create multi-def values that the production scan must not coalesce.
     pub(crate) disable_regalloc: bool,
-    /// Whether to generate position-independent code (-fPIC/-fpic)
+    /// Whether to generate fully interposable position-independent code
+    /// (`-fPIC`/`-fpic`, or a shared object).
     pub(crate) pic: bool,
+    /// Whether to generate position-independent executable code (`-fPIE`/
+    /// `-fpie`). Unlike full PIC, ordinary data definitions in the executable
+    /// are non-preemptible and may use direct RIP-relative references.
+    pub(crate) pie: bool,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
     pub(crate) function_return_thunk: bool,
     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern)

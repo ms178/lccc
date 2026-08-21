@@ -256,7 +256,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // (flag-neutral window). Runs before the peephole gate.
     let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
     // Always-on, provably-safe pass: eliminate redundant zero-extensions
-    // (movzbl %al,%eax where upper bits are already zero). Runs before gate.
+    // only when the tracked value already fits the source width. Runs before gate.
     let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
     // the peephole optimizer is now ENABLED BY DEFAULT with a curated,
     // gzip-validated safe subset. The two passes that were proven to miscompile

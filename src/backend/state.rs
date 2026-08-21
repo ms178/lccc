@@ -208,11 +208,19 @@ pub struct CodegenState {
     pub vec_live_regs: FxHashMap<u32, &'static str>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
-    /// Whether position-independent code (PIC) generation is enabled.
+    /// Whether any position-independent code generation is enabled. Backends
+    /// that do not distinguish PIE from full PIC retain this conservative bit.
     pub pic_mode: bool,
+    /// Position-independent executable mode. x86-64 may address ordinary
+    /// executable data directly; full PIC and weak extern data still use GOT.
+    pub pie_mode: bool,
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
+    /// Extern function linker names. Their addresses cannot use ELF data copy
+    /// relocations, so default-visibility function pointers remain GOT-based
+    /// in PIE even though ordinary extern data addresses may be direct.
+    pub extern_function_symbols: FxHashSet<String>,
     /// Compare-replay records: Cmp instructions whose boolean result is
     /// consumed by exactly one Select or CondBranch that is NOT adjacent to
     /// the Cmp (so pending-flag fusion cannot fire — an intervening ALU op
@@ -429,7 +437,9 @@ impl CodegenState {
             vec_live_regs: FxHashMap::default(),
             label_counter: 0,
             pic_mode: false,
+            pie_mode: false,
             local_symbols: FxHashSet::default(),
+            extern_function_symbols: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
@@ -749,26 +759,33 @@ impl CodegenState {
         !self.local_symbols.contains(name)
     }
 
-    /// Returns true if taking the address of a symbol requires GOT indirection.
-    /// Unlike needs_got(), this returns true for external symbols even in non-PIC
-    /// mode (x86-64 only). Modern toolchains default to PIE, so object files must
-    /// use GOTPCREL for external symbol addresses to be compatible with PIE linking
-    /// by the system linker. Locally-defined symbols can still use direct leaq.
+    /// Returns true if taking the address of a symbol requires GOT indirection
+    /// on x86-64.
+    ///
+    /// Full PIC keeps default-visibility data interposable and therefore uses
+    /// GOTPCREL. PIE is different: definitions in the main executable are not
+    /// preemptible, and ordinary extern data can use direct RIP-relative access
+    /// plus a copy relocation. Weak externs still need a GOT slot because their
+    /// address may resolve to zero. This is the GCC/Clang/ICX executable model;
+    /// conflating PIE with PIC added an address load and a long-lived temporary
+    /// to every gzip global access.
     pub fn needs_got_for_addr(&self, name: &str) -> bool {
-        if self.code_model_kernel {
+        if self.code_model_kernel || name.starts_with('.') {
             return false;
         }
-        if name.starts_with('.') {
+        if self.local_symbols.contains(name) {
             return false;
         }
-        // Non-PIC executables use direct sym(%rip) + copy reloc (LCCC's own
-        // linker emits R_X86_64_COPY, like GCC's -fPIE); GOT is required only
-        // in -fPIC/-shared where copy relocs are illegal. Saves one load per
-        // global access and enables GlobalAddr+Load folding.
-        if !self.pic_mode {
-            return false;
+        if self.pie_mode {
+            // RA-01 kill switch restores the old fully-GOT default so workload
+            // A/B runs isolate direct-global rematerialisation exactly.
+            if std::env::var_os("CCC_NO_GLOBAL_ADDR_REMAT").is_some() {
+                return true;
+            }
+            return self.weak_extern_symbols.contains(name)
+                || self.extern_function_symbols.contains(name);
         }
-        !self.local_symbols.contains(name)
+        self.pic_mode
     }
 
     /// Returns true if a function call needs PLT indirection in PIC mode.

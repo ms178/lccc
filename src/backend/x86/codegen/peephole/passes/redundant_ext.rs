@@ -7,19 +7,13 @@
 //! another zero-extended register). Such a re-extension is a no-op and can be
 //! removed, saving an instruction in hot loops.
 //!
-//! Soundness: we track, for each 64-bit register family, a flag "the upper 32
-//! bits are provably zero." This flag is:
-//!   - SET by any instruction that writes the full 32-bit register and
-//!     zero-extends (movzbl/movzwl/movl-from-anywhere/xorl-self/setcc, ...).
-//!   - COPIED by `movq %reg, %reg` (a 64-bit move preserves the upper-32-zero
-//!     property of the destination).
-//!   - CLEARED by anything that writes the 64-bit register or the upper bits
-//!     (movq from a possibly-nonzero source, arithmetic on the 64-bit reg, etc.)
-//!
-//! Then `movzbl %AL, %EAX` (source byte is the low byte of a dest reg known
-//! upper-32-zero) is a no-op and removed. We only apply this when source and
-//! destination are sub-registers of the SAME family, and the family's
-//! upper-32-zero flag is set, guaranteeing the move cannot change the value.
+//! Soundness: we separately track, for each 64-bit register family, whether
+//! its value is known to fit in 8, 16, or 32 bits. A byte re-extension such as
+//! `movzbl %al, %eax` is removable only when the source is known to fit in 8
+//! bits; merely knowing that bits 32..63 are zero is insufficient because the
+//! instruction must still clear bits 8..31. The same rule applies to 16-bit
+//! re-extensions. Facts are propagated by width-preserving register copies and
+//! cleared by instructions that may write a wider value.
 
 use super::super::types::*;
 
@@ -225,8 +219,10 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     if std::env::var("CCC_TRACE_EXT").is_ok() {
                         eprintln!("[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}", t, sf, df, is32, u32z, bytez);
                     }
-                    if is32 && u32z && sf == df {
-                        // Same family, upper-32-zero: pure no-op -> remove.
+                    if is32 && bytez && sf == df {
+                        // Same family and already known to fit in a byte: pure
+                        // no-op. Upper-32-zero alone is not enough because the
+                        // re-extension may still need to clear bits 8..31.
                         keep[i] = false;
                         changed = true;
                         continue;
@@ -587,5 +583,26 @@ mod tests {
         let mut asm = input.to_string();
         assert!(!eliminate_redundant_zero_extend(&mut asm));
         assert_eq!(asm, input);
+    }
+
+    #[test]
+    fn keeps_byte_truncation_after_arbitrary_32bit_value() {
+        // Writing EAX proves only that bits 32..63 are zero. The low 32 bits
+        // can still be 0xffffffd8, so this I8->U8 cast must clear bits 8..31.
+        let input = "f:\n    movl %edi, %eax\n    movzbl %al, %eax\n";
+        let mut asm = input.to_string();
+        assert!(!eliminate_redundant_zero_extend(&mut asm));
+        assert_eq!(asm, input);
+    }
+
+    #[test]
+    fn removes_byte_reextension_of_known_byte_value() {
+        let asm = run(
+            "f:\n\
+             \x20   movzbl (%rdi), %eax\n\
+             \x20   movzbl %al, %eax\n"
+        );
+        assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
+        assert!(asm.contains("movzbl (%rdi), %eax"), "asm was:\n{asm}");
     }
 }

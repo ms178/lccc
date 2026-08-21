@@ -105,8 +105,13 @@ pub struct Driver {
     pub(super) nostdlib: bool,
     /// Whether to produce a relocatable object file (-r / -relocatable)
     pub(super) relocatable: bool,
-    /// Whether to generate position-independent code (-fPIC/-fpic)
+    /// Whether to generate fully interposable position-independent code
+    /// (`-fPIC`/`-fpic`, or `-shared`).
     pub(super) pic: bool,
+    /// Whether to generate a position-independent executable (`-fPIE`/
+    /// `-fpie`, the x86-64 Linux default). PIE permits direct references to
+    /// ordinary executable data where full PIC requires the GOT.
+    pub(super) pie: bool,
     /// Files to force-include before the main source (-include flag)
     pub(super) force_includes: Vec<String>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
@@ -373,10 +378,11 @@ impl Driver {
             shared_lib: false,
             nostdlib: false,
             relocatable: false,
-            pic: true, // x86-64 Linux default: PIE/PIC-safe codegen, matching
-                       // GCC's default (zlib-ng etc. compile shared objects
-                       // with -DPIC only and rely on the compiler default).
-                       // -fno-pic/-fno-PIE disables.
+            // Debian x86-64 defaults to PIE, not full PIC. Keeping these modes
+            // distinct lets executable data use direct RIP-relative accesses
+            // while explicit -fPIC/-shared remains interposition-safe.
+            pic: false,
+            pie: true,
             force_includes: Vec::new(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
@@ -1035,10 +1041,10 @@ impl Driver {
         // associative-math flags permit selected transforms but do not define
         // __FAST_MATH__.
         preprocessor.set_fast_math(self.fast_math);
-        // Set PIC mode: defines __PIC__/__pic__ only when -fPIC is active.
-        // This is critical for kernel code where RIP_REL_REF() checks #ifndef __pic__
-        // to decide whether to use RIP-relative inline asm for early boot code.
-        preprocessor.set_pic(self.pic);
+        // PIE and full PIC both define __PIC__; only PIE defines __PIE__.
+        // Kernel `-fno-pic` clears both before RIP_REL_REF inline asm expands.
+        preprocessor.set_pic(self.pic || self.pie || self.shared_lib);
+        preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
         // Set SSE/SSE2/MMX predefined macros for x86 targets.
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
         // Our i686 backend also uses SSE2, so we define them for i686 as well.
@@ -1832,6 +1838,7 @@ impl Driver {
             // use canonical stack homes until an SSA-aware O0 allocator exists.
             disable_regalloc: self.opt_level == 0,
             pic: self.pic || self.shared_lib,
+            pie: self.pie && !self.pic && !self.shared_lib,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,
             indirect_branch_thunk_inline: self.indirect_branch_thunk_inline,

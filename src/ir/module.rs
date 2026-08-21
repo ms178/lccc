@@ -12,6 +12,11 @@ use super::instruction::{BasicBlock, Value};
 #[derive(Debug)]
 pub struct IrModule {
     pub functions: Vec<IrFunction>,
+    /// Linker names of functions referenced by this translation unit but not
+    /// defined in it. Backends need this distinction when taking addresses:
+    /// PIE may use copy relocations for ordinary extern data, but no analogous
+    /// mechanism makes an interposable extern function address PC-relative.
+    pub extern_function_symbols: crate::common::fx_hash::FxHashSet<String>,
     pub globals: Vec<IrGlobal>,
     pub string_literals: Vec<(String, String)>, // (label, value)
     /// Wide string literals (L"..."): (label, chars as u32 values including null terminator)
@@ -269,6 +274,7 @@ impl IrModule {
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: Vec::new(),
             string_literals: Vec::new(),
             wide_string_literals: Vec::new(),

@@ -300,6 +300,26 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether the backend can reconstruct an omitted GlobalAddr at audited
+    /// Add/Sub/GEP uses. x86-64 opts in; all other targets default off.
+    fn supports_global_addr_remat(&self) -> bool {
+        false
+    }
+
+    /// Emit `dest = symbol (+|-) offset` for a safely omitted GlobalAddr root.
+    /// The generic generator calls this only for roots whose every use passed
+    /// the fail-closed rematerialisation audit. Returns false by default so
+    /// non-x86 backends retain a materialized address home.
+    fn emit_rematerialized_global_addr(
+        &mut self,
+        _dest: &Value,
+        _sym: &str,
+        _offset: &Operand,
+        _subtract: bool,
+    ) -> bool {
+        false
+    }
+
     /// Flush per-function vector constants used by vpbroadcast* .LvcN(%rip)
     /// splats to .rodata. No-op by default; x86 emits the actual entries.
     fn emit_vector_const_rodata(&mut self) {}

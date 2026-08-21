@@ -1556,7 +1556,7 @@ impl X86Codegen {
         shift: u8,
         ty: IrType,
     ) -> bool {
-        if self.state.pic_mode {
+        if self.state.needs_got_for_addr(sym) {
             return false;
         }
         let Some(&x) = self.reg_assignments.get(&index.0) else {
@@ -1565,7 +1565,19 @@ impl X86Codegen {
         if is_xmm_reg(x) {
             return false;
         }
-        let mem = Self::sib_mem64_sym(sym, phys_reg_name(x), shift);
+        let index_name = phys_reg_name(x);
+        let mem = if self.state.pic_mode {
+            // x86 has no RIP-relative SIB form. Rebuild the legal direct
+            // executable/local symbol in reserved %rcx, then consume the
+            // scaled index in one memory operand. This avoids separately
+            // materializing the shift, add, and derived pointer.
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
+            Self::sib_mem64("rcx", index_name, shift)
+        } else {
+            Self::sib_mem64_sym(sym, index_name, shift)
+        };
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
 
@@ -1577,7 +1589,7 @@ impl X86Codegen {
         shift: u8,
         ty: IrType,
     ) -> bool {
-        if self.state.pic_mode {
+        if self.state.needs_got_for_addr(sym) {
             return false;
         }
         let Some(&x) = self.reg_assignments.get(&index.0) else {
@@ -1586,7 +1598,15 @@ impl X86Codegen {
         if is_xmm_reg(x) {
             return false;
         }
-        let mem = Self::sib_mem64_sym(sym, phys_reg_name(x), shift);
+        let index_name = phys_reg_name(x);
+        let mem = if self.state.pic_mode {
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
+            Self::sib_mem64("rcx", index_name, shift)
+        } else {
+            Self::sib_mem64_sym(sym, index_name, shift)
+        };
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }
 
