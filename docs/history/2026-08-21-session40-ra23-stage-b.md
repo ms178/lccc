@@ -19,4 +19,4 @@ Follow-up in the same session added:
 - MachInst producer and consumer instructions both fail closed on point-constrained accumulator locations;
 - Tier-2 occupancy now includes every IR definition write, including multi-def phi Copies.
 
-The Tier-2 gate remains research-only: huft and SQLite still crash with coloring enabled, proving another alias/live-through edge class remains. Default codegen is clean at 382/382 regressions.
+Final follow-up partitions copy aliases/roots, phi incoming webs, multi-def values, asm outputs, vectors, and protected values out of ordinary coloring. With definition-write points included, huft and SQLite pass; Tier-2 is production default with `CCC_NO_TIER2_GRAPH` as kill switch. huft's frame improves 1848→1832 bytes. Final gates: 382/382 regressions, 600/600 phi CFG, 540/540 alias differential.

@@ -802,15 +802,10 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         return;
     }
 
-    // The old implementation permanently disabled Tier-2 sharing because
-    // fat intervals allowed accumulator spill stores to collide in SQLite.
-    // The live graph colorer uses hole-aware segments and conservative CLOSED
-    // boundaries, so same-point hidden stores can never alias. It still cannot
-    // model the accumulator's non-IR materialization lifetime (RA-23): broad
-    // differential testing found huft/sqlite crashes and phi-CFG mismatches.
-    // Keep the improved colorer wired for research, but fail closed by default
-    // until RA-23 makes those hidden lifetimes explicit.
-    if !coalesce || std::env::var_os("CCC_ENABLE_TIER2_GRAPH").is_none() {
+    // RA-23 makes accumulator homes explicit and the caller quarantines
+    // copy/phi/multi-def webs whose edge semantics are resolved later. Ordinary
+    // SSA values use hole-aware closed-boundary coloring by default.
+    if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() {
         for mbv in multi_block_values {
             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
