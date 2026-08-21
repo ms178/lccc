@@ -112,17 +112,28 @@ pub(crate) fn forms_disjoint(
     if !same_frame && (load.march != 0 || store.march != 0) {
         return false;
     }
-    let d = store.konst - load.konst;
-    let dm = store.march - load.march;
+    let Some(d) = store.konst.checked_sub(load.konst) else { return false; };
+    let Some(dm) = store.march.checked_sub(load.march) else { return false; };
     if dm == 0 {
-        // Constant separation (also covers lockstep-equal marches).
-        return store.konst >= load.konst + load_sz || load.konst >= store.konst + store_sz;
+        let a = load.konst.checked_add(load_sz).is_some_and(|end| store.konst >= end);
+        let b = store.konst.checked_add(store_sz).is_some_and(|end| load.konst >= end);
+        return a || b;
     }
-    if dm > 0 {
-        // Separation grows with t: minimal at t=0.
-        d >= load_sz
-    } else {
-        // Separation shrinks with t: maximal overlap at t=0.
-        d + store_sz <= 0
+    if dm > 0 { d >= load_sz } else { d.checked_add(store_sz).is_some_and(|end| end <= 0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn form(konst: i64, march: i64) -> LinForm {
+        LinForm { root: 1, syms: vec![], konst, march }
+    }
+    #[test]
+    fn overflow_fails_closed() {
+        assert!(!forms_disjoint(&form(i64::MIN, 0), 8, &form(i64::MAX, 0), 8, true));
+    }
+    #[test]
+    fn separated_forms_prove() {
+        assert!(forms_disjoint(&form(0, 0), 8, &form(8, 0), 4, true));
     }
 }
