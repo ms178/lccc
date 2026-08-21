@@ -357,6 +357,24 @@ pub fn calculate_stack_space_common(
         }
     }
 
+    // Values participating in location rewrites are not ordinary SSA webs.
+    // Copy aliases are resolved after Tier-2, multi-def values have several
+    // emission stores, and phi incoming values are live on predecessor edges.
+    // Keep them unique until the colorer models those edge/alias constraints.
+    let mut tier2_location_sensitive = ctx.multi_def_values.clone();
+    tier2_location_sensitive.extend(ctx.phi_incoming_values.iter().copied());
+    for (&alias, &root) in &ctx.copy_alias {
+        tier2_location_sensitive.insert(alias);
+        tier2_location_sensitive.insert(root);
+    }
+    for mbv in &multi_block_values {
+        if tier2_location_sensitive.contains(&mbv.dest_id)
+            || state.asm_output_values.contains(&mbv.dest_id)
+        {
+            state.protected_slot_values.insert(mbv.dest_id);
+        }
+    }
+
     // Phase 4: Tier 2 — liveness-based packing for multi-block values.
     slot_assignment::assign_tier2_liveness_packed_slots(
         state, coalesce, cached_liveness, func,
