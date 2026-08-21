@@ -1,6 +1,6 @@
 # Current compiler state
 
-SHA at last doc refresh: **`a8d1b781`** (`ms178/lccc` main, PR #164; RA-24 patch rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
+SHA at last doc refresh: **`2f81cdce`** (`ms178/lccc` main, PR #165; explicit-accumulator/AB-14 patch based here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
 
 ## What is production
 
@@ -53,7 +53,7 @@ Not all dead code should be deleted. Some is sound infrastructure blocked by a h
 
 ## Hard blockers for RA improvements
 
-1. **`immediately_consumed`** (`stack_layout/copy_coalescing.rs:1328` `compute_immediately_consumed` + `is_safe_sole_consumer`) hard-codes the accumulator codegen's operand load order. Any RA change placing a "would-be immediately consumed" value in a non-accumulator register will miscompile. Must be refactored to RA-owned accumulator hint before RA can own placement (RA-23).
+1. **RA-23 PARTIAL:** register and accumulator homes share `ExplicitLocation`; parallel state sets are gone. The remaining blocker is `compute_immediately_consumed`/`is_safe_sole_consumer`, which still derives accumulator legality from backend load order. Move that decision into RA before enabling Tier-2 graph coloring.
 2. **RA-24 DONE:** register-homed pointers resolve as `SlotAddr::Reg(PhysReg)`. Shared codegen, soft-F128, x86/x87, i686, AArch64, and RISC-V consume the exact home; the fake offset-zero convention is deleted and future missing consumers fail exhaustiveness checking.
 3. **Lifetime demotion** (`live_range.rs:26-27`): "There is no reload-at-next-use in this module." 3-5× spill traffic vs LLVM. `segments` infrastructure is built but the scan doesn't use it for splitting (RA-05/RA-06).
 4. **RA-13 DONE:** final assignments are verified with coalesce/phi equivalence classes and hole-aware O(n log n) sweeps; `handled` additionally verifies actual register occupancy through expiration/eviction cut points. `CCC_VERIFY_REGALLOC` hard-aborts.

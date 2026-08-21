@@ -21,6 +21,12 @@ use crate::ir::reexports::{BlockId, IrCmpOp, Operand};
 #[derive(Debug, Clone, Copy)]
 pub struct StackSlot(pub i64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitLocation {
+    Reg(crate::backend::regalloc::PhysReg),
+    Accumulator,
+}
+
 /// Register cache entry: tracks which IR value is known to be in a register.
 /// The `is_alloca` flag distinguishes whether the register holds the alloca's
 /// address (leaq/adr) or the value loaded from the stack slot (movq/ldr).
@@ -333,8 +339,9 @@ pub struct CodegenState {
     /// reducing stack frame sizes by ~40%. Store/load paths check this set to
     /// emit 4-byte instructions (movl, sw/lw, str/ldr w-reg) instead of 8-byte.
     pub small_slot_values: FxHashSet<u32>,
-    /// Exact physical homes for values with no stack slot.
-    pub reg_assigned_locations: FxHashMap<u32, crate::backend::regalloc::PhysReg>,
+    /// Explicit non-stack homes. Register and accumulator residency share one
+    /// location contract rather than parallel convention sets.
+    pub explicit_locations: FxHashMap<u32, ExplicitLocation>,
     /// Values that are promoted InlineAsm output results. Like allocas, their
     /// stack slot holds the value directly (not a pointer). The asm emitter
     /// stores the output register to this slot after the asm, and subsequent
@@ -381,11 +388,7 @@ pub struct CodegenState {
     /// Whether to emit CFI directives (.cfi_startproc, .cfi_endproc, etc.)
     /// for generating .eh_frame unwind tables. Enabled by default (like GCC).
     pub emit_cfi: bool,
-    /// Values that are consumed by the very next instruction and have no other
-    /// uses. These values can stay in the accumulator register cache without
-    /// being stored to a stack slot. Populated during stack layout; used by
-    /// store_rax_to / store_eax_to to skip the store.
-    pub immediately_consumed: FxHashSet<u32>,
+
     /// Floating-point constant pool: maps bit pattern → label name.
     /// FP constants are emitted as .rodata entries and loaded via
     /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
@@ -454,7 +457,7 @@ impl CodegenState {
             no_jump_tables: false,
             weak_extern_symbols: FxHashSet::default(),
             small_slot_values: FxHashSet::default(),
-            reg_assigned_locations: FxHashMap::default(),
+            explicit_locations: FxHashMap::default(),
             asm_output_values: FxHashSet::default(),
             protected_slot_values: FxHashSet::default(),
             debug_info: false,
@@ -468,7 +471,7 @@ impl CodegenState {
             data_sections: false,
             needs_divdi3_helpers: false,
             emit_cfi: true,
-            immediately_consumed: FxHashSet::default(),
+
             fp_const_pool: FxHashMap::default(),
             next_block_label: None,
         }
@@ -582,7 +585,7 @@ impl CodegenState {
         self.small_slot_values.clear();
         self.vector_values.clear();
         self.protected_slot_values.clear();
-        self.reg_assigned_locations.clear();
+        self.explicit_locations.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();
         self.vec_last_store_slot = None;
@@ -810,6 +813,11 @@ pub enum SlotAddr {
 }
 
 impl CodegenState {
+    #[inline]
+    pub fn is_accumulator_location(&self, val_id: u32) -> bool {
+        matches!(self.explicit_locations.get(&val_id), Some(ExplicitLocation::Accumulator))
+    }
+
     /// Classify how to access a value's effective address.
     /// Returns `None` if the value has no assigned stack slot (and isn't register-assigned).
     pub fn resolve_slot_addr(&self, val_id: u32) -> Option<SlotAddr> {
@@ -839,8 +847,8 @@ impl CodegenState {
             } else {
                 Some(SlotAddr::Indirect(slot))
             }
-        } else if let Some(&reg) = self.reg_assigned_locations.get(&val_id) {
-            Some(SlotAddr::Reg(reg))
+        } else if let Some(ExplicitLocation::Reg(reg)) = self.explicit_locations.get(&val_id) {
+            Some(SlotAddr::Reg(*reg))
         } else {
             None
         }
@@ -855,8 +863,11 @@ mod slot_addr_tests {
     #[test]
     fn register_home_is_explicit_and_exact() {
         let mut state = CodegenState::new();
-        state.reg_assigned_locations.insert(17, PhysReg(14));
+        state.explicit_locations.insert(17, ExplicitLocation::Reg(PhysReg(14)));
         assert!(matches!(state.resolve_slot_addr(17), Some(SlotAddr::Reg(PhysReg(14)))));
         assert!(state.get_slot(17).is_none());
+        state.explicit_locations.insert(18, ExplicitLocation::Accumulator);
+        assert!(state.is_accumulator_location(18));
+        assert!(state.resolve_slot_addr(18).is_none());
     }
 }

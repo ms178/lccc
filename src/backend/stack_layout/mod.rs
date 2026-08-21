@@ -314,12 +314,15 @@ pub fn calculate_stack_space_common(
     //          dead param allocas, alloca coalescability, copy aliases).
     let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, lhs_first_binop, &cached_liveness);
 
-    // Preserve exact physical homes; no fabricated stack address.
-    state.reg_assigned_locations = reg_assigned.clone();
-
-    // Propagate the immediately-consumed set to CodegenState so that
-    // store_rax_to / store_eax_to can skip the store for these values.
-    state.immediately_consumed = ctx.immediately_consumed.clone();
+    // Publish every explicit non-stack home through one location contract.
+    state.explicit_locations.clear();
+    for &id in &ctx.immediately_consumed {
+        state.explicit_locations.insert(id, crate::backend::state::ExplicitLocation::Accumulator);
+    }
+    for (&id, &reg) in reg_assigned {
+        // A real allocated register wins over the accumulator hint.
+        state.explicit_locations.insert(id, crate::backend::state::ExplicitLocation::Reg(reg));
+    }
 
     // vector-intrinsic results that can skip their slot store (their only
     // use is the adjacent intrinsic's args[0]/args[1] load).
