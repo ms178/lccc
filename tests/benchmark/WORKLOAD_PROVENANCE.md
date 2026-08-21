@@ -85,6 +85,25 @@ glibc_memcmp     2158787064
 This validates the benchmark harnesses and catches common optimization-level
 miscompilations; it is not a proof of full parent-project behavior.
 
+## Common algorithm microbenchmarks
+
+The following files are self-contained algorithms written for this repository
+(no copied upstream code, MIT/Apache-2.0 dual-license as with the rest of LCCC)
+to broaden coverage beyond the original synthetic set while retaining exact,
+fast cross-compiler output oracles:
+
+| Benchmark | Shape | Primary stresses | Deterministic oracle |
+|---|---|---|---|
+| `ascii_case_fold` | byte parser loop | byte loads, compare/branch/select, dependent accumulator | fixed ASCII table and FNV-style checksum |
+| `binary_search` | sorted table lookup | midpoint splitting, branch-heavy search, array loads | sum of successful search indices |
+| `ring_fifo` | SPSC bounded queue | mask-based wrap, producer/consumer state, dependent load/store | final FNV/LCG stream checksum |
+| `histogram` | 256-bin reduction | scattered indexed increments, loop reduction, 64-bit sum | total count and final checksum |
+
+These are not substitutes for gzip/zlib-ng/expat/SQLite/glibc/kernel extracts;
+they are stable screening kernels for regressions in addressing, branches,
+register allocation, and memory-op folding before graduating to the pinned
+end-to-end workloads.
+
 ## What these kernels can and cannot establish
 
 They can isolate code-generation questions such as:

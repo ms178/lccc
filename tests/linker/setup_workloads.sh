@@ -56,13 +56,20 @@ fetch() { # fetch <url> <tarball> <dir>
 
 # ---------------------------------------------------------------------------
 # zlib-ng — CMake, no autotools fragility
+#
+# Keep this on the same release as archpkgbuilds/packages/zlib-ng/PKGBUILD and
+# tests/benchmark/WORKLOAD_PROVENANCE.md (currently 2.3.3).  The older 2.2.4
+# reference predates the benchmark corpus and silently made the linker-workload
+# oracle compare against a different implementation than the codegen oracle.
 # ---------------------------------------------------------------------------
-ZNG_DIR=zlib-ng-2.2.4
+ZNG_VERSION=2.3.3
+ZNG_DIR=zlib-ng-${ZNG_VERSION}
 if [[ -f "$ZNG_DIR/build/libz.a" && $CLEAN -eq 0 ]]; then
-  log "zlib-ng already built"
+  log "zlib-ng $ZNG_VERSION already built"
 else
-  log "building zlib-ng"
-  fetch https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.2.4.tar.gz \
+  log "building zlib-ng $ZNG_VERSION"
+  rm -rf zlib-ng-2.2.4
+  fetch "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/${ZNG_VERSION}.tar.gz" \
         zlib-ng.tar.gz "$ZNG_DIR"
   cmake -S "$ZNG_DIR" -B "$ZNG_DIR/build" \
         -DCMAKE_BUILD_TYPE=Release -DZLIB_COMPAT=ON -DWITH_GTEST=OFF \

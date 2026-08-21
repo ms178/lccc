@@ -67,6 +67,61 @@ fn reg32_name(fam: u8) -> Option<&'static str> {
 /// truncates the upper 32 bits)? Note: the 32-bit names are eax/ebx/ecx/edx/
 /// esi/edi/ebp/esp/r8d..r15d; the 8-bit names are al/bl/cl/dl/sil/dil/bpl/spl/
 /// r8b..r15b.
+fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if toks.is_empty() {
+        return false;
+    }
+    let op = toks[0];
+    let needle32 = if dst32.starts_with('%') { dst32.to_string() } else { format!("%{dst32}") };
+    let has_32 = toks.iter().any(|tok| tok.trim_end_matches(',') == needle32);
+    if !has_32 {
+        return false;
+    }
+    // If the same instruction names the 64-bit register, it may be a true
+    // 64-bit consumer despite also mentioning a 32-bit alias in an addressing
+    // expression.  Leave those to IR/RA rather than guessing in text.
+    let trimmed = dst32.trim_start_matches('%');
+    // Never narrow a copy into %esp/%ebp.  They are not general allocable homes
+    // in this backend, and later text passes may need the 64-bit frame/stack
+    // copy (for example copy-shift-copyback uses %rbp as a temporary that is
+    // later consumed by a 64-bit LEA).
+    if matches!(trimmed, "esp" | "ebp") {
+        return false;
+    }
+    // r8d/r15d may still be consumed by a 64-bit operation on the same line
+    // through their `%r8`/`%r15` alias. Reject that conservatively.
+    if trimmed.starts_with('r') && trimmed.ends_with('d')
+        && trimmed[1..trimmed.len() - 1].bytes().all(|b| b.is_ascii_digit())
+    {
+        let d64 = format!("%{}", &trimmed[..trimmed.len() - 1]);
+        if toks.iter().any(|tok| tok.trim_end_matches(',') == d64) {
+            return false;
+        }
+    }
+    let d64 = match trimmed {
+        "eax" => "%rax", "ecx" => "%rcx", "edx" => "%rdx", "ebx" => "%rbx",
+        "esi" => "%rsi", "edi" => "%rdi",
+        other if other.starts_with('r') && other.ends_with('d')
+            && other[1..other.len() - 1].bytes().all(|b| b.is_ascii_digit()) => "",
+        _ => return false,
+    };
+    if toks.iter().any(|tok| tok.trim_end_matches(',') == d64) {
+        return false;
+    }
+    // 32-bit arithmetic/logical moves and branches consume/write the low 32
+    // bits and zero the upper half.  Restrict to the common integer forms;
+    // unusual mnemonics are deliberately left unchanged.
+    matches!(
+        op,
+        "movl" | "addl" | "subl" | "andl" | "orl" | "xorl" | "cmpl" | "testl"
+            | "leal" | "imull" | "sall" | "shll" | "shrl" | "sarl"
+            | "movzbl" | "movzwl" | "cmovl" | "cmovel" | "cmovnel"
+            | "cmovsl" | "cmovns" | "cmovgl" | "cmovgel" | "cmovll"
+            | "cmovlel" | "cmovbl" | "cmovael" | "cmovbel" | "cmoval"
+    )
+}
+
 fn is_32bit_or_smaller(name: &str) -> bool {
     let n = name.trim_start_matches('%');
     match n {
@@ -254,6 +309,73 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             }
         }
 
+        // --- Pattern: 64-bit copy of a known zero-extended value ---
+        //
+        // Register allocation often emits a type-erased `movq %src64, %dst64`
+        // for a value that is known to live in the low 32 bits.  On x86-64 a
+        // 32-bit `movl` zero-extends the destination, so when `src` is already
+        // upper-32-zero the two moves are architecturally identical.  `movl`
+        // is one byte shorter (no REX.W), avoids a 64-bit dependency, and can
+        // remove an artificial whole-64-bit live range in hot integer loops
+        // (for example a CRC table index after byte XOR/AND).
+        //
+        // Only register-to-register copies are rewritten: a memory source may
+        // contain an arbitrary 64-bit value, and immediate operands are left
+        // to other constant-materialization patterns.
+        if t.starts_with("movq") && !t.contains('(') {
+            if let Some(comma) = t.find(',') {
+                const MOVQ_LEN: usize = "movq".len();
+                let so = MOVQ_LEN;
+                let mut so = so.min(t.len());
+                while so < t.len() && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
+                    so += 1;
+                }
+                if so < comma && comma < t.len() {
+                    let src = t[so..comma].trim();
+                    let dst = t[comma + 1..].trim();
+                    if src.starts_with('%') && dst.starts_with('%') {
+                        if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
+                            if (sf as usize) < GP_FAMILIES && (df as usize) < GP_FAMILIES {
+                                // The text peephole has no IR type information.
+                                // Treat this as a local instruction-selection
+                                // cleanup only when the immediately following
+                                // machine instruction consumes or overwrites
+                                // the 32-bit destination form.  That is exactly
+                                // enough for type-erased RA copies feeding
+                                // `xorl`/`andl` and avoids changing a 64-bit
+                                // pointer/address live range that may cross
+                                // labels/calls/64-bit consumers.  Do not require
+                                // global state: after the first copy is narrowed
+                                // the next copy's source is itself a 32-bit move
+                                // not represented in the historical state.
+                                if let Some(d32) = reg32_name(df) {
+                                    let next = (i + 1..lines.len())
+                                        .map(|j| lines[j].trim())
+                                        .find(|candidate| {
+                                            !candidate.is_empty()
+                                                && !candidate.starts_with('.')
+                                                && !candidate.ends_with(':')
+                                        });
+                                    if next.is_some_and(|candidate| {
+                                        candidate_uses_32bit_dest(candidate, d32)
+                                    }) {
+                                        if let Some(s32) = reg32_name(sf) {
+                                            lines[i] = format!("    movl %{}, %{}", s32, d32);
+                                            changed = true;
+                                            upper32_zero[df as usize] = true;
+                                            is_byte[df as usize] = is_byte[sf as usize];
+                                            is_16[df as usize] = is_16[sf as usize];
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Update flags based on this instruction ---
         self_update(t, &mut upper32_zero, &mut is_byte, &mut is_16);
     }
@@ -281,6 +403,21 @@ fn self_update(
     let toks: Vec<&str> = t.split_whitespace().collect();
     if toks.is_empty() { return; }
     let op = toks[0];
+
+    // Calls clobber the full 64-bit values of caller-saved registers.  The
+    // assembly line for a direct call often contains no `%reg`, so the generic
+    // operand scan below would not invalidate any state.  Clear all tracked
+    // families conservatively: losing one extension/copy-narrowing across a
+    // call is harmless; trusting stale upper-32-zero state across a call can
+    // miscompile a later 64-bit copy.
+    if op == "call" || op == "callq" {
+        for flags in [&mut *upper32_zero, &mut *is_byte, &mut *is_16] {
+            for value in flags.iter_mut() {
+                *value = false;
+            }
+        }
+        return;
+    }
 
     // movq %regA, %regB : copies both flags from A to B.
     // movq from MEMORY or IMMEDIATE: the destination holds an opaque 64-bit
@@ -414,5 +551,41 @@ fn self_update(
             }
         }
         let _ = cleared;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eliminate_redundant_zero_extend;
+
+    fn run(input: &str) -> String {
+        let mut asm = input.to_string();
+        assert!(eliminate_redundant_zero_extend(&mut asm));
+        asm
+    }
+
+    #[test]
+    fn narrows_known_zero_extended_register_copy() {
+        let asm = run(
+            "crc32_update:\n\
+             \x20   movzbl (%rdx), %r8d\n\
+             \x20   movl %esi, %eax\n\
+             \x20   movq %r8, %rcx\n\
+             \x20   xorl %ecx, %eax\n\
+             \x20   movq %rax, %r8\n\
+             \x20   andl $255, %r8d\n"
+        );
+        assert!(asm.contains("movl %r8d, %ecx"), "asm was:\n{asm}");
+        assert!(asm.contains("movl %eax, %r8d"), "asm was:\n{asm}");
+        assert!(!asm.contains("movq %r8, %rcx"));
+        assert!(!asm.contains("movq %rax, %r8"));
+    }
+
+    #[test]
+    fn does_not_narrow_opaque_memory_load_copy() {
+        let input = "f:\n    movq (%rdx), %rax\n    movq %rax, %rcx\n";
+        let mut asm = input.to_string();
+        assert!(!eliminate_redundant_zero_extend(&mut asm));
+        assert_eq!(asm, input);
     }
 }

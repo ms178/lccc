@@ -37,6 +37,14 @@ for src in "$dir"/*.c; do
   # symbol values, or cannot even compile the construct) — the test still runs
   # under lccc and must pass, but the invalid GCC comparison is skipped.
   LCCC_NO_COMPARE=0
+  # A sibling .txt file is a text marker used by some lccc-specific conformance
+  # tests.  The conventional content "LCCC_NO_COMPARE=1" means the test must
+  # compile and run under lccc, but GCC is known to be a defective default-mode
+  # oracle for it (wrong C mode, missing -lm, unsupported kernel construct,
+  # host ISA mismatch, or exact-output mismatch on a tolerance-only check).
+  if [ -f "$dir/$name.txt" ] && grep -q '^LCCC_NO_COMPARE=1$' "$dir/$name.txt"; then
+      LCCC_NO_COMPARE=1
+  fi
   # Per-test env vars must not LEAK into later tests (set -a exports persist
   # across loop iterations: vectorize_f32_sum_sse2.env's LCCC_FORCE_SSE2=1
   # silently switched every alphabetically-later test to the SSE2 path).
