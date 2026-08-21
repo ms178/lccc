@@ -83,6 +83,20 @@ impl X86Codegen {
                 }
             }
         }
+        // A 32-bit-or-smaller integer returned from a function is represented in
+        // %eax with bits 32..63 zeroed (SysV AMD64).  The generic loader uses
+        // 64-bit moves for GPR homes, which leaves artificial 64-bit copies in
+        // tiny boolean/classifier functions.  Emit the zero-extending 32-bit
+        // load directly; this matches GCC/Clang and avoids exposing a 64-bit
+        // return live range to the register allocator.
+        let ret_ty = self.current_return_type;
+        if ret_ty.is_integer() && ret_ty.size() <= 4 {
+            if let Some(val) = val {
+                self.operand_to_rax_i32(val);
+            }
+            self.emit_epilogue_and_ret_impl(frame_size);
+            return;
+        }
         crate::backend::traits::emit_return_default(self, val, frame_size);
     }
 

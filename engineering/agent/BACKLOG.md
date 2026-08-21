@@ -141,7 +141,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 34 | IS-03 | DONE | AVX2 64-byte assignment → 2 YMM load/store pairs + `vzeroupper`; safe leaf DCE removes dead parameter homes and the entire frame/setup | x86 memcpy + target feature contract + DCE | **G/M** 6 instructions, exact parity with GCC16.2/Clang22.1/ICX latest (ICC 9); runtime exact; baseline ISA remains XMM | structural/runtime regression | use YMM for 32/48 B (measured slower) |
 | 35 | IS-04 | P0 | Vectorizer emit `vfmadd231pd` into YMM acc **once** horiz | `vectorize.rs` + `intrinsics.rs` | **G** **icx** not gcc16; spectral ICX FMA 10 | `dot`/spectral CE vs icx | copy gcc16 per-iter hadd |
 | 36 | IS-05 | P1 | Mem-op `vmulpd (%rdi),…` | ISel fold | **G** | mem operand in vec loop | fold aliased |
-| 37 | IS-06 | P1 | `btq` / bitset classify | `simplify.rs` + emit | **G** gcc name_scan; **M** 1.95× | `btq` in name_scan | mega-inline varint |
+| 37 | IS-06 | P1 / partial (peephole landed 2026-08-21 session 37) | `btq` / bitset classify | `simplify.rs` + emit + `fold_variable_bit_test` | **G** gcc name_scan; **M** 1.95×; peephole now converts `shrq %cl; andq $1; cmpq; setne` to `btq; setc` | `btq` in name_scan after if-conversion/select pipeline | mega-inline varint |
 | 38 | IS-07 | P1 | `cmov` limit idiom | `if_convert.rs` | **G** gcc match `cmovc` | cmov in match | if-convert huge blocks |
 | 39 | IS-08 | P1 | Load-cast fold remaining | `prologue.rs` load_cast | **C** 33% gzip-9 was movzbl | leftover movzbl down | disable `CCC_NO_LOAD_CAST_FOLD` globally without measure |
 | 40 | IS-09 | P1 | Cmp-replay only from **slots** | keep | **C** sqlite `yy_shift` | no sqlite SEGV | replay from physreg |
@@ -149,7 +149,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 42 | IS-11 | P1 | C `__ffs` if-tree → gcc **`andn`+`cmov` chain** (not tzcnt) | `bit_idioms.rs`, `alu.rs` | **G** gcc cmov×11, **not** tzcnt; 1.85× | find_bit CE vs gcc | blindly emit tzcnt |
 | 43 | IS-12 | DONE | Adjacent single-use `not`+`and` → BMI1 `andn{l,q}`, direct physical sources, baseline ISA gated | CodegenOptions + shared fusion + x86 ALU | **M** linux_find_bit 1.04x faster vs control, 1.42x behind GCC | BMI/no-BMI runtime+assembly regression | emit without BMI contract |
 | 44 | IS-13 | P1 | ALU+mem for spilled | peephole | ICX lookalike | fewer reloads | change RA homes |
-| 45 | IS-14 | P1 | Dead `movq %r,%r` | peephole | **C** | 0 identity mov | delete live copies |
+| 45 | IS-14 | DONE (2026-08-21 session 37) | 32-bit integer returns now use `operand_to_rax_i32`; self-moves remain covered by the existing `SelfMove` peephole | `returns.rs`, `emit.rs`, `check_return_32bit_zeroext.sh` | **C/M** leaf boolean/classifier returns use `movl`/`xorl`, not `movq` | structural regression | delete live copies |
 | 46 | IS-15 | P1 | Redundant `movslq` on indices | narrow vs backend | **C** DOOM −390; rest is GEP | fewer movslq | break GEP signedness |
 | 47 | IS-16 | P2 | Match inner 258 B with `pcmpeqb` | vectorize | spike | gzip gate | ship without CRC/adler oracles |
 | 48 | IS-17 | P1 | MachInst profit model ≠ 32-inst cutoff | `prologue.rs:812` | **C** gzip −3% | beat gzip then raise | `CCC_MI_FORCE_LOOPS` |
