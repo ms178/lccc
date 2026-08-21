@@ -18,5 +18,7 @@ C
 body=$(sed -n '/^copy64:/,/^\.size copy64/p' "$tmp/v3.s")
 [[ $(grep -c 'vmovdqu.*%ymm' <<<"$body") -eq 4 ]]
 grep -q 'vzeroupper' <<<"$body"
+! grep -Eq '(subq|addq).*%rsp|movq[[:space:]]+%rsi,[[:space:]]*%rax' <<<"$body"
+[[ $(grep -Ec '^[[:space:]]+(v?mov|vzeroupper|ret)' <<<"$body") -eq 6 ]]
 "$CCC" -O2 -S "$tmp/t.c" -o "$tmp/base.s"
 ! grep -q '%ymm' "$tmp/base.s"

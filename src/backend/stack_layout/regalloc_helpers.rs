@@ -186,6 +186,9 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     // went to a nonexistent home: fptest.c returned garbage at O2 (exit 1 vs
     // GCC's 23.0). 64-bit gate fixes it (fptest exit 0).
     let xmm_regs = if available_regs.iter().any(|r| r.0 == 1)
+        // PhysReg IDs are target-local: RISC-V also has s1=1. Require
+        // x86-64's caller pool marker (%r10=10) before opening XMM homes.
+        && caller_saved_regs.iter().any(|r| r.0 == 10)
         && !crate::common::types::target_is_32bit()
         && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
         && !disable_scalar_fp_xmm

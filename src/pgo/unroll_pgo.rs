@@ -119,6 +119,28 @@ pub fn should_unroll_loop(
         None
     }
 }
-pub fn vectorize_gate(_: &IrFunction, _: Option<&ProfileData>) -> bool {
-    true
+/// Exact per-loop PGO profitability veto. Absence of profile data leaves the
+/// vectorizer's static model unchanged; profile data may veto but never force
+/// an otherwise illegal transform.
+pub fn should_vectorize_loop(f: &IrFunction, header_idx: usize, body_insts: usize) -> Option<bool> {
+    if std::env::var("LCCC_PGO_NO_VECTOR_GATE").is_ok() || !crate::pgo::prepass_is_active() {
+        return None;
+    }
+    Some(vectorize_profitable(trip_count(f, header_idx)?, body_insts))
+}
+
+#[inline]
+fn vectorize_profitable(trip: u64, body_insts: usize) -> bool {
+    trip >= 8 && !(body_insts > 80 && trip < 32)
+}
+
+#[cfg(test)]
+mod vector_gate_tests {
+    use super::vectorize_profitable;
+    #[test] fn short_loops_are_rejected() {
+        assert!(!vectorize_profitable(7, 8)); assert!(vectorize_profitable(8, 8));
+    }
+    #[test] fn large_loops_need_amortization() {
+        assert!(!vectorize_profitable(16, 81)); assert!(vectorize_profitable(32, 81));
+    }
 }

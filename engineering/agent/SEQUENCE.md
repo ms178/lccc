@@ -34,7 +34,7 @@ Re-oracle and check gzip `longest_match` stack-mem after **each** item.
 | 16 | RA-13 | **DONE:** hard segment/final verifier plus handled eviction-history verifier. |
 | 17 | RA-26 | **DONE conservatively:** scalar non-sret SysV/AArch64 ParamRef hints; mixed ABI signatures refuse. |
 | 18 | P0-04 / OP-01 | **DONE:** shared alias engine in LICM, targeted hoist plus full differential validation. |
-| 19 | P0-05 / FE-01 | Sema type-checking (correctness, not UX). |
+| 19 | P0-05 / FE-01 | **DONE for core constraints:** sema rejects invalid assignments, prototype arity, and return-value mismatches with direct/indirect-call coverage. |
 | 20 | RA-25 / OP-31 | Unify `loop_memory_promote` alias engine with `alias.rs`. |
 
 Veto: gzip match stack-mem. Stop if sqlite/expat miscompile.

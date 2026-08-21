@@ -34,11 +34,11 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 
 **D. Accumulator is still the ISA.** FP struct fields still `movq %xmm,%rax; movq %rax,%xmmN` (`struct_copy` 21.06×). `immediately_consumed` hard-codes the accumulator load order (RA-23).
 
-**E. Sema is a stub.** `src/frontend/sema/analysis.rs:15`: "This pass does NOT reject programs with type errors (yet); it collects information for the lowerer. Full type checking is TODO." 13 diagnostics in sema (up from 1) — still a stub. No IR `noalias`/`restrict`.
+**E. Sema now enforces core constraints.** Assignment, return, and fixed-prototype arity diagnostics run before lowering (P0-05/FE-01). Remaining frontend type work is canonical anonymous aggregate identity and broader operator constraints. IR already preserves pointer `noalias`; broader TBAA remains open.
 
 **F. Alias is loop-SCEV-lite, underutilized.** `alias.rs` (128 LOC) has `LoopFrames`, `resolve_in_frame`, `forms_disjoint`. Consumed by `redundant_loads` only. LICM does **not** call it for GEP loads (`licm.rs:750` TODO). `loop_memory_promote.rs` (1712 LOC) has its own duplicated `affine_disjoint` engine (RA-25 unifies).
 
-**G. PGO cannot talk to RA.** `CCC_PGO_WEIGHT_MAX` default 1 (gzip +4.7% at 4). Layout must not reorder (expat 131→248 ms). `vectorize_gate` ignores profile (`unroll_pgo.rs:122` `return true`).
+**G. PGO remains conservative.** `CCC_PGO_WEIGHT_MAX` default 1 (gzip +4.7% at 4), and layout must not reorder (expat 131→248 ms). Vectorization now consumes exact per-loop trip/body cost; RA profile weighting remains intentionally capped.
 
 **H. Dual coalescers.** RA copy-groups vs `stack_layout/copy_coalescing.rs`.
 
@@ -99,7 +99,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 3 | P0-02 | PARTIAL | i686 residual segment coloring now fills holes in already-saved callee regs without eviction/new saves; full split scan remains RA-05/06 | `regalloc.rs` | **M** boot C text -1,573 B, stack refs -13.1% | full xmltok/inflate treatment after RA-23 | pretend residual fill is reload-at-next-use |
 | 4 | P0-03 | DONE | Re-measured pinned gzip 1.14 on `50e7ac83` + patch | workload artifacts | **M** 30/30 tests; longest_match LCCC 303 insn/119 stack-mem vs GCC 114/0; treatment equals kill-switch control | numbers recorded in session doc | cite old 118 |
 | 5 | P0-04 | DONE | LICM now uses shared `LinForm`/`forms_disjoint`; resolver gains checked Shl scaling; calls/atomics/unresolved stores fail closed | `licm.rs`, `loop_memory_promote.rs`, `alias.rs` | **M** invariant `a[0]` hoisted across marching `a[i+1]` store; 720 alias + 600 phi cases clean | targeted regression | invent second engine |
-| 6 | P0-05 | P0 | **Sema type-checking** (was FE-01 P1; reprioritized P0 for correctness — "does NOT reject type errors" at `analysis.rs:15` is a silent-wrong-code risk) | `sema/analysis.rs` | **C** line 15 TODO; 13 diagnostics vs ~382 in lowerer | incompatible assignments, wrong arg counts, missing returns rejected in sema | silence lowerer checks first |
+| 6 | P0-05 | DONE | Sema now rejects named-aggregate and incompatible-pointer assignments, direct/indirect prototype arity errors, and invalid valued/valueless returns; unspecified legacy prototypes remain permissive | `sema/analysis.rs` | **M** six-error negative corpus plus valid variadic/void*/function-pointer control; 50/50 correctness, 364 runnable regressions | diagnostics originate in semantic analysis | reject anonymous SIMD typedefs before type identity is canonical |
 
 ### 5.1 Register allocation — RA-01 … RA-26
 
@@ -137,7 +137,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 |---|----|---|------|-------|----------|--------|--------|
 | 32 | IS-01 | DONE | Masked byte-table indexes retain a safe hidden home; x86 emits scale-4 SIB table loads | RA hidden-index priority + existing indexed emitters | **M** CRC -12 B/-7 insn, 1.34x vs control, now 1.07x behind GCC | SIB regression + 600 phi fuzz | broad hidden homes before RA-23 |
 | 33 | IS-02 | P0 | Keep `double` fields in XMM; ban `movq %xmm,%rax` roundtrip | `float_ops.rs`, `memory.rs` | **S** 21× struct_copy | mov count ≤40 | keep rax shuttle |
-| 34 | IS-03 | DONE | AVX2 64-byte assignment → 2 YMM load/store pairs + `vzeroupper`; baseline ISA remains XMM | x86 memcpy + target feature contract | **M** copy kernel 55→38 bytes (-17) after ParamRef memcpy homes, runtime exact | structural/runtime regression | use YMM for 32/48 B (measured slower) |
+| 34 | IS-03 | DONE | AVX2 64-byte assignment → 2 YMM load/store pairs + `vzeroupper`; safe leaf DCE removes dead parameter homes and the entire frame/setup | x86 memcpy + target feature contract + DCE | **G/M** 6 instructions, exact parity with GCC16.2/Clang22.1/ICX latest (ICC 9); runtime exact; baseline ISA remains XMM | structural/runtime regression | use YMM for 32/48 B (measured slower) |
 | 35 | IS-04 | P0 | Vectorizer emit `vfmadd231pd` into YMM acc **once** horiz | `vectorize.rs` + `intrinsics.rs` | **G** **icx** not gcc16; spectral ICX FMA 10 | `dot`/spectral CE vs icx | copy gcc16 per-iter hadd |
 | 36 | IS-05 | P1 | Mem-op `vmulpd (%rdi),…` | ISel fold | **G** | mem operand in vec loop | fold aliased |
 | 37 | IS-06 | P1 | `btq` / bitset classify | `simplify.rs` + emit | **G** gcc name_scan; **M** 1.95× | `btq` in name_scan | mega-inline varint |
@@ -171,7 +171,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 60 | OP-01 | DONE | Shared linear-form alias proof wired into LICM with fail-closed store modeling | `licm.rs`, `alias.rs`, `loop_memory_promote.rs` | **M** targeted hoist; full differential clean | regression | model unknown writes |
 | 61 | OP-02 | BLOCKED | Dominator-aware SROA copy-out remains default-off | aggregate_sroa | **M** current flag does not transform struct_copy (+2.2% noise) and miscompiles `structs_bitfields` (return 15); attempted loop relaxation reverted | require dominance/ABI proof + full fuzz | enable raw flag |
 | 62 | OP-03 | P1 | SROA cross-block memcpy (same-block only now) | same | **C** | more scalarized fields | ignore dominance |
-| 63 | OP-04 | P0 | `vectorize_gate` real cost (trip, size, PGO) | `unroll_pgo.rs:122` | **C** `return true`; **G** clang sieve 365 ymm vs gcc 45 | no 4-iter vec; **no clang-sieve** | copy clang sieve |
+| 63 | OP-04 | DONE | Active vectorizer now asks a per-natural-loop PGO cost gate; exact trips <8 are rejected and bodies >80 instructions require ≥32 trips; unprofiled builds retain static policy | `unroll_pgo.rs`, `vectorize.rs` | **C/M** dead function-only gate removed; threshold unit tests; existing constant-trip regression retained | no short profiled vectorization; no function-wide switch | force-enable on profile heat alone |
 | 64 | OP-05 | P0 | Non-reduction FP loop vectorize (nbody YMM) | `vectorize.rs` (~6905) | **S** nbody 3.8× spectral 9.3×; **G** ICX nbody 97 ymm / 58 FMA vs gcc 0 ymm / 24 FMA | ymm+FMA vs ICX | copy gcc16 horiz-per-iter |
 | 65 | OP-06 | P0 | Horiz reduce **once** (ICX) not per-iter (gcc16) | vectorize | **G** | one hadd/pack at exit | gcc16 pattern |
 | 66 | OP-07 | P1 | Runtime alias versioning | none | **C** | versioned loops, checksums | version everything |
@@ -206,7 +206,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
-| 93 | FE-01 | P0 | Sema type diagnostics (not lowerer) — merged with P0-05 | `sema/analysis.rs:15` | **C** TODO line 15; ~1 vs ~382 | diagnostics in sema | silence lowerer checks first |
+| 93 | FE-01 | DONE | Core assignment/call/return constraints diagnosed in sema; legacy unspecified prototypes and anonymous SIMD identities handled conservatively | `sema/analysis.rs` | **M** `check_sema_constraints.sh`, full suites | diagnostics in sema | invent incompatible anonymous identities |
 | 94 | FE-02 | P1 | TBAA / `restrict` → IR | IR attrs | **C** noalias grep empty | attribute on IR | pretend alias is TBAA |
 | 95 | FE-03 | P2 | ExprId not pointer | lowering | **C** TODOs | stable ids | |
 | 96 | FE-04 | P2 | Vector subscript | frontend | **C** | | |
@@ -255,7 +255,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 |---|----|---|------|-------|----------|--------|--------|
 | 130 | PG-01 | P2 | Sample PGO | ideas high_sample | **C** | | |
 | 131 | PG-02 | P2 | Loop-versioned devirt | ideas | **C** | | |
-| 132 | PG-03 | P1 | vectorize_gate use profile | OP-04 | **C** | | ignore profile |
+| 132 | PG-03 | DONE | Exact pre-pass profile trip counts feed active per-loop vector profitability | OP-04 | **C/M** threshold units + active call site | short/large loops vetoed | ignore profile |
 | 133 | PG-04 | P1 | RA use block counts after RA-01 | pgo_weight | **C** | gzip gate | `PGO_WEIGHT_MAX>1` first |
 | 134 | PG-05 | P2 | Value specialization | ideas | **C** | | |
 | 135 | PG-06 | P1 | Keep conservative layout | **M** expat | no 131→248 | reorder hot loop |
@@ -330,8 +330,8 @@ src/passes/vectorize.rs               6905
 src/passes/inline.rs                  3719
 src/passes/aggregate_sroa.rs          1009
 src/passes/outline_switch.rs:37       MIN_CASES = 40 (FIXED)
-src/pgo/unroll_pgo.rs:122             vectorize_gate = true
-src/frontend/sema/analysis.rs:15      "does NOT reject type errors" (P0-05)
+src/pgo/unroll_pgo.rs                 active per-loop PGO vector cost (OP-04 DONE)
+src/frontend/sema/analysis.rs         core assignment/call/return constraints (P0-05 DONE)
 src/ir/lowering/expr_builtins.rs:436  __builtin_cpu_supports (FIXED: exact allowlist at :453)
 src/common/types.rs:1586              usual_arithmetic_conversion (FIXED: C11 else-arm)
 scripts/godbolt.py                    CE oracle

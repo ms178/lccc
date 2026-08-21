@@ -1,6 +1,6 @@
 # Current compiler state
 
-SHA at last doc refresh: **`4b2effeb`** (`ms178/lccc` main, PR #156; current patch rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
+SHA at last doc refresh: **`00321224`** (`ms178/lccc` main, PR #158; round-6 work rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
 
 ## What is production
 
@@ -10,10 +10,11 @@ SHA at last doc refresh: **`4b2effeb`** (`ms178/lccc` main, PR #156; current pat
 - **SROA** `aggregate_sroa.rs` load-forward + chain collapse **on**. Copy-out **off** (`CCC_SROA_COPYOUT` hangs tests).
 - **Alias** `alias.rs` — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` and now LICM; the shared resolver supports checked Shl scaling. LICM models ordinary stores and fails closed on calls, atomics, memcpy, inline asm, intrinsic writes, or unresolved forms.
 - **FMA** scalar `vfmadd231sd` and vector `vfmadd231pd` **emitters exist**. Auto-vectorize of non-reduction loops and FMA-in-vector-body are the remaining gaps.
-- **YMM memcpy**: AVX2 64-byte assignments use two YMM pairs plus `vzeroupper` (-17 B on the copy kernel); 32/48-byte copies deliberately stay XMM after a measured YMM slowdown. Whole-workload `struct_copy` remains 3.58x behind GCC due aggregate scalar replacement, not the isolated 64-byte primitive.
+- **YMM memcpy**: AVX2 64-byte assignments use two YMM pairs plus `vzeroupper`; proven-safe 64-bit leaf DCE removes dead parameter homes, yielding the six-instruction GCC/Clang/ICX shape. 32/48-byte copies deliberately stay XMM after a measured YMM slowdown. Whole `struct_copy` remains 3.58x behind GCC due aggregate scalar replacement.
 - **BMI1 ANDN**: adjacent single-use `not`+`and` fuses only under a target BMI contract and reads assigned source registers directly; Linux find-bit improves ~4% vs treatment control. Baseline x86 remains instruction-set safe.
 - **MachInst** ISel/emit path exists; **disabled** when loop insts > 32 (`CCC_MI_MAX_LOOP_INSTS`) because the local scheduler **regressed gzip ~3%**. The `machinst_regalloc.rs` module (635 LOC) is **dead code** (zero callers, soundness bug in `rewrite_machinsts` RAX-clobber) — delete only this file (P0-01).
-- **PGO** generate/use; layout must not reorder hot loops (expat 131→248 ms). `vectorize_gate` is `return true` (`unroll_pgo.rs:122`).
+- **PGO** generate/use; layout must not reorder hot loops (expat 131→248 ms). The active vectorizer now applies exact profile profitability per natural loop: trip <8 is rejected, and >80-instruction bodies require at least 32 trips; absent profile data leaves static policy unchanged.
+- **Sema constraints**: named aggregate/pointer assignments, fixed-prototype direct and indirect call arity, and return-value mismatches are rejected before lowering. Legacy unspecified prototypes and anonymous SIMD identities remain conservative.
 - **`enable_splitting`** in the scan is a stub (`false`, never read) — keep as the gate for RA-06 (reload-at-next-use), do not delete.
 - **`outline_switch`** min cases = **40** (was 999999; fixed).
 - UnaryOp already emits `lzcnt`/`tzcnt`/`popcnt`. C if-trees (`__ffs`, hand-rolled popcount) do not become those insns until recognized.

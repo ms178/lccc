@@ -160,6 +160,17 @@ fn vectorize_with_analysis_mode(
             continue;
         }
 
+        let body_insts = loop_info.body.iter()
+            .map(|&bi| func.blocks.get(bi).map_or(0, |b| b.instructions.len()))
+            .sum();
+        if matches!(crate::pgo::unroll_pgo::should_vectorize_loop(
+            func, loop_info.header, body_insts), Some(false)) {
+            if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
+                eprintln!("[VEC] Loop {} (header block {}) not vectorized: PGO trip/body cost veto", idx, loop_info.header);
+            }
+            continue;
+        }
+
         // Try to vectorize this loop - first try matmul, then try reduction patterns.
         take_reject();
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
