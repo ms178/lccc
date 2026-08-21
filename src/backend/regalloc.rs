@@ -20,8 +20,28 @@ use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, T
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PhysReg(pub u8);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccumulatorOperandOrder {
+    LhsFirst,
+    AccumulatorCentric,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AccumulatorPolicy {
+    pub operand_order: AccumulatorOperandOrder,
+    pub return_consumes_accumulator: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccumulatorAssignment {
+    pub value_id: u32,
+    pub def_point: u32,
+    pub consume_point: u32,
+}
+
 pub struct RegAllocResult {
     pub assignments: FxHashMap<u32, PhysReg>,
+    pub accumulator_assignments: Vec<AccumulatorAssignment>,
     pub used_regs: Vec<PhysReg>,
     pub caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>>,
     pub liveness: Option<LivenessResult>,
@@ -67,6 +87,7 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
 
 pub struct RegAllocConfig {
     pub available_regs: Vec<PhysReg>,
+    pub accumulator_policy: AccumulatorPolicy,
     pub caller_saved_regs: Vec<PhysReg>,
     /// Subset of `caller_saved_regs` that a call's argument staging writes
     /// (SysV AMD64: rdi/rsi/rdx/r8/r9; AArch64: x4..x7 and the x8 indirect
@@ -701,6 +722,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() {
         return RegAllocResult {
             assignments: FxHashMap::default(),
+            accumulator_assignments: Vec::new(),
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
             liveness: None,
@@ -2139,6 +2161,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     RegAllocResult {
         assignments,
+        accumulator_assignments: Vec::new(),
         used_regs,
         caller_save_spans,
         liveness: Some(liveness),

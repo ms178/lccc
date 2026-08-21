@@ -263,8 +263,20 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         Vec::new()
     };
     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
+    let accumulator_policy = if caller_saved_regs.iter().any(|r| r.0 == 10)
+        || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1)) {
+        super::super::regalloc::AccumulatorPolicy {
+            operand_order: super::super::regalloc::AccumulatorOperandOrder::LhsFirst,
+            return_consumes_accumulator: crate::common::types::target_is_32bit(),
+        }
+    } else {
+        super::super::regalloc::AccumulatorPolicy {
+            operand_order: super::super::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
+            return_consumes_accumulator: crate::common::types::target_is_32bit(),
+        }
+    };
     let config = super::super::regalloc::RegAllocConfig {
-        available_regs, caller_saved_regs, call_arg_regs, indirect_target_regs,
+        available_regs, accumulator_policy, caller_saved_regs, call_arg_regs, indirect_target_regs,
         allow_inline_asm_regalloc, xmm_regs,
         never_materialized: never_materialized.unwrap_or_default(),
         folded_index_uses,
@@ -274,6 +286,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let alloc_result = if std::env::var("CCC_NO_REGALLOC").is_ok() {
         super::super::regalloc::RegAllocResult {
             assignments: Default::default(),
+            accumulator_assignments: Vec::new(),
             used_regs: Vec::new(),
             caller_save_spans: Default::default(),
             liveness: None,
