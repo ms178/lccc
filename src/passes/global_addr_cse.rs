@@ -10,13 +10,15 @@
 //! stale-base landmine that keeps GEP CSE disabled; we rewrite uses onto a
 //! dominance-safe canonical value and delete the duplicate instruction.
 //!
-//! Canonical choice is dominance-safe by construction: one materialization
-//! of class C is placed in the entry block (reusing an existing one, or
-//! inserting after the Alloca/ParamRef prefix). Entry dominates every
-//! reachable block, so loop-body and sibling-block duplicates all rewrite
-//! onto that value. That is the register-pressure win: fannkuch's
-//! perm/perm1/count stop being re-materialized every iteration, and two
-//! non-entry blocks that never saw each other still share one SSA web.
+//! Canonical placement is dominance-safe and lifetime-minimal:
+//! - a cold non-loop singleton stays at its original site (moving it performs
+//!   no CSE and eagerly lengthens execution/liveness);
+//! - a loop-executed address moves to the innermost containing loop's immediate
+//!   preheader, after any cold guard but before repeated iterations;
+//! - duplicates outside loops merge only when an existing occurrence already
+//!   dominates the others; mutually-exclusive branches remain branch-local,
+//!   matching GCC/Clang/ICC/ICX and avoiding eager materialization.
+//! This retains the register-pressure win without unconditional entry hoisting.
 //!
 //! Class split (the levkropp original mixed these and fought RIP remat):
 //! - **Foldable**: every use is a Load/Store pointer, an absorbed GEP/Add/Sub
@@ -90,20 +92,154 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 /// Hoisting/CSE lengthens the base live range and can evict the natural index,
 /// destroying x86 `sym(,%idx,scale)` selection (gzip CRC regression).
 pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
-    let mut out = FxHashSet::default();
+    let mut globals = FxHashSet::default();
+    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut indexed_bases = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr {
-                base,
-                offset: Operand::Value(_),
-                ..
-            } = inst
-            {
-                out.insert(base.0);
+            if let Some(dest) = inst.dest() {
+                *def_count.entry(dest.0).or_insert(0) += 1;
+            }
+            match inst {
+                Instruction::GlobalAddr { dest, .. } => {
+                    globals.insert(dest.0);
+                }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } => {
+                    parent.insert(dest.0, src.0);
+                }
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    from_ty,
+                    to_ty,
+                    ..
+                } if from_ty.size() == to_ty.size() && !from_ty.is_float() && !to_ty.is_float() => {
+                    parent.insert(dest.0, src.0);
+                }
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(_),
+                    ..
+                } => {
+                    parent.insert(dest.0, base.0);
+                }
+                Instruction::GetElementPtr {
+                    base,
+                    offset: Operand::Value(_),
+                    ..
+                } => {
+                    indexed_bases.push(base.0);
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Sub,
+                    lhs: Operand::Value(base),
+                    rhs: Operand::Const(_),
+                    ..
+                } => {
+                    parent.insert(dest.0, base.0);
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs: Operand::Const(_),
+                    rhs: Operand::Value(base),
+                    ..
+                } => {
+                    parent.insert(dest.0, base.0);
+                }
+                _ => {}
             }
         }
     }
+    parent.retain(|dest, _| def_count.get(dest).copied() == Some(1));
+
+    let mut out = FxHashSet::default();
+    for base in indexed_bases {
+        let mut current = base;
+        let mut seen = FxHashSet::default();
+        while seen.insert(current) {
+            if globals.contains(&current) {
+                out.insert(current);
+                break;
+            }
+            let Some(&next) = parent.get(&current) else {
+                break;
+            };
+            current = next;
+        }
+    }
     out
+}
+
+fn dominates(a: usize, mut b: usize, idom: &[usize]) -> bool {
+    loop {
+        if a == b {
+            return true;
+        }
+        let next = idom.get(b).copied().unwrap_or(usize::MAX);
+        if next == usize::MAX || next == b {
+            return false;
+        }
+        b = next;
+    }
+}
+
+/// Choose the narrowest dominance-safe placement. A non-loop singleton stays
+/// where it is (moving it is pure lifetime growth); values executed in a loop
+/// move to that loop's immediate preheader. Outside loops, only an existing
+/// occurrence that already dominates all others may become canonical.
+fn choose_placement(
+    blocks: &[usize],
+    cfg: &crate::ir::analysis::CfgAnalysis,
+    loops: &[super::loop_analysis::NaturalLoop],
+    intrinsic_blocks: &FxHashSet<usize>,
+) -> Option<usize> {
+    let containing = loops
+        .iter()
+        .filter(|lp| blocks.iter().all(|b| lp.body.contains(b)))
+        .min_by_key(|lp| lp.body.len());
+    if let Some(lp) = containing {
+        // Intrinsic loops still carry hidden accumulator/XMM locations. CSE at
+        // existing sites is safe, but extending a new home across the loop is
+        // blocked until RA-23 makes those locations explicit.
+        if !lp.body.iter().any(|b| intrinsic_blocks.contains(b)) {
+            let preheader = cfg.idom.get(lp.header).copied()?;
+            if preheader != usize::MAX && preheader != lp.header {
+                return Some(preheader);
+            }
+        }
+    }
+    if blocks.len() < 2 {
+        return None;
+    }
+
+    // Outside loops, never synthesize an eager common-dominator definition for
+    // mutually-exclusive branches. GCC/Clang/ICC/ICX all keep those branch-local.
+    // Reuse an existing occurrence only when it already dominates every other
+    // occurrence, selecting the deepest such definition to minimize lifetime.
+    let depth = |mut b: usize| {
+        let mut n = 0usize;
+        loop {
+            let next = cfg.idom.get(b).copied().unwrap_or(usize::MAX);
+            if next == usize::MAX || next == b {
+                break;
+            }
+            n += 1;
+            b = next;
+        }
+        n
+    };
+    blocks
+        .iter()
+        .copied()
+        .filter(|&candidate| blocks.iter().all(|&b| dominates(candidate, b, &cfg.idom)))
+        .max_by_key(|&candidate| depth(candidate))
 }
 
 pub(crate) fn run_with_aliases(
@@ -118,136 +254,183 @@ pub(crate) fn run_with_aliases(
         debug_merged(&func.name, 0);
         return 0;
     }
-    // Intrinsic emitters carry hidden accumulator/XMM state not represented in
-    // ordinary SSA liveness. Entry-hoisting a GlobalAddr lengthens pressure
-    // across that state and regressed rdtscp ordering plus deferred SIMD chains.
-    // Keep the pre-existing same-block GVN behavior, but refuse cross-block
-    // GlobalAddr hoisting until RA-23 makes those locations explicit.
-    if func.blocks.len() > 1
-        && func.blocks.iter().any(|b| b.instructions.iter().any(|i| matches!(i, Instruction::Intrinsic { .. })))
-    {
-        debug_merged(&func.name, 0);
-        return 0;
-    }
-
     let must_mat = classify_must_materialize(func);
     let site_local = classify_site_local_indexed(func);
 
-    // First existing entry-block GlobalAddr of each (symbol, class) is the
-    // canonical dest. Missing classes are inserted after the Alloca/ParamRef
-    // prefix so they dominate every reachable use.
-    let mut entry_canonical: FxHashMap<(String, bool), Value> = FxHashMap::default();
-    for inst in &func.blocks[0].instructions {
-        if let Instruction::GlobalAddr { dest, name } = inst {
-            if site_local.contains(&dest.0) {
-                continue;
-            }
-            let class = must_mat.contains(&dest.0);
-            let key = (canon_name(name, aliases).to_string(), class);
-            entry_canonical.entry(key).or_insert(*dest);
-        }
-    }
-
-    let mut needed: FxHashSet<(String, bool)> = FxHashSet::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    // Group every movable materialization by canonical symbol and use class.
+    // Site-local indexed bases deliberately keep distinct webs.
+    let mut groups: FxHashMap<(String, bool), Vec<(usize, usize, Value)>> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GlobalAddr { dest, name } = inst {
                 if site_local.contains(&dest.0) {
                     continue;
                 }
-                let class = must_mat.contains(&dest.0);
-                needed.insert((canon_name(name, aliases).to_string(), class));
+                groups
+                    .entry((
+                        canon_name(name, aliases).to_string(),
+                        must_mat.contains(&dest.0),
+                    ))
+                    .or_default()
+                    .push((bi, ii, *dest));
             }
         }
     }
 
-    let mut to_insert: Vec<(String, bool)> = needed
-        .into_iter()
-        .filter(|k| !entry_canonical.contains_key(k))
-        .collect();
-    to_insert.sort();
-
-    if !to_insert.is_empty() {
-        let mut next_id = func.next_value_id.max(func.max_value_id().saturating_add(1));
-        let insert_at = {
-            let mut i = 0usize;
-            for inst in &func.blocks[0].instructions {
-                match inst {
-                    Instruction::Alloca { .. } | Instruction::ParamRef { .. } => i += 1,
-                    _ => break,
-                }
-            }
-            i
-        };
-        let span_lockstep =
-            func.blocks[0].source_spans.len() == func.blocks[0].instructions.len();
-        let dummy = crate::common::source::Span::dummy();
-        for (name, class) in to_insert.iter().rev() {
-            let dest = Value(next_id);
-            next_id += 1;
-            entry_canonical.insert((name.clone(), *class), dest);
-            func.blocks[0].instructions.insert(
-                insert_at,
-                Instruction::GlobalAddr {
-                    dest,
-                    name: name.clone(),
-                },
-            );
-            if span_lockstep && !func.blocks[0].source_spans.is_empty() {
-                func.blocks[0].source_spans.insert(insert_at, dummy);
-            }
-        }
-        func.next_value_id = next_id;
-    }
-
-    // Freshly inserted dests are not in `must_mat` (no uses yet). Never
-    // treat a chosen canonical as a duplicate of the other class.
-    let canon_ids: FxHashSet<u32> = entry_canonical.values().map(|v| v.0).collect();
-
-    let mut subst: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut dups: Vec<(usize, usize)> = Vec::new();
-
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            let Instruction::GlobalAddr { dest, name } = inst else {
-                continue;
-            };
-            if canon_ids.contains(&dest.0) || site_local.contains(&dest.0) {
-                continue;
-            }
-            let class = must_mat.contains(&dest.0);
-            let key = (canon_name(name, aliases).to_string(), class);
-            let Some(&canon) = entry_canonical.get(&key) else {
-                continue;
-            };
-            if canon != *dest {
-                subst.insert(dest.0, canon.0);
-                dups.push((bi, ii));
-            }
-        }
-    }
-
-    if dups.is_empty() {
+    if groups.is_empty()
+        || groups
+            .values()
+            .all(|occurs| occurs.len() == 1 && occurs[0].0 == 0)
+    {
         debug_merged(&func.name, 0);
         return 0;
     }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let loops = super::loop_analysis::find_natural_loops(
+        func.blocks.len(),
+        &cfg.preds,
+        &cfg.succs,
+        &cfg.idom,
+    );
+    let intrinsic_blocks: FxHashSet<usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(bi, block)| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Intrinsic { .. }))
+                .then_some(bi)
+        })
+        .collect();
 
-    rewrite_uses(func, &subst);
+    let mut next_id = func
+        .next_value_id
+        .max(func.max_value_id().saturating_add(1));
+    let mut subst: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut delete_ids: FxHashSet<u32> = FxHashSet::default();
+    let mut inserts: FxHashMap<usize, Vec<(String, bool, Value)>> = FxHashMap::default();
 
-    let n = dups.len();
-    dups.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    for (bi, ii) in dups {
-        let block = &mut func.blocks[bi];
-        let span_lockstep = block.source_spans.len() == block.instructions.len();
-        block.instructions.remove(ii);
-        if span_lockstep {
-            block.source_spans.remove(ii);
-        } else if !block.source_spans.is_empty() {
-            // Desynchronized spans are untrustworthy; drop rather than
-            // index a mismatched parallel array (backend -g convention).
-            block.source_spans.clear();
+    for ((name, class), occurrences) in groups {
+        let blocks: Vec<usize> = occurrences.iter().map(|x| x.0).collect();
+        let Some(place) = choose_placement(&blocks, &cfg, &loops, &intrinsic_blocks) else {
+            continue;
+        };
+
+        // Reuse the earliest existing definition in the placement block when
+        // possible. Otherwise create one at the block's Phi-safe prefix.
+        let existing = occurrences
+            .iter()
+            .filter(|x| x.0 == place)
+            .min_by_key(|x| x.1)
+            .copied();
+        let canonical = if let Some((_, _, value)) = existing {
+            value
+        } else {
+            let value = Value(next_id);
+            next_id += 1;
+            inserts
+                .entry(place)
+                .or_default()
+                .push((name.clone(), class, value));
+            value
+        };
+
+        for &(_, _, value) in &occurrences {
+            if value != canonical {
+                subst.insert(value.0, canonical.0);
+                delete_ids.insert(value.0);
+            }
         }
     }
+
+    if delete_ids.is_empty() {
+        debug_merged(&func.name, 0);
+        return 0;
+    }
+    rewrite_uses(func, &subst);
+
+    // Rebuild each affected block once. This keeps instruction/source-span
+    // indices synchronized and avoids insertion indices shifting each other.
+    let dummy = crate::common::source::Span::dummy();
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        let mut add = inserts.remove(&bi).unwrap_or_default();
+        let has_delete = block.instructions.iter().any(|inst| {
+            matches!(
+                inst, Instruction::GlobalAddr { dest, .. } if delete_ids.contains(&dest.0)
+            )
+        });
+        if add.is_empty() && !has_delete {
+            continue;
+        }
+        add.sort_by(|a, b| (a.0.as_str(), a.1, a.2 .0).cmp(&(b.0.as_str(), b.1, b.2 .0)));
+        let insert_at = block
+            .instructions
+            .iter()
+            .take_while(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Phi { .. }
+                        | Instruction::Alloca { .. }
+                        | Instruction::ParamRef { .. }
+                )
+            })
+            .count();
+        let old_insts = std::mem::take(&mut block.instructions);
+        let old_len = old_insts.len();
+        let lockstep = block.source_spans.len() == old_len;
+        let old_spans = if lockstep {
+            std::mem::take(&mut block.source_spans)
+        } else {
+            block.source_spans.clear();
+            Vec::new()
+        };
+        let mut new_insts = Vec::with_capacity(old_insts.len() + add.len());
+        let mut new_spans = if lockstep {
+            Vec::with_capacity(old_spans.len() + add.len())
+        } else {
+            Vec::new()
+        };
+        for (ii, inst) in old_insts.into_iter().enumerate() {
+            if ii == insert_at {
+                for (name, _, dest) in &add {
+                    new_insts.push(Instruction::GlobalAddr {
+                        dest: *dest,
+                        name: name.clone(),
+                    });
+                    if lockstep {
+                        new_spans.push(dummy);
+                    }
+                }
+            }
+            let remove = matches!(&inst, Instruction::GlobalAddr { dest, .. } if delete_ids.contains(&dest.0));
+            if !remove {
+                new_insts.push(inst);
+                if lockstep {
+                    new_spans.push(old_spans[ii]);
+                }
+            }
+        }
+        if insert_at == old_len && !add.is_empty() {
+            // Empty/Phi-only block: insertion point is at the old end.
+            for (name, _, dest) in &add {
+                new_insts.push(Instruction::GlobalAddr {
+                    dest: *dest,
+                    name: name.clone(),
+                });
+                if lockstep {
+                    new_spans.push(dummy);
+                }
+            }
+        }
+        block.instructions = new_insts;
+        if lockstep {
+            block.source_spans = new_spans;
+        }
+    }
+    func.next_value_id = next_id;
+    let n = delete_ids.len();
     debug_merged(&func.name, n);
     n
 }
@@ -276,9 +459,14 @@ pub(crate) fn classify_must_materialize(func: &IrFunction) -> FxHashSet<u32> {
     // GlobalAddr, not just the derived id.
     let mut derived: FxHashSet<u32> = gaddrs.clone();
     let mut parent: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    let mut link = |dest: u32, src: u32, derived: &mut FxHashSet<u32>,
+    let mut parent_edges: FxHashSet<(u32, u32)> = FxHashSet::default();
+    let mut link = |dest: u32,
+                    src: u32,
+                    derived: &mut FxHashSet<u32>,
                     parent: &mut FxHashMap<u32, Vec<u32>>| {
-        parent.entry(dest).or_default().push(src);
+        if parent_edges.insert((dest, src)) {
+            parent.entry(dest).or_default().push(src);
+        }
         derived.insert(dest)
     };
     let mut changed = true;
@@ -640,9 +828,9 @@ mod tests {
     }
 
     #[test]
-    fn hoists_non_entry_to_entry() {
-        // A single loop-body GlobalAddr must move to entry so LICM/RA see
-        // one dominating def rather than a per-iteration materialization.
+    fn single_cold_non_entry_stays_local() {
+        // Moving a singleton out of a non-loop block performs no CSE and only
+        // lengthens its lifetime/eager execution.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -662,23 +850,113 @@ mod tests {
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
         });
-        let n = run(&mut func);
-        assert_eq!(n, 1);
-        match &func.blocks[0].instructions[0] {
-            Instruction::GlobalAddr { dest, name } => {
-                assert_eq!(name, "g");
-                assert_eq!(func.blocks[1].instructions.len(), 1);
-                match &func.blocks[1].instructions[0] {
-                    Instruction::Load { ptr, .. } => assert_eq!(ptr.0, dest.0),
-                    other => panic!("expected load, got {other:?}"),
-                }
-            }
-            other => panic!("expected entry GlobalAddr, got {other:?}"),
-        }
+        assert_eq!(run(&mut func), 0);
+        assert!(func.blocks[0].instructions.is_empty());
+        assert!(matches!(
+            func.blocks[1].instructions[0],
+            Instruction::GlobalAddr { dest: Value(5), .. }
+        ));
     }
 
     #[test]
-    fn two_non_entry_blocks_share_entry_canonical() {
+    fn singleton_in_loop_hoists_to_preheader() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "g".to_string(),
+                },
+                load(6, 5),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        assert_eq!(run(&mut func), 1);
+        let Instruction::GlobalAddr { dest, .. } = &func.blocks[0].instructions[0] else {
+            panic!("expected preheader GlobalAddr");
+        };
+        assert!(
+            matches!(func.blocks[2].instructions[0], Instruction::Load { ptr, .. } if ptr.0 == dest.0)
+        );
+    }
+
+    #[test]
+    fn intrinsic_loop_singleton_is_not_lifetime_extended() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "g".to_string(),
+                },
+                Instruction::Intrinsic {
+                    dest: Some(Value(7)),
+                    op: crate::ir::intrinsics::IntrinsicOp::Rdtsc,
+                    dest_ptr: None,
+                    args: vec![],
+                },
+                load(6, 5),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        assert_eq!(run(&mut func), 0);
+        assert!(func.blocks[0].instructions.is_empty());
+        assert!(matches!(
+            func.blocks[2].instructions[0],
+            Instruction::GlobalAddr { .. }
+        ));
+    }
+
+    #[test]
+    fn mutually_exclusive_blocks_stay_branch_local() {
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -715,18 +993,55 @@ mod tests {
             source_spans: Vec::new(),
         });
         let n = run(&mut func);
-        assert_eq!(n, 2);
-        let Instruction::GlobalAddr { dest: canon, .. } = &func.blocks[0].instructions[0] else {
-            panic!("expected entry GlobalAddr");
-        };
-        match &func.blocks[1].instructions[0] {
-            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, canon.0),
-            other => panic!("expected load, got {other:?}"),
-        }
-        match &func.blocks[2].instructions[0] {
-            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, canon.0),
-            other => panic!("expected load, got {other:?}"),
-        }
+        assert_eq!(n, 0);
+        assert!(func.blocks[0].instructions.is_empty());
+        assert!(matches!(
+            func.blocks[1].instructions[0],
+            Instruction::GlobalAddr { dest: Value(5), .. }
+        ));
+        assert!(matches!(
+            func.blocks[2].instructions[0],
+            Instruction::GlobalAddr { dest: Value(7), .. }
+        ));
+    }
+
+    #[test]
+    fn dominating_cross_block_occurrence_is_reused() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "g".to_string(),
+                },
+                load(6, 5),
+            ],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(7),
+                    name: "g".to_string(),
+                },
+                load(8, 7),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        assert_eq!(run(&mut func), 1);
+        assert!(
+            matches!(func.blocks[2].instructions[0], Instruction::Load { ptr, .. } if ptr.0 == 5)
+        );
     }
 
     #[test]
@@ -764,14 +1079,26 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::GlobalAddr { dest: Value(1), name: "table".to_string() },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "table".to_string(),
+                },
                 Instruction::GetElementPtr {
-                    dest: Value(2), base: Value(1), offset: Operand::Value(Value(9)), ty: IrType::Ptr,
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Value(Value(9)),
+                    ty: IrType::Ptr,
                 },
                 load(3, 2),
-                Instruction::GlobalAddr { dest: Value(4), name: "table".to_string() },
+                Instruction::GlobalAddr {
+                    dest: Value(4),
+                    name: "table".to_string(),
+                },
                 Instruction::GetElementPtr {
-                    dest: Value(5), base: Value(4), offset: Operand::Value(Value(8)), ty: IrType::Ptr,
+                    dest: Value(5),
+                    base: Value(4),
+                    offset: Operand::Value(Value(8)),
+                    ty: IrType::Ptr,
                 },
                 load(6, 5),
             ],
@@ -779,13 +1106,66 @@ mod tests {
             source_spans: Vec::new(),
         });
         assert_eq!(run(&mut func), 0);
-        assert_eq!(func.blocks[0].instructions.iter().filter(|i| matches!(i, Instruction::GlobalAddr { .. })).count(), 2);
+        assert_eq!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
-    fn hoist_preserves_class_split() {
-        // Foldable load in block 1 and call-arg in block 2 of the same
-        // symbol must become TWO entry GlobalAddrs, never one.
+    fn derived_variable_index_bases_remain_site_local() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "table".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(3),
+                    base: Value(2),
+                    offset: Operand::Value(Value(9)),
+                    ty: IrType::Ptr,
+                },
+                load(4, 3),
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "table".to_string(),
+                },
+                Instruction::Cast {
+                    dest: Value(6),
+                    src: Operand::Value(Value(5)),
+                    from_ty: IrType::Ptr,
+                    to_ty: IrType::U64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(7),
+                    base: Value(6),
+                    offset: Operand::Value(Value(8)),
+                    ty: IrType::Ptr,
+                },
+                load(10, 7),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(classify_site_local_indexed(&func).len(), 2);
+    }
+
+    #[test]
+    fn cold_singletons_preserve_class_split() {
+        // Foldable load and call-arg classes of the same symbol must remain
+        // distinct. As cold singletons they also stay in their original block.
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -830,12 +1210,13 @@ mod tests {
             source_spans: Vec::new(),
         });
         let n = run(&mut func);
-        assert_eq!(n, 2);
-        let entry_gaddrs: Vec<_> = func.blocks[0]
+        assert_eq!(n, 0);
+        assert!(func.blocks[0].instructions.is_empty());
+        let local_gaddrs = func.blocks[1]
             .instructions
             .iter()
             .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
-            .collect();
-        assert_eq!(entry_gaddrs.len(), 2);
+            .count();
+        assert_eq!(local_gaddrs, 2);
     }
 }

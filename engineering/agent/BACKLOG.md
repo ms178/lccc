@@ -7,7 +7,7 @@ Evidence: **M** measured LCCC vs GCC14 on kernels; **G** Compiler Explorer (`cg1
 
 **ROI rank:** P0 this week (testable) · P1 this month · P2 after P0/P1 · P3 research.
 
-Count: P0 5 + RA 27 + IS 28 + OP 33 + FE 22 + AB 15 + PG 12 + LK 18 + MS 9 = **169** (extra items are refinements; drop `[NEW]`/`[REFINED]` tags when stable).
+Count: P0 5 + RA 27 + IS 28 + OP 34 + FE 22 + AB 15 + PG 12 + LK 18 + MS 9 = **170** (extra items are refinements; drop `[NEW]`/`[REFINED]` tags when stable).
 
 ## 1. How to gather data (mandatory)
 
@@ -165,7 +165,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 58 | IS-27 | P2 | i128 through rdx:eax without excluding r8–rsi whole fn | prologue i128 filter | **C** | more GPR | ABI break |
 | 59 | IS-28 | DONE (pre-existing, revalidated) | Canonical SWAR popcount recognized in `bit_idioms` → `UnaryOp::Popcount`; x86 emits `popcntl` under v3 | optimizer + existing emitter | **G/M** current bitops assembly contains popcntl | unit near-miss + benchmark oracle | add duplicate emitter |
 
-### 5.3 Optimizer / alias / SROA / vectorize — OP-01 … OP-33
+### 5.3 Optimizer / alias / SROA / vectorize — OP-01 … OP-34
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
@@ -202,6 +202,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 90 | OP-31 | P1 | **Unify `loop_memory_promote` alias engine with `alias.rs`** (merged with RA-25) | `loop_memory_promote.rs`, `alias.rs` | **C** 1712 LOC with duplicated SCEV-lite | one alias engine | break sqlite `sqlite3FpDecode` fix |
 | 91 | OP-32 | P1 | **Wire `alias.rs` into GVN load CSE** (OP-12) — `forms_disjoint` can prove two loads don't alias | `gvn.rs`, `alias.rs` | **C** GVN is conservative on loads | fewer redundant loads | CSE aliased |
 | 92 | OP-33 | P2 | **`segments`-based dead-store elimination** — now that holes are representable, DCE can eliminate stores whose last user is dead | `dce.rs` (currently treats all Store as side-effecting) | **C** `segments` field exists | dead stores gone | DCE volatile |
+| 92a | OP-34 | DONE | GlobalAddr CSE uses oracle-derived placement: cold singleton stays local; guarded loop moves to innermost preheader; dominating existing defs merge; mutually-exclusive siblings stay replicated; derived variable-index bases remain site-local | `global_addr_cse.rs`, GVN | **G/M** all four oracles branch-local for cold/siblings; Clang loop-preheader; cold VM 0.983× base, hot-loop 0.758× kill; gzip VM 0.943× base and text -2,000 B; all four backends checked | 982 unit + 377 regression + codec veto | unconditional entry hoist |
 
 ### 5.4 Frontend / IR — FE-01 … FE-22
 
@@ -300,7 +301,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 163 | MS-04 | P1 | OnceLock env knobs break parameterized tests | live_range.rs | **C** | tests independent | |
 | 164 | MS-05 | P2 | Compile-time: pass rescans | use-def FE-13 | **C** | | |
 | 165 | MS-06 | P1 | Document PhysReg map once | RA-19 | **C** | | |
-| 166 | MS-07 | DONE | Current PR161+treatment oracles: gzip 1.14 30/30, `longest_match` 331 instructions/119 stack refs, byte-for-byte stack-count parity with pristine PR161; CRC scale-4 SIB restored | workloads | **M/G** `r8-*` artifacts + independent pristine-base build | numbers on this SHA | compare against stale pre-PR161 count |
+| 166 | MS-07 | DONE | Current PR162+treatment: gzip 1.14 30/30, `longest_match` 330 instructions/118 stack refs vs pristine 331/119; CRC scale-4 SIB retained | workloads | **M/G** independent base build; gzip VM 0.943×, text -2,000 B | numbers on this SHA | claim VM result as hardware |
 | 167 | MS-08 | P1 | **Consolidate 29+ `CCC_` env vars into `RaConfig` struct** | `regalloc.rs` (29), `live_range.rs` (7), `prologue.rs` (16) | **C** 29 in regalloc.rs alone, mixed polarity | `RaConfig` struct, single source of truth | env vars in hot path |
 | 168 | MS-09 | P1 | **Audit `peephole_common.rs` UTF-8 fix impact** — old `bytes[i] as char` corrupted non-ASCII bytes in asm (FIXED in current main); verify no compiled binary shipped with corrupted asm | `engineering/evidence/` | **C** old code corrupted UTF-8 | audit report | re-enable `bytes[i] as char` |
 
