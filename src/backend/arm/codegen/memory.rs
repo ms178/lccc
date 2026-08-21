@@ -171,10 +171,8 @@ impl ArmCodegen {
                                     self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
                                 }
                                 SlotAddr::Direct(slot) => self.emit_store_to_sp(&fp, slot.0, "str"),
-                                SlotAddr::Indirect(slot) => {
-                                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
-                                    self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
-                                }
+                                SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot_impl(slot,ptr.0); self.state.emit_fmt(format_args!("    str {}, [x9]",fp)); }
+                                SlotAddr::Reg(reg) => self.state.emit_fmt(format_args!("    str {}, [{}]",fp,callee_saved_name(reg))),
                             }
                             return;
                         }
@@ -201,10 +199,8 @@ impl ArmCodegen {
                                 self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
                             }
                             SlotAddr::Direct(slot) => self.emit_load_from_sp(&fp, slot.0, "ldr"),
-                            SlotAddr::Indirect(slot) => {
-                                self.emit_load_ptr_from_slot_impl(slot, ptr.0);
-                                self.state.emit_fmt(format_args!("    ldr {}, [x9]", fp));
-                            }
+                            SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot_impl(slot,ptr.0); self.state.emit_fmt(format_args!("    ldr {}, [x9]",fp)); }
+                            SlotAddr::Reg(reg) => self.state.emit_fmt(format_args!("    ldr {}, [{}]",fp,callee_saved_name(reg))),
                         }
                         return;
                     }
@@ -242,13 +238,8 @@ impl ArmCodegen {
                                 let folded_slot = StackSlot(slot.0 + offset);
                                 self.emit_store_to_sp(zr, folded_slot.0, store_instr);
                             }
-                            SlotAddr::Indirect(slot) => {
-                                self.emit_load_ptr_from_slot_impl(slot, base.0);
-                                if offset != 0 {
-                                    self.emit_add_offset_to_addr_reg_impl(offset);
-                                }
-                                self.state.emit_fmt(format_args!("    {} {}, [x9]", store_instr, zr));
-                            }
+                            SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot_impl(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    {} {}, [x9]",store_instr,zr)); }
+                            SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    {} {}, [x9]",store_instr,zr)); }
                         }
                         return;
                     }
@@ -287,6 +278,11 @@ impl ArmCodegen {
                                         }
                                         self.state.emit_fmt(format_args!("    str {}, [x9]", fp));
                                     }
+                                }                                SlotAddr::Reg(reg) => {
+                                    let r=callee_saved_name(reg);
+                                    if offset>0 && offset%scale==0 && offset/scale<=4095 { self.state.emit_fmt(format_args!("    str {}, [{}, #{}]",fp,r,offset)); }
+                                    else if (-256..=255).contains(&offset) { self.state.emit_fmt(format_args!("    stur {}, [{}, #{}]",fp,r,offset)); }
+                                    else { self.emit_reg_to_addr(reg); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    str {}, [x9]",fp)); }
                                 }
                             }
                             return;
@@ -312,15 +308,8 @@ impl ArmCodegen {
                     let reg = Self::reg_for_type("x0", ty);
                     self.emit_store_to_sp(reg, folded_slot.0, store_instr);
                 }
-                SlotAddr::Indirect(slot) => {
-                    self.state.emit("    mov x1, x0");
-                    self.emit_load_ptr_from_slot_impl(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg_impl(offset);
-                    }
-                    let reg = Self::reg_for_type("x1", ty);
-                    self.state.emit_fmt(format_args!("    {} {}, [x9]", store_instr, reg));
-                }
+                SlotAddr::Indirect(slot) => { self.state.emit("    mov x1, x0"); self.emit_load_ptr_from_slot_impl(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} let reg=Self::reg_for_type("x1",ty); self.state.emit_fmt(format_args!("    {} {}, [x9]",store_instr,reg)); }
+                SlotAddr::Reg(addr) => { self.state.emit("    mov x1, x0"); self.emit_reg_to_addr(addr); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} let reg=Self::reg_for_type("x1",ty); self.state.emit_fmt(format_args!("    {} {}, [x9]",store_instr,reg)); }
             }
         }
     }
@@ -368,14 +357,8 @@ impl ArmCodegen {
                     let (actual_instr, dest_reg) = Self::arm_parse_load(load_instr);
                     self.emit_load_from_sp(dest_reg, folded_slot.0, actual_instr);
                 }
-                SlotAddr::Indirect(slot) => {
-                    self.emit_load_ptr_from_slot_impl(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg_impl(offset);
-                    }
-                    let (actual_instr, dest_reg) = Self::arm_parse_load(load_instr);
-                    self.state.emit_fmt(format_args!("    {} {}, [x9]", actual_instr, dest_reg));
-                }
+                SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot_impl(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} let (i,d)=Self::arm_parse_load(load_instr); self.state.emit_fmt(format_args!("    {} {}, [x9]",i,d)); }
+                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} let (i,d)=Self::arm_parse_load(load_instr); self.state.emit_fmt(format_args!("    {} {}, [x9]",i,d)); }
             }
             self.store_x0_to(dest);
         }

@@ -1412,6 +1412,11 @@ impl ArchCodegen for I686Codegen {
         }
     }
 
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) {
+        emit!(self.state, "    movl %{}, %ecx", phys_reg_name(reg));
+        self.state.reg_cache.invalidate_sec();
+    }
+
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         // The trait DEFAULT for this hook is a NO-OP ("backends override").
         // i686 never overrode it, so emit_leaq_base_index's default path
@@ -1517,8 +1522,9 @@ impl ArchCodegen for I686Codegen {
                     self.emit_alloca_aligned_addr_to_acc(slot, id);
                     self.state.emit("    movl %eax, %edi");
                 }
-                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot, true, dest.0),
-                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot, false, dest.0),
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot,true,dest.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot,false,dest.0),
+                SlotAddr::Reg(reg) => emit!(self.state,"    movl %{}, %edi",phys_reg_name(reg)),
             }
         }
         // Load src address into esi
@@ -1528,8 +1534,9 @@ impl ArchCodegen for I686Codegen {
                     self.emit_alloca_aligned_addr_to_acc(slot, id);
                     self.state.emit("    movl %eax, %esi");
                 }
-                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, src.0),
-                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, src.0),
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot,true,src.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot,false,src.0),
+                SlotAddr::Reg(reg) => emit!(self.state,"    movl %{}, %esi",phys_reg_name(reg)),
             }
         }
         // Perform the copy

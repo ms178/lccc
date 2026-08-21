@@ -2,6 +2,7 @@
 
 use crate::ir::reexports::{IrConst, Operand, Value};
 use crate::common::types::IrType;
+use crate::backend::traits::ArchCodegen;
 use super::emit::X86Codegen;
 
 impl X86Codegen {
@@ -58,10 +59,8 @@ impl X86Codegen {
                                     self.emit_alloca_aligned_addr_impl(slot, id);
                                     self.state.emit("    fldt (%rcx)");
                                 }
-                                SlotAddr::Indirect(slot) => {
-                                    self.emit_load_ptr_from_slot_impl(slot, ptr_id);
-                                    self.state.emit("    fldt (%rcx)");
-                                }
+                                SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot_impl(slot,ptr_id); self.state.emit("    fldt (%rcx)"); }
+                                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); self.state.emit("    fldt (%rcx)"); }
                             }
                             self.emit_epilogue_and_ret_impl(frame_size);
                             return;

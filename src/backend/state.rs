@@ -333,10 +333,8 @@ pub struct CodegenState {
     /// reducing stack frame sizes by ~40%. Store/load paths check this set to
     /// emit 4-byte instructions (movl, sw/lw, str/ldr w-reg) instead of 8-byte.
     pub small_slot_values: FxHashSet<u32>,
-    /// Values that were assigned to callee-saved registers and have no stack slot.
-    /// Used by resolve_slot_addr to return a dummy Indirect slot for these values,
-    /// which is safe because all Indirect codepaths check reg_assignments first.
-    pub reg_assigned_values: FxHashSet<u32>,
+    /// Exact physical homes for values with no stack slot.
+    pub reg_assigned_locations: FxHashMap<u32, crate::backend::regalloc::PhysReg>,
     /// Values that are promoted InlineAsm output results. Like allocas, their
     /// stack slot holds the value directly (not a pointer). The asm emitter
     /// stores the output register to this slot after the asm, and subsequent
@@ -456,7 +454,7 @@ impl CodegenState {
             no_jump_tables: false,
             weak_extern_symbols: FxHashSet::default(),
             small_slot_values: FxHashSet::default(),
-            reg_assigned_values: FxHashSet::default(),
+            reg_assigned_locations: FxHashMap::default(),
             asm_output_values: FxHashSet::default(),
             protected_slot_values: FxHashSet::default(),
             debug_info: false,
@@ -584,7 +582,7 @@ impl CodegenState {
         self.small_slot_values.clear();
         self.vector_values.clear();
         self.protected_slot_values.clear();
-        self.reg_assigned_values.clear();
+        self.reg_assigned_locations.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();
         self.vec_last_store_slot = None;
@@ -807,6 +805,8 @@ pub enum SlotAddr {
     Direct(StackSlot),
     /// Non-alloca: slot holds a pointer that must be loaded first.
     Indirect(StackSlot),
+    /// Pointer value already resides in an allocated physical register.
+    Reg(crate::backend::regalloc::PhysReg),
 }
 
 impl CodegenState {
@@ -839,15 +839,24 @@ impl CodegenState {
             } else {
                 Some(SlotAddr::Indirect(slot))
             }
-        } else if self.reg_assigned_values.contains(&val_id) {
-            // Value lives in a callee-saved register with no stack slot.
-            // Return a dummy Indirect slot — all Indirect codepaths in both
-            // x86 and RISC-V backends check reg_assignments before accessing
-            // the slot, so the dummy offset is never actually used.
-            Some(SlotAddr::Indirect(StackSlot(0)))
+        } else if let Some(&reg) = self.reg_assigned_locations.get(&val_id) {
+            Some(SlotAddr::Reg(reg))
         } else {
             None
         }
     }
+}
 
+#[cfg(test)]
+mod slot_addr_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+
+    #[test]
+    fn register_home_is_explicit_and_exact() {
+        let mut state = CodegenState::new();
+        state.reg_assigned_locations.insert(17, PhysReg(14));
+        assert!(matches!(state.resolve_slot_addr(17), Some(SlotAddr::Reg(PhysReg(14)))));
+        assert!(state.get_slot(17).is_none());
+    }
 }

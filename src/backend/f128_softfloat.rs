@@ -32,6 +32,7 @@ use crate::ir::reexports::{
 };
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
+use crate::backend::regalloc::PhysReg;
 use crate::backend::cast::FloatOp;
 
 /// Arch-specific primitives for F128 soft-float operations.
@@ -194,6 +195,7 @@ pub trait F128SoftFloat {
     /// Move a callee-saved register value into the address register (ARM: x17, RISC-V: t5).
     /// Called when a pointer is register-allocated.
     fn f128_move_callee_reg_to_addr_reg(&mut self, val_id: u32) -> bool;
+    fn f128_move_phys_to_addr_reg(&mut self, reg: PhysReg);
 
     /// Move the computed aligned address into the address register.
     /// ARM needs `mov x17, x9` because x9 is the alloca addr register and x17 is the
@@ -300,13 +302,8 @@ pub fn f128_operand_to_arg1<T: F128SoftFloat + ?Sized>(cg: &mut T, op: &Operand)
                             let effective = slot.0 + offset;
                             cg.f128_load_from_frame_offset_to_arg1(effective);
                         }
-                        SlotAddr::OverAligned(slot, id) => {
-                            cg.f128_alloca_aligned_addr(slot, id);
-                            if offset != 0 {
-                                cg.f128_add_offset_to_addr_reg(offset);
-                            }
-                            cg.f128_load_16b_from_addr_reg_to_arg1();
-                        }
+                        SlotAddr::OverAligned(slot, id) => { cg.f128_alloca_aligned_addr(slot, id); if offset != 0 { cg.f128_add_offset_to_addr_reg(offset); } cg.f128_load_16b_from_addr_reg_to_arg1(); }
+                        SlotAddr::Reg(reg) => { cg.f128_move_phys_to_addr_reg(reg); if offset != 0 { cg.f128_add_offset_to_addr_reg(offset); } cg.f128_load_16b_from_addr_reg_to_arg1(); }
                     }
                     return;
                 }
@@ -500,11 +497,8 @@ pub fn f128_emit_store<T: F128SoftFloat + ?Sized>(
                 cg.f128_load_indirect_ptr_to_addr_reg(slot, ptr.0);
                 f128_store_to_addr_reg(cg, val);
             }
-            SlotAddr::OverAligned(slot, id) => {
-                cg.f128_alloca_aligned_addr(slot, id);
-                cg.f128_move_aligned_to_addr_reg();
-                f128_store_to_addr_reg(cg, val);
-            }
+            SlotAddr::OverAligned(slot, id) => { cg.f128_alloca_aligned_addr(slot, id); cg.f128_move_aligned_to_addr_reg(); f128_store_to_addr_reg(cg, val); }
+            SlotAddr::Reg(reg) => { cg.f128_move_phys_to_addr_reg(reg); f128_store_to_addr_reg(cg, val); }
         }
     }
 }
@@ -538,12 +532,8 @@ pub fn f128_emit_load<T: F128SoftFloat + ?Sized>(
                 cg.f128_load_from_addr_reg_to_acc(dest);
                 return;
             }
-            SlotAddr::OverAligned(slot, id) => {
-                cg.f128_alloca_aligned_addr(slot, id);
-                cg.f128_move_aligned_to_addr_reg();
-                cg.f128_load_from_addr_reg_to_acc(dest);
-                return;
-            }
+            SlotAddr::OverAligned(slot, id) => { cg.f128_alloca_aligned_addr(slot, id); cg.f128_move_aligned_to_addr_reg(); cg.f128_load_from_addr_reg_to_acc(dest); return; }
+            SlotAddr::Reg(reg) => { cg.f128_move_phys_to_addr_reg(reg); cg.f128_load_from_addr_reg_to_acc(dest); return; }
         }
     } else {
         return;
@@ -588,14 +578,8 @@ pub fn f128_emit_store_with_offset<T: F128SoftFloat + ?Sized>(
                 }
                 f128_store_to_addr_reg(cg, val);
             }
-            SlotAddr::OverAligned(slot, id) => {
-                cg.f128_alloca_aligned_addr(slot, id);
-                cg.f128_move_aligned_to_addr_reg();
-                if offset != 0 {
-                    cg.f128_add_offset_to_addr_reg(offset);
-                }
-                f128_store_to_addr_reg(cg, val);
-            }
+            SlotAddr::OverAligned(slot, id) => { cg.f128_alloca_aligned_addr(slot, id); cg.f128_move_aligned_to_addr_reg(); if offset != 0 { cg.f128_add_offset_to_addr_reg(offset); } f128_store_to_addr_reg(cg, val); }
+            SlotAddr::Reg(reg) => { cg.f128_move_phys_to_addr_reg(reg); if offset != 0 { cg.f128_add_offset_to_addr_reg(offset); } f128_store_to_addr_reg(cg, val); }
         }
     }
 }
@@ -636,15 +620,8 @@ pub fn f128_emit_load_with_offset<T: F128SoftFloat + ?Sized>(
                     cg.f128_load_from_addr_reg_to_acc(dest);
                     return;
                 }
-                SlotAddr::OverAligned(slot, id) => {
-                    cg.f128_alloca_aligned_addr(slot, id);
-                    cg.f128_move_aligned_to_addr_reg();
-                    if offset != 0 {
-                        cg.f128_add_offset_to_addr_reg(offset);
-                    }
-                    cg.f128_load_from_addr_reg_to_acc(dest);
-                    return;
-                }
+                SlotAddr::OverAligned(slot, id) => { cg.f128_alloca_aligned_addr(slot, id); cg.f128_move_aligned_to_addr_reg(); if offset != 0 { cg.f128_add_offset_to_addr_reg(offset); } cg.f128_load_from_addr_reg_to_acc(dest); return; }
+                SlotAddr::Reg(reg) => { cg.f128_move_phys_to_addr_reg(reg); if offset != 0 { cg.f128_add_offset_to_addr_reg(offset); } cg.f128_load_from_addr_reg_to_acc(dest); return; }
             }
             true
         } else {

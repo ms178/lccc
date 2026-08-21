@@ -518,12 +518,8 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
                     return;
                 }
-                Some(SlotAddr::OverAligned(slot, id)) => {
-                    self.emit_alloca_aligned_addr_impl(slot, id);
-                    let src = self.fp_store_value_xmm(val, ty);
-                    self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
-                    return;
-                }
+                Some(SlotAddr::OverAligned(slot,id)) => { self.emit_alloca_aligned_addr_impl(slot,id); let src=self.fp_store_value_xmm(val,ty); self.state.emit_fmt(format_args!("{} %{}, (%rcx)",store_instr,src)); return; }
+                Some(SlotAddr::Reg(reg)) => { let src=self.fp_store_value_xmm(val,ty); self.state.emit_fmt(format_args!("{} %{}, (%{})",store_instr,src,phys_reg_name(reg))); return; }
                 None => {} // fall through to default
             }
         }
@@ -715,10 +711,8 @@ impl X86Codegen {
                     self.emit_load_ptr_from_slot_impl(slot, ptr.0);
                     self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
                 }
-                Some(SlotAddr::OverAligned(slot, id)) => {
-                    self.emit_alloca_aligned_addr_impl(slot, id);
-                    self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
-                }
+                Some(SlotAddr::OverAligned(slot,id)) => { self.emit_alloca_aligned_addr_impl(slot,id); self.state.emit_fmt(format_args!("{} (%rcx), %{}",load_instr,target)); }
+                Some(SlotAddr::Reg(reg)) => self.state.emit_fmt(format_args!("{} (%{}), %{}",load_instr,phys_reg_name(reg),target)),
                 None => {
                     // No address resolution — fall back to the default path.
                     crate::backend::traits::emit_load_default(self, dest, ptr, ty);
@@ -959,13 +953,8 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
                     return;
                 }
-                Some(SlotAddr::OverAligned(slot, id)) => {
-                    self.emit_alloca_aligned_addr_impl(slot, id);
-                    self.emit_add_offset_to_addr_reg_impl(offset);
-                    let src = self.fp_store_value_xmm(val, ty);
-                    self.state.emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
-                    return;
-                }
+                Some(SlotAddr::OverAligned(slot,id)) => { self.emit_alloca_aligned_addr_impl(slot,id); self.emit_add_offset_to_addr_reg_impl(offset); let src=self.fp_store_value_xmm(val,ty); self.state.emit_fmt(format_args!("{} %{}, (%rcx)",store_instr,src)); return; }
+                Some(SlotAddr::Reg(reg)) => { let src=self.fp_store_value_xmm(val,ty); let r=phys_reg_name(reg); if offset!=0 { self.state.emit_fmt(format_args!("{} %{}, {}(%{})",store_instr,src,offset,r)); } else { self.state.emit_fmt(format_args!("{} %{}, (%{})",store_instr,src,r)); } return; }
                 None => {} // fall through to default
             }
         }
@@ -1150,6 +1139,7 @@ impl X86Codegen {
                         self.state.emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
                     }
                 }
+                SlotAddr::Reg(reg) => { self.operand_to_rax(val); let r=phys_reg_name(reg); let src=Self::reg_for_type("rax",ty); if offset!=0 { self.state.emit_fmt(format_args!("    {} %{}, {}(%{})",store_instr,src,offset,r)); } else { self.state.emit_fmt(format_args!("    {} %{}, (%{})",store_instr,src,r)); } }
             }
         } else if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
             // Register-resident base with no slot home (fold accepted through
@@ -1225,11 +1215,8 @@ impl X86Codegen {
                     }
                     self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
                 }
-                Some(SlotAddr::OverAligned(slot, id)) => {
-                    self.emit_alloca_aligned_addr_impl(slot, id);
-                    self.emit_add_offset_to_addr_reg_impl(offset);
-                    self.state.emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
-                }
+                Some(SlotAddr::OverAligned(slot,id)) => { self.emit_alloca_aligned_addr_impl(slot,id); self.emit_add_offset_to_addr_reg_impl(offset); self.state.emit_fmt(format_args!("{} (%rcx), %{}",load_instr,target)); }
+                Some(SlotAddr::Reg(reg)) => { let r=phys_reg_name(reg); if offset!=0 { self.state.emit_fmt(format_args!("{} {}(%{}), %{}",load_instr,offset,r,target)); } else { self.state.emit_fmt(format_args!("{} (%{}), %{}",load_instr,r,target)); } }
                 None => {
                     // Register-resident base with no slot home (fold accepted
                     // through const_offset_fold_reg_base_ok).  Dropping the
@@ -1317,6 +1304,11 @@ impl X86Codegen {
                         }
                         self.emit_typed_load_indirect_impl(load_instr);
                     }
+                }
+                SlotAddr::Reg(reg) => {
+                    let r=phys_reg_name(reg);
+                    if !ty.is_float() && !matches!(ty,IrType::I128|IrType::U128) { if let Some(&dr)=self.reg_assignments.get(&dest.0) { if !is_xmm_reg(dr) { let u=matches!(load_instr,"movl"|"movzbl"|"movzwl"); let d=if u {phys_reg_name_32(dr)} else {phys_reg_name(dr)}; if offset!=0 {self.state.emit_fmt(format_args!("    {} {}(%{}), %{}",load_instr,offset,r,d));} else {self.state.emit_fmt(format_args!("    {} (%{}), %{}",load_instr,r,d));} return; } } }
+                    let d=Self::load_dest_reg(ty); if offset!=0 {self.state.emit_fmt(format_args!("    {} {}(%{}), {}",load_instr,offset,r,d));} else {self.state.emit_fmt(format_args!("    {} (%{}), {}",load_instr,r,d));}
                 }
             }
             self.store_rax_to(dest);

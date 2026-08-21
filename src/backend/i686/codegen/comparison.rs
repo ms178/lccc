@@ -189,10 +189,8 @@ impl I686Codegen {
                 self.emit_load_ptr_from_slot(slot, ptr);
                 emit!(self.state, "    {} ${}, (%ecx)", mnemonic, imm);
             }
-            SlotAddr::OverAligned(slot, id) => {
-                self.emit_alloca_aligned_addr(slot, id);
-                emit!(self.state, "    {} ${}, (%ecx)", mnemonic, imm);
-            }
+            SlotAddr::OverAligned(slot,id) => { self.emit_alloca_aligned_addr(slot,id); emit!(self.state,"    {} ${}, (%ecx)",mnemonic,imm); }
+            SlotAddr::Reg(reg) => emit!(self.state,"    {} ${}, (%{})",mnemonic,imm,phys_reg_name(reg)),
         }
         true
     }

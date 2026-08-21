@@ -2141,6 +2141,9 @@ impl ArchCodegen for ArmCodegen {
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         self.state.emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));
     }
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) {
+        self.state.emit_fmt(format_args!("    mov x9, {}", callee_saved_name(reg)));
+    }
     fn emit_memcpy_store_dest_from_acc(&mut self) { }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mov x10, x9"); }
     fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {

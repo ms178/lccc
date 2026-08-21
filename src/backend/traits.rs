@@ -424,12 +424,13 @@ pub trait ArchCodegen {
                     self.emit_typed_load_from_slot(load_instr, folded_slot);
                 }
                 SlotAddr::Indirect(slot) => {
-                    // Non-alloca base: load the base pointer from its stack slot
-                    // to the addr register, add the constant offset, then load.
                     self.emit_load_ptr_from_slot(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg(offset);
-                    }
+                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
+                    self.emit_typed_load_indirect(load_instr);
+                }
+                SlotAddr::Reg(reg) => {
+                    self.emit_reg_to_addr(reg);
+                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
                     self.emit_typed_load_indirect(load_instr);
                 }
             }
@@ -464,13 +465,13 @@ pub trait ArchCodegen {
                     self.emit_typed_store_to_slot(store_instr, ty, folded_slot);
                 }
                 SlotAddr::Indirect(slot) => {
-                    // Non-alloca base: save the value, load the base pointer,
-                    // add the constant offset, then store through it.
-                    self.emit_save_acc();
-                    self.emit_load_ptr_from_slot(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg(offset);
-                    }
+                    self.emit_save_acc(); self.emit_load_ptr_from_slot(slot, base.0);
+                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
+                    self.emit_typed_store_indirect(store_instr, ty);
+                }
+                SlotAddr::Reg(reg) => {
+                    self.emit_reg_to_addr(reg);
+                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
                     self.emit_typed_store_indirect(store_instr, ty);
                 }
             }
@@ -1042,10 +1043,8 @@ pub trait ArchCodegen {
                             // Alloca: lea (slot+offset)(%rbp), %rax — single instruction.
                             self.emit_gep_direct_const(slot, off);
                         }
-                        SlotAddr::Indirect(slot) => {
-                            // Pointer in slot: load ptr, then lea offset(%rax), %rax.
-                            self.emit_gep_indirect_const(slot, off, base.0);
-                        }
+                        SlotAddr::Indirect(slot) => self.emit_gep_indirect_const(slot, off, base.0),
+                        SlotAddr::Reg(reg) => { self.emit_reg_to_acc(reg); self.emit_gep_add_const_to_acc(off); }
                     }
                     self.emit_store_result(dest);
                     return;
@@ -1086,6 +1085,7 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Direct(slot) => self.emit_slot_addr_to_secondary(slot, true, base.0),
                 SlotAddr::Indirect(slot) => self.emit_slot_addr_to_secondary(slot, false, base.0),
+                SlotAddr::Reg(reg) => { self.emit_reg_to_acc(reg); self.emit_acc_to_secondary(); }
             }
         } else if let Some(br) = self.get_phys_reg_for_value(base.0) {
             // SOUNDNESS FALLBACK: slot-less register-resident base — move it
@@ -1143,6 +1143,10 @@ pub trait ArchCodegen {
     fn emit_reg_to_acc(&mut self, _reg: PhysReg) {
         // Default: no-op (backends override)
     }
+    /// Move a register-resident pointer to the architecture address scratch.
+    fn emit_reg_to_addr(&mut self, _reg: PhysReg) {
+        panic!("backend must implement register-address materialization")
+    }
 
     /// Add a constant offset to accumulator (used after computing base in acc).
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) {
@@ -1182,6 +1186,7 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot, true, dest.0),
                 SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot, false, dest.0),
+                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); self.emit_memcpy_store_dest_from_acc(); }
             }
         }
         if let Some(addr) = self.state_ref().resolve_slot_addr(src.0) {
@@ -1192,6 +1197,7 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, src.0),
                 SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, src.0),
+                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); self.emit_memcpy_store_src_from_acc(); }
             }
         }
         self.emit_memcpy_impl(size);
@@ -2140,15 +2146,8 @@ pub fn emit_store_default(
                     cg.emit_store_pair_indirect();
                 }
                 SlotAddr::Direct(slot) => cg.emit_store_pair_to_slot(slot),
-                SlotAddr::Indirect(slot) => {
-                    // Load the pointer into the ptr register (ecx/x9/t5) BEFORE
-                    // saving the accumulator pair to callee-saved regs (esi:edi on i686).
-                    // On i686, the pointer may be register-allocated to esi or edi,
-                    // so emit_save_acc_pair() would clobber it if done first.
-                    cg.emit_load_ptr_from_slot(slot, ptr.0);
-                    cg.emit_save_acc_pair();
-                    cg.emit_store_pair_indirect();
-                }
+                SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_save_acc_pair(); cg.emit_store_pair_indirect(); }
+                SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_save_acc_pair(); cg.emit_store_pair_indirect(); }
             }
         }
         return;
@@ -2167,15 +2166,8 @@ pub fn emit_store_default(
                 cg.emit_load_operand(val);
                 cg.emit_typed_store_to_slot(store_instr, ty, slot);
             }
-            SlotAddr::Indirect(slot) => {
-                // Load pointer to %rcx FIRST, then load value to accumulator.
-                // This avoids emit_save_acc which uses %r11/%rdx as scratch —
-                // these can be clobbered by the value loading (operand_to_rax)
-                // if the value computation uses %r11 as an intermediate.
-                cg.emit_load_ptr_from_slot(slot, ptr.0);
-                cg.emit_load_operand(val);
-                cg.emit_typed_store_indirect(store_instr, ty);
-            }
+            SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_load_operand(val); cg.emit_typed_store_indirect(store_instr, ty); }
+            SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_load_operand(val); cg.emit_typed_store_indirect(store_instr, ty); }
         }
     } else {
         cg.emit_load_operand(val);
@@ -2199,10 +2191,8 @@ pub fn emit_load_default(
                     cg.emit_load_pair_indirect();
                 }
                 SlotAddr::Direct(slot) => cg.emit_load_pair_from_slot(slot),
-                SlotAddr::Indirect(slot) => {
-                    cg.emit_load_ptr_from_slot(slot, ptr.0);
-                    cg.emit_load_pair_indirect();
-                }
+                SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_load_pair_indirect(); }
+                SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_load_pair_indirect(); }
             }
             cg.emit_store_acc_pair(dest);
         }
@@ -2216,10 +2206,8 @@ pub fn emit_load_default(
                 cg.emit_typed_load_indirect(load_instr);
             }
             SlotAddr::Direct(slot) => cg.emit_typed_load_from_slot(load_instr, slot),
-            SlotAddr::Indirect(slot) => {
-                cg.emit_load_ptr_from_slot(slot, ptr.0);
-                cg.emit_typed_load_indirect(load_instr);
-            }
+            SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_typed_load_indirect(load_instr); }
+            SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_typed_load_indirect(load_instr); }
         }
         cg.emit_store_result(dest);
     }

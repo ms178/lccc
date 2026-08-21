@@ -1,8 +1,7 @@
 # Register allocation
 
 Production: `src/backend/regalloc.rs` (policy) + `src/backend/live_range.rs` (scan).
-Stack homes: `src/backend/stack_layout/`; its hole-aware graph colorer is
-research-wired but default-off until RA-23 exposes accumulator lifetimes.
+Stack homes: `src/backend/stack_layout/`; register pointers use exact `SlotAddr::Reg(PhysReg)` locations across every backend. The hole-aware graph colorer is research-wired but default-off until RA-23 exposes accumulator lifetimes.
 
 ## Pipeline
 
@@ -30,9 +29,7 @@ PhysReg **(11) = %r10**, (10) = %r11.
 
 ## Open quality gaps
 
-RA-23 explicit accumulator locations; RA-24 `SlotAddr::Reg`; true split scan
-and reload-at-next-use; gzip rematerialization/next-use; full cross-backend
-segment fill after the location contract is unified.
+RA-24 exact register pointer locations are production. Remaining gaps are RA-23 explicit accumulator locations, true split scan and reload-at-next-use, gzip rematerialization/next-use, and broader segment allocation after the accumulator contract is unified.
 
 ## Kill switches / diagnostics
 

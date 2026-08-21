@@ -3,6 +3,7 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
+use crate::backend::traits::ArchCodegen;
 use super::emit::{RiscvCodegen, callee_saved_name};
 
 impl RiscvCodegen {
@@ -45,14 +46,8 @@ impl RiscvCodegen {
                     let folded_slot = StackSlot(slot.0 + offset);
                     self.emit_store_to_s0("t0", folded_slot.0, store_instr);
                 }
-                SlotAddr::Indirect(slot) => {
-                    self.state.emit("    mv t3, t0");
-                    self.emit_load_ptr_from_slot_impl(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg_impl(offset);
-                    }
-                    self.state.emit_fmt(format_args!("    {} t3, 0(t5)", store_instr));
-                }
+                SlotAddr::Indirect(slot) => { self.state.emit("    mv t3, t0"); self.emit_load_ptr_from_slot_impl(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    {} t3, 0(t5)",store_instr)); }
+                SlotAddr::Reg(reg) => { self.state.emit("    mv t3, t0"); self.emit_reg_to_addr(reg); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    {} t3, 0(t5)",store_instr)); }
             }
         }
     }
@@ -76,13 +71,8 @@ impl RiscvCodegen {
                     let folded_slot = StackSlot(slot.0 + offset);
                     self.emit_load_from_s0("t0", folded_slot.0, load_instr);
                 }
-                SlotAddr::Indirect(slot) => {
-                    self.emit_load_ptr_from_slot_impl(slot, base.0);
-                    if offset != 0 {
-                        self.emit_add_offset_to_addr_reg_impl(offset);
-                    }
-                    self.state.emit_fmt(format_args!("    {} t0, 0(t5)", load_instr));
-                }
+                SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot_impl(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    {} t0, 0(t5)",load_instr)); }
+                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); if offset!=0 {self.emit_add_offset_to_addr_reg_impl(offset);} self.state.emit_fmt(format_args!("    {} t0, 0(t5)",load_instr)); }
             }
             self.store_t0_to(dest);
         }
