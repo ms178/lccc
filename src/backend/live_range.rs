@@ -412,6 +412,12 @@ impl LinearScanAllocator {
             if !self.register_steal_is_safe(interval.range.value_id, range) {
                 continue;
             }
+            // ABI-hinted ParamRefs are a codegen contract (see
+            // `select_evict_victim`); exchanging them out of their ABI
+            // register breaks the ordered-copy elision.
+            if interval.range.reg_hint.is_some() {
+                continue;
+            }
             let fut = Self::future_uses(&interval.range, range.start);
             let nxt = next_use_after(&interval.range, range.start);
             // Min future cost; ties → farthest next use (Braun–Hack MIN).
@@ -484,11 +490,27 @@ impl LinearScanAllocator {
     /// `incoming.end` is a strictly better decision than spilling a hot
     /// incoming.
     ///
-    /// Guards (all must pass):
+    /// Guards (all must pass, unless the victim is already dead at the scan
+    /// point — see below):
     /// - steal-safe
     /// - `incoming.priority > victim.priority` (never evict a hotter value)
     /// - mode 1 only: `victim.loop_depth < incoming.loop_depth`
     /// - mode ≥ 3: victim's next use is strictly after `incoming.end`
+    ///
+    /// Note (session 41): a "zero-future-use dead victim" search was
+    /// prototyped here twice — as a ranking override and as a last resort
+    /// when the guarded search finds nothing — and both variants were
+    /// measured and REVERTED. The free demotion is real (the victim has no
+    /// uses left), but firing it perturbs the eviction cascade in unrolled
+    /// kernels: the zlib-ng Adler DO8 loop regressed 59.9 → 70.4 ms
+    /// (+15%, 1.51× → 1.78× vs GCC) because byte temps that grabbed the
+    /// freed registers shifted pressure onto the later partial-sum temps,
+    /// which then spilled. The gzip `longest_match` preheader pathology is
+    /// better served by Phase-1 hot-loop candidacy (see `regalloc.rs`
+    /// `hot_loop_home`), which keeps the loop-carried values in
+    /// callee-saved registers without touching the eviction ranking.
+    /// `CCC_NO_DEAD_EVICT` no longer changes behaviour and is kept only
+    /// for the documented experiment trail.
     fn select_evict_victim(&self, incoming: &LiveRange, mode: i32) -> Option<usize> {
         if self.active.is_empty() || mode <= 0 {
             return None;
@@ -500,6 +522,17 @@ impl LinearScanAllocator {
 
         for (idx, interval) in self.active.iter().enumerate() {
             if !self.register_steal_is_safe(interval.range.value_id, incoming) {
+                continue;
+            }
+            // ABI-hinted values (leading ParamRefs) are a codegen contract:
+            // the ordered parallel-copy emitter elides the entry copy when a
+            // param's home equals its ABI register. Evicting such a value
+            // hands its ABI register to someone else and another param may
+            // take it, after which the elided copy is missing and the param
+            // is read from the wrong register (sqlite_vdbe_peephole
+            // corruption: `op` read from %dil instead of %sil). Never evict
+            // a hinted value; spill the incoming instead.
+            if interval.range.reg_hint.is_some() {
                 continue;
             }
             if incoming.priority <= interval.range.priority {
@@ -1267,6 +1300,60 @@ mod tests {
             "mode 2 has no next-use window: cheapest (A) wins"
         );
     }
+
+
+
+    #[test]
+    fn test_select_evict_victim_same_point_use_is_not_dead() {
+        // A's last use is AT the incoming's start point (use-before-def in
+        // the same instruction). Evicting A would hand its register to a
+        // value whose definition overwrites it while A's operand is read.
+        // The strict mode-3 window hides A (next use 15 <= incoming.end)
+        // and no other victim exists, so the incoming is spilled. Guards
+        // against reintroducing a "dead victim" search that ignores
+        // same-point uses.
+        let mut a = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
+        a.init_registers();
+        a.assignments.insert(1, PhysReg(0));
+        a.occupy_register(PhysReg(0), 51);
+        a.active.push(ActiveInterval {
+            range: lr(1, 0, 50, vec![0, 15], 1),
+            phys_reg: PhysReg(0),
+            occupancy_end: 50,
+            next_use: None,
+        });
+        let incoming = lr(3, 15, 100, vec![15, 40, 100], 50);
+        assert!(
+            a.select_evict_victim(&incoming, 3).is_none(),
+            "victim whose last use coincides with incoming.start must not be evicted"
+        );
+    }
+
+    #[test]
+    fn test_select_evict_victim_never_evicts_abi_hinted() {
+        // A is an ABI-hinted ParamRef (home == ABI register is a codegen
+        // contract for the ordered parallel-copy emitter). A is dead at the
+        // scan point, which would otherwise make it the ideal victim —
+        // the hint protection must outrank the dead-victim exception.
+        let mut a = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
+        a.init_registers();
+        a.assignments.insert(1, PhysReg(0));
+        a.occupy_register(PhysReg(0), 51);
+        let mut victim = lr(1, 0, 50, vec![0, 10], 1);
+        victim.reg_hint = Some(PhysReg(0));
+        a.active.push(ActiveInterval {
+            range: victim,
+            phys_reg: PhysReg(0),
+            occupancy_end: 50,
+            next_use: None,
+        });
+        let incoming = lr(3, 15, 100, vec![15, 40, 100], 50);
+        assert!(
+            a.select_evict_victim(&incoming, 3).is_none(),
+            "ABI-hinted ParamRef must never be evicted, dead or not"
+        );
+    }
+
 
     #[test]
     fn test_next_use_after_binary_search() {

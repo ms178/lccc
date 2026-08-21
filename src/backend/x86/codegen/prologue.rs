@@ -1423,7 +1423,14 @@ impl X86Codegen {
                         // deferred below because a destination may still hold a
                         // different incoming ABI argument. XMM homes use their
                         // own ordered parallel-copy set for the same reason.
-                        let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 5;
+                        // The GPR pool is X86_CALLEE_SAVED_WITH_RBP (1..=6)
+                        // whenever the frame pointer is omitted; rbp(6) is a
+                        // legal callee-saved home then. The old 1..=5 range
+                        // left rbp-homed params unclassified, so no pre-store
+                        // was emitted and the ParamRef fell back to an ABI
+                        // read that copy-propagation could corrupt
+                        // (sqlite_vdbe_peephole: `op` read from %dil).
+                        let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 6;
                         let is_caller_saved_gpr = (10..=16).contains(&phys_reg.0);
                         let is_xmm = super::emit::is_xmm_reg(phys_reg);
                         if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
@@ -1819,6 +1826,21 @@ impl X86Codegen {
                 let src_reg = Self::reg_for_type(X86_ARG_REGS[reg_idx], ty);
                 let load_instr = Self::mov_load_for_type(ty);
                 let dest_reg = Self::load_dest_reg(ty);
+                if std::env::var_os("CCC_DEBUG_PARAMREF").is_some() {
+                    eprintln!(
+                        "[PARAMREF] dest=v{} param_idx={} reg_idx={} src={} ty={:?}",
+                        dest.0, param_idx, reg_idx, src_reg, ty
+                    );
+                }
+                // The fallback ABI read is a pinned contract: the operand is
+                // the parameter's *incoming* ABI register. A caller-saved
+                // pre-store of a different parameter may have copied another
+                // value into the same register name (`movq %rdi, %rsi` for
+                // param 0 while param 1 arrives in %sil), and copy propagation
+                // must never rewrite this read through that copy — it would
+                // silently substitute the wrong parameter. The marker is
+                // consumed by `pin_param_abi_reads` in the text peephole.
+                self.state.emit_fmt(format_args!("    # LCCC_PARAM_ABI_READ {}", src_reg));
                 self.state.emit_fmt(format_args!("    {} %{}, {}", load_instr, src_reg, dest_reg));
                 self.store_rax_to(dest);
             }

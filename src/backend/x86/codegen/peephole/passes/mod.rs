@@ -150,6 +150,45 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
     }
 }
 
+/// Pin fallback parameter-ABI reads so no text pass rewrites their source.
+///
+/// `emit_param_ref_impl` falls back to reading a parameter from its incoming
+/// ABI register when the parameter has no register home and no alloca slot.
+/// The operand of that read is a *contract*: it must stay the ABI register
+/// even when a caller-saved pre-store of a different parameter copied another
+/// value into the same register name (`movq %rdi, %rsi` for param 0 while
+/// param 1 still arrives in `%sil`). Copy propagation had no way to tell the
+/// two apart and rewrote `movzbl %sil, %eax` into `movzbl %dil, %eax`,
+/// storing the wrong parameter (sqlite VDBE `addop` corruption).
+///
+/// The `# LCCC_PARAM_ABI_READ <reg>` marker is emitted immediately before
+/// the read; this pass pins that line (opaque to source rewriting, still
+/// classified by destination so register-taint tracking keeps working) and
+/// the marker itself stays a harmless comment for the assembler.
+fn pin_param_abi_reads(store: &LineStore, infos: &mut [LineInfo]) {
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        if !trimmed.starts_with("# LCCC_PARAM_ABI_READ ") {
+            continue;
+        }
+        // Pin the next real instruction line (skip other comments/labels).
+        let mut j = i + 1;
+        while j < store.len() {
+            let next_trimmed = infos[j].trimmed(store.get(j));
+            if next_trimmed.is_empty() || next_trimmed.starts_with('.') || next_trimmed.starts_with('#') {
+                j += 1;
+                continue;
+            }
+            let dest_reg = parse_dest_reg_fast(next_trimmed);
+            infos[j].pinned = true;
+            infos[j].has_indirect_mem = true;
+            infos[j].kind = LineKind::Other { dest_reg };
+            infos[j].rbp_offset = RBP_OFFSET_NONE;
+            break;
+        }
+    }
+}
+
 fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
     for i in 0..store.len() {
@@ -291,6 +330,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     pin_inline_asm_regions(&store, &mut infos);
     pin_volatile_stack_slots(&store, &mut infos);
     pin_address_taken_stack_slots(&store, &mut infos);
+    pin_param_abi_reads(&store, &mut infos);
 
     // ms178: pushfq/popfq are now classified as Push{REG_NONE}/Pop{REG_NONE}
     // (see types.rs) and all passes treat Push/Pop as barriers, so they can no

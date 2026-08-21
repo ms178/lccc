@@ -60,3 +60,4 @@ __pycache__/
 /.godbolt-cache/
 agentB*.patch
 agentB*.txt
+/results/
