@@ -35,8 +35,11 @@ the recipe checksum as validated.
    and byte-identical decompression;
 6. captures binaries, `size`, full `objdump`, build/test logs, raw randomized
    timing samples, individual best/worst/median cases, and arithmetic/geometric
-   aggregate ratios; and
-7. pins timing children to one available CPU when `taskset` is present.
+   aggregate ratios;
+7. optionally builds a same-LCCC kill-switch control (`--lccc-control-env
+   NAME=VALUE`) and reports every treatment/control case, arithmetic/geometric
+   means, best gain, and worst regression without hiding an outlier; and
+8. pins timing children to one available CPU when `taskset` is present.
 
 Example:
 
@@ -45,7 +48,8 @@ python3 tests/workloads/gzip-1.14/run.py \
   --archive /path/to/gzip-1.14.tar.xz \
   --lccc "$PWD/target/fastbuild/lccc" \
   --artifact-dir /path/to/results \
-  --rounds 9 --warmups 2
+  --lccc-control-env CCC_NO_GLOBAL_ADDR_REMAT=1 \
+  --rounds 15 --warmups 2
 ```
 
 The generated report is **VM wall-clock screening only**. It does not provide

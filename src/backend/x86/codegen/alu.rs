@@ -216,10 +216,20 @@ impl X86Codegen {
                             self.state.emit_fmt(format_args!("    movq %{src64}, %{dest64}"));
                         }
                     }
-                } else if use_32bit {
-                    self.value_to_reg(v, dest64);
                 } else {
-                    self.value_to_reg(v, dest64);
+                    // An adjacent producer may deliberately live only in the
+                    // allocator-owned accumulator location. `value_to_reg`
+                    // bypasses that cache and hard-fails for such a value;
+                    // consume through the normal operand path first, then copy
+                    // into BT's chosen result register. The canonical
+                    // `(x & y) >> bit & 1` handoff exercises this at -O1+.
+                    self.operand_to_rax(base);
+                    if use_32bit {
+                        let dest32 = super::emit::phys_reg_name_32(dest_phys);
+                        self.state.emit_fmt(format_args!("    movl %eax, %{dest32}"));
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq %rax, %{dest64}"));
+                    }
                 }
             }
             Operand::Const(_) => self.operand_to_reg(base, dest64),
@@ -239,10 +249,10 @@ impl X86Codegen {
             self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
         }
         self.state.emit_fmt(format_args!("    setc %{dest8}"));
-        if use_32bit {
-            let dest32 = super::emit::phys_reg_name_32(dest_phys);
-            self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
-        }
+        // SETcc writes one byte only. Always clear the rest of the destination;
+        // a 32-bit MOVZX also zeroes the upper half for an I64/U64 boolean.
+        let dest32 = super::emit::phys_reg_name_32(dest_phys);
+        self.state.emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
         true
     }
 

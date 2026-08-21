@@ -451,6 +451,19 @@ impl Preprocessor {
         }
     }
 
+    /// Define or undefine GCC-compatible PIE macros. PIE also defines PIC, but
+    /// the driver calls the two setters separately so explicit `-fPIC` does
+    /// not falsely advertise `__PIE__`.
+    pub fn set_pie(&mut self, enabled: bool) {
+        if enabled {
+            self.define_simple_macro("__PIE__", "2");
+            self.define_simple_macro("__pie__", "2");
+        } else {
+            self.macros.undefine("__PIE__");
+            self.macros.undefine("__pie__");
+        }
+    }
+
     /// Define x86/x86_64 SIMD feature macros (__SSE__, __SSE2__, __MMX__, etc.).
     ///
     /// GCC/Clang always define these for x86_64 (SSE2 is baseline for the ISA).

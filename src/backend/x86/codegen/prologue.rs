@@ -676,32 +676,29 @@ impl X86Codegen {
             self.value_types = value_types;
         }
 
-        // GlobalAddr values whose EVERY use is a foldable Load/Store pointer
-        // never materialize (they become direct sym(%rip) accesses in
-        // generate_load/store). Keep them out of the allocator AND slot
-        // assignment: a dead address value otherwise consumes a register a
-        // live value needs (forcing a callee-saved push/pop or a spill) and
-        // an 8-byte frame slot. Exact same fold-preview the i686 backend
-        // uses; the preconditions mirror generate_load/store (non-TLS,
-        // non-wide type, default address space; GOT-needing symbols are
-        // filtered inside the fold itself via needs_got_for_addr, which the
-        // preview conservatively respects by only listing GlobalAddr dests
-        // whose uses ALL satisfy the foldable-shape test).
+        // Direct scalar global accesses and safely reconstructible global
+        // address roots never need a register or stack home. The former become
+        // `sym(%rip)` Load/Store operands; the latter are recreated only at
+        // audited Add/Sub/GEP uses as `leaq sym(%rip)` plus the live offset.
+        // Filtering GOT/TLS identities before either analysis is the critical
+        // fail-closed contract: full PIC and weak PIE externs still materialize.
         let never_materialized = {
-            let gmap = crate::backend::generation::build_global_addr_map_for(
+            let mut gmap = crate::backend::generation::build_global_addr_map_for(
                 func, &self.state.tls_symbols);
-            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
-            // x86-64 refinement: the fold additionally requires
-            // !needs_got_for_addr(sym) at emission time. Drop candidates
-            // whose symbol would go through the GOT — those DO materialize.
-            set.retain(|vid| {
-                gmap.get(vid).map(|sym| {
-                    // strip "+off" suffixes the GEP-merge may have added
-                    let base = sym.split(['+', '-']).next().unwrap_or(sym);
-                    !self.state.needs_got_for_addr(base)
-                        && !self.state.tls_symbols.contains(base)
-                }).unwrap_or(false)
+            gmap.retain(|_, sym| {
+                // Strip a composed constant displacement. Symbol names emitted
+                // by C cannot contain '+'; '-' here is only the map's suffix.
+                let base = sym.split(['+', '-']).next().unwrap_or(sym);
+                !self.state.needs_got_for_addr(base)
+                    && !self.state.tls_symbols.contains(base)
+                    && !self.state.absolute_symbols.contains(base)
             });
+            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(
+                func, &gmap);
+            set.extend(
+                crate::backend::generation::build_rematerializable_global_addr_set_for(
+                    func, &gmap),
+            );
             self.state.never_materialized_values = set.clone();
             set
         };

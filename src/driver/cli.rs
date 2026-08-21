@@ -1099,9 +1099,21 @@ impl Driver {
                 "-fno-profile-arcs" | "-fno-test-coverage" | "-fno-branch-probabilities" | "-fno-auto-profile" => {},
                 arg if arg.starts_with("-fno-profile") => {},
 
-                // Feature flags
-                "-fPIC" | "-fpic" | "-fPIE" | "-fpie" => self.pic = true,
-                "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" => self.pic = false,
+                // Feature flags. Full PIC and PIE have different x86-64 data
+                // relocation rules, so preserve the last explicit mode rather
+                // than collapsing both flags into one boolean.
+                "-fPIC" | "-fpic" => {
+                    self.pic = true;
+                    self.pie = false;
+                }
+                "-fPIE" | "-fpie" => {
+                    self.pic = false;
+                    self.pie = true;
+                }
+                "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" => {
+                    self.pic = false;
+                    self.pie = false;
+                }
                 "-fcf-protection=branch" | "-fcf-protection=full" => self.cf_protection_branch = true,
                 "-fcf-protection=none" => self.cf_protection_branch = false,
                 arg if arg.starts_with("-fpatchable-function-entry=") => {

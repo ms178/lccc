@@ -1187,6 +1187,111 @@ fn build_foldable_global_addr_set(
     live
 }
 
+/// Root `GlobalAddr` values that can be omitted and reconstructed at each use.
+///
+/// This is deliberately narrower than the symbol identity map. A candidate's
+/// every use must be either an already-proven direct scalar Load/Store or one
+/// address derivation that the target hook can emit as `symbol + offset`.
+/// Passing an address as data, comparing it, storing it as a value, using a
+/// wide/segment memory operation, or placing it in a terminator rejects the
+/// root. The fail-closed scan is what makes removing its register/stack home
+/// safe: no generic operand path can encounter an unmaterialized value.
+pub fn build_rematerializable_global_addr_set_for(
+    func: &IrFunction,
+    global_addr_map: &FxHashMap<u32, String>,
+) -> FxHashSet<u32> {
+    if env_flag_set("CCC_NO_GLOBAL_ADDR_REMAT") {
+        return FxHashSet::default();
+    }
+
+    let mut roots = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, .. } = inst {
+                if global_addr_map.contains_key(&dest.0) {
+                    roots.insert(dest.0);
+                }
+            }
+        }
+    }
+    if roots.is_empty() {
+        return roots;
+    }
+
+    let op_is_root = |op: &Operand, id: u32| {
+        matches!(op, Operand::Value(v) if v.0 == id)
+    };
+    let op_uses_root = |op: &Operand, id: u32| op_is_root(op, id);
+
+    let candidates: Vec<u32> = roots.iter().copied().collect();
+    for id in candidates {
+        let mut valid = true;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if !inst.used_values().contains(&id) {
+                    continue;
+                }
+                let allowed = match inst {
+                    Instruction::Load {
+                        ptr, ty, seg_override, ..
+                    } => {
+                        ptr.0 == id
+                            && *seg_override == AddressSpace::Default
+                            && is_foldable_mem_ty(*ty)
+                    }
+                    Instruction::Store {
+                        val, ptr, ty, seg_override, ..
+                    } => {
+                        ptr.0 == id
+                            && !op_uses_root(val, id)
+                            && *seg_override == AddressSpace::Default
+                            && is_foldable_mem_ty(*ty)
+                    }
+                    Instruction::GetElementPtr { base, offset, .. } => {
+                        base.0 == id && !op_uses_root(offset, id)
+                    }
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
+                    } => {
+                        !ty.is_float()
+                            && ty.size() == 8
+                            && (op_is_root(lhs, id) ^ op_is_root(rhs, id))
+                    }
+                    Instruction::BinOp {
+                        op: IrBinOp::Sub,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
+                    } => {
+                        !ty.is_float()
+                            && ty.size() == 8
+                            && op_is_root(lhs, id)
+                            && !op_is_root(rhs, id)
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid || block.terminator.used_values().contains(&id) {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            roots.remove(&id);
+        }
+    }
+    roots
+}
+
 /// GlobalAddr ids that flow to a memory pointer (kernel code model: those
 /// need RIP-relative addressing; integer-only uses want R_X86_64_32S).
 fn build_global_addr_ptr_set(func: &IrFunction) -> FxHashSet<u32> {
@@ -1984,6 +2089,9 @@ fn pre_size_output_buffer(cg: &mut dyn ArchCodegen, module: &IrModule) {
 
 fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
     let state = cg.state();
+    state
+        .extern_function_symbols
+        .extend(module.extern_function_symbols.iter().cloned());
     for func in &module.functions {
         if func.is_static
             || matches!(
@@ -2520,11 +2628,17 @@ fn generate_function(
         FxHashSet::default()
     };
 
-    let dead_global_addrs = if cg.supports_global_addr_fold() {
+    let remat_global_addrs = if cg.supports_global_addr_remat() {
+        build_rematerializable_global_addr_set_for(func, &global_addr_map)
+    } else {
+        FxHashSet::default()
+    };
+    let mut dead_global_addrs = if cg.supports_global_addr_fold() {
         build_foldable_global_addr_set(func, &global_addr_map)
     } else {
         FxHashSet::default()
     };
+    dead_global_addrs.extend(remat_global_addrs.iter().copied());
 
     // Indexed-fold guaranteed-offset-producer skipping (session 27): when an
     // indexed GEP folds into a Load's SIB memory operand, the GEP's offset
@@ -3019,6 +3133,7 @@ fn generate_function(
                 &global_addr_map,
                 &global_addr_ptr_set,
                 &dead_global_addrs,
+                &remat_global_addrs,
             );
             cg.state().current_program_point += 1;
         }
@@ -3108,6 +3223,7 @@ pub(super) fn generate_instruction(
     global_addr_map: &FxHashMap<u32, String>,
     global_addr_ptr_set: &FxHashSet<u32>,
     dead_global_addrs: &FxHashSet<u32>,
+    remat_global_addrs: &FxHashSet<u32>,
 ) {
     match inst {
         Instruction::PgoCounterInc {
@@ -3151,9 +3267,37 @@ pub(super) fn generate_instruction(
             rhs,
             ty,
         } => {
-            cg.emit_binop(dest, *op, lhs, rhs, *ty);
-            if is_wide_int_type(*ty) {
-                cg.state().reg_cache.invalidate_all();
+            // A rematerializable GlobalAddr has deliberately no home. Rebuild
+            // it only at this audited address derivation; every other use shape
+            // was rejected before allocation.
+            let remat = match (op, lhs, rhs) {
+                (IrBinOp::Add, Operand::Value(base), offset)
+                    if remat_global_addrs.contains(&base.0) =>
+                {
+                    global_addr_map.get(&base.0).map(|sym| (sym, offset, false))
+                }
+                (IrBinOp::Add, offset, Operand::Value(base))
+                    if remat_global_addrs.contains(&base.0) =>
+                {
+                    global_addr_map.get(&base.0).map(|sym| (sym, offset, false))
+                }
+                (IrBinOp::Sub, Operand::Value(base), offset)
+                    if remat_global_addrs.contains(&base.0) =>
+                {
+                    global_addr_map.get(&base.0).map(|sym| (sym, offset, true))
+                }
+                _ => None,
+            };
+            if let Some((sym, offset, subtract)) = remat {
+                assert!(
+                    cg.emit_rematerialized_global_addr(dest, sym, offset, subtract),
+                    "backend accepted GlobalAddr rematerialisation but refused its audited use"
+                );
+            } else {
+                cg.emit_binop(dest, *op, lhs, rhs, *ty);
+                if is_wide_int_type(*ty) {
+                    cg.state().reg_cache.invalidate_all();
+                }
             }
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
@@ -3185,12 +3329,22 @@ pub(super) fn generate_instruction(
         Instruction::GetElementPtr {
             dest, base, offset, ..
         } => {
-            if let Operand::Value(off_val) = offset {
-                cg.state()
-                    .gep_base_offset
-                    .insert(dest.0, (base.0, off_val.0));
+            if remat_global_addrs.contains(&base.0) {
+                let sym = global_addr_map.get(&base.0).expect(
+                    "rematerializable GlobalAddr must retain its legal symbol identity",
+                );
+                assert!(
+                    cg.emit_rematerialized_global_addr(dest, sym, offset, false),
+                    "backend accepted GlobalAddr rematerialisation but refused its audited GEP"
+                );
+            } else {
+                if let Operand::Value(off_val) = offset {
+                    cg.state()
+                        .gep_base_offset
+                        .insert(dest.0, (base.0, off_val.0));
+                }
+                cg.emit_gep(dest, base, offset);
             }
-            cg.emit_gep(dest, base, offset);
         }
         Instruction::GlobalAddr { dest, name } => {
             // Defence in depth: the block loop already skipped dead addrs.

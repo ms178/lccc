@@ -26,6 +26,10 @@ int volatile_local(void) { volatile int loc = 3; loc = loc + 1; return loc; }
 EOF
 
 rc=0
+# Accept register-indirect and direct RIP-relative memory operands, plus the
+# signed-widening form selected for an i32 value on x86-64. RA-01 deliberately
+# turns ordinary PIE globals into `symbol(%rip)` accesses.
+load_pat='mov(l|slq) +[^,]*\(%[re]?[a-z0-9]+'
 check() { # check <fn> <grep-pattern> <description>
     local fn=$1 pat=$2 desc=$3
     local body
@@ -43,15 +47,15 @@ for lvl in O0 O1 O2 Os; do
     "$CCC" -$lvl -S "$td/vol.c" -o "$td/vol.s" || { echo "FAIL: compile at -$lvl"; rc=1; continue; }
     # 1. a real load of counter between the store and the return
     body=$(awk '/^read_after_store:/,/^\.size/' "$td/vol.s")
-    loads=$(echo "$body" | grep -Ec 'movl +[-0-9]*\(%[re]?[a-z]')
+    loads=$(echo "$body" | grep -Ec "$load_pat")
     if [ "$loads" -ge 1 ]; then echo "ok: store-then-load reloads memory"; else echo "FAIL: volatile load forwarded/eliminated"; rc=1; fi
     # 2. the loop body must contain a load
     body=$(awk '/^reads_in_loop:/,/^\.size/' "$td/vol.s" | awk '/\.LBB[0-9]*:/{blk=blk+1} {print}' )
-    check reads_in_loop 'movl +[-0-9]*\(%[re]?[a-z]' "loop keeps volatile load in body"
+    check reads_in_loop "$load_pat" "loop keeps volatile load in body"
     # 3. dead read survives
-    check dead_read 'movl +[-0-9]*\(%[re]?[a-z]' "dead-result volatile load survives DCE"
+    check dead_read "$load_pat" "dead-result volatile load survives DCE"
     # 4. deref through pointer param loads
-    check deref_param 'movl +[-0-9]*\(%[re]?[a-z]' "*volatile-ptr param loads"
+    check deref_param "$load_pat" "*volatile-ptr param loads"
     # 5. volatile local: store;load;store sequence
     body=$(awk '/^volatile_local:/,/^\.size/' "$td/vol.s")
     n=$(echo "$body" | grep -Ec 'mov[a-z]* +[^#]*\(%(rsp|rbp|esp|ebp)')

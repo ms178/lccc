@@ -7,7 +7,14 @@ CCCFLAGS=${CCCFLAGS:--O2}
 COMPARE_GCC=0
 [ "${1:-}" = "--compare-gcc" ] && COMPARE_GCC=1
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-pass=0; fail=0
+pass=0; fail=0; skip=0
+# A successfully linked i386 executable still cannot run when the host image
+# lacks the ELF interpreter. Keep compiling those regressions, but classify
+# the environment limitation honestly instead of reporting a compiler defect.
+have_i386_loader=0
+for loader in /lib/ld-linux.so.2 /lib32/ld-linux.so.2 /usr/lib32/ld-linux.so.2; do
+  [ -x "$loader" ] && have_i386_loader=1
+done
 for src in "$dir"/*.c; do
   name=$(basename "$src" .c)
   # Per-test flags: a sibling <name>.flags file adds compiler flags
@@ -61,16 +68,22 @@ for src in "$dir"/*.c; do
   # appear before the object under --as-needed, so extra_flags must follow
   # the input file (LCCC accepts both orders; GCC does not).
   if $CCC $CCCFLAGS "$src" $extra_flags -o "/tmp/ccc_${name}" 2>/tmp/ccc_err.txt; then
-    /tmp/ccc_${name} >/tmp/ccc_out.txt 2>&1; rc=$?
-    if [ $rc -eq 0 ]; then
-      if [ "$COMPARE_GCC" = 1 ] && [ "$LCCC_NO_COMPARE" = 0 ]; then
-        if command -v gcc >/dev/null && gcc -O2 "$src" $extra_flags -o /tmp/gcc_${name} 2>/dev/null \
-           && /tmp/gcc_${name} >/tmp/gcc_out.txt 2>&1 \
-           && diff -q /tmp/ccc_out.txt /tmp/gcc_out.txt >/dev/null; then
-          echo "PASS  $name"; pass=$((pass+1))
-        else echo "MISMATCH $name"; fail=$((fail+1)); fi
-      else echo "PASS  $name${LCCC_NO_COMPARE:+ (lccc-only)}"; pass=$((pass+1)); fi
-    else echo "FAIL  $name (run rc=$rc) out=[$(cat /tmp/ccc_out.txt)]"; fail=$((fail+1)); fi
+    if [[ " $extra_flags " == *" -m32 "* && "$have_i386_loader" = 0 ]] \
+       && readelf -l "/tmp/ccc_${name}" 2>/dev/null | grep -q 'Requesting program interpreter:.*ld-linux\.so\.2'; then
+      echo "SKIP  $name (compiled; host has no i386 ELF interpreter)"
+      skip=$((skip+1))
+    else
+      /tmp/ccc_${name} >/tmp/ccc_out.txt 2>&1; rc=$?
+      if [ $rc -eq 0 ]; then
+        if [ "$COMPARE_GCC" = 1 ] && [ "$LCCC_NO_COMPARE" = 0 ]; then
+          if command -v gcc >/dev/null && gcc -O2 "$src" $extra_flags -o /tmp/gcc_${name} 2>/dev/null \
+             && /tmp/gcc_${name} >/tmp/gcc_out.txt 2>&1 \
+             && diff -q /tmp/ccc_out.txt /tmp/gcc_out.txt >/dev/null; then
+            echo "PASS  $name"; pass=$((pass+1))
+          else echo "MISMATCH $name"; fail=$((fail+1)); fi
+        else echo "PASS  $name${LCCC_NO_COMPARE:+ (lccc-only)}"; pass=$((pass+1)); fi
+      else echo "FAIL  $name (run rc=$rc) out=[$(cat /tmp/ccc_out.txt)]"; fail=$((fail+1)); fi
+    fi
   else echo "FAIL  $name compile: $(tail -1 /tmp/ccc_err.txt)"; fail=$((fail+1)); fi
   # Undo this test's env file so it cannot affect subsequent tests.
   for _v in $_envfile_vars; do unset "$_v"; done
@@ -89,5 +102,5 @@ for check in "$dir"/check_*.sh; do
   fi
 done
 
-echo "=== Regression: $pass passed, $fail failed ==="
+echo "=== Regression: $pass passed, $skip skipped, $fail failed ==="
 [ $fail -eq 0 ]

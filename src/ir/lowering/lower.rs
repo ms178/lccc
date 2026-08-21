@@ -858,6 +858,23 @@ impl Lowerer {
                 }
             }
         }
+
+        // Preserve function-vs-data identity through IR. Calls already carry a
+        // dedicated Call instruction, but taking a function address lowers to
+        // the same GlobalAddr shape as data. In PIE, ordinary extern data may
+        // use a copy relocation while an interposable extern function pointer
+        // must remain GOT-indirect. Resolve asm labels / symver aliases now so
+        // this set uses exactly the names GlobalAddr emission will see.
+        let extern_function_symbols: Vec<String> = self
+            .known_functions
+            .iter()
+            .filter(|name| !self.defined_functions.contains(*name))
+            .map(|name| self.resolve_ref_name(name))
+            .collect();
+        self.module
+            .extern_function_symbols
+            .extend(extern_function_symbols);
+
         (self.module, self.diagnostics.into_inner())
     }
 

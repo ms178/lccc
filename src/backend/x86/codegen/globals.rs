@@ -38,6 +38,90 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
+    /// Recreate an omitted executable-data address at its audited derivation
+    /// use. Offsets are staged first so loading the symbol base into %rax cannot
+    /// destroy an immediately-consumed value. The result then follows the
+    /// ordinary destination-location contract.
+    pub(super) fn emit_rematerialized_global_addr_impl(
+        &mut self,
+        dest: &Value,
+        name: &str,
+        offset: &Operand,
+        subtract: bool,
+    ) -> bool {
+        if self.state.needs_got_for_addr(name)
+            || self.state.tls_symbols.contains(name)
+            || self.state.absolute_symbols.contains(name)
+        {
+            return false;
+        }
+
+        // Constant displacements belong in the LEA itself. This is both
+        // shorter and avoids creating a temporary live range for the offset.
+        if let Operand::Const(c) = offset {
+            if let Some(raw) = c.to_i64() {
+                let disp = if subtract { raw.checked_neg() } else { Some(raw) };
+                if let Some(disp) = disp.filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v)) {
+                    let target = self.dest_reg(dest)
+                        .filter(|r| !is_xmm_reg(*r))
+                        .map(phys_reg_name)
+                        .unwrap_or("rax");
+                    let sym = if disp == 0 {
+                        name.to_string()
+                    } else if disp > 0 {
+                        format!("{name}+{disp}")
+                    } else {
+                        format!("{name}{disp}")
+                    };
+                    self.state.out.emit_instr_sym_base_reg(
+                        "    leaq", &sym, "rip", target,
+                    );
+                    if target == "rax" {
+                        self.store_rax_to(dest);
+                    } else {
+                        self.state.reg_cache.invalidate_acc();
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // The common case has both the offset and result in allocated GPRs.
+        // Materialize the base straight into the result and consume the offset
+        // there, unless the two homes alias (which would destroy the offset).
+        if let (Some(off_reg), Some(dst_reg)) = (self.operand_reg(offset), self.dest_reg(dest)) {
+            if !is_xmm_reg(off_reg) && !is_xmm_reg(dst_reg) && off_reg != dst_reg {
+                let off_name = phys_reg_name(off_reg);
+                let dst_name = phys_reg_name(dst_reg);
+                self.state.out.emit_instr_sym_base_reg(
+                    "    leaq", name, "rip", dst_name,
+                );
+                self.state.emit_fmt(format_args!(
+                    "    {}q %{}, %{}",
+                    if subtract { "sub" } else { "add" },
+                    off_name,
+                    dst_name,
+                ));
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+
+        // Alias/slot/immediately-consumed fallback: preserve the offset in the
+        // secondary scratch before %rax receives the symbol base.
+        self.operand_to_rcx(offset);
+        self.state
+            .out
+            .emit_instr_sym_base_reg("    leaq", name, "rip", "rax");
+        self.state.emit(if subtract {
+            "    subq %rcx, %rax"
+        } else {
+            "    addq %rcx, %rax"
+        });
+        self.store_rax_to(dest);
+        true
+    }
+
     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
         // TLS requires %rax for the fs:0 base — can't fully avoid accumulator.
         // But when dest has a register, we can skip the final store_rax_to relay.

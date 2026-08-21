@@ -1266,6 +1266,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1348,6 +1349,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1418,6 +1420,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1494,6 +1497,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1574,6 +1578,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1654,6 +1659,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1759,6 +1765,7 @@ mod tests {
 
         let mut module = IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],
@@ -1827,6 +1834,7 @@ mod tests {
     fn make_module(func: IrFunction) -> IrModule {
         IrModule {
             functions: vec![func],
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: vec![],
             string_literals: vec![],
             wide_string_literals: vec![],

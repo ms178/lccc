@@ -5,6 +5,8 @@ This is VM wall-clock screening, never a PMU or bare-metal claim.  The script
 verifies the exact archive digest, builds the complete upstream project, runs
 its 30-test suite, checks compressed/decompressed bytes, captures disassembly,
 and records paired randomized timings for deterministic source/mixed corpora.
+An optional same-compiler environment control exposes treatment/control cases,
+aggregate ratios, best gain, and worst regression in one retained report.
 """
 from __future__ import annotations
 
@@ -132,14 +134,17 @@ def parse_check_summary(log: str) -> dict[str, int]:
 
 
 def build_one(key: str, cc: str, source: Path, root: Path,
-              artifacts: Path, gcc_include: str) -> dict:
+              artifacts: Path, gcc_include: str,
+              extra_env: dict[str, str] | None = None) -> dict:
     build = root / f"obj-{key}"
     build.mkdir()
     flags = "-O3 -march=x86-64-v3"
-    if key == "lccc":
+    if key.startswith("lccc"):
         flags += f" -I{gcc_include}"
     env = os.environ.copy()
     env.update(CC=cc, CFLAGS=flags)
+    if extra_env:
+        env.update(extra_env)
     configure = [str(source / "configure"), "--disable-dependency-tracking"]
     configured = run(configure, cwd=build, env=env, timeout=600)
     built = run(["make", "-j2"], cwd=build, env=env, timeout=900)
@@ -167,6 +172,7 @@ def build_one(key: str, cc: str, source: Path, root: Path,
         "cc": cc,
         "compiler_version": compiler_version(cc),
         "flags": flags,
+        "environment": dict(sorted((extra_env or {}).items())),
         "binary": str(copied),
         "binary_sha256": sha256(copied),
         "binary_bytes": copied.stat().st_size,
@@ -226,15 +232,85 @@ def summarize(samples: dict[str, dict[str, list[int]]], baseline: str) -> tuple[
     return summary, lines
 
 
+def compare_treatment_control(
+    summary: dict[str, dict], treatment: str, control: str,
+) -> tuple[dict, list[str]]:
+    """Expose every treatment/control case plus aggregate and extrema.
+
+    Ratios below 1.0 favor the treatment. Medians are paired by case; raw
+    randomized samples remain in the main summary for independent review.
+    """
+    cases: dict[str, dict] = {}
+    ratios: list[float] = []
+    lines = [
+        "## LCCC treatment versus kill-switch control",
+        "",
+        "VM wall-clock screening only; ratio < 1 favors treatment.",
+        "",
+        "| case | treatment ms | control ms | treatment/control | gain % |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for case, records in summary.items():
+        treatment_ns = records[treatment]["median_ns"]
+        control_ns = records[control]["median_ns"]
+        ratio = treatment_ns / control_ns
+        ratios.append(ratio)
+        cases[case] = {
+            "treatment_median_ns": treatment_ns,
+            "control_median_ns": control_ns,
+            "treatment_to_control": ratio,
+            "gain_percent": (1.0 - ratio) * 100.0,
+        }
+        lines.append(
+            f"| {case} | {treatment_ns/1e6:.3f} | {control_ns/1e6:.3f} | "
+            f"{ratio:.6f} | {(1.0-ratio)*100.0:+.3f} |"
+        )
+    best = min(cases, key=lambda k: cases[k]["treatment_to_control"])
+    worst = max(cases, key=lambda k: cases[k]["treatment_to_control"])
+    aggregates = {
+        "arithmetic_mean_ratio": statistics.mean(ratios),
+        "geometric_mean_ratio": math.exp(statistics.mean(math.log(v) for v in ratios)),
+        "best_gain_case": best,
+        "best_gain_ratio": cases[best]["treatment_to_control"],
+        "worst_regression_case": worst,
+        "worst_regression_ratio": cases[worst]["treatment_to_control"],
+    }
+    lines += [
+        "",
+        f"- Arithmetic mean ratio: **{aggregates['arithmetic_mean_ratio']:.6f}**",
+        f"- Geometric mean ratio: **{aggregates['geometric_mean_ratio']:.6f}**",
+        f"- Best case: `{best}` **{aggregates['best_gain_ratio']:.6f}**",
+        f"- Worst case: `{worst}` **{aggregates['worst_regression_ratio']:.6f}**",
+    ]
+    return {"cases": cases, "aggregates": aggregates}, lines
+
+
+def parse_env_assignments(values: list[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise SystemExit(f"control environment must be NAME=VALUE, got {value!r}")
+        name, assigned = value.split("=", 1)
+        if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
+            raise SystemExit(f"invalid environment variable name: {name!r}")
+        env[name] = assigned
+    return env
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--archive", help="local gzip-1.14.tar.xz (otherwise pinned URL/cache)")
     p.add_argument("--cache", type=Path, default=Path.home() / ".cache/lccc-workloads")
     p.add_argument("--lccc", default="target/fastbuild/lccc")
+    p.add_argument(
+        "--lccc-control-env", action="append", default=[], metavar="NAME=VALUE",
+        help="also build a same-compiler kill-switch control with this environment; repeatable",
+    )
     p.add_argument("--artifact-dir", type=Path, required=True)
     p.add_argument("--rounds", type=int, default=9)
     p.add_argument("--warmups", type=int, default=2)
     args = p.parse_args()
+    control_env = parse_env_assignments(args.lccc_control_env)
 
     archive = get_archive(args.archive, args.cache)
     lccc = str(Path(args.lccc).resolve())
@@ -262,6 +338,10 @@ def main() -> int:
             "lccc": build_one("lccc", lccc, source, root, artifacts, gcc_include),
             "gcc": build_one("gcc", gcc, source, root, artifacts, gcc_include),
         }
+        if control_env:
+            builds["lccc-control"] = build_one(
+                "lccc-control", lccc, source, root, artifacts, gcc_include, control_env,
+            )
         binaries = {k: Path(v["binary"]) for k, v in builds.items()}
 
         # Correctness: complete compressed streams must be bit-identical, and
@@ -315,8 +395,14 @@ def main() -> int:
                     samples[case][key].append(timed(command_for(binaries[key]), inp, cpu))
 
         summary, table = summarize(samples, "gcc")
+        treatment_control = None
+        treatment_table: list[str] = []
+        if control_env:
+            treatment_control, treatment_table = compare_treatment_control(
+                summary, "lccc", "lccc-control",
+            )
         evidence = {
-            "schema": 1,
+            "schema": 2,
             "date_utc": datetime.now(timezone.utc).isoformat(),
             "evidence_class": "VM wall-clock screening; no PMU",
             "archive": {"url": ARCHIVE_URL, "path": str(archive),
@@ -330,6 +416,7 @@ def main() -> int:
             "rounds": args.rounds,
             "warmups": args.warmups,
             "summary": summary,
+            "treatment_vs_control": treatment_control,
         }
         (artifacts / "results.json").write_text(json.dumps(evidence, indent=2) + "\n")
         report = [
@@ -342,6 +429,8 @@ def main() -> int:
             "",
             *table,
             "",
+            *treatment_table,
+            "" if treatment_table else "",
             "The current archpkgbuilds recipe checksum differs from the repeatedly fetched",
             "archive digest above; the archive signature was not verified in this run.",
         ]
