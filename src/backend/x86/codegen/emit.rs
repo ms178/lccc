@@ -1375,6 +1375,64 @@ impl X86Codegen {
         }
     }
 
+    /// Load an integer operand into zero-extended %eax using 32-bit moves.
+    /// Used by small integer returns where %rax's upper half must be zero but
+    /// the value itself is only 32 bits.  Register and stack homes are loaded
+    /// with `movl`, which is shorter than `movq` and avoids a 64-bit dependency.
+    pub(super) fn operand_to_rax_i32(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                self.state.reg_cache.invalidate_acc();
+                if c.to_i64() == Some(0) {
+                    self.state.emit("    xorl %eax, %eax");
+                } else if let Some(v) = c.to_i64() {
+                    self.state.out.emit_instr_imm_reg("    movl", v as i32 as i64, "eax");
+                } else {
+                    self.operand_to_rax(op);
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                    return;
+                }
+                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                    self.state.emit("    movl %ecx, %eax");
+                    self.state.reg_cache.set_acc(v.0, is_alloca);
+                    return;
+                }
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let name = phys_reg_name(reg);
+                    if is_xmm_reg(reg) {
+                        self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
+                    } else if self.value_types.get(&v.0).is_some_and(|t| t.size() <= 4) {
+                        let name32 = phys_reg_name_32(reg);
+                        self.state.emit_fmt(format_args!("    movl %{name32}, %eax"));
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
+                    }
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    // value_to_reg is a 64-bit loader and historically calls
+                    // emitted `movq slot, %eax` when passed a 32-bit register.
+                    // For a small integer return use a width-consistent load.
+                    match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
+                        IrType::I8 => self.state.out.emit_instr_rbp_reg("    movsbq", slot.0, "eax"),
+                        IrType::U8 => self.state.out.emit_instr_rbp_reg("    movzbl", slot.0, "eax"),
+                        IrType::I16 => self.state.out.emit_instr_rbp_reg("    movswq", slot.0, "eax"),
+                        IrType::U16 => self.state.out.emit_instr_rbp_reg("    movzwl", slot.0, "eax"),
+                        IrType::I32 if self.needs_sext_values.contains(&v.0) =>
+                            self.state.out.emit_instr_rbp_reg("    movslq", slot.0, "rax"),
+                        _ => self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax"),
+                    }
+                } else {
+                    self.operand_to_rax(op);
+                    return;
+                }
+                self.state.reg_cache.set_acc(v.0, false);
+            }
+        }
+    }
+
     /// Store %rax to a value's location (register or stack slot).
     /// Register-only strategy: if the value has a register assignment (callee-saved or caller-saved),
     /// store ONLY to the register (skip the stack write). This eliminates redundant

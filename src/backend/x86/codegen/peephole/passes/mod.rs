@@ -427,6 +427,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
         // A sound fusion saves nothing (still needs init + sext), so the
         // pass is deleted rather than gated.
         if !sk("copy_shift_back") { changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos); }
+        if !sk("var_bt") { changed |= local_patterns::fold_variable_bit_test(&mut store, &mut infos); }
         if !sk("xor_move_fold") { changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos); }
         if !sk("rotate_idiom") { changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos); }
         if !sk("vec_self_move") { changed |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos); }
@@ -616,6 +617,25 @@ mod tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("incl %ecx"), "{result}");
         assert!(!result.contains("movq %rcx, %rax\n    incl %eax"), "{result}");
+    }
+
+    #[test]
+    fn variable_bit_test_replaces_shift_mask_compare() {
+        let asm = concat!(
+            "f:\n",
+            "    movabsq $-1125899906859004, %rax\n",
+            "    shrq %cl, %rax\n",
+            "    andq $1, %rax\n",
+            "    cmpq $0, %rax\n",
+            "    setne %dil\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("btq %rcx, %rax"), "{result}");
+        assert!(result.contains("setc %dil"), "{result}");
+        assert!(!result.contains("andq $1, %rax"), "{result}");
+        assert!(!result.contains("cmpq $0, %rax"), "{result}");
     }
 
     #[test]
