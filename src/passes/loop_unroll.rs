@@ -439,7 +439,7 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
             Instruction::BinOp { op, .. } => {
                 use crate::ir::reexports::IrBinOp::*;
                 match op {
-                    AShr | LShr | Shl => saw_shift = true,
+                    AShr | LShr | Shl | BitTest => saw_shift = true,
                     And | Or | Xor => saw_and = true,
                     Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
                 }

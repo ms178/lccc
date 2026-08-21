@@ -671,6 +671,10 @@ pub fn lower_instruction_ctx(
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             if ty.is_float() || ty.is_128bit() { return false; }
+            // BitTest is lowered by the text path, which uses BT plus
+            // register/stack-aware SETCC materialization and keeps the i32
+            // result zero-extended. MachInst currently has no BT opcode.
+            if *op == IrBinOp::BitTest { return false; }
             // Only handle I32/U32/I64/U64/Ptr — sub-32-bit types have complex
             // register sub-register interactions that need special handling.
             if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }

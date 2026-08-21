@@ -49,6 +49,22 @@ impl RiscvCodegen {
 
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
+        if op == IrBinOp::BitTest {
+            // RISC-V has no BT. The canonical operation is i32, but keep 64-bit
+            // behavior for the shared integer default: logical-shift the base
+            // right by the index, then isolate bit zero. This is exactly what
+            // every backend would otherwise reconstruct from `(x >> i) & 1`.
+            let shift = if use_32bit { "srlw" } else { "srl" };
+            self.state.emit_fmt(format_args!("    {shift} t0, t1, t2"));
+            self.state.emit("    andi t0, t0, 1");
+            if use_32bit {
+                self.state.emit("    slli t0, t0, 32");
+                self.state.emit("    srli t0, t0, 32");
+            }
+            self.store_t0_to(dest);
+            return;
+        }
+
         let mnemonic = match (op, use_32bit) {
             (IrBinOp::Add, false) => "add",
             (IrBinOp::Add, true) => "addw",
@@ -73,6 +89,7 @@ impl RiscvCodegen {
             (IrBinOp::AShr, true) => "sraw",
             (IrBinOp::LShr, false) => "srl",
             (IrBinOp::LShr, true) => "srlw",
+            (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
         };
         self.state.emit_fmt(format_args!("    {} t0, t1, t2", mnemonic));
 
