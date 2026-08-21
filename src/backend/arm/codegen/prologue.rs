@@ -19,7 +19,7 @@ impl ArmCodegen {
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
-        let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
+        let mut available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
 
         let mut caller_saved_regs: Vec<PhysReg> = if func.is_variadic {
             Vec::new()
@@ -71,6 +71,11 @@ impl ArmCodegen {
                 caller_saved_regs.extend([PhysReg(9), PhysReg(10), PhysReg(11),
                     PhysReg(12), PhysReg(15)]);
             }
+        }
+
+        if self.state.disable_regalloc {
+            available_regs.clear();
+            caller_saved_regs.clear();
         }
 
         // AArch64 x4..x7 are argument registers 4..7 and x8 is the indirect-

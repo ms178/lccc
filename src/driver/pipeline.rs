@@ -1827,6 +1827,10 @@ impl Driver {
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {
+            // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
+            // scan assumes one definition and miscompiled 125/200 CFG seeds;
+            // use canonical stack homes until an SSA-aware O0 allocator exists.
+            disable_regalloc: self.opt_level == 0,
             pic: self.pic || self.shared_lib,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,

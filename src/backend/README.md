@@ -85,7 +85,7 @@ The pipeline is driven from `Target::generate_assembly_with_opts_and_debug` in
 `mod.rs`. For each target, it:
 
 1. Instantiates the architecture-specific codegen struct (e.g., `X86Codegen`).
-2. Applies CLI-driven `CodegenOptions` (PIC, retpoline, CET, patchable entry,
+2. Applies CLI-driven `CodegenOptions` (`-O0` stack-home safety, PIC, retpoline, CET, patchable entry,
    etc.).
 3. Calls `generation::generate_module_with_debug`, which emits data sections,
    iterates over functions, and dispatches each IR instruction through the

@@ -344,6 +344,7 @@ macro-expanded paths; direct include paths are left unchanged.
 ### Recursive Inclusion Protection
 
 - Maximum depth of 200 (matching GCC's default).
+- C2x `__VA_OPT__(tokens)` is selected before normal stringification/token-paste handling, including GNU named variadics.
 - Files without `#pragma once` or include guards may be re-included
   (intentional, to support patterns like TCC's conditional self-inclusion).
 - Only excessive nesting of the *same* file path triggers the depth limit.

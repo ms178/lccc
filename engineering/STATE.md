@@ -1,14 +1,15 @@
 # Current compiler state
 
-SHA at last doc refresh: **`8fb1573b`** (`ms178/lccc` main, PR #159; round-6 work rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
+SHA at last doc refresh: **`b650e4da`** (`ms178/lccc` main, PR #161; round-6 work rebased here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
 
 ## What is production
 
 - **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full / `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md`).
-- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). ABI physical hints now retain leading ParamRefs in caller/ABI homes across safe call-free x86 CFG leaves (≤6 register args), cutting the measured branch leaf from 16 to 8 body instructions. `CCC_TRACE_ALLOCSTATS` reports aggregate pressure without changing allocation. No `linear_scan.rs`.
+- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). ABI physical hints retain leading ParamRefs across safe call-free x86 CFG leaves. `-O0` deliberately uses canonical stack homes because phi elimination leaves non-SSA multi-def webs; this fixes the 600-case CFG differential while O1+ keeps production RA. `CCC_TRACE_ALLOCSTATS` reports aggregate pressure. No `linear_scan.rs`.
 - **Liveness** `src/backend/liveness.rs` — worklist backward dataflow (no `MAX_ITERATIONS` cap). Produces both fat `intervals` and hole-aware `segments`. `segments` is consumed by `regalloc.rs` for call-spanning detection and interval extension (lines 571, 785); the linear scan itself still runs on fat `intervals`.
 - **SROA** `aggregate_sroa.rs` load-forward + chain collapse **on**. Copy-out **off** (`CCC_SROA_COPYOUT` hangs tests).
-- **Alias** `alias.rs` — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` and now LICM; the shared resolver supports checked Shl scaling. LICM models ordinary stores and fails closed on calls, atomics, memcpy, inline asm, intrinsic writes, or unresolved forms.
+- **Alias** `alias.rs` — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` and LICM; the shared resolver supports checked Shl scaling.
+- **GlobalAddr CSE/GVN** hoists ordinary class-compatible addresses, but variable-index GEP bases stay site-local for symbol+index selection. Multi-block intrinsic functions refuse cross-block hoisting until RA-23 exposes hidden accumulator/XMM locations.
 - **FMA** scalar `vfmadd231sd` and vector `vfmadd231pd` **emitters exist**. Auto-vectorize of non-reduction loops and FMA-in-vector-body are the remaining gaps.
 - **YMM memcpy**: AVX2 64-byte assignments use two YMM pairs plus `vzeroupper`; proven-safe 64-bit leaf DCE removes dead parameter homes, yielding the six-instruction GCC/Clang/ICX shape. 32/48-byte copies deliberately stay XMM after a measured YMM slowdown. Whole `struct_copy` remains 3.58x behind GCC due aggregate scalar replacement.
 - **BMI1 ANDN**: adjacent single-use `not`+`and` fuses only under a target BMI contract and reads assigned source registers directly; Linux find-bit improves ~4% vs treatment control. Baseline x86 remains instruction-set safe.

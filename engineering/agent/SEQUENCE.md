@@ -33,6 +33,7 @@ Re-oracle and check gzip `longest_match` stack-mem after **each** item.
 | 15 | RA-24 | Eliminate `SlotAddr::Indirect(StackSlot(0))` dummy (`SlotAddr::Reg(PhysReg)`). |
 | 16 | RA-13 | **DONE:** hard segment/final verifier plus handled eviction-history verifier. |
 | 17 | RA-26 | **DONE and extended:** scalar non-sret hints plus ordered caller homes for call-free x86 CFG leaves with ≤6 register args and leading ParamRefs; stack args/mixed/calling shapes refuse. |
+| 17a | RA-27 | **DONE:** disable one-def linear scan on non-SSA `-O0` IR across all backends; 600/600 phi CFG and 540/540 alias differential. |
 | 18 | P0-04 / OP-01 | **DONE:** shared alias engine in LICM, targeted hoist plus full differential validation. |
 | 19 | P0-05 / FE-01 | **DONE for core constraints:** sema rejects invalid assignments, prototype arity, and return-value mismatches with direct/indirect-call coverage. |
 | 20 | RA-25 / OP-31 | Unify `loop_memory_promote` alias engine with `alias.rs`. |

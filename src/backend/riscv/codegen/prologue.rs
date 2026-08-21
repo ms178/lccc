@@ -51,7 +51,10 @@ impl RiscvCodegen {
             all_available.push(reg);
         }
 
-        let available_regs = crate::backend::generation::filter_available_regs(&all_available, &asm_clobbered_regs);
+        let mut available_regs = crate::backend::generation::filter_available_regs(&all_available, &asm_clobbered_regs);
+        if self.state.disable_regalloc {
+            available_regs.clear();
+        }
         let (reg_assigned, cached_liveness, _caller_save_spans) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,

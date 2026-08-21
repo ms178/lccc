@@ -777,10 +777,16 @@ impl MacroTable {
             self.expand_text(arg, expanding)
         }).collect();
 
+        // C2x __VA_OPT__: include its balanced token sequence iff the variadic
+        // argument is non-empty. This must happen before #/## processing so
+        // commas and paste operators inside the selected sequence participate
+        // in the normal replacement algorithm.
+        let va_body = self.expand_va_opt(
+            &mac.body, &mac.params, args, mac.is_variadic, mac.has_named_variadic,
+        );
+
         // Step 3: Handle stringification (#param) and token pasting (##).
-        // Returns Cow::Borrowed(&mac.body) when the body has no '#' (common case),
-        // avoiding a String clone.
-        let body = self.handle_stringify_and_paste(&mac.body, &mac.params, args, mac.is_variadic, mac.has_named_variadic);
+        let body = self.handle_stringify_and_paste(&va_body, &mac.params, args, mac.is_variadic, mac.has_named_variadic);
 
         // Step 4: Substitute parameters with expanded arguments
         let body = self.substitute_params(&body, &mac.params, &expanded_args, mac.is_variadic, mac.has_named_variadic);
@@ -1148,6 +1154,67 @@ impl MacroTable {
         }
 
         result
+    }
+
+    /// Expand balanced `__VA_OPT__(tokens)` groups for a variadic macro.
+    fn expand_va_opt(
+        &self,
+        body: &str,
+        params: &[String],
+        args: &[String],
+        is_variadic: bool,
+        has_named_variadic: bool,
+    ) -> String {
+        if !is_variadic || !body.contains("__VA_OPT__") {
+            return body.to_string();
+        }
+        let first_va = if has_named_variadic {
+            params.len().saturating_sub(1)
+        } else {
+            params.len()
+        };
+        let has_tokens = args.get(first_va..).is_some_and(|tail| {
+            tail.iter().any(|arg| !arg.trim().is_empty())
+        });
+        let bytes = body.as_bytes();
+        let mut out = String::with_capacity(body.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"__VA_OPT__")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                && (i + 10 == bytes.len()
+                    || !(bytes[i + 10].is_ascii_alphanumeric() || bytes[i + 10] == b'_'))
+            {
+                let mut open = i + 10;
+                while open < bytes.len() && bytes[open].is_ascii_whitespace() { open += 1; }
+                if open < bytes.len() && bytes[open] == b'(' {
+                    let inner = open + 1;
+                    let mut j = inner;
+                    let mut depth = 1usize;
+                    while j < bytes.len() && depth != 0 {
+                        match bytes[j] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            b'"' | b'\'' => {
+                                j = skip_literal_bytes(bytes, j, bytes[j]);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if depth == 0 {
+                        if has_tokens { out.push_str(&body[inner..j - 1]); }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            let ch = body[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
     }
 
     /// Get variadic arguments (__VA_ARGS__) as a comma-separated string.

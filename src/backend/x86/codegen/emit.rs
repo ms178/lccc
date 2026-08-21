@@ -704,6 +704,7 @@ impl X86Codegen {
 
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.state.disable_regalloc = opts.disable_regalloc;
         self.set_pic(opts.pic);
         self.set_function_return_thunk(opts.function_return_thunk);
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);

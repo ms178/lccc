@@ -36,6 +36,9 @@ use crate::ir::reexports::IrModule;
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
+    /// Disable register allocation for non-SSA `-O0` IR. Phi elimination can
+    /// create multi-def values that the production scan must not coalesce.
+    pub(crate) disable_regalloc: bool,
     /// Whether to generate position-independent code (-fPIC/-fpic)
     pub(crate) pic: bool,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)

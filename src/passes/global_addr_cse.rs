@@ -86,6 +86,26 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     run_with_aliases(func, &FxHashMap::default())
 }
 
+/// GlobalAddr values feeding variable-index GEPs stay at their original sites.
+/// Hoisting/CSE lengthens the base live range and can evict the natural index,
+/// destroying x86 `sym(,%idx,scale)` selection (gzip CRC regression).
+pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
+    let mut out = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr {
+                base,
+                offset: Operand::Value(_),
+                ..
+            } = inst
+            {
+                out.insert(base.0);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn run_with_aliases(
     func: &mut IrFunction,
     aliases: &FxHashMap<String, String>,
@@ -98,8 +118,20 @@ pub(crate) fn run_with_aliases(
         debug_merged(&func.name, 0);
         return 0;
     }
+    // Intrinsic emitters carry hidden accumulator/XMM state not represented in
+    // ordinary SSA liveness. Entry-hoisting a GlobalAddr lengthens pressure
+    // across that state and regressed rdtscp ordering plus deferred SIMD chains.
+    // Keep the pre-existing same-block GVN behavior, but refuse cross-block
+    // GlobalAddr hoisting until RA-23 makes those locations explicit.
+    if func.blocks.len() > 1
+        && func.blocks.iter().any(|b| b.instructions.iter().any(|i| matches!(i, Instruction::Intrinsic { .. })))
+    {
+        debug_merged(&func.name, 0);
+        return 0;
+    }
 
     let must_mat = classify_must_materialize(func);
+    let site_local = classify_site_local_indexed(func);
 
     // First existing entry-block GlobalAddr of each (symbol, class) is the
     // canonical dest. Missing classes are inserted after the Alloca/ParamRef
@@ -107,6 +139,9 @@ pub(crate) fn run_with_aliases(
     let mut entry_canonical: FxHashMap<(String, bool), Value> = FxHashMap::default();
     for inst in &func.blocks[0].instructions {
         if let Instruction::GlobalAddr { dest, name } = inst {
+            if site_local.contains(&dest.0) {
+                continue;
+            }
             let class = must_mat.contains(&dest.0);
             let key = (canon_name(name, aliases).to_string(), class);
             entry_canonical.entry(key).or_insert(*dest);
@@ -117,6 +152,9 @@ pub(crate) fn run_with_aliases(
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::GlobalAddr { dest, name } = inst {
+                if site_local.contains(&dest.0) {
+                    continue;
+                }
                 let class = must_mat.contains(&dest.0);
                 needed.insert((canon_name(name, aliases).to_string(), class));
             }
@@ -174,7 +212,7 @@ pub(crate) fn run_with_aliases(
             let Instruction::GlobalAddr { dest, name } = inst else {
                 continue;
             };
-            if canon_ids.contains(&dest.0) {
+            if canon_ids.contains(&dest.0) || site_local.contains(&dest.0) {
                 continue;
             }
             let class = must_mat.contains(&dest.0);
@@ -718,6 +756,30 @@ mod tests {
             Instruction::Store { ptr, .. } => assert_eq!(ptr.0, 1),
             other => panic!("expected store, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn variable_index_global_addrs_remain_site_local() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr { dest: Value(1), name: "table".to_string() },
+                Instruction::GetElementPtr {
+                    dest: Value(2), base: Value(1), offset: Operand::Value(Value(9)), ty: IrType::Ptr,
+                },
+                load(3, 2),
+                Instruction::GlobalAddr { dest: Value(4), name: "table".to_string() },
+                Instruction::GetElementPtr {
+                    dest: Value(5), base: Value(4), offset: Operand::Value(Value(8)), ty: IrType::Ptr,
+                },
+                load(6, 5),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.iter().filter(|i| matches!(i, Instruction::GlobalAddr { .. })).count(), 2);
     }
 
     #[test]

@@ -4,4 +4,6 @@ Tiers: `-O0` skip except asm resolve; `-O1` mem2reg/fold/copy/DCE; `-O2` full; `
 
 Notable modules: `vectorize.rs` (~6905), `inline.rs`, `aggregate_sroa.rs` (copy-out off), and shared `alias.rs`. LICM consumes shared linear forms. The active vectorizer applies per-natural-loop PGO profitability: exact trip <8 is rejected and bodies >80 instructions require >=32 trips; absent profile leaves static policy unchanged.
 
+GlobalAddr CSE/GVN uses three location classes in practice: foldable, must-materialize, and site-local variable-index bases. Never entry-hoist the last class; it destroys symbol+index addressing. Cross-block hoisting also fails closed for intrinsic-bearing CFGs until RA-23 models hidden locations.
+
 Do not copy Clang sieve vectorization. Copy ICX FMA-in-YMM for FP loops.
