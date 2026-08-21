@@ -190,8 +190,14 @@ impl ArmCodegen {
             }
         }
 
-        // Register-direct path
-        if let Some(dest_phys) = self.dest_reg(dest) {
+        // Register-direct path. An FP-homed destination (d8-d14 / d16-d31,
+        // possible since call-spanning F64 values allocate to the FP pool)
+        // cannot take the GP three-operand form — callee_saved_name would
+        // panic ("invalid ARM register index", aarch64_fuzz seed 17: an
+        // integer BinOp whose result feeds an F64 conversion got an FP
+        // home). Fall through to the accumulator path, which stages via
+        // x0 and lets store_x0_to fmov into the FP register.
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
             let dest_name = callee_saved_name(dest_phys);
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
