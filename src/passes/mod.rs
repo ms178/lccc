@@ -362,6 +362,13 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     iphase_dump!("canonicalize-copyprop");
     simplify::run(module);
     iphase_dump!("canonicalize-simplify");
+    // Class-aware GlobalAddr CSE *before* the first GVN. GVN already CSEs
+    // GlobalAddr into same-block Copies, so a late-only run after
+    // post-structural-inline never sees duplicates.
+    if !disabled.contains("gaddrcse") {
+        global_addr_cse::run_module(module);
+    }
+    iphase_dump!("global_addr_cse-pre-gvn");
     if !disabled.contains("gvn") {
         // Use the module context (GNU alias canonicalization, global epoch
         // facts) exactly like the main pass loop: with the default context,
@@ -631,17 +638,11 @@ macro_rules! preloop_dump {
     }
     preloop_dump!("post-structural-inline");
 
-    // Class-aware GlobalAddr CSE. The frontend emits one GlobalAddr per
-    // source-level access, so loops touching several file-scope arrays keep a
-    // distinct SSA address value live for every site. Merging same-symbol
-    // duplicates per use class (foldable vs. must-materialize) cuts register
-    // pressure before the main loop; copy propagation and DCE inside the loop
-    // then clean up the rewired copies. Runs after SROA and the
-    // post-structural inline phase (the final inlining round can clone
-    // callers and duplicate address materializations), before GVN/LICM.
+    // Second GlobalAddr CSE: post-structural inlining can clone callers and
+    // re-duplicate address materializations after the pre-GVN run.
     // Pass name for CCC_DISABLE_PASSES: "gaddrcse".
     if !disabled.contains("gaddrcse") {
-        module.for_each_function(global_addr_cse::run);
+        global_addr_cse::run_module(module);
         module.for_each_function(dce::eliminate_dead_code);
     }
 
@@ -831,6 +832,17 @@ macro_rules! preloop_dump {
                 total_changes += n;
                 total_changes_excl_dce += n;
             }
+        }
+
+        // Unroll/vectorize can clone loop bodies that still contained
+        // GlobalAddr. Re-CSE is O(n) and idempotent once addresses live in entry.
+        if iter == 0 && !disabled.contains("gaddrcse") {
+            let n = timed_pass!(
+                "global_addr_cse_post_unroll",
+                global_addr_cse::run_module(module)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
         }
 
         // Phase 2c: Integer narrowing

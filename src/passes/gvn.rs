@@ -56,10 +56,11 @@ enum ExprKey {
         offset: VNOperand,
         ty: IrType,
     },
-    /// Address of a named global: pure, so every reference to one symbol
-    /// shares a pointer VN — the key that makes loads/stores through the
-    /// same global CSE and alias-disambiguate from other globals.
-    GlobalAddr { name: String },
+    /// Address of a named global. `must_mat` is the class-aware CSE split:
+    /// foldable (Load/Store ptr / absorbed GEP) vs must-materialize (call
+    /// arg, asm, …). Mixing them pins a RIP-foldable `window(%rip)` into a
+    /// GPR. Alias tracking still keys on `name` alone.
+    GlobalAddr { name: String, must_mat: bool },
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
     Load { ptr: VNOperand, ty: IrType },
@@ -193,6 +194,9 @@ struct GvnState {
     /// These are used for post-increment/decrement temporaries that must
     /// survive through the stack slot to prevent register coalescing issues.
     volatile_allocas: FxHashSet<u32>,
+    /// GlobalAddr dests whose uses force a register (call arg, asm, …).
+    /// Populated by `global_addr_cse::classify_must_materialize`.
+    must_mat_gaddrs: FxHashSet<u32>,
 }
 
 impl GvnState {
@@ -203,6 +207,7 @@ impl GvnState {
         param_allocas: FxHashSet<u32>,
         volatile_allocas: FxHashSet<u32>,
         context: &GvnContext,
+        must_mat_gaddrs: FxHashSet<u32>,
     ) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
@@ -225,6 +230,7 @@ impl GvnState {
             escaped_param_allocas,
             param_allocas,
             volatile_allocas,
+            must_mat_gaddrs,
         }
     }
 
@@ -458,6 +464,7 @@ impl GvnState {
             Instruction::GlobalAddr { dest, name } => Some((
                 ExprKey::GlobalAddr {
                     name: self.context.canonical(name).to_string(),
+                    must_mat: self.must_mat_gaddrs.contains(&dest.0),
                 },
                 *dest,
             )),
@@ -748,6 +755,7 @@ pub(crate) fn run_gvn_function_with_context(
             find_param_allocas(func),
             volatile,
             context,
+            super::global_addr_cse::classify_must_materialize(func),
         );
         return process_block(0, func, &mut state);
     }
@@ -771,6 +779,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     }
     let escaped = find_escaped_param_allocas(func);
     let volatile = find_volatile_allocas(func);
+    let must_mat = super::global_addr_cse::classify_must_materialize(func);
     if num_blocks == 1 {
         let mut state = GvnState::new(
             func.max_value_id() as usize,
@@ -778,6 +787,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
             find_param_allocas(func),
             volatile,
             context,
+            must_mat,
         );
         return process_block(0, func, &mut state);
     }
@@ -787,6 +797,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
         find_param_allocas(func),
         volatile,
         context,
+        must_mat,
     );
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
     state.total_eliminated
@@ -2324,6 +2335,66 @@ mod tests {
         assert!(matches!(
             &module.functions[0].blocks[0].instructions[1],
             Instruction::BinOp { dest: Value(3), .. }
+        ));
+    }
+
+    #[test]
+    fn gvn_does_not_cse_mixed_class_global_addr() {
+        // v1 is only a load pointer (foldable). v2 is a call arg
+        // (must-materialize). Class-blind CSE would pin the RIP-foldable
+        // address in a GPR.
+        let func = make_func(
+            vec![BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "g".to_string(),
+                    },
+                    Instruction::Load {
+                        dest: Value(3),
+                        ptr: Value(1),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(2),
+                        name: "g".to_string(),
+                    },
+                    Instruction::Call {
+                        func: "use_ptr".to_string(),
+                        info: CallInfo {
+                            dest: None,
+                            args: vec![Operand::Value(Value(2))],
+                            arg_types: vec![IrType::Ptr],
+                            return_type: IrType::Void,
+                            is_variadic: false,
+                            num_fixed_args: 1,
+                            struct_arg_sizes: vec![],
+                            struct_arg_aligns: vec![],
+                            struct_arg_classes: vec![],
+                            struct_arg_riscv_float_classes: vec![],
+                            struct_arg_is_f128_sse: Vec::new(),
+                            is_sret: false,
+                            is_fastcall: false,
+                            ret_eightbyte_classes: vec![],
+                            ret_is_f128_sse: false,
+                        },
+                    },
+                ],
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }],
+            4,
+        );
+        let mut module = make_module(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 0);
+        assert_eq!(module.functions[0].blocks[0].instructions.len(), 4);
+        assert!(matches!(
+            &module.functions[0].blocks[0].instructions[2],
+            Instruction::GlobalAddr { dest: Value(2), .. }
         ));
     }
 }

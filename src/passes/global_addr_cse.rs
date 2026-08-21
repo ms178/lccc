@@ -10,14 +10,13 @@
 //! stale-base landmine that keeps GEP CSE disabled; we rewrite uses onto a
 //! dominance-safe canonical value and delete the duplicate instruction.
 //!
-//! Canonical choice is dominance-safe by construction:
-//! - an entry-block materialization of class C dominates every reachable
-//!   block, so it is canonical for every later same-symbol, same-class
-//!   duplicate;
-//! - otherwise the first materialization of class C within a block is
-//!   canonical for later same-block duplicates.
-//!
-//! Cross-block merging between two non-entry blocks is not attempted.
+//! Canonical choice is dominance-safe by construction: one materialization
+//! of class C is placed in the entry block (reusing an existing one, or
+//! inserting after the Alloca/ParamRef prefix). Entry dominates every
+//! reachable block, so loop-body and sibling-block duplicates all rewrite
+//! onto that value. That is the register-pressure win: fannkuch's
+//! perm/perm1/count stop being re-materialized every iteration, and two
+//! non-entry blocks that never saw each other still share one SSA web.
 //!
 //! Class split (the levkropp original mixed these and fought RIP remat):
 //! - **Foldable**: every use is a Load/Store pointer, an absorbed GEP/Add/Sub
@@ -35,59 +34,163 @@
 //! cannot be left dangling (the levkropp TCE helper missed both).
 //!
 //! Kill switches: `CCC_NO_GADDR_CSE`, `CCC_DISABLE_PASSES=gaddrcse`.
+//!
+//! Scheduling: the pass **must** run before the first GVN. GVN already CSEs
+//! `GlobalAddr` (same-block, class-blind Copies). A late-only wiring after
+//! post-structural-inline therefore observes `merged=0` on every fannkuch-like
+//! shape — the duplicates are already Copies. GVN's GlobalAddr key is also
+//! class-split so a later GVN cannot pin a RIP-foldable address into a GPR.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Value};
+
+fn debug_merged(name: &str, n: usize) {
+    if std::env::var_os("CCC_DEBUG_GADDR_CSE").is_some() {
+        eprintln!("[GADDR_CSE] fn={} merged={}", name, n);
+    }
+}
+
+/// Resolve GNU `__attribute__((alias))` chains the same way GVN does, so
+/// `GlobalAddr "foo"` and `GlobalAddr "bar"` of an alias pair share a web.
+fn alias_canon_map(module: &IrModule) -> FxHashMap<String, String> {
+    let direct: FxHashMap<String, String> = module
+        .aliases
+        .iter()
+        .map(|(alias, target, _)| (alias.clone(), target.clone()))
+        .collect();
+    let mut out = FxHashMap::default();
+    for alias in direct.keys() {
+        let mut current = alias.as_str();
+        let mut seen = FxHashSet::default();
+        while let Some(next) = direct.get(current) {
+            if !seen.insert(current.to_string()) {
+                break;
+            }
+            current = next;
+        }
+        out.insert(alias.clone(), current.to_string());
+    }
+    out
+}
+
+fn canon_name<'a>(name: &'a str, aliases: &'a FxHashMap<String, String>) -> &'a str {
+    aliases.get(name).map(String::as_str).unwrap_or(name)
+}
+
+pub(crate) fn run_module(module: &mut IrModule) -> usize {
+    let aliases = alias_canon_map(module);
+    module.for_each_function(|f| run_with_aliases(f, &aliases))
+}
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    if std::env::var("CCC_NO_GADDR_CSE").is_ok() || func.blocks.is_empty() {
+    run_with_aliases(func, &FxHashMap::default())
+}
+
+pub(crate) fn run_with_aliases(
+    func: &mut IrFunction,
+    aliases: &FxHashMap<String, String>,
+) -> usize {
+    if func.blocks.is_empty() {
+        debug_merged(&func.name, 0);
+        return 0;
+    }
+    if std::env::var_os("CCC_NO_GADDR_CSE").is_some() {
+        debug_merged(&func.name, 0);
         return 0;
     }
 
     let must_mat = classify_must_materialize(func);
 
-    // Entry-block canonicals keyed by (symbol, must_materialize).
+    // First existing entry-block GlobalAddr of each (symbol, class) is the
+    // canonical dest. Missing classes are inserted after the Alloca/ParamRef
+    // prefix so they dominate every reachable use.
     let mut entry_canonical: FxHashMap<(String, bool), Value> = FxHashMap::default();
     for inst in &func.blocks[0].instructions {
         if let Instruction::GlobalAddr { dest, name } = inst {
             let class = must_mat.contains(&dest.0);
-            entry_canonical
-                .entry((name.clone(), class))
-                .or_insert(*dest);
+            let key = (canon_name(name, aliases).to_string(), class);
+            entry_canonical.entry(key).or_insert(*dest);
         }
     }
+
+    let mut needed: FxHashSet<(String, bool)> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                let class = must_mat.contains(&dest.0);
+                needed.insert((canon_name(name, aliases).to_string(), class));
+            }
+        }
+    }
+
+    let mut to_insert: Vec<(String, bool)> = needed
+        .into_iter()
+        .filter(|k| !entry_canonical.contains_key(k))
+        .collect();
+    to_insert.sort();
+
+    if !to_insert.is_empty() {
+        let mut next_id = func.next_value_id.max(func.max_value_id().saturating_add(1));
+        let insert_at = {
+            let mut i = 0usize;
+            for inst in &func.blocks[0].instructions {
+                match inst {
+                    Instruction::Alloca { .. } | Instruction::ParamRef { .. } => i += 1,
+                    _ => break,
+                }
+            }
+            i
+        };
+        let span_lockstep =
+            func.blocks[0].source_spans.len() == func.blocks[0].instructions.len();
+        let dummy = crate::common::source::Span::dummy();
+        for (name, class) in to_insert.iter().rev() {
+            let dest = Value(next_id);
+            next_id += 1;
+            entry_canonical.insert((name.clone(), *class), dest);
+            func.blocks[0].instructions.insert(
+                insert_at,
+                Instruction::GlobalAddr {
+                    dest,
+                    name: name.clone(),
+                },
+            );
+            if span_lockstep && !func.blocks[0].source_spans.is_empty() {
+                func.blocks[0].source_spans.insert(insert_at, dummy);
+            }
+        }
+        func.next_value_id = next_id;
+    }
+
+    // Freshly inserted dests are not in `must_mat` (no uses yet). Never
+    // treat a chosen canonical as a duplicate of the other class.
+    let canon_ids: FxHashSet<u32> = entry_canonical.values().map(|v| v.0).collect();
 
     let mut subst: FxHashMap<u32, u32> = FxHashMap::default();
     let mut dups: Vec<(usize, usize)> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        let mut block_canonical: FxHashMap<(String, bool), Value> = FxHashMap::default();
         for (ii, inst) in block.instructions.iter().enumerate() {
             let Instruction::GlobalAddr { dest, name } = inst else {
                 continue;
             };
-            let class = must_mat.contains(&dest.0);
-            let key = (name.clone(), class);
-            if let Some(&canon) = entry_canonical.get(&key) {
-                if canon != *dest {
-                    subst.insert(dest.0, canon.0);
-                    dups.push((bi, ii));
-                }
+            if canon_ids.contains(&dest.0) {
                 continue;
             }
-            match block_canonical.get(&key) {
-                Some(&canon) => {
-                    subst.insert(dest.0, canon.0);
-                    dups.push((bi, ii));
-                }
-                None => {
-                    block_canonical.insert(key, *dest);
-                }
+            let class = must_mat.contains(&dest.0);
+            let key = (canon_name(name, aliases).to_string(), class);
+            let Some(&canon) = entry_canonical.get(&key) else {
+                continue;
+            };
+            if canon != *dest {
+                subst.insert(dest.0, canon.0);
+                dups.push((bi, ii));
             }
         }
     }
 
     if dups.is_empty() {
+        debug_merged(&func.name, 0);
         return 0;
     }
 
@@ -107,13 +210,14 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             block.source_spans.clear();
         }
     }
+    debug_merged(&func.name, n);
     n
 }
 
 /// A GlobalAddr dest *must materialize* if any use is not a foldable memory
 /// pointer or an absorbed address producer. Conservative: unknown shapes
 /// (calls, asm, intrinsics, stored *values*) force materialization.
-fn classify_must_materialize(func: &IrFunction) -> FxHashSet<u32> {
+pub(crate) fn classify_must_materialize(func: &IrFunction) -> FxHashSet<u32> {
     let mut gaddrs: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -495,5 +599,181 @@ mod tests {
             func.blocks[0].source_spans.len(),
             func.blocks[0].instructions.len()
         );
+    }
+
+    #[test]
+    fn hoists_non_entry_to_entry() {
+        // A single loop-body GlobalAddr must move to entry so LICM/RA see
+        // one dominating def rather than a per-iteration materialization.
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "g".to_string(),
+                },
+                load(6, 5),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let n = run(&mut func);
+        assert_eq!(n, 1);
+        match &func.blocks[0].instructions[0] {
+            Instruction::GlobalAddr { dest, name } => {
+                assert_eq!(name, "g");
+                assert_eq!(func.blocks[1].instructions.len(), 1);
+                match &func.blocks[1].instructions[0] {
+                    Instruction::Load { ptr, .. } => assert_eq!(ptr.0, dest.0),
+                    other => panic!("expected load, got {other:?}"),
+                }
+            }
+            other => panic!("expected entry GlobalAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_non_entry_blocks_share_entry_canonical() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "g".to_string(),
+                },
+                load(6, 5),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(7),
+                    name: "g".to_string(),
+                },
+                load(8, 7),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let n = run(&mut func);
+        assert_eq!(n, 2);
+        let Instruction::GlobalAddr { dest: canon, .. } = &func.blocks[0].instructions[0] else {
+            panic!("expected entry GlobalAddr");
+        };
+        match &func.blocks[1].instructions[0] {
+            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, canon.0),
+            other => panic!("expected load, got {other:?}"),
+        }
+        match &func.blocks[2].instructions[0] {
+            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, canon.0),
+            other => panic!("expected load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aliases_share_a_web() {
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "foo".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "bar".to_string(),
+                },
+                store(2),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let mut aliases = FxHashMap::default();
+        aliases.insert("bar".to_string(), "foo".to_string());
+        let n = run_with_aliases(&mut func, &aliases);
+        assert_eq!(n, 1);
+        match &func.blocks[0].instructions[1] {
+            Instruction::Store { ptr, .. } => assert_eq!(ptr.0, 1),
+            other => panic!("expected store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hoist_preserves_class_split() {
+        // Foldable load in block 1 and call-arg in block 2 of the same
+        // symbol must become TWO entry GlobalAddrs, never one.
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(5),
+                    name: "g".to_string(),
+                },
+                load(6, 5),
+                Instruction::GlobalAddr {
+                    dest: Value(7),
+                    name: "g".to_string(),
+                },
+                Instruction::Call {
+                    func: "use_ptr".to_string(),
+                    info: crate::ir::reexports::CallInfo {
+                        dest: None,
+                        args: vec![Operand::Value(Value(7))],
+                        arg_types: vec![IrType::Ptr],
+                        return_type: IrType::Void,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: vec![],
+                        struct_arg_riscv_float_classes: vec![],
+                        struct_arg_is_f128_sse: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: vec![],
+                        ret_is_f128_sse: false,
+                    },
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let n = run(&mut func);
+        assert_eq!(n, 2);
+        let entry_gaddrs: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
+            .collect();
+        assert_eq!(entry_gaddrs.len(), 2);
     }
 }
