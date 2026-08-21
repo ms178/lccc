@@ -809,6 +809,10 @@ impl X86Codegen {
         // call argument must not be homed in one of these: the staging writes
         // them in order before reading the value (`printf("%d %d", add(3,4),
         // mul(3,4))` read the mul result out of the format-string register).
+        if self.state.disable_regalloc {
+            available_regs.clear();
+            caller_saved_regs.clear();
+        }
         let call_arg_regs = vec![
             crate::backend::regalloc::PhysReg(12), // r8
             crate::backend::regalloc::PhysReg(13), // r9

@@ -7,7 +7,7 @@ Evidence: **M** measured LCCC vs GCC14 on kernels; **G** Compiler Explorer (`cg1
 
 **ROI rank:** P0 this week (testable) · P1 this month · P2 after P0/P1 · P3 research.
 
-Count: P0 5 + RA 26 + IS 28 + OP 33 + FE 22 + AB 15 + PG 12 + LK 18 + MS 9 = **168** (extra items are refinements; drop `[NEW]`/`[REFINED]` tags when stable).
+Count: P0 5 + RA 27 + IS 28 + OP 33 + FE 22 + AB 15 + PG 12 + LK 18 + MS 9 = **169** (extra items are refinements; drop `[NEW]`/`[REFINED]` tags when stable).
 
 ## 1. How to gather data (mandatory)
 
@@ -101,7 +101,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 5 | P0-04 | DONE | LICM now uses shared `LinForm`/`forms_disjoint`; resolver gains checked Shl scaling; calls/atomics/unresolved stores fail closed | `licm.rs`, `loop_memory_promote.rs`, `alias.rs` | **M** invariant `a[0]` hoisted across marching `a[i+1]` store; 720 alias + 600 phi cases clean | targeted regression | invent second engine |
 | 6 | P0-05 | DONE | Sema now rejects named-aggregate and incompatible-pointer assignments, direct/indirect prototype arity errors, and invalid valued/valueless returns; unspecified legacy prototypes remain permissive | `sema/analysis.rs` | **M** six-error negative corpus plus valid variadic/void*/function-pointer control; 50/50 correctness, 364 runnable regressions | diagnostics originate in semantic analysis | reject anonymous SIMD typedefs before type identity is canonical |
 
-### 5.1 Register allocation — RA-01 … RA-26
+### 5.1 Register allocation — RA-01 … RA-27
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
@@ -129,13 +129,14 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 28 | RA-23 | P0 | **Eliminate `immediately_consumed` blocker** — refactor to RA-owned accumulator hint | `stack_layout/copy_coalescing.rs:1328` (`compute_immediately_consumed` + `is_safe_sole_consumer`), `state.rs` | **C** hard-codes accumulator load order; `is_safe_sole_consumer` whitelist (`Store,Cast,UnaryOp,Copy` always; `BinOp,Cmp` only when `lhs_first_binop`) | RA owns accumulator placement; whitelist deleted; unblocks P0-01b (graph_coloring) | break accumulator codegen without differential test |
 | 29 | RA-24 | P0 | **Eliminate `SlotAddr::Indirect(StackSlot(0))` dummy** — add `SlotAddr::Reg(PhysReg)` variant | `state.rs:844` | **C** silent corruption if Indirect codepath forgets `reg_assignments` check | exhaustive match catches misses | migrate all backends at once without tests |
 | 30 | RA-25 | P1 | **Unify `loop_memory_promote`'s `affine_disjoint` with `alias.rs::forms_disjoint`** | `loop_memory_promote.rs`, `alias.rs` | **C** duplicated SCEV-lite engine (1712 LOC + 128 LOC) | one alias engine | break sqlite `sqlite3FpDecode` fix |
-| 31 | RA-26 | DONE | ABI physical hints plus ordered caller-home placement now cover scalar call-free x86 CFG leaves with ≤6 register arguments and leading entry ParamRefs; stack-argument/mixed/calling shapes fail closed | RA + x86 prologue | **G/M** branch leaf 16→8 body instructions vs control; CE LCCC 10 vs GCC/ICC 8, Clang/ICX 9; 374 regressions + 50 correctness | `CCC_NO_LEAF_PARAM_GPR` | admit stack args or late ParamRefs |
+| 31 | RA-26 | DONE | ABI physical hints plus ordered caller-home placement now cover scalar call-free x86 CFG leaves with ≤6 register arguments and leading entry ParamRefs; stack-argument/mixed/calling shapes fail closed | RA + x86 prologue | **G/M** branch leaf 16→8 body instructions vs control; CE LCCC 10 vs GCC/ICC 8, Clang/ICX 9; 377 regressions + 50 correctness | `CCC_NO_LEAF_PARAM_GPR` | admit stack args or late ParamRefs |
+| 32 | RA-27 | DONE | `-O0` non-SSA multi-def IR uses canonical stack homes on all backends; production RA remains enabled at O1/O2/O3/Os/Oz | CodegenOptions + all prologues | **M** phi CFG improved 475/600 → 600/600; seed-1 stale loop-carried value fixed; cross-target O0 compile | 600 phi + 540 alias + dedicated runtime | run one-def linear scan on multi-def IR |
 
 ### 5.2 x86 ISel / peephole / MachInst — IS-01 … IS-28
 
 | # | ID | P | Item | Files | Evidence | Accept | Do not |
 |---|----|---|------|-------|----------|--------|--------|
-| 32 | IS-01 | DONE | Masked byte-table indexes retain a safe hidden home; x86 emits scale-4 SIB table loads | RA hidden-index priority + existing indexed emitters | **M** CRC -12 B/-7 insn, 1.34x vs control, now 1.07x behind GCC | SIB regression + 600 phi fuzz | broad hidden homes before RA-23 |
+| 32 | IS-01 | DONE | Masked byte-table indexes retain a safe hidden home; variable-index GlobalAddrs remain site-local through GlobalAddr CSE/GVN so x86 still emits scale-4 SIB loads | RA + GAddr CSE/GVN + indexed emitters | **M** repaired PR161 regression (`movl (%rsi,%rdx,4),%edi`); CRC runtime + structural gate; 600 phi | SIB regression | entry-hoist indexed symbol bases |
 | 33 | IS-02 | P0 | Keep `double` fields in XMM; ban `movq %xmm,%rax` roundtrip | `float_ops.rs`, `memory.rs` | **S** 21× struct_copy | mov count ≤40 | keep rax shuttle |
 | 34 | IS-03 | DONE | AVX2 64-byte assignment → 2 YMM load/store pairs + `vzeroupper`; safe leaf DCE removes dead parameter homes and the entire frame/setup | x86 memcpy + target feature contract + DCE | **G/M** 6 instructions, exact parity with GCC16.2/Clang22.1/ICX latest (ICC 9); runtime exact; baseline ISA remains XMM | structural/runtime regression | use YMM for 32/48 B (measured slower) |
 | 35 | IS-04 | P0 | Vectorizer emit `vfmadd231pd` into YMM acc **once** horiz | `vectorize.rs` + `intrinsics.rs` | **G** **icx** not gcc16; spectral ICX FMA 10 | `dot`/spectral CE vs icx | copy gcc16 per-iter hadd |
@@ -227,7 +228,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 111 | FE-19 | P2 | **`__builtin_cpu_supports` runtime CPUID** (was P0 — now FIXED: exact Raptor Lake allowlist at `expr_builtins.rs:453` `PRESENT`; downgrade to P2 for runtime CPUID) | `expr_builtins.rs:436` | **C** FIXED: exact allowlist, not "return 1" | runtime CPUID on non-v3 targets | re-enable the "return 1 for everything" SIGILL bug |
 | 112 | FE-20 | P2 | **`usual_arithmetic_conversion` edge cases** (was P0 — now FIXED: correct C11 6.3.1.8 else-arm at `types.rs:1586`; downgrade to P2 for edge-case tests) | `common/types.rs:1586` | **C** FIXED: `size > ? signed : unsigned_version` | edge-case regression tests | re-enable the `1LL + 1UL` wrong-type bug |
 | 113 | FE-21 | P1 | **`_Pragma` implementation** (currently consumed and dropped) | `macro_defs.rs:542` | **C** C99 §6.10.9 violation | `_Pragma("foo")` injects `#pragma foo` | |
-| 114 | FE-22 | P1 | **`__VA_OPT__` support** (C2x) | absent | **C** modern headers use it | `__VA_OPT__` expands | |
+| 114 | FE-22 | DONE | C2x `__VA_OPT__` expands balanced replacement tokens before #/## handling; supports empty/nonempty, nested commas, token paste, and GNU named variadics | `macro_defs.rs` | **M** runtime regression covers five forms | selected tokens rescan normally | treat whitespace-only variadic as present |
 
 ### 5.5 ABI / aggregates / stack — AB-01 … AB-15
 
@@ -299,7 +300,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 163 | MS-04 | P1 | OnceLock env knobs break parameterized tests | live_range.rs | **C** | tests independent | |
 | 164 | MS-05 | P2 | Compile-time: pass rescans | use-def FE-13 | **C** | | |
 | 165 | MS-06 | P1 | Document PhysReg map once | RA-19 | **C** | | |
-| 166 | MS-07 | DONE | Re-ran current patch oracles: gzip 1.14 30/30, `longest_match` 330 instructions/118 stack refs; Expat local 114 vs GCC16.2 78; CRC/Adler artifacts refreshed where externally visible | workloads | **M/G** artifacts `r7-*`; gzip paired VM treatment/control median ratio 0.992 | numbers on this SHA | claim VM timing as hardware |
+| 166 | MS-07 | DONE | Current PR161+treatment oracles: gzip 1.14 30/30, `longest_match` 331 instructions/119 stack refs, byte-for-byte stack-count parity with pristine PR161; CRC scale-4 SIB restored | workloads | **M/G** `r8-*` artifacts + independent pristine-base build | numbers on this SHA | compare against stale pre-PR161 count |
 | 167 | MS-08 | P1 | **Consolidate 29+ `CCC_` env vars into `RaConfig` struct** | `regalloc.rs` (29), `live_range.rs` (7), `prologue.rs` (16) | **C** 29 in regalloc.rs alone, mixed polarity | `RaConfig` struct, single source of truth | env vars in hot path |
 | 168 | MS-09 | P1 | **Audit `peephole_common.rs` UTF-8 fix impact** — old `bytes[i] as char` corrupted non-ASCII bytes in asm (FIXED in current main); verify no compiled binary shipped with corrupted asm | `engineering/evidence/` | **C** old code corrupted UTF-8 | audit report | re-enable `bytes[i] as char` |
 

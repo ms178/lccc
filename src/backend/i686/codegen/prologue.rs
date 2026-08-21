@@ -150,9 +150,13 @@ impl I686Codegen {
         if needs_got && !asm_clobbered_regs.contains(&PhysReg(0)) {
             asm_clobbered_regs.push(PhysReg(0));
         }
-        let available_regs = filter_available_regs(callee_saved_set, &asm_clobbered_regs);
+        let mut available_regs = filter_available_regs(callee_saved_set, &asm_clobbered_regs);
 
-        let caller_saved_regs = I686_CALLER_SAVED.to_vec();
+        let mut caller_saved_regs = I686_CALLER_SAVED.to_vec();
+        if self.state.disable_regalloc {
+            available_regs.clear();
+            caller_saved_regs.clear();
+        }
 
         // GlobalAddr values whose EVERY use is a foldable Load/Store pointer
         // never materialize (non-PIC absolute fold in generate_load/store);

@@ -60,7 +60,7 @@ enum ExprKey {
     /// foldable (Load/Store ptr / absorbed GEP) vs must-materialize (call
     /// arg, asm, …). Mixing them pins a RIP-foldable `window(%rip)` into a
     /// GPR. Alias tracking still keys on `name` alone.
-    GlobalAddr { name: String, must_mat: bool },
+    GlobalAddr { name: String, must_mat: bool, site_local: Option<u32> },
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
     Load { ptr: VNOperand, ty: IrType },
@@ -197,6 +197,9 @@ struct GvnState {
     /// GlobalAddr dests whose uses force a register (call arg, asm, …).
     /// Populated by `global_addr_cse::classify_must_materialize`.
     must_mat_gaddrs: FxHashSet<u32>,
+    /// GlobalAddr values feeding variable-index GEPs must not CSE/hoist: their
+    /// site-local identity preserves symbol+index addressing profitability.
+    site_local_gaddrs: FxHashSet<u32>,
 }
 
 impl GvnState {
@@ -208,6 +211,7 @@ impl GvnState {
         volatile_allocas: FxHashSet<u32>,
         context: &GvnContext,
         must_mat_gaddrs: FxHashSet<u32>,
+        site_local_gaddrs: FxHashSet<u32>,
     ) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
@@ -231,6 +235,7 @@ impl GvnState {
             param_allocas,
             volatile_allocas,
             must_mat_gaddrs,
+            site_local_gaddrs,
         }
     }
 
@@ -465,6 +470,7 @@ impl GvnState {
                 ExprKey::GlobalAddr {
                     name: self.context.canonical(name).to_string(),
                     must_mat: self.must_mat_gaddrs.contains(&dest.0),
+                    site_local: self.site_local_gaddrs.contains(&dest.0).then_some(dest.0),
                 },
                 *dest,
             )),
@@ -756,6 +762,7 @@ pub(crate) fn run_gvn_function_with_context(
             volatile,
             context,
             super::global_addr_cse::classify_must_materialize(func),
+            super::global_addr_cse::classify_site_local_indexed(func),
         );
         return process_block(0, func, &mut state);
     }
@@ -780,6 +787,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     let escaped = find_escaped_param_allocas(func);
     let volatile = find_volatile_allocas(func);
     let must_mat = super::global_addr_cse::classify_must_materialize(func);
+    let site_local = super::global_addr_cse::classify_site_local_indexed(func);
     if num_blocks == 1 {
         let mut state = GvnState::new(
             func.max_value_id() as usize,
@@ -788,6 +796,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
             volatile,
             context,
             must_mat,
+            site_local,
         );
         return process_block(0, func, &mut state);
     }
@@ -798,6 +807,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
         volatile,
         context,
         must_mat,
+        site_local,
     );
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
     state.total_eliminated
@@ -2396,5 +2406,31 @@ mod tests {
             &module.functions[0].blocks[0].instructions[2],
             Instruction::GlobalAddr { dest: Value(2), .. }
         ));
+    }
+
+    #[test]
+    fn gvn_keeps_variable_index_global_addrs_site_local() {
+        let func = make_func(
+            vec![BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::GlobalAddr { dest: Value(1), name: "table".to_string() },
+                    Instruction::GetElementPtr {
+                        dest: Value(2), base: Value(1), offset: Operand::Value(Value(9)), ty: IrType::Ptr,
+                    },
+                    Instruction::GlobalAddr { dest: Value(3), name: "table".to_string() },
+                    Instruction::GetElementPtr {
+                        dest: Value(4), base: Value(3), offset: Operand::Value(Value(8)), ty: IrType::Ptr,
+                    },
+                ],
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }],
+            10,
+        );
+        let mut module = make_module(func);
+        let _ = module.for_each_function(run_gvn_function);
+        assert_eq!(module.functions[0].blocks[0].instructions.iter()
+            .filter(|i| matches!(i, Instruction::GlobalAddr { .. })).count(), 2);
     }
 }

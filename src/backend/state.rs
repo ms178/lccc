@@ -116,6 +116,8 @@ impl RegCache {
 /// Shared codegen state, used by all backends.
 pub struct CodegenState {
     pub out: AsmOutput,
+    /// Set from CodegenOptions for -O0 non-SSA correctness.
+    pub disable_regalloc: bool,
     pub stack_offset: i64,
     pub value_locations: FxHashMap<u32, StackSlot>,
     /// Emergency spill slot offset, allocated downward from the bottom of the frame.
@@ -399,6 +401,7 @@ impl CodegenState {
     pub fn new() -> Self {
         Self {
             out: AsmOutput::new(),
+            disable_regalloc: false,
             stack_offset: 0,
             value_locations: FxHashMap::default(),
             alloca_values: FxHashSet::default(),

@@ -5,3 +5,5 @@
 Session 33 moves core C constraints into sema: invalid valued/valueless returns, named aggregate assignment mismatch, incompatible pointer assignment, fixed-prototype arity, and indirect function-pointer arity. Empty legacy `f()` and fallback libc declarations stay permissive because they do not carry a real prototype. Anonymous SIMD aggregate keys are not compared as distinct named types until type identity is canonicalized.
 
 Regression: `tests/regression/check_sema_constraints.sh` requires seven semantic diagnostics and compiles/runs a valid variadic, function-pointer, aggregate-copy, and `void *` conversion control.
+
+The preprocessor supports C2x `__VA_OPT__`, expanding balanced selected tokens before `#`/`##` and rescanning. Runtime coverage includes empty/nonempty arguments, comma insertion, nested expressions, token paste, and GNU named variadics.
