@@ -968,9 +968,18 @@ fn invalidate_for_value_write(
             Operand::Value(source) => {
                 !write_may_clobber(pointer, source, write_root, roots, local_aliases)
             }
-            // A constant source denotes a fixed address; treat as non-writable
-            // for forwarding purposes (the backend materializes it directly).
-            Operand::Const(_) => true,
+            // A constant source denotes a fixed (absolute) address.  The only
+            // write that PROVABLY cannot reach it is one confined to an
+            // alloca-derived pointer: a fresh stack alloca can never equal a
+            // compile-time address, and a write through a pointer derived
+            // from one stays inside that alloca.  A plain parameter, a global
+            // symbol, or an opaque pointer may legally target the absolute
+            // address (the caller can pass it, a linker script can place a
+            // symbol there, a load result is unknown), so those must
+            // invalidate the forward — otherwise a promoted consumer
+            // re-reads the address after an intervening store and observes
+            // the wrong value.
+            Operand::Const(_) => matches!(write_root, Some(PointerRoot::Alloca(_))),
         }
     });
 }
@@ -1884,6 +1893,110 @@ mod tests {
             panic!("expected consumer");
         };
         assert!(matches!(args[0], Operand::Value(Value(10))));
+    }
+
+    #[test]
+    fn constant_address_source_rejects_plain_parameter_write() {
+        // A load whose source is an absolute (constant) address must NOT
+        // survive a write through a plain parameter: the caller may pass
+        // exactly that address, so the write can hit the source and a
+        // promoted consumer would re-read post-store memory.
+        let param = IrParam {
+            ty: IrType::Ptr,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        };
+        let mut function = IrFunction::new("const_src_param".into(), IrType::I32, vec![param], false);
+        function.blocks = vec![block(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(30),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                alloca(0, 32, 32),
+                intrinsic(
+                    Some(1),
+                    IntrinsicOp::Loadu256,
+                    Some(0),
+                    vec![Operand::Const(IrConst::I64(4096))],
+                ),
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(30),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                intrinsic(
+                    Some(2),
+                    IntrinsicOp::Pcmpeqb256,
+                    Some(20),
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                ),
+            ],
+        )];
+        assert_eq!(fuse_in_function(&mut function), 0);
+        let Instruction::Intrinsic { args, .. } =
+            function.blocks[0].instructions.last().unwrap()
+        else {
+            panic!("expected consumer");
+        };
+        assert!(
+            matches!(args[0], Operand::Value(Value(0))),
+            "param write must invalidate a constant-address forward"
+        );
+    }
+
+    #[test]
+    fn constant_address_source_survives_alloca_confined_write() {
+        // The one write that provably cannot reach an absolute address is a
+        // write through a pointer derived from a stack alloca.  That forward
+        // is the legitimate optimization and must survive.
+        let mut function = function(
+            "const_src_alloca",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(50, 4, 4),
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::Loadu256,
+                        Some(0),
+                        vec![Operand::Const(IrConst::I64(4096))],
+                    ),
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(1)),
+                        ptr: Value(50),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Pcmpeqb256,
+                        Some(20),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 1);
+        let Instruction::Intrinsic { args, .. } =
+            function.blocks[0].instructions.last().unwrap()
+        else {
+            panic!("expected consumer");
+        };
+        assert!(
+            matches!(args[0], Operand::Const(IrConst::I64(4096))),
+            "alloca-confined write must keep the constant-address forward"
+        );
     }
 
     #[test]

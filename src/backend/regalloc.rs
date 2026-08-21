@@ -856,10 +856,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .collect();
 
     let mut use_count: FxHashMap<u32, u64> = FxHashMap::default();
+    // Hottest *use-site* loop depth per value. Unlike the def block, a
+    // preheader-defined IV is used inside the loop — the canonical
+    // loop-carried shape. Used by `hot_loop_home` (Phase-1 candidacy).
+    let mut use_loop_depth: FxHashMap<u32, u32> = FxHashMap::default();
     let mut eligible: FxHashSet<u32> = FxHashSet::default();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let weight = block_loop_weight.get(block_idx).copied().unwrap_or(1);
+        let depth = liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
         for inst in &block.instructions {
             match inst {
                 Instruction::BinOp { dest, ty, .. } | Instruction::UnaryOp { dest, ty, .. } => {
@@ -926,15 +931,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
                     *use_count.entry(v.0).or_insert(0) += weight;
+                    let entry = use_loop_depth.entry(v.0).or_insert(0);
+                    *entry = (*entry).max(depth);
                 }
             });
             for_each_value_use_in_instruction(inst, |v| {
                 *use_count.entry(v.0).or_insert(0) += weight;
+                let entry = use_loop_depth.entry(v.0).or_insert(0);
+                *entry = (*entry).max(depth);
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
                 *use_count.entry(v.0).or_insert(0) += weight;
+                let entry = use_loop_depth.entry(v.0).or_insert(0);
+                *entry = (*entry).max(depth);
             }
         });
     }
@@ -1105,8 +1116,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // (cmdline_find_option's state machine, uses=71/81 loop-weighted, all
     // slotted while span-1 temps took caller-saved registers).  Giving them
     // callee-saved homes is exactly what gcc does on the same 6-register
-    // budget.  Candidates: loop-depth ≥ 1 at their start, heavily used, and
-    // long-lived (short temps are Phase-2 fodder, not loop state).
+    // budget.  Candidates: heavily used, long-lived, and *used inside a
+    // loop* (short temps are Phase-2 fodder, not loop state).
+    //
+    // Session 41 fix: candidacy keys on the hottest USE-SITE loop depth,
+    // not the def block. Loop-carried values are canonically defined in
+    // the preheader (def block depth 0) and consumed inside the loop, so
+    // the old def-block check rejected every one of them — gzip
+    // `longest_match` then spilled `scan`/`best`/`cur_match`/`len` to the
+    // stack while dead entry temps held registers.
     let hot_loop_home = |iv: &LiveInterval| -> bool {
         if env_on("CCC_NO_HOT_LOOP") {
             return false;
@@ -1132,14 +1150,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         if uc < 12 {
             return false;
         }
-        // Start point inside a loop block?
-        match liveness.block_starts.partition_point(|&s| s <= iv.start) {
-            0 => false,
-            idx => {
-                let b = idx - 1;
-                b < liveness.block_loop_depth.len() && liveness.block_loop_depth[b] >= 1
-            }
-        }
+        // At least one use inside a loop block.
+        use_loop_depth.get(&iv.value_id).copied().unwrap_or(0) >= 1
     };
     let phase1_intervals: Vec<LiveInterval> = scan_ivs
         .iter()
@@ -1152,6 +1164,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
     allocator.run();
     let mut assignments = allocator.assignments;
+    if env_on("CCC_DEBUG_RA_PHASES") {
+        let mut ids: Vec<u32> = assignments.keys().copied().collect();
+        ids.sort_unstable();
+        eprintln!(
+            "[RA-P1] fn={} pool={:?} candidates={} assigned={:?}",
+            func.name,
+            config.available_regs,
+            phase1_intervals.len(),
+            ids
+        );
+    }
 
     let mut used_regs_set: FxHashSet<u8> = FxHashSet::default();
     for &reg in assignments.values() {
@@ -1387,6 +1410,20 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
     propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+    if env_on("CCC_DEBUG_RA_PHASES") {
+        let mut ids: Vec<u32> = assignments.keys().copied().collect();
+        ids.sort_unstable();
+        let spills: Vec<u32> = {
+            let mut s: Vec<u32> = scan_ivs
+                .iter()
+                .map(|iv| iv.value_id)
+                .filter(|v| !assignments.contains_key(v))
+                .collect();
+            s.sort_unstable();
+            s
+        };
+        eprintln!("[RA-FINAL] fn={} assigned={:?} spilled={:?}", func.name, ids, spills);
+    }
 
     // Phase 2d (i686): load-hazard refinement.  Phase 2 treated every
     // non-alloca Load as a %ecx hazard because a slot-resident pointer must
