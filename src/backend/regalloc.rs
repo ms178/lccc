@@ -79,7 +79,31 @@ pub fn analyze_accumulator_assignments(
         out.push(AccumulatorAssignment { value_id, def_point, consume_point: points[0] });
     }
     out.sort_unstable_by_key(|a| (a.def_point, a.value_id));
+    verify_accumulator_assignments(func, &out);
     out
+}
+
+fn verify_accumulator_assignments(func: &IrFunction, assignments: &[AccumulatorAssignment]) {
+    if assignments.is_empty() { return; }
+    let mut defs = FxHashMap::default();
+    let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut pp = 0u32;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() { defs.insert(dest.0, pp); }
+            inst.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
+            pp += 1;
+        }
+        block.terminator.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
+        pp += 1;
+    }
+    let mut seen = FxHashSet::default();
+    for a in assignments {
+        assert!(seen.insert(a.value_id), "duplicate accumulator assignment for v{}", a.value_id);
+        assert_eq!(defs.get(&a.value_id).copied(), Some(a.def_point), "bad accumulator def point for v{}", a.value_id);
+        assert_eq!(uses.get(&a.value_id).map(Vec::as_slice), Some([a.consume_point].as_slice()), "accumulator value v{} is not single-use", a.value_id);
+        assert_eq!(a.consume_point, a.def_point + 1, "accumulator value v{} is not adjacent", a.value_id);
+    }
 }
 
 pub struct RegAllocResult {
@@ -2202,9 +2226,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    let mut accumulator_assignments = analyze_accumulator_assignments(func, config.accumulator_policy);
+    // A physical assignment is the durable home and always wins. Publishing
+    // both locations made downstream behavior depend on insertion order.
+    accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
+    verify_accumulator_assignments(func, &accumulator_assignments);
+
     RegAllocResult {
         assignments,
-        accumulator_assignments: analyze_accumulator_assignments(func, config.accumulator_policy),
+        accumulator_assignments,
         used_regs,
         caller_save_spans,
         liveness: Some(liveness),

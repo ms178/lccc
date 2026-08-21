@@ -826,6 +826,7 @@ pub(super) fn assign_tier2_liveness_packed_slots(
         .collect();
     super::graph_coloring::color_stack_slots(
         state,
+        func,
         &liveness,
         &values,
         non_local_space,

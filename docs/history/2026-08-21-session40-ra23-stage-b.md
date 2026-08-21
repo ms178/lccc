@@ -12,4 +12,11 @@ Implemented multiple dependent stages:
 
 Validation: build/check clean; `machinst_signed_gep`, copy64, leaf caller-home gates, and 382/382 lccc regressions pass.
 
-Remaining completion work is explicit MachInst accumulator operands, hard program-point verification, then Tier-2 definition-store interference and default enablement.
+Follow-up in the same session added:
+
+- hard program-point verification of every allocator assignment (unique value, exact def, exactly one use, consume=def+1);
+- physical-register assignments filter overlapping accumulator assignments deterministically;
+- MachInst producer and consumer instructions both fail closed on point-constrained accumulator locations;
+- Tier-2 occupancy now includes every IR definition write, including multi-def phi Copies.
+
+The Tier-2 gate remains research-only: huft and SQLite still crash with coloring enabled, proving another alias/live-through edge class remains. Default codegen is clean at 382/382 regressions.

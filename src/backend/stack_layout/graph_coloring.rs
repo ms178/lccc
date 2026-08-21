@@ -55,6 +55,7 @@ fn insert_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
 /// color whose occupancy union does not interfere.
 pub(super) fn color_stack_slots(
     state: &mut crate::backend::state::CodegenState,
+    func: &crate::ir::reexports::IrFunction,
     liveness: &LivenessResult,
     multi_block_values: &[(u32, i64)],
     non_local_space: &mut i64,
@@ -62,10 +63,20 @@ pub(super) fn color_stack_slots(
 ) {
     let mut segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for segment in &liveness.segments {
-        segments
-            .entry(segment.value_id)
-            .or_default()
-            .push((segment.start, segment.end));
+        segments.entry(segment.value_id).or_default().push((segment.start, segment.end));
+    }
+    // Liveness can omit a zero-length definition or retain only use-driven
+    // pieces. Emission still writes the value's home at every definition,
+    // including post-phi multi-def Copies. Add those write points explicitly.
+    let mut pp = 0u32;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                segments.entry(dest.0).or_default().push((pp, pp));
+            }
+            pp += 1;
+        }
+        pp += 1; // terminator program point
     }
     for pieces in segments.values_mut() {
         pieces.sort_unstable();
