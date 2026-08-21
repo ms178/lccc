@@ -178,7 +178,20 @@ impl I686Codegen {
             return;
         }
         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
-            let addr = self.state.resolve_slot_addr(ptr.0);
+            let mut addr = self.state.resolve_slot_addr(ptr.0);
+            // Base homed in %eax/%edx dies when the VALUE pair is staged
+            // into the accumulator below. Stash such a base into the %ecx
+            // address scratch first and store through it (same hazard as
+            // the pair-load ordering fix; store side cannot reorder because
+            // both halves of the value occupy %eax:%edx).
+            if let Some(SlotAddr::Reg(reg)) = addr {
+                let r = phys_reg_name(reg);
+                if r == "eax" || r == "edx" {
+                    emit!(self.state, "    movl %{}, %ecx", r);
+                    self.state.reg_cache.invalidate_sec();
+                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
+                }
+            }
             self.emit_load_acc_pair(val);
             if let Some(addr) = addr {
                 match addr {
@@ -256,7 +269,23 @@ impl I686Codegen {
                         emit!(self.state, "    movl {}, %edx", sr4);
                     }
                     SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); emit!(self.state,"    movl (%{}), %eax",r); emit!(self.state,"    movl 4(%{}), %edx",r); }
+                    SlotAddr::Reg(reg) => {
+                        // The base may live in %eax (PhysReg 6, Phase 2e
+                        // accumulator home) or %edx (PhysReg 5): loading the
+                        // word that OVERWRITES the base register first
+                        // destroys the address for the second load (nbody
+                        // -m32 SIGSEGV: `movl (%eax),%eax; movl 4(%eax),%edx`
+                        // dereferenced the low WORD as a pointer). Order the
+                        // pair so the base register is written LAST.
+                        let r = phys_reg_name(reg);
+                        if r == "eax" {
+                            emit!(self.state, "    movl 4(%{}), %edx", r);
+                            emit!(self.state, "    movl (%{}), %eax", r);
+                        } else {
+                            emit!(self.state, "    movl (%{}), %eax", r);
+                            emit!(self.state, "    movl 4(%{}), %edx", r);
+                        }
+                    }
                 }
                 self.emit_store_acc_pair(dest);
             }
@@ -321,8 +350,19 @@ impl I686Codegen {
             }
         }
         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
+            let mut addr = self.state.resolve_slot_addr(base.0);
+            // Same %eax/%edx-base hazard as the plain pair store: the value
+            // staging below overwrites both accumulator halves, so stash
+            // such a base into %ecx first.
+            if let Some(SlotAddr::Reg(reg)) = addr {
+                let r = phys_reg_name(reg);
+                if r == "eax" || r == "edx" {
+                    emit!(self.state, "    movl %{}, %ecx", r);
+                    self.state.reg_cache.invalidate_sec();
+                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
+                }
+            }
             self.emit_load_acc_pair(val);
-            let addr = self.state.resolve_slot_addr(base.0);
             if let Some(addr) = addr {
                 match addr {
                     SlotAddr::OverAligned(slot, id) => {
@@ -510,7 +550,24 @@ impl I686Codegen {
                         emit!(self.state, "    movl {}, %edx", sr4);
                     }
                     SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    movl {}(%{}), %eax",offset,r);emit!(self.state,"    movl {}(%{}), %edx",offset+4,r);} else {emit!(self.state,"    movl (%{}), %eax",r);emit!(self.state,"    movl 4(%{}), %edx",r);} }
+                    SlotAddr::Reg(reg) => {
+                        // Same base-clobber hazard as the plain pair load
+                        // above: write the base register (possibly %eax or
+                        // %edx) last.
+                        let r = phys_reg_name(reg);
+                        let (m0, m4) = if offset != 0 {
+                            (format!("{}(%{})", offset, r), format!("{}(%{})", offset + 4, r))
+                        } else {
+                            (format!("(%{})", r), format!("4(%{})", r))
+                        };
+                        if r == "eax" {
+                            emit!(self.state, "    movl {}, %edx", m4);
+                            emit!(self.state, "    movl {}, %eax", m0);
+                        } else {
+                            emit!(self.state, "    movl {}, %eax", m0);
+                            emit!(self.state, "    movl {}, %edx", m4);
+                        }
+                    }
                 }
                 self.emit_store_acc_pair(dest);
             }
