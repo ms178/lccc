@@ -244,9 +244,34 @@ impl X86Codegen {
             let bt = if use_32bit { "btl" } else { "btq" };
             self.state.emit_fmt(format_args!("    {bt} ${bit}, %{dest64}"));
         } else {
-            self.operand_to_rcx(index);
+            // BT's bit index is an ordinary r/m operand — it has no fixed
+            // count register (that restriction belongs to variable shifts,
+            // which use %cl).  Consume the index's own register directly when
+            // it has one; only a home-less value needs %rcx staging.  The old
+            // unconditional `movq %rN, %rcx; btl %ecx, %dest` paid a copy plus
+            // a partial-register dependency per classify (Expat name scan).
             let bt = if use_32bit { "btl" } else { "btq" };
-            self.state.emit_fmt(format_args!("    {bt} %rcx, %{dest64}"));
+            let own_reg = match index {
+                Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
+                _ => None,
+            };
+            match own_reg {
+                // The base was just staged into dest, so an index sharing
+                // dest's register is clobbered — stage those via %rcx.
+                Some(reg) if !super::emit::is_xmm_reg(reg) && reg != dest_phys => {
+                    let idx = if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dest64}"));
+                }
+                _ => {
+                    self.operand_to_rcx(index);
+                    let src = if use_32bit { "ecx" } else { "rcx" };
+                    self.state.emit_fmt(format_args!("    {bt} %{src}, %{dest64}"));
+                }
+            }
         }
         self.state.emit_fmt(format_args!("    setc %{dest8}"));
         // ALWAYS zero-extend: SETcc writes one byte only, and the
@@ -288,11 +313,12 @@ impl X86Codegen {
 
         if op == IrBinOp::BitTest {
             // Use the native BT instruction: base stays in %rax, the index is
-            // moved into %rcx (BT's fixed count register), SETC materializes
-            // CF, and the boolean is stored to the destination.  This is the
-            // cross-cutting canonical lower instead of patching text peepholes.
+            // consumed from its own register when it has one (BT's index is an
+            // ordinary r/m operand — only variable shifts are pinned to %cl),
+            // SETC materializes CF, and the boolean is stored to the
+            // destination.  This is the cross-cutting canonical lower instead
+            // of patching text peepholes.
             self.emit_load_operand(lhs);
-            self.operand_to_rcx(rhs);
             if let Some(imm) = Self::const_as_imm32(rhs) {
                 let width = if use_32bit { 32 } else { 64 };
                 let bit = (imm as u32) % width;
@@ -303,7 +329,29 @@ impl X86Codegen {
                 };
                 self.state.emit(&bt_line);
             } else {
-                self.state.emit(if use_32bit { "    btl %ecx, %eax" } else { "    btq %rcx, %rax" });
+                // %rax is not allocatable on x86-64, so a register-resident
+                // index can never be clobbered by the base load above.  A
+                // value without a home still stages through %rcx.
+                let own_reg = match rhs {
+                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
+                    _ => None,
+                };
+                match own_reg {
+                    Some(reg) if !super::emit::is_xmm_reg(reg) => {
+                        let idx = if use_32bit {
+                            super::emit::phys_reg_name_32(reg)
+                        } else {
+                            super::emit::phys_reg_name(reg)
+                        };
+                        let dst = if use_32bit { "eax" } else { "rax" };
+                        let bt = if use_32bit { "btl" } else { "btq" };
+                        self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dst}"));
+                    }
+                    _ => {
+                        self.operand_to_rcx(rhs);
+                        self.state.emit(if use_32bit { "    btl %ecx, %eax" } else { "    btq %rcx, %rax" });
+                    }
+                }
             }
             self.state.emit("    setc %al");
             self.state.emit(if use_32bit { "    movzbl %al, %eax" } else { "    movzbq %al, %rax" });
@@ -429,6 +477,29 @@ impl X86Codegen {
                         }
                     }
                 }
+            }
+        }
+
+        // Immediate multiply: `imull $imm, %eax, %eax` (3-operand immediate
+        // form) is one instruction and needs no scratch register, versus the
+        // two-instruction `movq $imm, %rcx; imull %ecx, %eax` general path.
+        // IMUL with imm32 sign-extends the immediate; for the 32-bit form any
+        // 32-bit bit pattern yields the correct low 32 bits (N ≡ -1 mod 2^32),
+        // so the typed helper's unsigned extension is sound there. The 64-bit
+        // form is restricted to the signed i32 range.
+        if op == IrBinOp::Mul {
+            let imm = Self::const_as_imm32_typed(rhs, use_32bit);
+            if let Some(imm) = imm {
+                if use_32bit {
+                    self.operand_to_eax(lhs);
+                    self.state.emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+                    self.store_eax_to(dest);
+                } else {
+                    self.operand_to_rax(lhs);
+                    self.state.emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+                    self.store_rax_to(dest);
+                }
+                return;
             }
         }
 
@@ -567,6 +638,18 @@ impl X86Codegen {
                     return;
                 }
             }
+        }
+
+        // Immediate multiply: fold the constant into the 3-operand immediate
+        // form instead of staging it in %rcx first (`imull $imm, %eax, %eax`).
+        if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
+            if use_32bit {
+                self.state.emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+            } else {
+                self.state.emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+            }
+            self.emit_fused_add_acc(acc, add_dest, use_32bit);
+            return;
         }
 
         // Register-source multiply

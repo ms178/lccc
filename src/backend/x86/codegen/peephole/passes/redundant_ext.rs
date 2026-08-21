@@ -192,7 +192,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 
         // --- Pattern: movzbl %AL, %EAX (redundant re-zero-extend) ---
         if t.starts_with("movzbl ") || t.starts_with("movzbq ") {
-            if let Some(comma) = t.find(',') {
+            if let Some(comma) = t.rfind(',') {
                 // Guard the operand slice.
                 //
                 // `so` is derived from the first space; slicing `t[so..comma]`
@@ -262,7 +262,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             && !t.contains('(') {
             // reg-reg form only (memory sources are handled by the flag
             // update below: movzwl mem,%eax already zero-extends).
-            if let Some(comma) = t.find(',') {
+            if let Some(comma) = t.rfind(',') {
                 // Guard the operand slice.
                 //
                 // `so` is derived from the first space; slicing `t[so..comma]`
@@ -332,7 +332,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         // contain an arbitrary 64-bit value, and immediate operands are left
         // to other constant-materialization patterns.
         if t.starts_with("movq") && !t.contains('(') {
-            if let Some(comma) = t.find(',') {
+            if let Some(comma) = t.rfind(',') {
                 const MOVQ_LEN: usize = "movq".len();
                 let so = MOVQ_LEN;
                 let mut so = so.min(t.len());
@@ -408,6 +408,20 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 }
 
 /// Update the upper32_zero/is_byte/is_16 tracking based on a single instruction.
+/// Mnemonics whose 32-bit form writes the low 32 bits of the destination and
+/// zero-extends to 64 bits on x86-64.  `cmpl`/`testl` deliberately do NOT
+/// appear: they only set flags and leave the register value untouched.
+fn is_32bit_zero_extend_write(op: &str) -> bool {
+    matches!(
+        op,
+        "addl" | "subl" | "andl" | "orl" | "leal" | "imull"
+            | "sall" | "shll" | "shrl" | "sarl"
+            | "cmovl" | "cmovel" | "cmovnel" | "cmovsl" | "cmovns"
+            | "cmovgl" | "cmovgel" | "cmovll" | "cmovlel"
+            | "cmovbl" | "cmovael" | "cmovbel" | "cmoval"
+    )
+}
+
 fn self_update(
     t: &str,
     upper32_zero: &mut Vec<bool>,
@@ -442,7 +456,7 @@ fn self_update(
     // 64-bit consumers. Harmless for stores: movq %reg, mem changes no
     // register flags.)
     if op == "movq" && t.contains('%') {
-        if let Some(comma) = t.find(',') {
+        if let Some(comma) = t.rfind(',') {
             // Split "movq <src>, <dst>" at the FIRST comma that separates the
             // operands -- but only when the mnemonic really ends before it.
             //
@@ -486,7 +500,7 @@ fn self_update(
     // Byte zero-extension into a register sets upper32_zero, is_byte AND
     // is_16 (a byte value fits in 16 bits).
     if op.starts_with("movzbl") {
-        if let Some(comma) = t.find(',') {
+        if let Some(comma) = t.rfind(',') {
             let dst = t[comma + 1..].trim();
             if let Some(df) = family_of_reg(dst) {
                 if (df as usize).lt(&upper32_zero.len()) {
@@ -500,7 +514,7 @@ fn self_update(
     }
     // 16-bit zero-extension: upper-32 zero, fits-16, but NOT a byte.
     if op.starts_with("movzwl") || op.starts_with("movzwq") || op.starts_with("movz") {
-        if let Some(comma) = t.find(',') {
+        if let Some(comma) = t.rfind(',') {
             let dst = t[comma + 1..].trim();
             if let Some(df) = family_of_reg(dst) {
                 if (df as usize).lt(&upper32_zero.len()) {
@@ -515,7 +529,26 @@ fn self_update(
     // movl / xorl: zero-extends to 32 bits, but NOT necessarily a byte or
     // 16-bit value.
     if op == "movl" || op == "xorl" {
-        if let Some(comma) = t.find(',') {
+        if let Some(comma) = t.rfind(',') {
+            let dst = t[comma + 1..].trim();
+            if let Some(df) = family_of_reg(dst) {
+                if (df as usize).lt(&upper32_zero.len()) {
+                    upper32_zero[df as usize] = true;
+                    is_byte[df as usize] = false;
+                    is_16[df as usize] = false;
+                }
+            }
+        }
+        return;
+    }
+    // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts,
+    // cmovl) zero-extends to 64 bits on x86-64, so the destination family is
+    // upper-32-zero (but not byte/16-bit-known).  Without this, an
+    // accumulator chain like `addl %eax, %esi` CLEARED the fact via the
+    // conservative fallback below, and a following `movq %rsi, %r12` never
+    // narrowed to the shorter, dependency-free `movl %esi, %r12d`.
+    if is_32bit_zero_extend_write(op) {
+        if let Some(comma) = t.rfind(',') {
             let dst = t[comma + 1..].trim();
             if let Some(df) = family_of_reg(dst) {
                 if (df as usize).lt(&upper32_zero.len()) {
@@ -622,5 +655,73 @@ mod tests {
         );
         assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
         assert!(asm.contains("movzbl (%rdi), %eax"), "asm was:\n{asm}");
+    }
+
+    #[test]
+    fn removes_byte_reextension_after_sib_memory_load() {
+        // The comma inside the SIB memory operand must not confuse operand
+        // splitting: the load still records a byte fact for %eax, so the
+        // register re-extension is a no-op (gzip CRC / table-index shape).
+        let asm = run(
+            "f:\n\
+             \x20   movzbl (%rcx, %r12), %eax\n\
+             \x20   movzbl %al, %eax\n"
+        );
+        assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
+        assert!(asm.contains("movzbl (%rcx, %r12), %eax"), "asm was:\n{asm}");
+    }
+
+    #[test]
+    fn removes_16bit_reextension_after_sib_memory_load() {
+        let asm = run(
+            "f:\n\
+             \x20   movzwl (%rcx, %rdi, 2), %eax\n\
+             \x20   movzwl %ax, %eax\n"
+        );
+        assert_eq!(asm.matches("movzwl").count(), 1, "asm was:\n{asm}");
+        assert!(asm.contains("movzwl (%rcx, %rdi, 2), %eax"), "asm was:\n{asm}");
+    }
+
+    #[test]
+    fn narrows_copy_after_32bit_alu_accumulation() {
+        // 32-bit ALU writes zero-extend: after `addl`/`subl` the accumulator
+        // family is upper-32-zero, so a 64-bit copy into a 32-bit consumer
+        // narrows to `movl`.
+        let asm = run(
+            "f:\n\
+             \x20   movl 128(%rsp), %esi\n\
+             \x20   addl %r15d, %esi\n\
+             \x20   subl $45, %esi\n\
+             \x20   movq %rsi, %r12\n\
+             \x20   addl %eax, %r12d\n"
+        );
+        assert!(asm.contains("movl %esi, %r12d"), "asm was:\n{asm}");
+        assert!(!asm.contains("movq %rsi, %r12"), "asm was:\n{asm}");
+    }
+
+    #[test]
+    fn does_not_claim_32bit_fact_from_flags_only_ops() {
+        // cmpl/testl only set flags; they must not mark the operand register
+        // upper-32-zero.  A 64-bit copy after them stays 64-bit.
+        let input = "f:\n    cmpl %edx, %esi\n    movq %rsi, %r12\n";
+        let mut asm = input.to_string();
+        let _ = eliminate_redundant_zero_extend(&mut asm);
+        assert_eq!(asm, input, "cmpl must not create an upper-32-zero fact");
+    }
+
+    #[test]
+    fn sib_memory_movq_load_clears_byte_fact() {
+        // SOUNDNESS: an opaque 64-bit load through a SIB address must clear
+        // the stale byte fact for %rax, otherwise the following re-extension
+        // would be wrongly removed (upper bits of a loaded pointer survive).
+        let input = "f:\n\
+             \x20   movzbl (%rdi), %eax\n\
+             \x20   movq (%rcx, %r12), %rax\n\
+             \x20   movzbl %al, %eax\n";
+        let mut asm = input.to_string();
+        let _ = eliminate_redundant_zero_extend(&mut asm);
+        // The trailing movzbl must survive: %rax holds an opaque load result.
+        assert!(asm.contains("movzbl %al, %eax"), "asm was:\n{asm}");
+        assert!(asm.contains("movq (%rcx, %r12), %rax"), "asm was:\n{asm}");
     }
 }

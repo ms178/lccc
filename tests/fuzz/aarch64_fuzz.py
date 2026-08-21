@@ -154,7 +154,13 @@ def main() -> int:
         for seed in range(lo, hi):
             src = gen(seed)
             (out / "t.c").write_text(src)
-            common = ["-fno-PIE", "-w", "-fno-strict-aliasing", f"-{level}"]
+            # -ffp-contract=off: both compilers may legally contract a*b+c
+            # into fmadd differently (gcc defaults to -ffp-contract=fast);
+            # the differing roundings are standard-conforming, so a bitwise
+            # differential harness must pin contraction or it reports false
+            # positives on every FP scenario (was: 12 phantom mismatches at
+            # O2, scen 0/2 float-double kernels).
+            common = ["-fno-PIE", "-w", "-fno-strict-aliasing", "-ffp-contract=off", f"-{level}"]
             r1 = subprocess.run([args.ccc] + common + ["-c", str(out / "t.c"), "-o", str(out / "l.o")], capture_output=True)
             if r1.returncode:
                 mismatches.append(f"seed{seed}: lccc compile fail: {r1.stderr.decode()[:160]}")
