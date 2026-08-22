@@ -90,6 +90,13 @@ pub enum IntrinsicOp {
     /// args[0] = input float value; dest = |x|
     FabsF32,
     FabsF64,
+    /// C99 fma()/fmaf(): dest = args[0] * args[1] + args[2] with a SINGLE
+    /// rounding. Must lower to a hardware FMA instruction (vfmadd on x86);
+    /// splitting into Mul+Add would double-round and is a correctness bug,
+    /// not a performance choice (glibc's s_fma.c/s_fmaf.c via the ms178
+    /// math-use-builtins-fma.h are the canonical consumers).
+    FmaScalarF32,
+    FmaScalarF64,
     /// _Float128 fabs: clear sign bit 127 (inline bit ops, no libgcc call).
     F128Fabs,
     /// _Float128 negate: toggle sign bit 127 (NOT an integer negation).
@@ -1101,6 +1108,7 @@ impl IntrinsicOp {
             self,
             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
+            IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |

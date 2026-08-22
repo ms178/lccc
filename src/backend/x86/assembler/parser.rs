@@ -90,13 +90,29 @@ pub enum AsmItem {
         skip: u64,
         count: Option<u64>,
     },
-    /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`
-    Symver(String, String),
+    /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`,
+    /// optionally followed by a visibility argument:
+    /// `.symver name, name2@VERSION, {local|hidden|remove}` (GAS 2.35+).
+    Symver(String, String, Option<SymverFlag>),
     /// Code mode switch: `.code16`, `.code32`, `.code64`
     /// The value is the bit width (16, 32, or 64).
     CodeMode(u8),
     /// Blank line or comment-only line
     Empty,
+}
+
+/// Visibility argument of a three-operand `.symver` directive (GAS 2.35+).
+/// Semantics verified against binutils GAS on the plain-name symbol when the
+/// versioned alias is created:
+///   `local`  — the plain name is kept but demoted to STB_LOCAL,
+///   `hidden` — the plain name stays global with STV_HIDDEN visibility,
+///   `remove` — the plain name is removed from the symbol table entirely and
+///              intra-object references rebind to the versioned symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymverFlag {
+    Local,
+    Hidden,
+    Remove,
 }
 
 /// Section directive with optional flags and type.
@@ -989,16 +1005,37 @@ fn parse_set_directive(args: &str) -> Result<AsmItem, String> {
     ))
 }
 
-/// Parse `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`.
+/// Parse `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`,
+/// with an optional third visibility argument `local`, `hidden` or `remove`
+/// (GAS 2.35+; glibc's compat_symbol machinery generates the plain two-arg
+/// form, the Linux kernel and newer glibc use `remove`).
+///
+/// An unrecognized third argument is a hard error, exactly like GAS
+/// ("junk at end of line"): silently folding it into the version string
+/// previously produced garbage symbol names like `foo@VERS_1, remove`.
 fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
-    let parts: Vec<&str> = args.splitn(2, ',').collect();
-    if parts.len() != 2 {
+    let parts: Vec<&str> = args.split(',').collect();
+    if parts.len() < 2 || parts.len() > 3 {
         return Err(format!("bad .symver directive: {}", args));
     }
-    Ok(AsmItem::Symver(
-        parts[0].trim().to_string(),
-        parts[1].trim().to_string(),
-    ))
+    let name = parts[0].trim();
+    let ver = parts[1].trim();
+    if name.is_empty() || ver.is_empty() {
+        return Err(format!("bad .symver directive: {}", args));
+    }
+    let flag = match parts.get(2).map(|s| s.trim()) {
+        None => None,
+        Some("local") => Some(SymverFlag::Local),
+        Some("hidden") => Some(SymverFlag::Hidden),
+        Some("remove") => Some(SymverFlag::Remove),
+        Some(other) => {
+            return Err(format!(
+                ".symver: invalid visibility argument '{}' (expected local, hidden or remove): {}",
+                other, args
+            ));
+        }
+    };
+    Ok(AsmItem::Symver(name.to_string(), ver.to_string(), flag))
 }
 
 /// Does this line start with an instruction prefix followed by a mnemonic?

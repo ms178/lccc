@@ -620,6 +620,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MaxPs128
             | BuiltinIntrinsic::X86MinPs128
             | BuiltinIntrinsic::X86ShufPsValue
+            | BuiltinIntrinsic::X86CvtPd2PsValue
             | BuiltinIntrinsic::X86Vextractf128V
             | BuiltinIntrinsic::X86MaxPs256V
             | BuiltinIntrinsic::X86MinPs256V
@@ -1677,6 +1678,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         // deref); the imm8 rides as the last argument, which is exactly the
         // (a, b, imm) shape the ShufPs128 backend op consumes.
         BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128Value,
+        // __builtin_ia32_cvtpd2ps returns v4sf BY VALUE (raw GCC builtin).
+        BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128Value,
         // vextractf128_ps256 returns a 16-byte vector BY VALUE from a ymm arg.
         BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128Value,
         // 256-bit raw builtins: v8sf is pointer/sret convention everywhere,
@@ -1700,6 +1703,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pause => IntrinsicOp::Pause,
         BuiltinIntrinsic::X86Vzeroupper => IntrinsicOp::Vzeroupper,
         BuiltinIntrinsic::X86ShufPsValue => IntrinsicOp::ShufPs128,
+        BuiltinIntrinsic::X86CvtPd2PsValue => IntrinsicOp::CvtPd2Ps128,
         BuiltinIntrinsic::X86Vextractf128V => IntrinsicOp::Vextractf128,
         BuiltinIntrinsic::X86MaxPs256V => IntrinsicOp::MaxPs256,
         BuiltinIntrinsic::X86MinPs256V => IntrinsicOp::MinPs256,

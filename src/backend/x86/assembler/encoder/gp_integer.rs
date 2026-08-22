@@ -1228,6 +1228,61 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// GNU as's shift/rotate immediate acceptance, derived empirically
+    /// against binutils 2.4x (insndiff FALSE-ACCEPT / REJECTS-VALID oracle):
+    ///   * 0..=255 is accepted everywhere (raw unsigned imm8 field);
+    ///   * -128..=-1 is additionally accepted when the immediate fits the
+    ///     DESTINATION width as signed — i.e. for every 8-bit-operand form
+    ///     (`shlb $-1, %al` is fine) — and for rol/ror at ALL widths (their
+    ///     binutils template carries Imm8S; a negative rotate is meaningful
+    ///     modulo the width);
+    ///   * everything else is "operand type mismatch".
+    /// Silently truncating an out-of-range count would encode an
+    /// instruction the programmer did not write.
+    fn check_shift_imm(mnemonic: &str, size: u8, count: i64) -> Result<(), String> {
+        // 8-bit operand forms: GNU as accepts ANY immediate and masks it to
+        // the low byte (silent inside -128..=255, warn-and-truncate outside
+        // — but never a hard error). Byte destinations therefore skip the
+        // range check entirely; the caller's `as u8` performs the same
+        // wrap GAS encodes.
+        if size == 1 {
+            return Ok(());
+        }
+        if mnemonic.starts_with("rol") || mnemonic.starts_with("ror") {
+            // rol/ror carry Imm8S. GAS's acceptance windows, probed
+            // empirically against binutils 2.4x:
+            //   * the raw value -128..=255, and
+            //   * the top unsigned band of the OPERAND width,
+            //     2^bits-128 ..= 2^bits-1 (`rolw $65535` is -1 in 16-bit
+            //     unsigned clothing; `rolw $65407` = -129 is refused, and
+            //     values whose low bits merely COLLAPSE into range, like
+            //     $-2^31 at 16-bit, are refused too — GAS does not mask).
+            // 64-bit operands need no extra band: 2^64-128.. wraps negative
+            // in the i64 the parser produced.
+            let in_basic = (-128..=255).contains(&count);
+            let in_top_band = size < 8 && {
+                let bits = (size as u32) * 8;
+                let top = 1i64 << bits;
+                count >= top - 128 && count < top
+            };
+            if !in_basic && !in_top_band {
+                return Err(format!(
+                    "operand type mismatch for `{}' (count {})",
+                    mnemonic, count
+                ));
+            }
+            return Ok(());
+        }
+        // shl/shr/sal/sar/rcl/rcr at 16/32/64-bit widths: unsigned imm8 only.
+        if !(0..=255).contains(&count) {
+            return Err(format!(
+                "operand type mismatch for `{}' (count {} outside 0..=255)",
+                mnemonic, count
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode_shift(
         &mut self,
         ops: &[Operand],
@@ -1268,6 +1323,7 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Immediate(ImmediateValue::Integer(count)), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                Self::check_shift_imm(mnemonic, size as u8, *count)?;
                 let count = *count as u8;
 
                 if size == 2 {
@@ -1286,6 +1342,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(count)), Operand::Memory(mem)) => {
+                Self::check_shift_imm(mnemonic, size as u8, *count)?;
                 let count = *count as u8;
                 if size == 2 {
                     self.bytes.push(0x66);

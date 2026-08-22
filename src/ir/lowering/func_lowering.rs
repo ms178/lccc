@@ -34,7 +34,38 @@ impl Lowerer {
     /// 6. Finalize (implicit return, emit IrFunction)
     pub(super) fn lower_function(&mut self, func: &FunctionDef) {
         if self.defined_functions.contains(&func.name) {
-            return;
+            // GNU89 extern-inline redefinition: an `extern __inline` body
+            // (gnu89 mode or __attribute__((gnu_inline))) does NOT provide
+            // the external definition, and GCC explicitly permits a later
+            // plain definition of the same name in the same TU — that one
+            // becomes THE external definition. glibc's libio/feof_u.c is
+            // exactly this shape: include/stdio.h provides __extern_inline
+            // __feof_unlocked, feof_u.c provides the out-of-line definition
+            // plus weak_alias(feof_unlocked). The weak alias makes the name
+            // "referenced", so the inline husk is lowered first; first-wins
+            // then silently DROPPED the real definition and feof_u.o was
+            // empty (ldconfig: undefined reference to feof_unlocked).
+            //
+            // Replace the husk with the real definition. The plain body is
+            // authoritative for both emission and inlining from here on.
+            let new_is_extern_def = !self.is_gnu_inline_no_extern_def(&func.attrs);
+            let emitted_name = self
+                .asm_label_map
+                .get(&func.name)
+                .cloned()
+                .unwrap_or_else(|| func.name.clone());
+            let husk_idx = self.module.functions.iter().position(|f| {
+                f.name == emitted_name && f.is_gnu_inline_def && !f.is_declaration
+            });
+            match husk_idx {
+                Some(i) if new_is_extern_def => {
+                    self.module.functions.remove(i);
+                }
+                // Plain duplicate definition (a frontend diagnostic case) or
+                // an extern-inline body FOLLOWING the real definition (GCC
+                // errors on that shape): keep the first definition.
+                _ => return,
+            }
         }
         self.defined_functions.insert(func.name.clone());
 

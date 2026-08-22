@@ -54,6 +54,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_fabsf", BuiltinInfo::simple("fabsf"));
     m.insert("__builtin_fabsl", BuiltinInfo::simple("fabsl"));
     m.insert("__builtin_sqrt", BuiltinInfo::simple("sqrt"));
+    // C99 fused multiply-add: MUST reach the FmaScalar intrinsic for
+    // single-rounding semantics (glibc math-use-builtins-fma.h).
+    m.insert("__builtin_fma", BuiltinInfo::simple("fma"));
+    m.insert("__builtin_fmaf", BuiltinInfo::simple("fmaf"));
     m.insert("__builtin_sqrtl", BuiltinInfo::simple("sqrtl"));
     m.insert("__builtin_sqrtf", BuiltinInfo::simple("sqrtf"));
     m.insert("__builtin_sin", BuiltinInfo::simple("sin"));
@@ -1485,6 +1489,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_ia32_shufps",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86ShufPsValue),
+    );
+    // glibc sysdeps/x86/fpu/sincosf_poly.h: v4sf = __builtin_ia32_cvtpd2ps(v2df).
+    m.insert(
+        "__builtin_ia32_cvtpd2ps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86CvtPd2PsValue),
     );
     m.insert(
         "__builtin_shufflevector",
@@ -2987,6 +2996,7 @@ pub enum BuiltinIntrinsic {
     X86MaxPs128,      // __builtin_ia32_maxps (MAXPS) — GCC vector-extension builtin
     X86MinPs128,      // __builtin_ia32_minps (MINPS)
     X86ShufPsValue,   // __builtin_ia32_shufps (SHUFPS imm8) — by-value raw builtin
+    X86CvtPd2PsValue, // __builtin_ia32_cvtpd2ps (CVTPD2PS) — by-value raw builtin
     ShuffleVector,    // __builtin_shufflevector (4-lane 32-bit shuffles)
     X86MaxPs256V,     // __builtin_ia32_maxps256 (VMAXPS ymm)
     X86MinPs256V,     // __builtin_ia32_minps256 (VMINPS ymm)

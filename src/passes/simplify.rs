@@ -1968,6 +1968,17 @@ const BINARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     ("copysignl", IntrinsicOp::LDCopysign),
 ];
 
+/// Ternary math functions mapping to single-instruction intrinsics.
+/// fma/fmaf REQUIRE the fused form (single rounding, C99 F.10.10.1);
+/// converting the libcall is not just faster, it is what makes glibc's own
+/// s_fma.c/s_fmaf.c (built with math-use-builtins-fma.h) link at all.
+/// The x86-64 backend emits VEX FMA3 unconditionally at -O2 (project
+/// baseline is x86-64-v3), matching the existing mul+add fusion policy.
+const TERNARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
+    ("fma", IntrinsicOp::FmaScalarF64),
+    ("fmaf", IntrinsicOp::FmaScalarF32),
+];
+
 /// Create a float constant (F32 or F64) appropriate for the return type.
 fn float_const(return_type: IrType, val: f64) -> IrConst {
     if return_type == IrType::F32 {
@@ -1996,6 +2007,21 @@ fn simplify_math_call(
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {
             if args.len() != 1 {
+                return None;
+            }
+            return Some(Instruction::Intrinsic {
+                dest: Some(dest),
+                op: intrinsic_op,
+                dest_ptr: None,
+                args: args.to_vec(),
+            });
+        }
+    }
+
+    // Ternary intrinsic table (fma/fmaf -> single vfmadd, single rounding).
+    for &(name, intrinsic_op) in TERNARY_INTRINSICS {
+        if func == name {
+            if args.len() != 3 {
                 return None;
             }
             return Some(Instruction::Intrinsic {

@@ -570,8 +570,12 @@ impl Instruction {
             Instruction::Phi { ty, .. } => Some(*ty),
             Instruction::Select { ty, .. } => Some(*ty),
             Instruction::Intrinsic { op, .. } => match op {
-                IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32 => Some(IrType::F32),
-                IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64 => Some(IrType::F64),
+                IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32 | IntrinsicOp::FmaScalarF32 => {
+                    Some(IrType::F32)
+                }
+                IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64 | IntrinsicOp::FmaScalarF64 => {
+                    Some(IrType::F64)
+                }
                 _ => None,
             },
             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),
