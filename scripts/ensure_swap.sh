@@ -42,11 +42,17 @@ fi
 # mkswap is idempotent for our disposable file and refreshes a partially
 # created header after an interrupted harness turn.
 "${privilege[@]}" /sbin/mkswap "$swapfile" >/dev/null
-"${privilege[@]}" /sbin/swapon "$swapfile"
+if ! "${privilege[@]}" /sbin/swapon "$swapfile" 2>/tmp/lccc-swapon.err; then
+    # Some sandboxes (unprivileged containers, no CAP_SYS_ADMIN) refuse
+    # swapon even as root. The 8G file is still useful as a tmp spill
+    # target; do not fail the compiler build.
+    echo "warning: swapon $swapfile failed (continuing without swap): $(tr '\n' ' ' </tmp/lccc-swapon.err)" >&2
+    exit 0
+fi
 
 if ! /sbin/swapon --show | grep -Fq "$swapfile"; then
-    echo "error: failed to activate swap file $swapfile" >&2
-    exit 1
+    echo "warning: swap file $swapfile was not activated; continuing without swap" >&2
+    exit 0
 fi
 
 # Persist across VM reboots and keep the box biased toward reclaiming cold

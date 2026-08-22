@@ -205,6 +205,13 @@ impl Lowerer {
             return self.convert_to_f128(src, &inner_ctype);
         }
 
+        // Fold constant casts at lowering time so -O0 matches GCC
+        // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
+        // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
+        if let Some(c) = self.eval_const_cast(target_type, inner) {
+            return Operand::Const(c);
+        }
+
         let src = self.lower_expr(inner);
         let mut from_ty = self.get_expr_type(inner);
         let to_ty = self.type_spec_to_ir(target_type);
@@ -542,11 +549,24 @@ impl Lowerer {
 
     /// Compute the runtime sizeof for a type that may contain VLA dimensions.
     /// Handles both typedef names that are VLA types and direct Array types
-    /// with non-constant size expressions.
+    /// with non-constant size expressions. Also looks up struct/union tags
+    /// whose layout was recorded as a VLA at the type definition.
     fn compute_vla_sizeof_for_type(&mut self, ts: &TypeSpecifier) -> Option<Value> {
         // Check if it's a VLA typedef name with a pre-computed runtime size
         if let TypeSpecifier::TypedefName(name) = ts {
             if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
+                return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Struct(Some(tag), _, _, _, _) = ts {
+            let key = format!("struct.{}", tag);
+            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(&key) {
+                return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Union(Some(tag), _, _, _, _) = ts {
+            let key = format!("union.{}", tag);
+            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(&key) {
                 return Some(vla_size);
             }
         }

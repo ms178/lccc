@@ -4,15 +4,103 @@
 //! replacing the instruction with the computed constant. This eliminates
 //! redundant computation and enables further optimizations (DCE, etc.).
 
+use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::reexports::{
-    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand, Value,
+    GlobalInit, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand,
+    Value,
 };
 
 /// Run constant folding on the entire module.
 /// Returns the number of instructions folded.
 pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(fold_function)
+    let loads = fold_const_global_loads(module);
+    loads + module.for_each_function(fold_function)
+}
+
+/// Fold loads of `const` scalar globals into the initializer constant.
+///
+/// `const double one = 1.0; if ((int)one != 1) link_error();` (gcc.c-torture
+/// 20030216-1) requires the load of `one` to become F64(1.0) so the cast and
+/// compare fold and the undefined `link_error` is DCE'd. Only `is_const`
+/// scalars are folded: a non-const global may be stored from another TU.
+fn fold_const_global_loads(module: &mut IrModule) -> usize {
+    let mut consts: FxHashMap<String, IrConst> = FxHashMap::default();
+    for g in &module.globals {
+        if g.is_const && !g.is_thread_local {
+            if let GlobalInit::Scalar(c) = &g.init {
+                consts.insert(g.name.clone(), *c);
+            }
+        }
+    }
+    if consts.is_empty() {
+        return 0;
+    }
+
+    let mut total = 0;
+    for func in &mut module.functions {
+        if func.is_declaration || func.blocks.is_empty() {
+            continue;
+        }
+        let mut addr_map: FxHashMap<u32, IrConst> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GlobalAddr { dest, name } = inst {
+                    if let Some(&c) = consts.get(name) {
+                        addr_map.insert(dest.0, c);
+                    }
+                }
+            }
+        }
+        if addr_map.is_empty() {
+            continue;
+        }
+        // Propagate through Copy of a const-global address (GlobalAddr CSE
+        // rewrites later uses to Copies of the canonical dest).
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Copy {
+                        dest,
+                        src: Operand::Value(v),
+                    } = inst
+                    {
+                        if let Some(&c) = addr_map.get(&v.0) {
+                            if addr_map.insert(dest.0, c).is_none() {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Instruction::Load {
+                    dest,
+                    ptr,
+                    ty,
+                    volatile,
+                    ..
+                } = inst
+                {
+                    if *volatile {
+                        continue;
+                    }
+                    if let Some(&c) = addr_map.get(&ptr.0) {
+                        *inst = Instruction::Copy {
+                            dest: *dest,
+                            src: Operand::Const(c.coerce_to(*ty)),
+                        };
+                        total += 1;
+                    }
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Fold `strlen`/`__builtin_strlen` calls whose argument is a string-literal
@@ -775,11 +863,9 @@ fn try_fold_float_cast_mapped(
                 });
             }
             let val = as_f64_const_mapped(src, const_map)?;
-            // Don't fold if value can't be represented as i64
-            if !val.is_finite() || val < i64::MIN as f64 || val > i64::MAX as f64 {
-                return None;
-            }
-            IrConst::from_i64(val as i64, to_ty)
+            // GCC -fno-trapping-math saturates finite out-of-range values to
+            // the destination min/max. NaN/Inf stay unfolded (IEEE invalid).
+            IrConst::saturate_float_to_int(val, to_ty)?
         }
         (false, true) => {
             // int-to-float conversion
@@ -956,7 +1042,11 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
         }
         IrUnaryOp::Ctz => {
             if src == 0 {
-                if is_32bit { 32 } else { 64 }
+                if is_32bit {
+                    32
+                } else {
+                    64
+                }
             } else if is_32bit {
                 (src as u32).trailing_zeros() as i64
             } else {
@@ -1320,15 +1410,45 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_float_cast_overflow_to_int_no_fold() {
-        // 1e20 exceeds i32 range, should not fold
+    fn test_fold_float_cast_overflow_to_int_saturates() {
+        // 1e20 exceeds i32 range; GCC -fno-trapping-math saturates to INT_MAX.
         let inst = Instruction::Cast {
             dest: Value(0),
             src: Operand::Const(IrConst::F64(1e20)),
             from_ty: IrType::F64,
             to_ty: IrType::I32,
         };
-        assert!(try_fold(&inst).is_none());
+        let result = try_fold(&inst).unwrap();
+        match result {
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(v)),
+                ..
+            } => {
+                assert_eq!(v, i32::MAX);
+            }
+            other => panic!("Expected Copy with I32(INT_MAX), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fold_float_cast_two_to_the_31_saturates_to_int_max() {
+        // gcc.c-torture 20031003-1: (int)2147483648.0f == INT_MAX
+        let inst = Instruction::Cast {
+            dest: Value(0),
+            src: Operand::Const(IrConst::F32(2147483648.0)),
+            from_ty: IrType::F32,
+            to_ty: IrType::I32,
+        };
+        let result = try_fold(&inst).unwrap();
+        match result {
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(v)),
+                ..
+            } => {
+                assert_eq!(v, i32::MAX);
+            }
+            other => panic!("Expected Copy with I32(INT_MAX), got {:?}", other),
+        }
     }
 
     #[test]

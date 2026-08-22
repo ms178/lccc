@@ -8,7 +8,7 @@
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
 use super::lower::Lowerer;
-use crate::common::types::{AddressSpace, CType, IrType};
+use crate::common::types::{target_is_32bit, AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::Expr;
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
@@ -25,8 +25,58 @@ impl Lowerer {
         }
     }
 
+    /// Expand `abs`/`labs`/`llabs` (and the `__builtin_*` spellings) to
+    /// `select(x < 0, -x, x)`. Matches GCC `-fbuiltin`: a later user
+    /// definition of the same name does not intercept the call.
+    fn try_lower_abs_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        let ty = match name {
+            "abs" | "__builtin_abs" => IrType::I32,
+            "labs" | "__builtin_labs" => {
+                if target_is_32bit() {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
+            }
+            "llabs" | "__builtin_llabs" => IrType::I64,
+            _ => return None,
+        };
+        if args.is_empty() {
+            return Some(Operand::Const(IrConst::from_i64(0, ty)));
+        }
+        let arg = self.lower_expr_with_type(&args[0], ty);
+        let zero = Operand::Const(IrConst::from_i64(0, ty));
+        let is_neg = self.emit_cmp_val(IrCmpOp::Slt, arg, zero, ty);
+        let neg = self.fresh_value();
+        self.emit(Instruction::UnaryOp {
+            dest: neg,
+            op: IrUnaryOp::Neg,
+            src: arg,
+            ty,
+        });
+        let result = self.fresh_value();
+        self.emit(Instruction::Select {
+            dest: result,
+            cond: Operand::Value(is_neg),
+            true_val: Operand::Value(neg),
+            false_val: arg,
+            ty,
+        });
+        Some(Operand::Value(result))
+    }
+
     /// Try to lower a __builtin_* call. Returns Some(result) if handled.
     pub(super) fn try_lower_builtin_call(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        // GCC -fbuiltin (the default) expands abs/labs/llabs as the corresponding
+        // integer absolute-value even when the user later provides a definition
+        // of the same name. The user body is still emitted (so taking the
+        // address of llabs works) but CALLS use the builtin. gcc.c-torture
+        // 20021127-1 defines `llabs` to abort() and requires the builtin.
+        // This must run BEFORE the is_defined override below.
+        if let Some(result) = self.try_lower_abs_builtin(name, args) {
+            return Some(result);
+        }
+
         // If the user has defined a function body with a builtin name, prefer the
         // user's definition over the builtin. This matches GCC's behavior: a user
         // can define `double *__builtin_alloca() { return malloc(...); }` and GCC

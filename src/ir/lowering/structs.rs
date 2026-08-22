@@ -33,6 +33,16 @@ impl Lowerer {
                 if tag.is_some() {
                     self.invalidate_ctype_cache_scoped(&key);
                 }
+                // Record runtime sizeof for structs with VLA members so
+                // sizeof(struct s) / sizeof(typedef_of_s) is not a compile-time
+                // constant. Bound expressions are evaluated here, at the type
+                // definition, matching C99/GCC (later stores to `n` are ignored).
+                if self.func_state.is_some() {
+                    if let Some(vla_size) = self.compute_vla_size_from_type_spec(ts) {
+                        self.func_mut()
+                            .insert_vla_typedef_size_scoped(key, vla_size);
+                    }
+                }
             }
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
                 // Recursively register nested struct/union types in fields
@@ -52,6 +62,12 @@ impl Lowerer {
                 self.insert_struct_layout_scoped(key.clone(), layout);
                 if tag.is_some() {
                     self.invalidate_ctype_cache_scoped(&key);
+                }
+                if self.func_state.is_some() {
+                    if let Some(vla_size) = self.compute_vla_size_from_type_spec(ts) {
+                        self.func_mut()
+                            .insert_vla_typedef_size_scoped(key, vla_size);
+                    }
                 }
             }
             _ => {}
