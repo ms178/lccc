@@ -97,6 +97,23 @@ pub enum IntrinsicOp {
     /// math-use-builtins-fma.h are the canonical consumers).
     FmaScalarF32,
     FmaScalarF64,
+    /// SSE4.1/AVX scalar directed rounding, payload = the ROUNDSS/ROUNDSD
+    /// imm8 (GCC-verified at -O2 -march=x86-64-v3):
+    ///   floor = 9, ceil = 10, trunc = 11,
+    ///   rint = 4 (dynamic MXCSR mode, inexact ALLOWED — C99 rint),
+    ///   nearbyint = 12 (dynamic mode, inexact SUPPRESSED — C99 nearbyint),
+    ///   roundeven = 8 (ties-to-even, inexact suppressed — C23 roundeven).
+    /// Inline expansion is a CORRECTNESS requirement for glibc self-hosting:
+    /// its generic s_floor.c/s_trunc.c/... define floor() AS __builtin_floor
+    /// under USE_*_BUILTIN, so lowering to a libm call recurses into the
+    /// function being compiled.
+    RoundScalarF32(u8),
+    RoundScalarF64(u8),
+    /// copysign(x, y)/copysignf: magnitude of x with the sign bit of y,
+    /// pure SSE bit ops (and/andn/or) — never a libm call (glibc's
+    /// s_copysign.c defines copysign() AS __builtin_copysign).
+    CopysignF32,
+    CopysignF64,
     /// _Float128 fabs: clear sign bit 127 (inline bit ops, no libgcc call).
     F128Fabs,
     /// _Float128 negate: toggle sign bit 127 (NOT an integer negation).
@@ -1109,6 +1126,8 @@ impl IntrinsicOp {
             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
             IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF64 |
+            IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_) |
+            IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |

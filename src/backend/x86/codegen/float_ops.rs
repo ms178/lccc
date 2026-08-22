@@ -293,6 +293,88 @@ impl X86Codegen {
         }
     }
 
+    /// Scalar directed rounding (vroundsd/vroundss imm). VEX 3-operand form
+    /// to stay in the VEX domain with the vmul/vadd/vsqrt paths (no
+    /// SSE/VEX transition stalls). Computes straight into an XMM-allocated
+    /// destination when there is one, mirroring emit_fp_scalar_unary.
+    pub(super) fn emit_fp_scalar_round(
+        &mut self,
+        dest: &Option<Value>,
+        arg: &Operand,
+        ty: IrType,
+        imm: u8,
+    ) {
+        let inst = if ty == IrType::F32 { "vroundss" } else { "vroundsd" };
+        if let Some(d) = dest {
+            if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                if is_xmm_reg(reg) {
+                    let dname = phys_reg_name(reg);
+                    self.load_fp_to_reg(arg, ty, dname);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}, %{}",
+                        inst, imm, dname, dname, dname
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+        self.load_fp_to_xmm0(arg, ty);
+        self.state.emit_fmt(format_args!(
+            "    {} ${}, %xmm0, %xmm0, %xmm0",
+            inst, imm
+        ));
+        if let Some(d) = dest {
+            self.store_xmm0_fp_dest(d, ty);
+        }
+    }
+
+    /// copysign(x, y): |x| bits OR'd with y's sign bit — three VEX bit ops
+    /// against rodata masks, no branches, no libm call. The libm call is not
+    /// merely slow: inside glibc's own s_copysign.c it recurses.
+    pub(super) fn emit_fp_copysign(
+        &mut self,
+        dest: &Option<Value>,
+        x: &Operand,
+        y: &Operand,
+        ty: IrType,
+    ) {
+        let (andp, orp, abs_mask, sign_mask) = if ty == IrType::F32 {
+            (
+                "vandps",
+                "vorps",
+                0x7FFF_FFFFu64,
+                0x8000_0000u64,
+            )
+        } else {
+            (
+                "vandpd",
+                "vorpd",
+                0x7FFF_FFFF_FFFF_FFFFu64,
+                0x8000_0000_0000_0000u64,
+            )
+        };
+        // y's sign into xmm1, |x| into xmm0, OR them.
+        self.load_fp_to_reg(y, ty, "xmm1");
+        self.load_fp_to_xmm0(x, ty);
+        let abs_label = self.state.get_fp_const_label(abs_mask);
+        let sign_label = self.state.get_fp_const_label(sign_mask);
+        self.state.emit_fmt(format_args!(
+            "    {} {}(%rip), %xmm1, %xmm1",
+            andp, sign_label
+        ));
+        self.state.emit_fmt(format_args!(
+            "    {} {}(%rip), %xmm0, %xmm0",
+            andp, abs_label
+        ));
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", orp));
+        if let Some(d) = dest {
+            self.store_xmm0_fp_dest(d, ty);
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
     pub(super) fn emit_float_binop_impl(
         &mut self,
         dest: &Value,

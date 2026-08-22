@@ -112,7 +112,8 @@ pub use mapfile::{build_link_map, LinkMap, MapArchiveMember, MapSectionContribut
 
 // symbols.rs
 pub use symbols::{
-    is_linker_defined_symbol, is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+    is_layout_anchor_symbol, is_linker_defined_symbol, is_valid_c_identifier_for_section,
+    resolve_start_stop_symbols,
     GlobalSymbolOps, InputSection, OutputSection,
 };
 

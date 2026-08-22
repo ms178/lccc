@@ -75,6 +75,14 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_floorf", BuiltinInfo::simple("floorf"));
     m.insert("__builtin_ceil", BuiltinInfo::simple("ceil"));
     m.insert("__builtin_ceilf", BuiltinInfo::simple("ceilf"));
+    m.insert("__builtin_trunc", BuiltinInfo::simple("trunc"));
+    m.insert("__builtin_truncf", BuiltinInfo::simple("truncf"));
+    m.insert("__builtin_rint", BuiltinInfo::simple("rint"));
+    m.insert("__builtin_rintf", BuiltinInfo::simple("rintf"));
+    m.insert("__builtin_nearbyint", BuiltinInfo::simple("nearbyint"));
+    m.insert("__builtin_nearbyintf", BuiltinInfo::simple("nearbyintf"));
+    m.insert("__builtin_roundeven", BuiltinInfo::simple("roundeven"));
+    m.insert("__builtin_roundevenf", BuiltinInfo::simple("roundevenf"));
     m.insert("__builtin_round", BuiltinInfo::simple("round"));
     m.insert("__builtin_roundf", BuiltinInfo::simple("roundf"));
     m.insert("__builtin_fmin", BuiltinInfo::simple("fmin"));

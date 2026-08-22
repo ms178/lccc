@@ -2587,16 +2587,27 @@ impl X86Codegen {
                 unreachable!("segment-prefixed op called with default address space")
             }
         };
+        // Operand-ordering hazard: %rdx/%rcx scratch bounces can CLOBBER the
+        // other operand's register home before it is read. glibc's
+        // __tls_init_tp hit exactly this: THREAD_SETMEM's fs-offset constant
+        // (v = Copy(Const 1296)) was register-allocated to %rdx, the old
+        // sequence moved the stored VALUE into %rdx first, and the store
+        // then went through the value-as-address (*fs:&robust_head = ...)
+        // — startup SIGSEGV for every external binary (LK-24). Saving the
+        // value on the stack makes the sequence correct for EVERY possible
+        // home assignment of val and ptr, including rax/rcx/rdx themselves.
         self.operand_to_rax(val);
-        self.state.emit("    movq %rax, %rdx");
+        self.state.emit("    pushq %rax");
         self.operand_to_rax(&Operand::Value(*ptr));
         self.state.emit("    movq %rax, %rcx");
+        self.state.emit("    popq %rax");
         let store_instr = Self::mov_store_for_type(ty);
-        let store_reg = Self::reg_for_type("rdx", ty);
+        let store_reg = Self::reg_for_type("rax", ty);
         self.state.emit_fmt(format_args!(
             "    {} %{}, {}(%rcx)",
             store_instr, store_reg, seg_prefix
         ));
+        self.state.reg_cache.invalidate_acc();
     }
 
     pub(super) fn emit_seg_store_symbol_impl(

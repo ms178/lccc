@@ -199,6 +199,16 @@ pub(super) fn emit_shared_library(
                 if sym.is_local() {
                     continue;
                 }
+                // Layout-anchor symbols (__ehdr_start, _DYNAMIC, _end, ...)
+                // are link-time constants the linker itself defines during
+                // layout; they are UNDEFINED at this collection point, which
+                // previously classified them "external" and gave them PLT
+                // slots + JUMP_SLOT relocations. glibc ld.so then computed
+                // its own load base from an unrelocated GOT slot and crashed
+                // in _dl_start before the first LD_DEBUG line (LK-24).
+                if linker_common::is_layout_anchor_symbol(&sym.name) {
+                    continue;
+                }
                 match rela.rela_type {
                     R_X86_64_PLT32 | R_X86_64_PC32 => {
                         if let Some(gsym) = globals.get(sym.name.as_str()) {
@@ -479,6 +489,18 @@ pub(super) fn emit_shared_library(
             sym_versions.push((name.clone(), None, false));
         }
     }
+    // GNU ld emits a Verdef node for EVERY named node of the version script,
+    // whether or not a symbol currently binds to it. glibc depends on this:
+    // /bin/echo's verneed asks libc.so.6 for GLIBC_2.34/GLIBC_2.14/... and
+    // ld.so answers from the Verdef table alone — a missing node is a fatal
+    // "version `GLIBC_2.34' not found" even if no exported symbol uses it.
+    if let Some(vs) = version_script.as_ref() {
+        for node in &vs.nodes {
+            if !node.name.is_empty() && !version_set.contains(&node.name) {
+                version_set.push(node.name.clone());
+            }
+        }
+    }
     // Version node names must be in .dynstr BEFORE dynstr_size is computed.
     for v in &version_set {
         dynstr.add(v);
@@ -657,7 +679,13 @@ pub(super) fn emit_shared_library(
         push_verdef_entry(&mut verdef, 1, &base_version_name, base_off, 28);
         for (i, v) in version_set.iter().enumerate() {
             let voff = dynstr.get_offset(v);
-            push_verdef_entry(&mut verdef, (2 + i) as u16, v, voff, 0);
+            // vd_next chains EVERY node (28 = Verdef 20B + one Verdaux 8B);
+            // only the final node terminates with 0. The old unconditional 0
+            // ended the chain at the second entry: VERDEFNUM said 27 but
+            // ld.so's version lookup walked 2, and every binary needing
+            // GLIBC_2.3/2.14/2.34/... aborted with "version not found".
+            let next = if i + 1 == version_set.len() { 0 } else { 28 };
+            push_verdef_entry(&mut verdef, (2 + i) as u16, v, voff, next);
         }
         (versym, verdef, 1 + version_set.len() as u64)
     } else if script_nodes.len() > 1 {
@@ -1182,7 +1210,19 @@ pub(super) fn emit_shared_library(
     w16(&mut out, 16, ET_DYN); // Shared object
     w16(&mut out, 18, EM_X86_64);
     w32(&mut out, 20, 1);
-    w64(&mut out, 24, 0); // e_entry = 0 for shared libraries
+    // e_entry: GNU ld sets the entry point for ET_DYN outputs too — to the
+    // `-e` symbol if given, else to `_start` when the output defines it,
+    // else 0. glibc's ld.so DEPENDS on this: it is linked `-shared` with no
+    // `-e`, defines `_start` (RTLD_START in rtld.c), and is EXECUTED
+    // directly (`./ld.so --library-path ... prog`); the kernel jumps to
+    // e_entry, so a hardcoded 0 made the kernel execute the ELF header
+    // bytes at the map base (SIGSEGV before any LD_DEBUG output).
+    let e_entry = globals
+        .get("_start")
+        .filter(|s| s.defined_in.is_some())
+        .map(|s| s.value)
+        .unwrap_or(0);
+    w64(&mut out, 24, e_entry);
     w64(&mut out, 32, 64); // e_phoff
     w64(&mut out, 40, 0); // e_shoff = 0 (no section headers for now)
     w32(&mut out, 48, 0);

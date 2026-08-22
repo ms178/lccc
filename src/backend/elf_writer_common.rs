@@ -312,7 +312,7 @@ const MAX_NOP: usize = NOP_PATTERNS.len();
 /// exceeds EIGHT max-size NOPs (count/11 > 8 — an 88-byte pad is still all
 /// NOPs, 99 bytes becomes `jmp` + NOPs), where a predicted-taken branch
 /// clearly beats decoding more NOP µops.
-const MAX_NOP_RUN: usize = 8;
+const MAX_NOP_RUN: usize = 7; // GAS 2.47: jump-over at count/11 > 7 (2.44 used > 8)
 
 /// Build `count` bytes of executable padding.
 ///
@@ -357,12 +357,18 @@ pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
         }
     }
 
+    // GAS 2.47 NOP layout (binutils flipped this relative to 2.44): the
+    // REMAINDER-size NOP comes FIRST, followed by the run of max-size
+    // (11-byte `66 66 2e 0f 1f 84 00 ...`) NOPs. Byte-count and
+    // instruction-count are identical either way — this is pure oracle
+    // parity with the only binutils generation we certify against (2.47).
+    if count % MAX_NOP != 0 {
+        out.extend_from_slice(NOP_PATTERNS[count % MAX_NOP - 1]);
+        count -= count % MAX_NOP;
+    }
     while count >= MAX_NOP {
         out.extend_from_slice(NOP_PATTERNS[MAX_NOP - 1]);
         count -= MAX_NOP;
-    }
-    if count != 0 {
-        out.extend_from_slice(NOP_PATTERNS[count - 1]);
     }
     out
 }

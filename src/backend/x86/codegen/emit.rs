@@ -2934,7 +2934,17 @@ impl X86Codegen {
             if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
                 self.operand_to_rax(lhs);
                 let mnemonic = alu_mnemonic(op);
-                if use_32bit && matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+                // The l-form is REQUIRED (not just preferred) when the
+                // immediate only exists as a 32-bit bit pattern
+                // (i32::MAX < imm <= u32::MAX): the q-form sign-extends its
+                // imm32, so `xorq $0x80000000` is unencodable — the old
+                // assembler silently turned it into XOR with
+                // 0xFFFFFFFF80000000 (wrong 33 bits). After the l-form the
+                // canonical 64-bit slot value is restored exactly like the
+                // Add/Sub path: cltq for signed, implicit zero-extension for
+                // unsigned.
+                let needs_l_form = imm > i32::MAX as i64;
+                if use_32bit && (matches!(op, IrBinOp::Add | IrBinOp::Sub) || needs_l_form) {
                     self.state
                         .emit_fmt(format_args!("    {}l ${}, %eax", mnemonic, imm));
                     if !is_unsigned {
