@@ -809,6 +809,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_never_read_store_eliminated_in_six_push_nofp_function() {
+        // No-FP functions push rbp as an ordinary callee-saved register, so
+        // the `subq $N,%rsp` prologue marker is separated from the .cfi
+        // directives by the whole push chain.  The old form-1 failure path
+        // skipped past the subq and the form-2 window missed the directives,
+        // disabling dead-store elimination for such functions entirely
+        // (gzip CRC kernel: a never-read `movq %rax, 8(%rsp)` survived).
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    pushq %r14\n",
+            "    pushq %r15\n",
+            "    pushq %rbp\n",
+            "    subq $24, %rsp\n",
+            ".cfi_def_cfa_offset 80\n",
+            "    movabsq $4294967295, %r13\n",
+            ".L1:\n",
+            "    movl (%rsi), %eax\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    addl %eax, %r13d\n",
+            "    jmp .L1\n",
+            ".Lend:\n",
+            "    addq $24, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %r15\n",
+            "    popq %r14\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size main, .-main\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rax, 8(%rsp)"),
+            "never-read slot store must be eliminated:\n{result}"
+        );
+    }
+
+    #[test]
     fn test_cfg_retargets_accumulator_update_copyback() {
         let asm = concat!(
             "f:\n",
