@@ -449,6 +449,36 @@ impl Driver {
                     println!(".");
                     return Ok(true);
                 }
+                _ if arg.starts_with("-print-prog-name=")
+                    || arg.starts_with("--print-prog-name=") =>
+                {
+                    // GCC query returning the path of a helper program.
+                    // glibc's configure derives LD from `$CC -print-prog-name=ld`
+                    // and then requires `$LD --version` to advertise GNU ld;
+                    // without this answer LD ends up empty and configure aborts
+                    // with "These critical programs are missing: GNU ld".
+                    //
+                    // The linker programs resolve to the sibling lccc-ld binary
+                    // (which advertises "GNU ld (LCCC built-in)"). Everything
+                    // else follows GCC's not-found behaviour: print the plain
+                    // name unchanged.
+                    let name = arg.trim_start_matches('-');
+                    let name = name.strip_prefix("print-prog-name=").unwrap_or(name);
+                    match name {
+                        "ld" | "ld.bfd" | "collect2" => {
+                            let sibling = std::env::current_exe()
+                                .ok()
+                                .and_then(|p| p.parent().map(|d| d.join("lccc-ld")))
+                                .filter(|p| p.exists());
+                            match sibling {
+                                Some(p) => println!("{}", p.display()),
+                                None => println!("lccc-ld"),
+                            }
+                        }
+                        other => println!("{}", other),
+                    }
+                    return Ok(true);
+                }
                 "-print-search-dirs" | "--print-search-dirs" => {
                     println!("install: /usr/lib/gcc/{}/13/", target.triple());
                     println!("programs: /usr/bin/");
@@ -1353,10 +1383,22 @@ impl Driver {
                     self.pic = false;
                     self.pie = false;
                 }
-                "-fcf-protection=branch" | "-fcf-protection=full" => {
-                    self.cf_protection_branch = true
+                "-fcf-protection=branch" => {
+                    self.cf_protection_branch = true;
+                    self.cf_protection_value = Some("1");
                 }
-                "-fcf-protection=none" => self.cf_protection_branch = false,
+                "-fcf-protection=full" | "-fcf-protection" => {
+                    self.cf_protection_branch = true;
+                    self.cf_protection_value = Some("3");
+                }
+                "-fcf-protection=return" => {
+                    self.cf_protection_branch = false;
+                    self.cf_protection_value = Some("2");
+                }
+                "-fcf-protection=none" => {
+                    self.cf_protection_branch = false;
+                    self.cf_protection_value = None;
+                }
                 arg if arg.starts_with("-fpatchable-function-entry=") => {
                     let val = &arg["-fpatchable-function-entry=".len()..];
                     let parts: Vec<&str> = val.split(',').collect();

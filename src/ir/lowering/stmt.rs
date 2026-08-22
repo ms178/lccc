@@ -223,6 +223,10 @@ impl Lowerer {
                     .insert(declarator.name.clone(), fti);
             }
             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
+            crate::common::type_builder::apply_declaration_address_space(
+                &mut resolved_ctype,
+                decl.address_space,
+            );
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
             }
@@ -352,6 +356,13 @@ impl Lowerer {
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
         local_info.var.address_space = decl.address_space;
+        // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the
+        // space the pointer points into), not just on the variable slot.
+        // Without this, `*p` resolves AddressSpace::Default through
+        // get_expr_ctype and the segment prefix is silently dropped.
+        if let Some(ref mut ct) = local_info.var.c_type {
+            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
+        }
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
         }
@@ -1327,7 +1338,26 @@ impl Lowerer {
         }
         match stmt {
             Stmt::Return(expr, _span) => {
-                let op = expr.as_ref().map(|e| self.lower_return_expr(e));
+                // GNU C: `return void_expr;` in a void function (accepted by
+                // sema for GCC compatibility — glibc `return helper();`
+                // shims). The expression is evaluated for side effects only;
+                // the Return itself must carry no operand, otherwise it
+                // references the "result" of a void call that no instruction
+                // defines (malloc.c __libc_free ICE: Return(Some(v59)) with
+                // v59 undefined).
+                let func_returns_void = self
+                    .func_state
+                    .as_ref()
+                    .map(|fs| fs.return_type == IrType::Void)
+                    .unwrap_or(false);
+                let op = if func_returns_void {
+                    if let Some(e) = expr.as_ref() {
+                        self.lower_expr_discard(e);
+                    }
+                    None
+                } else {
+                    expr.as_ref().map(|e| self.lower_return_expr(e))
+                };
                 // Emit cleanup calls for all active scopes before returning
                 let all_cleanups = self.collect_all_scope_cleanup_vars();
                 self.emit_cleanup_calls(&all_cleanups);

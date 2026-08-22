@@ -213,7 +213,8 @@ pub(super) fn emit_shared_library(
                             // exported), version-script-locals, or -Bsymbolic.
                             let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
                             let version_local = version_script.as_ref().is_some_and(|vs| {
-                                vs.any_local_star() && !vs.matches_global(&sym.name)
+                                vs.any_local_star()
+                                    && !vs.matches_global(&sym_base(&sym.name))
                             }) || excluded_syms.contains(sym.name.as_str());
                             let is_func = (gsym.info & 0xf) == STT_FUNC
                                 || sym.sym_type() == STT_FUNC
@@ -396,7 +397,14 @@ pub(super) fn emit_shared_library(
             // FFmpeg-style DSOs expose the intended ABI and produce versioned
             // dynamic symbols for consumers like mpv.
             if let Some(ref vs) = version_script {
-                if vs.any_local_star() && !vs.matches_global(name) {
+                // .symver-derived globals are keyed "base@@VER"/"base@VER";
+                // the script's patterns name the BASE. Matching the composed
+                // string dropped every explicitly-versioned export: glibc's
+                // libc.so lost fdopen/fopen/... (defined as
+                // _IO_new_fdopen + `.symver fdopen@@GLIBC_2.2.5`) and
+                // sotruss-lib.so failed with `undefined reference to fdopen`
+                // even though the DSO was right there on the command line.
+                if vs.any_local_star() && !vs.matches_global(&sym_base(name)) {
                     return false;
                 }
             }
@@ -437,7 +445,7 @@ pub(super) fn emit_shared_library(
     for name in &abs64_sym_names {
         let is_version_local = version_script
             .as_ref()
-            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(name));
+            .is_some_and(|vs| vs.any_local_star() && !vs.matches_global(&sym_base(name)));
         if !is_version_local && dyn_sym_seen.insert(name.clone()) {
             dyn_sym_names.push(name.clone());
         }
@@ -619,11 +627,29 @@ pub(super) fn emit_shared_library(
         // The base node (1) carries the SONAME.
         let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
         versym.extend_from_slice(&0u16.to_le_bytes()); // dynsym[0]
-        for (_, ver, _) in &sym_versions {
-            let idx: u16 = match ver {
+        // Emit versym in dyn_sym_names' FINAL order. sym_versions was built
+        // before the undef-first reorder and the .gnu.hash bucket sort;
+        // iterating it here assigned version indices to the WRONG symbols
+        // once any reordering happened (glibc libc.so: every .symver export
+        // landed on versym 1 "*global*", so versioned references like
+        // fdopen@GLIBC_2.2.5 failed at load time). Re-derive each entry's
+        // version from its (still composed) name.
+        for name in &dyn_sym_names {
+            let (ver, hidden): (Option<&str>, bool) = if let Some(pos) = name.find("@@") {
+                (Some(&name[pos + 2..]), false)
+            } else if let Some(pos) = name.find('@') {
+                (Some(&name[pos + 1..]), true)
+            } else {
+                (None, false)
+            };
+            let mut idx: u16 = match ver {
                 Some(v) => 2 + version_set.iter().position(|x| x == v).unwrap_or(0) as u16,
                 None => 1,
             };
+            // "name@VER" (single @): non-default version — hidden bit set.
+            if hidden {
+                idx |= 0x8000;
+            }
             versym.extend_from_slice(&idx.to_le_bytes());
         }
         let mut verdef = Vec::new();

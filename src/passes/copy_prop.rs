@@ -792,6 +792,15 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
     let mut def_position: Vec<Option<(usize, usize)>> = vec![None; max_id + 1];
     let mut use_count = vec![0u32; max_id + 1];
     let mut use_positions: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_id + 1];
+    // Uses in *Value-typed* instruction fields (Load.ptr, Store.ptr, GEP.base,
+    // Memcpy dest/src, va_list pointers, InlineAsm output pointers, ...).
+    // These fields structurally CANNOT hold a constant, so a copy whose
+    // resolved source is a Const must never be removed while such a use
+    // exists: `replace_value_in_place` cannot rewrite it and the use dangles.
+    // glibc __libc_start_main_impl hit exactly this — `v = Copy(Const 16);
+    // Load %fs:(v)` (TLS stack-guard) lost its only def and the backend's
+    // no-home hard gate fired at the SegFs load.
+    let mut value_pos_uses = vec![0u32; max_id + 1];
     let mut copies: Vec<(usize, usize, Value, Operand)> = Vec::new(); // (bi, ii, dest, src)
 
     // Count definitions (single-def test) and uses.
@@ -836,6 +845,7 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
                         if (v.0 as usize) <= max_id {
                             use_count[v.0 as usize] += 1;
                             use_positions[v.0 as usize].push((bi, ii));
+                            value_pos_uses[v.0 as usize] += 1;
                         }
                     });
                 }
@@ -943,7 +953,6 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
     // RESOLVED source. Chained copies (d1=Copy(s1); d2=Copy(d1)) must resolve
     // d2's source to s1 — substituting the intermediate d1 would leave a
     // dangling reference once d1's own copy is removed.
-    let removed = to_remove.len();
     let resolved_src: Vec<Operand> = to_remove
         .iter()
         .map(|&(_, _, dest, src)| {
@@ -967,6 +976,25 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
             cur
         })
         .collect();
+    // Const-resolved removals must not orphan Value-position uses (Load.ptr,
+    // Store.ptr, GEP.base, ...): those fields cannot hold a constant, so
+    // `replace_value_in_place` would silently skip them and the removed copy's
+    // dest would dangle. This covers both direct `Copy(Const)` and chains that
+    // RESOLVE to a Const through other removed copies. Dropping an entry is
+    // always sound: its copy simply stays, and chains that resolved through it
+    // still substitute the same resolved value into their (operand) uses.
+    let (to_remove, resolved_src): (Vec<_>, Vec<_>) = to_remove
+        .into_iter()
+        .zip(resolved_src)
+        .filter(|((_, _, dest, _), rsrc)| {
+            !(matches!(rsrc, Operand::Const(_))
+                && value_pos_uses.get(dest.0 as usize).copied().unwrap_or(0) > 0)
+        })
+        .unzip();
+    if to_remove.is_empty() {
+        return 0;
+    }
+    let removed = to_remove.len();
     for (idx, (bi, ii, dest, _)) in to_remove.iter().enumerate() {
         // Replace uses of dest in block bi at indices > ii — INCLUDING the
         // block's terminator (a terminator use is recorded at (bi, usize::MAX),

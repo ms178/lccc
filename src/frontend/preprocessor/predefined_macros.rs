@@ -278,12 +278,10 @@ impl Preprocessor {
             ("__ELF__", "1"),
             // Note: __PIC__/__pic__ are conditionally defined via set_pic(),
             // not here, so they are only present when -fPIC is active.
-            // CET (Control-flow Enforcement Technology) - match GCC's default
-            // This is x86_64-only; removed for other targets in set_target().
-            // Value 3 = IBT (bit 0) + SHSTK (bit 1), matching GCC's default.
-            // Critical: must match the GCC that assembles .S files, because
-            // libffi's trampoline sizes depend on ENDBR_PRESENT which checks __CET__.
-            ("__CET__", "3"),
+            // __CET__ is NOT predefined here: GCC only defines it under an
+            // active -fcf-protection (see set_cet(), called from the driver
+            // with the parsed flag). Predefining it unconditionally broke
+            // glibc --disable-cet (undefined _dl_cet_* at the ld.so link).
             // SSE/MMX feature macros: SSE2 is baseline for x86_64.
             // Removed for non-x86_64 targets in set_target().
             // Many projects (dr_libs, minimp3, stb_image, etc.) use #ifdef __SSE2__
@@ -544,6 +542,23 @@ impl Preprocessor {
             self.define_simple_macro("__FAST_MATH__", "1");
         } else {
             self.macros.undefine("__FAST_MATH__");
+        }
+    }
+
+    /// Define or undefine __CET__ based on -fcf-protection.
+    ///
+    /// GCC defines `__CET__` ONLY when -fcf-protection is active (=1 branch,
+    /// =2 return, =3 full); `-fcf-protection=none` or absence leaves it
+    /// undefined. lccc used to predefine __CET__=3 unconditionally (for
+    /// libffi's ENDBR_PRESENT), which dragged CET-only code into builds that
+    /// disabled it: glibc --disable-cet compiles rtld WITHOUT dl-cet.c, but
+    /// sysdeps/x86_64/sysdep.h saw __CET__ and made dl_main call
+    /// _dl_cet_check/_dl_cet_setup_features — undefined symbols at the ld.so
+    /// link.
+    pub fn set_cet(&mut self, value: Option<&str>) {
+        match value {
+            Some(v) => self.define_simple_macro("__CET__", v),
+            None => self.macros.undefine("__CET__"),
         }
     }
 

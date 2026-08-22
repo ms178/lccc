@@ -201,7 +201,15 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
     });
 
     let dyn_syms = parse_shared_library_symbols(&data, path)?;
+    if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
+        eprintln!("[LD-SO] load path={} soname={} as_needed={} dynsyms={}",
+                  path, soname, as_needed, dyn_syms.len());
+    }
     let lib_needed = match_shared_library_dynsyms(&dyn_syms, &soname, globals);
+    if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
+        eprintln!("[LD-SO]   -> lib_needed={} (fdopen defined? {:?})", lib_needed,
+                  globals.get("fdopen").map(|g| (g.is_defined(), g.is_dynamic())));
+    }
 
     if (lib_needed || !as_needed) && !needed_sonames.contains(&soname) {
         needed_sonames.push(soname);

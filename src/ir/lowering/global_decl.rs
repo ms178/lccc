@@ -58,6 +58,12 @@ impl Lowerer {
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space = decl.address_space;
+            if let Some(ref mut ct) = ginfo.var.c_type {
+                crate::common::type_builder::apply_declaration_address_space(
+                    ct,
+                    decl.address_space,
+                );
+            }
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
@@ -94,6 +100,10 @@ impl Lowerer {
                 continue;
             }
             let mut resolved_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
+            crate::common::type_builder::apply_declaration_address_space(
+                &mut resolved_ctype,
+                decl.address_space,
+            );
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
             }
@@ -212,6 +222,12 @@ impl Lowerer {
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.address_space = decl.address_space;
+            if let Some(ref mut ct) = ginfo.var.c_type {
+                crate::common::type_builder::apply_declaration_address_space(
+                    ct,
+                    decl.address_space,
+                );
+            }
         self.globals.insert(declarator.name.clone(), ginfo);
         true
     }
@@ -229,6 +245,12 @@ impl Lowerer {
             }
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space = decl.address_space;
+            if let Some(ref mut ct) = ginfo.var.c_type {
+                crate::common::type_builder::apply_declaration_address_space(
+                    ct,
+                    decl.address_space,
+                );
+            }
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.
