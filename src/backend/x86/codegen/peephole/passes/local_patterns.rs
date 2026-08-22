@@ -1193,6 +1193,17 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 i += 1;
                 continue;
             }
+            // SOUNDNESS: the LEA dest must be FULLY absorbed by the address
+            // replacement. If the memory op still references the register
+            // OUTSIDE the replaced operand — e.g. as the store SOURCE in
+            // `leaq 1296(%rsi),%rdx; movq %rdx,(%rdx)` (glibc __tls_init_tp:
+            // pd->robust_head.list = &pd->robust_head, where GVN legally
+            // CSEs both GEPs into one value) — dropping the LEA leaves that
+            // use reading an unwritten register (LK-24 startup SIGSEGV).
+            if line_refs_gp_family(&replacement, dst_family) {
+                i += 1;
+                continue;
+            }
             mark_nop(&mut infos[i]);
             replace_line(store, &mut infos[j], j, format!("    {}", replacement));
             changed = true;
@@ -1279,7 +1290,10 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                             && !fam_read_after(store, infos, k + 1, dst_family)
                         {
                             let replacement = mem_next.replacen(&tmp_pat, &sib, 1);
-                            if replacement != mem_next {
+                            if replacement != mem_next
+                                && !line_refs_gp_family(&replacement, tmp_family)
+                                && !line_refs_gp_family(&replacement, dst_family)
+                            {
                                 mark_nop(&mut infos[i]);
                                 mark_nop(&mut infos[j]);
                                 replace_line(
@@ -1310,12 +1324,52 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         }
+        // Same full-absorption rule as the single-base arm: a leftover
+        // reference to the LEA dest outside the replaced address operand
+        // means the LEA is still live and must not be dropped.
+        if line_refs_gp_family(&replacement, dst_family) {
+            i += 1;
+            continue;
+        }
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, format!("    {}", replacement));
         changed = true;
         i = j + 1;
     }
     changed
+}
+
+/// Does `line` reference any name of GP register family `fam`
+/// (%rax/%eax/%ax/%al tiers)? Conservative true for out-of-range families.
+fn line_refs_gp_family(line: &str, fam: u8) -> bool {
+    use super::super::types::REG_NAMES;
+    if fam as usize >= REG_NAMES[0].len() {
+        return true;
+    }
+    for tier in REG_NAMES.iter() {
+        let name = tier[fam as usize];
+        if name.is_empty() {
+            continue;
+        }
+        // REG_NAMES entries already carry the '%' prefix (see the
+        // fold_lea_all_uses_in_block comment about the "%%rdx" bug class);
+        // match them verbatim, with a boundary check so %r1 does not match
+        // inside %r10.
+        let pat = name;
+        let mut start = 0;
+        while let Some(pos) = line[start..].find(pat) {
+            let abs = start + pos;
+            let end = abs + pat.len();
+            let boundary = line.as_bytes().get(end).map_or(true, |&c| {
+                !(c as char).is_ascii_alphanumeric()
+            });
+            if boundary {
+                return true;
+            }
+            start = end;
+        }
+    }
+    false
 }
 
 // ── SIB indexed addressing folding ──────────────────────────────────────────

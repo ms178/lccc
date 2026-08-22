@@ -1960,12 +1960,36 @@ const UNARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     // _Float128 / long-double bit ops: inline beats any libgcc/libm call.
     ("__fabstf2", IntrinsicOp::F128Fabs),
     ("fabsl", IntrinsicOp::LDFabs),
+    // SSE4.1 directed rounding (project baseline x86-64-v3; same policy as
+    // the FMA table below). Inline expansion is REQUIRED for glibc
+    // self-hosting: its s_floor.c/s_trunc.c define floor()/trunc() as the
+    // corresponding builtin, so a libm call here is infinite recursion.
+    // Immediates are GCC-verified: floor 9, ceil 10, trunc 11, rint 4,
+    // nearbyint 12, roundeven 8. round()/roundf() are deliberately ABSENT:
+    // GCC 14 keeps them as libm calls, and glibc's s_round.c uses its C
+    // bit-twiddling path, never __builtin_round, on x86-64.
+    ("floor", IntrinsicOp::RoundScalarF64(9)),
+    ("floorf", IntrinsicOp::RoundScalarF32(9)),
+    ("ceil", IntrinsicOp::RoundScalarF64(10)),
+    ("ceilf", IntrinsicOp::RoundScalarF32(10)),
+    ("trunc", IntrinsicOp::RoundScalarF64(11)),
+    ("truncf", IntrinsicOp::RoundScalarF32(11)),
+    ("rint", IntrinsicOp::RoundScalarF64(4)),
+    ("rintf", IntrinsicOp::RoundScalarF32(4)),
+    ("nearbyint", IntrinsicOp::RoundScalarF64(12)),
+    ("nearbyintf", IntrinsicOp::RoundScalarF32(12)),
+    ("roundeven", IntrinsicOp::RoundScalarF64(8)),
+    ("roundevenf", IntrinsicOp::RoundScalarF32(8)),
 ];
 
 /// Table of binary math functions that map directly to intrinsic instructions.
 const BINARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     ("__copysigntf3", IntrinsicOp::F128Copysign),
     ("copysignl", IntrinsicOp::LDCopysign),
+    // Pure SSE bit ops; a libm call would recurse inside glibc's own
+    // s_copysign.c (copysign() IS __builtin_copysign there).
+    ("copysign", IntrinsicOp::CopysignF64),
+    ("copysignf", IntrinsicOp::CopysignF32),
 ];
 
 /// Ternary math functions mapping to single-instruction intrinsics.

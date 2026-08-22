@@ -121,6 +121,50 @@ pub const LINKER_DEFINED_SYMBOLS: &[&str] = &[
 /// GNU ld `__start_<section>` / `__stop_<section>` pattern: when an undefined
 /// symbol matches `__start_X` or `__stop_X` where `X` is a valid C identifier,
 /// the linker will auto-generate it to point to the start/end of section `X`.
+/// Layout-anchor symbols: pure ADDRESSES the linker itself defines during
+/// layout (`__ehdr_start`, `_DYNAMIC`, `_end`, section start/stop markers,
+/// ...). Unlike the broader LINKER_DEFINED_SYMBOLS list (which also names
+/// real runtime functions like `__tls_get_addr`), these must NEVER receive a
+/// PLT slot or GOT dynamic relocation: they are not callable, they are
+/// link-time constants. glibc's ld.so bootstraps by computing its own load
+/// base as `&__ehdr_start` BEFORE any dynamic relocation is applied — a
+/// JUMP_SLOT for it hands _dl_start an unrelocated garbage address and the
+/// self-relocation loop dereferences NULL (the LK-24 startup SIGSEGV).
+pub fn is_layout_anchor_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "__ehdr_start"
+            | "__executable_start"
+            | "_DYNAMIC"
+            | "_GLOBAL_OFFSET_TABLE_"
+            | "_end"
+            | "end"
+            | "__end"
+            | "__end__"
+            | "_edata"
+            | "edata"
+            | "_etext"
+            | "etext"
+            | "__bss_start"
+            | "__bss_start__"
+            | "__BSS_END__"
+            | "__data_start"
+            | "data_start"
+            | "__DATA_BEGIN__"
+            | "__init_array_start"
+            | "__init_array_end"
+            | "__fini_array_start"
+            | "__fini_array_end"
+            | "__preinit_array_start"
+            | "__preinit_array_end"
+            | "__rela_iplt_start"
+            | "__rela_iplt_end"
+            | "__rel_iplt_start"
+            | "__rel_iplt_end"
+            | "__GNU_EH_FRAME_HDR"
+    ) || name.starts_with("__start_") || name.starts_with("__stop_")
+}
+
 pub fn is_linker_defined_symbol(name: &str) -> bool {
     if LINKER_DEFINED_SYMBOLS.contains(&name) {
         return true;

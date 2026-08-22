@@ -343,6 +343,10 @@ impl Lowerer {
             "__builtin_nanf" => Some(IrType::F32),
             "__builtin_nanl" => Some(IrType::F128),
             "__builtin_fma"
+            | "__builtin_trunc"
+            | "__builtin_rint"
+            | "__builtin_nearbyint"
+            | "__builtin_roundeven"
             | "__builtin_fabs"
             | "__builtin_sqrt"
             | "__builtin_sin"
@@ -359,6 +363,10 @@ impl Lowerer {
             | "__builtin_copysign"
             | "__builtin_nextafter" => Some(IrType::F64),
             "__builtin_fmaf"
+            | "__builtin_truncf"
+            | "__builtin_rintf"
+            | "__builtin_nearbyintf"
+            | "__builtin_roundevenf"
             | "__builtin_fabsf"
             | "__builtin_sqrtf"
             | "__builtin_sinf"

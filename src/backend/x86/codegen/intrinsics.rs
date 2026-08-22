@@ -994,6 +994,18 @@ impl X86Codegen {
             IntrinsicOp::FmaScalarF32 => {
                 self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F32);
             }
+            IntrinsicOp::RoundScalarF64(imm) => {
+                self.emit_fp_scalar_round(dest, &args[0], IrType::F64, *imm);
+            }
+            IntrinsicOp::RoundScalarF32(imm) => {
+                self.emit_fp_scalar_round(dest, &args[0], IrType::F32, *imm);
+            }
+            IntrinsicOp::CopysignF64 => {
+                self.emit_fp_copysign(dest, &args[0], &args[1], IrType::F64);
+            }
+            IntrinsicOp::CopysignF32 => {
+                self.emit_fp_copysign(dest, &args[0], &args[1], IrType::F32);
+            }
             IntrinsicOp::SqrtF64 => {
                 // Prefer VEX scalar sqrt (ICX/GCC on x86-64-v3). Avoids the
                 // legacy SSE encoding and matches the vmul/vadd path.

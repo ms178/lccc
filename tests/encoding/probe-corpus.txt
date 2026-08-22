@@ -1,0 +1,96 @@
+# Encoding-choice probe corpus: instructions where legal encodings of
+# different lengths exist, i.e. where an assembler can WIN bytes.
+# Each line is one instruction; encdiff.py assembles it with every oracle.
+#
+# 1. Accumulator short forms (opcode base+4) vs ModRM imm forms
+and $0x12345678, %eax
+or $0x12345678, %eax
+xor $0x12345678, %eax
+add $0x12345678, %eax
+sub $0x12345678, %eax
+cmp $0x12345678, %eax
+test $0x12345678, %eax
+and $0x1234, %ax
+cmp $0x99, %al
+# 2. imm8 sign-extended (83 /r) vs imm32 (81 /r)
+add $127, %ebx
+add $-128, %ebx
+add $128, %ebx
+cmp $127, %r11
+cmp $128, %r11
+# 3. TEST imm narrowing candidates (no 83-form exists for TEST)
+test $1, %rax
+test $1, %rbx
+test $0x7f, %ecx
+test $0x80, %ecx
+test $0xff, %edx
+test $0x100, %edx
+# 4. mov 64-bit immediate: movabs vs movl zero-extend vs movq sign-extend
+movq $0xffffffff, %rax
+movq $0x7fffffff, %rax
+movq $-1, %rax
+movq $0x100000000, %rax
+mov $0xffffffffffffffff, %rcx
+# 5. Shift-by-one: D1 /r vs C1 /r ib
+shl $1, %eax
+shr $1, %r10
+sar $1, %rdx
+rol $1, %ecx
+# 6. Zero idioms and reg-reg forms with two encodings (r/m dir bit)
+mov %eax, %ebx
+add %ecx, %edx
+xor %r8d, %r8d
+# 7. VEX two-byte vs three-byte prefix
+vmovaps %xmm1, %xmm2
+vmovaps %xmm9, %xmm2
+vmovaps %xmm1, %xmm10
+vaddps %ymm1, %ymm2, %ymm3
+vaddps %ymm9, %ymm10, %ymm11
+# 8. disp8 vs disp32
+movl 16(%rsp), %eax
+movl 128(%rsp), %eax
+movl 127(%rbp), %ecx
+movl (%r13), %edx
+# 9. push imm8 vs imm32
+push $1
+push $127
+push $128
+# 10. LEA with redundant components
+lea (%rax), %rbx
+lea 0(%rax,%rbx,1), %rcx
+# 11. movzx/movsx and equivalents
+movzbl %al, %eax
+movzwl %ax, %eax
+movslq %eax, %rax
+# 12. xchg with accumulator (0x90+r) vs 87 /r
+xchg %eax, %ecx
+xchg %rax, %r8
+xchg %ebx, %ecx
+# 13. INC/DEC (no short form in 64-bit; FF /0)
+incl %eax
+decq %r15
+# 14. adc/sbb accumulator forms
+adc $0x12345678, %eax
+sbb $0x1234, %ax
+# 15. imul three forms: 6B (imm8) / 69 (imm32) / 0FAF
+imul $3, %eax, %eax
+imul $300, %eax, %eax
+imul $3, %rbx
+# 16. Sign-vs-zero extending 32->64 candidates in cmp/mov chains
+cmpq $0xffffffff, %rax
+andq $0xffffffff, %rax
+# 17. SSE mov aliases with equal semantics, different length
+movaps %xmm1, %xmm2
+movapd %xmm1, %xmm2
+movdqa %xmm1, %xmm2
+movups %xmm3, %xmm4
+# 18. bswap vs movbe availability irrelevant; ror/rol imm equivalences
+ror $31, %eax
+rol $31, %eax
+# 19. btc/bts/btr imm8 vs reg
+bt $3, %eax
+bts $63, %rax
+# 20. Compare against zero alternatives (faithful: no rewrite allowed)
+cmp $0, %eax
+test %eax, %eax
+or $0, %eax

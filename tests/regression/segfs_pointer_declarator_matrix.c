@@ -74,8 +74,27 @@ int main(void) {
     ok &= phi_const_ptr(sel) == canary;
     ok &= phi_const_ptr(0) != 0; /* %fs:0 = TCB self pointer */
     ok &= no_leak() == 7;
+    ok &= segstore_conflation() == 1;
     /* Print a stable token (not the canary value itself) for the
      * cross-compiler stdout comparison. */
     printf("segfs-matrix:%s\n", ok ? "ok" : "MISMATCH");
     return ok ? 0 : 1;
+}
+
+/* Regression (LK-24 stage 3): SegFs STORE operand conflation. The fs-offset
+ * constant's register home (%rdx) was clobbered by the stored VALUE before
+ * the pointer was read, so THREAD_SETMEM-shaped code stored through the
+ * VALUE as the address. Shape: value is an address derived from a SegFs
+ * load, pointer is a small constant with a register home. %fs:16 is the
+ * TCB self pointer: fs:16+0x30-ish offsets are inside our own (glibc)
+ * pthread struct, so writing there is NOT safe in-process; instead verify
+ * pure codegen shape via a round-trip through a real TLS variable. */
+static __thread unsigned long tls_cell[4];
+__attribute__((noinline)) static unsigned long segstore_conflation(void) {
+    /* address-of-TLS derived value + constant-offset store target in one
+     * expression forces both operands into registers simultaneously */
+    unsigned long *p = &tls_cell[1];
+    tls_cell[2] = (unsigned long)p; /* value IS an address */
+    tls_cell[1] = 0x5150;
+    return *(unsigned long *)tls_cell[2] == 0x5150;
 }

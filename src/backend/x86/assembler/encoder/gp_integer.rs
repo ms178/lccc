@@ -295,6 +295,9 @@ impl super::InstructionEncoder {
         mem: &MemoryOperand,
         size: u8,
     ) -> Result<(), String> {
+        if let ImmediateValue::Integer(v) = imm {
+            Self::check_imm32s_q("mov", size, *v)?;
+        }
         self.emit_segment_prefix(mem)?;
         if size == 2 {
             self.bytes.push(0x66);
@@ -594,6 +597,9 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Immediate(ImmediateValue::Integer(val)) => {
+                // push imm is a 64-bit operation in long mode: imm32 is
+                // sign-extended, so the same faithfulness gate applies.
+                Self::check_imm32s_q("push", 8, *val)?;
                 if *val >= -128 && *val <= 127 {
                     self.bytes.push(0x6A);
                     self.bytes.push(*val as u8);
@@ -668,6 +674,7 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
                 let val = *val;
+                Self::check_imm32s_q(mnemonic, size, val)?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
 
                 if size == 2 {
@@ -791,6 +798,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
                 let val = *val;
+                Self::check_imm32s_q(mnemonic, size, val)?;
                 self.emit_segment_prefix(mem)?;
                 if size == 2 {
                     self.bytes.push(0x66);
@@ -920,6 +928,7 @@ impl super::InstructionEncoder {
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
                 let val = *val;
+                Self::check_imm32s_q(mnemonic, size, val)?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 if size == 2 {
                     self.bytes.push(0x66);
@@ -981,6 +990,7 @@ impl super::InstructionEncoder {
             }
             // test $imm, mem
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
+                Self::check_imm32s_q(mnemonic, size, *val)?;
                 let val = *val;
                 self.emit_segment_prefix(mem)?;
                 if size == 2 {
@@ -1089,6 +1099,7 @@ impl super::InstructionEncoder {
                 }
                 (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
                     let val = *val;
+                    Self::check_imm32s_q("imul", size, val)?;
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                     if size == 2 {
                         self.bytes.push(0x66);
@@ -1115,6 +1126,7 @@ impl super::InstructionEncoder {
                     _ => return Err("unsupported imul operands".to_string()),
                 };
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                Self::check_imm32s_q("imul", size, val)?;
                 let short = fits_imm8(val, size);
                 match &ops[1] {
                     Operand::Register(src) => {
@@ -1239,6 +1251,27 @@ impl super::InstructionEncoder {
     ///   * everything else is "operand type mismatch".
     /// Silently truncating an out-of-range count would encode an
     /// instruction the programmer did not write.
+    /// GAS 2.47 parity + wrong-code prevention: a 64-bit operation's 32-bit
+    /// immediate field is SIGN-extended by the CPU, so only values
+    /// representable as i32 can be encoded faithfully. `$0xffffffff` in
+    /// `andq $0xffffffff, %rax` would silently become `$-1`
+    /// (0xffffffffffffffff) — a value change, not an encoding choice.
+    /// binutils rejects these ("operand type mismatch"); we reject with a
+    /// message that says what actually went wrong and what to use instead.
+    /// (ICC 2021 SILENTLY mis-encodes exactly this case — the defect class
+    /// this check exists to prevent.)
+    fn check_imm32s_q(mnemonic: &str, size: u8, val: i64) -> Result<(), String> {
+        if size == 8 && (val > i32::MAX as i64 || val < i32::MIN as i64) {
+            return Err(format!(
+                "{}: immediate 0x{:x} does not fit the sign-extended 32-bit \
+                 immediate field of a 64-bit operation (it would silently \
+                 change value); use a register, movl zero-extension, or movabs",
+                mnemonic, val
+            ));
+        }
+        Ok(())
+    }
+
     fn check_shift_imm(mnemonic: &str, size: u8, count: i64) -> Result<(), String> {
         // 8-bit operand forms: GNU as accepts ANY immediate and masks it to
         // the low byte (silent inside -128..=255, warn-and-truncate outside
