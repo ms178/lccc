@@ -5,10 +5,10 @@
 // (e.g., "long unsigned int" == "unsigned long int"), so we collect flags
 // and resolve them at the end.
 
-use crate::common::types::AddressSpace;
-use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, Parser};
+use crate::common::types::AddressSpace;
+use crate::frontend::lexer::token::TokenKind;
 
 /// Collected type specifier flags during parsing.
 ///
@@ -65,8 +65,7 @@ impl Parser {
                 TokenKind::Restrict => {
                     self.advance();
                 }
-                TokenKind::Register
-                | TokenKind::Auto => {
+                TokenKind::Register | TokenKind::Auto => {
                     self.advance();
                     any_storage_class = true;
                 }
@@ -125,7 +124,8 @@ impl Parser {
                     let (_, aligned, mk, _) = self.parse_gcc_attributes();
                     mode_kind = mode_kind.or(mk);
                     if let Some(a) = aligned {
-                        self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+                        self.attrs.parsed_alignas =
+                            Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
                     }
                     // parse_gcc_attributes already sets self.attrs.parsing_constructor/destructor
                 }
@@ -141,9 +141,9 @@ impl Parser {
                     if matches!(self.peek(), TokenKind::LParen) {
                         let open = self.peek_span();
                         self.advance(); // consume '('
-                        // Save and restore const qualifier across inner type parse
-                        // to prevent leakage (e.g., _Atomic(const int) should not
-                        // make the outer declaration const).
+                                        // Save and restore const qualifier across inner type parse
+                                        // to prevent leakage (e.g., _Atomic(const int) should not
+                                        // make the outer declaration const).
                         let saved_const = self.attrs.parsing_const();
                         self.attrs.set_const(false);
                         let inner = self.parse_type_specifier();
@@ -170,33 +170,51 @@ impl Parser {
                 TokenKind::Alignas => {
                     self.advance();
                     if let Some(align) = self.parse_alignas_argument() {
-                        self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(align, |prev| prev.max(align)));
+                        self.attrs.parsed_alignas = Some(
+                            self.attrs
+                                .parsed_alignas
+                                .map_or(align, |prev| prev.max(align)),
+                        );
                     }
                 }
                 // Type specifier tokens
                 TokenKind::Void => {
-                    self.advance(); flags.has_void = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_void = true;
+                    any_base_specifier = true;
                     break; // void can't combine with others
                 }
                 TokenKind::Char => {
-                    self.advance(); flags.has_char = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_char = true;
+                    any_base_specifier = true;
                     break; // char only combines with signed/unsigned
                 }
                 TokenKind::Short => {
-                    self.advance(); flags.has_short = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_short = true;
+                    any_base_specifier = true;
                 }
                 TokenKind::Int => {
-                    self.advance(); flags.has_int = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_int = true;
+                    any_base_specifier = true;
                 }
                 TokenKind::Long => {
-                    self.advance(); flags.long_count += 1; any_base_specifier = true;
+                    self.advance();
+                    flags.long_count += 1;
+                    any_base_specifier = true;
                 }
                 TokenKind::Float => {
-                    self.advance(); flags.has_float = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_float = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Double => {
-                    self.advance(); flags.has_double = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_double = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Float128 => {
@@ -204,14 +222,20 @@ impl Parser {
                     return Some(TypeSpecifier::Float128);
                 }
                 TokenKind::Bool => {
-                    self.advance(); flags.has_bool = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_bool = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Signed => {
-                    self.advance(); flags.has_signed = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_signed = true;
+                    any_base_specifier = true;
                 }
                 TokenKind::Unsigned => {
-                    self.advance(); flags.has_unsigned = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_unsigned = true;
+                    any_base_specifier = true;
                 }
                 // __int128 can combine with signed/unsigned
                 TokenKind::Int128 => {
@@ -242,19 +266,27 @@ impl Parser {
                     return Some(TypeSpecifier::UnsignedInt128);
                 }
                 TokenKind::Struct => {
-                    self.advance(); flags.has_struct = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_struct = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Union => {
-                    self.advance(); flags.has_union = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_union = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Enum => {
-                    self.advance(); flags.has_enum = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_enum = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Typeof => {
-                    self.advance(); flags.has_typeof = true; any_base_specifier = true;
+                    self.advance();
+                    flags.has_typeof = true;
+                    any_base_specifier = true;
                     break;
                 }
                 TokenKind::Builtin => {
@@ -273,23 +305,34 @@ impl Parser {
                 // _Float64x==long double (80-bit x87). (_Float128 has its own
                 // TokenKind::Float128 and is a distinct binary128 type.)
                 TokenKind::Identifier(name)
-                    if matches!(name.as_str(), "_Float32" | "_Float64" | "_Float32x" | "_Float64x") =>
+                    if matches!(
+                        name.as_str(),
+                        "_Float32" | "_Float64" | "_Float32x" | "_Float64x"
+                    ) =>
                 {
                     let nm = name.clone();
                     if !any_base_specifier {
                         self.advance();
                         any_base_specifier = true;
                         match nm.as_str() {
-                            "_Float32" => { flags.has_float = true; }
-                            "_Float64" | "_Float32x" => { flags.has_double = true; }
-                            _ => { flags.has_double = true; }
+                            "_Float32" => {
+                                flags.has_float = true;
+                            }
+                            "_Float64" | "_Float32x" => {
+                                flags.has_double = true;
+                            }
+                            _ => {
+                                flags.has_double = true;
+                            }
                         }
                         break;
                     } else {
                         break;
                     }
                 }
-                TokenKind::Identifier(ref name) if self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name) => {
+                TokenKind::Identifier(ref name)
+                    if self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name) =>
+                {
                     if !any_base_specifier {
                         flags.typedef_name = Some(name.clone());
                         self.advance();
@@ -345,30 +388,79 @@ impl Parser {
         if flags.has_char || flags.has_short || flags.has_int || flags.long_count > 0 {
             loop {
                 match self.peek() {
-                    TokenKind::Signed => { self.advance(); flags.has_signed = true; }
-                    TokenKind::Unsigned => { self.advance(); flags.has_unsigned = true; }
-                    TokenKind::Int => { self.advance(); flags.has_int = true; }
-                    TokenKind::Long => { self.advance(); flags.long_count += 1; }
-                    TokenKind::Short => { self.advance(); flags.has_short = true; }
-                    TokenKind::Char => { self.advance(); flags.has_char = true; }
-                    TokenKind::Complex => { self.advance(); flags.has_complex = true; }
-                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
-                    TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-                    TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
-                    TokenKind::Static => { self.advance(); self.attrs.set_static(true); }
-                    TokenKind::Extern => { self.advance(); self.attrs.set_extern(true); }
-                    TokenKind::Auto | TokenKind::Register => { self.advance(); }
-                    TokenKind::ThreadLocal => { self.advance(); self.attrs.set_thread_local(true); }
-                    TokenKind::Noreturn => { self.advance(); self.attrs.set_noreturn(true); }
-                    TokenKind::Inline => { self.advance(); self.attrs.set_inline(true); }
+                    TokenKind::Signed => {
+                        self.advance();
+                        flags.has_signed = true;
+                    }
+                    TokenKind::Unsigned => {
+                        self.advance();
+                        flags.has_unsigned = true;
+                    }
+                    TokenKind::Int => {
+                        self.advance();
+                        flags.has_int = true;
+                    }
+                    TokenKind::Long => {
+                        self.advance();
+                        flags.long_count += 1;
+                    }
+                    TokenKind::Short => {
+                        self.advance();
+                        flags.has_short = true;
+                    }
+                    TokenKind::Char => {
+                        self.advance();
+                        flags.has_char = true;
+                    }
+                    TokenKind::Complex => {
+                        self.advance();
+                        flags.has_complex = true;
+                    }
+                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                        self.advance();
+                    }
+                    TokenKind::SegGs => {
+                        self.advance();
+                        self.attrs.parsing_address_space = AddressSpace::SegGs;
+                    }
+                    TokenKind::SegFs => {
+                        self.advance();
+                        self.attrs.parsing_address_space = AddressSpace::SegFs;
+                    }
+                    TokenKind::Static => {
+                        self.advance();
+                        self.attrs.set_static(true);
+                    }
+                    TokenKind::Extern => {
+                        self.advance();
+                        self.attrs.set_extern(true);
+                    }
+                    TokenKind::Auto | TokenKind::Register => {
+                        self.advance();
+                    }
+                    TokenKind::ThreadLocal => {
+                        self.advance();
+                        self.attrs.set_thread_local(true);
+                    }
+                    TokenKind::Noreturn => {
+                        self.advance();
+                        self.attrs.set_noreturn(true);
+                    }
+                    TokenKind::Inline => {
+                        self.advance();
+                        self.attrs.set_inline(true);
+                    }
                     TokenKind::Attribute => {
                         let (_, aligned, mk, _) = self.parse_gcc_attributes();
                         *mode_kind = mode_kind.or(mk);
                         if let Some(a) = aligned {
-                            self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+                            self.attrs.parsed_alignas =
+                                Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
                         }
                     }
-                    TokenKind::Extension => { self.advance(); }
+                    TokenKind::Extension => {
+                        self.advance();
+                    }
                     _ => break,
                 }
             }
@@ -376,17 +468,47 @@ impl Parser {
             // "float" can be followed by "_Complex" and storage class / qualifiers
             loop {
                 match self.peek() {
-                    TokenKind::Complex => { self.advance(); flags.has_complex = true; }
-                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
-                    TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-                    TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
-                    TokenKind::Static => { self.advance(); self.attrs.set_static(true); }
-                    TokenKind::Extern => { self.advance(); self.attrs.set_extern(true); }
-                    TokenKind::Auto | TokenKind::Register => { self.advance(); }
-                    TokenKind::ThreadLocal => { self.advance(); self.attrs.set_thread_local(true); }
-                    TokenKind::Noreturn => { self.advance(); self.attrs.set_noreturn(true); }
-                    TokenKind::Inline => { self.advance(); self.attrs.set_inline(true); }
-                    TokenKind::Extension => { self.advance(); }
+                    TokenKind::Complex => {
+                        self.advance();
+                        flags.has_complex = true;
+                    }
+                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                        self.advance();
+                    }
+                    TokenKind::SegGs => {
+                        self.advance();
+                        self.attrs.parsing_address_space = AddressSpace::SegGs;
+                    }
+                    TokenKind::SegFs => {
+                        self.advance();
+                        self.attrs.parsing_address_space = AddressSpace::SegFs;
+                    }
+                    TokenKind::Static => {
+                        self.advance();
+                        self.attrs.set_static(true);
+                    }
+                    TokenKind::Extern => {
+                        self.advance();
+                        self.attrs.set_extern(true);
+                    }
+                    TokenKind::Auto | TokenKind::Register => {
+                        self.advance();
+                    }
+                    TokenKind::ThreadLocal => {
+                        self.advance();
+                        self.attrs.set_thread_local(true);
+                    }
+                    TokenKind::Noreturn => {
+                        self.advance();
+                        self.attrs.set_noreturn(true);
+                    }
+                    TokenKind::Inline => {
+                        self.advance();
+                        self.attrs.set_inline(true);
+                    }
+                    TokenKind::Extension => {
+                        self.advance();
+                    }
                     _ => break,
                 }
             }
@@ -394,18 +516,51 @@ impl Parser {
             // "double" can be followed by "long", "_Complex", and storage class / qualifiers
             loop {
                 match self.peek() {
-                    TokenKind::Long => { self.advance(); flags.long_count += 1; }
-                    TokenKind::Complex => { self.advance(); flags.has_complex = true; }
-                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => { self.advance(); }
-                    TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-                    TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
-                    TokenKind::Static => { self.advance(); self.attrs.set_static(true); }
-                    TokenKind::Extern => { self.advance(); self.attrs.set_extern(true); }
-                    TokenKind::Auto | TokenKind::Register => { self.advance(); }
-                    TokenKind::ThreadLocal => { self.advance(); self.attrs.set_thread_local(true); }
-                    TokenKind::Noreturn => { self.advance(); self.attrs.set_noreturn(true); }
-                    TokenKind::Inline => { self.advance(); self.attrs.set_inline(true); }
-                    TokenKind::Extension => { self.advance(); }
+                    TokenKind::Long => {
+                        self.advance();
+                        flags.long_count += 1;
+                    }
+                    TokenKind::Complex => {
+                        self.advance();
+                        flags.has_complex = true;
+                    }
+                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                        self.advance();
+                    }
+                    TokenKind::SegGs => {
+                        self.advance();
+                        self.attrs.parsing_address_space = AddressSpace::SegGs;
+                    }
+                    TokenKind::SegFs => {
+                        self.advance();
+                        self.attrs.parsing_address_space = AddressSpace::SegFs;
+                    }
+                    TokenKind::Static => {
+                        self.advance();
+                        self.attrs.set_static(true);
+                    }
+                    TokenKind::Extern => {
+                        self.advance();
+                        self.attrs.set_extern(true);
+                    }
+                    TokenKind::Auto | TokenKind::Register => {
+                        self.advance();
+                    }
+                    TokenKind::ThreadLocal => {
+                        self.advance();
+                        self.attrs.set_thread_local(true);
+                    }
+                    TokenKind::Noreturn => {
+                        self.advance();
+                        self.attrs.set_noreturn(true);
+                    }
+                    TokenKind::Inline => {
+                        self.advance();
+                        self.attrs.set_inline(true);
+                    }
+                    TokenKind::Extension => {
+                        self.advance();
+                    }
                     _ => break,
                 }
             }
@@ -413,14 +568,23 @@ impl Parser {
     }
 
     /// Resolve the collected type specifier flags into a concrete TypeSpecifier.
-    fn resolve_type_flags(
-        &mut self,
-        flags: &TypeSpecFlags,
-    ) -> TypeSpecifier {
+    fn resolve_type_flags(&mut self, flags: &TypeSpecFlags) -> TypeSpecifier {
         let TypeSpecFlags {
-            has_void, has_bool, has_float, has_double, has_complex,
-            has_char, has_short, has_int: _, has_unsigned, has_signed: _,
-            has_struct, has_union, has_enum, has_typeof, long_count,
+            has_void,
+            has_bool,
+            has_float,
+            has_double,
+            has_complex,
+            has_char,
+            has_short,
+            has_int: _,
+            has_unsigned,
+            has_signed: _,
+            has_struct,
+            has_union,
+            has_enum,
+            has_typeof,
+            long_count,
             ref typedef_name,
         } = *flags;
         if has_void {
@@ -428,10 +592,18 @@ impl Parser {
         } else if has_bool {
             TypeSpecifier::Bool
         } else if has_float {
-            if has_complex { TypeSpecifier::ComplexFloat } else { TypeSpecifier::Float }
+            if has_complex {
+                TypeSpecifier::ComplexFloat
+            } else {
+                TypeSpecifier::Float
+            }
         } else if has_double {
             if has_complex {
-                if long_count > 0 { TypeSpecifier::ComplexLongDouble } else { TypeSpecifier::ComplexDouble }
+                if long_count > 0 {
+                    TypeSpecifier::ComplexLongDouble
+                } else {
+                    TypeSpecifier::ComplexDouble
+                }
             } else if long_count > 0 {
                 TypeSpecifier::LongDouble
             } else {
@@ -451,13 +623,29 @@ impl Parser {
         } else if let Some(ref name) = typedef_name {
             TypeSpecifier::TypedefName(name.clone())
         } else if has_char {
-            if has_unsigned { TypeSpecifier::UnsignedChar } else { TypeSpecifier::Char }
+            if has_unsigned {
+                TypeSpecifier::UnsignedChar
+            } else {
+                TypeSpecifier::Char
+            }
         } else if has_short {
-            if has_unsigned { TypeSpecifier::UnsignedShort } else { TypeSpecifier::Short }
+            if has_unsigned {
+                TypeSpecifier::UnsignedShort
+            } else {
+                TypeSpecifier::Short
+            }
         } else if long_count >= 2 {
-            if has_unsigned { TypeSpecifier::UnsignedLongLong } else { TypeSpecifier::LongLong }
+            if has_unsigned {
+                TypeSpecifier::UnsignedLongLong
+            } else {
+                TypeSpecifier::LongLong
+            }
         } else if long_count == 1 {
-            if has_unsigned { TypeSpecifier::UnsignedLong } else { TypeSpecifier::Long }
+            if has_unsigned {
+                TypeSpecifier::UnsignedLong
+            } else {
+                TypeSpecifier::Long
+            }
         } else if has_unsigned {
             TypeSpecifier::UnsignedInt
         } else {
@@ -478,7 +666,9 @@ impl Parser {
         };
         let (packed2, aligned2, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed2;
-        if aligned2.is_some() { struct_aligned = aligned2; }
+        if aligned2.is_some() {
+            struct_aligned = aligned2;
+        }
         let fields = if matches!(self.peek(), TokenKind::LBrace) {
             // Save and restore parsing_const across struct field parsing.
             // Field types may contain `const` (e.g., `const int *p`), and without
@@ -493,7 +683,9 @@ impl Parser {
         };
         let (packed3, aligned3, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
-        if aligned3.is_some() { struct_aligned = aligned3; }
+        if aligned3.is_some() {
+            struct_aligned = aligned3;
+        }
         // Apply current #pragma pack alignment to struct definition
         let max_field_align = self.pragma_pack_align;
         let ts = if is_struct {
@@ -614,14 +806,21 @@ impl Parser {
                 TokenKind::Attribute => {
                     let (_, aligned, _, _) = self.parse_gcc_attributes();
                     if let Some(a) = aligned {
-                        self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+                        self.attrs.parsed_alignas =
+                            Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
                     }
                 }
                 TokenKind::Extension => {
                     self.advance();
                 }
-                TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-                TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
+                TokenKind::SegGs => {
+                    self.advance();
+                    self.attrs.parsing_address_space = AddressSpace::SegGs;
+                }
+                TokenKind::SegFs => {
+                    self.advance();
+                    self.attrs.parsing_address_space = AddressSpace::SegFs;
+                }
                 _ => break,
             }
         }
@@ -648,7 +847,14 @@ impl Parser {
                 if matches!(self.peek(), TokenKind::Semicolon) {
                     // Anonymous field (e.g., anonymous struct/union)
                     let alignment = self.attrs.parsed_alignas.take();
-                    fields.push(StructFieldDecl { type_spec, name: None, bit_width: None, derived: Vec::new(), alignment, is_packed: false });
+                    fields.push(StructFieldDecl {
+                        type_spec,
+                        name: None,
+                        bit_width: None,
+                        derived: Vec::new(),
+                        alignment,
+                        is_packed: false,
+                    });
                 } else {
                     self.parse_struct_field_declarators(&type_spec, &mut fields);
                 }
@@ -693,7 +899,9 @@ impl Parser {
                     alignment: alignas_from_type,
                     is_packed: false,
                 });
-                if !self.consume_if(&TokenKind::Comma) { break; }
+                if !self.consume_if(&TokenKind::Comma) {
+                    break;
+                }
                 continue;
             }
 
@@ -702,7 +910,8 @@ impl Parser {
             // pointer declarators of arbitrary depth.
             // parse_declarator_with_attrs also consumes trailing __attribute__ and
             // returns the aligned value from __attribute__((aligned(N))).
-            let (name, derived, _, _, decl_aligned, decl_packed) = self.parse_declarator_with_attrs();
+            let (name, derived, _, _, decl_aligned, decl_packed) =
+                self.parse_declarator_with_attrs();
 
             // Parse optional bitfield width (constant-expression, not full expr with comma)
             let bit_width = if self.consume_if(&TokenKind::Colon) {
@@ -734,7 +943,9 @@ impl Parser {
                 is_packed,
             });
 
-            if !self.consume_if(&TokenKind::Comma) { break; }
+            if !self.consume_if(&TokenKind::Comma) {
+                break;
+            }
         }
     }
 
@@ -746,8 +957,14 @@ impl Parser {
                 TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
                     self.advance();
                 }
-                TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-                TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
+                TokenKind::SegGs => {
+                    self.advance();
+                    self.attrs.parsing_address_space = AddressSpace::SegGs;
+                }
+                TokenKind::SegFs => {
+                    self.advance();
+                    self.attrs.parsing_address_space = AddressSpace::SegFs;
+                }
                 TokenKind::Alignas => {
                     self.advance();
                     if let Some(align) = self.parse_alignas_argument() {
@@ -760,7 +977,9 @@ impl Parser {
                         *alignas = attr_aligned;
                     }
                 }
-                TokenKind::Extension => { self.advance(); }
+                TokenKind::Extension => {
+                    self.advance();
+                }
                 _ => break,
             }
         }
@@ -770,10 +989,17 @@ impl Parser {
     /// into the TypeSpecifier directly to maintain backward compatibility with
     /// downstream code. For complex cases (function pointers), return the
     /// derived list for downstream to process with build_full_ctype().
-    fn fold_simple_derived(base: &TypeSpecifier, derived: &[DerivedDeclarator]) -> (TypeSpecifier, Vec<DerivedDeclarator>) {
+    fn fold_simple_derived(
+        base: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> (TypeSpecifier, Vec<DerivedDeclarator>) {
         // If derived contains any function-related declarators, pass it through
-        let has_function = derived.iter().any(|d| matches!(d,
-            DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)));
+        let has_function = derived.iter().any(|d| {
+            matches!(
+                d,
+                DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)
+            )
+        });
 
         if has_function {
             return (base.clone(), derived.to_vec());
@@ -804,7 +1030,9 @@ impl Parser {
                         }
                     }
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
         (result, Vec::new())
@@ -844,7 +1072,11 @@ impl Parser {
                 // Evaluate the explicit value expression.
                 // Use eval_const_int_expr_with_enums so references to previously
                 // defined enum constants are resolved.
-                let tag_aligns = if self.struct_tag_alignments.is_empty() { None } else { Some(&self.struct_tag_alignments) };
+                let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                    None
+                } else {
+                    Some(&self.struct_tag_alignments)
+                };
                 Self::eval_const_int_expr_with_enums(expr, Some(&self.enum_constants), tag_aligns)
             } else {
                 next_value
@@ -883,7 +1115,8 @@ impl Parser {
                     if matches!(self.peek(), TokenKind::LParen) {
                         self.skip_balanced_parens();
                     }
-                    result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                    result_type =
+                        TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
                 } else {
                     self.pos = save2;
                 }
@@ -914,7 +1147,10 @@ impl Parser {
     ///
     /// Input: base type already parsed.
     /// Output: type wrapped with pointer/array/function-pointer modifiers.
-    pub(super) fn parse_abstract_declarator_suffix(&mut self, mut result_type: TypeSpecifier) -> TypeSpecifier {
+    pub(super) fn parse_abstract_declarator_suffix(
+        &mut self,
+        mut result_type: TypeSpecifier,
+    ) -> TypeSpecifier {
         // Consume address space qualifiers that appear before the first '*'
         // e.g., typeof(var) __seg_gs * → __seg_gs sets parsing_address_space
         self.skip_cv_qualifiers();
@@ -933,20 +1169,32 @@ impl Parser {
             if let Some(paren_decl) = self.try_parse_paren_abstract_declarator() {
                 use super::declarators::ParenAbstractDecl;
                 match paren_decl {
-                    ParenAbstractDecl::Simple { ptr_depth, array_dims: inner_array_dims } => {
+                    ParenAbstractDecl::Simple {
+                        ptr_depth,
+                        array_dims: inner_array_dims,
+                    } => {
                         if matches!(self.peek(), TokenKind::LParen) {
                             // Function pointer cast: (*)(params) or (**)(params)
                             let (params, variadic) = self.parse_param_list();
-                            result_type = TypeSpecifier::FunctionPointer(Box::new(result_type), params, variadic);
+                            result_type = TypeSpecifier::FunctionPointer(
+                                Box::new(result_type),
+                                params,
+                                variadic,
+                            );
                             // Extra pointer levels for multi-indirection (e.g., ** means ptr-to-func-ptr)
                             for _ in 0..ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(
+                                    Box::new(result_type),
+                                    AddressSpace::Default,
+                                );
                             }
                             // Wrap with inner array dims (for array of function pointers)
                             for dim in inner_array_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
-                        } else if matches!(self.peek(), TokenKind::LBracket) || !inner_array_dims.is_empty() {
+                        } else if matches!(self.peek(), TokenKind::LBracket)
+                            || !inner_array_dims.is_empty()
+                        {
                             // Pointer to array: (*)[N] or (*[3][4])[2]
                             let mut outer_dims: Vec<Option<Box<Expr>>> = Vec::new();
                             while matches!(self.peek(), TokenKind::LBracket) {
@@ -964,20 +1212,28 @@ impl Parser {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                             for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(
+                                    Box::new(result_type),
+                                    AddressSpace::Default,
+                                );
                             }
                             for dim in inner_array_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                         } else {
                             for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(
+                                    Box::new(result_type),
+                                    AddressSpace::Default,
+                                );
                             }
                         }
                     }
                     ParenAbstractDecl::NestedFnPtr {
-                        outer_ptr_depth, inner_ptr_depth,
-                        inner_params, inner_variadic,
+                        outer_ptr_depth,
+                        inner_ptr_depth,
+                        inner_params,
+                        inner_variadic,
                     } => {
                         // Nested function pointer: (*(*)(inner_params))(outer_params)
                         // e.g., void(*(*)(void*))(void):
@@ -990,24 +1246,37 @@ impl Parser {
                             let (outer_params, outer_variadic) = self.parse_param_list();
                             // Build the return type: function pointer returning base type
                             for _ in 0..inner_ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(
+                                    Box::new(result_type),
+                                    AddressSpace::Default,
+                                );
                             }
                             let return_fn_type = TypeSpecifier::FunctionPointer(
-                                Box::new(result_type), outer_params, outer_variadic
+                                Box::new(result_type),
+                                outer_params,
+                                outer_variadic,
                             );
                             // Build the outer function: takes inner_params, returns return_fn_type
                             result_type = TypeSpecifier::FunctionPointer(
-                                Box::new(return_fn_type), inner_params, inner_variadic
+                                Box::new(return_fn_type),
+                                inner_params,
+                                inner_variadic,
                             );
                             // Apply extra outer pointer levels (for outer_ptr_depth > 1)
                             for _ in 0..outer_ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(
+                                    Box::new(result_type),
+                                    AddressSpace::Default,
+                                );
                             }
                         } else {
                             // No outer params - treat as simple pointer
                             let total = outer_ptr_depth + inner_ptr_depth;
                             for _ in 0..total {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(
+                                    Box::new(result_type),
+                                    AddressSpace::Default,
+                                );
                             }
                         }
                     }

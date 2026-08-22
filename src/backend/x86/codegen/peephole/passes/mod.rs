@@ -20,22 +20,22 @@
 use super::types::*;
 
 // Submodule pass implementations
-mod helpers;
-mod local_patterns;
-mod push_pop;
+mod callee_saves;
 mod compare_branch;
 mod copy_propagation;
 mod dead_code;
-mod store_forwarding;
-mod loop_trampoline;
-mod callee_saves;
-mod memory_fold;
 mod frame_compact;
-mod tail_call;
+mod helpers;
 mod identical_blocks;
+mod local_patterns;
+mod loop_trampoline;
+mod memory_fold;
+mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
 mod spill_deref;
+mod store_forwarding;
+mod tail_call;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -81,7 +81,8 @@ fn direct_stack_slot_in_line(line: &str) -> Option<(u8, i32)> {
         if let Some(pos) = line.find(base) {
             let end = pos + base.len();
             let prefix = &line[..end];
-            let start = prefix.rfind(|c: char| c == ' ' || c == '\t' || c == ',')
+            let start = prefix
+                .rfind(|c: char| c == ' ' || c == '\t' || c == ',')
                 .map(|idx| idx + 1)
                 .unwrap_or(0);
             if let Some(slot) = direct_stack_slot(&prefix[start..]) {
@@ -175,7 +176,10 @@ fn pin_param_abi_reads(store: &LineStore, infos: &mut [LineInfo]) {
         let mut j = i + 1;
         while j < store.len() {
             let next_trimmed = infos[j].trimmed(store.get(j));
-            if next_trimmed.is_empty() || next_trimmed.starts_with('.') || next_trimmed.starts_with('#') {
+            if next_trimmed.is_empty()
+                || next_trimmed.starts_with('.')
+                || next_trimmed.starts_with('#')
+            {
                 j += 1;
                 continue;
             }
@@ -293,11 +297,15 @@ pub fn peephole_optimize(mut asm: String) -> String {
     }
     // Always-on, provably-safe pass: eliminate redundant pushfq/popfq pairs
     // (flag-neutral window). Runs before the peephole gate.
-    if std::env::var("CCC_NO_PUSHF_ELIM").is_err() { let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm); }
+    if std::env::var("CCC_NO_PUSHF_ELIM").is_err() {
+        let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
+    }
     // Always-on, provably-safe pass: eliminate redundant zero-extensions
     // only when the tracked value already fits the source width. Runs before
     // gate; CCC_NO_REDUNDANT_EXT=1 disables it for miscompile bisection.
-    if std::env::var("CCC_NO_REDUNDANT_EXT").is_err() { let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm); }
+    if std::env::var("CCC_NO_REDUNDANT_EXT").is_err() {
+        let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
+    }
     // the peephole optimizer is now ENABLED BY DEFAULT with a curated,
     // gzip-validated safe subset. The two passes that were proven to miscompile
     // gzip 1.14 (full 30-test suite) are skipped by default: `store_fwd`
@@ -318,15 +326,17 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // valid programs (found via differential fuzzing on generated C; gzip was
     // unaffected but other code with certain loop shapes was). It also does not
     // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
-    let skip_phase4 = !std::env::var("CCC_PEEPHOLE_PHASE4").is_ok()
-        || std::env::var("CCC_NO_MACHINST").is_err(); // Phase 4 renaming is not MachInst-safe
+    let skip_phase4 =
+        !std::env::var("CCC_PEEPHOLE_PHASE4").is_ok() || std::env::var("CCC_NO_MACHINST").is_err(); // Phase 4 renaming is not MachInst-safe
     let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
     let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
     let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
 
     let mut store = LineStore::new(asm);
     let line_count = store.len();
-    let mut infos: Vec<LineInfo> = (0..line_count).map(|i| classify_line(store.get(i))).collect();
+    let mut infos: Vec<LineInfo> = (0..line_count)
+        .map(|i| classify_line(store.get(i)))
+        .collect();
     pin_inline_asm_regions(&store, &mut infos);
     pin_volatile_stack_slots(&store, &mut infos);
     pin_address_taken_stack_slots(&store, &mut infos);
@@ -358,7 +368,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
                 in_prologue = true;
                 continue;
             }
-            if !in_prologue { continue; }
+            if !in_prologue {
+                continue;
+            }
             if matches!(infos[idx].kind, LineKind::Call) {
                 in_prologue = false;
                 continue;
@@ -370,17 +382,25 @@ pub fn peephole_optimize(mut asm: String) -> String {
             // epilogue) are NOT parameter saves. Stop pinning here — otherwise
             // such copies get pinned and block legitimate peephole passes,
             // which can miscompile (see coalesce_phi_register_copies).
-            if matches!(infos[idx].kind, LineKind::Jmp | LineKind::JmpIndirect | LineKind::CondJmp) {
+            if matches!(
+                infos[idx].kind,
+                LineKind::Jmp | LineKind::JmpIndirect | LineKind::CondJmp
+            ) {
                 in_prologue = false;
                 continue;
             }
             // Pin movq from arg regs to callee-saved regs
             if trimmed.starts_with("movq %") {
-                let is_param_prestore = (trimmed.contains("%rdi") || trimmed.contains("%rsi")
-                    || trimmed.contains("%rdx") || trimmed.contains("%rcx")
-                    || trimmed.contains("%r8") || trimmed.contains("%r9"))
-                    && (trimmed.ends_with("%rbx") || trimmed.ends_with("%r12")
-                        || trimmed.ends_with("%r13") || trimmed.ends_with("%r14")
+                let is_param_prestore = (trimmed.contains("%rdi")
+                    || trimmed.contains("%rsi")
+                    || trimmed.contains("%rdx")
+                    || trimmed.contains("%rcx")
+                    || trimmed.contains("%r8")
+                    || trimmed.contains("%r9"))
+                    && (trimmed.ends_with("%rbx")
+                        || trimmed.ends_with("%r12")
+                        || trimmed.ends_with("%r13")
+                        || trimmed.ends_with("%r14")
                         || trimmed.ends_with("%r15"));
                 if is_param_prestore {
                     infos[idx].pinned = true;
@@ -428,7 +448,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
     let mut pass_count = 0;
     while changed && pass_count < max_phase1_iters && !skip_phase1 {
         changed = false;
-        let local_changed = if sk("combined") { false } else { local_patterns::combined_local_pass(&mut store, &mut infos) };
+        let local_changed = if sk("combined") {
+            false
+        } else {
+            local_patterns::combined_local_pass(&mut store, &mut infos)
+        };
         changed |= local_changed;
         if !sk("lea_mem_sib") {
             changed |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
@@ -436,28 +460,60 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("lea_all_uses") {
             changed |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
         }
-        if !sk("fuse_movq_ext") { changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos); }
-        if !sk("fp_roundtrips") { changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos); }
-        if !sk("fp_mem_fold") { changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos); }
-        if !sk("fp_reg_mem_fold") { changed |= memory_fold::fold_fp_register_loads(&mut store, &mut infos); }
+        if !sk("fuse_movq_ext") {
+            changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+        }
+        if !sk("fp_roundtrips") {
+            changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        }
+        if !sk("fp_mem_fold") {
+            changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+        }
+        if !sk("fp_reg_mem_fold") {
+            changed |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+        }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
         // masked interaction with expat test_multichar_cdata_utf16 under the
         // full pass mix — root cause still open, so keep it off by default.
         if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
             changed |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
         }
-        if !sk("rcx_copy") { changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos); }
-        if !sk("ptr_deref") { changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos); }
-        if !sk("fp_spill") { changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos); }
-        if !sk("fuse_copy_op") { changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos); }
-        if !sk("fp_hoist") { changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos); }
-        if !sk("dead_signext") { changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos); }
-        if !sk("dead_leaq") { changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos); }
-        if !sk("base_index") { changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
-        if !sk("acc_alu") { changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos); }
-        if !sk("phi_coalesce") { changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
-        if !sk("signext_move") { changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
-        if !sk("inc_chain") { changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos); }
+        if !sk("rcx_copy") {
+            changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+        }
+        if !sk("ptr_deref") {
+            changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+        }
+        if !sk("fp_spill") {
+            changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
+        }
+        if !sk("fuse_copy_op") {
+            changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
+        }
+        if !sk("fp_hoist") {
+            changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
+        }
+        if !sk("dead_signext") {
+            changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
+        }
+        if !sk("dead_leaq") {
+            changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos);
+        }
+        if !sk("base_index") {
+            changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+        }
+        if !sk("acc_alu") {
+            changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
+        }
+        if !sk("phi_coalesce") {
+            changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+        }
+        if !sk("signext_move") {
+            changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+        }
+        if !sk("inc_chain") {
+            changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+        }
         // add_signext (fuse_add_sign_extend) REMOVED: it rewrote
         // `addl %X,%X; movslq %X,%DST` into `addl %X,%DSTd`, which (a) reads
         // an uninitialized %DSTd — its own SAFETY comment required "DST was
@@ -467,37 +523,84 @@ pub fn peephole_optimize(mut asm: String) -> String {
         // became garbage and XmlNameLength walked off the buffer (SIGSEGV).
         // A sound fusion saves nothing (still needs init + sext), so the
         // pass is deleted rather than gated.
-        if !sk("copy_shift_back") { changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos); }
-        if !sk("xor_move_fold") { changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos); }
-        if !sk("rotate_idiom") { changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos); }
-        if !sk("vec_self_move") { changed |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos); }
-        if !sk("cascaded_shifts") { changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos); }
-        if !sk("gpr_hoist") { changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos); }
-        if !sk("fp_broadcast") { changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos); }
+        if !sk("copy_shift_back") {
+            changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
+        }
+        if !sk("xor_move_fold") {
+            changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
+        }
+        if !sk("rotate_idiom") {
+            changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos);
+        }
+        if !sk("vec_self_move") {
+            changed |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+        }
+        if !sk("cascaded_shifts") {
+            changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
+        }
+        if !sk("gpr_hoist") {
+            changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        }
+        if !sk("fp_broadcast") {
+            changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+        }
         if local_changed || pass_count == 0 {
-            if !sk("push_pop") { changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos); }
-            if !sk("binop_push_pop") { changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos); }
+            if !sk("push_pop") {
+                changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
+            }
+            if !sk("binop_push_pop") {
+                changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
+            }
         }
         pass_count += 1;
     }
 
     // Phase 2: Expensive global passes (run once)
-    let global_changed = if skip_phase2 { false } else {
-    let mut global_changed = false;
-    if !sk("store_fwd") { global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos); }
-    if !sk("spill_deref") { global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos); }
-    if !sk("copy_prop") { global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos); }
-    if !sk("dead_regs") { global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
-    if !sk("dead_stores") { global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos); }
-    if !sk("cmp_branch") { global_changed |= compare_branch::fuse_compare_and_branch(&mut store, &mut infos); }
-    if !sk("mem_fold") { global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
-    if !sk("load_relay") { global_changed |= memory_fold::fold_load_relay(&mut store, &mut infos); }
-    if !sk("leaq_relay") { global_changed |= memory_fold::fold_leaq_relay(&mut store, &mut infos); }
-    if !sk("cltq_relay") { global_changed |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
-    if !sk("ext_relay") { global_changed |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
-    if !sk("gen_relay") { global_changed |= memory_fold::fold_general_relay(&mut store, &mut infos); }
-    if !sk("store_relay") { global_changed |= memory_fold::fold_store_relay(&mut store, &mut infos); }
-    global_changed };
+    let global_changed = if skip_phase2 {
+        false
+    } else {
+        let mut global_changed = false;
+        if !sk("store_fwd") {
+            global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos);
+        }
+        if !sk("spill_deref") {
+            global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos);
+        }
+        if !sk("copy_prop") {
+            global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
+        }
+        if !sk("dead_regs") {
+            global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        }
+        if !sk("dead_stores") {
+            global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos);
+        }
+        if !sk("cmp_branch") {
+            global_changed |= compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
+        }
+        if !sk("mem_fold") {
+            global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+        }
+        if !sk("load_relay") {
+            global_changed |= memory_fold::fold_load_relay(&mut store, &mut infos);
+        }
+        if !sk("leaq_relay") {
+            global_changed |= memory_fold::fold_leaq_relay(&mut store, &mut infos);
+        }
+        if !sk("cltq_relay") {
+            global_changed |= memory_fold::fold_cltq_relay(&mut store, &mut infos);
+        }
+        if !sk("ext_relay") {
+            global_changed |= memory_fold::fold_extend_relay(&mut store, &mut infos);
+        }
+        if !sk("gen_relay") {
+            global_changed |= memory_fold::fold_general_relay(&mut store, &mut infos);
+        }
+        if !sk("store_relay") {
+            global_changed |= memory_fold::fold_store_relay(&mut store, &mut infos);
+        }
+        global_changed
+    };
 
     // Phase 3: One more local cleanup if global passes made changes.
     if global_changed && !skip_phase3 {
@@ -509,36 +612,76 @@ pub fn peephole_optimize(mut asm: String) -> String {
             // executed even when the user skipped `combined` — this caused
             // interaction miscompiles (e.g. redundant `xorl %eax,%eax` removal
             // across loop boundaries). Honor the skip set.
-            if !sk("combined") { changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos); }
-            if !sk("lea_mem_sib") { changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
-            if !sk("lea_all_uses") { changed2 |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos); }
+            if !sk("combined") {
+                changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos);
+            }
+            if !sk("lea_mem_sib") {
+                changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+            }
+            if !sk("lea_all_uses") {
+                changed2 |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
-            if !sk("fp_reg_mem_fold") { changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos); }
+            if !sk("fp_reg_mem_fold") {
+                changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            }
             if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
                 changed2 |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
             }
             changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed2 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
-            if !sk("dead_regs") { changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
-            if !sk("dead_stores") { changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
-            if !sk("mem_fold") { changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
-            if !sk("load_relay") { changed2 |= memory_fold::fold_load_relay(&mut store, &mut infos); }
-            if !sk("leaq_relay") { changed2 |= memory_fold::fold_leaq_relay(&mut store, &mut infos); }
-            if !sk("cltq_relay") { changed2 |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
-            if !sk("ext_relay") { changed2 |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
-            if !sk("gen_relay") { changed2 |= memory_fold::fold_general_relay(&mut store, &mut infos); }
-            if !sk("store_relay") { changed2 |= memory_fold::fold_store_relay(&mut store, &mut infos); }
-            if !sk("base_index") { changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos); }
-            if !sk("phi_coalesce") { changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos); }
-            if !sk("signext_move") { changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
+            if !sk("dead_regs") {
+                changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+            }
+            if !sk("dead_stores") {
+                changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
+            }
+            if !sk("mem_fold") {
+                changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            }
+            if !sk("load_relay") {
+                changed2 |= memory_fold::fold_load_relay(&mut store, &mut infos);
+            }
+            if !sk("leaq_relay") {
+                changed2 |= memory_fold::fold_leaq_relay(&mut store, &mut infos);
+            }
+            if !sk("cltq_relay") {
+                changed2 |= memory_fold::fold_cltq_relay(&mut store, &mut infos);
+            }
+            if !sk("ext_relay") {
+                changed2 |= memory_fold::fold_extend_relay(&mut store, &mut infos);
+            }
+            if !sk("gen_relay") {
+                changed2 |= memory_fold::fold_general_relay(&mut store, &mut infos);
+            }
+            if !sk("store_relay") {
+                changed2 |= memory_fold::fold_store_relay(&mut store, &mut infos);
+            }
+            if !sk("base_index") {
+                changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+            }
+            if !sk("phi_coalesce") {
+                changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            }
+            if !sk("signext_move") {
+                changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
-            if !sk("copy_shift_back") { changed2 |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos); }
-            if !sk("xor_move_fold") { changed2 |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos); }
-            if !sk("rotate_idiom") { changed2 |= local_patterns::fold_rotate_idiom(&mut store, &mut infos); }
-            if !sk("vec_self_move") { changed2 |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos); }
+            if !sk("copy_shift_back") {
+                changed2 |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
+            }
+            if !sk("xor_move_fold") {
+                changed2 |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
+            }
+            if !sk("rotate_idiom") {
+                changed2 |= local_patterns::fold_rotate_idiom(&mut store, &mut infos);
+            }
+            if !sk("vec_self_move") {
+                changed2 |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+            }
             pass_count2 += 1;
         }
     }
@@ -548,7 +691,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // fuse_add_sign_extend removed (unsound: uninitialized dest + dropped sext).
 
     // Phase 4: Eliminate loop backedge trampoline blocks.
-    let trampoline_changed = if skip_phase4 || sk("loop_trampoline") { false } else {
+    let trampoline_changed = if skip_phase4 || sk("loop_trampoline") {
+        false
+    } else {
         loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
     };
 
@@ -559,23 +704,45 @@ pub fn peephole_optimize(mut asm: String) -> String {
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
             changed3 = false;
             changed3 |= local_patterns::combined_local_pass(&mut store, &mut infos);
-            if !sk("lea_mem_sib") { changed3 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos); }
+            if !sk("lea_mem_sib") {
+                changed3 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+            }
             changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
-            if !sk("fp_reg_mem_fold") { changed3 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos); }
+            if !sk("fp_reg_mem_fold") {
+                changed3 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            }
             changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
-            if !sk("dead_regs") { changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos); }
-            if !sk("dead_stores") { changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos); }
-            if !sk("mem_fold") { changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos); }
-            if !sk("load_relay") { changed3 |= memory_fold::fold_load_relay(&mut store, &mut infos); }
-            if !sk("leaq_relay") { changed3 |= memory_fold::fold_leaq_relay(&mut store, &mut infos); }
-            if !sk("cltq_relay") { changed3 |= memory_fold::fold_cltq_relay(&mut store, &mut infos); }
-            if !sk("ext_relay") { changed3 |= memory_fold::fold_extend_relay(&mut store, &mut infos); }
-            if !sk("gen_relay") { changed3 |= memory_fold::fold_general_relay(&mut store, &mut infos); }
+            if !sk("dead_regs") {
+                changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+            }
+            if !sk("dead_stores") {
+                changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
+            }
+            if !sk("mem_fold") {
+                changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            }
+            if !sk("load_relay") {
+                changed3 |= memory_fold::fold_load_relay(&mut store, &mut infos);
+            }
+            if !sk("leaq_relay") {
+                changed3 |= memory_fold::fold_leaq_relay(&mut store, &mut infos);
+            }
+            if !sk("cltq_relay") {
+                changed3 |= memory_fold::fold_cltq_relay(&mut store, &mut infos);
+            }
+            if !sk("ext_relay") {
+                changed3 |= memory_fold::fold_extend_relay(&mut store, &mut infos);
+            }
+            if !sk("gen_relay") {
+                changed3 |= memory_fold::fold_general_relay(&mut store, &mut infos);
+            }
             changed3 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
-            if !sk("signext_move") { changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos); }
+            if !sk("signext_move") {
+                changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            }
             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             pass_count3 += 1;
         }
@@ -656,7 +823,10 @@ mod tests {
         .to_string();
         let result = peephole_optimize(asm);
         assert!(result.contains("incl %ecx"), "{result}");
-        assert!(!result.contains("movq %rcx, %rax\n    incl %eax"), "{result}");
+        assert!(
+            !result.contains("movq %rcx, %rax\n    incl %eax"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -695,18 +865,27 @@ mod tests {
         let asm = "    movq -32(%rbp), %rax\n    movq %rax, %xmm0\n".to_string();
         let result = peephole_optimize(asm);
         eprintln!("fp_roundtrip result: {:?}", result);
-        assert!(result.contains("movsd -32(%rbp), %xmm0"),
-            "should eliminate rax roundtrip: {}", result);
-        assert!(!result.contains("movq %rax, %xmm0"),
-            "movq rax->xmm should be gone: {}", result);
+        assert!(
+            result.contains("movsd -32(%rbp), %xmm0"),
+            "should eliminate rax roundtrip: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %rax, %xmm0"),
+            "movq rax->xmm should be gone: {}",
+            result
+        );
     }
 
     #[test]
     fn test_fp_xmm_roundtrip_load_rcx() {
         let asm = "    movq -40(%rbp), %rcx\n    movq %rcx, %xmm1\n".to_string();
         let result = peephole_optimize(asm);
-        assert!(result.contains("movsd -40(%rbp), %xmm1"),
-            "should eliminate rcx roundtrip: {}", result);
+        assert!(
+            result.contains("movsd -40(%rbp), %xmm1"),
+            "should eliminate rcx roundtrip: {}",
+            result
+        );
     }
 
     #[test]
@@ -714,8 +893,11 @@ mod tests {
         let asm = "    movq %xmm0, %rax\n    movq %rax, -48(%rbp)\n".to_string();
         let result = peephole_optimize(asm);
         eprintln!("fp_store result: {:?}", result);
-        assert!(result.contains("movsd %xmm0, -48(%rbp)"),
-            "should eliminate store roundtrip: {}", result);
+        assert!(
+            result.contains("movsd %xmm0, -48(%rbp)"),
+            "should eliminate store roundtrip: {}",
+            result
+        );
     }
 
     #[test]
@@ -725,18 +907,27 @@ mod tests {
         // not just %xmm0.
         let asm = "    movq %xmm4, %rax\n    movq %rax, 296(%rsp)\n".to_string();
         let result = peephole_optimize(asm);
-        assert!(result.contains("movsd %xmm4, 296(%rsp)"),
-            "should fold movq %xmm4->rax + store: {}", result);
-        assert!(!result.contains("movq %xmm4, %rax"),
-            "GPR bridge should be gone: {}", result);
+        assert!(
+            result.contains("movsd %xmm4, 296(%rsp)"),
+            "should fold movq %xmm4->rax + store: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %xmm4, %rax"),
+            "GPR bridge should be gone: {}",
+            result
+        );
     }
 
     #[test]
     fn test_fp_xmm_roundtrip_store_high_xmm_reg() {
         let asm = "    movq %xmm13, %rax\n    movq %rax, 112(%rbp)\n".to_string();
         let result = peephole_optimize(asm);
-        assert!(result.contains("movsd %xmm13, 112(%rbp)"),
-            "should fold high xmm register: {}", result);
+        assert!(
+            result.contains("movsd %xmm13, 112(%rbp)"),
+            "should fold high xmm register: {}",
+            result
+        );
     }
 
     #[test]
@@ -747,8 +938,11 @@ mod tests {
         let result = peephole_optimize(asm);
         let defined = result.contains("movq -24(%rbp), %rax");
         let read = result.contains("addq $7, %rax");
-        assert!(!(read && !defined),
-            "folded away a LIVE %rax definition:\n{}", result);
+        assert!(
+            !(read && !defined),
+            "folded away a LIVE %rax definition:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -757,29 +951,38 @@ mod tests {
         let result = peephole_optimize(asm);
         let defined = result.contains("movq -8(%rbp), %rcx");
         let read = result.contains("addq $1, %rcx");
-        assert!(!(read && !defined),
-            "folded away a LIVE %rcx definition:\n{}", result);
+        assert!(
+            !(read && !defined),
+            "folded away a LIVE %rcx definition:\n{}",
+            result
+        );
     }
 
     #[test]
     fn test_fp_xmm_roundtrip_load_any_xmm_reg() {
         let asm = "    movq -24(%rbp), %rax\n    movq %rax, %xmm7\n".to_string();
         let result = peephole_optimize(asm);
-        assert!(result.contains("movsd -24(%rbp), %xmm7"),
-            "should fold load into any xmm register: {}", result);
-        assert!(!result.contains("movq %rax, %xmm7"),
-            "bridge movq should be gone: {}", result);
+        assert!(
+            result.contains("movsd -24(%rbp), %xmm7"),
+            "should fold load into any xmm register: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %rax, %xmm7"),
+            "bridge movq should be gone: {}",
+            result
+        );
     }
 
     #[test]
     fn test_fp_memory_fold_mulsd() {
-        let asm = [
-            "    movsd -40(%rbp), %xmm1",
-            "    mulsd %xmm1, %xmm0",
-        ].join("\n") + "\n";
+        let asm = ["    movsd -40(%rbp), %xmm1", "    mulsd %xmm1, %xmm0"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("mulsd -40(%rbp), %xmm0"),
-            "should fold movsd+mulsd: {}", result);
+        assert!(
+            result.contains("mulsd -40(%rbp), %xmm0"),
+            "should fold movsd+mulsd: {}",
+            result
+        );
     }
 
     #[test]
@@ -788,12 +991,20 @@ mod tests {
             "    movsd 8(%rsi), %xmm5",
             "    vsubsd %xmm5, %xmm4, %xmm4",
             "    ret",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("vsubsd 8(%rsi), %xmm4, %xmm4"),
-            "single-use load should become a memory source: {}", result);
-        assert!(!result.contains("movsd 8(%rsi), %xmm5"),
-            "folded load should be deleted: {}", result);
+        assert!(
+            result.contains("vsubsd 8(%rsi), %xmm4, %xmm4"),
+            "single-use load should become a memory source: {}",
+            result
+        );
+        assert!(
+            !result.contains("movsd 8(%rsi), %xmm5"),
+            "folded load should be deleted: {}",
+            result
+        );
     }
 
     #[test]
@@ -803,10 +1014,15 @@ mod tests {
             "    vaddss %xmm5, %xmm4, %xmm4",
             "    vmulss %xmm5, %xmm6, %xmm6",
             "    ret",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movss (%rdi), %xmm5"),
-            "multi-use source load must remain: {}", result);
+        assert!(
+            result.contains("movss (%rdi), %xmm5"),
+            "multi-use source load must remain: {}",
+            result
+        );
     }
 
     #[test]
@@ -815,10 +1031,15 @@ mod tests {
             "    movsd (%rdi), %xmm5",
             "    vmulsd %xmm5, %xmm5, %xmm5",
             "    ret",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movsd (%rdi), %xmm5"),
-            "destination's old value depends on this load: {}", result);
+        assert!(
+            result.contains("movsd (%rdi), %xmm5"),
+            "destination's old value depends on this load: {}",
+            result
+        );
     }
 
     #[test]
@@ -828,23 +1049,31 @@ mod tests {
             "    vaddsd %xmm1, %xmm4, %xmm4",
             "    movsd %xmm10, %xmm11",
             "    ret",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("vaddsd (%rdi), %xmm4, %xmm4"),
-            "xmm10 must not count as a later xmm1 use: {}", result);
+        assert!(
+            result.contains("vaddsd (%rdi), %xmm4, %xmm4"),
+            "xmm10 must not count as a later xmm1 use: {}",
+            result
+        );
     }
 
     #[test]
     fn test_lea_into_indexed_load() {
-        let asm = [
-            "    leaq (%r12, %r9), %rdi",
-            "    movsbq (%rdi), %rsi",
-        ].join("\n") + "\n";
+        let asm = ["    leaq (%r12, %r9), %rdi", "    movsbq (%rdi), %rsi"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movsbq (%r12,%r9), %rsi"),
-            "should fold LEA into SIB load: {}", result);
-        assert!(!result.contains("leaq (%r12, %r9), %rdi"),
-            "temporary LEA should be removed: {}", result);
+        assert!(
+            result.contains("movsbq (%r12,%r9), %rsi"),
+            "should fold LEA into SIB load: {}",
+            result
+        );
+        assert!(
+            !result.contains("leaq (%r12, %r9), %rdi"),
+            "temporary LEA should be removed: {}",
+            result
+        );
     }
 
     #[test]
@@ -853,12 +1082,20 @@ mod tests {
             "    leaq (%r12, %r9), %rdi",
             "    movq %rdi, %rcx",
             "    movb $0, (%rcx)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movb $0, (%r12,%r9)"),
-            "should fold LEA/copy into SIB store: {}", result);
-        assert!(!result.contains("movq %rdi, %rcx"),
-            "temporary address copy should be removed: {}", result);
+        assert!(
+            result.contains("movb $0, (%r12,%r9)"),
+            "should fold LEA/copy into SIB store: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "temporary address copy should be removed: {}",
+            result
+        );
     }
 
     #[test]
@@ -870,23 +1107,47 @@ mod tests {
             "    movq %rax, %r8",
             "    leaq (%rdx, %r8), %r9",
             "    movb $0x20, (%r9)",
-        ].join("\n") + "\n";
-        assert_ne!(scan_register_refs(b"movb $0x20, (%rdx,%r8)") & (1u16 << 8), 0,
-            "SIB index must be represented in the cached register-reference mask");
+        ]
+        .join("\n")
+            + "\n";
+        assert_ne!(
+            scan_register_refs(b"movb $0x20, (%rdx,%r8)") & (1u16 << 8),
+            0,
+            "SIB index must be represented in the cached register-reference mask"
+        );
         let mut store = LineStore::new(asm.clone());
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
-        assert!(local_patterns::fold_lea_into_memory_op(&mut store, &mut infos));
-        assert_ne!(infos[2].reg_refs & (1u16 << 8), 0,
-            "rewritten SIB store must retain r8 in LineInfo: {}", store.get(2));
-        assert_eq!(helpers::get_dest_reg(&infos[2]), REG_NONE,
-            "SIB memory operands do not write their base/index registers");
-        assert!(!dead_code::eliminate_dead_reg_moves(&store, &mut infos),
-            "index producer must not become dead after SIB fold");
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(local_patterns::fold_lea_into_memory_op(
+            &mut store, &mut infos
+        ));
+        assert_ne!(
+            infos[2].reg_refs & (1u16 << 8),
+            0,
+            "rewritten SIB store must retain r8 in LineInfo: {}",
+            store.get(2)
+        );
+        assert_eq!(
+            helpers::get_dest_reg(&infos[2]),
+            REG_NONE,
+            "SIB memory operands do not write their base/index registers"
+        );
+        assert!(
+            !dead_code::eliminate_dead_reg_moves(&store, &mut infos),
+            "index producer must not become dead after SIB fold"
+        );
         let result = peephole_optimize(asm);
-        assert!(result.contains("movb $0x20, (%rdx,%r8)"),
-            "should fold to indexed store: {}", result);
-        assert!(result.contains("movq %rax, %r8"),
-            "SIB index producer must remain live after folding: {}", result);
+        assert!(
+            result.contains("movb $0x20, (%rdx,%r8)"),
+            "should fold to indexed store: {}",
+            result
+        );
+        assert!(
+            result.contains("movq %rax, %r8"),
+            "SIB index producer must remain live after folding: {}",
+            result
+        );
     }
 
     #[test]
@@ -937,14 +1198,29 @@ mod tests {
             "    movq 304(%rsp), %rcx",
             "    addq %rcx, %rax",
             "    jne .LBB1",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let mut store = LineStore::new(asm);
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-        assert!(!changed, "must not hoist when the header has a second forward entry edge");
+        assert!(
+            !changed,
+            "must not hoist when the header has a second forward entry edge"
+        );
         let result = store.build_result(|i| infos[i].is_nop());
-        assert!(result.contains("jmp .LBB1"), "entry jmp must be preserved: {}", result);
-        assert!(result.contains("movq 304(%rsp), %rcx"), "invariant load must stay in the loop: {}", result);
+        assert!(
+            result.contains("jmp .LBB1"),
+            "entry jmp must be preserved: {}",
+            result
+        );
+        assert!(
+            result.contains("movq 304(%rsp), %rcx"),
+            "invariant load must stay in the loop: {}",
+            result
+        );
     }
 
     #[test]
@@ -960,14 +1236,29 @@ mod tests {
             "    movq 304(%rsp), %rcx",
             "    addq %rcx, %rax",
             "    jne .LBB1",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let mut store = LineStore::new(asm);
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-        assert!(changed, "single-entry loop should still hoist the invariant load");
+        assert!(
+            changed,
+            "single-entry loop should still hoist the invariant load"
+        );
         let result = store.build_result(|i| infos[i].is_nop());
-        assert!(!result.contains("jmp .LBB1"), "entry jmp should be replaced by the hoisted load: {}", result);
-        assert!(result.contains("movq 304(%rsp), %rcx"), "hoisted load must be present in the preheader: {}", result);
+        assert!(
+            !result.contains("jmp .LBB1"),
+            "entry jmp should be replaced by the hoisted load: {}",
+            result
+        );
+        assert!(
+            result.contains("movq 304(%rsp), %rcx"),
+            "hoisted load must be present in the preheader: {}",
+            result
+        );
     }
 
     #[test]
@@ -1010,7 +1301,9 @@ mod tests {
             "    testq %rax, %rax",
             "    jne .LBB2",
             "    jmp .LBB4",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         assert!(result.contains("cmpq %rcx, %rax"), "should keep the cmp");
         assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
@@ -1026,7 +1319,9 @@ mod tests {
             "    testq %rax, %rax",
             "    jne .LBB2",
             "    jmp .LBB4",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
         assert!(!result.contains("setl"), "should eliminate setl");
@@ -1041,9 +1336,15 @@ mod tests {
             "    testq %rax, %rax",
             "    je .Lfalse",
             "    jmp .Ltrue",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jge .Lfalse"), "should fuse to jge: {}", result);
+        assert!(
+            result.contains("jge .Lfalse"),
+            "should fuse to jge: {}",
+            result
+        );
     }
 
     #[test]
@@ -1054,9 +1355,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    movq %rcx, -32(%rbp)",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(!result.contains("-24(%rbp), %rax"), "should eliminate the load: {}", result);
+        assert!(
+            !result.contains("-24(%rbp), %rax"),
+            "should eliminate the load: {}",
+            result
+        );
     }
 
     #[test]
@@ -1067,9 +1374,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    movq %rcx, -32(%rbp)",
             "    movq -24(%rbp), %rdx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movq %rax, %rdx"), "should forward to reg-reg: {}", result);
+        assert!(
+            result.contains("movq %rax, %rdx"),
+            "should forward to reg-reg: {}",
+            result
+        );
     }
 
     #[test]
@@ -1078,10 +1391,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    movq -32(%rbp), %rax",
             "    movq -24(%rbp), %rcx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-24(%rbp), %rcx") || result.contains("%rax, %rcx"),
-            "should not forward since rax was modified: {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rcx") || result.contains("%rax, %rcx"),
+            "should not forward since rax was modified: {}",
+            result
+        );
     }
 
     #[test]
@@ -1089,7 +1407,11 @@ mod tests {
         let asm = "    movslq -8(%rbp), %rax\n    cltq\n".to_string();
         let result = peephole_optimize(asm);
         assert!(result.contains("movslq"), "should keep movslq");
-        assert!(!result.contains("cltq"), "should eliminate redundant cltq: {}", result);
+        assert!(
+            !result.contains("cltq"),
+            "should eliminate redundant cltq: {}",
+            result
+        );
     }
 
     #[test]
@@ -1099,23 +1421,46 @@ mod tests {
             "    movq %rsp, %rbp",
             "    movq %rax, -24(%rbp)",
             "    movq %rcx, -24(%rbp)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(!result.contains("%rax, -24(%rbp)"), "first store should be dead: {}", result);
-        assert!(result.contains("%rcx, -24(%rbp)"), "second store should remain: {}", result);
+        assert!(
+            !result.contains("%rax, -24(%rbp)"),
+            "first store should be dead: {}",
+            result
+        );
+        assert!(
+            result.contains("%rcx, -24(%rbp)"),
+            "second store should remain: {}",
+            result
+        );
     }
 
     #[test]
     fn test_condition_codes() {
-        for (cc, expected_jcc) in &[("e", "je"), ("ne", "jne"), ("l", "jl"), ("g", "jg"),
-                                     ("le", "jle"), ("ge", "jge"), ("b", "jb"), ("a", "ja")] {
+        for (cc, expected_jcc) in &[
+            ("e", "je"),
+            ("ne", "jne"),
+            ("l", "jl"),
+            ("g", "jg"),
+            ("le", "jle"),
+            ("ge", "jge"),
+            ("b", "jb"),
+            ("a", "ja"),
+        ] {
             let asm = format!(
                 "    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n",
                 cc
             );
             let result = peephole_optimize(asm);
-            assert!(result.contains(&format!("{} .LBB1", expected_jcc)),
-                "cc={} should produce {}: {}", cc, expected_jcc, result);
+            assert!(
+                result.contains(&format!("{} .LBB1", expected_jcc)),
+                "cc={} should produce {}: {}",
+                cc,
+                expected_jcc,
+                result
+            );
         }
     }
 
@@ -1126,10 +1471,15 @@ mod tests {
             "    movq %rsp, %rbp",
             "    movq %rdi, -24(%rbp)",
             "    movl -24(%rbp), %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movl %edi, %eax"),
-            "qword-to-dword forwarding must retain movl semantics: {}", result);
+        assert!(
+            result.contains("movl %edi, %eax"),
+            "qword-to-dword forwarding must retain movl semantics: {}",
+            result
+        );
         assert!(!result.contains("-24(%rbp), %eax"), "{}", result);
     }
 
@@ -1140,7 +1490,9 @@ mod tests {
             "    movq %rsp, %rbp",
             "    movq %rax, -24(%rbp)",
             "    movl -24(%rbp), %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // movl %eax,%eax is not a no-op: it clears RAX's upper half.
         assert!(result.contains("movl %eax, %eax"), "{}", result);
@@ -1155,10 +1507,15 @@ mod tests {
             "    movq %rcx, -32(%rbp)",
             ".Lfallthrough:",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(!result.contains("-24(%rbp), %rax"),
-            "should forward across fallthrough label: {}", result);
+        assert!(
+            !result.contains("-24(%rbp), %rax"),
+            "should forward across fallthrough label: {}",
+            result
+        );
     }
 
     #[test]
@@ -1171,10 +1528,15 @@ mod tests {
             ".Lskip:",
             "    ret",
             "    jmp .Ltarget",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-24(%rbp), %rax") || result.contains("-24(%rbp),"),
-            "should NOT forward across jump target: {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rax") || result.contains("-24(%rbp),"),
+            "should NOT forward across jump target: {}",
+            result
+        );
     }
 
     #[test]
@@ -1186,10 +1548,15 @@ mod tests {
             "    cmpq %rcx, %rax",
             "    jne .Lother",
             "    movq -24(%rbp), %rdx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movq %rax, %rdx"),
-            "should forward on fallthrough after cond branch: {}", result);
+        assert!(
+            result.contains("movq %rax, %rdx"),
+            "should forward on fallthrough after cond branch: {}",
+            result
+        );
     }
 
     #[test]
@@ -1198,10 +1565,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    callq some_func",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-24(%rbp), %rax"),
-            "should not forward across call (rax clobbered): {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "should not forward across call (rax clobbered): {}",
+            result
+        );
     }
 
     #[test]
@@ -1212,13 +1584,18 @@ mod tests {
             "    movq %rbx, -24(%rbp)",
             "    callq some_func",
             "    movq -24(%rbp), %rbx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // A callee may write through an escaped pointer to this slot. Preserve
         // the reload until escape analysis exists; callee-saved register status
         // alone does not prove memory is unchanged.
-        assert!(result.contains("-24(%rbp), %rbx"),
-            "must not forward a stack slot across a call: {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rbx"),
+            "must not forward a stack slot across a call: {}",
+            result
+        );
     }
 
     #[test]
@@ -1227,19 +1604,38 @@ mod tests {
             "    movl %eax, -8(%rbp)",
             "    movntil %ecx, -8(%rbp)",
             "    movl -8(%rbp), %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-8(%rbp), %eax"),
-            "must not eliminate load after unrecognized write to same slot: {}", result);
+        assert!(
+            result.contains("-8(%rbp), %eax"),
+            "must not eliminate load after unrecognized write to same slot: {}",
+            result
+        );
     }
 
     #[test]
     fn test_classify_line() {
         let info = classify_line("    movq %rax, -8(%rbp)");
-        assert!(matches!(info.kind, LineKind::StoreRbp { reg: 0, offset: -8, size: MoveSize::Q }));
+        assert!(matches!(
+            info.kind,
+            LineKind::StoreRbp {
+                reg: 0,
+                offset: -8,
+                size: MoveSize::Q
+            }
+        ));
 
         let info = classify_line("    movq -16(%rbp), %rcx");
-        assert!(matches!(info.kind, LineKind::LoadRbp { reg: 1, offset: -16, size: MoveSize::Q }));
+        assert!(matches!(
+            info.kind,
+            LineKind::LoadRbp {
+                reg: 1,
+                offset: -16,
+                size: MoveSize::Q
+            }
+        ));
 
         let info = classify_line(".Lfoo:");
         assert_eq!(info.kind, LineKind::Label);
@@ -1257,7 +1653,10 @@ mod tests {
         assert_eq!(parse_rbp_offset("addq (%rbp), %rax"), 0);
         assert_eq!(parse_rbp_offset("movq 16(%rbp), %rdx"), 16);
         assert_eq!(parse_rbp_offset("movq %rax, %rcx"), RBP_OFFSET_NONE);
-        assert_eq!(parse_rbp_offset("movq -8(%rbp), -16(%rbp)"), RBP_OFFSET_NONE);
+        assert_eq!(
+            parse_rbp_offset("movq -8(%rbp), -16(%rbp)"),
+            RBP_OFFSET_NONE
+        );
         assert_eq!(parse_rbp_offset("addq -8(%rbp), -8(%rbp)"), -8);
     }
 
@@ -1271,12 +1670,20 @@ mod tests {
             "    testq %rax, %rax",
             "    jne .LBB8",
             "    jmp .LBB10",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-40(%rbp)"),
-            "must preserve cross-block store: {}", result);
-        assert!(result.contains("sete"),
-            "must preserve sete for cross-block store: {}", result);
+        assert!(
+            result.contains("-40(%rbp)"),
+            "must preserve cross-block store: {}",
+            result
+        );
+        assert!(
+            result.contains("sete"),
+            "must preserve sete for cross-block store: {}",
+            result
+        );
     }
 
     #[test]
@@ -1287,10 +1694,15 @@ mod tests {
             ".LBB21:",
             "    movq -40(%rbp), %rax",
             "    movq %rax, -160(%rbp)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-40(%rbp), %rax"),
-            "must NOT eliminate load after indirect jump target label: {}", result);
+        assert!(
+            result.contains("-40(%rbp), %rax"),
+            "must NOT eliminate load after indirect jump target label: {}",
+            result
+        );
     }
 
     #[test]
@@ -1301,10 +1713,15 @@ mod tests {
             ".LBB5:",
             "    movq -40(%rbp), %rax",
             "    ret",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-40(%rbp), %rax"),
-            "must NOT eliminate load after jmpq* indirect jump target: {}", result);
+        assert!(
+            result.contains("-40(%rbp), %rax"),
+            "must NOT eliminate load after jmpq* indirect jump target: {}",
+            result
+        );
     }
 
     #[test]
@@ -1318,10 +1735,15 @@ mod tests {
             "    movq -40(%rbp), %rcx",
             "    movl %esi, (%rcx)",
             "    popq %rcx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-40(%rbp), %rcx"),
-            "must NOT forward rax across rdmsr (rax clobbered by inline asm): {}", result);
+        assert!(
+            result.contains("-40(%rbp), %rcx"),
+            "must NOT forward rax across rdmsr (rax clobbered by inline asm): {}",
+            result
+        );
     }
 
     #[test]
@@ -1330,10 +1752,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    xorl %eax, %eax ; movl $1, %ecx",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-24(%rbp), %rax"),
-            "must not forward across multi-instruction line with ';': {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "must not forward across multi-instruction line with ';': {}",
+            result
+        );
     }
 
     #[test]
@@ -1342,10 +1769,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    rdmsr",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-24(%rbp), %rax"),
-            "must not forward across rdmsr (implicit clobber of rax/rdx): {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "must not forward across rdmsr (implicit clobber of rax/rdx): {}",
+            result
+        );
     }
 
     #[test]
@@ -1354,10 +1786,15 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    cpuid",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-24(%rbp), %rax"),
-            "must not forward across cpuid (implicit clobber of rax/rbx/rcx/rdx): {}", result);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "must not forward across cpuid (implicit clobber of rax/rbx/rcx/rdx): {}",
+            result
+        );
     }
 
     #[test]
@@ -1366,10 +1803,15 @@ mod tests {
             "    movl %ecx, -8(%rbp)",
             "    sete %cl",
             "    movl -8(%rbp), %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-8(%rbp), %eax"),
-            "must NOT forward ecx across sete %%cl (ecx clobbered): {}", result);
+        assert!(
+            result.contains("-8(%rbp), %eax"),
+            "must NOT forward ecx across sete %%cl (ecx clobbered): {}",
+            result
+        );
     }
 
     #[test]
@@ -1378,10 +1820,15 @@ mod tests {
             "    movq %rax, -16(%rbp)",
             "    sete %al",
             "    movq -16(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-16(%rbp), %rax"),
-            "must NOT forward rax across sete %%al (rax clobbered): {}", result);
+        assert!(
+            result.contains("-16(%rbp), %rax"),
+            "must NOT forward rax across sete %%al (rax clobbered): {}",
+            result
+        );
     }
 
     #[test]
@@ -1390,10 +1837,15 @@ mod tests {
             "    movq %rcx, -16(%rbp)",
             "    syscall",
             "    movq -16(%rbp), %rcx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("-16(%rbp), %rcx"),
-            "must NOT forward rcx across syscall (rcx clobbered): {}", result);
+        assert!(
+            result.contains("-16(%rbp), %rcx"),
+            "must NOT forward rcx across syscall (rcx clobbered): {}",
+            result
+        );
     }
 
     #[test]
@@ -1410,16 +1862,30 @@ mod tests {
             ".LBB2:",
             "    movq %r14, %r9",
             "    jmp .LBB1",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("addq $320, %r9"),
-            "should rewrite addq to target %r9 directly: {}", result);
-        assert!(!result.contains("movq %r9, %r14"),
-            "should eliminate the initial copy: {}", result);
-        assert!(!result.contains("movq %r14, %r9"),
-            "should eliminate the trampoline copy: {}", result);
-        assert!(result.contains("jne .LBB1"),
-            "should redirect branch to loop header: {}", result);
+        assert!(
+            result.contains("addq $320, %r9"),
+            "should rewrite addq to target %r9 directly: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r9, %r14"),
+            "should eliminate the initial copy: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r14, %r9"),
+            "should eliminate the trampoline copy: {}",
+            result
+        );
+        assert!(
+            result.contains("jne .LBB1"),
+            "should redirect branch to loop header: {}",
+            result
+        );
     }
 
     #[test]
@@ -1440,18 +1906,35 @@ mod tests {
             "    movq %r14, %r9",
             "    movq %r15, %r10",
             "    jmp .LBB10",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("addq $320, %r9"),
-            "should rewrite dest addq to %r9: {}", result);
-        assert!(result.contains("addl %r8d, %r10d"),
-            "should rewrite frac addl to %r10d: {}", result);
-        assert!(!result.contains("movq %r9, %r14"),
-            "should eliminate dest copy: {}", result);
-        assert!(!result.contains("movq %r10, %r15"),
-            "should eliminate frac copy: {}", result);
-        assert!(result.contains("jne .LBB10"),
-            "should redirect branch to loop header: {}", result);
+        assert!(
+            result.contains("addq $320, %r9"),
+            "should rewrite dest addq to %r9: {}",
+            result
+        );
+        assert!(
+            result.contains("addl %r8d, %r10d"),
+            "should rewrite frac addl to %r10d: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r9, %r14"),
+            "should eliminate dest copy: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r10, %r15"),
+            "should eliminate frac copy: {}",
+            result
+        );
+        assert!(
+            result.contains("jne .LBB10"),
+            "should redirect branch to loop header: {}",
+            result
+        );
     }
 
     #[test]
@@ -1462,16 +1945,30 @@ mod tests {
             "    jmp .LBB4",
             ".LBB2:",
             "    movq %rax, %rcx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jge .LBB4"),
-            "should invert jl to jge: {}", result);
-        assert!(!result.contains("jl .LBB2"),
-            "should remove original jl: {}", result);
-        assert!(!result.contains("jmp .LBB4"),
-            "should remove the jmp: {}", result);
-        assert!(result.contains(".LBB2:"),
-            "should keep the label: {}", result);
+        assert!(
+            result.contains("jge .LBB4"),
+            "should invert jl to jge: {}",
+            result
+        );
+        assert!(
+            !result.contains("jl .LBB2"),
+            "should remove original jl: {}",
+            result
+        );
+        assert!(
+            !result.contains("jmp .LBB4"),
+            "should remove the jmp: {}",
+            result
+        );
+        assert!(
+            result.contains(".LBB2:"),
+            "should keep the label: {}",
+            result
+        );
     }
 
     #[test]
@@ -1482,12 +1979,20 @@ mod tests {
             "    jmp .Lfalse",
             ".Ltrue:",
             "    ret",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jne .Lfalse"),
-            "should invert je to jne: {}", result);
-        assert!(!result.contains("jmp .Lfalse"),
-            "should remove the jmp: {}", result);
+        assert!(
+            result.contains("jne .Lfalse"),
+            "should invert je to jne: {}",
+            result
+        );
+        assert!(
+            !result.contains("jmp .Lfalse"),
+            "should remove the jmp: {}",
+            result
+        );
     }
 
     #[test]
@@ -1498,18 +2003,27 @@ mod tests {
             "    jmp .LBB4",
             ".LBB2:",
             "    movq %rax, %rcx",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jl .LBB5"),
-            "should keep jl when not fallthrough: {}", result);
+        assert!(
+            result.contains("jl .LBB5"),
+            "should keep jl when not fallthrough: {}",
+            result
+        );
     }
 
     #[test]
     fn test_back_to_back_cltq() {
         let asm = "    cltq\n    cltq\n".to_string();
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("cltq").count(), 1,
-            "should keep only one cltq: {}", result);
+        assert_eq!(
+            result.matches("cltq").count(),
+            1,
+            "should keep only one cltq: {}",
+            result
+        );
     }
 
     #[test]
@@ -1518,34 +2032,38 @@ mod tests {
             "    movslq -8(%rbp), %rax",
             "    movq %rax, %r8",
             "    cltq",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(!result.contains("cltq"),
-            "cltq should be eliminated after movslq past non-rax-write: {}", result);
+        assert!(
+            !result.contains("cltq"),
+            "cltq should be eliminated after movslq past non-rax-write: {}",
+            result
+        );
     }
 
     #[test]
     fn test_cltq_backward_scan_blocked_by_rax_write() {
-        let asm = [
-            "    movslq -8(%rbp), %rax",
-            "    addl $1, %eax",
-            "    cltq",
-        ].join("\n") + "\n";
+        let asm = ["    movslq -8(%rbp), %rax", "    addl $1, %eax", "    cltq"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("cltq"),
-            "cltq should NOT be eliminated when rax is modified: {}", result);
+        assert!(
+            result.contains("cltq"),
+            "cltq should NOT be eliminated when rax is modified: {}",
+            result
+        );
     }
 
     #[test]
     fn test_cltq_backward_scan_blocked_by_call() {
-        let asm = [
-            "    cltq",
-            "    call foo",
-            "    cltq",
-        ].join("\n") + "\n";
+        let asm = ["    cltq", "    call foo", "    cltq"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("cltq").count(), 2,
-            "both cltq should survive when call intervenes: {}", result);
+        assert_eq!(
+            result.matches("cltq").count(),
+            2,
+            "both cltq should survive when call intervenes: {}",
+            result
+        );
     }
 
     #[test]
@@ -1555,136 +2073,144 @@ mod tests {
             "    movq %rax, -16(%rbp)",
             "    movq %rax, %r9",
             "    cltq",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("cltq").count(), 1,
-            "second cltq should be eliminated past store and mov: {}", result);
+        assert_eq!(
+            result.matches("cltq").count(),
+            1,
+            "second cltq should be eliminated past store and mov: {}",
+            result
+        );
     }
 
     // ── Memory operand folding tests ──────────────────────────────────────
 
     #[test]
     fn test_mem_fold_addq_rcx() {
-        let asm = [
-            "    movq -48(%rbp), %rcx",
-            "    addq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -48(%rbp), %rcx", "    addq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("addq -48(%rbp), %rax"),
-            "should fold load+add into memory operand: {}", result);
-        assert!(!result.contains("movq -48(%rbp), %rcx"),
-            "load should be eliminated: {}", result);
+        assert!(
+            result.contains("addq -48(%rbp), %rax"),
+            "should fold load+add into memory operand: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq -48(%rbp), %rcx"),
+            "load should be eliminated: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_subl_ecx() {
-        let asm = [
-            "    movq -64(%rbp), %rcx",
-            "    subl %ecx, %eax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -64(%rbp), %rcx", "    subl %ecx, %eax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("subl -64(%rbp), %eax"),
-            "should fold load+sub into memory operand: {}", result);
+        assert!(
+            result.contains("subl -64(%rbp), %eax"),
+            "should fold load+sub into memory operand: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_cmpq_rcx() {
-        let asm = [
-            "    movq -8(%rbp), %rcx",
-            "    cmpq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -8(%rbp), %rcx", "    cmpq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("cmpq -8(%rbp), %rax"),
-            "should fold load+cmp into memory operand: {}", result);
+        assert!(
+            result.contains("cmpq -8(%rbp), %rax"),
+            "should fold load+cmp into memory operand: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_testq_rcx() {
-        let asm = [
-            "    movq -16(%rbp), %rcx",
-            "    testq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -16(%rbp), %rcx", "    testq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("testq -16(%rbp), %rax"),
-            "should fold load+test into memory operand: {}", result);
+        assert!(
+            result.contains("testq -16(%rbp), %rax"),
+            "should fold load+test into memory operand: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_no_fold_when_dest_is_loaded_reg() {
-        let asm = [
-            "    movq -48(%rbp), %rcx",
-            "    addq %rax, %rcx",
-        ].join("\n") + "\n";
+        let asm = ["    movq -48(%rbp), %rcx", "    addq %rax, %rcx"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movq -48(%rbp), %rcx") || result.contains("addq %rax, %rcx"),
-            "should not fold when loaded reg is destination: {}", result);
+        assert!(
+            result.contains("movq -48(%rbp), %rcx") || result.contains("addq %rax, %rcx"),
+            "should not fold when loaded reg is destination: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_no_fold_for_callee_saved() {
-        let asm = [
-            "    movq -48(%rbp), %rbx",
-            "    addq %rbx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -48(%rbp), %rbx", "    addq %rbx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(!result.contains("addq -48(%rbp), %rax"),
-            "should not fold callee-saved register loads: {}", result);
+        assert!(
+            !result.contains("addq -48(%rbp), %rax"),
+            "should not fold callee-saved register loads: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_andq() {
-        let asm = [
-            "    movq -16(%rbp), %rcx",
-            "    andq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -16(%rbp), %rcx", "    andq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("andq -16(%rbp), %rax"),
-            "should fold load+and into memory operand: {}", result);
+        assert!(
+            result.contains("andq -16(%rbp), %rax"),
+            "should fold load+and into memory operand: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_xorq() {
-        let asm = [
-            "    movq -24(%rbp), %rcx",
-            "    xorq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -24(%rbp), %rcx", "    xorq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("xorq -24(%rbp), %rax"),
-            "should fold load+xor into memory operand: {}", result);
+        assert!(
+            result.contains("xorq -24(%rbp), %rax"),
+            "should fold load+xor into memory operand: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_load_rax_into_add_with_reg_dest() {
-        let asm = [
-            "    movq -32(%rbp), %rax",
-            "    addq %rax, %r12",
-        ].join("\n") + "\n";
+        let asm = ["    movq -32(%rbp), %rax", "    addq %rax, %r12"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("addq -32(%rbp), %r12"),
-            "should fold rax load into add with callee-saved dest: {}", result);
+        assert!(
+            result.contains("addq -32(%rbp), %r12"),
+            "should fold rax load into add with callee-saved dest: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_orq() {
-        let asm = [
-            "    movq -16(%rbp), %rcx",
-            "    orq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -16(%rbp), %rcx", "    orq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("orq -16(%rbp), %rax"),
-            "should fold load+or into memory operand: {}", result);
+        assert!(
+            result.contains("orq -16(%rbp), %rax"),
+            "should fold load+or into memory operand: {}",
+            result
+        );
     }
 
     #[test]
     fn test_mem_fold_with_empty_line_between() {
-        let asm = [
-            "    movq -48(%rbp), %rcx",
-            "",
-            "    addq %rcx, %rax",
-        ].join("\n") + "\n";
+        let asm = ["    movq -48(%rbp), %rcx", "", "    addq %rcx, %rax"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("addq -48(%rbp), %rax"),
-            "should fold with empty lines between: {}", result);
+        assert!(
+            result.contains("addq -48(%rbp), %rax"),
+            "should fold with empty lines between: {}",
+            result
+        );
     }
 
     // ── Redundant xorl elimination tests ─────────────────────────────────
@@ -1696,14 +2222,26 @@ mod tests {
             "    movq %rax, -8(%rbp)",
             "    xorl %eax, %eax",
             "    movq %rax, -16(%rbp)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("xorl %eax, %eax").count(), 1,
-            "second xorl should be eliminated: {}", result);
-        assert!(result.contains("movq %rax, -8(%rbp)"),
-            "first store should remain: {}", result);
-        assert!(result.contains("movq %rax, -16(%rbp)"),
-            "second store should remain: {}", result);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            1,
+            "second xorl should be eliminated: {}",
+            result
+        );
+        assert!(
+            result.contains("movq %rax, -8(%rbp)"),
+            "first store should remain: {}",
+            result
+        );
+        assert!(
+            result.contains("movq %rax, -16(%rbp)"),
+            "second store should remain: {}",
+            result
+        );
     }
 
     #[test]
@@ -1717,10 +2255,16 @@ mod tests {
             "    movq %rax, -24(%rbp)",
             "    xorl %eax, %eax",
             "    movq %rax, -32(%rbp)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("xorl %eax, %eax").count(), 1,
-            "only first xorl should survive: {}", result);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            1,
+            "only first xorl should survive: {}",
+            result
+        );
     }
 
     #[test]
@@ -1730,11 +2274,17 @@ mod tests {
             "    movq %rax, -8(%rbp)",
             "    movq -16(%rbp), %rax",
             "    xorl %eax, %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // The load to %rax invalidates rax_is_zero, so both xorls are needed
-        assert_eq!(result.matches("xorl %eax, %eax").count(), 2,
-            "both xorls should survive after rax modification: {}", result);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            2,
+            "both xorls should survive after rax modification: {}",
+            result
+        );
     }
 
     #[test]
@@ -1744,10 +2294,16 @@ mod tests {
             "    movq %rax, -8(%rbp)",
             ".LBB1:",
             "    xorl %eax, %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("xorl %eax, %eax").count(), 2,
-            "xorl after label should NOT be eliminated: {}", result);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            2,
+            "xorl after label should NOT be eliminated: {}",
+            result
+        );
     }
 
     #[test]
@@ -1757,10 +2313,16 @@ mod tests {
             "    movq %rax, -8(%rbp)",
             "    call some_func",
             "    xorl %eax, %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert_eq!(result.matches("xorl %eax, %eax").count(), 2,
-            "xorl after call should NOT be eliminated: {}", result);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            2,
+            "xorl after call should NOT be eliminated: {}",
+            result
+        );
     }
 }
 
@@ -1806,21 +2368,23 @@ mod regression_tests {
             "    subq $160, %rsp",
             // ... setup ...
             "    movl (%rcx), %eax",
-            "    movq %rax, -144(%rbp)",       // store data[x*2]
-            "    movq -128(%rbp), %rax",       // load to+1 (clobbers rax)
-            "    movl %eax, %eax",             // truncate
-            "    movq %rax, -136(%rbp)",       // store to+1
-            "    cmpl -144(%rbp), %eax",       // memory-folded cmp (Cmp kind)
+            "    movq %rax, -144(%rbp)", // store data[x*2]
+            "    movq -128(%rbp), %rax", // load to+1 (clobbers rax)
+            "    movl %eax, %eax",       // truncate
+            "    movq %rax, -136(%rbp)", // store to+1
+            "    cmpl -144(%rbp), %eax", // memory-folded cmp (Cmp kind)
             "    setae %al",
             "    movzbq %al, %rax",
             "    movq %rax, %rsi",
             "    movq %r11, %rax",
             "    addl $1, %eax",
             "    cltq",
-            "    movq %rax, -144(%rbp)",       // later overwrite of -144
+            "    movq %rax, -144(%rbp)", // later overwrite of -144
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // After optimization, there must still be a store to -144(%rbp) before
         // the cmpl that reads it. The cmpl must compare the correct value.
@@ -1836,16 +2400,24 @@ mod regression_tests {
                         found_store = true;
                         break;
                     }
-                    if prev.ends_with(':') { break; }
+                    if prev.ends_with(':') {
+                        break;
+                    }
                 }
-                assert!(found_store,
-                    "cmpl -144(%rbp) has no preceding store in same block!\nResult:\n{}", result);
+                assert!(
+                    found_store,
+                    "cmpl -144(%rbp) has no preceding store in same block!\nResult:\n{}",
+                    result
+                );
                 return;
             }
         }
         // If the cmpl was not folded, check it exists in some form
-        assert!(result.contains("cmpl") || result.contains("setae"),
-            "No comparison found\nResult:\n{}", result);
+        assert!(
+            result.contains("cmpl") || result.contains("setae"),
+            "No comparison found\nResult:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -1872,7 +2444,9 @@ mod regression_tests {
             "    movq %rax, %r14",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // After optimization, rax must be loaded from rdi or from the stack
         // before the leaq instruction.
@@ -1881,10 +2455,11 @@ mod regression_tests {
         // NOT: leaq 208(%rax) with rax uninitialized!
         eprintln!("Result:\n{}", result);
         assert!(
-            result.contains("movq %rdi, %rax") || 
-            result.contains("movq -8(%rbp), %rax") ||
-            result.contains("leaq 208(%rdi)"),
-            "rax must be set from rdi before leaq 208(%rax): {}", result
+            result.contains("movq %rdi, %rax")
+                || result.contains("movq -8(%rbp), %rax")
+                || result.contains("leaq 208(%rdi)"),
+            "rax must be set from rdi before leaq 208(%rax): {}",
+            result
         );
     }
 
@@ -1927,19 +2502,29 @@ mod regression_tests {
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // The store to -8(%rbp) must survive because the read at -4(%rbp) overlaps it.
         // The load must also survive.
         let lines: Vec<&str> = result.lines().map(|l| l.trim()).collect();
-        let has_store = lines.iter().any(|l| l.contains("%rsi") && l.contains("(%rbp)"));
+        let has_store = lines
+            .iter()
+            .any(|l| l.contains("%rsi") && l.contains("(%rbp)"));
         // The load may be folded by relay elimination: movl -4(%rbp),%eax + movq %rax,%r14
         // becomes movl -4(%rbp),%r14d — so accept either %eax or %r14d as the destination.
-        let has_load = lines.iter().any(|l| l.starts_with("movl") && l.contains("(%rbp)") && (l.contains("%eax") || l.contains("%r14d")));
-        assert!(has_store,
-            "store of struct param must survive frame compaction (overlapping read exists): {}", result);
-        assert!(has_load,
-            "load of struct field must survive: {}", result);
+        let has_load = lines.iter().any(|l| {
+            l.starts_with("movl")
+                && l.contains("(%rbp)")
+                && (l.contains("%eax") || l.contains("%r14d"))
+        });
+        assert!(
+            has_store,
+            "store of struct param must survive frame compaction (overlapping read exists): {}",
+            result
+        );
+        assert!(has_load, "load of struct field must survive: {}", result);
     }
 
     /// Regression test: frame compaction must NOP out dead stores that conflict
@@ -1972,7 +2557,7 @@ mod regression_tests {
             "    movq %rax, -56(%rbp)",
             "    movq -56(%rbp), %rdi",
             "    call some_func",
-            "    movq %rax, -64(%rbp)",      // dead store - never read
+            "    movq %rax, -64(%rbp)", // dead store - never read
             "    movq %rax, %r14",
             // Epilogue
             "    movq %r14, %rax",
@@ -1985,22 +2570,29 @@ mod regression_tests {
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // After compaction:
         // - Frame should be smaller than 112
         // - Dead store at -64 should be NOP'd (not present in output)
         // - Callee saves should be at new offsets
-        assert!(result.contains("subq $"),
-            "should have subq: {}", result);
-        assert!(!result.contains("subq $112"),
-            "frame should be compacted from 112: {}", result);
+        assert!(result.contains("subq $"), "should have subq: {}", result);
+        assert!(
+            !result.contains("subq $112"),
+            "frame should be compacted from 112: {}",
+            result
+        );
         // The dead store to -64 must not appear in the output
         // (it would clobber the relocated callee save)
-        assert!(!result.contains("-64(%rbp)") ||
+        assert!(
+            !result.contains("-64(%rbp)") ||
                 // -64 might appear as a new callee-save offset in saves/restores which is OK
                 (result.contains("movq %r15, -64(%rbp)") || result.contains("movq -64(%rbp), %r15")),
-            "dead store to -64 must be eliminated or -64 used only for callee save: {}", result);
+            "dead store to -64 must be eliminated or -64 used only for callee save: {}",
+            result
+        );
     }
 
     /// Regression test: a struct stored with movq at -8(%rbp) that is read
@@ -2038,11 +2630,16 @@ mod regression_tests {
             "    popq %rbp",
             "    ret",
             ".size release_entry, .-release_entry",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // The struct store at -8(%rbp) must be preserved because -4(%rbp) is read
-        assert!(result.contains("movq %rsi, -8(%rbp)"),
-            "struct param store at -8(%rbp) must NOT be NOP'd when -4(%rbp) is read: {}", result);
+        assert!(
+            result.contains("movq %rsi, -8(%rbp)"),
+            "struct param store at -8(%rbp) must NOT be NOP'd when -4(%rbp) is read: {}",
+            result
+        );
     }
 
     #[test]
@@ -2053,13 +2650,21 @@ mod regression_tests {
             "    addq %rcx, %rax",
             "    movq %rax, %rcx",
             "    movb $0, (%rcx)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         eprintln!("sib_indexed result: {:?}", result);
-        assert!(result.contains("(%rcx, %r14)") || result.contains("(%rcx,%r14)"),
-            "should fold to SIB indexed addressing: {}", result);
-        assert!(!result.contains("addq %rcx, %rax"),
-            "addq should be eliminated: {}", result);
+        assert!(
+            result.contains("(%rcx, %r14)") || result.contains("(%rcx,%r14)"),
+            "should fold to SIB indexed addressing: {}",
+            result
+        );
+        assert!(
+            !result.contains("addq %rcx, %rax"),
+            "addq should be eliminated: {}",
+            result
+        );
     }
 
     #[test]
@@ -2069,11 +2674,16 @@ mod regression_tests {
             "    movq %r14, %rax",
             "    addq %rbx, %rax",
             "    movb $0, (%rax)",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         eprintln!("sib_direct result: {:?}", result);
-        assert!(result.contains("(%rbx, %r14)") || result.contains("(%rbx,%r14)"),
-            "should fold to SIB indexed addressing: {}", result);
+        assert!(
+            result.contains("(%rbx, %r14)") || result.contains("(%rbx,%r14)"),
+            "should fold to SIB indexed addressing: {}",
+            result
+        );
     }
 
     #[test]
@@ -2082,12 +2692,19 @@ mod regression_tests {
             "    # LCCC_VOLATILE_SLOT -24(%rbp)",
             "    movq %rax, -24(%rbp)",
             "    movq -24(%rbp), %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let mut store = LineStore::new(asm.clone());
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         pin_volatile_stack_slots(&store, &mut infos);
         assert!(infos[1].pinned && infos[2].pinned);
-        assert!(matches!(infos[1].kind, LineKind::Other { dest_reg: REG_NONE }));
+        assert!(matches!(
+            infos[1].kind,
+            LineKind::Other { dest_reg: REG_NONE }
+        ));
         let result = peephole_optimize(asm);
         assert!(result.contains("movq %rax, -24(%rbp)"), "{}", result);
         assert!(result.contains("movq -24(%rbp), %rax"), "{}", result);
@@ -2105,15 +2722,25 @@ mod regression_tests {
             "    movl 8(%rsp), %eax",
             "    xorl %eax, %eax",
             "    pushq %rax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // The first zeroing is dead because the volatile load overwrites eax.
         // The important invariant is that the *second* zeroing survives after
         // the opaque load; otherwise pushq would consume the volatile value.
         assert_eq!(result.matches("xorl %eax, %eax").count(), 1, "{}", result);
-        let load = result.find("movl 8(%rsp), %eax").expect("volatile load kept");
-        let zero = result.rfind("xorl %eax, %eax").expect("post-load zero kept");
-        assert!(load < zero, "post-load zero must follow volatile load: {}", result);
+        let load = result
+            .find("movl 8(%rsp), %eax")
+            .expect("volatile load kept");
+        let zero = result
+            .rfind("xorl %eax, %eax")
+            .expect("post-load zero kept");
+        assert!(
+            load < zero,
+            "post-load zero must follow volatile load: {}",
+            result
+        );
     }
 
     #[test]
@@ -2127,25 +2754,32 @@ mod regression_tests {
             "    movsd 24(%rsp), %xmm0",
             "    leaq 56(%rsp), %rsi",
             "    call memcpy",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let mut store = LineStore::new(asm);
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         pin_address_taken_stack_slots(&store, &mut infos);
         assert!(infos[0].pinned, "address-taken store must be pinned");
         while local_patterns::combined_local_pass(&mut store, &mut infos) {}
         let local = store.build_result(|i| infos[i].is_nop());
         assert!(local.contains("movq %rax, 56(%rsp)"), "{}", local);
 
-        let full = peephole_optimize([
-            "    movq %rax, 56(%rsp)",
-            "    movq %rax, 24(%rsp)",
-            "    movsd 24(%rsp), %xmm0",
-            "    leaq 56(%rsp), %rsi",
-            "    call memcpy",
-        ].join("\n") + "\n");
+        let full = peephole_optimize(
+            [
+                "    movq %rax, 56(%rsp)",
+                "    movq %rax, 24(%rsp)",
+                "    movsd 24(%rsp), %xmm0",
+                "    leaq 56(%rsp), %rsi",
+                "    call memcpy",
+            ]
+            .join("\n")
+                + "\n",
+        );
         assert!(full.contains("movq %rax, 56(%rsp)"), "{}", full);
     }
-
 
     #[test]
     fn test_global_store_forward_callee_saved_loop_header_is_not_forwarded() {
@@ -2160,15 +2794,21 @@ mod regression_tests {
             "    movq -8(%rsp), %rax",
             "    movq $2, %rbx",
             "    jmp .LBB200",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movq -8(%rsp), %rax"),
-            "CFG-join reload must not forward a stale callee-saved register: {}", result);
+        assert!(
+            result.contains("movq -8(%rsp), %rax"),
+            "CFG-join reload must not forward a stale callee-saved register: {}",
+            result
+        );
     }
 
     #[test]
     fn test_copy_shift_copyback_fold() {
-        let asm = "    movq %rsi, %rbp\n    shll $5, %ebp\n    movl %ebp, %esi\n    movq $0, %rbp\n";
+        let asm =
+            "    movq %rsi, %rbp\n    shll $5, %ebp\n    movl %ebp, %esi\n    movq $0, %rbp\n";
         let out = peephole_optimize(asm.to_string());
         assert!(out.contains("shll $5, %esi"), "{}", out);
         assert!(!out.contains("movq %rsi, %rbp"), "{}", out);
@@ -2177,7 +2817,8 @@ mod regression_tests {
 
     #[test]
     fn test_copy_shift_copyback_keeps_live_tmp() {
-        let asm = "    movq %rsi, %rbp\n    shll $5, %ebp\n    movl %ebp, %esi\n    addq %rbp, %rax\n";
+        let asm =
+            "    movq %rsi, %rbp\n    shll $5, %ebp\n    movl %ebp, %esi\n    addq %rbp, %rax\n";
         let out = peephole_optimize(asm.to_string());
         assert!(out.contains("movq %rsi, %rbp"), "{}", out);
     }
@@ -2185,49 +2826,53 @@ mod regression_tests {
     #[test]
     fn test_zero_extended_xor_move_fold() {
         let asm = "    shll $5, %esi\n    movl %edi, %r15d\n    movq %rsi, %rdi\n    xorq %r15, %rdi\n    andq $32767, %rdi\n    movq $0, %r15\n";
-        let out=peephole_optimize(asm.to_string());
+        let out = peephole_optimize(asm.to_string());
         assert!(out.contains("xorl %esi, %edi"), "{}", out);
         assert!(!out.contains("xorq %r15, %rdi"), "{}", out);
     }
     #[test]
     fn test_zero_extended_xor_keeps_live_flags() {
         let asm = "    shll $5, %esi\n    movl %edi, %r15d\n    movq %rsi, %rdi\n    xorq %r15, %rdi\n    jne .Lx\n    movq $0, %r15\n.Lx:\n";
-        let out=peephole_optimize(asm.to_string());
+        let out = peephole_optimize(asm.to_string());
         assert!(out.contains("xorq %r15, %rdi"), "{}", out);
     }
 
     #[test]
     fn test_rotate_idiom_fold() {
         let asm="    movq %r9, %rsi\n    shlq $13, %rsi\n    movq %r9, %rdx\n    shrq $51, %rdx\n    movq %rsi, %r9\n    orq %rdx, %r9\n    addq %rax, %rbx\n";
-        let out=peephole_optimize(asm.to_string());
-        assert!(out.contains("rolq $13, %r9"),"{}",out);
-        assert!(!out.contains("shrq $51"),"{}",out);
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("rolq $13, %r9"), "{}", out);
+        assert!(!out.contains("shrq $51"), "{}", out);
     }
 
     #[test]
     fn test_compare_branch_rsp_signed_byte_reload() {
         let asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n    jmp .Lyes\n.Lno:\n";
-        let out=peephole_optimize(asm.to_string());
-        assert!(out.contains("jae .Lno") || out.contains("jb .Lyes"),"{}",out);
-        assert!(!out.contains("setb"),"{}",out);
-        assert!(!out.contains("movsbq 384"),"{}",out);
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("jae .Lno") || out.contains("jb .Lyes"),
+            "{}",
+            out
+        );
+        assert!(!out.contains("setb"), "{}", out);
+        assert!(!out.contains("movsbq 384"), "{}", out);
     }
 
     #[test]
     fn test_late_compare_bool_rsp_spill() {
         let mut asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n".to_string();
         assert!(compare_branch::fuse_late_compare_bool_spills(&mut asm));
-        assert!(asm.contains("jae .Lno"),"{}",asm);
-        assert!(!asm.contains("setb"),"{}",asm);
+        assert!(asm.contains("jae .Lno"), "{}", asm);
+        assert!(!asm.contains("setb"), "{}", asm);
     }
 
     #[test]
     fn test_late_compare_phi_false_redirect() {
         let mut asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n.Ljoin:\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lfalse_target\n.Lother:\n    ret\n.Lpred_false:\n    xorl %eax, %eax\n    movq %rax, 384(%rsp)\n    jmp .Ljoin\n.Lfalse_target:\n    ret\n".to_string();
         assert!(compare_branch::fuse_late_compare_bool_spills(&mut asm));
-        assert!(asm.contains("jae .Lfalse_target"),"{}",asm);
-        assert!(asm.contains("jmp .Lfalse_target"),"{}",asm);
-        assert!(!asm.contains("setb"),"{}",asm);
+        assert!(asm.contains("jae .Lfalse_target"), "{}", asm);
+        assert!(asm.contains("jmp .Lfalse_target"), "{}", asm);
+        assert!(!asm.contains("setb"), "{}", asm);
     }
 
     #[test]
@@ -2240,47 +2885,51 @@ mod regression_tests {
             "    movslq %edi, %rdi",
             "    movzbl (%rcx, %rdi), %edi",
             "    movzbl (%rsi), %eax",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("movslq %edi, %rdi"),
-            "movslq must be kept when the byte-load reads %rdi as index: {}", result);
+        assert!(
+            result.contains("movslq %edi, %rdi"),
+            "movslq must be kept when the byte-load reads %rdi as index: {}",
+            result
+        );
     }
 
     #[test]
     fn test_movslq_eliminated_when_next_insn_only_writes_reg() {
         // Control: `movslq %edi, %rdi` followed by a pure 32-bit write of %edi
         // (no 64-bit read) is still safe to eliminate.
-        let asm = [
-            "    movslq %edi, %rdi",
-            "    movl %eax, %edi",
-        ].join("\n") + "\n";
+        let asm = ["    movslq %edi, %rdi", "    movl %eax, %edi"].join("\n") + "\n";
         let result = peephole_optimize(asm);
-        assert!(!result.contains("movslq %edi, %rdi"),
-            "movslq should be eliminated after a pure 32-bit overwrite: {}", result);
+        assert!(
+            !result.contains("movslq %edi, %rdi"),
+            "movslq should be eliminated after a pure 32-bit overwrite: {}",
+            result
+        );
     }
 
     #[test]
     fn test_vector_self_move_eliminated() {
-        let asm = [
-            "    vmovdqu %ymm0, %ymm0",
-            "    vmovdqu %ymm0, 240(%rsp)",
-        ].join("\n") + "\n";
+        let asm = ["    vmovdqu %ymm0, %ymm0", "    vmovdqu %ymm0, 240(%rsp)"].join("\n") + "\n";
         let out = peephole_optimize(asm.to_string());
-        assert!(!out.contains("vmovdqu %ymm0, %ymm0"),
-            "self-move must be removed: {}", out);
+        assert!(
+            !out.contains("vmovdqu %ymm0, %ymm0"),
+            "self-move must be removed: {}",
+            out
+        );
     }
 
     #[test]
     fn test_vector_self_move_kept_for_different_regs() {
-        let asm = [
-            "    vmovdqu %ymm1, %ymm0",
-            "    vmovdqu %ymm0, 240(%rsp)",
-        ].join("\n") + "\n";
+        let asm = ["    vmovdqu %ymm1, %ymm0", "    vmovdqu %ymm0, 240(%rsp)"].join("\n") + "\n";
         let out = peephole_optimize(asm.to_string());
-        assert!(out.contains("vmovdqu %ymm1, %ymm0"),
-            "reg-reg move with different regs must stay: {}", out);
+        assert!(
+            out.contains("vmovdqu %ymm1, %ymm0"),
+            "reg-reg move with different regs must stay: {}",
+            out
+        );
     }
-
 
     #[test]
     fn xmm_source_is_not_indexed_as_a_gpr_in_extension_fusion() {
@@ -2288,6 +2937,4 @@ mod regression_tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("%xmm2"));
     }
-
 }
-

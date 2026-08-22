@@ -49,7 +49,10 @@ pub(crate) fn encode_tst(operands: &[Operand]) -> Result<EncodeResult, String> {
     encode_logical(&new_ops, 0b11)
 }
 
-pub(crate) fn encode_ccmp_ccmn(operands: &[Operand], is_ccmp: bool) -> Result<EncodeResult, String> {
+pub(crate) fn encode_ccmp_ccmn(
+    operands: &[Operand],
+    is_ccmp: bool,
+) -> Result<EncodeResult, String> {
     // CCMP/CCMN Rn, #imm5, #nzcv, cond
     // The only difference: CCMP has bit 30 = 1, CCMN has bit 30 = 0
     let (rn, is_64) = get_reg(operands, 0)?;
@@ -60,8 +63,15 @@ pub(crate) fn encode_ccmp_ccmn(operands: &[Operand], is_ccmp: bool) -> Result<En
         (operands.get(1), operands.get(2), operands.get(3))
     {
         let cond_val = encode_cond(cond).ok_or("invalid condition")?;
-        let word = (sf << 31) | op | (1 << 29) | (0b11010010 << 21)
-            | ((*imm5 as u32 & 0x1F) << 16) | (cond_val << 12) | (1 << 11) | (rn << 5) | (*nzcv as u32 & 0xF);
+        let word = (sf << 31)
+            | op
+            | (1 << 29)
+            | (0b11010010 << 21)
+            | ((*imm5 as u32 & 0x1F) << 16)
+            | (cond_val << 12)
+            | (1 << 11)
+            | (rn << 5)
+            | (*nzcv as u32 & 0xF);
         return Ok(EncodeResult::Word(word));
     }
 
@@ -71,8 +81,14 @@ pub(crate) fn encode_ccmp_ccmn(operands: &[Operand], is_ccmp: bool) -> Result<En
     {
         let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
         let cond_val = encode_cond(cond).ok_or("invalid condition")?;
-        let word = (sf << 31) | op | (1 << 29) | (0b11010010 << 21)
-            | (rm << 16) | (cond_val << 12) | (rn << 5) | (*nzcv as u32 & 0xF);
+        let word = (sf << 31)
+            | op
+            | (1 << 29)
+            | (0b11010010 << 21)
+            | (rm << 16)
+            | (cond_val << 12)
+            | (rn << 5)
+            | (*nzcv as u32 & 0xF);
         return Ok(EncodeResult::Word(word));
     }
 
@@ -91,8 +107,7 @@ pub(crate) fn encode_csel(operands: &[Operand]) -> Result<EncodeResult, String> 
         _ => return Err("csel requires condition".to_string()),
     };
     let sf = sf_bit(is_64);
-    let word = ((sf << 31) | (0b11010100 << 21)
-        | (rm << 16) | (cond << 12)) | (rn << 5) | rd;
+    let word = ((sf << 31) | (0b11010100 << 21) | (rm << 16) | (cond << 12)) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -105,8 +120,8 @@ pub(crate) fn encode_csinc(operands: &[Operand]) -> Result<EncodeResult, String>
         _ => return Err("csinc requires condition".to_string()),
     };
     let sf = sf_bit(is_64);
-    let word = (sf << 31) | (0b11010100 << 21)
-        | (rm << 16) | (cond << 12) | (0b01 << 10) | (rn << 5) | rd;
+    let word =
+        (sf << 31) | (0b11010100 << 21) | (rm << 16) | (cond << 12) | (0b01 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -119,8 +134,9 @@ pub(crate) fn encode_csinv(operands: &[Operand]) -> Result<EncodeResult, String>
         _ => return Err("csinv requires condition".to_string()),
     };
     let sf = sf_bit(is_64);
-    let word = (((sf << 31) | (1 << 30)) | (0b11010100 << 21)
-        | (rm << 16) | (cond << 12)) | (rn << 5) | rd;
+    let word = (((sf << 31) | (1 << 30)) | (0b11010100 << 21) | (rm << 16) | (cond << 12))
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -133,8 +149,13 @@ pub(crate) fn encode_csneg(operands: &[Operand]) -> Result<EncodeResult, String>
         _ => return Err("csneg requires condition".to_string()),
     };
     let sf = sf_bit(is_64);
-    let word = ((sf << 31) | (1 << 30)) | (0b11010100 << 21)
-        | (rm << 16) | (cond << 12) | (0b01 << 10) | (rn << 5) | rd;
+    let word = ((sf << 31) | (1 << 30))
+        | (0b11010100 << 21)
+        | (rm << 16)
+        | (cond << 12)
+        | (0b01 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -147,8 +168,13 @@ pub(crate) fn encode_cset(operands: &[Operand]) -> Result<EncodeResult, String> 
     };
     let sf = sf_bit(is_64);
     let inv_cond = cond ^ 1; // invert least significant bit
-    let word = (sf << 31) | (0b11010100 << 21)
-        | (0b11111 << 16) | (inv_cond << 12) | (0b01 << 10) | (0b11111 << 5) | rd;
+    let word = (sf << 31)
+        | (0b11010100 << 21)
+        | (0b11111 << 16)
+        | (inv_cond << 12)
+        | (0b01 << 10)
+        | (0b11111 << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -161,8 +187,9 @@ pub(crate) fn encode_csetm(operands: &[Operand]) -> Result<EncodeResult, String>
     };
     let sf = sf_bit(is_64);
     let inv_cond = cond ^ 1;
-    let word = (((sf << 31) | (1 << 30)) | (0b11010100 << 21)
-        | (0b11111 << 16) | (inv_cond << 12)) | (0b11111 << 5) | rd;
+    let word = (((sf << 31) | (1 << 30)) | (0b11010100 << 21) | (0b11111 << 16) | (inv_cond << 12))
+        | (0b11111 << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -277,15 +304,23 @@ pub(crate) fn encode_cneg(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let cond = match operands.get(2) {
-        Some(Operand::Cond(c)) => encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?,
+        Some(Operand::Cond(c)) => {
+            encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?
+        }
         _ => return Err("cneg: expected condition code as third operand".to_string()),
     };
     let sf = sf_bit(is_64);
     // Invert the condition (flip bit 0)
     let inv_cond = cond ^ 1;
     // CSNEG: sf 1 0 11010100 Rm cond 0 1 Rn Rd (with Rm = Rn)
-    let word = (sf << 31) | (1 << 30) | (0b011010100 << 21) | (rn << 16)
-        | (inv_cond << 12) | (0b01 << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (1 << 30)
+        | (0b011010100 << 21)
+        | (rn << 16)
+        | (inv_cond << 12)
+        | (0b01 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -294,14 +329,21 @@ pub(crate) fn encode_cinc(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let cond = match operands.get(2) {
-        Some(Operand::Cond(c)) => encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?,
+        Some(Operand::Cond(c)) => {
+            encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?
+        }
         _ => return Err("cinc: expected condition code as third operand".to_string()),
     };
     let sf = sf_bit(is_64);
     let inv_cond = cond ^ 1;
     // CSINC: sf 0 0 11010100 Rm cond 0 1 Rn Rd (with Rm = Rn)
-    let word = (sf << 31) | (0b011010100 << 21) | (rn << 16)
-        | (inv_cond << 12) | (0b01 << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (0b011010100 << 21)
+        | (rn << 16)
+        | (inv_cond << 12)
+        | (0b01 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -310,13 +352,20 @@ pub(crate) fn encode_cinv(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let cond = match operands.get(2) {
-        Some(Operand::Cond(c)) => encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?,
+        Some(Operand::Cond(c)) => {
+            encode_cond(c).ok_or_else(|| format!("unknown condition: {}", c))?
+        }
         _ => return Err("cinv: expected condition code as third operand".to_string()),
     };
     let sf = sf_bit(is_64);
     let inv_cond = cond ^ 1;
     // CSINV: sf 1 0 11010100 Rm cond 0 0 Rn Rd (with Rm = Rn)
-    let word = (sf << 31) | (1 << 30) | (0b011010100 << 21) | (rn << 16)
-        | (inv_cond << 12) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (1 << 30)
+        | (0b011010100 << 21)
+        | (rn << 16)
+        | (inv_cond << 12)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }

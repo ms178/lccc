@@ -63,7 +63,9 @@ pub(super) fn merge_sections(
                 out_sec.align = align;
             }
             let padding = (align - (out_sec.data.len() as u32 % align)) % align;
-            out_sec.data.extend(std::iter::repeat_n(0u8, padding as usize));
+            out_sec
+                .data
+                .extend(std::iter::repeat_n(0u8, padding as usize));
             let offset = out_sec.data.len() as u32;
 
             section_map.insert((obj_idx, sec.input_index), (out_idx, offset));
@@ -71,7 +73,9 @@ pub(super) fn merge_sections(
             if sec.sh_type != SHT_NOBITS {
                 out_sec.data.extend_from_slice(&sec.data);
             } else {
-                out_sec.data.extend(std::iter::repeat_n(0u8, sec.data.len()));
+                out_sec
+                    .data
+                    .extend(std::iter::repeat_n(0u8, sec.data.len()));
             }
         }
     }
@@ -85,10 +89,16 @@ pub(super) fn compute_comdat_skip(inputs: &[InputObject]) -> FxHashSet<(usize, u
 
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in obj.sections.iter() {
-            if sec.sh_type != SHT_GROUP { continue; }
-            if sec.data.len() < 4 { continue; }
+            if sec.sh_type != SHT_GROUP {
+                continue;
+            }
+            if sec.data.len() < 4 {
+                continue;
+            }
             let flags = read_u32(&sec.data, 0);
-            if flags & 1 == 0 { continue; }
+            if flags & 1 == 0 {
+                continue;
+            }
             let sig_name = if (sec.info as usize) < obj.symbols.len() {
                 obj.symbols[sec.info as usize].name.clone()
             } else {
@@ -121,11 +131,13 @@ pub(super) fn section_type_and_flags(out_name: &str, sec: &InputSection) -> (u32
         ".fini_array" => (SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE),
         ".eh_frame" => (SHT_PROGBITS, SHF_ALLOC),
         ".note" => (SHT_NOTE, SHF_ALLOC),
-        _ => (sec.sh_type, sec.flags & (SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR)),
+        _ => (
+            sec.sh_type,
+            sec.flags & (SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
+        ),
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Phase 6: Symbol resolution
 // ══════════════════════════════════════════════════════════════════════════════
-

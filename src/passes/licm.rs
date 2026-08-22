@@ -27,7 +27,10 @@
 //! Address-taken allocas (used in GEP, passed to calls, etc.) are never hoisted
 //! because stores through derived pointers may not be tracked in `stored_allocas`.
 
-use super::{alias, loop_analysis::{self, NaturalLoop}};
+use super::{
+    alias,
+    loop_analysis::{self, NaturalLoop},
+};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
@@ -716,7 +719,9 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
                 | Instruction::AtomicStore { .. }
                 | Instruction::Memcpy { .. }
                 | Instruction::InlineAsm { .. }
-                | Instruction::Intrinsic { dest_ptr: Some(_), .. } => {
+                | Instruction::Intrinsic {
+                    dest_ptr: Some(_), ..
+                } => {
                     complete = false;
                 }
                 _ => {}
@@ -744,7 +749,11 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
             func.name, natural_loop.header, forms, stores, complete
         );
     }
-    LoopAliasInfo { forms, stores, complete }
+    LoopAliasInfo {
+        forms,
+        stores,
+        complete,
+    }
 }
 
 /// Check if a Load instruction is safe to hoist from a loop.
@@ -825,9 +834,7 @@ fn is_load_hoistable(
     // memory write in the loop must be modeled, and each modeled store must be
     // provably disjoint in this exact loop frame. An empty store set is safe
     // when there are no calls/unmodeled writes.
-    if std::env::var_os("CCC_NO_LICM_ALIAS").is_some()
-        || !alias_info.complete
-        || loop_mem.has_calls
+    if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() || !alias_info.complete || loop_mem.has_calls
     {
         return false;
     }
@@ -1048,22 +1055,25 @@ fn hoist_loop_invariants(
                         }
                     }
                     all_invariant
-                } else if let Instruction::Load { ptr, ty, volatile, .. } = inst {
+                } else if let Instruction::Load {
+                    ptr, ty, volatile, ..
+                } = inst
+                {
                     // Volatile loads must execute exactly as written: hoisting
                     // one out of its loop changes the number of observable
                     // accesses (C11 5.1.2.3).
                     !*volatile
                         && is_load_hoistable(
-                        ptr,
-                        alloca_info,
-                        &loop_mem,
-                        &loop_defined,
-                        &invariant,
-                        &global_addr_values,
-                        &value_to_base_global,
-                        &alias_info,
-                        ty.size() as i64,
-                    )
+                            ptr,
+                            alloca_info,
+                            &loop_mem,
+                            &loop_defined,
+                            &invariant,
+                            &global_addr_values,
+                            &value_to_base_global,
+                            &alias_info,
+                            ty.size() as i64,
+                        )
                 } else {
                     false
                 };
@@ -1422,7 +1432,8 @@ mod tests {
                     volatile: false,
                     semantic_volatile: false,
                 },
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Const(IrConst::I32(42)),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1449,7 +1460,8 @@ mod tests {
                         (Operand::Value(Value(5)), BlockId(2)),
                     ],
                 },
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(3),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1531,7 +1543,8 @@ mod tests {
                     volatile: false,
                     semantic_volatile: false,
                 },
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Const(IrConst::I32(0)),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1546,7 +1559,8 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(1),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1579,7 +1593,8 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(Value(3)),
                     ptr: Value(0),
                     ty: IrType::I32,
@@ -1672,7 +1687,8 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(1),
                     ptr: Value(0),
                     ty: IrType::I32,

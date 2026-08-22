@@ -1,26 +1,25 @@
 //! AArch64 InlineAsmEmitter implementation: constraint classification, scratch
 //! register allocation, operand loading/storing, and template substitution.
 
-use crate::ir::reexports::{
-    BlockId,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::IrType;
-use crate::backend::state::CodegenState;
-use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};
+use super::emit::{is_arm_fp_reg, ArmCodegen};
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
 use crate::backend::regalloc::PhysReg;
-use super::emit::{ArmCodegen, is_arm_fp_reg};
+use crate::backend::state::CodegenState;
+use crate::common::types::IrType;
+use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
 
 /// AArch64 scratch registers for inline asm (caller-saved temporaries).
-pub(super) const ARM_GP_SCRATCH: &[&str] = &["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x19", "x20", "x21"];
+pub(super) const ARM_GP_SCRATCH: &[&str] = &[
+    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x19", "x20", "x21",
+];
 /// AArch64 FP/SIMD scratch registers for inline asm (d8-d15 are callee-saved,
 /// d16-d31 are caller-saved; we use v16+ as scratch to avoid save/restore).
 /// We use the 'v' prefix so that unmodified %0 in templates like `eor %0.16b, %1.16b, %2.16b`
 /// correctly produces `v16.16b` (GCC behavior). Modifiers (%d0, %s0, etc.) convert
 /// to the appropriate scalar view in format_reg_static.
-const ARM_FP_SCRATCH: &[&str] = &["v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25"];
+const ARM_FP_SCRATCH: &[&str] = &[
+    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25",
+];
 
 /// Convert an IR constant to a 64-bit value appropriate for an inline asm operand.
 /// On AArch64, 32-bit values in X registers must have upper 32 bits zeroed (zero-extended).
@@ -41,7 +40,9 @@ fn const_for_asm_operand(c: &IrConst, operand_type: &IrType) -> i64 {
 }
 
 impl InlineAsmEmitter for ArmCodegen {
-    fn asm_state(&mut self) -> &mut CodegenState { &mut self.state }
+    fn asm_state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
 
     // Multi-alternative constraint parsing (e.g., "rm", "ri") matching x86 behavior.
     // Priority: specific register > GP register > FP register > memory > immediate.
@@ -50,7 +51,7 @@ impl InlineAsmEmitter for ArmCodegen {
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint from register variable: {regname}
         if c.starts_with('{') && c.ends_with('}') {
-            let reg_name = &c[1..c.len()-1];
+            let reg_name = &c[1..c.len() - 1];
             // On AArch64, GCC treats r0-r30 as aliases for x0-x30.
             // The Linux kernel uses `register ... asm("r0")` extensively
             // (e.g., arm-smccc.h). Normalize to the canonical x-register name.
@@ -77,7 +78,11 @@ impl InlineAsmEmitter for ArmCodegen {
         for ch in c.chars() {
             match ch {
                 'r' => has_gp = true,
-                'g' => { has_gp = true; has_mem = true; has_imm = true; }
+                'g' => {
+                    has_gp = true;
+                    has_mem = true;
+                    has_imm = true;
+                }
                 'w' => has_fp = true,
                 'm' | 'Q' | 'o' | 'V' | 'p' => has_mem = true,
                 'i' | 'n' | 'I' | 'K' | 'L' => has_imm = true,
@@ -116,7 +121,12 @@ impl InlineAsmEmitter for ArmCodegen {
         }
     }
 
-    fn resolve_memory_operand(&mut self, op: &mut AsmOperand, val: &Operand, excluded: &[String]) -> bool {
+    fn resolve_memory_operand(
+        &mut self,
+        op: &mut AsmOperand,
+        val: &Operand,
+        excluded: &[String],
+    ) -> bool {
         if !op.mem_addr.is_empty() || op.mem_offset != 0 {
             return false;
         }
@@ -175,8 +185,7 @@ impl InlineAsmEmitter for ArmCodegen {
                 if !excluded.iter().any(|e| e == &reg) {
                     // If this is a callee-saved register (x19-x28), ensure it is
                     // saved/restored in the prologue/epilogue.
-                    let reg_num = reg.strip_prefix('x')
-                        .and_then(|s| s.parse::<u8>().ok());
+                    let reg_num = reg.strip_prefix('x').and_then(|s| s.parse::<u8>().ok());
                     if let Some(n) = reg_num {
                         if (19..=28).contains(&n) {
                             let phys = PhysReg(n);
@@ -238,11 +247,13 @@ impl InlineAsmEmitter for ArmCodegen {
                             let q_reg = Self::fp_to_q_reg(reg);
                             self.emit_load_from_sp(&q_reg, slot.0, "ldr");
                         } else if op.operand_type == IrType::F32 || type_size == 4 {
-                            self.state.emit_fmt(format_args!("    ldr w9, [sp, #{}]", slot.0));
+                            self.state
+                                .emit_fmt(format_args!("    ldr w9, [sp, #{}]", slot.0));
                             let s_reg = Self::fp_to_s_reg(reg);
                             self.state.emit_fmt(format_args!("    fmov {}, w9", s_reg));
                         } else {
-                            self.state.emit_fmt(format_args!("    ldr x9, [sp, #{}]", slot.0));
+                            self.state
+                                .emit_fmt(format_args!("    ldr x9, [sp, #{}]", slot.0));
                             let d_reg = Self::fp_to_d_reg(reg);
                             self.state.emit_fmt(format_args!("    fmov {}, x9", d_reg));
                         }
@@ -277,11 +288,13 @@ impl InlineAsmEmitter for ArmCodegen {
                     let q_reg = Self::fp_to_q_reg(reg);
                     self.emit_load_from_sp(&q_reg, slot.0, "ldr");
                 } else if op.operand_type == IrType::F32 || type_size == 4 {
-                    self.state.emit_fmt(format_args!("    ldr w9, [sp, #{}]", slot.0));
+                    self.state
+                        .emit_fmt(format_args!("    ldr w9, [sp, #{}]", slot.0));
                     let s_reg = Self::fp_to_s_reg(reg);
                     self.state.emit_fmt(format_args!("    fmov {}, w9", s_reg));
                 } else {
-                    self.state.emit_fmt(format_args!("    ldr x9, [sp, #{}]", slot.0));
+                    self.state
+                        .emit_fmt(format_args!("    ldr x9, [sp, #{}]", slot.0));
                     let d_reg = Self::fp_to_d_reg(reg);
                     self.state.emit_fmt(format_args!("    fmov {}, x9", d_reg));
                 }
@@ -295,40 +308,68 @@ impl InlineAsmEmitter for ArmCodegen {
         }
     }
 
-    fn substitute_template_line(&self, line: &str, operands: &[AsmOperand], gcc_to_internal: &[usize], _operand_types: &[IrType], goto_labels: &[(String, BlockId)]) -> String {
+    fn substitute_template_line(
+        &self,
+        line: &str,
+        operands: &[AsmOperand],
+        gcc_to_internal: &[usize],
+        _operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+    ) -> String {
         // For memory operands (Q/m constraints), use mem_addr (e.g., "[x9]") or
         // format as [sp, #offset] for stack-based memory. For register operands,
         // use the register name directly.
-        let op_regs: Vec<String> = operands.iter().map(|o| {
-            if matches!(o.kind, AsmOperandKind::Memory) {
-                if !o.mem_addr.is_empty() {
-                    // Non-alloca pointer: mem_addr already formatted as "[xN]"
-                    o.mem_addr.clone()
-                } else if o.mem_offset != 0 {
-                    // Alloca: stack-relative address
-                    format!("[sp, #{}]", o.mem_offset)
-                } else {
-                    // Fallback: wrap register in brackets
-                    if o.reg.is_empty() {
-                        "[sp]".to_string()
+        let op_regs: Vec<String> = operands
+            .iter()
+            .map(|o| {
+                if matches!(o.kind, AsmOperandKind::Memory) {
+                    if !o.mem_addr.is_empty() {
+                        // Non-alloca pointer: mem_addr already formatted as "[xN]"
+                        o.mem_addr.clone()
+                    } else if o.mem_offset != 0 {
+                        // Alloca: stack-relative address
+                        format!("[sp, #{}]", o.mem_offset)
                     } else {
-                        format!("[{}]", o.reg)
+                        // Fallback: wrap register in brackets
+                        if o.reg.is_empty() {
+                            "[sp]".to_string()
+                        } else {
+                            format!("[{}]", o.reg)
+                        }
                     }
+                } else {
+                    o.reg.clone()
                 }
-            } else {
-                o.reg.clone()
-            }
-        }).collect();
+            })
+            .collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_imm_values: Vec<Option<i64>> = operands.iter().map(|o| o.imm_value).collect();
-        let op_imm_symbols: Vec<Option<String>> = operands.iter().map(|o| o.imm_symbol.clone()).collect();
-        let mut result = Self::substitute_asm_operands_static(line, &op_regs, &op_names, gcc_to_internal, &op_imm_values, &op_imm_symbols);
+        let op_imm_symbols: Vec<Option<String>> =
+            operands.iter().map(|o| o.imm_symbol.clone()).collect();
+        let mut result = Self::substitute_asm_operands_static(
+            line,
+            &op_regs,
+            &op_names,
+            gcc_to_internal,
+            &op_imm_values,
+            &op_imm_symbols,
+        );
         // Substitute %l[name] goto label references
-        result = crate::backend::inline_asm::substitute_goto_labels(&result, goto_labels, operands.len());
+        result = crate::backend::inline_asm::substitute_goto_labels(
+            &result,
+            goto_labels,
+            operands.len(),
+        );
         result
     }
 
-    fn store_output_from_reg(&mut self, op: &AsmOperand, ptr: &Value, _constraint: &str, all_output_regs: &[&str]) {
+    fn store_output_from_reg(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        _constraint: &str,
+        all_output_regs: &[&str],
+    ) {
         if matches!(op.kind, AsmOperandKind::Memory) {
             return;
         }
@@ -345,11 +386,13 @@ impl InlineAsmEmitter for ArmCodegen {
                 } else if op.operand_type == IrType::F32 || type_size == 4 {
                     let s_reg = Self::fp_to_s_reg(reg);
                     self.state.emit_fmt(format_args!("    fmov w9, {}", s_reg));
-                    self.state.emit_fmt(format_args!("    str w9, [sp, #{}]", slot.0));
+                    self.state
+                        .emit_fmt(format_args!("    str w9, [sp, #{}]", slot.0));
                 } else {
                     let d_reg = Self::fp_to_d_reg(reg);
                     self.state.emit_fmt(format_args!("    fmov x9, {}", d_reg));
-                    self.state.emit_fmt(format_args!("    str x9, [sp, #{}]", slot.0));
+                    self.state
+                        .emit_fmt(format_args!("    str x9, [sp, #{}]", slot.0));
                 }
             } else if reg == "sp" {
                 // ARM64: sp (register 31) can't be used as str source operand directly.
@@ -364,12 +407,14 @@ impl InlineAsmEmitter for ArmCodegen {
                 // not just the current one. This prevents clobbering other outputs that
                 // haven't been stored yet.
                 let candidates = ["x9", "x10", "x11", "x12", "x13", "x14", "x15"];
-                let scratch = candidates.iter()
+                let scratch = candidates
+                    .iter()
                     .find(|&&c| !all_output_regs.contains(&c))
                     .copied()
                     .unwrap_or(if reg != "x9" { "x9" } else { "x10" });
                 self.emit_load_from_sp(scratch, slot.0, "ldr");
-                self.state.emit_fmt(format_args!("    str {}, [{}]", reg, scratch));
+                self.state
+                    .emit_fmt(format_args!("    str {}, [{}]", reg, scratch));
             }
         }
     }
@@ -438,7 +483,11 @@ fn is_valid_aarch64_logical_immediate_32(value: u32) -> bool {
     // Check element sizes: 2, 4, 8, 16, 32 bits within a 32-bit value
     let mut size: u32 = 32;
     while size >= 2 {
-        let mask = if size == 32 { u32::MAX } else { (1u32 << size) - 1 };
+        let mask = if size == 32 {
+            u32::MAX
+        } else {
+            (1u32 << size) - 1
+        };
         let element = value & mask;
         // Check if value is a repeating pattern of this element size
         let mut check = element;
@@ -481,7 +530,11 @@ fn is_valid_aarch64_logical_immediate(value: u64) -> bool {
     // and if the element contains a contiguous (possibly rotated) run of 1-bits.
     let mut size: u32 = 64;
     while size >= 2 {
-        let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+        let mask = if size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << size) - 1
+        };
         let element = value & mask;
 
         // Check if value is a repeating pattern of this element size
@@ -511,7 +564,11 @@ fn is_repeating_pattern(value: u64, element: u64, size: u32) -> bool {
 /// set bits (possibly rotated). A contiguous-rotated pattern means there's
 /// at most one 0->1 transition and one 1->0 transition in the circular bit sequence.
 fn has_contiguous_ones(element: u64, size: u32) -> bool {
-    let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+    let mask = if size == 64 {
+        u64::MAX
+    } else {
+        (1u64 << size) - 1
+    };
     let val = element & mask;
     // All-zeros or all-ones within the element are not valid
     if val == 0 || val == mask {

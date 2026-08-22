@@ -1,13 +1,13 @@
 //! I686Codegen: memory operations (load, store, memcpy, GEP, stack).
 
-use crate::ir::reexports::{Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::{StackSlot, SlotAddr};
-use crate::backend::regalloc::PhysReg;
+use super::emit::{phys_reg_name, I686Codegen};
 use crate::backend::generation::is_i128_type;
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::{SlotAddr, StackSlot};
 use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
 use crate::emit;
-use super::emit::{I686Codegen, phys_reg_name};
+use crate::ir::reexports::{Operand, Value};
 
 impl I686Codegen {
     // ---- accumulator-bypass store/load helpers -----------------------------
@@ -97,10 +97,14 @@ impl I686Codegen {
         if is_i128_type(ty) {
             return false;
         }
-        let Some(phys) = self.dest_reg(dest) else { return false };
+        let Some(phys) = self.dest_reg(dest) else {
+            return false;
+        };
         let d = phys_reg_name(phys);
         let load_instr = self.load_instr_for_type(ty);
-        let Some(addr) = self.state.resolve_slot_addr(ptr.0) else { return false };
+        let Some(addr) = self.state.resolve_slot_addr(ptr.0) else {
+            return false;
+        };
         match addr {
             SlotAddr::Direct(slot) => {
                 let sr = self.slot_ref(slot);
@@ -121,8 +125,17 @@ impl I686Codegen {
                     emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
                 }
             }
-            SlotAddr::OverAligned(slot,id) => { self.emit_alloca_aligned_addr(slot,id); emit!(self.state,"    {} (%ecx), %{}",load_instr,d); }
-            SlotAddr::Reg(reg) => emit!(self.state,"    {} (%{}), %{}",load_instr,phys_reg_name(reg),d),
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr(slot, id);
+                emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+            }
+            SlotAddr::Reg(reg) => emit!(
+                self.state,
+                "    {} (%{}), %{}",
+                load_instr,
+                phys_reg_name(reg),
+                d
+            ),
         }
         true
     }
@@ -131,9 +144,17 @@ impl I686Codegen {
     /// bypassing the `movl …,%eax; store %eax/…` round-trip. `%ecx` is the
     /// indirect-address scratch, so a value held in %ecx only qualifies for
     /// Direct-slot stores. Returns false to fall back to the accumulator path.
-    fn try_emit_store_direct(&mut self, val: &Operand, ptr: &Value, addr: SlotAddr, ty: IrType) -> bool {
+    fn try_emit_store_direct(
+        &mut self,
+        val: &Operand,
+        ptr: &Value,
+        addr: SlotAddr,
+        ty: IrType,
+    ) -> bool {
         let store_instr = self.store_instr_for_type(ty);
-        let Some(src) = self.direct_store_src(val, ty) else { return false };
+        let Some(src) = self.direct_store_src(val, ty) else {
+            return false;
+        };
         if src == "%ecx" || src == "%cl" || src == "%cx" {
             if !matches!(addr, SlotAddr::Direct(_)) {
                 return false;
@@ -148,8 +169,17 @@ impl I686Codegen {
                 self.emit_load_ptr_from_slot(slot, ptr.0);
                 emit!(self.state, "    {} {}, (%ecx)", store_instr, src);
             }
-            SlotAddr::OverAligned(slot,id) => { self.emit_alloca_aligned_addr(slot,id); emit!(self.state,"    {} {}, (%ecx)",store_instr,src); }
-            SlotAddr::Reg(reg) => emit!(self.state,"    {} {}, (%{})",store_instr,src,phys_reg_name(reg)),
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr(slot, id);
+                emit!(self.state, "    {} {}, (%ecx)", store_instr, src);
+            }
+            SlotAddr::Reg(reg) => emit!(
+                self.state,
+                "    {} {}, (%{})",
+                store_instr,
+                src,
+                phys_reg_name(reg)
+            ),
         }
         true
     }
@@ -170,8 +200,11 @@ impl I686Codegen {
                         let sr = self.slot_ref(slot);
                         emit!(self.state, "    fstpt {}", sr);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    fstpt (%ecx)"); }
-                    SlotAddr::Reg(reg) => emit!(self.state,"    fstpt (%{})",phys_reg_name(reg)),
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, ptr.0);
+                        self.state.emit("    fstpt (%ecx)");
+                    }
+                    SlotAddr::Reg(reg) => emit!(self.state, "    fstpt (%{})", phys_reg_name(reg)),
                 }
             }
             self.state.reg_cache.invalidate_acc();
@@ -214,8 +247,24 @@ impl I686Codegen {
                         emit!(self.state, "    movl %eax, {}", sr0);
                         emit!(self.state, "    movl %edx, {}", sr4);
                     }
-                    SlotAddr::Indirect(slot) => { self.state.emit("    pushl %edx"); self.esp_adjust+=4; self.state.emit("    pushl %eax"); self.esp_adjust+=4; self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    popl %eax"); self.esp_adjust-=4; self.state.emit("    movl %eax, (%ecx)"); self.state.emit("    popl %edx"); self.esp_adjust-=4; self.state.emit("    movl %edx, 4(%ecx)"); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); emit!(self.state,"    movl %eax, (%{})",r); emit!(self.state,"    movl %edx, 4(%{})",r); }
+                    SlotAddr::Indirect(slot) => {
+                        self.state.emit("    pushl %edx");
+                        self.esp_adjust += 4;
+                        self.state.emit("    pushl %eax");
+                        self.esp_adjust += 4;
+                        self.emit_load_ptr_from_slot(slot, ptr.0);
+                        self.state.emit("    popl %eax");
+                        self.esp_adjust -= 4;
+                        self.state.emit("    movl %eax, (%ecx)");
+                        self.state.emit("    popl %edx");
+                        self.esp_adjust -= 4;
+                        self.state.emit("    movl %edx, 4(%ecx)");
+                    }
+                    SlotAddr::Reg(reg) => {
+                        let r = phys_reg_name(reg);
+                        emit!(self.state, "    movl %eax, (%{})", r);
+                        emit!(self.state, "    movl %edx, 4(%{})", r);
+                    }
                 }
             }
             self.state.reg_cache.invalidate_acc();
@@ -242,8 +291,11 @@ impl I686Codegen {
                         let sr = self.slot_ref(slot);
                         emit!(self.state, "    fldt {}", sr);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    fldt (%ecx)"); }
-                    SlotAddr::Reg(reg) => emit!(self.state,"    fldt (%{})",phys_reg_name(reg)),
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, ptr.0);
+                        self.state.emit("    fldt (%ecx)");
+                    }
+                    SlotAddr::Reg(reg) => emit!(self.state, "    fldt (%{})", phys_reg_name(reg)),
                 }
                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
                     let sr = self.slot_ref(dest_slot);
@@ -268,7 +320,11 @@ impl I686Codegen {
                         emit!(self.state, "    movl {}, %eax", sr0);
                         emit!(self.state, "    movl {}, %edx", sr4);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,ptr.0); self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, ptr.0);
+                        self.state.emit("    movl (%ecx), %eax");
+                        self.state.emit("    movl 4(%ecx), %edx");
+                    }
                     SlotAddr::Reg(reg) => {
                         // The base may live in %eax (PhysReg 6, Phase 2e
                         // accumulator home) or %edx (PhysReg 5): loading the
@@ -298,7 +354,13 @@ impl I686Codegen {
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }
 
-    pub(super) fn emit_store_with_const_offset_impl(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) {
+    pub(super) fn emit_store_with_const_offset_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) {
         if ty == IrType::F128 {
             self.emit_f128_load_to_x87(val);
             let addr = self.state.resolve_slot_addr(base.0);
@@ -316,8 +378,21 @@ impl I686Codegen {
                         let sr = self.slot_ref(folded_slot);
                         emit!(self.state, "    fstpt {}", sr);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    fstpt (%ecx)"); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    fstpt {}(%{})",offset,r);} else {emit!(self.state,"    fstpt (%{})",r);} }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        self.state.emit("    fstpt (%ecx)");
+                    }
+                    SlotAddr::Reg(reg) => {
+                        let r = phys_reg_name(reg);
+                        if offset != 0 {
+                            emit!(self.state, "    fstpt {}(%{})", offset, r);
+                        } else {
+                            emit!(self.state, "    fstpt (%{})", r);
+                        }
+                    }
                 }
             }
             self.state.reg_cache.invalidate_acc();
@@ -388,8 +463,32 @@ impl I686Codegen {
                         emit!(self.state, "    movl %eax, {}", sr0);
                         emit!(self.state, "    movl %edx, {}", sr4);
                     }
-                    SlotAddr::Indirect(slot) => { self.state.emit("    pushl %edx"); self.esp_adjust+=4; self.state.emit("    pushl %eax"); self.esp_adjust+=4; self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    popl %eax"); self.esp_adjust-=4; self.state.emit("    movl %eax, (%ecx)"); self.state.emit("    popl %edx"); self.esp_adjust-=4; self.state.emit("    movl %edx, 4(%ecx)"); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    movl %eax, {}(%{})",offset,r);emit!(self.state,"    movl %edx, {}(%{})",offset+4,r);} else {emit!(self.state,"    movl %eax, (%{})",r);emit!(self.state,"    movl %edx, 4(%{})",r);} }
+                    SlotAddr::Indirect(slot) => {
+                        self.state.emit("    pushl %edx");
+                        self.esp_adjust += 4;
+                        self.state.emit("    pushl %eax");
+                        self.esp_adjust += 4;
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        self.state.emit("    popl %eax");
+                        self.esp_adjust -= 4;
+                        self.state.emit("    movl %eax, (%ecx)");
+                        self.state.emit("    popl %edx");
+                        self.esp_adjust -= 4;
+                        self.state.emit("    movl %edx, 4(%ecx)");
+                    }
+                    SlotAddr::Reg(reg) => {
+                        let r = phys_reg_name(reg);
+                        if offset != 0 {
+                            emit!(self.state, "    movl %eax, {}(%{})", offset, r);
+                            emit!(self.state, "    movl %edx, {}(%{})", offset + 4, r);
+                        } else {
+                            emit!(self.state, "    movl %eax, (%{})", r);
+                            emit!(self.state, "    movl %edx, 4(%{})", r);
+                        }
+                    }
                 }
             }
             self.state.reg_cache.invalidate_acc();
@@ -471,13 +570,41 @@ impl I686Codegen {
                     let folded_slot = StackSlot(slot.0 + offset);
                     self.emit_typed_store_to_slot(store_instr, ty, folded_slot);
                 }
-                SlotAddr::Indirect(slot) => { self.emit_save_acc(); self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.emit_typed_store_indirect(store_instr,ty); }
-                SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); let src=self.eax_for_type(ty); if offset!=0 {emit!(self.state,"    {} {}, {}(%{})",store_instr,src,offset,r);} else {emit!(self.state,"    {} {}, (%{})",store_instr,src,r);} }
+                SlotAddr::Indirect(slot) => {
+                    self.emit_save_acc();
+                    self.emit_load_ptr_from_slot(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
+                    self.emit_typed_store_indirect(store_instr, ty);
+                }
+                SlotAddr::Reg(reg) => {
+                    let r = phys_reg_name(reg);
+                    let src = self.eax_for_type(ty);
+                    if offset != 0 {
+                        emit!(
+                            self.state,
+                            "    {} {}, {}(%{})",
+                            store_instr,
+                            src,
+                            offset,
+                            r
+                        );
+                    } else {
+                        emit!(self.state, "    {} {}, (%{})", store_instr, src, r);
+                    }
+                }
             }
         }
     }
 
-    pub(super) fn emit_load_with_const_offset_impl(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) {
+    pub(super) fn emit_load_with_const_offset_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) {
         if ty == IrType::F128 {
             let addr = self.state.resolve_slot_addr(base.0);
             if let Some(addr) = addr {
@@ -494,8 +621,21 @@ impl I686Codegen {
                         let sr = self.slot_ref(folded_slot);
                         emit!(self.state, "    fldt {}", sr);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    fldt (%ecx)"); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    fldt {}(%{})",offset,r);} else {emit!(self.state,"    fldt (%{})",r);} }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        self.state.emit("    fldt (%ecx)");
+                    }
+                    SlotAddr::Reg(reg) => {
+                        let r = phys_reg_name(reg);
+                        if offset != 0 {
+                            emit!(self.state, "    fldt {}(%{})", offset, r);
+                        } else {
+                            emit!(self.state, "    fldt (%{})", r);
+                        }
+                    }
                 }
                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
                     let sr = self.slot_ref(dest_slot);
@@ -549,14 +689,24 @@ impl I686Codegen {
                         emit!(self.state, "    movl {}, %eax", sr0);
                         emit!(self.state, "    movl {}, %edx", sr4);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.state.emit("    movl (%ecx), %eax"); self.state.emit("    movl 4(%ecx), %edx"); }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        self.state.emit("    movl (%ecx), %eax");
+                        self.state.emit("    movl 4(%ecx), %edx");
+                    }
                     SlotAddr::Reg(reg) => {
                         // Same base-clobber hazard as the plain pair load
                         // above: write the base register (possibly %eax or
                         // %edx) last.
                         let r = phys_reg_name(reg);
                         let (m0, m4) = if offset != 0 {
-                            (format!("{}(%{})", offset, r), format!("{}(%{})", offset + 4, r))
+                            (
+                                format!("{}(%{})", offset, r),
+                                format!("{}(%{})", offset + 4, r),
+                            )
                         } else {
                             (format!("(%{})", r), format!("4(%{})", r))
                         };
@@ -631,8 +781,21 @@ impl I686Codegen {
                         let sr = self.slot_ref(folded_slot);
                         emit!(self.state, "    {} {}, %{}", load_instr, sr, d);
                     }
-                    SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} emit!(self.state,"    {} (%ecx), %{}",load_instr,d); }
-                    SlotAddr::Reg(reg) => { let r=phys_reg_name(reg); if offset!=0 {emit!(self.state,"    {} {}(%{}), %{}",load_instr,offset,r,d);} else {emit!(self.state,"    {} (%{}), %{}",load_instr,r,d);} }
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg(offset);
+                        }
+                        emit!(self.state, "    {} (%ecx), %{}", load_instr, d);
+                    }
+                    SlotAddr::Reg(reg) => {
+                        let r = phys_reg_name(reg);
+                        if offset != 0 {
+                            emit!(self.state, "    {} {}(%{}), %{}", load_instr, offset, r, d);
+                        } else {
+                            emit!(self.state, "    {} (%{}), %{}", load_instr, r, d);
+                        }
+                    }
                 }
                 return;
             }
@@ -646,8 +809,20 @@ impl I686Codegen {
                     let folded_slot = StackSlot(slot.0 + offset);
                     self.emit_typed_load_from_slot(load_instr, folded_slot);
                 }
-                SlotAddr::Indirect(slot) => { self.emit_load_ptr_from_slot(slot,base.0); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.emit_typed_load_indirect(load_instr); }
-                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); if offset!=0 {self.emit_add_offset_to_addr_reg(offset);} self.emit_typed_load_indirect(load_instr); }
+                SlotAddr::Indirect(slot) => {
+                    self.emit_load_ptr_from_slot(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
+                    self.emit_typed_load_indirect(load_instr);
+                }
+                SlotAddr::Reg(reg) => {
+                    self.emit_reg_to_addr(reg);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
+                    self.emit_typed_load_indirect(load_instr);
+                }
             }
             self.emit_store_result(dest);
         }
@@ -715,7 +890,13 @@ impl I686Codegen {
         // Single instruction — no staging, so dest may alias base/index
         // (x86 computes the address before writing the destination).
         if let Some(&d) = self.reg_assignments.get(&dest.0) {
-            emit!(self.state, "    {} {}, %{}", load_instr, mem, phys_reg_name(d));
+            emit!(
+                self.state,
+                "    {} {}, %{}",
+                load_instr,
+                mem,
+                phys_reg_name(d)
+            );
             self.state.reg_cache.invalidate_acc();
             return true;
         }
@@ -782,7 +963,13 @@ impl I686Codegen {
         let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
         let load_instr = self.load_instr_for_type(ty);
         if let Some(&d) = self.reg_assignments.get(&dest.0) {
-            emit!(self.state, "    {} {}, %{}", load_instr, mem, phys_reg_name(d));
+            emit!(
+                self.state,
+                "    {} {}, %{}",
+                load_instr,
+                mem,
+                phys_reg_name(d)
+            );
             self.state.reg_cache.invalidate_acc();
             return true;
         }
@@ -825,7 +1012,12 @@ impl I686Codegen {
 
     // ---- Typed store/load helpers ----
 
-    pub(super) fn emit_typed_store_to_slot_impl(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) {
+    pub(super) fn emit_typed_store_to_slot_impl(
+        &mut self,
+        instr: &'static str,
+        ty: IrType,
+        slot: StackSlot,
+    ) {
         let reg = self.eax_for_type(ty);
         let sr = self.slot_ref(slot);
         emit!(self.state, "    {} {}, {}", instr, reg, sr);
@@ -891,7 +1083,12 @@ impl I686Codegen {
         }
     }
 
-    pub(super) fn emit_slot_addr_to_secondary_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
+    pub(super) fn emit_slot_addr_to_secondary_impl(
+        &mut self,
+        slot: StackSlot,
+        is_alloca: bool,
+        val_id: u32,
+    ) {
         if is_alloca {
             self.emit_alloca_addr_to("ecx", val_id, slot);
         } else if let Some(phys) = self.reg_assignments.get(&val_id).copied() {
@@ -909,7 +1106,12 @@ impl I686Codegen {
         emit!(self.state, "    leal {}, %eax", sr);
     }
 
-    pub(super) fn emit_gep_indirect_const_impl(&mut self, slot: StackSlot, offset: i64, val_id: u32) {
+    pub(super) fn emit_gep_indirect_const_impl(
+        &mut self,
+        slot: StackSlot,
+        offset: i64,
+        val_id: u32,
+    ) {
         if let Some(phys) = self.reg_assignments.get(&val_id).copied() {
             let reg = phys_reg_name(phys);
             if offset == 0 {
@@ -958,7 +1160,9 @@ impl I686Codegen {
     // ---- Alloca aligned addr ----
 
     pub(super) fn emit_alloca_aligned_addr_impl(&mut self, slot: StackSlot, val_id: u32) {
-        let align = self.state.alloca_over_align(val_id)
+        let align = self
+            .state
+            .alloca_over_align(val_id)
             .expect("alloca must have over-alignment for aligned addr emission");
         let sr = self.slot_ref(slot);
         emit!(self.state, "    leal {}, %ecx", sr);
@@ -967,7 +1171,9 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_alloca_aligned_addr_to_acc_impl(&mut self, slot: StackSlot, val_id: u32) {
-        let align = self.state.alloca_over_align(val_id)
+        let align = self
+            .state
+            .alloca_over_align(val_id)
             .expect("alloca must have over-alignment for aligned addr emission");
         let sr = self.slot_ref(slot);
         emit!(self.state, "    leal {}, %eax", sr);
@@ -978,7 +1184,12 @@ impl I686Codegen {
 
     // ---- Memcpy ----
 
-    pub(super) fn emit_memcpy_load_dest_addr_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
+    pub(super) fn emit_memcpy_load_dest_addr_impl(
+        &mut self,
+        slot: StackSlot,
+        is_alloca: bool,
+        val_id: u32,
+    ) {
         if is_alloca {
             self.emit_alloca_addr_to("edi", val_id, slot);
         } else if let Some(phys) = self.reg_assignments.get(&val_id).copied() {
@@ -990,7 +1201,12 @@ impl I686Codegen {
         }
     }
 
-    pub(super) fn emit_memcpy_load_src_addr_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
+    pub(super) fn emit_memcpy_load_src_addr_impl(
+        &mut self,
+        slot: StackSlot,
+        is_alloca: bool,
+        val_id: u32,
+    ) {
         if is_alloca {
             self.emit_alloca_addr_to("esi", val_id, slot);
         } else if let Some(phys) = self.reg_assignments.get(&val_id).copied() {

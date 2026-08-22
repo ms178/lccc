@@ -1,9 +1,9 @@
 //! ArmCodegen: 128-bit integer operations.
 
-use crate::ir::reexports::{IrCmpOp, Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::StackSlot;
 use super::emit::ArmCodegen;
+use crate::backend::state::StackSlot;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrCmpOp, Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn emit_load_acc_pair_impl(&mut self, op: &Operand) {
@@ -188,12 +188,16 @@ impl ArmCodegen {
             self.state.emit("    mov x1, x2");
             self.state.emit("    mov x0, #0");
         } else if amount > 64 {
-            self.state.emit_fmt(format_args!("    lsl x1, x2, #{}", amount - 64));
+            self.state
+                .emit_fmt(format_args!("    lsl x1, x2, #{}", amount - 64));
             self.state.emit("    mov x0, #0");
         } else {
-            self.state.emit_fmt(format_args!("    lsl x1, x3, #{}", amount));
-            self.state.emit_fmt(format_args!("    orr x1, x1, x2, lsr #{}", 64 - amount));
-            self.state.emit_fmt(format_args!("    lsl x0, x2, #{}", amount));
+            self.state
+                .emit_fmt(format_args!("    lsl x1, x3, #{}", amount));
+            self.state
+                .emit_fmt(format_args!("    orr x1, x1, x2, lsr #{}", 64 - amount));
+            self.state
+                .emit_fmt(format_args!("    lsl x0, x2, #{}", amount));
         }
     }
 
@@ -206,12 +210,16 @@ impl ArmCodegen {
             self.state.emit("    mov x0, x3");
             self.state.emit("    mov x1, #0");
         } else if amount > 64 {
-            self.state.emit_fmt(format_args!("    lsr x0, x3, #{}", amount - 64));
+            self.state
+                .emit_fmt(format_args!("    lsr x0, x3, #{}", amount - 64));
             self.state.emit("    mov x1, #0");
         } else {
-            self.state.emit_fmt(format_args!("    lsr x0, x2, #{}", amount));
-            self.state.emit_fmt(format_args!("    orr x0, x0, x3, lsl #{}", 64 - amount));
-            self.state.emit_fmt(format_args!("    lsr x1, x3, #{}", amount));
+            self.state
+                .emit_fmt(format_args!("    lsr x0, x2, #{}", amount));
+            self.state
+                .emit_fmt(format_args!("    orr x0, x0, x3, lsl #{}", 64 - amount));
+            self.state
+                .emit_fmt(format_args!("    lsr x1, x3, #{}", amount));
         }
     }
 
@@ -224,16 +232,25 @@ impl ArmCodegen {
             self.state.emit("    mov x0, x3");
             self.state.emit("    asr x1, x3, #63");
         } else if amount > 64 {
-            self.state.emit_fmt(format_args!("    asr x0, x3, #{}", amount - 64));
+            self.state
+                .emit_fmt(format_args!("    asr x0, x3, #{}", amount - 64));
             self.state.emit("    asr x1, x3, #63");
         } else {
-            self.state.emit_fmt(format_args!("    lsr x0, x2, #{}", amount));
-            self.state.emit_fmt(format_args!("    orr x0, x0, x3, lsl #{}", 64 - amount));
-            self.state.emit_fmt(format_args!("    asr x1, x3, #{}", amount));
+            self.state
+                .emit_fmt(format_args!("    lsr x0, x2, #{}", amount));
+            self.state
+                .emit_fmt(format_args!("    orr x0, x0, x3, lsl #{}", 64 - amount));
+            self.state
+                .emit_fmt(format_args!("    asr x1, x3, #{}", amount));
         }
     }
 
-    pub(super) fn emit_i128_divrem_call_impl(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
+    pub(super) fn emit_i128_divrem_call_impl(
+        &mut self,
+        func_name: &str,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
         self.operand_to_x0_x1(lhs);
         self.state.emit("    mov x2, x0");
         self.state.emit("    mov x3, x1");
@@ -251,7 +268,12 @@ impl ArmCodegen {
         self.store_x0_x1_to(dest);
     }
 
-    pub(super) fn emit_float_to_i128_call_impl(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) {
+    pub(super) fn emit_float_to_i128_call_impl(
+        &mut self,
+        src: &Operand,
+        to_signed: bool,
+        from_ty: IrType,
+    ) {
         self.operand_to_x0(src);
         if from_ty == IrType::F32 {
             self.state.emit("    fmov s0, w0");
@@ -259,8 +281,8 @@ impl ArmCodegen {
             self.state.emit("    fmov d0, x0");
         }
         let func_name = match (to_signed, from_ty) {
-            (true, IrType::F64)  => "__fixdfti",
-            (true, IrType::F32)  => "__fixsfti",
+            (true, IrType::F64) => "__fixdfti",
+            (true, IrType::F32) => "__fixsfti",
             (false, IrType::F64) => "__fixunsdfti",
             (false, IrType::F32) => "__fixunssfti",
             _ => panic!("unsupported float-to-i128 conversion: {:?}", from_ty),
@@ -269,11 +291,16 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_all();
     }
 
-    pub(super) fn emit_i128_to_float_call_impl(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) {
+    pub(super) fn emit_i128_to_float_call_impl(
+        &mut self,
+        src: &Operand,
+        from_signed: bool,
+        to_ty: IrType,
+    ) {
         self.operand_to_x0_x1(src);
         let func_name = match (from_signed, to_ty) {
-            (true, IrType::F64)  => "__floattidf",
-            (true, IrType::F32)  => "__floattisf",
+            (true, IrType::F64) => "__floattidf",
+            (true, IrType::F32) => "__floattisf",
             (true, IrType::F128) => "__floattitf",
             (false, IrType::F64) => "__floatuntidf",
             (false, IrType::F32) => "__floatuntisf",
@@ -312,10 +339,12 @@ impl ArmCodegen {
             IrCmpOp::Ugt | IrCmpOp::Uge => ("hi", if op == IrCmpOp::Ugt { "hi" } else { "hs" }),
             _ => unreachable!("i128 ordered cmp got equality op: {:?}", op),
         };
-        self.state.emit_fmt(format_args!("    cset x0, {}", hi_cond));
+        self.state
+            .emit_fmt(format_args!("    cset x0, {}", hi_cond));
         self.state.emit_fmt(format_args!("    b.ne {}", done));
         self.state.emit("    cmp x2, x4");
-        self.state.emit_fmt(format_args!("    cset x0, {}", lo_cond));
+        self.state
+            .emit_fmt(format_args!("    cset x0, {}", lo_cond));
         self.state.emit_fmt(format_args!("{}:", done));
     }
 

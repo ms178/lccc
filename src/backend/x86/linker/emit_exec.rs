@@ -4,12 +4,12 @@
 //! depending on whether dynamic symbols are present. Handles PLT/GOT,
 //! `.dynamic` section, TLS, IFUNC/IRELATIVE, and copy relocations.
 
-use std::collections::BTreeSet;
 use crate::common::fx_hash::FxHashMap;
+use std::collections::BTreeSet;
 
-use crate::backend::elf::{push_strtab_name, elf64_sym_entry};
 use super::elf::*;
-use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE, INTERP};
+use super::types::{GlobalSymbol, BASE_ADDR, INTERP, PAGE_SIZE};
+use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
 /// The dynsym NAME for a dynamic symbol reference. Versioned references are
@@ -27,18 +27,25 @@ fn dynsym_emit_name(name: &str) -> &str {
 }
 
 pub(super) fn emit_executable(
-    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
+    objects: &[ElfObject],
+    globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
-    plt_names: &[String], got_entries: &[(String, bool)],
+    plt_names: &[String],
+    got_entries: &[(String, bool)],
     // Absolute 64-bit relocations against dynamic data symbols; each becomes a
     // dynamic R_X86_64_64 in .rela.dyn (see AbsDynReloc).
     abs_dyn_relocs: &[super::plt_got::AbsDynReloc],
-    needed_sonames: &[String], output_path: &str,
-    export_dynamic: bool, rpath_entries: &[String], use_runpath: bool,
-    is_static: bool, ifunc_symbols: &[String],
+    needed_sonames: &[String],
+    output_path: &str,
+    export_dynamic: bool,
+    rpath_entries: &[String],
+    use_runpath: bool,
+    is_static: bool,
+    ifunc_symbols: &[String],
     entry_symbol: Option<&str>,
-    z_now: bool, z_relro: bool,
+    z_now: bool,
+    z_relro: bool,
     // `-Map=FILE`: write a GNU-ld-compatible link map after layout.
     map_path: Option<&str>,
     // `--version-script=FILE`: restrict which symbols --export-dynamic puts
@@ -48,11 +55,26 @@ pub(super) fn emit_executable(
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     let mut t_zone = std::time::Instant::now();
-    macro_rules! zone { ($name:expr) => { if ld_time { eprintln!("[ldtime]   emit/{:<18} {:>7.1} ms", $name, t_zone.elapsed().as_secs_f64()*1e3); t_zone = std::time::Instant::now(); } } }
+    macro_rules! zone {
+        ($name:expr) => {
+            if ld_time {
+                eprintln!(
+                    "[ldtime]   emit/{:<18} {:>7.1} ms",
+                    $name,
+                    t_zone.elapsed().as_secs_f64() * 1e3
+                );
+                t_zone = std::time::Instant::now();
+            }
+        };
+    }
 
     let mut dynstr = DynStrTab::new();
-    for lib in needed_sonames { dynstr.add(lib); }
-    let rpath_string = if rpath_entries.is_empty() { None } else {
+    for lib in needed_sonames {
+        dynstr.add(lib);
+    }
+    let rpath_string = if rpath_entries.is_empty() {
+        None
+    } else {
         let s = rpath_entries.join(":");
         dynstr.add(&s);
         Some(s)
@@ -66,7 +88,9 @@ pub(super) fn emit_executable(
     let mut dyn_sym_seen: crate::common::fx_hash::FxHashSet<String> =
         crate::common::fx_hash::FxHashSet::default();
     for name in plt_names {
-        if dyn_sym_seen.insert(name.clone()) { dyn_sym_names.push(name.clone()); }
+        if dyn_sym_seen.insert(name.clone()) {
+            dyn_sym_names.push(name.clone());
+        }
     }
     for (name, is_plt) in got_entries {
         if !name.is_empty() && !*is_plt && !dyn_sym_seen.contains(name) {
@@ -83,7 +107,8 @@ pub(super) fn emit_executable(
 
     // Collect copy relocation symbols - these go AFTER non-hashed symbols
     // and are included in the .gnu.hash table
-    let copy_reloc_syms: Vec<(String, u64)> = globals.iter()
+    let copy_reloc_syms: Vec<(String, u64)> = globals
+        .iter()
         .filter(|(_, g)| g.copy_reloc)
         .map(|(n, g)| (n.clone(), g.size))
         .collect();
@@ -110,13 +135,16 @@ pub(super) fn emit_executable(
         // A version script narrows the --export-dynamic set exactly as it does
         // for shared objects; `{ global: a; b; local: *; }` is the common
         // spelling used to keep an executable's plugin ABI small.
-        let version_script = version_script_path
-            .and_then(linker_common::VersionScript::parse);
-        let mut exported: Vec<String> = globals.iter()
+        let version_script = version_script_path.and_then(linker_common::VersionScript::parse);
+        let mut exported: Vec<String> = globals
+            .iter()
             .filter(|(name, g)| {
                 // Export defined, non-dynamic (local to this executable) global symbols
-                if !(g.section_idx != SHN_UNDEF && !g.is_dynamic && !g.copy_reloc
-                    && (g.info >> 4) != 0) // not STB_LOCAL
+                if !(g.section_idx != SHN_UNDEF
+                    && !g.is_dynamic
+                    && !g.copy_reloc
+                    && (g.info >> 4) != 0)
+                // not STB_LOCAL
                 {
                     return false;
                 }
@@ -137,7 +165,9 @@ pub(super) fn emit_executable(
         }
     }
 
-    for name in &dyn_sym_names { dynstr.add(dynsym_emit_name(name)); }
+    for name in &dyn_sym_names {
+        dynstr.add(dynsym_emit_name(name));
+    }
 
     // ── Build .gnu.version (versym) and .gnu.version_r (verneed) data ──
     //
@@ -148,7 +178,8 @@ pub(super) fn emit_executable(
             if gs.is_dynamic {
                 if let Some(ref ver) = gs.version {
                     if let Some(ref lib) = gs.from_lib {
-                        lib_versions.entry(lib.clone())
+                        lib_versions
+                            .entry(lib.clone())
                             .or_default()
                             .insert(ver.clone());
                     }
@@ -178,7 +209,8 @@ pub(super) fn emit_executable(
     let mut verneed_data: Vec<u8> = Vec::new();
     let mut verneed_count: u32 = 0;
     // Only include libraries that are in our needed list
-    let lib_ver_needed: Vec<(String, Vec<String>)> = lib_ver_list.iter()
+    let lib_ver_needed: Vec<(String, Vec<String>)> = lib_ver_list
+        .iter()
         .filter(|(lib, _)| needed_sonames.contains(lib))
         .cloned()
         .collect();
@@ -221,9 +253,17 @@ pub(super) fn emit_executable(
     let dynsym_size = dynsym_count as u64 * 24;
     let dynstr_size = dynstr.as_bytes().len() as u64;
     let rela_plt_size = plt_names.len() as u64 * 24;
-    let rela_dyn_glob_count = got_entries.iter().filter(|(n, p)| {
-        !n.is_empty() && !*p && globals.get(n).map(|g| g.is_dynamic && !g.copy_reloc && g.plt_idx.is_none()).unwrap_or(false)
-    }).count();
+    let rela_dyn_glob_count = got_entries
+        .iter()
+        .filter(|(n, p)| {
+            !n.is_empty()
+                && !*p
+                && globals
+                    .get(n)
+                    .map(|g| g.is_dynamic && !g.copy_reloc && g.plt_idx.is_none())
+                    .unwrap_or(false)
+        })
+        .count();
     // Dynamic executables carry IFUNC IRELATIVE relocations at the END of
     // .rela.dyn (ld.so applies IRELATIVE last, matching GNU ld/mold layout).
     // Static executables use the separate .rela.iplt + __rela_iplt_start/end
@@ -233,8 +273,14 @@ pub(super) fn emit_executable(
     // Symbols that ended up copy-relocated are excluded: for those the storage
     // is a local BSS copy that ld.so fills via R_X86_64_COPY, so an additional
     // R_X86_64_64 would double-apply.
-    let abs_dyn_count = abs_dyn_relocs.iter()
-        .filter(|r| globals.get(r.name.as_str()).map(|g| !g.copy_reloc).unwrap_or(false))
+    let abs_dyn_count = abs_dyn_relocs
+        .iter()
+        .filter(|r| {
+            globals
+                .get(r.name.as_str())
+                .map(|g| !g.copy_reloc)
+                .unwrap_or(false)
+        })
         .count();
     let rela_dyn_count =
         rela_dyn_glob_count + copy_reloc_syms.len() + dyn_irelative_count + abs_dyn_count;
@@ -243,7 +289,11 @@ pub(super) fn emit_executable(
     // Build .gnu.hash table for hashed symbols (copy-reloc + exported)
     // Number of hashed symbols = total symbols after the non-hashed imports
     let num_hashed = dyn_sym_names.len() - (gnu_hash_symoffset - 1);
-    let gnu_hash_nbuckets = if num_hashed == 0 { 1 } else { num_hashed.next_power_of_two().max(1) } as u32;
+    let gnu_hash_nbuckets = if num_hashed == 0 {
+        1
+    } else {
+        num_hashed.next_power_of_two().max(1)
+    } as u32;
     let gnu_hash_bloom_size: u32 = 1;
     let gnu_hash_bloom_shift: u32 = 6;
 
@@ -287,8 +337,10 @@ pub(super) fn emit_executable(
             if gs.is_dynamic {
                 if let Some(ref ver) = gs.version {
                     if let Some(ref lib) = gs.from_lib {
-                        let idx = ver_index_map.get(&(lib.clone(), ver.clone()))
-                            .copied().unwrap_or(1);
+                        let idx = ver_index_map
+                            .get(&(lib.clone(), ver.clone()))
+                            .copied()
+                            .unwrap_or(1);
                         versym_data.extend_from_slice(&idx.to_le_bytes());
                     } else {
                         versym_data.extend_from_slice(&1u16.to_le_bytes()); // VER_NDX_GLOBAL
@@ -311,7 +363,9 @@ pub(super) fn emit_executable(
 
     // O(1) name -> dynsym index (1-based; 0 is the null symbol). Built AFTER
     // the .gnu.hash bucket sort so indices match the final table order.
-    let dyn_sym_index: FxHashMap<&str, u64> = dyn_sym_names.iter().enumerate()
+    let dyn_sym_index: FxHashMap<&str, u64> = dyn_sym_names
+        .iter()
+        .enumerate()
         .map(|(i, n)| (n.as_str(), (i + 1) as u64))
         .collect();
 
@@ -341,30 +395,66 @@ pub(super) fn emit_executable(
         let last = i + 1 == hashed_sym_hashes.len()
             || (hashed_sym_hashes[i + 1] % gnu_hash_nbuckets)
                 != (hashed_sym_hashes[i] % gnu_hash_nbuckets);
-        if last { gnu_hash_chains[i] |= 1; }
+        if last {
+            gnu_hash_chains[i] |= 1;
+        }
     }
 
     // gnu_hash_size = header(16) + bloom(bloom_size*8) + buckets(nbuckets*4) + chains(num_hashed*4)
-    let gnu_hash_size: u64 = if is_static { 0 } else {
+    let gnu_hash_size: u64 = if is_static {
+        0
+    } else {
         16 + (gnu_hash_bloom_size as u64 * 8)
-            + (gnu_hash_nbuckets as u64 * 4) + (num_hashed as u64 * 4)
+            + (gnu_hash_nbuckets as u64 * 4)
+            + (num_hashed as u64 * 4)
     };
-    let plt_size = if is_static || plt_names.is_empty() { 0u64 } else { 16 + 16 * plt_names.len() as u64 };
-    let got_plt_size = if is_static { 0u64 } else { (3 + plt_names.len()) as u64 * 8 };
-    let got_globdat_count = got_entries.iter().filter(|(n, p)| !n.is_empty() && !*p).count();
+    let plt_size = if is_static || plt_names.is_empty() {
+        0u64
+    } else {
+        16 + 16 * plt_names.len() as u64
+    };
+    let got_plt_size = if is_static {
+        0u64
+    } else {
+        (3 + plt_names.len()) as u64 * 8
+    };
+    let got_globdat_count = got_entries
+        .iter()
+        .filter(|(n, p)| !n.is_empty() && !*p)
+        .count();
     let got_size = got_globdat_count as u64 * 8; // GOT needed even for static (TLS, GOTPCREL)
 
-    let has_init_array = output_sections.iter().any(|s| s.name == ".init_array" && s.mem_size > 0);
-    let has_preinit_array = output_sections.iter().any(|s| s.name == ".preinit_array" && s.mem_size > 0);
-    let has_fini_array = output_sections.iter().any(|s| s.name == ".fini_array" && s.mem_size > 0);
-    let dynamic_size = if is_static { 0u64 } else {
+    let has_init_array = output_sections
+        .iter()
+        .any(|s| s.name == ".init_array" && s.mem_size > 0);
+    let has_preinit_array = output_sections
+        .iter()
+        .any(|s| s.name == ".preinit_array" && s.mem_size > 0);
+    let has_fini_array = output_sections
+        .iter()
+        .any(|s| s.name == ".fini_array" && s.mem_size > 0);
+    let dynamic_size = if is_static {
+        0u64
+    } else {
         let mut dyn_count = needed_sonames.len() as u64 + 14; // fixed entries + NULL
-        if has_init_array { dyn_count += 2; }
-        if has_fini_array { dyn_count += 2; }
-        if has_preinit_array { dyn_count += 2; }
-        if z_now { dyn_count += 2; } // DT_FLAGS(BIND_NOW) + DT_FLAGS_1(NOW)
-        if rpath_string.is_some() { dyn_count += 1; }
-        if verneed_size > 0 { dyn_count += 3; } // DT_VERSYM + DT_VERNEED + DT_VERNEEDNUM
+        if has_init_array {
+            dyn_count += 2;
+        }
+        if has_fini_array {
+            dyn_count += 2;
+        }
+        if has_preinit_array {
+            dyn_count += 2;
+        }
+        if z_now {
+            dyn_count += 2;
+        } // DT_FLAGS(BIND_NOW) + DT_FLAGS_1(NOW)
+        if rpath_string.is_some() {
+            dyn_count += 1;
+        }
+        if verneed_size > 0 {
+            dyn_count += 3;
+        } // DT_VERSYM + DT_VERNEED + DT_VERNEEDNUM
         dyn_count * 16
     };
     // Override other dynamic sizes for static linking
@@ -375,29 +465,49 @@ pub(super) fn emit_executable(
     let versym_size = if is_static { 0u64 } else { versym_size };
     let verneed_size = if is_static { 0u64 } else { verneed_size };
 
-    let has_tls_sections = output_sections.iter().any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
+    let has_tls_sections = output_sections
+        .iter()
+        .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
     // .eh_frame_hdr + PT_GNU_EH_FRAME: required for libgcc/libunwind binary-
     // search unwinding (C++ exceptions, backtrace()) instead of linear scans.
-    let eh_frame_fde_count: usize = output_sections.iter()
+    let eh_frame_fde_count: usize = output_sections
+        .iter()
         .filter(|s| s.name == ".eh_frame" && s.mem_size > 0)
         .flat_map(|s| s.inputs.iter())
-        .map(|input| linker_common::count_eh_frame_fdes(
-            &objects[input.object_idx].section_data[input.section_idx]))
+        .map(|input| {
+            linker_common::count_eh_frame_fdes(
+                &objects[input.object_idx].section_data[input.section_idx],
+            )
+        })
         .sum();
     let eh_frame_hdr_size: u64 = if eh_frame_fde_count > 0 {
         (12 + 8 * eh_frame_fde_count) as u64
-    } else { 0 };
+    } else {
+        0
+    };
     // Static: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), GNU_STACK, [TLS]
     // Dynamic: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, [TLS]
     let mut phdr_count: u64 = if is_static {
-        if has_tls_sections { 7 } else { 6 }
-    } else if has_tls_sections { 9 } else { 8 };
-    if eh_frame_hdr_size > 0 { phdr_count += 1; }
+        if has_tls_sections {
+            7
+        } else {
+            6
+        }
+    } else if has_tls_sections {
+        9
+    } else {
+        8
+    };
+    if eh_frame_hdr_size > 0 {
+        phdr_count += 1;
+    }
     // PT_GNU_RELRO: covers the head of the RW segment (init/fini arrays,
     // .dynamic, .got — plus .got.plt under -z now). Static executables get
     // it too when they carry protectable content.
     let has_relro = z_relro && !is_static;
-    if has_relro { phdr_count += 1; }
+    if has_relro {
+        phdr_count += 1;
+    }
     let phdr_total_size = phdr_count * 56;
 
     zone!("pre-layout");
@@ -430,30 +540,56 @@ pub(super) fn emit_executable(
     // precisely why the shared-library path stayed broken after the executable
     // path was fixed.
     let mut packer = super::layout_plan::SegmentPacker::new(BASE_ADDR, PAGE_SIZE);
-    macro_rules! vaddr { ($off:expr) => { packer.vaddr($off) } }
-    macro_rules! new_segment { () => { packer.new_segment(); } }
+    macro_rules! vaddr {
+        ($off:expr) => {
+            packer.vaddr($off)
+        };
+    }
+    macro_rules! new_segment {
+        () => {
+            packer.new_segment();
+        };
+    }
     let mut offset = 64 + phdr_total_size;
     let interp_offset = offset;
     let interp_addr = vaddr!(offset);
-    if !is_static { offset += INTERP.len() as u64; }
+    if !is_static {
+        offset += INTERP.len() as u64;
+    }
 
     offset = (offset + 7) & !7;
-    let gnu_hash_offset = offset; let gnu_hash_addr = vaddr!(offset); offset += gnu_hash_size;
+    let gnu_hash_offset = offset;
+    let gnu_hash_addr = vaddr!(offset);
+    offset += gnu_hash_size;
     offset = (offset + 7) & !7;
-    let dynsym_offset = offset; let dynsym_addr = vaddr!(offset); offset += dynsym_size;
-    let dynstr_offset = offset; let dynstr_addr = vaddr!(offset); offset += dynstr_size;
+    let dynsym_offset = offset;
+    let dynsym_addr = vaddr!(offset);
+    offset += dynsym_size;
+    let dynstr_offset = offset;
+    let dynstr_addr = vaddr!(offset);
+    offset += dynstr_size;
     // .gnu.version (versym) - right after dynstr, aligned to 2
     offset = (offset + 1) & !1;
-    let versym_offset = offset; let versym_addr = vaddr!(offset);
-    if versym_size > 0 { offset += versym_size; }
+    let versym_offset = offset;
+    let versym_addr = vaddr!(offset);
+    if versym_size > 0 {
+        offset += versym_size;
+    }
     // .gnu.version_r (verneed) - aligned to 4
     offset = (offset + 3) & !3;
-    let verneed_offset = offset; let verneed_addr = vaddr!(offset);
-    if verneed_size > 0 { offset += verneed_size; }
+    let verneed_offset = offset;
+    let verneed_addr = vaddr!(offset);
+    if verneed_size > 0 {
+        offset += verneed_size;
+    }
     offset = (offset + 7) & !7;
-    let rela_dyn_offset = offset; let rela_dyn_addr = vaddr!(offset); offset += rela_dyn_size;
+    let rela_dyn_offset = offset;
+    let rela_dyn_addr = vaddr!(offset);
+    offset += rela_dyn_size;
     offset = (offset + 7) & !7;
-    let rela_plt_offset = offset; let rela_plt_addr = vaddr!(offset); offset += rela_plt_size;
+    let rela_plt_offset = offset;
+    let rela_plt_addr = vaddr!(offset);
+    offset += rela_plt_size;
 
     // Text segment
     new_segment!();
@@ -470,8 +606,13 @@ pub(super) fn emit_executable(
     }
     let (plt_addr, plt_offset) = if plt_size > 0 {
         offset = (offset + 15) & !15;
-        let a = vaddr!(offset); let o = offset; offset += plt_size; (a, o)
-    } else { (0u64, 0u64) };
+        let a = vaddr!(offset);
+        let o = offset;
+        offset += plt_size;
+        (a, o)
+    } else {
+        (0u64, 0u64)
+    };
 
     // .iplt (IFUNC PLT entries for static linking)
     let num_ifunc = ifunc_symbols.len();
@@ -479,8 +620,13 @@ pub(super) fn emit_executable(
     let iplt_total_size = num_ifunc as u64 * iplt_entry_size;
     let (iplt_addr, iplt_offset) = if iplt_total_size > 0 {
         offset = (offset + 15) & !15;
-        let a = vaddr!(offset); let o = offset; offset += iplt_total_size; (a, o)
-    } else { (0u64, 0u64) };
+        let a = vaddr!(offset);
+        let o = offset;
+        offset += iplt_total_size;
+        (a, o)
+    } else {
+        (0u64, 0u64)
+    };
 
     let text_total_size = offset - text_page_offset;
 
@@ -490,13 +636,19 @@ pub(super) fn emit_executable(
     let rodata_page_addr = vaddr!(offset);
     // .eh_frame_hdr leads the rodata segment (data filled after relocation).
     let (eh_frame_hdr_offset, eh_frame_hdr_vaddr) = if eh_frame_hdr_size > 0 {
-        let o = offset; let v = vaddr!(offset);
+        let o = offset;
+        let v = vaddr!(offset);
         offset += eh_frame_hdr_size;
         (o, v)
-    } else { (0u64, 0u64) };
+    } else {
+        (0u64, 0u64)
+    };
     for sec in output_sections.iter_mut() {
-        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
-           sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS {
+        if sec.flags & SHF_ALLOC != 0
+            && sec.flags & SHF_EXECINSTR == 0
+            && sec.flags & SHF_WRITE == 0
+            && sec.sh_type != SHT_NOBITS
+        {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = vaddr!(offset);
@@ -511,49 +663,66 @@ pub(super) fn emit_executable(
     let rw_page_offset = offset;
     let rw_page_addr = vaddr!(offset);
 
-    let mut init_array_addr = 0u64; let mut init_array_size = 0u64;
-    let mut fini_array_addr = 0u64; let mut fini_array_size = 0u64;
-    let mut preinit_array_addr = 0u64; let mut preinit_array_size = 0u64;
+    let mut init_array_addr = 0u64;
+    let mut init_array_size = 0u64;
+    let mut fini_array_addr = 0u64;
+    let mut fini_array_size = 0u64;
+    let mut preinit_array_addr = 0u64;
+    let mut preinit_array_size = 0u64;
 
     for sec in output_sections.iter_mut() {
         if sec.name == ".preinit_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = vaddr!(offset); sec.file_offset = offset;
-            preinit_array_addr = sec.addr; preinit_array_size = sec.mem_size;
-            offset += sec.mem_size; break;
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            preinit_array_addr = sec.addr;
+            preinit_array_size = sec.mem_size;
+            offset += sec.mem_size;
+            break;
         }
     }
     for sec in output_sections.iter_mut() {
         if sec.name == ".init_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = vaddr!(offset); sec.file_offset = offset;
-            init_array_addr = sec.addr; init_array_size = sec.mem_size;
-            offset += sec.mem_size; break;
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            init_array_addr = sec.addr;
+            init_array_size = sec.mem_size;
+            offset += sec.mem_size;
+            break;
         }
     }
     for sec in output_sections.iter_mut() {
         if sec.name == ".fini_array" {
             let a = sec.alignment.max(8);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = vaddr!(offset); sec.file_offset = offset;
-            fini_array_addr = sec.addr; fini_array_size = sec.mem_size;
-            offset += sec.mem_size; break;
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            fini_array_addr = sec.addr;
+            fini_array_size = sec.mem_size;
+            offset += sec.mem_size;
+            break;
         }
     }
 
     offset = (offset + 7) & !7;
-    let dynamic_offset = offset; let dynamic_addr = vaddr!(offset); offset += dynamic_size;
+    let dynamic_offset = offset;
+    let dynamic_addr = vaddr!(offset);
+    offset += dynamic_size;
     offset = (offset + 7) & !7;
-    let got_offset = offset; let got_addr = vaddr!(offset); offset += got_size;
+    let got_offset = offset;
+    let got_addr = vaddr!(offset);
+    offset += got_size;
     // Under -z now the .got.plt is never written after startup, so it can be
     // protected too (Full RELRO). Under lazy binding it must stay writable
     // and is placed after the RELRO page boundary below.
     let (mut got_plt_offset, mut got_plt_addr) = (0u64, 0u64);
     if has_relro && z_now {
         offset = (offset + 7) & !7;
-        got_plt_offset = offset; got_plt_addr = vaddr!(offset);
+        got_plt_offset = offset;
+        got_plt_addr = vaddr!(offset);
         offset += got_plt_size;
     }
     // RELRO boundary: everything before this is mprotect(PROT_READ)ed by
@@ -573,13 +742,15 @@ pub(super) fn emit_executable(
     }
     if !(has_relro && z_now) {
         offset = (offset + 7) & !7;
-        got_plt_offset = offset; got_plt_addr = vaddr!(offset);
+        got_plt_offset = offset;
+        got_plt_addr = vaddr!(offset);
         offset += got_plt_size;
     }
 
     // IFUNC GOT (8 bytes per entry, stores resolver addresses initially)
     offset = (offset + 7) & !7;
-    let ifunc_got_offset = offset; let ifunc_got_addr = vaddr!(offset);
+    let ifunc_got_offset = offset;
+    let ifunc_got_addr = vaddr!(offset);
     let ifunc_got_size = num_ifunc as u64 * 8;
     offset += ifunc_got_size;
 
@@ -587,17 +758,24 @@ pub(super) fn emit_executable(
     // Only emitted for STATIC executables: dynamic executables put their
     // IRELATIVE entries in .rela.dyn instead (ld.so ignores .rela.iplt).
     offset = (offset + 7) & !7;
-    let rela_iplt_offset = offset; let rela_iplt_addr = vaddr!(offset);
+    let rela_iplt_offset = offset;
+    let rela_iplt_addr = vaddr!(offset);
     let rela_iplt_size = if is_static { num_ifunc as u64 * 24 } else { 0 };
     offset += rela_iplt_size;
 
     for sec in output_sections.iter_mut() {
-        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 &&
-           sec.sh_type != SHT_NOBITS && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" &&
-           sec.flags & SHF_TLS == 0 {
+        if sec.flags & SHF_ALLOC != 0
+            && sec.flags & SHF_WRITE != 0
+            && sec.sh_type != SHT_NOBITS
+            && sec.name != ".init_array"
+            && sec.name != ".fini_array"
+            && sec.name != ".preinit_array"
+            && sec.flags & SHF_TLS == 0
+        {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = vaddr!(offset); sec.file_offset = offset;
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
             offset += sec.mem_size;
         }
     }
@@ -612,8 +790,13 @@ pub(super) fn emit_executable(
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
-            sec.addr = vaddr!(offset); sec.file_offset = offset;
-            if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            if tls_addr == 0 {
+                tls_addr = sec.addr;
+                tls_file_offset = offset;
+                tls_align = a;
+            }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
             offset += sec.mem_size;
@@ -629,9 +812,12 @@ pub(super) fn emit_executable(
         if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
             let a = sec.alignment.max(1);
             let aligned = (tls_mem_size + a - 1) & !(a - 1);
-            sec.addr = tls_addr + aligned; sec.file_offset = offset;
+            sec.addr = tls_addr + aligned;
+            sec.file_offset = offset;
             tls_mem_size = aligned + sec.mem_size;
-            if a > tls_align { tls_align = a; }
+            if a > tls_align {
+                tls_align = a;
+            }
         }
     }
     // Align TLS size to TLS alignment
@@ -645,7 +831,8 @@ pub(super) fn emit_executable(
             let a = sec.alignment.max(1);
             let aligned = (bss_addr + bss_size + a - 1) & !(a - 1);
             bss_size = aligned - bss_addr + sec.mem_size;
-            sec.addr = aligned; sec.file_offset = offset;
+            sec.addr = aligned;
+            sec.file_offset = offset;
         }
     }
 
@@ -655,7 +842,9 @@ pub(super) fn emit_executable(
     for (name, size) in &copy_reloc_syms {
         let gsym = globals.get(name).cloned();
         let key = gsym.as_ref().and_then(|g| {
-            g.from_lib.as_ref().map(|lib| (lib.clone(), g.lib_sym_value))
+            g.from_lib
+                .as_ref()
+                .map(|lib| (lib.clone(), g.lib_sym_value))
         });
         let addr = if let Some(ref k) = key {
             if let Some(&existing_addr) = copy_reloc_addr_map.get(k) {
@@ -679,13 +868,17 @@ pub(super) fn emit_executable(
 
     // Merge section data
     for sec in output_sections.iter_mut() {
-        if sec.sh_type == SHT_NOBITS { continue; }
+        if sec.sh_type == SHT_NOBITS {
+            continue;
+        }
         let mut data = vec![0u8; sec.mem_size as usize];
         for input in &sec.inputs {
             let sd = &objects[input.object_idx].section_data[input.section_idx];
             let s = input.output_offset as usize;
             let e = s + sd.len();
-            if e <= data.len() && !sd.is_empty() { data[s..e].copy_from_slice(sd); }
+            if e <= data.len() && !sd.is_empty() {
+                data[s..e].copy_from_slice(sd);
+            }
         }
         sec.data = data;
     }
@@ -729,9 +922,18 @@ pub(super) fn emit_executable(
     };
     for sym in &get_standard_linker_symbols(&linker_addrs) {
         let entry = globals.entry(sym.name.to_string()).or_insert(GlobalSymbol {
-            value: 0, size: 0, info: (sym.binding << 4),
-            defined_in: None, from_lib: None, plt_idx: None, got_idx: None,
-            section_idx: SHN_ABS, is_dynamic: false, copy_reloc: false, lib_sym_value: 0, version: None,
+            value: 0,
+            size: 0,
+            info: (sym.binding << 4),
+            defined_in: None,
+            from_lib: None,
+            plt_idx: None,
+            got_idx: None,
+            section_idx: SHN_ABS,
+            is_dynamic: false,
+            copy_reloc: false,
+            lib_sym_value: 0,
+            version: None,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = sym.value;
@@ -764,7 +966,9 @@ pub(super) fn emit_executable(
     }
 
     let entry_name = entry_symbol.unwrap_or("_start");
-    let entry_addr = globals.get(entry_name).map(|s| s.value)
+    let entry_addr = globals
+        .get(entry_name)
+        .map(|s| s.value)
         .or_else(|| globals.get("_start").map(|s| s.value))
         .unwrap_or(text_page_addr);
 
@@ -780,7 +984,8 @@ pub(super) fn emit_executable(
     // Pre-size: every defined global plus locals lands here; growth doubling
     // copies 24-byte entries repeatedly (measured 8.8 ms of a 60 ms link in
     // this zone for a 40k-symbol object).
-    let est_syms: usize = globals.len() + objects.iter().map(|o| o.symbols.len()).sum::<usize>() / 4 + 2;
+    let est_syms: usize =
+        globals.len() + objects.iter().map(|o| o.symbols.len()).sum::<usize>() / 4 + 2;
     let mut symtab_entries: Vec<[u8; 24]> = Vec::with_capacity(est_syms);
     let mut symtab_names: Vec<u8> = Vec::with_capacity(est_syms * 12);
     symtab_names.push(0u8); // strtab with leading NUL
@@ -807,11 +1012,21 @@ pub(super) fn emit_executable(
         if !is_static {
             h += 4; // .interp .gnu.hash .dynsym .dynstr
         }
-        if !is_static && verneed_size > 0 { h += 2; }
-        if !is_static && rela_dyn_size > 0 { h += 1; }
-        if !is_static && rela_plt_size > 0 { h += 1; }
-        if !is_static && plt_size > 0 { h += 1; }
-        if eh_frame_hdr_size > 0 { h += 1; } // .eh_frame_hdr
+        if !is_static && verneed_size > 0 {
+            h += 2;
+        }
+        if !is_static && rela_dyn_size > 0 {
+            h += 1;
+        }
+        if !is_static && rela_plt_size > 0 {
+            h += 1;
+        }
+        if !is_static && plt_size > 0 {
+            h += 1;
+        }
+        if eh_frame_hdr_size > 0 {
+            h += 1;
+        } // .eh_frame_hdr
 
         // Output sections, in four ordered groups.
         let mut assign = |pred: &dyn Fn(&OutputSection) -> bool,
@@ -825,37 +1040,67 @@ pub(super) fn emit_executable(
             }
         };
         // 1. ordinary allocated PROGBITS (init/fini arrays are placed later)
-        assign(&|sec: &OutputSection| {
-            sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS
-                && sec.flags & SHF_TLS == 0
-                && sec.name != ".init_array" && sec.name != ".fini_array"
-                && sec.name != ".preinit_array"
-        }, &mut h, &mut out_sec_to_hdr);
+        assign(
+            &|sec: &OutputSection| {
+                sec.flags & SHF_ALLOC != 0
+                    && sec.sh_type != SHT_NOBITS
+                    && sec.flags & SHF_TLS == 0
+                    && sec.name != ".init_array"
+                    && sec.name != ".fini_array"
+                    && sec.name != ".preinit_array"
+            },
+            &mut h,
+            &mut out_sec_to_hdr,
+        );
         // 2. TLS PROGBITS (.tdata)
-        assign(&|sec: &OutputSection| {
-            sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0
-                && sec.sh_type != SHT_NOBITS
-        }, &mut h, &mut out_sec_to_hdr);
+        assign(
+            &|sec: &OutputSection| {
+                sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS
+            },
+            &mut h,
+            &mut out_sec_to_hdr,
+        );
         // 3. TLS NOBITS (.tbss)
-        assign(&|sec: &OutputSection| {
-            sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS
-        }, &mut h, &mut out_sec_to_hdr);
+        assign(
+            &|sec: &OutputSection| sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS,
+            &mut h,
+            &mut out_sec_to_hdr,
+        );
 
         // Linker-created headers between the alloc sections and .bss.
-        if has_init_array { h += 1; }
-        if has_fini_array { h += 1; }
-        if has_preinit_array { h += 1; }
-        if !is_static { h += 1; }        // .dynamic
-        if got_size > 0 { h += 1; }      // .got
-        if !is_static { h += 1; }        // .got.plt
-        if iplt_total_size > 0 { h += 1; }
-        if rela_iplt_size > 0 { h += 1; }
+        if has_init_array {
+            h += 1;
+        }
+        if has_fini_array {
+            h += 1;
+        }
+        if has_preinit_array {
+            h += 1;
+        }
+        if !is_static {
+            h += 1;
+        } // .dynamic
+        if got_size > 0 {
+            h += 1;
+        } // .got
+        if !is_static {
+            h += 1;
+        } // .got.plt
+        if iplt_total_size > 0 {
+            h += 1;
+        }
+        if rela_iplt_size > 0 {
+            h += 1;
+        }
 
         // 4. non-TLS NOBITS (.bss)
-        assign(&|sec: &OutputSection| {
-            sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0
-                && sec.flags & SHF_TLS == 0
-        }, &mut h, &mut out_sec_to_hdr);
+        assign(
+            &|sec: &OutputSection| {
+                sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0
+            },
+            &mut h,
+            &mut out_sec_to_hdr,
+        );
 
         // .symtab and .strtab follow, then .shstrtab.
         symtab_shidx = h as u16;
@@ -890,11 +1135,14 @@ pub(super) fn emit_executable(
     });
     for (obj_idx, sym) in locals {
         let (oi, sec_off) = section_map[&(obj_idx, sym.shndx as usize)];
-        let Some(&shndx) = out_sec_to_hdr.get(&oi) else { continue };
+        let Some(&shndx) = out_sec_to_hdr.get(&oi) else {
+            continue;
+        };
         let off = push_strtab_name(&mut symtab_names, sym.name.as_bytes());
         let value = output_sections[oi].addr + sec_off + sym.value;
         symtab_entries.push(elf64_sym_entry(
-            off, sym.info, sym.other, shndx, value, sym.size));
+            off, sym.info, sym.other, shndx, value, sym.size,
+        ));
     }
     let n_local = symtab_entries.len();
 
@@ -935,9 +1183,11 @@ pub(super) fn emit_executable(
         })
         .collect();
     keyed.sort_unstable_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
     });
-    let sym_names: Vec<(&String, &GlobalSymbol)> = keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
+    let sym_names: Vec<(&String, &GlobalSymbol)> =
+        keyed.into_iter().map(|(_, n, g)| (n, g)).collect();
     for (name, gsym) in &sym_names {
         let off = push_strtab_name(&mut symtab_names, name.as_bytes());
         let shndx: u16 = if gsym.defined_in == Some(usize::MAX) || gsym.section_idx == SHN_ABS {
@@ -953,7 +1203,9 @@ pub(super) fn emit_executable(
             SHN_ABS
         };
         symtab_entries.push(elf64_sym_entry(
-            off, gsym.info, 0 /* st_other */, shndx, gsym.value, gsym.size));
+            off, gsym.info, 0, /* st_other */
+            shndx, gsym.value, gsym.size,
+        ));
     }
     zone!("symtab");
     // === Build output buffer ===
@@ -973,53 +1225,168 @@ pub(super) fn emit_executable(
              this usually means an input object has corrupt section offsets or sizes",
             file_size,
             file_size as f64 / (1u64 << 30) as f64,
-            MAX_OUTPUT_BYTES >> 30));
+            MAX_OUTPUT_BYTES >> 30
+        ));
     }
     let mut out = vec![0u8; file_size];
 
     // ELF header
     out[0..4].copy_from_slice(&ELF_MAGIC);
-    out[4] = ELFCLASS64; out[5] = ELFDATA2LSB; out[6] = 1;
-    w16(&mut out, 16, ET_EXEC); w16(&mut out, 18, EM_X86_64); w32(&mut out, 20, 1);
-    w64(&mut out, 24, entry_addr); w64(&mut out, 32, 64); w64(&mut out, 40, 0);
-    w32(&mut out, 48, 0); w16(&mut out, 52, 64); w16(&mut out, 54, 56);
-    w16(&mut out, 56, phdr_count as u16); w16(&mut out, 58, 64); w16(&mut out, 60, 0); w16(&mut out, 62, 0);
+    out[4] = ELFCLASS64;
+    out[5] = ELFDATA2LSB;
+    out[6] = 1;
+    w16(&mut out, 16, ET_EXEC);
+    w16(&mut out, 18, EM_X86_64);
+    w32(&mut out, 20, 1);
+    w64(&mut out, 24, entry_addr);
+    w64(&mut out, 32, 64);
+    w64(&mut out, 40, 0);
+    w32(&mut out, 48, 0);
+    w16(&mut out, 52, 64);
+    w16(&mut out, 54, 56);
+    w16(&mut out, 56, phdr_count as u16);
+    w16(&mut out, 58, 64);
+    w16(&mut out, 60, 0);
+    w16(&mut out, 62, 0);
 
     // Program headers
     let mut ph = 64usize;
-    wphdr(&mut out, ph, PT_PHDR, PF_R, 64, BASE_ADDR+64, phdr_total_size, phdr_total_size, 8); ph += 56;
+    wphdr(
+        &mut out,
+        ph,
+        PT_PHDR,
+        PF_R,
+        64,
+        BASE_ADDR + 64,
+        phdr_total_size,
+        phdr_total_size,
+        8,
+    );
+    ph += 56;
     if !is_static {
-        wphdr(&mut out, ph, PT_INTERP, PF_R, interp_offset, interp_addr, INTERP.len() as u64, INTERP.len() as u64, 1); ph += 56;
-    }
-    let ro_seg_end = rela_plt_offset + rela_plt_size;
-    wphdr(&mut out, ph, PT_LOAD, PF_R, 0, BASE_ADDR, ro_seg_end, ro_seg_end, PAGE_SIZE); ph += 56;
-    wphdr(&mut out, ph, PT_LOAD, PF_R|PF_X, text_page_offset, text_page_addr, text_total_size, text_total_size, PAGE_SIZE); ph += 56;
-    wphdr(&mut out, ph, PT_LOAD, PF_R, rodata_page_offset, rodata_page_addr, rodata_total_size, rodata_total_size, PAGE_SIZE); ph += 56;
-    let rw_filesz = offset - rw_page_offset;
-    let rw_memsz = if bss_size > 0 { (bss_addr + bss_size) - rw_page_addr } else { rw_filesz };
-    wphdr(&mut out, ph, PT_LOAD, PF_R|PF_W, rw_page_offset, rw_page_addr, rw_filesz, rw_memsz, PAGE_SIZE); ph += 56;
-    if !is_static {
-        wphdr(&mut out, ph, PT_DYNAMIC, PF_R|PF_W, dynamic_offset, dynamic_addr, dynamic_size, dynamic_size, 8); ph += 56;
-    }
-    if has_relro && relro_size > 0 {
-        wphdr(&mut out, ph, PT_GNU_RELRO, PF_R,
-              relro_start, relro_start_addr, relro_size, relro_size, 1);
+        wphdr(
+            &mut out,
+            ph,
+            PT_INTERP,
+            PF_R,
+            interp_offset,
+            interp_addr,
+            INTERP.len() as u64,
+            INTERP.len() as u64,
+            1,
+        );
         ph += 56;
     }
-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R|PF_W, 0, 0, 0, 0, 0x10); ph += 56;
+    let ro_seg_end = rela_plt_offset + rela_plt_size;
+    wphdr(
+        &mut out, ph, PT_LOAD, PF_R, 0, BASE_ADDR, ro_seg_end, ro_seg_end, PAGE_SIZE,
+    );
+    ph += 56;
+    wphdr(
+        &mut out,
+        ph,
+        PT_LOAD,
+        PF_R | PF_X,
+        text_page_offset,
+        text_page_addr,
+        text_total_size,
+        text_total_size,
+        PAGE_SIZE,
+    );
+    ph += 56;
+    wphdr(
+        &mut out,
+        ph,
+        PT_LOAD,
+        PF_R,
+        rodata_page_offset,
+        rodata_page_addr,
+        rodata_total_size,
+        rodata_total_size,
+        PAGE_SIZE,
+    );
+    ph += 56;
+    let rw_filesz = offset - rw_page_offset;
+    let rw_memsz = if bss_size > 0 {
+        (bss_addr + bss_size) - rw_page_addr
+    } else {
+        rw_filesz
+    };
+    wphdr(
+        &mut out,
+        ph,
+        PT_LOAD,
+        PF_R | PF_W,
+        rw_page_offset,
+        rw_page_addr,
+        rw_filesz,
+        rw_memsz,
+        PAGE_SIZE,
+    );
+    ph += 56;
+    if !is_static {
+        wphdr(
+            &mut out,
+            ph,
+            PT_DYNAMIC,
+            PF_R | PF_W,
+            dynamic_offset,
+            dynamic_addr,
+            dynamic_size,
+            dynamic_size,
+            8,
+        );
+        ph += 56;
+    }
+    if has_relro && relro_size > 0 {
+        wphdr(
+            &mut out,
+            ph,
+            PT_GNU_RELRO,
+            PF_R,
+            relro_start,
+            relro_start_addr,
+            relro_size,
+            relro_size,
+            1,
+        );
+        ph += 56;
+    }
+    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+    ph += 56;
     if eh_frame_hdr_size > 0 {
-        wphdr(&mut out, ph, PT_GNU_EH_FRAME, PF_R,
-              eh_frame_hdr_offset, eh_frame_hdr_vaddr,
-              eh_frame_hdr_size, eh_frame_hdr_size, 4);
+        wphdr(
+            &mut out,
+            ph,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_size,
+            eh_frame_hdr_size,
+            4,
+        );
         ph += 56;
     }
     if has_tls {
-        wphdr(&mut out, ph, PT_TLS, PF_R, tls_file_offset, tls_addr, tls_file_size, tls_mem_size, tls_align);
+        wphdr(
+            &mut out,
+            ph,
+            PT_TLS,
+            PF_R,
+            tls_file_offset,
+            tls_addr,
+            tls_file_size,
+            tls_mem_size,
+            tls_align,
+        );
     }
 
     // Section data (needed for both static and dynamic)
     for sec in output_sections.iter() {
-        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() { continue; }
+        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() {
+            continue;
+        }
         write_bytes(&mut out, sec.file_offset as usize, &sec.data);
     }
 
@@ -1031,9 +1398,9 @@ pub(super) fn emit_executable(
         // .gnu.hash - proper hash table so dynamic linker can find copy-reloc symbols
         let gh = gnu_hash_offset as usize;
         w32(&mut out, gh, gnu_hash_nbuckets);
-        w32(&mut out, gh+4, gnu_hash_symoffset as u32);
-        w32(&mut out, gh+8, gnu_hash_bloom_size);
-        w32(&mut out, gh+12, gnu_hash_bloom_shift);
+        w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
+        w32(&mut out, gh + 8, gnu_hash_bloom_size);
+        w32(&mut out, gh + 12, gnu_hash_bloom_shift);
         // Bloom filter
         let bloom_off = gh + 16;
         w64(&mut out, bloom_off, bloom_word);
@@ -1055,16 +1422,22 @@ pub(super) fn emit_executable(
             w32(&mut out, ds, no);
             if let Some(gsym) = globals.get(name) {
                 if gsym.copy_reloc {
-                    if ds+5 < out.len() { out[ds+4] = (STB_GLOBAL << 4) | STT_OBJECT; out[ds+5] = 0; }
-                    w16(&mut out, ds+6, 1);
-                    w64(&mut out, ds+8, gsym.value);
-                    w64(&mut out, ds+16, gsym.size);
+                    if ds + 5 < out.len() {
+                        out[ds + 4] = (STB_GLOBAL << 4) | STT_OBJECT;
+                        out[ds + 5] = 0;
+                    }
+                    w16(&mut out, ds + 6, 1);
+                    w64(&mut out, ds + 8, gsym.value);
+                    w64(&mut out, ds + 16, gsym.size);
                 } else if !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF && gsym.value != 0 {
                     let stt = gsym.info & 0xf;
                     let stb = gsym.info >> 4;
                     let st_info = (stb << 4) | stt;
-                    if ds+5 < out.len() { out[ds+4] = st_info; out[ds+5] = 0; }
-                    w16(&mut out, ds+6, 1);
+                    if ds + 5 < out.len() {
+                        out[ds + 4] = st_info;
+                        out[ds + 5] = 0;
+                    }
+                    w16(&mut out, ds + 6, 1);
                     // For TLS symbols, the dynsym value must be the offset within
                     // the TLS segment, not the virtual address.
                     let sym_val = if stt == STT_TLS && tls_addr != 0 {
@@ -1072,18 +1445,28 @@ pub(super) fn emit_executable(
                     } else {
                         gsym.value
                     };
-                    w64(&mut out, ds+8, sym_val);
-                    w64(&mut out, ds+16, gsym.size);
+                    w64(&mut out, ds + 8, sym_val);
+                    w64(&mut out, ds + 16, gsym.size);
                 } else {
                     let bind = gsym.info >> 4;
                     let stype = gsym.info & 0xf;
                     let st_info = (bind << 4) | if stype != 0 { stype } else { STT_FUNC };
-                    if ds+5 < out.len() { out[ds+4] = st_info; out[ds+5] = 0; }
-                    w16(&mut out, ds+6, 0); w64(&mut out, ds+8, 0); w64(&mut out, ds+16, 0);
+                    if ds + 5 < out.len() {
+                        out[ds + 4] = st_info;
+                        out[ds + 5] = 0;
+                    }
+                    w16(&mut out, ds + 6, 0);
+                    w64(&mut out, ds + 8, 0);
+                    w64(&mut out, ds + 16, 0);
                 }
             } else {
-                if ds+5 < out.len() { out[ds+4] = (STB_GLOBAL << 4) | STT_FUNC; out[ds+5] = 0; }
-                w16(&mut out, ds+6, 0); w64(&mut out, ds+8, 0); w64(&mut out, ds+16, 0);
+                if ds + 5 < out.len() {
+                    out[ds + 4] = (STB_GLOBAL << 4) | STT_FUNC;
+                    out[ds + 5] = 0;
+                }
+                w16(&mut out, ds + 6, 0);
+                w64(&mut out, ds + 8, 0);
+                w64(&mut out, ds + 16, 0);
             }
             ds += 24;
         }
@@ -1105,9 +1488,13 @@ pub(super) fn emit_executable(
         let mut rd = rela_dyn_offset as usize;
         let mut gd_a = got_addr;
         for (name, is_plt) in got_entries {
-            if name.is_empty() || *is_plt { continue; }
+            if name.is_empty() || *is_plt {
+                continue;
+            }
             let gsym_info = globals.get(name);
-            let is_dynamic = gsym_info.map(|g| g.is_dynamic && !g.copy_reloc).unwrap_or(false);
+            let is_dynamic = gsym_info
+                .map(|g| g.is_dynamic && !g.copy_reloc)
+                .unwrap_or(false);
             let has_plt = gsym_info.map(|g| g.plt_idx.is_some()).unwrap_or(false);
             // Skip GLOB_DAT for dynamic symbols that also have a PLT entry:
             // their GOT entry is statically filled with the PLT address to match
@@ -1116,9 +1503,18 @@ pub(super) fn emit_executable(
                 let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
                 // TLS symbols get R_X86_64_TPOFF64 (ld.so stores the TP offset);
                 // everything else gets GLOB_DAT.
-                let is_tls = globals.get(name).map(|g| (g.info & 0xf) == STT_TLS).unwrap_or(false);
-                let rtype = if is_tls { R_X86_64_TPOFF64 } else { R_X86_64_GLOB_DAT } as u64;
-                w64(&mut out, rd, gd_a); w64(&mut out, rd+8, (si << 32) | rtype); w64(&mut out, rd+16, 0);
+                let is_tls = globals
+                    .get(name)
+                    .map(|g| (g.info & 0xf) == STT_TLS)
+                    .unwrap_or(false);
+                let rtype = if is_tls {
+                    R_X86_64_TPOFF64
+                } else {
+                    R_X86_64_GLOB_DAT
+                } as u64;
+                w64(&mut out, rd, gd_a);
+                w64(&mut out, rd + 8, (si << 32) | rtype);
+                w64(&mut out, rd + 16, 0);
                 rd += 24;
             }
             gd_a += 8;
@@ -1128,13 +1524,22 @@ pub(super) fn emit_executable(
         // of loading; we leave the storage itself zero (see the R_X86_64_64
         // emit arm) so a stale addend cannot be mistaken for a real pointer.
         for r in abs_dyn_relocs {
-            if globals.get(r.name.as_str()).map(|g| g.copy_reloc).unwrap_or(true) {
+            if globals
+                .get(r.name.as_str())
+                .map(|g| g.copy_reloc)
+                .unwrap_or(true)
+            {
                 continue; // copy-relocated: R_X86_64_COPY handles it below
             }
-            let Some(&(out_idx, sec_off)) = section_map.get(&(r.obj_idx, r.sec_idx)) else { continue };
+            let Some(&(out_idx, sec_off)) = section_map.get(&(r.obj_idx, r.sec_idx)) else {
+                continue;
+            };
             let addr = output_sections[out_idx].addr + sec_off + r.offset;
             let si = dyn_sym_index.get(r.name.as_str()).copied().unwrap_or(0);
-            debug_assert!(si != 0, "absolute dynamic reloc against symbol absent from .dynsym");
+            debug_assert!(
+                si != 0,
+                "absolute dynamic reloc against symbol absent from .dynsym"
+            );
             w64(&mut out, rd, addr);
             w64(&mut out, rd + 8, (si << 32) | R_X86_64_64 as u64);
             w64(&mut out, rd + 16, r.addend as u64);
@@ -1146,7 +1551,9 @@ pub(super) fn emit_executable(
             if let Some(gsym) = globals.get(name) {
                 let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
                 let copy_addr = gsym.value;
-                w64(&mut out, rd, copy_addr); w64(&mut out, rd+8, (si << 32) | 5); w64(&mut out, rd+16, 0);
+                w64(&mut out, rd, copy_addr);
+                w64(&mut out, rd + 8, (si << 32) | 5);
+                w64(&mut out, rd + 16, 0);
                 rd += 24;
             }
         }
@@ -1155,8 +1562,8 @@ pub(super) fn emit_executable(
         for i in 0..dyn_irelative_count {
             let slot = ifunc_got_addr + i as u64 * 8;
             w64(&mut out, rd, slot);
-            w64(&mut out, rd+8, R_X86_64_IRELATIVE as u64);
-            w64(&mut out, rd+16, ifunc_resolver_addrs[i]);
+            w64(&mut out, rd + 8, R_X86_64_IRELATIVE as u64);
+            w64(&mut out, rd + 16, ifunc_resolver_addrs[i]);
             rd += 24;
         }
 
@@ -1166,27 +1573,48 @@ pub(super) fn emit_executable(
         for (i, name) in plt_names.iter().enumerate() {
             let gea = gpb + i as u64 * 8;
             let si = dyn_sym_index.get(name.as_str()).copied().unwrap_or(0);
-            w64(&mut out, rp, gea); w64(&mut out, rp+8, (si << 32) | R_X86_64_JUMP_SLOT as u64); w64(&mut out, rp+16, 0);
+            w64(&mut out, rp, gea);
+            w64(&mut out, rp + 8, (si << 32) | R_X86_64_JUMP_SLOT as u64);
+            w64(&mut out, rp + 16, 0);
             rp += 24;
         }
 
         // .plt
         if plt_size > 0 {
             let po = plt_offset as usize;
-            out[po] = 0xff; out[po+1] = 0x35;
-            w32(&mut out, po+2, ((got_plt_addr+8) as i64 - (plt_addr+6) as i64) as u32);
-            out[po+6] = 0xff; out[po+7] = 0x25;
-            w32(&mut out, po+8, ((got_plt_addr+16) as i64 - (plt_addr+12) as i64) as u32);
-            for i in 12..16 { out[po+i] = 0x90; }
+            out[po] = 0xff;
+            out[po + 1] = 0x35;
+            w32(
+                &mut out,
+                po + 2,
+                ((got_plt_addr + 8) as i64 - (plt_addr + 6) as i64) as u32,
+            );
+            out[po + 6] = 0xff;
+            out[po + 7] = 0x25;
+            w32(
+                &mut out,
+                po + 8,
+                ((got_plt_addr + 16) as i64 - (plt_addr + 12) as i64) as u32,
+            );
+            for i in 12..16 {
+                out[po + i] = 0x90;
+            }
 
             for (i, _) in plt_names.iter().enumerate() {
                 let ep = po + 16 + i * 16;
                 let pea = plt_addr + 16 + i as u64 * 16;
                 let gea = got_plt_addr + 24 + i as u64 * 8;
-                out[ep] = 0xff; out[ep+1] = 0x25;
-                w32(&mut out, ep+2, (gea as i64 - (pea+6) as i64) as u32);
-                out[ep+6] = 0x68; w32(&mut out, ep+7, i as u32);
-                out[ep+11] = 0xe9; w32(&mut out, ep+12, (plt_addr as i64 - (pea+16) as i64) as u32);
+                out[ep] = 0xff;
+                out[ep + 1] = 0x25;
+                w32(&mut out, ep + 2, (gea as i64 - (pea + 6) as i64) as u32);
+                out[ep + 6] = 0x68;
+                w32(&mut out, ep + 7, i as u32);
+                out[ep + 11] = 0xe9;
+                w32(
+                    &mut out,
+                    ep + 12,
+                    (plt_addr as i64 - (pea + 16) as i64) as u32,
+                );
             }
         }
 
@@ -1194,51 +1622,89 @@ pub(super) fn emit_executable(
         let mut dd = dynamic_offset as usize;
         for lib in needed_sonames {
             let so = dynstr.get_offset(lib);
-            w64(&mut out, dd, DT_NEEDED as u64); w64(&mut out, dd+8, so as u64); dd += 16;
+            w64(&mut out, dd, DT_NEEDED as u64);
+            w64(&mut out, dd + 8, so as u64);
+            dd += 16;
         }
         for &(tag, val) in &[
-            (DT_STRTAB, dynstr_addr), (DT_SYMTAB, dynsym_addr), (DT_STRSZ, dynstr_size),
-            (DT_SYMENT, 24), (DT_DEBUG, 0), (DT_PLTGOT, got_plt_addr),
-            (DT_PLTRELSZ, rela_plt_size), (DT_PLTREL, DT_RELA as u64), (DT_JMPREL, rela_plt_addr),
-            (DT_RELA, rela_dyn_addr), (DT_RELASZ, rela_dyn_size), (DT_RELAENT, 24),
+            (DT_STRTAB, dynstr_addr),
+            (DT_SYMTAB, dynsym_addr),
+            (DT_STRSZ, dynstr_size),
+            (DT_SYMENT, 24),
+            (DT_DEBUG, 0),
+            (DT_PLTGOT, got_plt_addr),
+            (DT_PLTRELSZ, rela_plt_size),
+            (DT_PLTREL, DT_RELA as u64),
+            (DT_JMPREL, rela_plt_addr),
+            (DT_RELA, rela_dyn_addr),
+            (DT_RELASZ, rela_dyn_size),
+            (DT_RELAENT, 24),
             (DT_GNU_HASH, gnu_hash_addr),
         ] {
-            w64(&mut out, dd, tag as u64); w64(&mut out, dd+8, val); dd += 16;
+            w64(&mut out, dd, tag as u64);
+            w64(&mut out, dd + 8, val);
+            dd += 16;
         }
         if has_init_array {
-            w64(&mut out, dd, DT_INIT_ARRAY as u64); w64(&mut out, dd+8, init_array_addr); dd += 16;
-            w64(&mut out, dd, DT_INIT_ARRAYSZ as u64); w64(&mut out, dd+8, init_array_size); dd += 16;
+            w64(&mut out, dd, DT_INIT_ARRAY as u64);
+            w64(&mut out, dd + 8, init_array_addr);
+            dd += 16;
+            w64(&mut out, dd, DT_INIT_ARRAYSZ as u64);
+            w64(&mut out, dd + 8, init_array_size);
+            dd += 16;
         }
         if has_fini_array {
-            w64(&mut out, dd, DT_FINI_ARRAY as u64); w64(&mut out, dd+8, fini_array_addr); dd += 16;
-            w64(&mut out, dd, DT_FINI_ARRAYSZ as u64); w64(&mut out, dd+8, fini_array_size); dd += 16;
+            w64(&mut out, dd, DT_FINI_ARRAY as u64);
+            w64(&mut out, dd + 8, fini_array_addr);
+            dd += 16;
+            w64(&mut out, dd, DT_FINI_ARRAYSZ as u64);
+            w64(&mut out, dd + 8, fini_array_size);
+            dd += 16;
         }
         if has_preinit_array {
-            w64(&mut out, dd, DT_PREINIT_ARRAY as u64); w64(&mut out, dd+8, preinit_array_addr); dd += 16;
-            w64(&mut out, dd, DT_PREINIT_ARRAYSZ as u64); w64(&mut out, dd+8, preinit_array_size); dd += 16;
+            w64(&mut out, dd, DT_PREINIT_ARRAY as u64);
+            w64(&mut out, dd + 8, preinit_array_addr);
+            dd += 16;
+            w64(&mut out, dd, DT_PREINIT_ARRAYSZ as u64);
+            w64(&mut out, dd + 8, preinit_array_size);
+            dd += 16;
         }
         if let Some(ref rp) = rpath_string {
             let rp_off = dynstr.get_offset(rp) as u64;
             let tag = if use_runpath { DT_RUNPATH } else { DT_RPATH };
-            w64(&mut out, dd, tag as u64); w64(&mut out, dd+8, rp_off); dd += 16;
+            w64(&mut out, dd, tag as u64);
+            w64(&mut out, dd + 8, rp_off);
+            dd += 16;
         }
         if verneed_size > 0 {
-            w64(&mut out, dd, DT_VERSYM as u64); w64(&mut out, dd+8, versym_addr); dd += 16;
-            w64(&mut out, dd, DT_VERNEED as u64); w64(&mut out, dd+8, verneed_addr); dd += 16;
-            w64(&mut out, dd, DT_VERNEEDNUM as u64); w64(&mut out, dd+8, verneed_count as u64); dd += 16;
+            w64(&mut out, dd, DT_VERSYM as u64);
+            w64(&mut out, dd + 8, versym_addr);
+            dd += 16;
+            w64(&mut out, dd, DT_VERNEED as u64);
+            w64(&mut out, dd + 8, verneed_addr);
+            dd += 16;
+            w64(&mut out, dd, DT_VERNEEDNUM as u64);
+            w64(&mut out, dd + 8, verneed_count as u64);
+            dd += 16;
         }
         if z_now {
-            w64(&mut out, dd, DT_FLAGS as u64); w64(&mut out, dd+8, DF_BIND_NOW as u64); dd += 16;
-            w64(&mut out, dd, DT_FLAGS_1 as u64); w64(&mut out, dd+8, DF_1_NOW as u64); dd += 16;
+            w64(&mut out, dd, DT_FLAGS as u64);
+            w64(&mut out, dd + 8, DF_BIND_NOW as u64);
+            dd += 16;
+            w64(&mut out, dd, DT_FLAGS_1 as u64);
+            w64(&mut out, dd + 8, DF_1_NOW as u64);
+            dd += 16;
         }
-        w64(&mut out, dd, DT_NULL as u64); w64(&mut out, dd+8, 0);
+        w64(&mut out, dd, DT_NULL as u64);
+        w64(&mut out, dd + 8, 0);
 
         // .got.plt
         let gp = got_plt_offset as usize;
         w64(&mut out, gp, dynamic_addr);
-        w64(&mut out, gp+8, 0); w64(&mut out, gp+16, 0);
+        w64(&mut out, gp + 8, 0);
+        w64(&mut out, gp + 16, 0);
         for (i, _) in plt_names.iter().enumerate() {
-            w64(&mut out, gp+24+i*8, plt_addr + 16 + i as u64 * 16 + 6);
+            w64(&mut out, gp + 24 + i * 8, plt_addr + 16 + i as u64 * 16 + 6);
         }
     } // end if !is_static
 
@@ -1246,7 +1712,9 @@ pub(super) fn emit_executable(
     if got_size > 0 {
         let mut go = got_offset as usize;
         for (name, is_plt) in got_entries {
-            if name.is_empty() || *is_plt { continue; }
+            if name.is_empty() || *is_plt {
+                continue;
+            }
             if let Some(gsym) = globals.get(name) {
                 if gsym.defined_in.is_some() && !gsym.is_dynamic {
                     let sym_val = gsym.value;
@@ -1280,11 +1748,14 @@ pub(super) fn emit_executable(
             let ep = iplt_offset as usize + i * iplt_entry_size as usize;
             let pea = iplt_addr + i as u64 * iplt_entry_size; // address of this IPLT entry
             let gea = ifunc_got_addr + i as u64 * 8; // address of IFUNC GOT entry
-            // ff 25 XX XX XX XX = jmp *disp32(%rip)
-            out[ep] = 0xff; out[ep+1] = 0x25;
-            w32(&mut out, ep+2, (gea as i64 - (pea + 6) as i64) as u32);
+                                                     // ff 25 XX XX XX XX = jmp *disp32(%rip)
+            out[ep] = 0xff;
+            out[ep + 1] = 0x25;
+            w32(&mut out, ep + 2, (gea as i64 - (pea + 6) as i64) as u32);
             // Pad remaining 10 bytes with NOPs
-            for j in 6..iplt_entry_size as usize { out[ep+j] = 0x90; }
+            for j in 6..iplt_entry_size as usize {
+                out[ep + j] = 0x90;
+            }
         }
 
         // IFUNC GOT - initialized to resolver function addresses
@@ -1301,8 +1772,8 @@ pub(super) fn emit_executable(
                 let r_offset = ifunc_got_addr + i as u64 * 8;
                 // r_info: (0 << 32) | R_X86_64_IRELATIVE
                 w64(&mut out, rp, r_offset);
-                w64(&mut out, rp+8, R_X86_64_IRELATIVE as u64);
-                w64(&mut out, rp+16, ifunc_resolver_addrs[i]); // r_addend = resolver address
+                w64(&mut out, rp + 8, R_X86_64_IRELATIVE as u64);
+                w64(&mut out, rp + 16, ifunc_resolver_addrs[i]); // r_addend = resolver address
             }
         }
     }
@@ -1318,13 +1789,20 @@ pub(super) fn emit_executable(
         sorted: bool,
     }
     impl TlsConsumed {
-        fn new() -> Self { Self { ranges: Vec::new(), sorted: true } }
+        fn new() -> Self {
+            Self {
+                ranges: Vec::new(),
+                sorted: true,
+            }
+        }
         fn push(&mut self, start: usize, end: usize) {
             self.ranges.push((start, end));
             self.sorted = false;
         }
         fn contains(&mut self, fp: usize) -> bool {
-            if self.ranges.is_empty() { return false; }
+            if self.ranges.is_empty() {
+                return false;
+            }
             if self.ranges.len() <= 32 && !self.sorted {
                 return self.ranges.iter().any(|&(s, e)| fp >= s && fp < e);
             }
@@ -1333,18 +1811,27 @@ pub(super) fn emit_executable(
                 let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.ranges.len());
                 for (s, e) in self.ranges.drain(..) {
                     if let Some(last) = merged.last_mut() {
-                        if s <= last.1 { last.1 = last.1.max(e); continue; }
+                        if s <= last.1 {
+                            last.1 = last.1.max(e);
+                            continue;
+                        }
                     }
                     merged.push((s, e));
                 }
                 self.ranges = merged;
                 self.sorted = true;
             }
-            self.ranges.binary_search_by(|&(s, e)| {
-                if fp < s { std::cmp::Ordering::Greater }
-                else if fp >= e { std::cmp::Ordering::Less }
-                else { std::cmp::Ordering::Equal }
-            }).is_ok()
+            self.ranges
+                .binary_search_by(|&(s, e)| {
+                    if fp < s {
+                        std::cmp::Ordering::Greater
+                    } else if fp >= e {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
         }
     }
     let mut tls_consumed = TlsConsumed::new();
@@ -1363,7 +1850,9 @@ pub(super) fn emit_executable(
         let mut nb = 0usize;
         for (n, p) in got_entries.iter() {
             v.push(nb);
-            if !n.is_empty() && !*p { nb += 1; }
+            if !n.is_empty() && !*p {
+                nb += 1;
+            }
         }
         v
     };
@@ -1376,16 +1865,21 @@ pub(super) fn emit_executable(
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
             let relas = &objects[obj_idx].relocations[sec_idx];
-            if relas.is_empty() { continue; }
+            if relas.is_empty() {
+                continue;
+            }
             let (out_idx, sec_off) = match section_map.get(&(obj_idx, sec_idx)) {
-                Some(&v) => v, None => continue,
+                Some(&v) => v,
+                None => continue,
             };
             let sa = output_sections[out_idx].addr;
             let sfo = output_sections[out_idx].file_offset;
 
             for rela in relas {
                 let si = rela.sym_idx as usize;
-                if si >= objects[obj_idx].symbols.len() { continue; }
+                if si >= objects[obj_idx].symbols.len() {
+                    continue;
+                }
                 let sym = &objects[obj_idx].symbols[si];
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
@@ -1393,9 +1887,17 @@ pub(super) fn emit_executable(
 
                 // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
                 // rewrite (the __tls_get_addr call no longer exists).
-                if tls_consumed.contains(fp) { continue; }
-                let s = resolve_sym(obj_idx, sym, globals_snap, section_map, output_sections,
-                                    plt_addr);
+                if tls_consumed.contains(fp) {
+                    continue;
+                }
+                let s = resolve_sym(
+                    obj_idx,
+                    sym,
+                    globals_snap,
+                    section_map,
+                    output_sections,
+                    plt_addr,
+                );
 
                 match rela.rela_type {
                     R_X86_64_64 => {
@@ -1419,9 +1921,15 @@ pub(super) fn emit_executable(
                                         deferred_to_loader = true;
                                         0
                                     }
-                                } else { s }
-                            } else { s }
-                        } else { s };
+                                } else {
+                                    s
+                                }
+                            } else {
+                                s
+                            }
+                        } else {
+                            s
+                        };
                         if deferred_to_loader {
                             w64(&mut out, fp, 0);
                         } else {
@@ -1431,9 +1939,17 @@ pub(super) fn emit_executable(
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
                         let t = if !sym.name.is_empty() && !sym.is_local() {
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
-                                if let Some(pi) = g.plt_idx { plt_addr + 16 + pi as u64 * 16 } else { s }
-                            } else { s }
-                        } else { s };
+                                if let Some(pi) = g.plt_idx {
+                                    plt_addr + 16 + pi as u64 * 16
+                                } else {
+                                    s
+                                }
+                            } else {
+                                s
+                            }
+                        } else {
+                            s
+                        };
                         let v = t as i64 + a - p as i64;
                         if v > i32::MAX as i64 || v < i32::MIN as i64 {
                             return Err(reloc_truncated("R_X86_64_PC32", v, sym, obj_idx, objects));
@@ -1488,16 +2004,16 @@ pub(super) fn emit_executable(
                             // corrupting the stack pointer (observed as glibc
                             // static-TLS crashes).
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            let opc = if fp >= 2 { out[fp-2] } else { 0 };
+                            let opc = if fp >= 2 { out[fp - 2] } else { 0 };
                             if fp >= 3 && fp + 4 <= out.len() && (opc == 0x8b || opc == 0x03) {
-                                let modrm = out[fp-1];
+                                let modrm = out[fp - 1];
                                 let reg = (modrm >> 3) & 7;
-                                out[fp-2] = if opc == 0x8b { 0xc7 } else { 0x81 };
-                                out[fp-1] = 0xc0 | reg;
-                                let rex = out[fp-3];
+                                out[fp - 2] = if opc == 0x8b { 0xc7 } else { 0x81 };
+                                out[fp - 1] = 0xc0 | reg;
+                                let rex = out[fp - 3];
                                 if (rex & 0xf0) == 0x40 {
                                     // Keep W and X; move R into B.
-                                    out[fp-3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
+                                    out[fp - 3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
                                 }
                                 w32(&mut out, fp, (tpoff + a) as u32);
                             } else {
@@ -1527,10 +2043,12 @@ pub(super) fn emit_executable(
                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                                     continue;
                                 }
-                                if (rela.rela_type == R_X86_64_GOTPCRELX || rela.rela_type == R_X86_64_REX_GOTPCRELX)
-                                   && g.defined_in.is_some() {
-                                    if fp >= 2 && fp < out.len() && out[fp-2] == 0x8b {
-                                        out[fp-2] = 0x8d;
+                                if (rela.rela_type == R_X86_64_GOTPCRELX
+                                    || rela.rela_type == R_X86_64_REX_GOTPCRELX)
+                                    && g.defined_in.is_some()
+                                {
+                                    if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
+                                        out[fp - 2] = 0x8d;
                                     }
                                     w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
                                     continue;
@@ -1550,8 +2068,8 @@ pub(super) fn emit_executable(
                         // shape with a slotless GOT reference cannot be
                         // fixed up locally — fail loudly rather than emit a
                         // silently corrupt binary.
-                        if fp >= 2 && fp < out.len() && out[fp-2] == 0x8b {
-                            out[fp-2] = 0x8d;
+                        if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
+                            out[fp - 2] = 0x8d;
                             w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
                         } else {
                             return Err(format!(
@@ -1559,10 +2077,13 @@ pub(super) fn emit_executable(
                                  instruction is not a relaxable mov (opcode 0x{:02x}); \
                                  refusing to emit a load of the symbol's bytes",
                                 sym.name,
-                                if fp >= 2 { out[fp-2] } else { 0 }));
+                                if fp >= 2 { out[fp - 2] } else { 0 }
+                            ));
                         }
                     }
-                    R_X86_64_PC64 => { w64(&mut out, fp, (s as i64 + a - p as i64) as u64); }
+                    R_X86_64_PC64 => {
+                        w64(&mut out, fp, (s as i64 + a - p as i64) as u64);
+                    }
                     R_X86_64_TPOFF32 => {
                         // Initial Exec TLS: value = (sym_addr - tls_addr) - tls_mem_size
                         // %fs:0 points past end of TLS block on x86-64
@@ -1575,25 +2096,35 @@ pub(super) fn emit_executable(
                         //   66 66 48 e8 <disp32>      data16 data16 rex.W call __tls_get_addr
                         // fp points at the lea's disp32, so the sequence spans
                         // [fp-4, fp+12) = 16 bytes.
-                        let seq = fp.checked_sub(4)
-                            .filter(|&st| st + 16 <= out.len()
-                                && out[st] == 0x66 && out[st+1] == 0x48
-                                && out[st+2] == 0x8d && out[st+3] == 0x3d
-                                && out[fp+4] == 0x66 && out[fp+5] == 0x66
-                                && out[fp+6] == 0x48 && out[fp+7] == 0xe8);
+                        let seq = fp.checked_sub(4).filter(|&st| {
+                            st + 16 <= out.len()
+                                && out[st] == 0x66
+                                && out[st + 1] == 0x48
+                                && out[st + 2] == 0x8d
+                                && out[st + 3] == 0x3d
+                                && out[fp + 4] == 0x66
+                                && out[fp + 5] == 0x66
+                                && out[fp + 6] == 0x48
+                                && out[fp + 7] == 0xe8
+                        });
                         let Some(st) = seq else {
                             return Err(format!(
                                 "TLSGD relaxation failed: unrecognized code sequence for '{}' in {}",
                                 sym.name, objects[obj_idx].source_name));
                         };
-                        let is_dyn_tls = globals_snap.get(sym.name.as_str())
-                            .map(|g| g.is_dynamic).unwrap_or(false);
+                        let is_dyn_tls = globals_snap
+                            .get(sym.name.as_str())
+                            .map(|g| g.is_dynamic)
+                            .unwrap_or(false);
                         if !is_dyn_tls {
                             // GD -> LE:  mov %fs:0,%rax ; lea tpoff(%rax),%rax
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            out[st..st+9].copy_from_slice(&[0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
-                            out[st+9] = 0x48; out[st+10] = 0x8d; out[st+11] = 0x80;
-                            w32(&mut out, st+12, tpoff as u32);
+                            out[st..st + 9]
+                                .copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+                            out[st + 9] = 0x48;
+                            out[st + 10] = 0x8d;
+                            out[st + 11] = 0x80;
+                            w32(&mut out, st + 12, tpoff as u32);
                         } else {
                             // GD -> IE:  mov %fs:0,%rax ; add got(%rip),%rax
                             // Requires a GOT slot with an R_X86_64_TPOFF64 dynamic
@@ -1602,14 +2133,22 @@ pub(super) fn emit_executable(
                             let Some(gi) = gi else {
                                 return Err(format!(
                                     "TLSGD->IE: no GOT entry for dynamic TLS symbol '{}'",
-                                    sym.name));
+                                    sym.name
+                                ));
                             };
                             let nb = got_slot_ordinal[gi];
                             let gea = got_addr + nb as u64 * 8;
                             let seq_addr = sa + sec_off + rela.offset - 4;
-                            out[st..st+9].copy_from_slice(&[0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
-                            out[st+9] = 0x48; out[st+10] = 0x03; out[st+11] = 0x05;
-                            w32(&mut out, st+12, (gea as i64 - (seq_addr as i64 + 16)) as u32);
+                            out[st..st + 9]
+                                .copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+                            out[st + 9] = 0x48;
+                            out[st + 10] = 0x03;
+                            out[st + 11] = 0x05;
+                            w32(
+                                &mut out,
+                                st + 12,
+                                (gea as i64 - (seq_addr as i64 + 16)) as u32,
+                            );
                         }
                         tls_consumed.push(fp + 4, fp + 12);
                     }
@@ -1620,17 +2159,22 @@ pub(super) fn emit_executable(
                         // spans [fp-3, fp+9) = 12 bytes. Replaced by a 12-byte
                         //   66 66 66 64 48 8b 04 25 00 00 00 00   mov %fs:0,%rax
                         // after which DTPOFF32 values are TP-relative.
-                        let seq = fp.checked_sub(3)
-                            .filter(|&st| st + 12 <= out.len()
-                                && out[st] == 0x48 && out[st+1] == 0x8d && out[st+2] == 0x3d
-                                && out[fp+4] == 0xe8);
+                        let seq = fp.checked_sub(3).filter(|&st| {
+                            st + 12 <= out.len()
+                                && out[st] == 0x48
+                                && out[st + 1] == 0x8d
+                                && out[st + 2] == 0x3d
+                                && out[fp + 4] == 0xe8
+                        });
                         let Some(st) = seq else {
                             return Err(format!(
                                 "TLSLD relaxation failed: unrecognized code sequence in {}",
-                                objects[obj_idx].source_name));
+                                objects[obj_idx].source_name
+                            ));
                         };
-                        out[st..st+12].copy_from_slice(
-                            &[0x66,0x66,0x66,0x64,0x48,0x8b,0x04,0x25,0,0,0,0]);
+                        out[st..st + 12].copy_from_slice(&[
+                            0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+                        ]);
                         tls_consumed.push(fp + 4, fp + 9);
                     }
                     R_X86_64_DTPOFF32 => {
@@ -1648,20 +2192,27 @@ pub(super) fn emit_executable(
                         //   48 8d 05 <disp32>  lea sym@tlsdesc(%rip),%rax
                         // becomes
                         //   48 c7 c0 <tpoff32> mov $tpoff,%rax
-                        if fp >= 3 && out[fp-3] == 0x48 && out[fp-2] == 0x8d && out[fp-1] == 0x05 {
+                        if fp >= 3
+                            && out[fp - 3] == 0x48
+                            && out[fp - 2] == 0x8d
+                            && out[fp - 1] == 0x05
+                        {
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                            out[fp-2] = 0xc7; out[fp-1] = 0xc0;
+                            out[fp - 2] = 0xc7;
+                            out[fp - 1] = 0xc0;
                             w32(&mut out, fp, tpoff as u32);
                         } else {
                             return Err(format!(
                                 "TLSDESC relaxation failed: unrecognized sequence for '{}'",
-                                sym.name));
+                                sym.name
+                            ));
                         }
                     }
                     R_X86_64_TLSDESC_CALL => {
                         // call *(%rax) [ff 10] -> xchg %ax,%ax [66 90] after LE relax
-                        if fp + 2 <= out.len() && out[fp] == 0xff && out[fp+1] == 0x10 {
-                            out[fp] = 0x66; out[fp+1] = 0x90;
+                        if fp + 2 <= out.len() && out[fp] == 0xff && out[fp + 1] == 0x10 {
+                            out[fp] = 0x66;
+                            out[fp + 1] = 0x90;
                         }
                     }
                     R_X86_64_NONE => {}
@@ -1679,7 +2230,10 @@ pub(super) fn emit_executable(
     // Build .eh_frame_hdr from the RELOCATED .eh_frame bytes (initial_location
     // fields are only meaningful after R_X86_64_PC32 application).
     if eh_frame_hdr_size > 0 {
-        if let Some(ef) = output_sections.iter().find(|s| s.name == ".eh_frame" && s.mem_size > 0) {
+        if let Some(ef) = output_sections
+            .iter()
+            .find(|s| s.name == ".eh_frame" && s.mem_size > 0)
+        {
             let ef_start = ef.file_offset as usize;
             let ef_end = ef_start + ef.mem_size as usize;
             if ef_end <= out.len() {
@@ -1691,9 +2245,12 @@ pub(super) fn emit_executable(
                 // immutable borrow ends when `hdr` is produced, which is
                 // before `out` is borrowed mutably, so NLL accepts this.
                 let hdr = linker_common::build_eh_frame_hdr(
-                    &out[ef_start..ef_end], ef.addr, eh_frame_hdr_vaddr, true);
-                if !hdr.is_empty()
-                    && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
+                    &out[ef_start..ef_end],
+                    ef.addr,
+                    eh_frame_hdr_vaddr,
+                    true,
+                );
+                if !hdr.is_empty() && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
                     write_bytes(&mut out, eh_frame_hdr_offset as usize, &hdr);
                 }
             }
@@ -1707,13 +2264,29 @@ pub(super) fn emit_executable(
     let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
     let known_names = [
         ".eh_frame_hdr",
-        ".interp", ".gnu.hash", ".dynsym", ".dynstr",
-        ".gnu.version", ".gnu.version_r",
-        ".rela.dyn", ".rela.plt", ".plt", ".dynamic",
-        ".got", ".got.plt", ".init_array", ".fini_array", ".preinit_array",
-        ".tdata", ".tbss", ".bss", ".shstrtab",
-        ".iplt", ".rela.iplt",
-        ".symtab", ".strtab",
+        ".interp",
+        ".gnu.hash",
+        ".dynsym",
+        ".dynstr",
+        ".gnu.version",
+        ".gnu.version_r",
+        ".rela.dyn",
+        ".rela.plt",
+        ".plt",
+        ".dynamic",
+        ".got",
+        ".got.plt",
+        ".init_array",
+        ".fini_array",
+        ".preinit_array",
+        ".tdata",
+        ".tbss",
+        ".bss",
+        ".shstrtab",
+        ".iplt",
+        ".rela.iplt",
+        ".symtab",
+        ".strtab",
     ];
     for name in &known_names {
         let off = shstrtab.len() as u32;
@@ -1747,43 +2320,82 @@ pub(super) fn emit_executable(
     } else {
         5 // NULL + .interp + .gnu.hash + .dynsym + .dynstr
     };
-    if !is_static && verneed_size > 0 { sh_count += 2; } // .gnu.version + .gnu.version_r
-    if !is_static && rela_dyn_size > 0 { sh_count += 1; }
-    if !is_static && rela_plt_size > 0 { sh_count += 1; }
-    if !is_static && plt_size > 0 { sh_count += 1; }
-    if eh_frame_hdr_size > 0 { sh_count += 1; } // .eh_frame_hdr
-    // Merged output sections (non-BSS, non-TLS, non-init/fini)
+    if !is_static && verneed_size > 0 {
+        sh_count += 2;
+    } // .gnu.version + .gnu.version_r
+    if !is_static && rela_dyn_size > 0 {
+        sh_count += 1;
+    }
+    if !is_static && rela_plt_size > 0 {
+        sh_count += 1;
+    }
+    if !is_static && plt_size > 0 {
+        sh_count += 1;
+    }
+    if eh_frame_hdr_size > 0 {
+        sh_count += 1;
+    } // .eh_frame_hdr
+      // Merged output sections (non-BSS, non-TLS, non-init/fini)
     for sec in output_sections.iter() {
-        if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-           && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" {
+        if sec.flags & SHF_ALLOC != 0
+            && sec.sh_type != SHT_NOBITS
+            && sec.flags & SHF_TLS == 0
+            && sec.name != ".init_array"
+            && sec.name != ".fini_array"
+            && sec.name != ".preinit_array"
+        {
             sh_count += 1;
         }
     }
     // TLS data + TLS BSS
     for sec in output_sections.iter() {
-        if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS { sh_count += 1; }
+        if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
+            sh_count += 1;
+        }
     }
     for sec in output_sections.iter() {
-        if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS { sh_count += 1; }
+        if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
+            sh_count += 1;
+        }
     }
-    if has_init_array { sh_count += 1; }
-    if has_fini_array { sh_count += 1; }
-    if has_preinit_array { sh_count += 1; }
-    if !is_static { sh_count += 1; } // .dynamic
-    if got_size > 0 { sh_count += 1; } // .got (needed for static too: TLS, GOTPCREL)
-    if !is_static { sh_count += 1; } // .got.plt
-    if iplt_total_size > 0 { sh_count += 1; } // .iplt
-    if rela_iplt_size > 0 { sh_count += 1; } // .rela.iplt
-    // BSS sections (non-TLS)
+    if has_init_array {
+        sh_count += 1;
+    }
+    if has_fini_array {
+        sh_count += 1;
+    }
+    if has_preinit_array {
+        sh_count += 1;
+    }
+    if !is_static {
+        sh_count += 1;
+    } // .dynamic
+    if got_size > 0 {
+        sh_count += 1;
+    } // .got (needed for static too: TLS, GOTPCREL)
+    if !is_static {
+        sh_count += 1;
+    } // .got.plt
+    if iplt_total_size > 0 {
+        sh_count += 1;
+    } // .iplt
+    if rela_iplt_size > 0 {
+        sh_count += 1;
+    } // .rela.iplt
+      // BSS sections (non-TLS)
     for sec in output_sections.iter() {
-        if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 { sh_count += 1; }
+        if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
+            sh_count += 1;
+        }
     }
     sh_count += 2; // .symtab + .strtab
     let shstrtab_shidx = sh_count; // .shstrtab is the last section
     sh_count += 1;
 
     // Align and append .symtab + .strtab data (before .shstrtab)
-    while out.len() % 8 != 0 { out.push(0); }
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
     let symtab_data_offset = out.len() as u64;
     let symtab_data_size = (symtab_entries.len() * 24) as u64;
     for e in &symtab_entries {
@@ -1793,12 +2405,16 @@ pub(super) fn emit_executable(
     out.extend_from_slice(&symtab_names);
 
     // Align and append .shstrtab data
-    while out.len() % 8 != 0 { out.push(0); }
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
     let shstrtab_data_offset = out.len() as u64;
     out.extend_from_slice(&shstrtab);
 
     // Align section header table to 8 bytes
-    while out.len() % 8 != 0 { out.push(0); }
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
     let shdr_offset = out.len() as u64;
 
     // Write section headers
@@ -1807,133 +2423,412 @@ pub(super) fn emit_executable(
     // Dynamic linking section headers (skipped for static executables)
     if !is_static {
         // .interp
-        write_shdr(&mut out, get_shname(".interp"), SHT_PROGBITS, SHF_ALLOC,
-                   interp_addr, interp_offset, INTERP.len() as u64, 0, 0, 1, 0);
+        write_shdr(
+            &mut out,
+            get_shname(".interp"),
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            interp_addr,
+            interp_offset,
+            INTERP.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
         // .gnu.hash
-        write_shdr(&mut out, get_shname(".gnu.hash"), SHT_GNU_HASH, SHF_ALLOC,
-                   gnu_hash_addr, gnu_hash_offset, gnu_hash_size, dynsym_shidx, 0, 8, 0);
+        write_shdr(
+            &mut out,
+            get_shname(".gnu.hash"),
+            SHT_GNU_HASH,
+            SHF_ALLOC,
+            gnu_hash_addr,
+            gnu_hash_offset,
+            gnu_hash_size,
+            dynsym_shidx,
+            0,
+            8,
+            0,
+        );
         // .dynsym
-        write_shdr(&mut out, get_shname(".dynsym"), SHT_DYNSYM, SHF_ALLOC,
-                   dynsym_addr, dynsym_offset, dynsym_size, dynstr_shidx, 1, 8, 24);
+        write_shdr(
+            &mut out,
+            get_shname(".dynsym"),
+            SHT_DYNSYM,
+            SHF_ALLOC,
+            dynsym_addr,
+            dynsym_offset,
+            dynsym_size,
+            dynstr_shidx,
+            1,
+            8,
+            24,
+        );
         // .dynstr
-        write_shdr(&mut out, get_shname(".dynstr"), SHT_STRTAB, SHF_ALLOC,
-                   dynstr_addr, dynstr_offset, dynstr_size, 0, 0, 1, 0);
+        write_shdr(
+            &mut out,
+            get_shname(".dynstr"),
+            SHT_STRTAB,
+            SHF_ALLOC,
+            dynstr_addr,
+            dynstr_offset,
+            dynstr_size,
+            0,
+            0,
+            1,
+            0,
+        );
         // .gnu.version (versym)
         if verneed_size > 0 {
-            write_shdr(&mut out, get_shname(".gnu.version"), SHT_GNU_VERSYM, SHF_ALLOC,
-                       versym_addr, versym_offset, versym_size, dynsym_shidx, 0, 2, 2);
+            write_shdr(
+                &mut out,
+                get_shname(".gnu.version"),
+                SHT_GNU_VERSYM,
+                SHF_ALLOC,
+                versym_addr,
+                versym_offset,
+                versym_size,
+                dynsym_shidx,
+                0,
+                2,
+                2,
+            );
         }
         // .gnu.version_r (verneed)
         if verneed_size > 0 {
-            write_shdr(&mut out, get_shname(".gnu.version_r"), SHT_GNU_VERNEED, SHF_ALLOC,
-                       verneed_addr, verneed_offset, verneed_size, dynstr_shidx, verneed_count, 4, 0);
+            write_shdr(
+                &mut out,
+                get_shname(".gnu.version_r"),
+                SHT_GNU_VERNEED,
+                SHF_ALLOC,
+                verneed_addr,
+                verneed_offset,
+                verneed_size,
+                dynstr_shidx,
+                verneed_count,
+                4,
+                0,
+            );
         }
         // .rela.dyn
         if rela_dyn_size > 0 {
-            write_shdr(&mut out, get_shname(".rela.dyn"), SHT_RELA, SHF_ALLOC,
-                       rela_dyn_addr, rela_dyn_offset, rela_dyn_size, dynsym_shidx, 0, 8, 24);
+            write_shdr(
+                &mut out,
+                get_shname(".rela.dyn"),
+                SHT_RELA,
+                SHF_ALLOC,
+                rela_dyn_addr,
+                rela_dyn_offset,
+                rela_dyn_size,
+                dynsym_shidx,
+                0,
+                8,
+                24,
+            );
         }
         // .rela.plt
         if rela_plt_size > 0 {
-            write_shdr(&mut out, get_shname(".rela.plt"), SHT_RELA, SHF_ALLOC | 0x40,
-                       rela_plt_addr, rela_plt_offset, rela_plt_size, dynsym_shidx, 0, 8, 24);
+            write_shdr(
+                &mut out,
+                get_shname(".rela.plt"),
+                SHT_RELA,
+                SHF_ALLOC | 0x40,
+                rela_plt_addr,
+                rela_plt_offset,
+                rela_plt_size,
+                dynsym_shidx,
+                0,
+                8,
+                24,
+            );
         }
         // .plt
         if plt_size > 0 {
-            write_shdr(&mut out, get_shname(".plt"), SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
-                       plt_addr, plt_offset, plt_size, 0, 0, 16, 16);
+            write_shdr(
+                &mut out,
+                get_shname(".plt"),
+                SHT_PROGBITS,
+                SHF_ALLOC | SHF_EXECINSTR,
+                plt_addr,
+                plt_offset,
+                plt_size,
+                0,
+                0,
+                16,
+                16,
+            );
         }
     }
     // .eh_frame_hdr (before the merged sections; matches the count walks above)
     if eh_frame_hdr_size > 0 {
-        write_shdr(&mut out, get_shname(".eh_frame_hdr"), SHT_PROGBITS, SHF_ALLOC,
-                   eh_frame_hdr_vaddr, eh_frame_hdr_offset, eh_frame_hdr_size, 0, 0, 4, 0);
+        write_shdr(
+            &mut out,
+            get_shname(".eh_frame_hdr"),
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_size,
+            0,
+            0,
+            4,
+            0,
+        );
     }
     // Merged output sections (text/rodata/data, excluding BSS/TLS/init_array/fini_array)
     for sec in output_sections.iter() {
-        if sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0
-           && sec.name != ".init_array" && sec.name != ".fini_array" && sec.name != ".preinit_array" {
-            write_shdr(&mut out, get_shname(&sec.name), sec.sh_type, sec.flags,
-                       sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
+        if sec.flags & SHF_ALLOC != 0
+            && sec.sh_type != SHT_NOBITS
+            && sec.flags & SHF_TLS == 0
+            && sec.name != ".init_array"
+            && sec.name != ".fini_array"
+            && sec.name != ".preinit_array"
+        {
+            write_shdr(
+                &mut out,
+                get_shname(&sec.name),
+                sec.sh_type,
+                sec.flags,
+                sec.addr,
+                sec.file_offset,
+                sec.mem_size,
+                0,
+                0,
+                sec.alignment.max(1),
+                0,
+            );
         }
     }
     // TLS data sections (.tdata)
     for sec in output_sections.iter() {
         if sec.flags & SHF_TLS != 0 && sec.flags & SHF_ALLOC != 0 && sec.sh_type != SHT_NOBITS {
-            write_shdr(&mut out, get_shname(&sec.name), sec.sh_type, sec.flags,
-                       sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
+            write_shdr(
+                &mut out,
+                get_shname(&sec.name),
+                sec.sh_type,
+                sec.flags,
+                sec.addr,
+                sec.file_offset,
+                sec.mem_size,
+                0,
+                0,
+                sec.alignment.max(1),
+                0,
+            );
         }
     }
     // TLS BSS sections (.tbss)
     for sec in output_sections.iter() {
         if sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS {
-            write_shdr(&mut out, get_shname(&sec.name), SHT_NOBITS, sec.flags,
-                       sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
+            write_shdr(
+                &mut out,
+                get_shname(&sec.name),
+                SHT_NOBITS,
+                sec.flags,
+                sec.addr,
+                sec.file_offset,
+                sec.mem_size,
+                0,
+                0,
+                sec.alignment.max(1),
+                0,
+            );
         }
     }
     // .init_array
     if has_init_array {
         if let Some(ia_sec) = output_sections.iter().find(|s| s.name == ".init_array") {
-            write_shdr(&mut out, get_shname(".init_array"), SHT_INIT_ARRAY, SHF_ALLOC | SHF_WRITE,
-                       init_array_addr, ia_sec.file_offset, init_array_size, 0, 0, 8, 8);
+            write_shdr(
+                &mut out,
+                get_shname(".init_array"),
+                SHT_INIT_ARRAY,
+                SHF_ALLOC | SHF_WRITE,
+                init_array_addr,
+                ia_sec.file_offset,
+                init_array_size,
+                0,
+                0,
+                8,
+                8,
+            );
         }
     }
     // .fini_array
     if has_fini_array {
         if let Some(fa_sec) = output_sections.iter().find(|s| s.name == ".fini_array") {
-            write_shdr(&mut out, get_shname(".fini_array"), SHT_FINI_ARRAY, SHF_ALLOC | SHF_WRITE,
-                       fini_array_addr, fa_sec.file_offset, fini_array_size, 0, 0, 8, 8);
+            write_shdr(
+                &mut out,
+                get_shname(".fini_array"),
+                SHT_FINI_ARRAY,
+                SHF_ALLOC | SHF_WRITE,
+                fini_array_addr,
+                fa_sec.file_offset,
+                fini_array_size,
+                0,
+                0,
+                8,
+                8,
+            );
         }
     }
     // .preinit_array
     if has_preinit_array {
         if let Some(pa_sec) = output_sections.iter().find(|s| s.name == ".preinit_array") {
-            write_shdr(&mut out, get_shname(".preinit_array"), SHT_PREINIT_ARRAY, SHF_ALLOC | SHF_WRITE,
-                       preinit_array_addr, pa_sec.file_offset, preinit_array_size, 0, 0, 8, 8);
+            write_shdr(
+                &mut out,
+                get_shname(".preinit_array"),
+                SHT_PREINIT_ARRAY,
+                SHF_ALLOC | SHF_WRITE,
+                preinit_array_addr,
+                pa_sec.file_offset,
+                preinit_array_size,
+                0,
+                0,
+                8,
+                8,
+            );
         }
     }
     if !is_static {
         // .dynamic
-        write_shdr(&mut out, get_shname(".dynamic"), SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE,
-                   dynamic_addr, dynamic_offset, dynamic_size, dynstr_shidx, 0, 8, 16);
+        write_shdr(
+            &mut out,
+            get_shname(".dynamic"),
+            SHT_DYNAMIC,
+            SHF_ALLOC | SHF_WRITE,
+            dynamic_addr,
+            dynamic_offset,
+            dynamic_size,
+            dynstr_shidx,
+            0,
+            8,
+            16,
+        );
     }
     // .got (needed for both static and dynamic: TLS GOTTPOFF, GOTPCREL)
     if got_size > 0 {
-        write_shdr(&mut out, get_shname(".got"), SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
-                   got_addr, got_offset, got_size, 0, 0, 8, 8);
+        write_shdr(
+            &mut out,
+            get_shname(".got"),
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_WRITE,
+            got_addr,
+            got_offset,
+            got_size,
+            0,
+            0,
+            8,
+            8,
+        );
     }
     if !is_static {
         // .got.plt
-        write_shdr(&mut out, get_shname(".got.plt"), SHT_PROGBITS, SHF_ALLOC | SHF_WRITE,
-                   got_plt_addr, got_plt_offset, got_plt_size, 0, 0, 8, 8);
+        write_shdr(
+            &mut out,
+            get_shname(".got.plt"),
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_WRITE,
+            got_plt_addr,
+            got_plt_offset,
+            got_plt_size,
+            0,
+            0,
+            8,
+            8,
+        );
     }
     // .iplt (IFUNC PLT for static linking)
     if iplt_total_size > 0 {
-        write_shdr(&mut out, get_shname(".iplt"), SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
-                   iplt_addr, iplt_offset, iplt_total_size, 0, 0, 16, 16);
+        write_shdr(
+            &mut out,
+            get_shname(".iplt"),
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_EXECINSTR,
+            iplt_addr,
+            iplt_offset,
+            iplt_total_size,
+            0,
+            0,
+            16,
+            16,
+        );
     }
     // .rela.iplt (IRELATIVE relocations for static linking)
     if rela_iplt_size > 0 {
-        write_shdr(&mut out, get_shname(".rela.iplt"), SHT_RELA, SHF_ALLOC,
-                   rela_iplt_addr, rela_iplt_offset, rela_iplt_size, 0, 0, 8, 24);
+        write_shdr(
+            &mut out,
+            get_shname(".rela.iplt"),
+            SHT_RELA,
+            SHF_ALLOC,
+            rela_iplt_addr,
+            rela_iplt_offset,
+            rela_iplt_size,
+            0,
+            0,
+            8,
+            24,
+        );
     }
     // BSS sections (non-TLS)
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
-            write_shdr(&mut out, get_shname(&sec.name), SHT_NOBITS, sec.flags,
-                       sec.addr, sec.file_offset, sec.mem_size, 0, 0, sec.alignment.max(1), 0);
+            write_shdr(
+                &mut out,
+                get_shname(&sec.name),
+                SHT_NOBITS,
+                sec.flags,
+                sec.addr,
+                sec.file_offset,
+                sec.mem_size,
+                0,
+                0,
+                sec.alignment.max(1),
+                0,
+            );
         }
     }
     // .symtab (defined symbols for profilers/debuggers)
-    write_shdr(&mut out, get_shname(".symtab"), SHT_SYMTAB, 0,
-               0, symtab_data_offset, symtab_data_size,
-               strtab_shidx as u32, n_local as u32, 8, 24);
+    write_shdr(
+        &mut out,
+        get_shname(".symtab"),
+        SHT_SYMTAB,
+        0,
+        0,
+        symtab_data_offset,
+        symtab_data_size,
+        strtab_shidx as u32,
+        n_local as u32,
+        8,
+        24,
+    );
     // .strtab
-    write_shdr(&mut out, get_shname(".strtab"), SHT_STRTAB, 0,
-               0, strtab_data_offset, symtab_names.len() as u64, 0, 0, 1, 0);
+    write_shdr(
+        &mut out,
+        get_shname(".strtab"),
+        SHT_STRTAB,
+        0,
+        0,
+        strtab_data_offset,
+        symtab_names.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
     // .shstrtab (last section)
-    write_shdr(&mut out, get_shname(".shstrtab"), SHT_STRTAB, 0,
-               0, shstrtab_data_offset, shstrtab.len() as u64, 0, 0, 1, 0);
+    write_shdr(
+        &mut out,
+        get_shname(".shstrtab"),
+        SHT_STRTAB,
+        0,
+        0,
+        shstrtab_data_offset,
+        shstrtab.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
 
     // Patch ELF header with section header info
     // e_shoff at offset 40 (8 bytes)
@@ -1951,19 +2846,24 @@ pub(super) fn emit_executable(
     // itself was emitted from, which makes the map authoritative rather than
     // a reconstruction that can drift from reality.
     if let Some(mp) = map_path {
-        let object_names: Vec<String> =
-            objects.iter().map(|o| o.source_name.clone()).collect();
+        let object_names: Vec<String> = objects.iter().map(|o| o.source_name.clone()).collect();
 
         // (name, object_idx, section_idx, offset-within-input-section)
         let mut map_syms: Vec<(String, usize, usize, u64)> = Vec::new();
         for (obj_idx, obj) in objects.iter().enumerate() {
             for sym in &obj.symbols {
-                if sym.name.is_empty() { continue; }
+                if sym.name.is_empty() {
+                    continue;
+                }
                 let st = sym.sym_type();
                 // STT_SECTION (3) and STT_FILE (4) are bookkeeping entries,
                 // not addresses a map reader cares about.
-                if st == STT_SECTION || st == 4 { continue; }
-                if sym.is_undefined() { continue; }
+                if st == STT_SECTION || st == 4 {
+                    continue;
+                }
+                if sym.is_undefined() {
+                    continue;
+                }
                 let si = sym.shndx as usize;
                 if section_map.contains_key(&(obj_idx, si)) {
                     map_syms.push((sym.name.to_string(), obj_idx, si, sym.value));
@@ -1972,13 +2872,18 @@ pub(super) fn emit_executable(
         }
 
         let lm = linker_common::build_link_map(
-            output_sections, &object_names, &map_syms,
-            entry_symbol.or(Some("_start")), entry_addr);
+            output_sections,
+            &object_names,
+            &map_syms,
+            entry_symbol.or(Some("_start")),
+            entry_addr,
+        );
         lm.write_to_path(std::path::Path::new(mp))
             .map_err(|e| format!("failed to write map file '{}': {}", mp, e))?;
     }
 
-    std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
+    std::fs::write(output_path, &out)
+        .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1988,38 +2893,65 @@ pub(super) fn emit_executable(
 }
 
 pub(super) fn resolve_sym(
-    obj_idx: usize, sym: &Symbol, globals: &FxHashMap<String, GlobalSymbol>,
-    section_map: &FxHashMap<(usize, usize), (usize, u64)>, output_sections: &[OutputSection],
+    obj_idx: usize,
+    sym: &Symbol,
+    globals: &FxHashMap<String, GlobalSymbol>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    output_sections: &[OutputSection],
     plt_addr: u64,
 ) -> u64 {
     if sym.sym_type() == STT_SECTION {
         let si = sym.shndx as usize;
-        return section_map.get(&(obj_idx, si)).map(|&(oi, so)| output_sections[oi].addr + so).unwrap_or(0);
+        return section_map
+            .get(&(obj_idx, si))
+            .map(|&(oi, so)| output_sections[oi].addr + so)
+            .unwrap_or(0);
     }
     // Local (STB_LOCAL) symbols must NOT be resolved via globals, since a
     // local symbol named e.g. "opts" must not be confused with a global "opts"
     // from another object file.
     if !sym.name.is_empty() && !sym.is_local() {
         if let Some(g) = globals.get(sym.name.as_str()) {
-            if g.defined_in.is_some() { return g.value; }
+            if g.defined_in.is_some() {
+                return g.value;
+            }
             if g.is_dynamic {
-                return g.plt_idx.map(|pi| plt_addr + 16 + pi as u64 * 16).unwrap_or(0);
+                return g
+                    .plt_idx
+                    .map(|pi| plt_addr + 16 + pi as u64 * 16)
+                    .unwrap_or(0);
             }
         }
-        if sym.is_weak() { return 0; }
+        if sym.is_weak() {
+            return 0;
+        }
     }
-    if sym.is_undefined() { return 0; }
-    if sym.shndx == SHN_ABS { return sym.value; }
-    section_map.get(&(obj_idx, sym.shndx as usize))
-        .map(|&(oi, so)| output_sections[oi].addr + so + sym.value).unwrap_or(sym.value)
+    if sym.is_undefined() {
+        return 0;
+    }
+    if sym.shndx == SHN_ABS {
+        return sym.value;
+    }
+    section_map
+        .get(&(obj_idx, sym.shndx as usize))
+        .map(|&(oi, so)| output_sections[oi].addr + so + sym.value)
+        .unwrap_or(sym.value)
 }
 
 /// Format a "relocation truncated to fit" error in the GNU ld style,
 /// with the referencing object file for actionable diagnostics.
 pub(super) fn reloc_truncated(
-    rtype: &str, value: i64, sym: &Symbol, obj_idx: usize, objects: &[ElfObject],
+    rtype: &str,
+    value: i64,
+    sym: &Symbol,
+    obj_idx: usize,
+    objects: &[ElfObject],
 ) -> String {
-    let target = if sym.name.is_empty() { "<local>" } else { sym.name.as_str() };
+    let target = if sym.name.is_empty() {
+        "<local>"
+    } else {
+        sym.name.as_str()
+    };
     format!(
         "relocation truncated to fit: {} against symbol '{}' in {} (value 0x{:x} out of range); \
          recompile with -mcmodel=large or -fpic if the image exceeds 2 GiB",

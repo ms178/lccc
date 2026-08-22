@@ -41,22 +41,88 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
     match infos[i].kind {
         LineKind::Cmp => true, // cmp/test/ucomis*
-        LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::Label
-        | LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect
-        | LineKind::Call | LineKind::Ret | LineKind::Directive
-        | LineKind::SelfMove | LineKind::SetCC { .. } => false,
+        LineKind::Push { .. }
+        | LineKind::Pop { .. }
+        | LineKind::Label
+        | LineKind::Jmp
+        | LineKind::CondJmp
+        | LineKind::JmpIndirect
+        | LineKind::Call
+        | LineKind::Ret
+        | LineKind::Directive
+        | LineKind::SelfMove
+        | LineKind::SetCC { .. } => false,
         _ => {
             let t = infos[i].trimmed(store.get(i));
             let mnem = t.split_whitespace().next().unwrap_or("");
-            matches!(mnem,
-                "addl"|"addq"|"addw"|"addb"|"subl"|"subq"|"subw"|"subb"|
-                "andl"|"andq"|"andw"|"andb"|"orl"|"orq"|"orw"|"orb"|
-                "xorl"|"xorq"|"xorw"|"xorb"|"imull"|"imulq"|"imulw"|
-                "mull"|"mulq"|"mulw"|"incl"|"incq"|"incw"|"decl"|"decq"|"decw"|
-                "negl"|"negq"|"negw"|"notl"|"notq"|"notw"|"shll"|"shlq"|"shlw"|
-                "shrl"|"shrq"|"shrw"|"sarl"|"sarq"|"sarw"|"roll"|"rolq"|"rolw"|
-                "rorl"|"rorq"|"rorw"|"testl"|"testq"|"testw"|"testb"|
-                "cmpl"|"cmpq"|"cmpw"|"cmpb"|"btl"|"btq"|"btw"|"btb")
+            matches!(
+                mnem,
+                "addl"
+                    | "addq"
+                    | "addw"
+                    | "addb"
+                    | "subl"
+                    | "subq"
+                    | "subw"
+                    | "subb"
+                    | "andl"
+                    | "andq"
+                    | "andw"
+                    | "andb"
+                    | "orl"
+                    | "orq"
+                    | "orw"
+                    | "orb"
+                    | "xorl"
+                    | "xorq"
+                    | "xorw"
+                    | "xorb"
+                    | "imull"
+                    | "imulq"
+                    | "imulw"
+                    | "mull"
+                    | "mulq"
+                    | "mulw"
+                    | "incl"
+                    | "incq"
+                    | "incw"
+                    | "decl"
+                    | "decq"
+                    | "decw"
+                    | "negl"
+                    | "negq"
+                    | "negw"
+                    | "notl"
+                    | "notq"
+                    | "notw"
+                    | "shll"
+                    | "shlq"
+                    | "shlw"
+                    | "shrl"
+                    | "shrq"
+                    | "shrw"
+                    | "sarl"
+                    | "sarq"
+                    | "sarw"
+                    | "roll"
+                    | "rolq"
+                    | "rolw"
+                    | "rorl"
+                    | "rorq"
+                    | "rorw"
+                    | "testl"
+                    | "testq"
+                    | "testw"
+                    | "testb"
+                    | "cmpl"
+                    | "cmpq"
+                    | "cmpw"
+                    | "cmpb"
+                    | "btl"
+                    | "btq"
+                    | "btw"
+                    | "btb"
+            )
         }
     }
 }
@@ -68,19 +134,31 @@ fn reads_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
         _ => {
             let t = infos[i].trimmed(store.get(i));
             let mnem = t.split_whitespace().next().unwrap_or("");
-            mnem.starts_with("cmov") || mnem.starts_with("set")
-                || mnem == "adcl" || mnem == "adcq" || mnem == "adcw"
-                || mnem == "sbbl" || mnem == "sbbq" || mnem == "sbbw"
+            mnem.starts_with("cmov")
+                || mnem.starts_with("set")
+                || mnem == "adcl"
+                || mnem == "adcq"
+                || mnem == "adcw"
+                || mnem == "sbbl"
+                || mnem == "sbbq"
+                || mnem == "sbbw"
         }
     }
 }
 
 /// True if the block reads EFLAGS *before* establishing them itself, i.e. it
 /// depends on the incoming (predecessor-set) flags.
-fn block_is_flag_dependent(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
+fn block_is_flag_dependent(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+) -> bool {
     let mut flags_set = false;
     for j in (start + 1)..end {
-        if infos[j].is_nop() { continue; }
+        if infos[j].is_nop() {
+            continue;
+        }
         if sets_flags(store, infos, j) {
             flags_set = true;
         } else if reads_flags(store, infos, j) && !flags_set {
@@ -95,7 +173,9 @@ fn block_is_flag_dependent(store: &LineStore, infos: &[LineInfo], start: usize, 
 /// would split it, so its register state at exit is path-independent.
 fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
     for j in (start + 1)..end {
-        if infos[j].is_nop() { continue; }
+        if infos[j].is_nop() {
+            continue;
+        }
         match infos[j].kind {
             LineKind::Label | LineKind::Directive => return false,
             _ => {}
@@ -108,7 +188,9 @@ fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usiz
 /// decide if EFLAGS matter for the merge).
 fn block_has_flag_use(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
     for j in (start + 1)..end {
-        if infos[j].is_nop() { continue; }
+        if infos[j].is_nop() {
+            continue;
+        }
         if reads_flags(store, infos, j) || sets_flags(store, infos, j) {
             return true;
         }
@@ -120,7 +202,9 @@ fn block_has_flag_use(store: &LineStore, infos: &[LineInfo], start: usize, end: 
 /// Returns true if any blocks were merged.
 pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
-    if len < 10 { return false; }
+    if len < 10 {
+        return false;
+    }
 
     // Phase 1: Find all labels and their block boundaries.
     let mut blocks: Vec<(usize, usize, String, u32)> = Vec::new(); // (start_line, end_line, label_name, func_id)
@@ -130,7 +214,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     while i < len {
         if infos[i].kind == LineKind::Directive {
             let line = infos[i].trimmed(store.get(i));
-            if line == ".cfi_startproc" { current_func_id += 1; }
+            if line == ".cfi_startproc" {
+                current_func_id += 1;
+            }
         }
         if infos[i].kind == LineKind::Label {
             let label = infos[i].trimmed(store.get(i));
@@ -139,8 +225,13 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                     let start = i;
                     let mut end = i + 1;
                     while end < len {
-                        if infos[end].is_nop() { end += 1; continue; }
-                        if infos[end].kind == LineKind::Label { break; }
+                        if infos[end].is_nop() {
+                            end += 1;
+                            continue;
+                        }
+                        if infos[end].kind == LineKind::Label {
+                            break;
+                        }
                         if infos[end].kind == LineKind::Directive {
                             // .loc/.file debug directives are INERT text markers
                             // (parsed but carry no semantics): they must not
@@ -159,7 +250,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                         end += 1;
                     }
                     let bidx = blocks.len() as isize;
-                    for k in start..end { block_of_line[k] = bidx; }
+                    for k in start..end {
+                        block_of_line[k] = bidx;
+                    }
                     blocks.push((start, end, label_name.to_string(), current_func_id));
                     i = end;
                     continue;
@@ -169,7 +262,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         i += 1;
     }
 
-    if blocks.len() < 2 { return false; }
+    if blocks.len() < 2 {
+        return false;
+    }
 
     // Phase 1.5: Compute predecessor set for each block.
     // preds[label] = sorted set of predecessor block labels.
@@ -182,22 +277,32 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     let mut block_terminator: Vec<LineKind> = vec![LineKind::Empty; blocks.len()];
     for (bidx, &(start, end, _, _)) in blocks.iter().enumerate() {
         for k in (start + 1..end).rev() {
-            if infos[k].is_nop() { continue; }
+            if infos[k].is_nop() {
+                continue;
+            }
             block_terminator[bidx] = infos[k].kind;
             break;
         }
     }
     // Scan all jumps/cond-jumps; add source block to target's preds.
     for i in 0..len {
-        if infos[i].is_nop() { continue; }
+        if infos[i].is_nop() {
+            continue;
+        }
         if matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp) {
             let trimmed = infos[i].trimmed(store.get(i));
             if let Some(space_pos) = trimmed.find(' ') {
-                let target = trimmed[space_pos + 1..].trim().trim_end_matches(':').to_string();
+                let target = trimmed[space_pos + 1..]
+                    .trim()
+                    .trim_end_matches(':')
+                    .to_string();
                 if let Some(&src_bidx) = block_of_line.get(i) {
                     if src_bidx >= 0 {
                         let src_label = &blocks[src_bidx as usize].2;
-                        preds.entry(target.clone()).or_default().insert(src_label.clone());
+                        preds
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(src_label.clone());
                     }
                 }
             }
@@ -211,7 +316,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         // Only one block can end at b_start (the immediately preceding one), but
         // check all blocks for safety.
         for xi in 0..blocks.len() {
-            if xi == bi { continue; }
+            if xi == bi {
+                continue;
+            }
             if blocks[xi].1 == b_start {
                 // X immediately precedes B.
                 match block_terminator[xi] {
@@ -235,7 +342,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         let mut hasher = 0u64;
         let mut instr_count = 0u32;
         for j in (start + 1)..end {
-            if infos[j].is_nop() { continue; }
+            if infos[j].is_nop() {
+                continue;
+            }
             let line = store.get(j);
             for byte in line.bytes() {
                 hasher ^= byte as u64;
@@ -263,7 +372,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     // is a jump-table target must be excluded from merging entirely.
     let mut jump_table_targets: FxHashSet<String> = FxHashSet::default();
     for i in 0..len {
-        if infos[i].is_nop() { continue; }
+        if infos[i].is_nop() {
+            continue;
+        }
         let line = infos[i].trimmed(store.get(i));
         if line.starts_with(".long ") {
             // Extract every `.LBB...` label mentioned in the entry.
@@ -273,7 +384,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             while let Some(pos) = rest.find(".LBB") {
                 let name_start = pos + ".LBB".len();
                 let mut j = name_start;
-                while j < rest.len() && (rest.as_bytes()[j].is_ascii_alphanumeric() || rest.as_bytes()[j] == b'_') {
+                while j < rest.len()
+                    && (rest.as_bytes()[j].is_ascii_alphanumeric() || rest.as_bytes()[j] == b'_')
+                {
                     j += 1;
                 }
                 let tok = rest[pos..j].to_string();
@@ -295,7 +408,8 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     let mut fallthrough: Vec<Option<String>> = vec![None; blocks.len()];
     for bi in 0..blocks.len() {
         let term = block_terminator[bi];
-        let has_explicit_exit = matches!(term, LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret);
+        let has_explicit_exit =
+            matches!(term, LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret);
         if !has_explicit_exit {
             // Find the block that starts exactly where this block ends.
             let end_pos = blocks[bi].1;
@@ -325,7 +439,10 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             for pl in pset {
                 if let Some(&pidx) = label_to_bidx.get(pl) {
                     let (ps, pe, _, _) = blocks[pidx];
-                    if !block_is_clean(store, infos, ps, pe) { all_clean = false; break; }
+                    if !block_is_clean(store, infos, ps, pe) {
+                        all_clean = false;
+                        break;
+                    }
                 }
             }
         }
@@ -337,7 +454,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     let mut redirects: FxHashMap<String, String> = FxHashMap::default(); // old_label → canonical_label
 
     for ((_hash, _func_id), group) in &block_hashes {
-        if group.len() < 2 { continue; }
+        if group.len() < 2 {
+            continue;
+        }
         let canonical_idx = group[0];
         let (can_start, can_end, _, _) = &blocks[canonical_idx];
         let canonical_label = blocks[canonical_idx].2.clone();
@@ -350,8 +469,11 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
 
         // SOUNDNESS: skip if the canonical block is flag-dependent, not
         // clean, has a non-clean predecessor, or is a jump-table target.
-        if flag_dep[canonical_idx] || !clean[canonical_idx] || !preds_clean[canonical_idx]
-            || jump_table_targets.contains(&canonical_label) {
+        if flag_dep[canonical_idx]
+            || !clean[canonical_idx]
+            || !preds_clean[canonical_idx]
+            || jump_table_targets.contains(&canonical_label)
+        {
             continue;
         }
 
@@ -359,12 +481,18 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             let (other_start, other_end, ref other_label, _) = blocks[other_idx];
             let other_preds = preds.get(other_label).cloned().unwrap_or_default();
             // SOUNDNESS: require identical predecessor sets.
-            if canonical_preds != other_preds { continue; }
+            if canonical_preds != other_preds {
+                continue;
+            }
             // SOUNDNESS: never merge/eliminate a jump-table target, a
             // flag-dependent block, a non-clean block, or one with a non-clean
             // predecessor.
-            if jump_table_targets.contains(other_label) { continue; }
-            if flag_dep[other_idx] || !clean[other_idx] || !preds_clean[other_idx] { continue; }
+            if jump_table_targets.contains(other_label) {
+                continue;
+            }
+            if flag_dep[other_idx] || !clean[other_idx] || !preds_clean[other_idx] {
+                continue;
+            }
 
             let other_instrs: Vec<String> = ((other_start + 1)..other_end)
                 .filter(|&j| !infos[j].is_nop())
@@ -376,21 +504,30 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                 // block text; both blocks must fall through to the SAME next
                 // block (or neither falls through), else redirecting changes
                 // control flow after the merged block.
-                if fallthrough[canonical_idx] != fallthrough[other_idx] { continue; }
+                if fallthrough[canonical_idx] != fallthrough[other_idx] {
+                    continue;
+                }
 
                 redirects.insert(other_label.clone(), canonical_label.clone());
                 for j in other_start..other_end {
-                    if !infos[j].is_nop() { mark_nop(&mut infos[j]); changed = true; }
+                    if !infos[j].is_nop() {
+                        mark_nop(&mut infos[j]);
+                        changed = true;
+                    }
                 }
             }
         }
     }
 
-    if redirects.is_empty() { return false; }
+    if redirects.is_empty() {
+        return false;
+    }
 
     // Phase 4: Rewrite all branch targets that reference redirected labels.
     for i in 0..len {
-        if infos[i].is_nop() { continue; }
+        if infos[i].is_nop() {
+            continue;
+        }
         match infos[i].kind {
             LineKind::Jmp | LineKind::CondJmp => {
                 let line = store.get(i).to_string();

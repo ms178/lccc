@@ -227,7 +227,9 @@ pub(crate) fn encode_mv(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rs = get_reg(operands, 1)?;
     // Use `add rd, x0, rs` instead of `addi rd, rs, 0` so the instruction
     // is eligible for RV64C compression to C.MV (which requires the ADD form).
-    Ok(EncodeResult::Word(encode_r(OP_OP, rd, 0b000, 0, rs, 0b0000000))) // add rd, x0, rs
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP, rd, 0b000, 0, rs, 0b0000000,
+    ))) // add rd, x0, rs
 }
 
 pub(crate) fn encode_not(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -239,13 +241,17 @@ pub(crate) fn encode_not(operands: &[Operand]) -> Result<EncodeResult, String> {
 pub(crate) fn encode_neg(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP, rd, 0b000, 0, rs2, 0b0100000))) // sub rd, x0, rs2
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP, rd, 0b000, 0, rs2, 0b0100000,
+    ))) // sub rd, x0, rs2
 }
 
 pub(crate) fn encode_negw(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP_32, rd, 0b000, 0, rs2, 0b0100000)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_32, rd, 0b000, 0, rs2, 0b0100000,
+    )))
 }
 
 pub(crate) fn encode_sext_w(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -263,19 +269,25 @@ pub(crate) fn encode_seqz(operands: &[Operand]) -> Result<EncodeResult, String> 
 pub(crate) fn encode_snez(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP, rd, 0b011, 0, rs2, 0b0000000))) // sltu rd, x0, rs2
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP, rd, 0b011, 0, rs2, 0b0000000,
+    ))) // sltu rd, x0, rs2
 }
 
 pub(crate) fn encode_sltz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs1 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP, rd, 0b010, rs1, 0, 0b0000000))) // slt rd, rs1, x0
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP, rd, 0b010, rs1, 0, 0b0000000,
+    ))) // slt rd, rs1, x0
 }
 
 pub(crate) fn encode_sgtz(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP, rd, 0b010, 0, rs2, 0b0000000))) // slt rd, x0, rs2
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP, rd, 0b010, 0, rs2, 0b0000000,
+    ))) // slt rd, x0, rs2
 }
 
 // Branch pseudo-instructions
@@ -284,7 +296,11 @@ pub(crate) fn encode_beqz(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 1)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b000, rs1, 0, 0),
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -293,7 +309,11 @@ pub(crate) fn encode_bnez(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 1)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b001, rs1, 0, 0),
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -302,7 +322,11 @@ pub(crate) fn encode_blez(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 1)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b101, 0, rs2, 0), // bge x0, rs
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -311,7 +335,11 @@ pub(crate) fn encode_bgez(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 1)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b101, rs1, 0, 0), // bge rs, x0
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -320,7 +348,11 @@ pub(crate) fn encode_bltz(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 1)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b100, rs1, 0, 0), // blt rs, x0
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -329,7 +361,11 @@ pub(crate) fn encode_bgtz(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 1)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b100, 0, rs2, 0), // blt x0, rs
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -339,7 +375,11 @@ pub(crate) fn encode_bgt(operands: &[Operand]) -> Result<EncodeResult, String> {
     let label = get_branch_target(operands, 2)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b100, rs2, rs1, 0), // blt rs2, rs1
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -349,7 +389,11 @@ pub(crate) fn encode_ble(operands: &[Operand]) -> Result<EncodeResult, String> {
     let label = get_branch_target(operands, 2)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b101, rs2, rs1, 0), // bge rs2, rs1
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -359,7 +403,11 @@ pub(crate) fn encode_bgtu(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 2)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b110, rs2, rs1, 0), // bltu rs2, rs1
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -369,7 +417,11 @@ pub(crate) fn encode_bleu(operands: &[Operand]) -> Result<EncodeResult, String> 
     let label = get_branch_target(operands, 2)?;
     Ok(EncodeResult::WordWithReloc {
         word: encode_b(OP_BRANCH, 0b111, rs2, rs1, 0), // bgeu rs2, rs1
-        reloc: Relocation { reloc_type: RelocType::Branch, symbol: label, addend: 0 },
+        reloc: Relocation {
+            reloc_type: RelocType::Branch,
+            symbol: label,
+            addend: 0,
+        },
     })
 }
 
@@ -397,9 +449,7 @@ pub(crate) fn encode_j_pseudo(operands: &[Operand]) -> Result<EncodeResult, Stri
                 },
             })
         }
-        Operand::Imm(imm) => {
-            Ok(EncodeResult::Word(encode_j(OP_JAL, 0, *imm as i32)))
-        }
+        Operand::Imm(imm) => Ok(EncodeResult::Word(encode_j(OP_JAL, 0, *imm as i32))),
         _ => Err("j: expected offset or label".to_string()),
     }
 }
@@ -413,11 +463,14 @@ pub(crate) fn encode_call(operands: &[Operand]) -> Result<EncodeResult, String> 
     // call symbol -> auipc ra, %pcrel_hi(symbol) ; jalr ra, %pcrel_lo(symbol)(ra)
     let (symbol, addend) = get_symbol(operands, 0)?;
     Ok(EncodeResult::WordsWithRelocs(vec![
-        (encode_u(OP_AUIPC, 1, 0), Some(Relocation {
-            reloc_type: RelocType::CallPlt,
-            symbol: symbol.clone(),
-            addend,
-        })),
+        (
+            encode_u(OP_AUIPC, 1, 0),
+            Some(Relocation {
+                reloc_type: RelocType::CallPlt,
+                symbol: symbol.clone(),
+                addend,
+            }),
+        ),
         (encode_i(OP_JALR, 1, 0, 1, 0), None), // jalr ra, 0(ra)
     ]))
 }
@@ -426,11 +479,15 @@ pub(crate) fn encode_tail(operands: &[Operand]) -> Result<EncodeResult, String> 
     // tail symbol -> auipc t1, %pcrel_hi(symbol) ; jalr x0, %pcrel_lo(symbol)(t1)
     let (symbol, addend) = get_symbol(operands, 0)?;
     Ok(EncodeResult::WordsWithRelocs(vec![
-        (encode_u(OP_AUIPC, 6, 0), Some(Relocation { // t1 = x6
-            reloc_type: RelocType::CallPlt,
-            symbol: symbol.clone(),
-            addend,
-        })),
+        (
+            encode_u(OP_AUIPC, 6, 0),
+            Some(Relocation {
+                // t1 = x6
+                reloc_type: RelocType::CallPlt,
+                symbol: symbol.clone(),
+                addend,
+            }),
+        ),
         (encode_i(OP_JALR, 0, 0, 6, 0), None),
     ]))
 }
@@ -446,11 +503,14 @@ pub(crate) fn encode_jump(operands: &[Operand]) -> Result<EncodeResult, String> 
     };
 
     Ok(EncodeResult::WordsWithRelocs(vec![
-        (encode_u(OP_AUIPC, temp, 0), Some(Relocation {
-            reloc_type: RelocType::CallPlt,
-            symbol: symbol.clone(),
-            addend,
-        })),
+        (
+            encode_u(OP_AUIPC, temp, 0),
+            Some(Relocation {
+                reloc_type: RelocType::CallPlt,
+                symbol: symbol.clone(),
+                addend,
+            }),
+        ),
         (encode_i(OP_JALR, 0, 0, temp, 0), None),
     ]))
 }
@@ -467,16 +527,22 @@ pub(crate) fn encode_lla(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (symbol, addend) = get_symbol(operands, 1)?;
 
     Ok(EncodeResult::WordsWithRelocs(vec![
-        (encode_u(OP_AUIPC, rd, 0), Some(Relocation {
-            reloc_type: RelocType::PcrelHi20,
-            symbol: symbol.clone(),
-            addend,
-        })),
-        (encode_i(OP_OP_IMM, rd, 0, rd, 0), Some(Relocation {
-            reloc_type: RelocType::PcrelLo12I,
-            symbol, // TODO: This should reference the auipc label, not the symbol directly
-            addend,
-        })),
+        (
+            encode_u(OP_AUIPC, rd, 0),
+            Some(Relocation {
+                reloc_type: RelocType::PcrelHi20,
+                symbol: symbol.clone(),
+                addend,
+            }),
+        ),
+        (
+            encode_i(OP_OP_IMM, rd, 0, rd, 0),
+            Some(Relocation {
+                reloc_type: RelocType::PcrelLo12I,
+                symbol, // TODO: This should reference the auipc label, not the symbol directly
+                addend,
+            }),
+        ),
     ]))
 }
 
@@ -494,37 +560,51 @@ pub(crate) fn encode_rdcsr(mnemonic: &str, operands: &[Operand]) -> Result<Encod
 pub(crate) fn encode_csrr(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let csr = get_csr_num(operands, 1)?;
-    Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b010, 0, csr as i32)))
+    Ok(EncodeResult::Word(encode_i(
+        OP_SYSTEM, rd, 0b010, 0, csr as i32,
+    )))
 }
 
 pub(crate) fn encode_csrw(operands: &[Operand]) -> Result<EncodeResult, String> {
     let csr = get_csr_num(operands, 0)?;
     if matches!(operands.get(1), Some(Operand::Imm(_))) {
         let zimm = get_imm(operands, 1)? as u32 & 0x1F;
-        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b101, zimm, csr as i32)));
+        return Ok(EncodeResult::Word(encode_i(
+            OP_SYSTEM, 0, 0b101, zimm, csr as i32,
+        )));
     }
     let rs1 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b001, rs1, csr as i32)))
+    Ok(EncodeResult::Word(encode_i(
+        OP_SYSTEM, 0, 0b001, rs1, csr as i32,
+    )))
 }
 
 pub(crate) fn encode_csrs(operands: &[Operand]) -> Result<EncodeResult, String> {
     let csr = get_csr_num(operands, 0)?;
     if matches!(operands.get(1), Some(Operand::Imm(_))) {
         let zimm = get_imm(operands, 1)? as u32 & 0x1F;
-        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b110, zimm, csr as i32)));
+        return Ok(EncodeResult::Word(encode_i(
+            OP_SYSTEM, 0, 0b110, zimm, csr as i32,
+        )));
     }
     let rs1 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b010, rs1, csr as i32)))
+    Ok(EncodeResult::Word(encode_i(
+        OP_SYSTEM, 0, 0b010, rs1, csr as i32,
+    )))
 }
 
 pub(crate) fn encode_csrc(operands: &[Operand]) -> Result<EncodeResult, String> {
     let csr = get_csr_num(operands, 0)?;
     if matches!(operands.get(1), Some(Operand::Imm(_))) {
         let zimm = get_imm(operands, 1)? as u32 & 0x1F;
-        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b111, zimm, csr as i32)));
+        return Ok(EncodeResult::Word(encode_i(
+            OP_SYSTEM, 0, 0b111, zimm, csr as i32,
+        )));
     }
     let rs1 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b011, rs1, csr as i32)))
+    Ok(EncodeResult::Word(encode_i(
+        OP_SYSTEM, 0, 0b011, rs1, csr as i32,
+    )))
 }
 
 // Float pseudo-instructions
@@ -532,39 +612,51 @@ pub(crate) fn encode_fmv_s(operands: &[Operand]) -> Result<EncodeResult, String>
     let rd = get_freg(operands, 0)?;
     let rs1 = get_freg(operands, 1)?;
     // fsgnj.s rd, rs, rs
-    Ok(EncodeResult::Word(encode_r(OP_OP_FP, rd, 0b000, rs1, rs1, 0b0010000)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_FP, rd, 0b000, rs1, rs1, 0b0010000,
+    )))
 }
 
 pub(crate) fn encode_fmv_d(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_freg(operands, 0)?;
     let rs1 = get_freg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP_FP, rd, 0b000, rs1, rs1, 0b0010001)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_FP, rd, 0b000, rs1, rs1, 0b0010001,
+    )))
 }
 
 pub(crate) fn encode_fabs_s(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_freg(operands, 0)?;
     let rs1 = get_freg(operands, 1)?;
     // fsgnjx.s rd, rs, rs
-    Ok(EncodeResult::Word(encode_r(OP_OP_FP, rd, 0b010, rs1, rs1, 0b0010000)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_FP, rd, 0b010, rs1, rs1, 0b0010000,
+    )))
 }
 
 pub(crate) fn encode_fabs_d(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_freg(operands, 0)?;
     let rs1 = get_freg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP_FP, rd, 0b010, rs1, rs1, 0b0010001)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_FP, rd, 0b010, rs1, rs1, 0b0010001,
+    )))
 }
 
 pub(crate) fn encode_fneg_s(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_freg(operands, 0)?;
     let rs1 = get_freg(operands, 1)?;
     // fsgnjn.s rd, rs, rs
-    Ok(EncodeResult::Word(encode_r(OP_OP_FP, rd, 0b001, rs1, rs1, 0b0010000)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_FP, rd, 0b001, rs1, rs1, 0b0010000,
+    )))
 }
 
 pub(crate) fn encode_fneg_d(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_freg(operands, 0)?;
     let rs1 = get_freg(operands, 1)?;
-    Ok(EncodeResult::Word(encode_r(OP_OP_FP, rd, 0b001, rs1, rs1, 0b0010001)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_OP_FP, rd, 0b001, rs1, rs1, 0b0010001,
+    )))
 }
 
 // ── Relocation modifier parsing ──────────────────────────────────────

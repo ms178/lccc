@@ -700,9 +700,22 @@ fn classify_token(token: &str, entries: &mut Vec<LinkerScriptEntry>) {
 #[inline]
 fn is_ignored_ld_keyword(token: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "KEEP", "SORT", "SORT_BY_NAME", "SORT_BY_ALIGNMENT", "SORT_NONE", "EXTERN",
-        "OUTPUT_FORMAT", "OUTPUT_ARCH", "TARGET", "SEARCH_DIR", "ENTRY", "STARTUP",
-        "INCLUDE", "OUTPUT", "GROUP", "INPUT",
+        "KEEP",
+        "SORT",
+        "SORT_BY_NAME",
+        "SORT_BY_ALIGNMENT",
+        "SORT_NONE",
+        "EXTERN",
+        "OUTPUT_FORMAT",
+        "OUTPUT_ARCH",
+        "TARGET",
+        "SEARCH_DIR",
+        "ENTRY",
+        "STARTUP",
+        "INCLUDE",
+        "OUTPUT",
+        "GROUP",
+        "INPUT",
     ];
     // `str::eq_ignore_ascii_case` compares lengths first, so the scan is cheap
     // and allocation-free (unlike `to_ascii_uppercase` per token).
@@ -974,10 +987,7 @@ mod tests {
         let members = parse_archive_members(&data).unwrap();
         assert_eq!(members.len(), 1);
         // Index offsets point at member *headers*: data offset − 60.
-        assert_eq!(
-            syms,
-            vec![("foo".to_string(), members[0].1 - HEADER_SIZE)]
-        );
+        assert_eq!(syms, vec![("foo".to_string(), members[0].1 - HEADER_SIZE)]);
     }
 
     #[test]
@@ -1033,7 +1043,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC_REGULAR);
         data.extend_from_slice(&member_header(b"lost.o/", 999)); // no payload
-        // Declared overrun → member skipped, no error, iteration terminates.
+                                                                 // Declared overrun → member skipped, no error, iteration terminates.
         assert!(parse_archive_members(&data).unwrap().is_empty());
     }
 

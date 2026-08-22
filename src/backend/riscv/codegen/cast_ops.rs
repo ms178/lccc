@@ -1,9 +1,9 @@
 //! RiscvCodegen: type conversion/casting operations.
 
-use crate::ir::reexports::{Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::cast::{CastKind, classify_cast};
 use super::emit::RiscvCodegen;
+use crate::backend::cast::{classify_cast, CastKind};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Operand, Value};
 
 impl RiscvCodegen {
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
@@ -118,20 +118,18 @@ impl RiscvCodegen {
                 }
             }
 
-            CastKind::SignedToUnsignedSameSize { to_ty } => {
-                match to_ty {
-                    IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
-                    IrType::U16 => {
-                        self.state.emit("    slli t0, t0, 48");
-                        self.state.emit("    srli t0, t0, 48");
-                    }
-                    IrType::U32 => {
-                        self.state.emit("    slli t0, t0, 32");
-                        self.state.emit("    srli t0, t0, 32");
-                    }
-                    _ => {}
+            CastKind::SignedToUnsignedSameSize { to_ty } => match to_ty {
+                IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
+                IrType::U16 => {
+                    self.state.emit("    slli t0, t0, 48");
+                    self.state.emit("    srli t0, t0, 48");
                 }
-            }
+                IrType::U32 => {
+                    self.state.emit("    slli t0, t0, 32");
+                    self.state.emit("    srli t0, t0, 32");
+                }
+                _ => {}
+            },
 
             CastKind::IntWiden { from_ty, .. } => {
                 if from_ty.is_unsigned() {
@@ -163,29 +161,27 @@ impl RiscvCodegen {
                 }
             }
 
-            CastKind::IntNarrow { to_ty } => {
-                match to_ty {
-                    IrType::I8 => {
-                        self.state.emit("    slli t0, t0, 56");
-                        self.state.emit("    srai t0, t0, 56");
-                    }
-                    IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
-                    IrType::I16 => {
-                        self.state.emit("    slli t0, t0, 48");
-                        self.state.emit("    srai t0, t0, 48");
-                    }
-                    IrType::U16 => {
-                        self.state.emit("    slli t0, t0, 48");
-                        self.state.emit("    srli t0, t0, 48");
-                    }
-                    IrType::I32 => self.state.emit("    sext.w t0, t0"),
-                    IrType::U32 => {
-                        self.state.emit("    slli t0, t0, 32");
-                        self.state.emit("    srli t0, t0, 32");
-                    }
-                    _ => {}
+            CastKind::IntNarrow { to_ty } => match to_ty {
+                IrType::I8 => {
+                    self.state.emit("    slli t0, t0, 56");
+                    self.state.emit("    srai t0, t0, 56");
                 }
-            }
+                IrType::U8 => self.state.emit("    andi t0, t0, 0xff"),
+                IrType::I16 => {
+                    self.state.emit("    slli t0, t0, 48");
+                    self.state.emit("    srai t0, t0, 48");
+                }
+                IrType::U16 => {
+                    self.state.emit("    slli t0, t0, 48");
+                    self.state.emit("    srli t0, t0, 48");
+                }
+                IrType::I32 => self.state.emit("    sext.w t0, t0"),
+                IrType::U32 => {
+                    self.state.emit("    slli t0, t0, 32");
+                    self.state.emit("    srli t0, t0, 32");
+                }
+                _ => {}
+            },
 
             CastKind::SignedToF128 { .. }
             | CastKind::UnsignedToF128 { .. }
@@ -198,7 +194,13 @@ impl RiscvCodegen {
         }
     }
 
-    pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+    pub(super) fn emit_cast_impl(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) {
         if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }

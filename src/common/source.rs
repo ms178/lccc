@@ -8,13 +8,20 @@ pub struct Span {
 
 impl Span {
     pub fn new(start: u32, end: u32, file_id: u32) -> Self {
-        Self { start, end, file_id }
+        Self {
+            start,
+            end,
+            file_id,
+        }
     }
 
     pub fn dummy() -> Self {
-        Self { start: 0, end: 0, file_id: 0 }
+        Self {
+            start: 0,
+            end: 0,
+            file_id: 0,
+        }
     }
-
 }
 
 /// A human-readable source location.
@@ -122,7 +129,11 @@ impl SourceManager {
     pub fn add_file(&mut self, name: String, content: String) -> u32 {
         let line_offsets = compute_line_offsets(&content);
         let id = self.files.len() as u32;
-        self.files.push(SourceFile { name, content, line_offsets });
+        self.files.push(SourceFile {
+            name,
+            content,
+            line_offsets,
+        });
         id
     }
 
@@ -222,25 +233,24 @@ impl SourceManager {
                             // Deduplicate filenames: check last-used cache first
                             // (consecutive markers usually reference the same file),
                             // then fall back to the hash map for non-consecutive repeats.
-                            let filename_idx =
-                                if last_fname_end > last_fname_start
-                                    && fname_bytes == &bytes[last_fname_start..last_fname_end]
-                                {
-                                    // Same filename as previous marker (common case)
-                                    last_fname_idx
-                                } else if let Some(&idx) = fname_map.get(fname_bytes) {
-                                    // Previously seen filename
-                                    idx
-                                } else {
-                                    // New unique filename - allocate once
-                                    let s = std::str::from_utf8(fname_bytes)
-                                        .unwrap_or("<unknown>")
-                                        .to_string();
-                                    let idx = self.line_map_filenames.len() as u16;
-                                    self.line_map_filenames.push(s);
-                                    fname_map.insert(fname_bytes, idx);
-                                    idx
-                                };
+                            let filename_idx = if last_fname_end > last_fname_start
+                                && fname_bytes == &bytes[last_fname_start..last_fname_end]
+                            {
+                                // Same filename as previous marker (common case)
+                                last_fname_idx
+                            } else if let Some(&idx) = fname_map.get(fname_bytes) {
+                                // Previously seen filename
+                                idx
+                            } else {
+                                // New unique filename - allocate once
+                                let s = std::str::from_utf8(fname_bytes)
+                                    .unwrap_or("<unknown>")
+                                    .to_string();
+                                let idx = self.line_map_filenames.len() as u16;
+                                self.line_map_filenames.push(s);
+                                fname_map.insert(fname_bytes, idx);
+                                idx
+                            };
                             last_fname_start = fname_start;
                             last_fname_end = j;
                             last_fname_idx = filename_idx;
@@ -258,7 +268,8 @@ impl SourceManager {
                                     while k < line_end && bytes[k].is_ascii_digit() {
                                         k += 1;
                                     }
-                                    if let Some(flag) = parse_u32_from_digits(&bytes[flag_start..k]) {
+                                    if let Some(flag) = parse_u32_from_digits(&bytes[flag_start..k])
+                                    {
                                         if flag == 1 {
                                             has_flag_1 = true;
                                         }
@@ -286,11 +297,11 @@ impl SourceManager {
                                     // Count newlines between the last marker and the
                                     // current line to get the actual line number of the
                                     // #include directive in the parent file.
-                                    let newlines_since_marker = bytes
-                                        [last_marker_next_offset..i]
+                                    let newlines_since_marker = bytes[last_marker_next_offset..i]
                                         .iter()
                                         .filter(|&&b| b == b'\n')
-                                        .count() as u32;
+                                        .count()
+                                        as u32;
                                     let include_line = current_line + newlines_since_marker;
                                     self.include_origins[filename_idx as usize] =
                                         Some(IncludeOrigin {
@@ -351,7 +362,13 @@ impl SourceManager {
         let file = &self.files[span.file_id as usize];
         let line = match file.line_offsets.binary_search(&span.start) {
             Ok(i) => i as u32,
-            Err(i) => if i > 0 { (i - 1) as u32 } else { 0 },
+            Err(i) => {
+                if i > 0 {
+                    (i - 1) as u32
+                } else {
+                    0
+                }
+            }
         };
         let col = span.start.saturating_sub(file.line_offsets[line as usize]);
         SourceLocation {
@@ -370,7 +387,13 @@ impl SourceManager {
         // Binary search for the last entry with pp_offset <= offset.
         let idx = match self.line_map.binary_search_by_key(&offset, |e| e.pp_offset) {
             Ok(i) => i,
-            Err(i) => if i > 0 { i - 1 } else { 0 },
+            Err(i) => {
+                if i > 0 {
+                    i - 1
+                } else {
+                    0
+                }
+            }
         };
 
         let entry = &self.line_map[idx];
@@ -406,7 +429,13 @@ impl SourceManager {
         let col = if !line_offsets.is_empty() {
             let pp_line = match line_offsets.binary_search(&offset) {
                 Ok(i) => i,
-                Err(i) => if i > 0 { i - 1 } else { 0 },
+                Err(i) => {
+                    if i > 0 {
+                        i - 1
+                    } else {
+                        0
+                    }
+                }
             };
             offset.saturating_sub(line_offsets[pp_line]) + 1
         } else {
@@ -475,7 +504,10 @@ impl SourceManager {
         // Limit depth to avoid infinite loops from malformed data
         for _ in 0..200 {
             // Find the filename index for current_file
-            let idx = self.line_map_filenames.iter().position(|f| f == &current_file);
+            let idx = self
+                .line_map_filenames
+                .iter()
+                .position(|f| f == &current_file);
             let idx = match idx {
                 Some(i) => i,
                 None => break,
@@ -516,14 +548,27 @@ impl SourceManager {
         let line_offsets = &self.files[0].line_offsets;
         let pp_line = match line_offsets.binary_search(&span.start) {
             Ok(i) => i as u32,
-            Err(i) => if i > 0 { (i - 1) as u32 } else { 0 },
+            Err(i) => {
+                if i > 0 {
+                    (i - 1) as u32
+                } else {
+                    0
+                }
+            }
         };
 
         // Binary search for this pp_line in the macro expansions
-        match self.macro_expansions.binary_search_by_key(&pp_line, |e| e.pp_line) {
+        match self
+            .macro_expansions
+            .binary_search_by_key(&pp_line, |e| e.pp_line)
+        {
             Ok(idx) => {
                 let names = &self.macro_expansions[idx].macro_names;
-                if names.is_empty() { None } else { Some(names) }
+                if names.is_empty() {
+                    None
+                } else {
+                    Some(names)
+                }
             }
             Err(_) => None,
         }

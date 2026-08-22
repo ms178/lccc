@@ -4,9 +4,9 @@
 //! section name, and merges their data with proper alignment. Used by both
 //! executable and shared library linking.
 
-use crate::common::fx_hash::FxHashMap;
 use super::elf_read::*;
-use super::relocations::{MergedSection, InputSecRef, output_section_name};
+use super::relocations::{output_section_name, InputSecRef, MergedSection};
+use crate::common::fx_hash::FxHashMap;
 
 /// Merge sections from all input objects into output sections.
 ///
@@ -15,15 +15,22 @@ use super::relocations::{MergedSection, InputSecRef, output_section_name};
 /// along with a mapping of input section indices to merged section positions.
 pub fn merge_sections(
     input_objs: &[(String, ElfObject)],
-) -> (Vec<MergedSection>, FxHashMap<String, usize>, Vec<InputSecRef>) {
+) -> (
+    Vec<MergedSection>,
+    FxHashMap<String, usize>,
+    Vec<InputSecRef>,
+) {
     let mut merged_sections: Vec<MergedSection> = Vec::new();
     let mut merged_map: FxHashMap<String, usize> = FxHashMap::default();
     let mut input_sec_refs: Vec<InputSecRef> = Vec::new();
 
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            if sec.name.is_empty() || sec.sh_type == SHT_SYMTAB || sec.sh_type == SHT_STRTAB
-                || sec.sh_type == SHT_RELA || sec.sh_type == SHT_GROUP
+            if sec.name.is_empty()
+                || sec.sh_type == SHT_SYMTAB
+                || sec.sh_type == SHT_STRTAB
+                || sec.sh_type == SHT_RELA
+                || sec.sh_type == SHT_GROUP
             {
                 continue;
             }

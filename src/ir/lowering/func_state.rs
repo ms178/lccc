@@ -9,16 +9,11 @@
 //! cloning entire HashMaps at scope boundaries. On scope exit, only the changes
 //! made within that scope are undone, giving O(changes) cost instead of O(total).
 
+use super::definitions::{LocalInfo, SwitchFrame};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::ir::reexports::{
-    BasicBlock,
-    BlockId,
-    Instruction,
-    Value,
-};
-use crate::common::types::{IrType, CType};
-use super::definitions::{LocalInfo, SwitchFrame};
+use crate::common::types::{CType, IrType};
+use crate::ir::reexports::{BasicBlock, BlockId, Instruction, Value};
 
 /// Records undo operations for function-local scoped variables.
 ///

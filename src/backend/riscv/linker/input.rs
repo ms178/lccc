@@ -4,10 +4,10 @@
 //! libraries. Resolves undefined symbols by demand-loading archive members, with
 //! group iteration to handle circular dependencies between libraries.
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::resolve_archive_members;
 use crate::backend::linker_common;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Load a single input file (ELF object, archive, or thin archive) into
 /// `input_objs`. Archives are saved to `inline_archive_paths` for later
@@ -21,14 +21,12 @@ pub fn load_input_files(
         if !std::path::Path::new(path).exists() {
             return Err(format!("linker input file not found: {}", path));
         }
-        let data = std::fs::read(path)
-            .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+        let data = std::fs::read(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
 
         if (data.len() >= 8 && &data[0..8] == b"!<arch>\n") || is_thin_archive(&data) {
             inline_archive_paths.push(path.clone());
         } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
-            let obj = parse_object(&data, path)
-                .map_err(|e| format!("{}: {}", path, e))?;
+            let obj = parse_object(&data, path).map_err(|e| format!("{}: {}", path, e))?;
             input_objs.push((path.clone(), obj));
         }
         // Skip non-ELF/non-archive files (e.g. linker scripts)
@@ -51,7 +49,9 @@ pub fn collect_initial_symbols(
     }
     for (_, obj) in input_objs {
         for sym in &obj.symbols {
-            if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
+            if sym.shndx == SHN_UNDEF
+                && !sym.name.is_empty()
+                && sym.binding() != STB_LOCAL
                 && !defined_syms.contains(sym.name.as_str())
             {
                 undefined_syms.insert(sym.name.to_string());
@@ -93,12 +93,19 @@ pub fn discover_shared_lib_symbols(
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            if data.starts_with(b"/* GNU ld script") || data.starts_with(b"OUTPUT_FORMAT")
-                || data.starts_with(b"GROUP") || data.starts_with(b"INPUT")
+            if data.starts_with(b"/* GNU ld script")
+                || data.starts_with(b"OUTPUT_FORMAT")
+                || data.starts_with(b"GROUP")
+                || data.starts_with(b"INPUT")
             {
                 process_linker_script(
-                    &data, dir, lib_search_paths, input_objs,
-                    defined_syms, undefined_syms, shared_lib_syms,
+                    &data,
+                    dir,
+                    lib_search_paths,
+                    input_objs,
+                    defined_syms,
+                    undefined_syms,
+                    shared_lib_syms,
                 );
             } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
                 if let Ok(syms) = read_shared_lib_symbols(&path) {
@@ -290,9 +297,9 @@ pub fn load_shared_lib_inputs(
     let load = |path: &str,
                 objs: &mut Vec<(String, ElfObject)>,
                 defs: &mut FxHashSet<String>,
-                undefs: &mut FxHashSet<String>| -> Result<(), String> {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("failed to read '{}': {}", path, e))?;
+                undefs: &mut FxHashSet<String>|
+     -> Result<(), String> {
+        let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
         if data.len() < 4 {
             return Ok(());
         }
@@ -332,7 +339,9 @@ fn register_obj_symbols(
         }
     }
     for sym in &obj.symbols {
-        if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
+        if sym.shndx == SHN_UNDEF
+            && !sym.name.is_empty()
+            && sym.binding() != STB_LOCAL
             && !defined_syms.contains(sym.name.as_str())
         {
             undefined_syms.insert(sym.name.to_string());
@@ -384,7 +393,8 @@ pub fn resolve_shared_lib_deps(
                 let load_fn = |path: &str,
                                objs: &mut Vec<(String, ElfObject)>,
                                defs: &mut FxHashSet<String>,
-                               undefs: &mut FxHashSet<String>| -> Result<(), String> {
+                               undefs: &mut FxHashSet<String>|
+                 -> Result<(), String> {
                     let data = std::fs::read(path)
                         .map_err(|e| format!("failed to read '{}': {}", path, e))?;
                     if data.starts_with(&[0x7f, b'E', b'L', b'F']) {
@@ -395,7 +405,8 @@ pub fn resolve_shared_lib_deps(
                     Ok(())
                 };
                 load_fn(&lib_path, input_objs, defined_syms, undefined_syms)?;
-            } else if data.starts_with(b"/* GNU ld script") || data.starts_with(b"GROUP")
+            } else if data.starts_with(b"/* GNU ld script")
+                || data.starts_with(b"GROUP")
                 || data.starts_with(b"INPUT")
             {
                 continue;

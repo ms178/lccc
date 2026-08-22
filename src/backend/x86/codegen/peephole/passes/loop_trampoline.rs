@@ -43,30 +43,62 @@ fn register_family_no_prefix(name: &str) -> RegId {
         b'r' | b'e' => {
             if len < 3 {
                 // len==2: only r8, r9 are valid
-                return if b[0] == b'r' { reg_digit_to_id(b[1]) } else { REG_NONE };
+                return if b[0] == b'r' {
+                    reg_digit_to_id(b[1])
+                } else {
+                    REG_NONE
+                };
             }
             match (b[1], b[2]) {
-                (b'a', b'x') => 0,  // rax / eax
-                (b'c', b'x') => 1,  // rcx / ecx
-                (b'd', b'x') => 2,  // rdx / edx
-                (b'd', b'i') => 7,  // rdi / edi
-                (b'b', b'x') => 3,  // rbx / ebx
-                (b'b', b'p') => 5,  // rbp / ebp
-                (b's', b'p') => 4,  // rsp / esp
-                (b's', b'i') => 6,  // rsi / esi
-                (b'8', _)    => 8,  // r8d / r8w / r8b
-                (b'9', _)    => 9,  // r9d / r9w / r9b
-                (b'1', b'0') => 10, (b'1', b'1') => 11, (b'1', b'2') => 12,
-                (b'1', b'3') => 13, (b'1', b'4') => 14, (b'1', b'5') => 15,
+                (b'a', b'x') => 0, // rax / eax
+                (b'c', b'x') => 1, // rcx / ecx
+                (b'd', b'x') => 2, // rdx / edx
+                (b'd', b'i') => 7, // rdi / edi
+                (b'b', b'x') => 3, // rbx / ebx
+                (b'b', b'p') => 5, // rbp / ebp
+                (b's', b'p') => 4, // rsp / esp
+                (b's', b'i') => 6, // rsi / esi
+                (b'8', _) => 8,    // r8d / r8w / r8b
+                (b'9', _) => 9,    // r9d / r9w / r9b
+                (b'1', b'0') => 10,
+                (b'1', b'1') => 11,
+                (b'1', b'2') => 12,
+                (b'1', b'3') => 13,
+                (b'1', b'4') => 14,
+                (b'1', b'5') => 15,
                 _ => REG_NONE,
             }
         }
         // 16-bit / 8-bit short forms: ax, al, ah, cx, cl, etc.
-        b'a' => if matches!(b[1], b'x' | b'l' | b'h') { 0 } else { REG_NONE },
-        b'c' => if matches!(b[1], b'x' | b'l' | b'h') { 1 } else { REG_NONE },
-        b'd' => match b[1] { b'i' => 7, b'x' | b'l' | b'h' => 2, _ => REG_NONE },
-        b'b' => match b[1] { b'p' => 5, b'x' | b'l' | b'h' => 3, _ => REG_NONE },
-        b's' => match b[1] { b'p' => 4, b'i' => 6, _ => REG_NONE },
+        b'a' => {
+            if matches!(b[1], b'x' | b'l' | b'h') {
+                0
+            } else {
+                REG_NONE
+            }
+        }
+        b'c' => {
+            if matches!(b[1], b'x' | b'l' | b'h') {
+                1
+            } else {
+                REG_NONE
+            }
+        }
+        b'd' => match b[1] {
+            b'i' => 7,
+            b'x' | b'l' | b'h' => 2,
+            _ => REG_NONE,
+        },
+        b'b' => match b[1] {
+            b'p' => 5,
+            b'x' | b'l' | b'h' => 3,
+            _ => REG_NONE,
+        },
+        b's' => match b[1] {
+            b'p' => 4,
+            b'i' => 6,
+            _ => REG_NONE,
+        },
         _ => REG_NONE,
     }
 }
@@ -114,12 +146,16 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
     let mut max_label_num: u32 = 0;
 
     for i in 0..len {
-        if infos[i].is_nop() { continue; }
+        if infos[i].is_nop() {
+            continue;
+        }
         if infos[i].kind == LineKind::Label {
             let trimmed = infos[i].trimmed(store.get(i));
             if let Some(n) = parse_label_number(trimmed) {
                 label_positions.push((n, i));
-                if n > max_label_num { max_label_num = n; }
+                if n > max_label_num {
+                    max_label_num = n;
+                }
             }
         }
     }
@@ -144,7 +180,9 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
     let mut cond_branch_for_label: Vec<usize> = vec![usize::MAX; table_size];
 
     for i in 0..len {
-        if infos[i].is_nop() { continue; }
+        if infos[i].is_nop() {
+            continue;
+        }
         match infos[i].kind {
             LineKind::Jmp | LineKind::CondJmp => {
                 let trimmed = infos[i].trimmed(store.get(i));
@@ -294,8 +332,10 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
                 if infos[k].kind == LineKind::Label {
                     break;
                 }
-                if matches!(infos[k].kind, LineKind::Call | LineKind::Jmp |
-                    LineKind::JmpIndirect | LineKind::Ret) {
+                if matches!(
+                    infos[k].kind,
+                    LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
+                ) {
                     break;
                 }
 
@@ -365,8 +405,10 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
             let mut killed = [false; 2];
             let mut jumps_followed = 0u32;
             'ft_scan: while m < len {
-                if infos[m].is_nop() || infos[m].kind == LineKind::Empty
-                    || infos[m].kind == LineKind::Label {
+                if infos[m].is_nop()
+                    || infos[m].kind == LineKind::Empty
+                    || infos[m].kind == LineKind::Label
+                {
                     m += 1;
                     continue;
                 }
@@ -460,7 +502,12 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
         for &(mod_idx, old_fam, new_fam) in &coalesce_actions {
             let old_line = infos[mod_idx].trimmed(store.get(mod_idx)).to_string();
             if let Some(new_line) = rewrite_instruction_register(&old_line, old_fam, new_fam) {
-                replace_line(store, &mut infos[mod_idx], mod_idx, format!("    {}", new_line));
+                replace_line(
+                    store,
+                    &mut infos[mod_idx],
+                    mod_idx,
+                    format!("    {}", new_line),
+                );
             }
         }
 
@@ -486,13 +533,20 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
             }
         } else {
             for (idx, &(src_fam, dst_fam)) in tramp_moves.iter().enumerate() {
-                if !move_coalesced[idx] { continue; }
+                if !move_coalesced[idx] {
+                    continue;
+                }
                 // Skip XMM/YMM registers — REG_NAMES only covers GP families 0-15
-                if src_fam as usize >= REG_NAMES[0].len() || dst_fam as usize >= REG_NAMES[0].len() { continue; }
+                if src_fam as usize >= REG_NAMES[0].len() || dst_fam as usize >= REG_NAMES[0].len()
+                {
+                    continue;
+                }
                 let src_64 = REG_NAMES[0][src_fam as usize];
                 let dst_64 = REG_NAMES[0][dst_fam as usize];
                 for &line_idx in &tramp_all_lines {
-                    if infos[line_idx].is_nop() { continue; }
+                    if infos[line_idx].is_nop() {
+                        continue;
+                    }
                     let trimmed = infos[line_idx].trimmed(store.get(line_idx));
                     if is_movq_reg_reg(trimmed, src_64, dst_64) {
                         mark_nop(&mut infos[line_idx]);

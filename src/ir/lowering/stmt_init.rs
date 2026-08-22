@@ -4,26 +4,14 @@
 //! lowering `Initializer::Expr` and `Initializer::List` for local variable
 //! declarations, plus helpers for registering block-scope function declarations.
 
-use crate::frontend::parser::ast::{
-    Declaration,
-    DerivedDeclarator,
-    Designator,
-    Expr,
-    InitDeclarator,
-    Initializer,
-    InitializerItem,
-    ParamDecl,
-    TypeSpecifier,
-};
-use crate::ir::reexports::{
-    Instruction,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, CType};
+use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo};
 use super::lower::Lowerer;
-use super::definitions::{GlobalInfo, DeclAnalysis, FuncSig};
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::{
+    Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator, Initializer, InitializerItem,
+    ParamDecl, TypeSpecifier,
+};
+use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 
 impl Lowerer {
     /// Handle extern declarations inside function bodies.
@@ -59,7 +47,10 @@ impl Lowerer {
         }
 
         // Check if this is a function declaration (extern int f(int))
-        let is_func_decl = declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+        let is_func_decl = declarator
+            .derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
         if is_func_decl {
             return false; // Fall through to the function declaration handler
         }
@@ -70,7 +61,8 @@ impl Lowerer {
             if let Some(vs) = decl.resolve_vector_size(elem_size) {
                 ext_da.apply_vector_size(vs);
             }
-            self.globals.insert(declarator.name.clone(), GlobalInfo::from_analysis(&ext_da));
+            self.globals
+                .insert(declarator.name.clone(), GlobalInfo::from_analysis(&ext_da));
         }
         true // Handled, caller should continue to next declarator
     }
@@ -117,7 +109,13 @@ impl Lowerer {
             return false;
         }
         if let Some((params, variadic)) = func_info {
-            self.register_block_func_meta(&declarator.name, &decl.type_spec, ptr_count, &params, variadic);
+            self.register_block_func_meta(
+                &declarator.name,
+                &decl.type_spec,
+                ptr_count,
+                &params,
+                variadic,
+            );
             self.shadow_local_for_scope(&declarator.name);
             // Propagate __attribute__((error("..."))) and __attribute__((noreturn)) / _Noreturn
             // from block-scope function declarations. Without this, the kernel's BUILD_BUG_ON
@@ -149,7 +147,13 @@ impl Lowerer {
         if declarator.derived.is_empty() && declarator.init.is_none() {
             if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
                 if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
-                    self.register_block_func_meta(&declarator.name, &fti.return_type, 0, &fti.params, fti.variadic);
+                    self.register_block_func_meta(
+                        &declarator.name,
+                        &fti.return_type,
+                        0,
+                        &fti.params,
+                        fti.variadic,
+                    );
                     self.shadow_local_for_scope(&declarator.name);
                     if declarator.attrs.is_error_attr() && !declarator.name.is_empty() {
                         self.error_functions.insert(declarator.name.clone());
@@ -229,7 +233,9 @@ impl Lowerer {
         if ptr_count == 0 {
             let ret_ct = self.type_spec_to_ctype(ret_type_spec);
             if ret_ct.is_complex() {
-                self.types.func_return_ctypes.insert(name.to_string(), ret_ct);
+                self.types
+                    .func_return_ctypes
+                    .insert(name.to_string(), ret_ct);
             }
         }
 
@@ -285,61 +291,75 @@ impl Lowerer {
             Vec::new()
         };
 
-        let param_tys: Vec<IrType> = params.iter().map(|p| {
-            self.type_spec_to_ir(&p.type_spec)
-        }).collect();
-        let param_bool_flags: Vec<bool> = params.iter().map(|p| {
-            self.is_type_bool(&p.type_spec)
-        }).collect();
-        let param_ctypes: Vec<CType> = params.iter().map(|p| {
-            self.type_spec_to_ctype(&p.type_spec)
-        }).collect();
+        let param_tys: Vec<IrType> = params
+            .iter()
+            .map(|p| self.type_spec_to_ir(&p.type_spec))
+            .collect();
+        let param_bool_flags: Vec<bool> = params
+            .iter()
+            .map(|p| self.is_type_bool(&p.type_spec))
+            .collect();
+        let param_ctypes: Vec<CType> = params
+            .iter()
+            .map(|p| self.type_spec_to_ctype(&p.type_spec))
+            .collect();
         let decomposes_cld = self.decomposes_complex_long_double();
         let decomposes_cd = self.decomposes_complex_double();
         let decomposes_cf = self.decomposes_complex_float();
-        let param_struct_sizes: Vec<Option<usize>> = params.iter().map(|p| {
-            let ctype = self.type_spec_to_ctype(&p.type_spec);
-            if self.is_type_struct_or_union(&p.type_spec) {
-                Some(self.sizeof_type(&p.type_spec))
-            } else if ctype.is_vector() {
-                // Vector types are passed by value like structs
-                Some(self.sizeof_type(&p.type_spec))
-            } else if !decomposes_cld && matches!(ctype, CType::ComplexLongDouble) {
-                Some(self.sizeof_type(&p.type_spec))
-            } else if !decomposes_cd && matches!(ctype, CType::ComplexDouble) {
-                Some(CType::ComplexDouble.size())
-            } else if !decomposes_cf && matches!(ctype, CType::ComplexFloat) {
-                Some(CType::ComplexFloat.size())
-            } else {
-                None
-            }
-        }).collect();
-
-        // Compute per-eightbyte SysV ABI classification for struct params
-        let param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = params.iter().enumerate().map(|(i, p)| {
-            if param_struct_sizes.get(i).copied().flatten().is_some() {
-                if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        }).collect();
-
-        // Compute RISC-V LP64D float field classification for struct params
-        let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params.iter().enumerate().map(|(i, p)| {
-            if param_struct_sizes.get(i).copied().flatten().is_some() {
-                if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                    layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
+        let param_struct_sizes: Vec<Option<usize>> = params
+            .iter()
+            .map(|p| {
+                let ctype = self.type_spec_to_ctype(&p.type_spec);
+                if self.is_type_struct_or_union(&p.type_spec) {
+                    Some(self.sizeof_type(&p.type_spec))
+                } else if ctype.is_vector() {
+                    // Vector types are passed by value like structs
+                    Some(self.sizeof_type(&p.type_spec))
+                } else if !decomposes_cld && matches!(ctype, CType::ComplexLongDouble) {
+                    Some(self.sizeof_type(&p.type_spec))
+                } else if !decomposes_cd && matches!(ctype, CType::ComplexDouble) {
+                    Some(CType::ComplexDouble.size())
+                } else if !decomposes_cf && matches!(ctype, CType::ComplexFloat) {
+                    Some(CType::ComplexFloat.size())
                 } else {
                     None
                 }
-            } else {
-                None
-            }
-        }).collect();
+            })
+            .collect();
+
+        // Compute per-eightbyte SysV ABI classification for struct params
+        let param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if param_struct_sizes.get(i).copied().flatten().is_some() {
+                    if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+
+        // Compute RISC-V LP64D float field classification for struct params
+        let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if param_struct_sizes.get(i).copied().flatten().is_some() {
+                    if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                        layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let sig = if !variadic || !param_tys.is_empty() {
             FuncSig {
@@ -425,11 +445,32 @@ impl Lowerer {
                     // Packed register value: store to alloca, then memcpy from alloca
                     let tmp_alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(total_size);
-                    self.emit(Instruction::Alloca { dest: tmp_alloca, size: total_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(src_val), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default });
-                    self.emit(Instruction::Memcpy { dest: alloca, src: tmp_alloca, size: total_size });
+                    self.emit(Instruction::Alloca {
+                        dest: tmp_alloca,
+                        size: total_size,
+                        ty: store_ty,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: Operand::Value(src_val),
+                        ptr: tmp_alloca,
+                        ty: store_ty,
+                        seg_override: AddressSpace::Default,
+                    });
+                    self.emit(Instruction::Memcpy {
+                        dest: alloca,
+                        src: tmp_alloca,
+                        size: total_size,
+                    });
                 } else {
-                    self.emit(Instruction::Memcpy { dest: alloca, src: src_val, size: total_size });
+                    self.emit(Instruction::Memcpy {
+                        dest: alloca,
+                        src: src_val,
+                        size: total_size,
+                    });
                 }
             } else {
                 self.lower_scalar_init_expr(expr, alloca, da, decl);
@@ -442,7 +483,8 @@ impl Lowerer {
     /// Char array from string literal: `char s[] = "hello"`
     fn lower_char_array_init_expr(&mut self, expr: &Expr, alloca: Value, da: &DeclAnalysis) {
         match expr {
-            Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _)
+            Expr::StringLiteral(s, _)
+            | Expr::WideStringLiteral(s, _)
             | Expr::Char16StringLiteral(s, _) => {
                 let arr_size = da.alloc_size;
                 self.emit_string_to_alloca(alloca, s, 0, arr_size);
@@ -455,7 +497,13 @@ impl Lowerer {
             }
             _ => {
                 let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: alloca,
+                    ty: da.var_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         }
     }
@@ -463,13 +511,20 @@ impl Lowerer {
     /// wchar_t/int array from wide string: `wchar_t s[] = L"hello"`
     fn lower_wchar_array_init_expr(&mut self, expr: &Expr, alloca: Value, da: &DeclAnalysis) {
         match expr {
-            Expr::WideStringLiteral(s, _) | Expr::StringLiteral(s, _)
+            Expr::WideStringLiteral(s, _)
+            | Expr::StringLiteral(s, _)
             | Expr::Char16StringLiteral(s, _) => {
                 self.emit_wide_string_to_alloca(alloca, s, 0);
             }
             _ => {
                 let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: alloca,
+                    ty: da.var_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         }
     }
@@ -477,7 +532,8 @@ impl Lowerer {
     /// char16_t array from u"..." string literal: `char16_t s[] = u"hello"`
     fn lower_char16_array_init_expr(&mut self, expr: &Expr, alloca: Value, da: &DeclAnalysis) {
         match expr {
-            Expr::Char16StringLiteral(s, _) | Expr::StringLiteral(s, _)
+            Expr::Char16StringLiteral(s, _)
+            | Expr::StringLiteral(s, _)
             | Expr::WideStringLiteral(s, _) => {
                 self.emit_char16_string_to_alloca(alloca, s, 0);
                 // Zero-fill remaining bytes if string is shorter than array
@@ -493,7 +549,13 @@ impl Lowerer {
             }
             _ => {
                 let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: da.var_ty, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: alloca,
+                    ty: da.var_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         }
     }
@@ -505,7 +567,13 @@ impl Lowerer {
         // IS the struct data, not an address. Store directly.
         if self.expr_produces_packed_struct_data(expr) && da.actual_alloc_size <= 8 {
             let val = self.lower_expr(expr);
-            self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: Self::packed_store_type(da.actual_alloc_size) , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val,
+                ptr: alloca,
+                ty: Self::packed_store_type(da.actual_alloc_size),
+                seg_override: AddressSpace::Default,
+            });
         } else {
             let src_addr = self.get_struct_base_addr(expr);
             self.emit(Instruction::Memcpy {
@@ -517,7 +585,13 @@ impl Lowerer {
     }
 
     /// Complex variable initialization: `_Complex double z = expr;`
-    fn lower_complex_var_init(&mut self, expr: &Expr, alloca: Value, da: &DeclAnalysis, decl: &Declaration) {
+    fn lower_complex_var_init(
+        &mut self,
+        expr: &Expr,
+        alloca: Value,
+        da: &DeclAnalysis,
+        decl: &Declaration,
+    ) {
         let complex_ctype = self.type_spec_to_ctype(&decl.type_spec);
         let src = self.lower_expr_to_complex(expr, &complex_ctype);
         self.emit(Instruction::Memcpy {
@@ -528,7 +602,13 @@ impl Lowerer {
     }
 
     /// Scalar variable initialization with implicit casts and const tracking.
-    fn lower_scalar_init_expr(&mut self, expr: &Expr, alloca: Value, da: &DeclAnalysis, decl: &Declaration) {
+    fn lower_scalar_init_expr(
+        &mut self,
+        expr: &Expr,
+        alloca: Value,
+        da: &DeclAnalysis,
+        decl: &Declaration,
+    ) {
         // Track const-qualified integer variable values for compile-time
         // array size evaluation (e.g., const int len = 5000; int arr[len];)
         if decl.is_const() && !da.is_pointer && !da.is_array && !da.is_struct {
@@ -567,13 +647,21 @@ impl Lowerer {
                 // _Float128 (and its U128 carrier) must route through the
                 // soft-float helpers; a plain F64/F32->U128 bit-cast would
                 // store an integer bit pattern instead of binary128 bytes.
-                Some(target_ct) if *target_ct == CType::Float128 || rhs_ctype == CType::Float128 => {
+                Some(target_ct)
+                    if *target_ct == CType::Float128 || rhs_ctype == CType::Float128 =>
+                {
                     self.convert_scalar_ctype(val, expr_ty, &rhs_ctype, target_ct)
                 }
                 _ => self.emit_implicit_cast(val, expr_ty, da.var_ty),
             }
         };
-        self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val,
+            ptr: alloca,
+            ty: da.var_ty,
+            seg_override: AddressSpace::Default,
+        });
     }
 
     /// Lower `Initializer::List` for a local variable declaration.
@@ -593,7 +681,14 @@ impl Lowerer {
         } else if da.is_struct {
             self.lower_struct_init_list(items, alloca, declarator_name);
         } else if da.is_array && da.elem_size > 0 {
-            self.lower_array_init_list_dispatch(items, alloca, da, complex_elem_ctype, decl, declarator_name);
+            self.lower_array_init_list_dispatch(
+                items,
+                alloca,
+                da,
+                complex_elem_ctype,
+                decl,
+                declarator_name,
+            );
         } else if let Some(ref ct) = da.c_type {
             if let Some((elem_ct, num_elems)) = ct.vector_info() {
                 self.lower_vector_init_list(items, alloca, elem_ct, num_elems);
@@ -608,7 +703,12 @@ impl Lowerer {
     }
 
     /// Complex initializer list: `_Complex double z = {real, imag}`
-    fn lower_complex_init_list(&mut self, items: &[InitializerItem], alloca: Value, decl: &Declaration) {
+    fn lower_complex_init_list(
+        &mut self,
+        items: &[InitializerItem],
+        alloca: Value,
+        decl: &Declaration,
+    ) {
         let complex_ctype = self.type_spec_to_ctype(&decl.type_spec);
         let comp_ty = Self::complex_component_ir_type(&complex_ctype);
         // Store real part (first item)
@@ -617,11 +717,23 @@ impl Lowerer {
                 let val = self.lower_expr(expr);
                 let expr_ty = self.get_expr_type(expr);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: alloca,
+                    ty: comp_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { volatile: false, val: zero, ptr: alloca, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: zero,
+                ptr: alloca,
+                ty: comp_ty,
+                seg_override: AddressSpace::Default,
+            });
         }
         // Store imag part (second item) at offset
         let comp_size = Self::complex_component_size(&complex_ctype);
@@ -631,17 +743,39 @@ impl Lowerer {
                 let val = self.lower_expr(expr);
                 let expr_ty = self.get_expr_type(expr);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { volatile: false, val, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: imag_ptr,
+                    ty: comp_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { volatile: false, val: zero, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: zero,
+                ptr: imag_ptr,
+                ty: comp_ty,
+                seg_override: AddressSpace::Default,
+            });
         }
     }
 
     /// Struct initializer list with designated initializer support.
-    fn lower_struct_init_list(&mut self, items: &[InitializerItem], alloca: Value, declarator_name: &str) {
-        if let Some(layout) = self.func_mut().locals.get(declarator_name).and_then(|l| l.struct_layout.clone()) {
+    fn lower_struct_init_list(
+        &mut self,
+        items: &[InitializerItem],
+        alloca: Value,
+        declarator_name: &str,
+    ) {
+        if let Some(layout) = self
+            .func_mut()
+            .locals
+            .get(declarator_name)
+            .and_then(|l| l.struct_layout.clone())
+        {
             // Always zero-initialize the entire struct before writing explicit values.
             // The C standard (C11 6.7.9p21) requires that all members not explicitly
             // initialized in a brace-enclosed list are implicitly zero-initialized.
@@ -669,11 +803,14 @@ impl Lowerer {
         // rather than the per-element size (da.elem_size = 1).
         if (da.base_ty == IrType::I8 || da.base_ty == IrType::U8)
             && !da.is_array_of_pointers
-            && items.len() == 1 && items[0].designators.is_empty()
+            && items.len() == 1
+            && items[0].designators.is_empty()
         {
             if let Initializer::Expr(ref expr) = items[0].init {
                 match expr {
-                    Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..) => {
+                    Expr::StringLiteral(..)
+                    | Expr::WideStringLiteral(..)
+                    | Expr::Char16StringLiteral(..) => {
                         self.lower_char_array_init_expr(expr, alloca, da);
                         return;
                     }
@@ -684,7 +821,8 @@ impl Lowerer {
         // Also handle brace-wrapped wide string for wchar_t (I32/U32) arrays
         if (da.base_ty == IrType::I32 || da.base_ty == IrType::U32)
             && !da.is_array_of_pointers
-            && items.len() == 1 && items[0].designators.is_empty()
+            && items.len() == 1
+            && items[0].designators.is_empty()
         {
             if let Initializer::Expr(ref expr @ Expr::WideStringLiteral(..)) = items[0].init {
                 self.lower_wchar_array_init_expr(expr, alloca, da);
@@ -694,7 +832,8 @@ impl Lowerer {
         // Also handle brace-wrapped char16_t string for char16_t (I16/U16) arrays
         if (da.base_ty == IrType::I16 || da.base_ty == IrType::U16)
             && !da.is_array_of_pointers
-            && items.len() == 1 && items[0].designators.is_empty()
+            && items.len() == 1
+            && items[0].designators.is_empty()
         {
             if let Initializer::Expr(ref expr @ Expr::Char16StringLiteral(..)) = items[0].init {
                 self.lower_char16_array_init_expr(expr, alloca, da);
@@ -707,7 +846,9 @@ impl Lowerer {
         let elem_struct_layout = if da.is_array_of_func_ptrs || da.is_array_of_pointers {
             None
         } else {
-            self.func_mut().locals.get(declarator_name)
+            self.func_mut()
+                .locals
+                .get(declarator_name)
                 .and_then(|l| l.struct_layout.clone())
         };
 
@@ -756,7 +897,14 @@ impl Lowerer {
         let strides = da.array_dim_strides.clone();
         let s_layout_cloned = s_layout.clone();
         let mut flat_idx = 0usize;
-        self.lower_struct_array_init_recursive(items, alloca, &strides, struct_size, &s_layout_cloned, &mut flat_idx);
+        self.lower_struct_array_init_recursive(
+            items,
+            alloca,
+            &strides,
+            struct_size,
+            &s_layout_cloned,
+            &mut flat_idx,
+        );
     }
 
     /// Recursively initialize a (possibly multi-dimensional) array of structs.
@@ -784,7 +932,11 @@ impl Lowerer {
         };
 
         // How many leaf structs fit in one element at this dimension level
-        let elems_per_slot = if struct_size > 0 { this_stride / struct_size } else { 1 };
+        let elems_per_slot = if struct_size > 0 {
+            this_stride / struct_size
+        } else {
+            1
+        };
         let is_subarray = this_stride > struct_size && !remaining.is_empty();
 
         let mut item_idx = 0usize;
@@ -812,13 +964,22 @@ impl Lowerer {
                     if let Some(ref fname) = field_designator_name {
                         // Field-designated list init: [idx].field = { ... }
                         self.lower_struct_array_field_designated_list(
-                            sub_items, alloca, base_byte_offset, fname, s_layout,
+                            sub_items,
+                            alloca,
+                            base_byte_offset,
+                            fname,
+                            s_layout,
                         );
                     } else if is_subarray {
                         // Sub-array: recurse with next dimension level
                         let start_flat = *flat_idx;
                         self.lower_struct_array_init_recursive(
-                            sub_items, alloca, remaining, struct_size, s_layout, flat_idx,
+                            sub_items,
+                            alloca,
+                            remaining,
+                            struct_size,
+                            s_layout,
+                            flat_idx,
                         );
                         // After recursion, advance flat_idx to the next sub-array boundary
                         // to handle partial initialization (C11 6.7.9p21: uninitialized
@@ -838,14 +999,23 @@ impl Lowerer {
                 Initializer::Expr(e) => {
                     if let Some(ref fname) = field_designator_name {
                         self.lower_struct_array_field_designated_expr(
-                            e, alloca, base_byte_offset, fname, s_layout,
+                            e,
+                            alloca,
+                            base_byte_offset,
+                            fname,
+                            s_layout,
                         );
                     } else if self.struct_value_size(e).is_some() {
                         let src_addr = self.get_struct_base_addr(e);
                         self.emit_memcpy_at_offset(alloca, base_byte_offset, src_addr, struct_size);
                     } else {
                         // Flat scalar init without braces (e.g., `struct t a[2] = {1,2,3,4}`)
-                        let consumed = self.emit_struct_init(&items[item_idx..], alloca, s_layout, base_byte_offset);
+                        let consumed = self.emit_struct_init(
+                            &items[item_idx..],
+                            alloca,
+                            s_layout,
+                            base_byte_offset,
+                        );
                         item_idx += consumed.max(1);
                         *flat_idx += 1;
                         continue;
@@ -877,11 +1047,18 @@ impl Lowerer {
                 if elem_ty.is_complex() {
                     let complex_ctype = elem_ty.as_ref().clone();
                     for (ai, sub_item) in sub_items.iter().enumerate() {
-                        if ai >= arr_size { break; }
+                        if ai >= arr_size {
+                            break;
+                        }
                         let elem_offset = field_offset + ai * elem_size;
                         match &sub_item.init {
                             Initializer::Expr(e) => {
-                                self.emit_complex_expr_to_offset(e, alloca, elem_offset, &complex_ctype);
+                                self.emit_complex_expr_to_offset(
+                                    e,
+                                    alloca,
+                                    elem_offset,
+                                    &complex_ctype,
+                                );
                             }
                             Initializer::List(inner_items) => {
                                 let dest = self.emit_gep_offset(alloca, elem_offset, IrType::Ptr);
@@ -893,10 +1070,18 @@ impl Lowerer {
                     let elem_ir_ty = IrType::from_ctype(elem_ty);
                     let elem_is_bool = **elem_ty == CType::Bool;
                     for (ai, sub_item) in sub_items.iter().enumerate() {
-                        if ai >= arr_size { break; }
+                        if ai >= arr_size {
+                            break;
+                        }
                         if let Initializer::Expr(e) = &sub_item.init {
                             let elem_offset = field_offset + ai * elem_size;
-                            self.emit_init_expr_to_offset_bool(e, alloca, elem_offset, elem_ir_ty, elem_is_bool);
+                            self.emit_init_expr_to_offset_bool(
+                                e,
+                                alloca,
+                                elem_offset,
+                                elem_ir_ty,
+                                elem_is_bool,
+                            );
                         }
                     }
                 }
@@ -955,7 +1140,14 @@ impl Lowerer {
     ) {
         self.zero_init_alloca(alloca, da.alloc_size);
         let mut flat_idx = 0usize;
-        self.lower_complex_init_recursive(items, alloca, da, cplx_ctype, &da.array_dim_strides.clone(), &mut flat_idx);
+        self.lower_complex_init_recursive(
+            items,
+            alloca,
+            da,
+            cplx_ctype,
+            &da.array_dim_strides.clone(),
+            &mut flat_idx,
+        );
     }
 
     /// Recursive helper for multi-dimensional complex array initialization.
@@ -996,7 +1188,14 @@ impl Lowerer {
                 Initializer::List(sub_items) => {
                     if dim_strides.len() > 1 {
                         // Recurse into nested brace list for inner dimensions
-                        self.lower_complex_init_recursive(sub_items, alloca, da, cplx_ctype, &dim_strides[1..], flat_idx);
+                        self.lower_complex_init_recursive(
+                            sub_items,
+                            alloca,
+                            da,
+                            cplx_ctype,
+                            &dim_strides[1..],
+                            flat_idx,
+                        );
                         // Advance to next sub-array boundary
                         let boundary = start_index + sub_elem_count;
                         if *flat_idx < boundary {
@@ -1006,7 +1205,12 @@ impl Lowerer {
                         // At leaf dimension, unwrap single-element brace list
                         if let Some(e) = Self::unwrap_nested_init_expr(sub_items) {
                             let src = self.lower_expr_to_complex(e, cplx_ctype);
-                            self.emit_memcpy_at_offset(alloca, *flat_idx * leaf_size, src, leaf_size);
+                            self.emit_memcpy_at_offset(
+                                alloca,
+                                *flat_idx * leaf_size,
+                                src,
+                                leaf_size,
+                            );
                         }
                         *flat_idx += 1;
                     }
@@ -1036,9 +1240,14 @@ impl Lowerer {
 
         let is_complex_elem_array = self.is_type_complex(&decl.type_spec);
         let is_bool_elem_array = self.is_type_bool(&decl.type_spec)
-            && !da.is_array_of_pointers && !da.is_array_of_func_ptrs;
+            && !da.is_array_of_pointers
+            && !da.is_array_of_func_ptrs;
 
-        let elem_store_ty = if da.is_array_of_pointers || da.is_array_of_func_ptrs { IrType::Ptr } else { da.elem_ir_ty };
+        let elem_store_ty = if da.is_array_of_pointers || da.is_array_of_func_ptrs {
+            IrType::Ptr
+        } else {
+            da.elem_ir_ty
+        };
 
         let mut current_idx = 0usize;
         for item in items.iter() {
@@ -1050,20 +1259,27 @@ impl Lowerer {
 
             let init_expr = match &item.init {
                 Initializer::Expr(e) => Some(e),
-                Initializer::List(sub_items) => {
-                    Self::unwrap_nested_init_expr(sub_items)
-                }
+                Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
             };
             if let Some(e) = init_expr {
-                if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I8 || da.elem_ir_ty == IrType::U8) {
+                if !da.is_array_of_pointers
+                    && (da.elem_ir_ty == IrType::I8 || da.elem_ir_ty == IrType::U8)
+                {
                     if let Expr::StringLiteral(s, _) = e {
-                        self.emit_string_to_alloca(alloca, s, current_idx * da.elem_size, da.elem_size);
+                        self.emit_string_to_alloca(
+                            alloca,
+                            s,
+                            current_idx * da.elem_size,
+                            da.elem_size,
+                        );
                         current_idx += 1;
                         continue;
                     }
                 }
                 // wchar_t array with braced wide string: wchar_t w[] = {L"hello"};
-                if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I32 || da.elem_ir_ty == IrType::U32) {
+                if !da.is_array_of_pointers
+                    && (da.elem_ir_ty == IrType::I32 || da.elem_ir_ty == IrType::U32)
+                {
                     if let Expr::WideStringLiteral(s, _) = e {
                         self.emit_wide_string_to_alloca(alloca, s, current_idx * da.elem_size);
                         current_idx += 1;
@@ -1071,7 +1287,9 @@ impl Lowerer {
                     }
                 }
                 // char16_t array with braced char16 string: char16_t w[] = {u"hello"};
-                if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I16 || da.elem_ir_ty == IrType::U16) {
+                if !da.is_array_of_pointers
+                    && (da.elem_ir_ty == IrType::I16 || da.elem_ir_ty == IrType::U16)
+                {
                     if let Expr::Char16StringLiteral(s, _) = e {
                         self.emit_char16_string_to_alloca(alloca, s, current_idx * da.elem_size);
                         current_idx += 1;
@@ -1081,18 +1299,33 @@ impl Lowerer {
                 if is_complex_elem_array {
                     let val = self.lower_expr(e);
                     let src = self.operand_to_value(val);
-                    self.emit_memcpy_at_offset(alloca, current_idx * da.elem_size, src, da.elem_size);
+                    self.emit_memcpy_at_offset(
+                        alloca,
+                        current_idx * da.elem_size,
+                        src,
+                        da.elem_size,
+                    );
                 } else if is_bool_elem_array {
                     // _Bool array elements: normalize (any nonzero -> 1) per C11 6.3.1.2
                     let val = self.lower_expr(e);
                     let expr_ty = self.get_expr_type(e);
                     let val = self.emit_bool_normalize_typed(val, expr_ty);
-                    self.emit_array_element_store(alloca, val, current_idx * da.elem_size, elem_store_ty);
+                    self.emit_array_element_store(
+                        alloca,
+                        val,
+                        current_idx * da.elem_size,
+                        elem_store_ty,
+                    );
                 } else {
                     let val = self.lower_expr(e);
                     let expr_ty = self.get_expr_type(e);
                     let val = self.emit_implicit_cast(val, expr_ty, elem_store_ty);
-                    self.emit_array_element_store(alloca, val, current_idx * da.elem_size, elem_store_ty);
+                    self.emit_array_element_store(
+                        alloca,
+                        val,
+                        current_idx * da.elem_size,
+                        elem_store_ty,
+                    );
                 }
             }
             current_idx += 1;
@@ -1101,7 +1334,13 @@ impl Lowerer {
 
     /// Vector init list: `v4hi a = {1, 2, 3, 4};`
     /// Stores each element at elem_size * index offset from the alloca.
-    pub(super) fn lower_vector_init_list(&mut self, items: &[InitializerItem], alloca: Value, elem_ct: &CType, num_elems: usize) {
+    pub(super) fn lower_vector_init_list(
+        &mut self,
+        items: &[InitializerItem],
+        alloca: Value,
+        elem_ct: &CType,
+        num_elems: usize,
+    ) {
         let elem_ir_ty = IrType::from_ctype(elem_ct);
         let elem_size = elem_ct.size();
         // Zero-init first if fewer initializers than elements
@@ -1109,7 +1348,9 @@ impl Lowerer {
             self.zero_init_alloca(alloca, elem_size * num_elems);
         }
         for (idx, item) in items.iter().enumerate() {
-            if idx >= num_elems { break; }
+            if idx >= num_elems {
+                break;
+            }
             let init_expr = match &item.init {
                 Initializer::Expr(e) => Some(e),
                 Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
@@ -1125,7 +1366,12 @@ impl Lowerer {
     }
 
     /// Scalar with braces: `int x = { 1 };` or `int x = {{{1}}};`
-    fn lower_scalar_braced_init(&mut self, items: &[InitializerItem], alloca: Value, da: &DeclAnalysis) {
+    fn lower_scalar_braced_init(
+        &mut self,
+        items: &[InitializerItem],
+        alloca: Value,
+        da: &DeclAnalysis,
+    ) {
         if let Some(expr) = Self::unwrap_nested_init_expr(items) {
             let val = self.lower_expr(expr);
             let expr_ty = self.get_expr_type(expr);
@@ -1135,7 +1381,13 @@ impl Lowerer {
             } else {
                 self.emit_implicit_cast(val, expr_ty, da.var_ty)
             };
-            self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val,
+                ptr: alloca,
+                ty: da.var_ty,
+                seg_override: AddressSpace::Default,
+            });
         }
     }
 }

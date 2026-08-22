@@ -15,14 +15,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
-    BasicBlock,
-    BlockId,
-    Instruction,
-    IrConst,
-    IrFunction,
-    Operand,
-    Terminator,
-    Value,
+    BasicBlock, BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value,
 };
 
 /// Maximum depth for resolving transitive jump chains (A→B→C→...),
@@ -85,7 +78,11 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
 /// Build a map from BlockId -> index in func.blocks for O(1) lookup.
 #[inline]
 fn build_label_to_idx(func: &IrFunction) -> FxHashMap<BlockId, usize> {
-    func.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect()
+    func.blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect()
 }
 
 /// Build predecessor count for each block.
@@ -148,7 +145,11 @@ fn remap_terminator_targets(term: &mut Terminator, remap: &FxHashMap<BlockId, Bl
                 *target = new;
             }
         }
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             if let Some(&new) = remap.get(true_label) {
                 *true_label = new;
             }
@@ -166,7 +167,9 @@ fn remap_terminator_targets(term: &mut Terminator, remap: &FxHashMap<BlockId, Bl
                 }
             }
         }
-        Terminator::IndirectBranch { possible_targets, .. } => {
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
             for target in possible_targets.iter_mut() {
                 if let Some(&new) = remap.get(target) {
                     *target = new;
@@ -183,11 +186,17 @@ fn remap_terminator_targets(term: &mut Terminator, remap: &FxHashMap<BlockId, Bl
 fn for_each_terminator_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
     match term {
         Terminator::Branch(target) => f(*target),
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             f(*true_label);
             f(*false_label);
         }
-        Terminator::IndirectBranch { possible_targets, .. } => {
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
             for &target in possible_targets {
                 f(target);
             }
@@ -213,7 +222,12 @@ fn for_each_terminator_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
 fn simplify_redundant_cond_branches(func: &mut IrFunction) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
-        if let Terminator::CondBranch { true_label, false_label, .. } = &block.terminator {
+        if let Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } = &block.terminator
+        {
             if true_label == false_label {
                 let target = *true_label;
                 block.terminator = Terminator::Branch(target);
@@ -240,7 +254,10 @@ fn simplify_redundant_cond_branches(func: &mut IrFunction) -> usize {
 /// the phi entries referencing the current block must be removed since the edge
 /// no longer exists. Without this cleanup, stale phi entries can cause
 /// miscompilation when the not-taken block is still reachable from other paths.
-fn fold_constant_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+fn fold_constant_cond_branches(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
     // Build predecessor info for cross-block value resolution.
     let (_pred_count, single_pred) = build_pred_info(func);
 
@@ -252,13 +269,23 @@ fn fold_constant_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<B
     let mut folds: Vec<(usize, BlockId, BlockId, BlockId)> = Vec::new();
 
     for (idx, block) in func.blocks.iter().enumerate() {
-        if let Terminator::CondBranch { cond, true_label, false_label } = &block.terminator {
+        if let Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } = &block.terminator
+        {
             let const_val = match cond {
                 Operand::Const(c) => Some(c.is_nonzero()),
-                Operand::Value(v) => {
-                    resolve_cond_branch_value(func, block, *v, &single_pred, label_to_idx, &global_val_map)
-                        .map(|c| c.is_nonzero())
-                }
+                Operand::Value(v) => resolve_cond_branch_value(
+                    func,
+                    block,
+                    *v,
+                    &single_pred,
+                    label_to_idx,
+                    &global_val_map,
+                )
+                .map(|c| c.is_nonzero()),
             };
             if let Some(is_true) = const_val {
                 let taken = if is_true { *true_label } else { *false_label };
@@ -337,19 +364,29 @@ fn resolve_cond_branch_value(
 /// pattern: a switch on a capability number that should resolve at compile time.
 ///
 /// When folding, we clean up phi nodes in all not-taken target blocks.
-fn fold_constant_switches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+fn fold_constant_switches(
+    func: &mut IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> usize {
     // Collect folding decisions: (block_index, taken_target, not_taken_targets, block_label)
     let mut folds: Vec<(usize, BlockId, Vec<BlockId>, BlockId)> = Vec::new();
 
     for (idx, block) in func.blocks.iter().enumerate() {
-        if let Terminator::Switch { val, cases, default, .. } = &block.terminator {
+        if let Terminator::Switch {
+            val,
+            cases,
+            default,
+            ..
+        } = &block.terminator
+        {
             let resolved_const = match val {
                 Operand::Const(c) => Some(*c),
                 Operand::Value(v) => resolve_value_to_const_in_block(block, *v),
             };
             if let Some(c) = resolved_const {
                 if let Some(switch_int) = c.to_i64() {
-                    let taken = cases.iter()
+                    let taken = cases
+                        .iter()
                         .find(|(cv, _)| *cv == switch_int)
                         .map(|(_, label)| *label)
                         .unwrap_or(*default);
@@ -405,10 +442,11 @@ fn fold_constant_switches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockI
 /// the two control flow paths, causing miscompilation.
 fn thread_jump_chains(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
     // Build forwarding map: empty blocks that just branch unconditionally.
-    let forwarding: FxHashMap<BlockId, BlockId> = func.blocks.iter()
+    let forwarding: FxHashMap<BlockId, BlockId> = func
+        .blocks
+        .iter()
         .filter(|block| {
-            block.instructions.is_empty()
-                && matches!(&block.terminator, Terminator::Branch(_))
+            block.instructions.is_empty() && matches!(&block.terminator, Terminator::Branch(_))
         })
         .map(|block| {
             if let Terminator::Branch(target) = &block.terminator {
@@ -442,7 +480,9 @@ fn thread_jump_chains(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, u
 
 /// Resolve transitive forwarding chains.
 /// Returns a map: start_block -> (final_target, immediate_pred_of_final).
-fn resolve_forwarding_chains(forwarding: &FxHashMap<BlockId, BlockId>) -> FxHashMap<BlockId, (BlockId, BlockId)> {
+fn resolve_forwarding_chains(
+    forwarding: &FxHashMap<BlockId, BlockId>,
+) -> FxHashMap<BlockId, (BlockId, BlockId)> {
     let mut resolved = FxHashMap::default();
     for &start in forwarding.keys() {
         let mut prev = start;
@@ -520,7 +560,11 @@ fn collect_thread_redirections(
                     }
                 }
             }
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 let true_resolved = resolved.get(true_label).copied();
                 let false_resolved = resolved.get(false_label).copied();
                 let true_final = true_resolved.map(|(t, _)| t).unwrap_or(*true_label);
@@ -528,9 +572,15 @@ fn collect_thread_redirections(
 
                 if true_final == false_final && true_label != false_label {
                     // Threading would merge both edges — check for phi conflict.
-                    if would_create_phi_conflict(func, block_label, *true_label,
-                                                  *false_label, true_final, resolved,
-                                                  label_to_idx) {
+                    if would_create_phi_conflict(
+                        func,
+                        block_label,
+                        *true_label,
+                        *false_label,
+                        true_final,
+                        resolved,
+                        label_to_idx,
+                    ) {
                         continue; // Skip: phi conflict
                     }
                 }
@@ -542,7 +592,10 @@ fn collect_thread_redirections(
                 }
                 if let Some((rf, rf_phi)) = false_resolved {
                     if !unsafe_to_thread.contains(false_label) {
-                        if !edge_changes.iter().any(|(old, new, _)| *old == *false_label && *new == rf) {
+                        if !edge_changes
+                            .iter()
+                            .any(|(old, new, _)| *old == *false_label && *new == rf)
+                        {
                             edge_changes.push((*false_label, rf, rf_phi));
                         }
                     }
@@ -575,13 +628,23 @@ fn apply_thread_redirections(
         match &mut func.blocks[*block_idx].terminator {
             Terminator::Branch(target) => {
                 for (old, new, _) in edge_changes {
-                    if target == old { *target = *new; }
+                    if target == old {
+                        *target = *new;
+                    }
                 }
             }
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 for (old, new, _) in edge_changes {
-                    if true_label == old { *true_label = *new; }
-                    if false_label == old { *false_label = *new; }
+                    if true_label == old {
+                        *true_label = *new;
+                    }
+                    if false_label == old {
+                        *false_label = *new;
+                    }
                 }
             }
             _ => {}
@@ -599,8 +662,10 @@ fn apply_thread_redirections(
                 let all_phis_covered = func.blocks[target_idx].instructions.iter().all(|inst| {
                     if let Instruction::Phi { incoming, .. } = inst {
                         incoming.iter().any(|(_, label)| *label == block_label)
-                        || incoming.iter().any(|(_, label)| *label == *phi_lookup_block)
-                        || incoming.iter().any(|(_, label)| *label == *_old)
+                            || incoming
+                                .iter()
+                                .any(|(_, label)| *label == *phi_lookup_block)
+                            || incoming.iter().any(|(_, label)| *label == *_old)
                     } else {
                         true
                     }
@@ -609,11 +674,21 @@ fn apply_thread_redirections(
                     // Revert the terminator change for this edge.
                     match &mut func.blocks[*block_idx].terminator {
                         Terminator::Branch(target) => {
-                            if *target == *new_target { *target = *_old; }
+                            if *target == *new_target {
+                                *target = *_old;
+                            }
                         }
-                        Terminator::CondBranch { true_label, false_label, .. } => {
-                            if *true_label == *new_target { *true_label = *_old; }
-                            if *false_label == *new_target { *false_label = *_old; }
+                        Terminator::CondBranch {
+                            true_label,
+                            false_label,
+                            ..
+                        } => {
+                            if *true_label == *new_target {
+                                *true_label = *_old;
+                            }
+                            if *false_label == *new_target {
+                                *false_label = *_old;
+                            }
                         }
                         _ => {}
                     }
@@ -627,7 +702,8 @@ fn apply_thread_redirections(
                         if incoming.iter().any(|(_, label)| *label == block_label) {
                             continue;
                         }
-                        let value_from_chain = incoming.iter()
+                        let value_from_chain = incoming
+                            .iter()
                             .find(|(_, label)| *label == *phi_lookup_block)
                             .or_else(|| incoming.iter().find(|(_, label)| *label == *_old))
                             .map(|(val, _)| *val);
@@ -661,8 +737,14 @@ fn would_create_phi_conflict(
     };
 
     // Determine the phi-lookup label for each path.
-    let true_phi_label = resolved.get(&true_label).map(|&(_, pb)| pb).unwrap_or(block_label);
-    let false_phi_label = resolved.get(&false_label).map(|&(_, pb)| pb).unwrap_or(block_label);
+    let true_phi_label = resolved
+        .get(&true_label)
+        .map(|&(_, pb)| pb)
+        .unwrap_or(block_label);
+    let false_phi_label = resolved
+        .get(&false_label)
+        .map(|&(_, pb)| pb)
+        .unwrap_or(block_label);
 
     if true_phi_label == false_phi_label {
         return false;
@@ -670,8 +752,14 @@ fn would_create_phi_conflict(
 
     for inst in &target_block.instructions {
         if let Instruction::Phi { incoming, .. } = inst {
-            let true_value = incoming.iter().find(|(_, l)| *l == true_phi_label).map(|(v, _)| v);
-            let false_value = incoming.iter().find(|(_, l)| *l == false_phi_label).map(|(v, _)| v);
+            let true_value = incoming
+                .iter()
+                .find(|(_, l)| *l == true_phi_label)
+                .map(|(v, _)| v);
+            let false_value = incoming
+                .iter()
+                .find(|(_, l)| *l == false_phi_label)
+                .map(|(v, _)| v);
             if let (Some(tv), Some(fv)) = (true_value, false_value) {
                 if !operands_equal(tv, fv) {
                     return true;
@@ -736,7 +824,9 @@ fn remove_dead_blocks(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, u
         }
     }
 
-    let dead_blocks: FxHashSet<BlockId> = func.blocks.iter()
+    let dead_blocks: FxHashSet<BlockId> = func
+        .blocks
+        .iter()
         .map(|b| b.label)
         .filter(|label| !reachable.contains(label))
         .collect();
@@ -831,8 +921,11 @@ fn merge_single_pred_blocks(func: &mut IrFunction) -> usize {
     let (label_addr_targets, asm_goto_targets) = collect_unmergeable_targets(func);
 
     let fusions = find_fusion_candidates(
-        func, &pred_count, &label_to_idx,
-        &label_addr_targets, &asm_goto_targets,
+        func,
+        &pred_count,
+        &label_to_idx,
+        &label_addr_targets,
+        &asm_goto_targets,
     );
 
     if fusions.is_empty() {
@@ -888,30 +981,48 @@ fn find_fusion_candidates(
             _ => continue,
         };
 
-        if *target == entry_label { continue; }
-        if pred_count.get(target).copied().unwrap_or(0) != 1 { continue; }
+        if *target == entry_label {
+            continue;
+        }
+        if pred_count.get(target).copied().unwrap_or(0) != 1 {
+            continue;
+        }
 
         let &succ_idx = match label_to_idx.get(target) {
             Some(si) => si,
             None => continue,
         };
 
-        if idx == succ_idx { continue; }
-        if absorbed.contains(&succ_idx) || absorbers.contains(&succ_idx) { continue; }
-        if absorbed.contains(&idx) { continue; }
+        if idx == succ_idx {
+            continue;
+        }
+        if absorbed.contains(&succ_idx) || absorbers.contains(&succ_idx) {
+            continue;
+        }
+        if absorbed.contains(&idx) {
+            continue;
+        }
 
         // Successor contains InlineAsm with goto_labels — must stay separate.
         let has_asm_goto = func.blocks[succ_idx].instructions.iter().any(|inst| {
             matches!(inst, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty())
         });
-        if has_asm_goto { continue; }
+        if has_asm_goto {
+            continue;
+        }
 
         // Target is referenced by LabelAddr or asm goto — must keep identity.
-        if label_addr_targets.contains(target) { continue; }
-        if asm_goto_targets.contains(target) { continue; }
+        if label_addr_targets.contains(target) {
+            continue;
+        }
+        if asm_goto_targets.contains(target) {
+            continue;
+        }
 
         // Target is referenced by global init (&&label in global data).
-        if func.global_init_label_blocks.contains(target) { continue; }
+        if func.global_init_label_blocks.contains(target) {
+            continue;
+        }
 
         fusions.push((idx, succ_idx));
         absorbed.insert(succ_idx);
@@ -938,13 +1049,21 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
 
         for (i, inst) in succ_instructions.into_iter().enumerate() {
             if let Instruction::Phi { dest, incoming, .. } = &inst {
-                let src = incoming.iter()
+                let src = incoming
+                    .iter()
                     .find(|(_, label)| *label == pred_label)
                     .map(|(op, _)| *op)
                     .unwrap_or_else(|| {
                         // Fallback: single-pred blocks should always have a matching entry.
-                        debug_assert!(!incoming.is_empty(), "Phi with no incoming in single-pred block");
-                        if !incoming.is_empty() { incoming[0].0 } else { Operand::Const(IrConst::I64(0)) }
+                        debug_assert!(
+                            !incoming.is_empty(),
+                            "Phi with no incoming in single-pred block"
+                        );
+                        if !incoming.is_empty() {
+                            incoming[0].0
+                        } else {
+                            Operand::Const(IrConst::I64(0))
+                        }
                     });
                 converted_instructions.push(Instruction::Copy { dest: *dest, src });
             } else {
@@ -960,16 +1079,20 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
         let succ_has_spans = !converted_spans.is_empty();
 
         if pred_has_spans && !succ_has_spans && !converted_instructions.is_empty() {
-            converted_spans.resize(converted_instructions.len(), crate::common::source::Span::dummy());
-        } else if !pred_has_spans && succ_has_spans {
-            let pred_inst_len = func.blocks[pred_idx].instructions.len();
-            func.blocks[pred_idx].source_spans.resize(
-                pred_inst_len,
+            converted_spans.resize(
+                converted_instructions.len(),
                 crate::common::source::Span::dummy(),
             );
+        } else if !pred_has_spans && succ_has_spans {
+            let pred_inst_len = func.blocks[pred_idx].instructions.len();
+            func.blocks[pred_idx]
+                .source_spans
+                .resize(pred_inst_len, crate::common::source::Span::dummy());
         }
 
-        func.blocks[pred_idx].instructions.extend(converted_instructions);
+        func.blocks[pred_idx]
+            .instructions
+            .extend(converted_instructions);
         func.blocks[pred_idx].terminator = succ_terminator;
         if !converted_spans.is_empty() {
             func.blocks[pred_idx].source_spans.extend(converted_spans);
@@ -980,7 +1103,8 @@ fn execute_fusions(func: &mut IrFunction, fusions: &[(usize, usize)]) {
 /// After fusing blocks, update phi nodes and terminators in all blocks to
 /// replace references to absorbed block labels with their predecessor labels.
 fn patch_absorbed_references(func: &mut IrFunction, fusions: &[(usize, usize)]) {
-    let absorbed_to_pred: FxHashMap<BlockId, BlockId> = fusions.iter()
+    let absorbed_to_pred: FxHashMap<BlockId, BlockId> = fusions
+        .iter()
         .map(|&(pred_idx, succ_idx)| (func.blocks[succ_idx].label, func.blocks[pred_idx].label))
         .collect();
 
@@ -1008,13 +1132,13 @@ fn build_global_value_map(func: &IrFunction) -> FxHashMap<Value, (usize, usize)>
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             let dest = match inst {
-                Instruction::Copy { dest, .. } |
-                Instruction::Phi { dest, .. } |
-                Instruction::Cmp { dest, .. } |
-                Instruction::Cast { dest, .. } |
-                Instruction::Select { dest, .. } |
-                Instruction::BinOp { dest, .. } |
-                Instruction::UnaryOp { dest, .. } => Some(*dest),
+                Instruction::Copy { dest, .. }
+                | Instruction::Phi { dest, .. }
+                | Instruction::Cmp { dest, .. }
+                | Instruction::Cast { dest, .. }
+                | Instruction::Select { dest, .. }
+                | Instruction::BinOp { dest, .. }
+                | Instruction::UnaryOp { dest, .. } => Some(*dest),
                 _ => None,
             };
             if let Some(d) = dest {
@@ -1029,17 +1153,26 @@ fn build_global_value_map(func: &IrFunction) -> FxHashMap<Value, (usize, usize)>
 ///
 /// This handles chains like: Phi → Copy → Cmp(Ne, Cast(Phi), 0) where the inner
 /// Phi has collapsed to a constant but the outer chain spans multiple blocks.
-fn resolve_value_globally(func: &IrFunction, v: Value, val_map: &FxHashMap<Value, (usize, usize)>, depth: usize) -> Option<IrConst> {
+fn resolve_value_globally(
+    func: &IrFunction,
+    v: Value,
+    val_map: &FxHashMap<Value, (usize, usize)>,
+    depth: usize,
+) -> Option<IrConst> {
     if depth > MAX_GLOBAL_RESOLVE_DEPTH {
         return None;
     }
     let &(bi, ii) = val_map.get(&v)?;
     let inst = &func.blocks[bi].instructions[ii];
     match inst {
-        Instruction::Copy { src: Operand::Const(c), .. } => Some(*c),
-        Instruction::Copy { src: Operand::Value(sv), .. } => {
-            resolve_value_globally(func, *sv, val_map, depth + 1)
-        }
+        Instruction::Copy {
+            src: Operand::Const(c),
+            ..
+        } => Some(*c),
+        Instruction::Copy {
+            src: Operand::Value(sv),
+            ..
+        } => resolve_value_globally(func, *sv, val_map, depth + 1),
         Instruction::Phi { incoming, .. } => {
             // All incoming must be the same constant.
             let mut common_val: Option<i64> = None;
@@ -1053,7 +1186,9 @@ fn resolve_value_globally(func: &IrFunction, v: Value, val_map: &FxHashMap<Value
                     Some(c) => {
                         let ci = c.to_i64()?;
                         if let Some(prev) = common_val {
-                            if prev != ci { return None; }
+                            if prev != ci {
+                                return None;
+                            }
                         } else {
                             common_val = Some(ci);
                             first_const = Some(c);
@@ -1064,17 +1199,28 @@ fn resolve_value_globally(func: &IrFunction, v: Value, val_map: &FxHashMap<Value
             }
             first_const
         }
-        Instruction::Cmp { op, lhs, rhs, ty, .. } => {
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } => {
             let l = resolve_operand_globally(func, lhs, val_map, depth + 1)?;
             let r = resolve_operand_globally(func, rhs, val_map, depth + 1)?;
             let result = op.eval_i64(ty.truncate_i64(l), ty.truncate_i64(r));
             Some(IrConst::I32(if result { 1 } else { 0 }))
         }
-        Instruction::Cast { src: Operand::Const(c), .. } => Some(*c),
-        Instruction::Cast { src: Operand::Value(sv), .. } => {
-            resolve_value_globally(func, *sv, val_map, depth + 1)
-        }
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Cast {
+            src: Operand::Const(c),
+            ..
+        } => Some(*c),
+        Instruction::Cast {
+            src: Operand::Value(sv),
+            ..
+        } => resolve_value_globally(func, *sv, val_map, depth + 1),
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             let cond_val = resolve_operand_globally(func, cond, val_map, depth + 1)?;
             let chosen = if cond_val != 0 { true_val } else { false_val };
             match chosen {
@@ -1087,7 +1233,12 @@ fn resolve_value_globally(func: &IrFunction, v: Value, val_map: &FxHashMap<Value
 }
 
 /// Resolve an operand to an i64 constant using global cross-block resolution.
-fn resolve_operand_globally(func: &IrFunction, op: &Operand, val_map: &FxHashMap<Value, (usize, usize)>, depth: usize) -> Option<i64> {
+fn resolve_operand_globally(
+    func: &IrFunction,
+    op: &Operand,
+    val_map: &FxHashMap<Value, (usize, usize)>,
+    depth: usize,
+) -> Option<i64> {
     match op {
         Operand::Const(c) => c.to_i64(),
         Operand::Value(v) => resolve_value_globally(func, *v, val_map, depth)?.to_i64(),
@@ -1101,7 +1252,10 @@ fn resolve_operand_globally(func: &IrFunction, op: &Operand, val_map: &FxHashMap
 fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrConst> {
     for inst in &block.instructions {
         match inst {
-            Instruction::Copy { dest, src: Operand::Const(c) } if *dest == v => {
+            Instruction::Copy {
+                dest,
+                src: Operand::Const(c),
+            } if *dest == v => {
                 return Some(*c);
             }
             Instruction::Phi { dest, incoming, .. } if *dest == v => {
@@ -1113,7 +1267,9 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
                         Operand::Const(c) => {
                             let ci = c.to_i64()?;
                             if let Some(prev) = common_val {
-                                if prev != ci { return None; }
+                                if prev != ci {
+                                    return None;
+                                }
                             } else {
                                 common_val = Some(ci);
                                 first_const = Some(*c);
@@ -1124,13 +1280,25 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
                 }
                 return first_const;
             }
-            Instruction::Cmp { dest, op, lhs, rhs, ty } if *dest == v => {
+            Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } if *dest == v => {
                 let l = resolve_operand_to_i64_in_block(block, lhs)?;
                 let r = resolve_operand_to_i64_in_block(block, rhs)?;
                 let result = op.eval_i64(ty.truncate_i64(l), ty.truncate_i64(r));
                 return Some(IrConst::I32(if result { 1 } else { 0 }));
             }
-            Instruction::Select { dest, cond, true_val, false_val, .. } if *dest == v => {
+            Instruction::Select {
+                dest,
+                cond,
+                true_val,
+                false_val,
+                ..
+            } if *dest == v => {
                 let cond_const = resolve_operand_to_i64_in_block(block, cond)?;
                 let chosen = if cond_const != 0 { true_val } else { false_val };
                 return match chosen {
@@ -1186,8 +1354,17 @@ mod tests {
 
     /// Create a basic block for testing. Reduces boilerplate since
     /// `source_spans` is always empty in tests.
-    fn make_block(label: BlockId, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-        BasicBlock { label, instructions, terminator, source_spans: Vec::new() }
+    fn make_block(
+        label: BlockId,
+        instructions: Vec<Instruction>,
+        terminator: Terminator,
+    ) -> BasicBlock {
+        BasicBlock {
+            label,
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
     }
 
     #[test]
@@ -1195,45 +1372,68 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
         func.blocks.push(make_block(
             BlockId(0),
-            vec![Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(1)) }],
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
             Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(1),
                 false_label: BlockId(1),
             },
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Return(None)));
+        func.blocks
+            .push(make_block(BlockId(1), vec![], Terminator::Return(None)));
 
         let count = simplify_cfg(&mut func);
         assert!(count > 0);
         // After redundant cond branch -> Branch(1), then merge_single_pred_blocks
         // merges Block 1 into Block 0, so Block 0 ends with Return(None).
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(None)));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(None)
+        ));
         assert_eq!(func.blocks.len(), 1);
     }
 
     #[test]
     fn test_jump_chain_threading() {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
-        func.blocks.push(make_block(BlockId(0), vec![], Terminator::Branch(BlockId(1))));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Branch(BlockId(2))));
-        func.blocks.push(make_block(BlockId(2), vec![], Terminator::Return(None)));
+        func.blocks.push(make_block(
+            BlockId(0),
+            vec![],
+            Terminator::Branch(BlockId(1)),
+        ));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Branch(BlockId(2)),
+        ));
+        func.blocks
+            .push(make_block(BlockId(2), vec![], Terminator::Return(None)));
 
         let count = simplify_cfg(&mut func);
         assert!(count > 0);
         // After threading Block 0 -> Block 2 (skipping Block 1), Block 1 is dead,
         // then merge_single_pred_blocks merges Block 2 into Block 0.
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(None)));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(None)
+        ));
         assert_eq!(func.blocks.len(), 1);
     }
 
     #[test]
     fn test_dead_block_elimination() {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
-        func.blocks.push(make_block(BlockId(0), vec![], Terminator::Return(None)));
+        func.blocks
+            .push(make_block(BlockId(0), vec![], Terminator::Return(None)));
         func.blocks.push(make_block(
             BlockId(1),
-            vec![Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(42)) }],
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(42)),
+            }],
             Terminator::Return(None),
         ));
 
@@ -1250,21 +1450,33 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
         func.blocks.push(make_block(
             BlockId(0),
-            vec![Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(1)) }],
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
             Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(1),
                 false_label: BlockId(1),
             },
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Branch(BlockId(2))));
-        func.blocks.push(make_block(BlockId(2), vec![], Terminator::Return(None)));
-        func.blocks.push(make_block(BlockId(3), vec![], Terminator::Return(None)));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Branch(BlockId(2)),
+        ));
+        func.blocks
+            .push(make_block(BlockId(2), vec![], Terminator::Return(None)));
+        func.blocks
+            .push(make_block(BlockId(3), vec![], Terminator::Return(None)));
 
         let count = simplify_cfg(&mut func);
         assert!(count > 0);
         // After all passes: Block 3 is dead, intermediate blocks are merged.
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(None)));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(None)
+        ));
         assert_eq!(func.blocks.len(), 1);
     }
 
@@ -1276,10 +1488,17 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
         func.blocks.push(make_block(
             BlockId(0),
-            vec![Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(42)) }],
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(42)),
+            }],
             Terminator::Branch(BlockId(1)),
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Branch(BlockId(2))));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Branch(BlockId(2)),
+        ));
         func.blocks.push(make_block(
             BlockId(2),
             vec![Instruction::Phi {
@@ -1294,12 +1513,19 @@ mod tests {
         assert!(count > 0);
         // After threading + dead block elimination + trivial phi -> Copy + merge:
         // Block 0 absorbs everything and ends with Return.
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Value(Value(1))))));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(Some(Operand::Value(Value(1))))
+        ));
         // The Copy instruction should be in Block 0 now (from the merged phi-to-copy).
-        let has_copy = func.blocks[0].instructions.iter().any(|inst| {
-            matches!(inst, Instruction::Copy { dest: Value(1), .. })
-        });
-        assert!(has_copy, "Block 0 should contain the Copy from the merged phi");
+        let has_copy = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Copy { dest: Value(1), .. }));
+        assert!(
+            has_copy,
+            "Block 0 should contain the Copy from the merged phi"
+        );
     }
 
     #[test]
@@ -1308,10 +1534,17 @@ mod tests {
         // However, merge_single_pred_blocks will merge Block 1 into Block 0
         // (single pred), and then Block 2 into the merged block.
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(make_block(BlockId(0), vec![], Terminator::Branch(BlockId(1))));
+        func.blocks.push(make_block(
+            BlockId(0),
+            vec![],
+            Terminator::Branch(BlockId(1)),
+        ));
         func.blocks.push(make_block(
             BlockId(1),
-            vec![Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(42)) }],
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(42)),
+            }],
             Terminator::Branch(BlockId(2)),
         ));
         func.blocks.push(make_block(
@@ -1322,7 +1555,10 @@ mod tests {
 
         let _ = simplify_cfg(&mut func);
         // No threading, but merge_single_pred_blocks merges all three blocks.
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Value(Value(0))))));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(Some(Operand::Value(Value(0))))
+        ));
         assert_eq!(func.blocks.len(), 1);
     }
 
@@ -1334,21 +1570,36 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
         func.blocks.push(make_block(
             BlockId(0),
-            vec![Instruction::Copy { dest: Value(0), src: Operand::Const(IrConst::I32(1)) }],
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
             Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(1),
                 false_label: BlockId(2),
             },
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Branch(BlockId(3))));
-        func.blocks.push(make_block(BlockId(2), vec![], Terminator::Branch(BlockId(3))));
-        func.blocks.push(make_block(BlockId(3), vec![], Terminator::Return(None)));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Branch(BlockId(3)),
+        ));
+        func.blocks.push(make_block(
+            BlockId(2),
+            vec![],
+            Terminator::Branch(BlockId(3)),
+        ));
+        func.blocks
+            .push(make_block(BlockId(3), vec![], Terminator::Return(None)));
 
         let count = simplify_cfg(&mut func);
         assert!(count > 0);
         // All intermediate blocks absorbed: Block 0 ends with Return(None).
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(None)));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(None)
+        ));
         assert_eq!(func.blocks.len(), 1);
     }
 
@@ -1370,7 +1621,11 @@ mod tests {
                 false_label: BlockId(3),
             },
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Branch(BlockId(3))));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Branch(BlockId(3)),
+        ));
         func.blocks.push(make_block(
             BlockId(3),
             vec![Instruction::Phi {
@@ -1387,7 +1642,11 @@ mod tests {
         simplify_cfg(&mut func);
 
         match &func.blocks[0].terminator {
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 assert!(
                     *true_label == BlockId(1) || *false_label != *true_label,
                     "Should not thread both branches to same target when phi has different values"
@@ -1401,11 +1660,17 @@ mod tests {
 
         let merge_block = func.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
         if let Instruction::Phi { incoming, .. } = &merge_block.instructions[0] {
-            assert!(incoming.len() >= 2, "Phi must retain at least 2 incoming edges");
-            let has_const_1 = incoming.iter().any(|(val, _)| {
-                matches!(val, Operand::Const(IrConst::I64(1)))
-            });
-            assert!(has_const_1, "Phi must still have the Const(1) incoming value");
+            assert!(
+                incoming.len() >= 2,
+                "Phi must retain at least 2 incoming edges"
+            );
+            let has_const_1 = incoming
+                .iter()
+                .any(|(val, _)| matches!(val, Operand::Const(IrConst::I64(1))));
+            assert!(
+                has_const_1,
+                "Phi must still have the Const(1) incoming value"
+            );
         } else {
             panic!("Expected Phi instruction in merge block");
         }
@@ -1469,16 +1734,28 @@ mod tests {
 
         // Block 1 should be dead (unreachable).
         let has_block_1 = func.blocks.iter().any(|b| b.label == BlockId(1));
-        assert!(!has_block_1, "Dead block 1 (RHS of &&) should be eliminated");
+        assert!(
+            !has_block_1,
+            "Dead block 1 (RHS of &&) should be eliminated"
+        );
 
         // The phi should have been simplified to a Copy with Const(0).
         // This Copy may be in Block 0 (if Block 2 was merged) or Block 2.
         let has_copy_const_0 = func.blocks.iter().any(|b| {
             b.instructions.iter().any(|inst| {
-                matches!(inst, Instruction::Copy { dest: Value(2), src: Operand::Const(IrConst::I64(0)) })
+                matches!(
+                    inst,
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Const(IrConst::I64(0))
+                    }
+                )
             })
         });
-        assert!(has_copy_const_0, "Should have Copy(Value(2), Const(0)) somewhere");
+        assert!(
+            has_copy_const_0,
+            "Should have Copy(Value(2), Const(0)) somewhere"
+        );
     }
 
     #[test]
@@ -1494,16 +1771,37 @@ mod tests {
                 ty: IrType::I64,
             },
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(100))))));
-        func.blocks.push(make_block(BlockId(2), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(200))))));
-        func.blocks.push(make_block(BlockId(3), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(300))))));
-        func.blocks.push(make_block(BlockId(4), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(-1))))));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(100)))),
+        ));
+        func.blocks.push(make_block(
+            BlockId(2),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(200)))),
+        ));
+        func.blocks.push(make_block(
+            BlockId(3),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(300)))),
+        ));
+        func.blocks.push(make_block(
+            BlockId(4),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(-1)))),
+        ));
 
         let count = simplify_cfg(&mut func);
         assert!(count > 0, "Should have made simplifications");
         // After switch fold -> Branch(4), dead blocks removed, Block 4 merged into Block 0.
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Const(IrConst::I32(-1))))),
-            "Switch on constant 37 should result in Return(-1) after merge");
+        assert!(
+            matches!(
+                func.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(-1))))
+            ),
+            "Switch on constant 37 should result in Return(-1) after merge"
+        );
         assert_eq!(func.blocks.len(), 1);
     }
 
@@ -1520,16 +1818,37 @@ mod tests {
                 ty: IrType::I64,
             },
         ));
-        func.blocks.push(make_block(BlockId(1), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(100))))));
-        func.blocks.push(make_block(BlockId(2), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(200))))));
-        func.blocks.push(make_block(BlockId(3), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(300))))));
-        func.blocks.push(make_block(BlockId(4), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(-1))))));
+        func.blocks.push(make_block(
+            BlockId(1),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(100)))),
+        ));
+        func.blocks.push(make_block(
+            BlockId(2),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(200)))),
+        ));
+        func.blocks.push(make_block(
+            BlockId(3),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(300)))),
+        ));
+        func.blocks.push(make_block(
+            BlockId(4),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(-1)))),
+        ));
 
         let count = simplify_cfg(&mut func);
         assert!(count > 0, "Should have made simplifications");
         // After switch fold -> Branch(2), dead blocks removed, Block 2 merged into Block 0.
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Const(IrConst::I32(200))))),
-            "Switch on constant 20 should result in Return(200) after merge");
+        assert!(
+            matches!(
+                func.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(200))))
+            ),
+            "Switch on constant 20 should result in Return(200) after merge"
+        );
         assert_eq!(func.blocks.len(), 1);
     }
 
@@ -1548,7 +1867,10 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
         func.blocks.push(make_block(
             BlockId(0),
-            vec![Instruction::Copy { dest: Value(1), src: Operand::Const(IrConst::I32(1)) }],
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
             Terminator::CondBranch {
                 cond: Operand::Value(Value(1)),
                 true_label: BlockId(1),
@@ -1565,7 +1887,11 @@ mod tests {
                 ty: IrType::I64,
             },
         ));
-        func.blocks.push(make_block(BlockId(2), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(42))))));
+        func.blocks.push(make_block(
+            BlockId(2),
+            vec![],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(42)))),
+        ));
         func.blocks.push(make_block(
             BlockId(3),
             vec![Instruction::Phi {
@@ -1583,7 +1909,12 @@ mod tests {
         assert!(count > 0, "Should have made simplifications");
 
         // After all folding and merging, Block 0 should end with Return(42).
-        assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Const(IrConst::I32(42))))),
-            "After full simplification, should return 42");
+        assert!(
+            matches!(
+                func.blocks[0].terminator,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(42))))
+            ),
+            "After full simplification, should return 42"
+        );
     }
 }

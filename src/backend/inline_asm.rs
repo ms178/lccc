@@ -10,11 +10,11 @@
 //! classification, loading, and storage. The shared `emit_inline_asm_common`
 //! orchestrates the phases.
 
-use std::borrow::Cow;
-use crate::ir::reexports::{BlockId, Operand, Value};
-use crate::common::types::{AddressSpace, IrType};
-pub use crate::common::asm_constraints::constraint_is_immediate_only;
 use super::state::CodegenState;
+pub use crate::common::asm_constraints::constraint_is_immediate_only;
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{BlockId, Operand, Value};
+use std::borrow::Cow;
 
 /// Operand classification for inline asm. Each backend classifies its constraints
 /// into these categories so the shared framework can orchestrate register
@@ -83,7 +83,19 @@ pub struct AsmOperand {
 
 impl AsmOperand {
     pub fn new(kind: AsmOperandKind, name: Option<String>) -> Self {
-        Self { kind, reg: String::new(), reg_hi: String::new(), name, mem_addr: String::new(), mem_offset: 0, imm_value: None, imm_symbol: None, operand_type: IrType::I64, constraint: String::new(), seg_prefix: String::new() }
+        Self {
+            kind,
+            reg: String::new(),
+            reg_hi: String::new(),
+            name,
+            mem_addr: String::new(),
+            mem_offset: 0,
+            imm_value: None,
+            imm_symbol: None,
+            operand_type: IrType::I64,
+            constraint: String::new(),
+            seg_prefix: String::new(),
+        }
     }
 
     /// Copy register assignment and operand metadata from another operand.
@@ -128,12 +140,25 @@ pub trait InlineAsmEmitter {
     fn preload_readwrite_output(&mut self, op: &AsmOperand, ptr: &Value);
 
     /// Substitute operand references in a single template line and return the result.
-    fn substitute_template_line(&self, line: &str, operands: &[AsmOperand], gcc_to_internal: &[usize], operand_types: &[IrType], goto_labels: &[(String, BlockId)]) -> String;
+    fn substitute_template_line(
+        &self,
+        line: &str,
+        operands: &[AsmOperand],
+        gcc_to_internal: &[usize],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+    ) -> String;
 
     /// Store an output register value back to its stack slot after the asm executes.
     /// `all_output_regs` contains the register names of ALL output operands, used to
     /// avoid clobbering other output registers when picking scratch registers.
-    fn store_output_from_reg(&mut self, op: &AsmOperand, ptr: &Value, constraint: &str, all_output_regs: &[&str]);
+    fn store_output_from_reg(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        constraint: &str,
+        all_output_regs: &[&str],
+    );
 
     /// Comment markers emitted around the substituted inline-asm body
     /// (`Some((open, close))`), or `None` to emit no markers.
@@ -146,12 +171,19 @@ pub trait InlineAsmEmitter {
     /// peephole deleted it and the kernel's .altinstructions entries got
     /// orig_len = 0 ("empty alternative entry", objtool). Markers are comment
     /// lines for the target assembler, so they are semantically invisible.
-    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> { None }
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
 
     /// Resolve memory operand addresses that require indirection (non-alloca pointers).
     /// `excluded` contains registers claimed by specific-register constraints,
     /// used to avoid conflicts when allocating a temp register for the address.
-    fn resolve_memory_operand(&mut self, _op: &mut AsmOperand, _val: &Operand, _excluded: &[String]) -> bool {
+    fn resolve_memory_operand(
+        &mut self,
+        _op: &mut AsmOperand,
+        _val: &Operand,
+        _excluded: &[String],
+    ) -> bool {
         false
     }
 
@@ -169,7 +201,9 @@ pub trait InlineAsmEmitter {
     /// Returns true if the given type requires a register pair for GP register constraints.
     /// On i686, 64-bit types (I64/U64) need two 32-bit registers to represent a single value.
     /// Defaults to false (most architectures have 64-bit GP registers).
-    fn needs_register_pair(&self, _ty: IrType) -> bool { false }
+    fn needs_register_pair(&self, _ty: IrType) -> bool {
+        false
+    }
 
     /// Reset scratch register allocation state (called at start of each inline asm).
     fn reset_scratch_state(&mut self);
@@ -242,7 +276,7 @@ pub fn constant_fits_immediate_constraint(constraint: &str, value: i64) -> bool 
             'L' => value == 0xFF || value == 0xFFFF,
             'O' => (0..=127).contains(&value),
             'G' | 'H' => false, // floating-point immediate constraints, not integer
-            _ => continue, // not an immediate constraint letter
+            _ => continue,      // not an immediate constraint letter
         };
         if fits {
             return true;
@@ -283,19 +317,22 @@ pub fn constraint_is_memory_only(constraint: &str, is_arm: bool) -> bool {
         return false;
     }
     // 'Q' is memory-only ONLY on AArch64; on x86 it's a register constraint.
-    let has_mem = stripped.chars().any(|c| {
-        matches!(c, 'm' | 'o' | 'V' | 'p') || (c == 'Q' && is_arm)
-    });
+    let has_mem = stripped
+        .chars()
+        .any(|c| matches!(c, 'm' | 'o' | 'V' | 'p') || (c == 'Q' && is_arm));
     if !has_mem {
         return false;
     }
     // Check for any register alternative (GP, FP, or specific register)
-    let has_reg = stripped.chars().any(|c| matches!(c,
-        'r' | 'q' | 'R' | 'l' |           // GP register
+    let has_reg = stripped.chars().any(|c| {
+        matches!(
+            c,
+            'r' | 'q' | 'R' | 'l' |           // GP register
         'g' |                              // general (reg + mem + imm)
         'x' | 'v' | 'Y' |                 // FP register
         'a' | 'b' | 'c' | 'd' | 'S' | 'D' // specific register
-    ));
+        )
+    });
     // Also check for tied operand (digits) — those get a register
     let has_tied = stripped.chars().any(|c| c.is_ascii_digit());
     !has_reg && !has_tied
@@ -342,9 +379,15 @@ pub fn constraint_needs_address(constraint: &str, is_riscv: bool, is_arm: bool) 
 pub fn normalize_inline_asm_reg_name(name: &str) -> &str {
     let trimmed = name.trim();
     let no_percent = trimmed.trim_start_matches('%');
-    if let Some(inner) = no_percent.strip_prefix("~{").and_then(|s| s.strip_suffix('}')) {
+    if let Some(inner) = no_percent
+        .strip_prefix("~{")
+        .and_then(|s| s.strip_suffix('}'))
+    {
         inner
-    } else if let Some(inner) = no_percent.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+    } else if let Some(inner) = no_percent
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+    {
         inner
     } else {
         no_percent
@@ -398,7 +441,9 @@ pub fn expand_dialect_alternatives(template: &str) -> Cow<'_, str> {
                     depth += 1;
                 } else if chars[i] == '}' {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 } else if chars[i] == '|' && depth == 1 && pipe_pos.is_none() {
                     pipe_pos = Some(i);
                 }
@@ -442,7 +487,17 @@ pub fn emit_inline_asm_common(
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
 ) {
-    emit_inline_asm_common_impl(emitter, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols, &[]);
+    emit_inline_asm_common_impl(
+        emitter,
+        template,
+        outputs,
+        inputs,
+        clobbers,
+        operand_types,
+        goto_labels,
+        input_symbols,
+        &[],
+    );
 }
 
 pub fn emit_inline_asm_common_impl(
@@ -469,10 +524,22 @@ pub fn emit_inline_asm_common_impl(
     }
     resolve_symbols_and_immediates(&mut operands, outputs, input_symbols);
     let specific_regs = collect_excluded_registers(&operands, clobbers);
-    assign_scratch_registers(emitter, &mut operands, &input_tied_to, &specific_regs, outputs, inputs);
+    assign_scratch_registers(
+        emitter,
+        &mut operands,
+        &input_tied_to,
+        &specific_regs,
+        outputs,
+        inputs,
+    );
     resolve_tied_and_types(&mut operands, &input_tied_to, outputs, operand_types);
     let (_, gcc_to_internal) = finalize_operands_and_build_gcc_map(
-        emitter, &mut operands, outputs, inputs, &specific_regs, seg_overrides,
+        emitter,
+        &mut operands,
+        outputs,
+        inputs,
+        &specific_regs,
+        seg_overrides,
     );
 
     // Phase 2: Load input values into their assigned registers
@@ -494,7 +561,13 @@ pub fn emit_inline_asm_common_impl(
         if line.is_empty() {
             continue;
         }
-        let resolved = emitter.substitute_template_line(line, &operands, &gcc_to_internal, operand_types, goto_labels);
+        let resolved = emitter.substitute_template_line(
+            line,
+            &operands,
+            &gcc_to_internal,
+            operand_types,
+            goto_labels,
+        );
         // Strip GNU-as mnemonic hint prefixes (glibc math uses `%vstmxcsr` /
         // `%vldmxcsr` and `%xbegin`): GCC removes the `%v`/`%x` when emitting
         // the assembly; GAS 2.47 rejects them in the final .s (GAS-oracle:
@@ -502,7 +575,10 @@ pub fn emit_inline_asm_common_impl(
         // (%xmm0..); no register name starts with `%v`.
         let stripped = if resolved.starts_with("%v") {
             resolved.replacen("%v", "", 1)
-        } else if resolved.starts_with("%x") && !resolved.starts_with("%xmm") && !resolved.starts_with("%ymm") {
+        } else if resolved.starts_with("%x")
+            && !resolved.starts_with("%xmm")
+            && !resolved.starts_with("%ymm")
+        {
             resolved.replacen("%x", "", 1)
         } else {
             resolved
@@ -516,7 +592,9 @@ pub fn emit_inline_asm_common_impl(
         } else {
             stripped
         };
-        emitter.asm_state().emit_fmt(format_args!("    {}", final_line));
+        emitter
+            .asm_state()
+            .emit_fmt(format_args!("    {}", final_line));
     }
     if let Some((_, close)) = markers {
         if body_nonempty {
@@ -525,7 +603,9 @@ pub fn emit_inline_asm_common_impl(
     }
 
     // Phase 4: Store output register values back to their stack slots
-    let all_output_regs: Vec<&str> = outputs.iter().enumerate()
+    let all_output_regs: Vec<&str> = outputs
+        .iter()
+        .enumerate()
         .filter(|(_, (c, _, _))| c.contains('=') || c.contains('+'))
         .map(|(i, _)| operands[i].reg.as_str())
         .collect();
@@ -566,10 +646,10 @@ fn classify_all_operands(
     for (constraint, val, name) in inputs {
         // Handle named tied operands: "[name]" resolves to the output with that name
         let kind = if constraint.starts_with('[') && constraint.ends_with(']') {
-            let tied_name = &constraint[1..constraint.len()-1];
-            let tied_idx = outputs.iter().position(|(_, _, oname)| {
-                oname.as_deref() == Some(tied_name)
-            });
+            let tied_name = &constraint[1..constraint.len() - 1];
+            let tied_idx = outputs
+                .iter()
+                .position(|(_, _, oname)| oname.as_deref() == Some(tied_name));
             if let Some(idx) = tied_idx {
                 AsmOperandKind::Tied(idx)
             } else {
@@ -628,11 +708,13 @@ fn classify_all_operands(
         // linked into the final binary. Without this, the backend would load the value
         // into a register and substitute the register name (e.g., "x9") into data
         // directives like .hword, causing linker errors ("undefined reference to x9").
-        if matches!(op.kind, AsmOperandKind::GpReg | AsmOperandKind::QReg) && matches!(val, Operand::Value(_))
-            && constraint_is_immediate_only(constraint) {
-                op.imm_value = Some(0);
-                op.kind = AsmOperandKind::Immediate;
-            }
+        if matches!(op.kind, AsmOperandKind::GpReg | AsmOperandKind::QReg)
+            && matches!(val, Operand::Value(_))
+            && constraint_is_immediate_only(constraint)
+        {
+            op.imm_value = Some(0);
+            op.kind = AsmOperandKind::Immediate;
+        }
 
         operands.push(op);
     }
@@ -655,7 +737,10 @@ fn resolve_symbols_and_immediates(
             if let Some(ref s) = sym {
                 operands[op_idx].imm_symbol = Some(s.clone());
                 // Promote to Immediate so the symbol is emitted directly
-                if matches!(operands[op_idx].kind, AsmOperandKind::GpReg | AsmOperandKind::QReg) {
+                if matches!(
+                    operands[op_idx].kind,
+                    AsmOperandKind::GpReg | AsmOperandKind::QReg
+                ) {
                     operands[op_idx].kind = AsmOperandKind::Immediate;
                 }
             }
@@ -681,7 +766,10 @@ fn resolve_symbols_and_immediates(
     // For Immediate operands that have neither an imm_value nor an imm_symbol,
     // resolve to either a placeholder $0 or fall back to GpReg.
     for op in operands.iter_mut() {
-        if matches!(op.kind, AsmOperandKind::Immediate) && op.imm_value.is_none() && op.imm_symbol.is_none() {
+        if matches!(op.kind, AsmOperandKind::Immediate)
+            && op.imm_value.is_none()
+            && op.imm_symbol.is_none()
+        {
             if constraint_is_immediate_only(&op.constraint) {
                 op.imm_value = Some(0);
             } else {
@@ -693,11 +781,9 @@ fn resolve_symbols_and_immediates(
 
 /// Phase 1c: Collect registers excluded from scratch allocation (specific-register
 /// constraints and clobber registers).
-fn collect_excluded_registers(
-    operands: &[AsmOperand],
-    clobbers: &[String],
-) -> Vec<String> {
-    let mut specific_regs: Vec<String> = operands.iter()
+fn collect_excluded_registers(operands: &[AsmOperand], clobbers: &[String]) -> Vec<String> {
+    let mut specific_regs: Vec<String> = operands
+        .iter()
         .filter(|op| matches!(op.kind, AsmOperandKind::Specific(_)))
         .map(|op| op.reg.clone())
         .collect();
@@ -732,7 +818,8 @@ fn collect_excluded_registers(
         }
         // ARM64: v/d/s/q registers are all views of the same physical FP/SIMD register.
         // Add all aliases so scratch allocation avoids conflicts.
-        let fp_suffix = clobber.strip_prefix('v')
+        let fp_suffix = clobber
+            .strip_prefix('v')
             .or_else(|| clobber.strip_prefix('d'))
             .or_else(|| clobber.strip_prefix('s'))
             .or_else(|| clobber.strip_prefix('q'));
@@ -782,7 +869,16 @@ fn assign_scratch_registers(
     // so the wraparound fallback never reuses an already-assigned register.
     let mut output_excluded: Vec<String> = specific_regs.to_vec();
     for i in 0..outputs.len() {
-        assign_one_scratch(emitter, operands, input_tied_to, &output_excluded, outputs, inputs, i, num_plus);
+        assign_one_scratch(
+            emitter,
+            operands,
+            input_tied_to,
+            &output_excluded,
+            outputs,
+            inputs,
+            i,
+            num_plus,
+        );
         // Track the just-assigned register so it won't be reused by the
         // next output operand when the scratch pool wraps around.
         if !operands[i].reg.is_empty() {
@@ -807,7 +903,8 @@ fn assign_scratch_registers(
     // overwrite the pre-loaded value.
     let mut input_excluded: Vec<String> = specific_regs.to_vec();
     for i in 0..outputs.len() {
-        if (outputs[i].0.contains('&') || outputs[i].0.contains('+')) && !operands[i].reg.is_empty() {
+        if (outputs[i].0.contains('&') || outputs[i].0.contains('+')) && !operands[i].reg.is_empty()
+        {
             let reg = &operands[i].reg;
             // Normalize to 64-bit canonical name for x86 (e.g., "ecx" -> "rcx")
             let canonical = x86_normalize_reg_to_64bit(reg)
@@ -835,7 +932,16 @@ fn assign_scratch_registers(
     // extended exclusion list that includes early-clobber output registers.
     // Also track assigned registers to avoid reuse when the pool wraps around.
     for i in outputs.len()..total_operands {
-        assign_one_scratch(emitter, operands, input_tied_to, &input_excluded, outputs, inputs, i, num_plus);
+        assign_one_scratch(
+            emitter,
+            operands,
+            input_tied_to,
+            &input_excluded,
+            outputs,
+            inputs,
+            i,
+            num_plus,
+        );
         if !operands[i].reg.is_empty() {
             let reg = &operands[i].reg;
             if !input_excluded.contains(reg) {
@@ -866,10 +972,14 @@ fn assign_one_scratch(
         return;
     }
     match &operands[i].kind {
-        AsmOperandKind::Memory | AsmOperandKind::Immediate => {},
-        AsmOperandKind::Tied(_) => {},
-        AsmOperandKind::X87St0 => { operands[i].reg = "st(0)".to_string(); }
-        AsmOperandKind::X87St1 => { operands[i].reg = "st(1)".to_string(); }
+        AsmOperandKind::Memory | AsmOperandKind::Immediate => {}
+        AsmOperandKind::Tied(_) => {}
+        AsmOperandKind::X87St0 => {
+            operands[i].reg = "st(0)".to_string();
+        }
+        AsmOperandKind::X87St1 => {
+            operands[i].reg = "st(1)".to_string();
+        }
         kind => {
             if i >= outputs.len() {
                 let input_idx = i - outputs.len();
@@ -898,7 +1008,9 @@ fn assign_one_scratch(
                 operands[i].reg = reg;
                 // For 64-bit register pairs on 32-bit architectures (i686),
                 // allocate a second GP register for the high 32 bits.
-                if matches!(kind, AsmOperandKind::GpReg) && emitter.needs_register_pair(operands[i].operand_type) {
+                if matches!(kind, AsmOperandKind::GpReg)
+                    && emitter.needs_register_pair(operands[i].operand_type)
+                {
                     let reg_hi = emitter.assign_scratch_reg(kind, excluded);
                     operands[i].reg_hi = reg_hi;
                 }
@@ -965,7 +1077,7 @@ fn finalize_operands_and_build_gcc_map(
     }
 
     // Handle "+" read-write constraints: synthetic inputs share the output's register.
-    let num_plus = outputs.iter().filter(|(c,_,_)| c.contains('+')).count();
+    let num_plus = outputs.iter().filter(|(c, _, _)| c.contains('+')).count();
     let mut plus_idx = 0;
     for (i, (constraint, _, _)) in outputs.iter().enumerate() {
         if constraint.contains('+') {
@@ -991,7 +1103,9 @@ fn finalize_operands_and_build_gcc_map(
 
     // Resolve memory operand addresses for non-synthetic input operands
     for (i, (_, val, _)) in inputs.iter().enumerate() {
-        if i < num_plus { continue; }
+        if i < num_plus {
+            continue;
+        }
         let op_idx = outputs.len() + i;
         if matches!(operands[op_idx].kind, AsmOperandKind::Memory) {
             emitter.resolve_memory_operand(&mut operands[op_idx], val, specific_regs);
@@ -1077,7 +1191,11 @@ fn load_inputs(
 ///
 /// This is called as a post-processing step after regular operand substitution,
 /// to handle any remaining `%l[...]` or `%l<digit>` patterns that weren't consumed.
-pub fn substitute_goto_labels(line: &str, goto_labels: &[(String, BlockId)], num_operands: usize) -> String {
+pub fn substitute_goto_labels(
+    line: &str,
+    goto_labels: &[(String, BlockId)],
+    num_operands: usize,
+) -> String {
     if goto_labels.is_empty() {
         return line.to_string();
     }
@@ -1094,8 +1212,10 @@ pub fn substitute_goto_labels(line: &str, goto_labels: &[(String, BlockId)], num
                     j += 1;
                 }
                 let name: String = chars[i + 3..j].iter().collect();
-                if j < chars.len() { j += 1; } // skip ]
-                // Look up the label name
+                if j < chars.len() {
+                    j += 1;
+                } // skip ]
+                  // Look up the label name
                 if let Some((_, block_id)) = goto_labels.iter().find(|(n, _)| n == &name) {
                     result.push_str(&block_id.to_string());
                     i = j;
@@ -1237,11 +1357,21 @@ fn x86_normalize_reg_to_64bit(name: &str) -> Option<Cow<'static, str>> {
 /// True if the (already-substituted) inline-asm line is a setcc instruction.
 fn is_setcc_line(line: &str) -> bool {
     let t = line.trim_start();
-    t.starts_with("sete ") || t.starts_with("setne ") || t.starts_with("setl ")
-        || t.starts_with("setle ") || t.starts_with("setg ") || t.starts_with("setge ")
-        || t.starts_with("seta ") || t.starts_with("setae ") || t.starts_with("setb ")
-        || t.starts_with("setbe ") || t.starts_with("sets ") || t.starts_with("setns ")
-        || t.starts_with("seto ") || t.starts_with("setno ") || t.starts_with("setp ")
+    t.starts_with("sete ")
+        || t.starts_with("setne ")
+        || t.starts_with("setl ")
+        || t.starts_with("setle ")
+        || t.starts_with("setg ")
+        || t.starts_with("setge ")
+        || t.starts_with("seta ")
+        || t.starts_with("setae ")
+        || t.starts_with("setb ")
+        || t.starts_with("setbe ")
+        || t.starts_with("sets ")
+        || t.starts_with("setns ")
+        || t.starts_with("seto ")
+        || t.starts_with("setno ")
+        || t.starts_with("setp ")
         || t.starts_with("setnp ")
 }
 

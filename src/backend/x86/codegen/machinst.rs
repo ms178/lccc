@@ -28,10 +28,10 @@ pub enum MachReg {
 /// Operand size for instruction encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpSize {
-    S8,   // byte (al, bl, r12b, ...)
-    S16,  // word (ax, bx, r12w, ...)
-    S32,  // dword (eax, ebx, r12d, ...)
-    S64,  // qword (rax, rbx, r12, ...)
+    S8,  // byte (al, bl, r12b, ...)
+    S16, // word (ax, bx, r12w, ...)
+    S32, // dword (eax, ebx, r12d, ...)
+    S64, // qword (rax, rbx, r12, ...)
 }
 
 /// ALU operation (two-address form: dst = dst OP src).
@@ -42,30 +42,30 @@ pub enum AluOp {
     And,
     Or,
     Xor,
-    Imul,  // 2-operand signed multiply (dst *= src)
+    Imul, // 2-operand signed multiply (dst *= src)
 }
 
 /// Shift operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftOp {
     Shl,
-    Shr,   // logical shift right
-    Sar,   // arithmetic shift right
+    Shr, // logical shift right
+    Sar, // arithmetic shift right
 }
 
 /// Condition code for Jcc, SetCC, CMov.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CondCode {
-    E,   // equal (ZF=1)
-    Ne,  // not equal (ZF=0)
-    L,   // less (signed) (SF≠OF)
-    Le,  // less or equal (signed) (ZF=1 or SF≠OF)
-    G,   // greater (signed) (ZF=0 and SF=OF)
-    Ge,  // greater or equal (signed) (SF=OF)
-    B,   // below (unsigned) (CF=1)
-    Be,  // below or equal (unsigned) (CF=1 or ZF=1)
-    A,   // above (unsigned) (CF=0 and ZF=0)
-    Ae,  // above or equal (unsigned) (CF=0)
+    E,  // equal (ZF=1)
+    Ne, // not equal (ZF=0)
+    L,  // less (signed) (SF≠OF)
+    Le, // less or equal (signed) (ZF=1 or SF≠OF)
+    G,  // greater (signed) (ZF=0 and SF=OF)
+    Ge, // greater or equal (signed) (SF=OF)
+    B,  // below (unsigned) (CF=1)
+    Be, // below or equal (unsigned) (CF=1 or ZF=1)
+    A,  // above (unsigned) (CF=0 and ZF=0)
+    Ae, // above or equal (unsigned) (CF=0)
 }
 
 /// An operand in a machine instruction.
@@ -78,7 +78,12 @@ pub enum MachOperand {
     /// Memory: offset(%base). Base is a register.
     Mem { base: MachReg, offset: i64 },
     /// Indexed memory: offset(%base, %index, scale). Scale is 1/2/4/8.
-    MemIndex { base: MachReg, index: MachReg, scale: u8, offset: i64 },
+    MemIndex {
+        base: MachReg,
+        index: MachReg,
+        scale: u8,
+        offset: i64,
+    },
     /// Stack slot (assigned after register allocation for spills).
     /// The i64 is the offset from the frame pointer (%rbp or %rsp-relative).
     StackSlot(i64),
@@ -99,38 +104,80 @@ pub enum MachOperand {
 pub enum MachInst {
     // ── Data movement ────────────────────────────────────────────────
     /// mov src, dst (covers reg-reg, imm-reg, mem-reg, reg-mem, etc.)
-    Mov { src: MachOperand, dst: MachOperand, size: OpSize },
+    Mov {
+        src: MachOperand,
+        dst: MachOperand,
+        size: OpSize,
+    },
 
     /// movzx src, dst (zero-extend: movzbl, movzwl, movzbq, movzwq)
-    Movzx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
+    Movzx {
+        src: MachOperand,
+        dst: MachReg,
+        from_size: OpSize,
+        to_size: OpSize,
+    },
 
     /// movsx src, dst (sign-extend: movsbq, movswq, movslq)
-    Movsx { src: MachOperand, dst: MachReg, from_size: OpSize, to_size: OpSize },
+    Movsx {
+        src: MachOperand,
+        dst: MachReg,
+        from_size: OpSize,
+        to_size: OpSize,
+    },
 
     // ── Arithmetic ───────────────────────────────────────────────────
     /// Two-address ALU: dst = dst OP src.
     /// x86 form: `{add,sub,and,or,xor,imul} src, dst`
-    Alu { op: AluOp, src: MachOperand, dst: MachReg, size: OpSize },
+    Alu {
+        op: AluOp,
+        src: MachOperand,
+        dst: MachReg,
+        size: OpSize,
+    },
 
     /// Three-operand multiply: dst = src * imm.
     /// x86 form: `imul $imm, src, dst`
-    Imul3 { imm: i64, src: MachReg, dst: MachReg, size: OpSize },
+    Imul3 {
+        imm: i64,
+        src: MachReg,
+        dst: MachReg,
+        size: OpSize,
+    },
 
     /// Unary ALU: dst = OP(dst). Covers neg, not.
-    Neg { dst: MachReg, size: OpSize },
-    Not { dst: MachReg, size: OpSize },
+    Neg {
+        dst: MachReg,
+        size: OpSize,
+    },
+    Not {
+        dst: MachReg,
+        size: OpSize,
+    },
 
     /// Shift: dst = dst SHIFT amount.
     /// Amount must be Imm or Reg(Phys(RCX)) — x86 constraint.
-    Shift { op: ShiftOp, amount: MachOperand, dst: MachReg, size: OpSize },
+    Shift {
+        op: ShiftOp,
+        amount: MachOperand,
+        dst: MachReg,
+        size: OpSize,
+    },
 
     /// LEA: dst = base + index*scale + offset (3-address add).
     /// x86 form: `leaq offset(%base, %index, scale), %dst`
-    Lea { base: MachReg, index: Option<(MachReg, u8)>, offset: i64, dst: MachReg },
+    Lea {
+        base: MachReg,
+        index: Option<(MachReg, u8)>,
+        offset: i64,
+        dst: MachReg,
+    },
 
     // ── Division (implicit rax:rdx) ──────────────────────────────────
     /// Sign-extend rax → rdx:rax. x86: `cqto` (64-bit) or `cltd` (32-bit).
-    Cqto { size: OpSize },
+    Cqto {
+        size: OpSize,
+    },
 
     /// Zero rdx for unsigned division. x86: `xorl %edx, %edx`.
     XorRdx,
@@ -138,40 +185,69 @@ pub enum MachInst {
     /// Integer division: rdx:rax / divisor.
     /// Quotient → rax, remainder → rdx.
     /// x86: `idivq divisor` (signed) or `divq divisor` (unsigned).
-    Div { divisor: MachOperand, signed: bool, size: OpSize },
+    Div {
+        divisor: MachOperand,
+        signed: bool,
+        size: OpSize,
+    },
 
     // ── Comparison & flags ───────────────────────────────────────────
     /// Compare: sets flags based on (lhs - rhs).
     /// x86 form: `cmp rhs, lhs` (note: AT&T operand order is reversed).
-    Cmp { lhs: MachOperand, rhs: MachOperand, size: OpSize },
+    Cmp {
+        lhs: MachOperand,
+        rhs: MachOperand,
+        size: OpSize,
+    },
 
     /// Test: sets flags based on (lhs & rhs).
     /// x86 form: `test rhs, lhs`.
-    Test { lhs: MachOperand, rhs: MachOperand, size: OpSize },
+    Test {
+        lhs: MachOperand,
+        rhs: MachOperand,
+        size: OpSize,
+    },
 
     /// Set byte from condition code: `setCC %dst_8bit`.
     /// Always writes to the 8-bit sub-register.
-    SetCC { cc: CondCode, dst: MachReg },
+    SetCC {
+        cc: CondCode,
+        dst: MachReg,
+    },
 
     /// Conditional move: dst = cc ? src : dst.
     /// x86 form: `cmovCC src, dst`.
-    Cmov { cc: CondCode, src: MachOperand, dst: MachReg, size: OpSize },
+    Cmov {
+        cc: CondCode,
+        src: MachOperand,
+        dst: MachReg,
+        size: OpSize,
+    },
 
     // ── Control flow ─────────────────────────────────────────────────
     /// Conditional jump: `jCC target`.
-    Jcc { cc: CondCode, target: String },
+    Jcc {
+        cc: CondCode,
+        target: String,
+    },
 
     /// Unconditional jump: `jmp target`.
-    Jmp { target: String },
+    Jmp {
+        target: String,
+    },
 
     /// Block label (pseudo-instruction).
     Label(String),
 
     /// Direct function call: `call target`. Clobbers caller-saved regs.
-    Call { target: String },
+    Call {
+        target: String,
+    },
 
     /// Indirect function call: `call *%reg`. Clobbers caller-saved regs.
-    CallIndirect { reg: MachReg },
+    CallIndirect {
+        reg: MachReg,
+    },
 
     /// Return: `ret`.
     Ret,
@@ -209,8 +285,8 @@ pub const RBP: PhysReg = PhysReg(6);
 // Caller-saved registers (destroyed by calls, available between calls):
 pub const R11: PhysReg = PhysReg(10);
 pub const R10: PhysReg = PhysReg(11);
-pub const R8:  PhysReg = PhysReg(12);
-pub const R9:  PhysReg = PhysReg(13);
+pub const R8: PhysReg = PhysReg(12);
+pub const R9: PhysReg = PhysReg(13);
 pub const RDI: PhysReg = PhysReg(14);
 pub const RSI: PhysReg = PhysReg(15);
 

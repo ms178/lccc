@@ -9,20 +9,20 @@
 // Encoding helpers for all RISC-V instruction formats; not all formats used yet.
 #![allow(dead_code)]
 
-mod base;
 mod atomics;
-mod system;
+mod base;
+mod compressed;
 mod float;
 mod pseudo;
-mod compressed;
+mod system;
 mod vector;
 
-pub(crate) use base::*;
 pub(crate) use atomics::*;
-pub(crate) use system::*;
+pub(crate) use base::*;
+pub(crate) use compressed::*;
 pub(crate) use float::*;
 pub(crate) use pseudo::*;
-pub(crate) use compressed::*;
+pub(crate) use system::*;
 pub(crate) use vector::*;
 
 use super::parser::Operand;
@@ -37,10 +37,7 @@ pub enum EncodeResult {
     /// Two 4-byte instruction words (e.g., pseudo-instructions like `call`, `li` with large imm)
     Words(Vec<u32>),
     /// Instruction needs a relocation to be applied later
-    WordWithReloc {
-        word: u32,
-        reloc: Relocation,
-    },
+    WordWithReloc { word: u32, reloc: Relocation },
     /// Multiple words with relocations (e.g., `call` = auipc + jalr)
     WordsWithRelocs(Vec<(u32, Option<Relocation>)>),
     /// Skip this instruction (e.g., pseudo handled elsewhere)
@@ -104,30 +101,30 @@ impl RelocType {
     /// Get the ELF relocation type number.
     pub fn elf_type(&self) -> u32 {
         match self {
-            RelocType::Branch => 16,      // R_RISCV_BRANCH
-            RelocType::Jal => 17,         // R_RISCV_JAL
-            RelocType::CallPlt => 19,     // R_RISCV_CALL_PLT
-            RelocType::GotHi20 => 20,     // R_RISCV_GOT_HI20
-            RelocType::TlsGdHi20 => 22,   // R_RISCV_TLS_GD_HI20
-            RelocType::TlsGotHi20 => 21,  // R_RISCV_TLS_GOT_HI20
-            RelocType::PcrelHi20 => 23,   // R_RISCV_PCREL_HI20 = 23
-            RelocType::PcrelLo12I => 24,  // R_RISCV_PCREL_LO12_I = 24
-            RelocType::PcrelLo12S => 25,  // R_RISCV_PCREL_LO12_S = 25
-            RelocType::Hi20 => 26,        // R_RISCV_HI20
-            RelocType::Lo12I => 27,       // R_RISCV_LO12_I
-            RelocType::Lo12S => 28,       // R_RISCV_LO12_S
-            RelocType::TprelHi20 => 29,   // R_RISCV_TPREL_HI20
-            RelocType::TprelLo12I => 30,  // R_RISCV_TPREL_LO12_I
-            RelocType::TprelLo12S => 31,  // R_RISCV_TPREL_LO12_S
-            RelocType::TprelAdd => 32,    // R_RISCV_TPREL_ADD
-            RelocType::Abs32 => 1,        // R_RISCV_32
-            RelocType::Abs64 => 2,        // R_RISCV_64
-            RelocType::Add16 => 34,       // R_RISCV_ADD16
-            RelocType::Sub16 => 38,       // R_RISCV_SUB16
-            RelocType::Add32 => 35,       // R_RISCV_ADD32
-            RelocType::Sub32 => 39,       // R_RISCV_SUB32
-            RelocType::Add64 => 36,       // R_RISCV_ADD64
-            RelocType::Sub64 => 40,       // R_RISCV_SUB64
+            RelocType::Branch => 16,     // R_RISCV_BRANCH
+            RelocType::Jal => 17,        // R_RISCV_JAL
+            RelocType::CallPlt => 19,    // R_RISCV_CALL_PLT
+            RelocType::GotHi20 => 20,    // R_RISCV_GOT_HI20
+            RelocType::TlsGdHi20 => 22,  // R_RISCV_TLS_GD_HI20
+            RelocType::TlsGotHi20 => 21, // R_RISCV_TLS_GOT_HI20
+            RelocType::PcrelHi20 => 23,  // R_RISCV_PCREL_HI20 = 23
+            RelocType::PcrelLo12I => 24, // R_RISCV_PCREL_LO12_I = 24
+            RelocType::PcrelLo12S => 25, // R_RISCV_PCREL_LO12_S = 25
+            RelocType::Hi20 => 26,       // R_RISCV_HI20
+            RelocType::Lo12I => 27,      // R_RISCV_LO12_I
+            RelocType::Lo12S => 28,      // R_RISCV_LO12_S
+            RelocType::TprelHi20 => 29,  // R_RISCV_TPREL_HI20
+            RelocType::TprelLo12I => 30, // R_RISCV_TPREL_LO12_I
+            RelocType::TprelLo12S => 31, // R_RISCV_TPREL_LO12_S
+            RelocType::TprelAdd => 32,   // R_RISCV_TPREL_ADD
+            RelocType::Abs32 => 1,       // R_RISCV_32
+            RelocType::Abs64 => 2,       // R_RISCV_64
+            RelocType::Add16 => 34,      // R_RISCV_ADD16
+            RelocType::Sub16 => 38,      // R_RISCV_SUB16
+            RelocType::Add32 => 35,      // R_RISCV_ADD32
+            RelocType::Sub32 => 39,      // R_RISCV_SUB32
+            RelocType::Add64 => 36,      // R_RISCV_ADD64
+            RelocType::Sub64 => 40,      // R_RISCV_SUB64
         }
     }
 }
@@ -183,7 +180,11 @@ pub fn reg_num(name: &str) -> Option<u32> {
             // x0-x31
             if let Some(rest) = name.strip_prefix('x') {
                 let n: u32 = rest.parse().ok()?;
-                if n <= 31 { Some(n) } else { None }
+                if n <= 31 {
+                    Some(n)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -229,11 +230,17 @@ pub fn freg_num(name: &str) -> Option<u32> {
         "ft11" => Some(31),
         _ => {
             // f0-f31
-            if name.starts_with('f') && !name.starts_with("ft")
-                && !name.starts_with("fs") && !name.starts_with("fa")
+            if name.starts_with('f')
+                && !name.starts_with("ft")
+                && !name.starts_with("fs")
+                && !name.starts_with("fa")
             {
                 let n: u32 = name[1..].parse().ok()?;
-                if n <= 31 { Some(n) } else { None }
+                if n <= 31 {
+                    Some(n)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -248,7 +255,11 @@ pub fn vreg_num(name: &str) -> Option<u32> {
     if let Some(rest) = name.strip_prefix('v') {
         // Avoid matching "vector" etc. - must be just digits after 'v'
         let n: u32 = rest.parse().ok()?;
-        if n <= 31 { Some(n) } else { None }
+        if n <= 31 {
+            Some(n)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -297,8 +308,14 @@ fn encode_b(opcode: u32, funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
     let bit11 = (imm >> 11) & 1;
     let bits10_5 = (imm >> 5) & 0x3F;
     let bits4_1 = (imm >> 1) & 0xF;
-    (bit12 << 31) | (bits10_5 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12)
-        | (bits4_1 << 8) | (bit11 << 7) | opcode
+    (bit12 << 31)
+        | (bits10_5 << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (funct3 << 12)
+        | (bits4_1 << 8)
+        | (bit11 << 7)
+        | opcode
 }
 
 /// U-type: imm[31:12] | rd[11:7] | opcode[6:0]
@@ -339,7 +356,7 @@ const OP_FMADD: u32 = 0b1000011;
 const OP_FMSUB: u32 = 0b1000111;
 const OP_FNMSUB: u32 = 0b1001011;
 const OP_FNMADD: u32 = 0b1001111;
-const OP_V: u32 = 0b1010111;       // Vector arithmetic/config (RVV 1.0)
+const OP_V: u32 = 0b1010111; // Vector arithmetic/config (RVV 1.0)
 const OP_V_CRYPTO: u32 = 0b1110111; // Vector crypto (Zvk*) — uses OP-P encoding space per RVV Crypto spec
 
 // ── Helper functions ──────────────────────────────────────────────────
@@ -351,7 +368,10 @@ fn get_reg(operands: &[Operand], idx: usize) -> Result<u32, String> {
         }
         // GCC sometimes emits bare register numbers (0-31) in inline asm
         Some(Operand::Imm(n)) if *n >= 0 && *n <= 31 => Ok(*n as u32),
-        other => Err(format!("expected register at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected register at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
@@ -360,7 +380,10 @@ fn get_freg(operands: &[Operand], idx: usize) -> Result<u32, String> {
         Some(Operand::Reg(name)) => {
             freg_num(name).ok_or_else(|| format!("invalid float register: {}", name))
         }
-        other => Err(format!("expected float register at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected float register at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
@@ -371,7 +394,10 @@ fn get_any_reg(operands: &[Operand], idx: usize) -> Result<u32, String> {
         }
         // GCC sometimes emits bare register numbers (0-31) in inline asm
         Some(Operand::Imm(n)) if *n >= 0 && *n <= 31 => Ok(*n as u32),
-        other => Err(format!("expected register at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected register at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
@@ -380,14 +406,20 @@ fn get_vreg(operands: &[Operand], idx: usize) -> Result<u32, String> {
         Some(Operand::Reg(name)) => {
             vreg_num(name).ok_or_else(|| format!("invalid vector register: {}", name))
         }
-        other => Err(format!("expected vector register at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected vector register at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
 fn get_imm(operands: &[Operand], idx: usize) -> Result<i64, String> {
     match operands.get(idx) {
         Some(Operand::Imm(v)) => Ok(*v),
-        other => Err(format!("expected immediate at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected immediate at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
@@ -400,18 +432,24 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
         // symbol names (e.g. `call f1` where f1 is a function). When an encoder
         // expects a symbol operand, treat a Reg as a symbol name.
         Some(Operand::Reg(s)) => Ok((s.clone(), 0)),
-        other => Err(format!("expected symbol at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected symbol at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
 fn get_mem(operands: &[Operand], idx: usize) -> Result<(u32, i64), String> {
     match operands.get(idx) {
         Some(Operand::Mem { base, offset }) => {
-            let base_reg = reg_num(base)
-                .ok_or_else(|| format!("invalid base register: {}", base))?;
+            let base_reg =
+                reg_num(base).ok_or_else(|| format!("invalid base register: {}", base))?;
             Ok((base_reg, *offset))
         }
-        other => Err(format!("expected memory operand at operand {}, got {:?}", idx, other)),
+        other => Err(format!(
+            "expected memory operand at operand {}, got {:?}",
+            idx, other
+        )),
     }
 }
 
@@ -419,10 +457,18 @@ fn get_mem(operands: &[Operand], idx: usize) -> Result<(u32, i64), String> {
 fn parse_fence_bits(s: &str) -> u32 {
     let s = s.to_lowercase();
     let mut bits = 0u32;
-    if s.contains('i') { bits |= 8; }
-    if s.contains('o') { bits |= 4; }
-    if s.contains('r') { bits |= 2; }
-    if s.contains('w') { bits |= 1; }
+    if s.contains('i') {
+        bits |= 8;
+    }
+    if s.contains('o') {
+        bits |= 4;
+    }
+    if s.contains('r') {
+        bits |= 2;
+    }
+    if s.contains('w') {
+        bits |= 1;
+    }
     bits
 }
 
@@ -442,7 +488,11 @@ fn parse_rm(s: &str) -> u32 {
 // ── Main encode function ──────────────────────────────────────────────
 
 /// Encode a RISC-V instruction from its mnemonic and parsed operands.
-pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
+pub fn encode_instruction(
+    mnemonic: &str,
+    operands: &[Operand],
+    raw_operands: &str,
+) -> Result<EncodeResult, String> {
     let mn = mnemonic.to_lowercase();
 
     match mn.as_str() {
@@ -494,80 +544,106 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
 
         // Register-register arithmetic (R-type)
         // Auto-convert to immediate variants when 3rd operand is an immediate
-        "add" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm(operands, 0b000) // -> addi
-        } else {
-            encode_alu_reg(operands, 0b000, 0b0000000)
-        },
+        "add" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm(operands, 0b000) // -> addi
+            } else {
+                encode_alu_reg(operands, 0b000, 0b0000000)
+            }
+        }
         "sub" => encode_alu_reg(operands, 0b000, 0b0100000),
-        "sll" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm(operands, 0b001, 0b000000)
-        } else {
-            encode_alu_reg(operands, 0b001, 0b0000000)
-        },
-        "slt" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm(operands, 0b010) // -> slti
-        } else {
-            encode_alu_reg(operands, 0b010, 0b0000000)
-        },
-        "sltu" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm(operands, 0b011) // -> sltiu
-        } else {
-            encode_alu_reg(operands, 0b011, 0b0000000)
-        },
-        "xor" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm(operands, 0b100) // -> xori
-        } else {
-            encode_alu_reg(operands, 0b100, 0b0000000)
-        },
-        "srl" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm(operands, 0b101, 0b000000)
-        } else {
-            encode_alu_reg(operands, 0b101, 0b0000000)
-        },
-        "sra" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm(operands, 0b101, 0b010000)
-        } else {
-            encode_alu_reg(operands, 0b101, 0b0100000)
-        },
-        "or" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm(operands, 0b110) // -> ori
-        } else {
-            encode_alu_reg(operands, 0b110, 0b0000000)
-        },
-        "and" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm(operands, 0b111) // -> andi
-        } else {
-            encode_alu_reg(operands, 0b111, 0b0000000)
-        },
+        "sll" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm(operands, 0b001, 0b000000)
+            } else {
+                encode_alu_reg(operands, 0b001, 0b0000000)
+            }
+        }
+        "slt" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm(operands, 0b010) // -> slti
+            } else {
+                encode_alu_reg(operands, 0b010, 0b0000000)
+            }
+        }
+        "sltu" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm(operands, 0b011) // -> sltiu
+            } else {
+                encode_alu_reg(operands, 0b011, 0b0000000)
+            }
+        }
+        "xor" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm(operands, 0b100) // -> xori
+            } else {
+                encode_alu_reg(operands, 0b100, 0b0000000)
+            }
+        }
+        "srl" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm(operands, 0b101, 0b000000)
+            } else {
+                encode_alu_reg(operands, 0b101, 0b0000000)
+            }
+        }
+        "sra" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm(operands, 0b101, 0b010000)
+            } else {
+                encode_alu_reg(operands, 0b101, 0b0100000)
+            }
+        }
+        "or" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm(operands, 0b110) // -> ori
+            } else {
+                encode_alu_reg(operands, 0b110, 0b0000000)
+            }
+        }
+        "and" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm(operands, 0b111) // -> andi
+            } else {
+                encode_alu_reg(operands, 0b111, 0b0000000)
+            }
+        }
 
         // RV64I word (32-bit) operations
         "addiw" => encode_alu_imm_w(operands, 0b000),
         "slliw" => encode_shift_imm_w(operands, 0b001, 0b0000000),
         "srliw" => encode_shift_imm_w(operands, 0b101, 0b0000000),
         "sraiw" => encode_shift_imm_w(operands, 0b101, 0b0100000),
-        "addw" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_alu_imm_w(operands, 0b000) // -> addiw
-        } else {
-            encode_alu_reg_w(operands, 0b000, 0b0000000)
-        },
+        "addw" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_alu_imm_w(operands, 0b000) // -> addiw
+            } else {
+                encode_alu_reg_w(operands, 0b000, 0b0000000)
+            }
+        }
         "subw" => encode_alu_reg_w(operands, 0b000, 0b0100000),
         // sllw/srlw/sraw: auto-convert to slliw/srliw/sraiw when 3rd operand is immediate
-        "sllw" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm_w(operands, 0b001, 0b0000000)
-        } else {
-            encode_alu_reg_w(operands, 0b001, 0b0000000)
-        },
-        "srlw" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm_w(operands, 0b101, 0b0000000)
-        } else {
-            encode_alu_reg_w(operands, 0b101, 0b0000000)
-        },
-        "sraw" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm_w(operands, 0b101, 0b0100000)
-        } else {
-            encode_alu_reg_w(operands, 0b101, 0b0100000)
-        },
+        "sllw" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm_w(operands, 0b001, 0b0000000)
+            } else {
+                encode_alu_reg_w(operands, 0b001, 0b0000000)
+            }
+        }
+        "srlw" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm_w(operands, 0b101, 0b0000000)
+            } else {
+                encode_alu_reg_w(operands, 0b101, 0b0000000)
+            }
+        }
+        "sraw" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm_w(operands, 0b101, 0b0100000)
+            } else {
+                encode_alu_reg_w(operands, 0b101, 0b0100000)
+            }
+        }
 
         // ── M Extension (multiply/divide) ──
         "mul" => encode_alu_reg(operands, 0b000, 0b0000001),
@@ -586,16 +662,16 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
 
         // ── Zbb Extension (basic bit manipulation) ──
         // Unary operations (encoded as I-type with rs2 field in immediate)
-        "clz" => encode_zbb_unary(operands, 0x600),   // clz rd, rs1
-        "ctz" => encode_zbb_unary(operands, 0x601),   // ctz rd, rs1
-        "cpop" => encode_zbb_unary(operands, 0x602),  // cpop rd, rs1
+        "clz" => encode_zbb_unary(operands, 0x600), // clz rd, rs1
+        "ctz" => encode_zbb_unary(operands, 0x601), // ctz rd, rs1
+        "cpop" => encode_zbb_unary(operands, 0x602), // cpop rd, rs1
         "sext.b" => encode_zbb_unary(operands, 0x604), // sext.b rd, rs1
         "sext.h" => encode_zbb_unary(operands, 0x605), // sext.h rd, rs1
-        "rev8" => encode_zbb_unary_f5(operands, 0x6B8),  // rev8 rd, rs1 (RV64, funct3=101)
+        "rev8" => encode_zbb_unary_f5(operands, 0x6B8), // rev8 rd, rs1 (RV64, funct3=101)
         "orc.b" => encode_zbb_unary_f5(operands, 0x287), // orc.b rd, rs1 (funct3=101)
         // Unary word operations
-        "clzw" => encode_zbb_unary_w(operands, 0x600),  // clzw rd, rs1
-        "ctzw" => encode_zbb_unary_w(operands, 0x601),  // ctzw rd, rs1
+        "clzw" => encode_zbb_unary_w(operands, 0x600), // clzw rd, rs1
+        "ctzw" => encode_zbb_unary_w(operands, 0x601), // ctzw rd, rs1
         "cpopw" => encode_zbb_unary_w(operands, 0x602), // cpopw rd, rs1
         // Register-register operations
         "andn" => encode_alu_reg(operands, 0b111, 0b0100000),
@@ -606,17 +682,21 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "min" => encode_alu_reg(operands, 0b100, 0b0000101),
         "minu" => encode_alu_reg(operands, 0b101, 0b0000101),
         "rol" => encode_alu_reg(operands, 0b001, 0b0110000),
-        "ror" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm(operands, 0b101, 0b011000) // -> rori
-        } else {
-            encode_alu_reg(operands, 0b101, 0b0110000)
-        },
+        "ror" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm(operands, 0b101, 0b011000) // -> rori
+            } else {
+                encode_alu_reg(operands, 0b101, 0b0110000)
+            }
+        }
         "rolw" => encode_alu_reg_w(operands, 0b001, 0b0110000),
-        "rorw" => if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
-            encode_shift_imm_w(operands, 0b101, 0b0110000) // -> roriw
-        } else {
-            encode_alu_reg_w(operands, 0b101, 0b0110000)
-        },
+        "rorw" => {
+            if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
+                encode_shift_imm_w(operands, 0b101, 0b0110000) // -> roriw
+            } else {
+                encode_alu_reg_w(operands, 0b101, 0b0110000)
+            }
+        }
         // Shift-immediate rotate
         "rori" => encode_shift_imm(operands, 0b101, 0b011000),
         "roriw" => encode_shift_imm_w(operands, 0b101, 0b0110000),
@@ -800,50 +880,62 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "frcsr" => {
             let rd = get_reg(operands, 0)?;
             Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b010, 0, 0x003)))
-        },
+        }
         // fscsr rs -> csrrw x0, fcsr, rs   (or fscsr rd, rs -> csrrw rd, fcsr, rs)
         "fscsr" => {
             if operands.len() >= 2 {
                 let rd = get_reg(operands, 0)?;
                 let rs1 = get_reg(operands, 1)?;
-                Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b001, rs1, 0x003)))
+                Ok(EncodeResult::Word(encode_i(
+                    OP_SYSTEM, rd, 0b001, rs1, 0x003,
+                )))
             } else {
                 let rs1 = get_reg(operands, 0)?;
-                Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b001, rs1, 0x003)))
+                Ok(EncodeResult::Word(encode_i(
+                    OP_SYSTEM, 0, 0b001, rs1, 0x003,
+                )))
             }
-        },
+        }
         // frrm rd -> csrrs rd, frm, x0
         "frrm" => {
             let rd = get_reg(operands, 0)?;
             Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b010, 0, 0x002)))
-        },
+        }
         // fsrm rs -> csrrw x0, frm, rs   (or fsrm rd, rs -> csrrw rd, frm, rs)
         "fsrm" => {
             if operands.len() >= 2 {
                 let rd = get_reg(operands, 0)?;
                 let rs1 = get_reg(operands, 1)?;
-                Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b001, rs1, 0x002)))
+                Ok(EncodeResult::Word(encode_i(
+                    OP_SYSTEM, rd, 0b001, rs1, 0x002,
+                )))
             } else {
                 let rs1 = get_reg(operands, 0)?;
-                Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b001, rs1, 0x002)))
+                Ok(EncodeResult::Word(encode_i(
+                    OP_SYSTEM, 0, 0b001, rs1, 0x002,
+                )))
             }
-        },
+        }
         // frflags rd -> csrrs rd, fflags, x0
         "frflags" => {
             let rd = get_reg(operands, 0)?;
             Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b010, 0, 0x001)))
-        },
+        }
         // fsflags rs -> csrrw x0, fflags, rs
         "fsflags" => {
             if operands.len() >= 2 {
                 let rd = get_reg(operands, 0)?;
                 let rs1 = get_reg(operands, 1)?;
-                Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, 0b001, rs1, 0x001)))
+                Ok(EncodeResult::Word(encode_i(
+                    OP_SYSTEM, rd, 0b001, rs1, 0x001,
+                )))
             } else {
                 let rs1 = get_reg(operands, 0)?;
-                Ok(EncodeResult::Word(encode_i(OP_SYSTEM, 0, 0b001, rs1, 0x001)))
+                Ok(EncodeResult::Word(encode_i(
+                    OP_SYSTEM, 0, 0b001, rs1, 0x001,
+                )))
             }
-        },
+        }
 
         // Explicit compressed instructions
         "c.nop" => Ok(EncodeResult::Half(0x0001)),
@@ -867,20 +959,20 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "vsetvl" => encode_vsetvl(operands),
 
         // Vector loads
-        "vle8.v" => encode_vload(operands, 0b000, 0),   // EEW=8
-        "vle16.v" => encode_vload(operands, 0b101, 0),   // EEW=16
-        "vle32.v" => encode_vload(operands, 0b110, 0),   // EEW=32
-        "vle64.v" => encode_vload(operands, 0b111, 0),   // EEW=64
+        "vle8.v" => encode_vload(operands, 0b000, 0), // EEW=8
+        "vle16.v" => encode_vload(operands, 0b101, 0), // EEW=16
+        "vle32.v" => encode_vload(operands, 0b110, 0), // EEW=32
+        "vle64.v" => encode_vload(operands, 0b111, 0), // EEW=64
 
         // Vector stores
-        "vse8.v" => encode_vstore(operands, 0b000, 0),   // EEW=8
-        "vse16.v" => encode_vstore(operands, 0b101, 0),   // EEW=16
-        "vse32.v" => encode_vstore(operands, 0b110, 0),   // EEW=32
-        "vse64.v" => encode_vstore(operands, 0b111, 0),   // EEW=64
+        "vse8.v" => encode_vstore(operands, 0b000, 0), // EEW=8
+        "vse16.v" => encode_vstore(operands, 0b101, 0), // EEW=16
+        "vse32.v" => encode_vstore(operands, 0b110, 0), // EEW=32
+        "vse64.v" => encode_vstore(operands, 0b111, 0), // EEW=64
 
         // Vector load/store mask
-        "vlm.v" => encode_vload(operands, 0b000, 0x0B),   // lumop=0b01011
-        "vsm.v" => encode_vstore(operands, 0b000, 0x0B),  // sumop=0b01011
+        "vlm.v" => encode_vload(operands, 0b000, 0x0B), // lumop=0b01011
+        "vsm.v" => encode_vstore(operands, 0b000, 0x0B), // sumop=0b01011
 
         // Vector integer arithmetic - OPIVV (funct3=000), OPIVX (funct3=100), OPIVI (funct3=011)
         "vadd.vv" => encode_v_arith_vv(operands, 0b000000),
@@ -919,8 +1011,9 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
         "vsm4k.vi" => encode_v_crypto_vi(operands, 0b100001),
         "vsm4r.vs" => encode_v_crypto_vs(operands, 0b101001),
 
-        _ => {
-            Err(format!("unsupported instruction: {} {}", mnemonic, raw_operands))
-        }
+        _ => Err(format!(
+            "unsupported instruction: {} {}",
+            mnemonic, raw_operands
+        )),
     }
 }

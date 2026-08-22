@@ -21,9 +21,11 @@ mod version_tests {
     fn standalone_banner_has_linux_ld_version_shape() {
         let fields: Vec<_> = GNU_LD_VERSION_OUTPUT.split_whitespace().collect();
         assert_eq!(&fields[..2], &["GNU", "ld"]);
-        assert!(fields.last().unwrap().split('.').all(|part| {
-            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-        }));
+        assert!(fields
+            .last()
+            .unwrap()
+            .split('.')
+            .all(|part| { !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) }));
     }
 }
 
@@ -37,9 +39,7 @@ pub fn load_inputs_x86(
 }
 
 /// Load ELF32/i386 objects and archives for a script-driven link.
-pub fn load_inputs_i386_script(
-    inputs: &[(String, bool)],
-) -> Result<Vec<Elf64Object>, String> {
+pub fn load_inputs_i386_script(inputs: &[(String, bool)]) -> Result<Vec<Elf64Object>, String> {
     crate::backend::i686::linker::load_inputs_for_script(inputs)
 }
 
@@ -47,36 +47,54 @@ pub fn load_inputs_i386_script(
 /// section (36 bytes for SHA-1). The script engine places it via the usual
 /// `*(.note.*)` input patterns and patches the digest after layout.
 pub fn append_build_id_object(objects: &mut Vec<Elf64Object>) {
-    use crate::backend::linker_common::{Elf64Section};
+    use crate::backend::linker_common::Elf64Section;
     let sections = vec![
         Elf64Section {
-            name_idx: 0, name: String::new(), sh_type: 0, flags: 0, addr: 0,
-            offset: 0, size: 0, link: 0, info: 0, addralign: 0, entsize: 0,
+            name_idx: 0,
+            name: String::new(),
+            sh_type: 0,
+            flags: 0,
+            addr: 0,
+            offset: 0,
+            size: 0,
+            link: 0,
+            info: 0,
+            addralign: 0,
+            entsize: 0,
         },
         Elf64Section {
-            name_idx: 0, name: ".note.gnu.build-id".into(), sh_type: 7 /* SHT_NOTE */,
-            flags: 0x2 /* SHF_ALLOC */, addr: 0, offset: 0,
+            name_idx: 0,
+            name: ".note.gnu.build-id".into(),
+            sh_type: 7, /* SHT_NOTE */
+            flags: 0x2, /* SHF_ALLOC */
+            addr: 0,
+            offset: 0,
             size: crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE,
-            link: 0, info: 0, addralign: 4, entsize: 0,
+            link: 0,
+            info: 0,
+            addralign: 4,
+            entsize: 0,
         },
     ];
     let section_data = vec![
         crate::backend::linker_common::SectionData::empty(),
-        crate::backend::linker_common::SectionData::owned(
-            vec![0u8; crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE as usize]),
+        crate::backend::linker_common::SectionData::owned(vec![
+            0u8;
+            crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE
+                as usize
+        ]),
     ];
     objects.push(Elf64Object {
-        sections, symbols: Vec::new(), section_data,
+        sections,
+        symbols: Vec::new(),
+        section_data,
         relocations: vec![Vec::new(); 2],
         source_name: "<build-id>".into(),
     });
 }
 
 /// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
-pub fn link_relocatable_x86(
-    objects: &[Elf64Object],
-    output: &str,
-) -> Result<(), String> {
+pub fn link_relocatable_x86(objects: &[Elf64Object], output: &str) -> Result<(), String> {
     crate::backend::x86::linker::emit_rel::link_relocatable(objects, output)
 }
 
@@ -93,8 +111,16 @@ pub fn link_with_script_x86(
     max_page_size: u64,
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script(
-        objects, script_src, output, emit_symtab, is_pie, emit_relocs,
-        soname, bsymbolic, max_page_size)
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        soname,
+        bsymbolic,
+        max_page_size,
+    )
 }
 
 /// Link pre-loaded ELF32/i386 objects with a full GNU linker script.
@@ -110,8 +136,16 @@ pub fn link_with_script_i386(
     max_page_size: u64,
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script_i386(
-        objects, script_src, output, emit_symtab, is_pie, emit_relocs,
-        soname, bsymbolic, max_page_size)
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        soname,
+        bsymbolic,
+        max_page_size,
+    )
 }
 
 /// Standard userspace executable link for the standalone `lccc-ld` driver.
@@ -128,7 +162,9 @@ pub fn link_builtin_x86(
     user_args: &[String],
 ) -> Result<(), String> {
     crate::backend::x86::linker::link_builtin(
-        object_files, output, user_args,
+        object_files,
+        output,
+        user_args,
         &[], // lib paths come from -L in user_args
         &[], // no implicit libs: the caller lists -lc etc. explicitly
         &[], // CRT before: positional

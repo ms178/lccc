@@ -10,17 +10,12 @@
 //! - Pointer field resolution
 //! - Struct layout lookup
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::ir::reexports::{GlobalInit};
-use crate::common::types::{IrType, StructLayout, CType};
-use super::lower::Lowerer;
 use super::global_init_helpers as h;
-use h::{push_zero_bytes, push_bytes_as_elements};
+use super::lower::Lowerer;
+use crate::common::types::{CType, IrType, StructLayout};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
+use crate::ir::reexports::GlobalInit;
+use h::{push_bytes_as_elements, push_zero_bytes};
 
 impl Lowerer {
     /// Emit a field whose initializer has multi-level designators targeting a sub-field
@@ -85,7 +80,13 @@ impl Lowerer {
         };
 
         if !handled {
-            self.emit_compound_field_init(elements, &item.init, &current_ty, sub_size, sub_is_pointer);
+            self.emit_compound_field_init(
+                elements,
+                &item.init,
+                &current_ty,
+                sub_size,
+                sub_is_pointer,
+            );
         }
 
         // Zero-fill the remaining outer field after the sub-field
@@ -163,13 +164,17 @@ impl Lowerer {
 
         for item in items {
             // Find the Index designator (may be after a Field designator)
-            let idx = item.designators.iter().find_map(|d| {
-                if let Designator::Index(ref idx_expr) = d {
-                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                } else {
-                    None
-                }
-            }).unwrap_or(0);
+            let idx = item
+                .designators
+                .iter()
+                .find_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
 
             if idx < arr_size {
                 index_inits[idx] = Some(&item.init);
@@ -208,7 +213,13 @@ impl Lowerer {
                 // Not an array - just use first item
                 if let Some(first) = inits.first() {
                     let field_is_pointer = matches!(field_ty, CType::Pointer(_, _));
-                    self.emit_compound_field_init(elements, &first.init, field_ty, field_size, field_is_pointer);
+                    self.emit_compound_field_init(
+                        elements,
+                        &first.init,
+                        field_ty,
+                        field_size,
+                        field_is_pointer,
+                    );
                 } else {
                     push_zero_bytes(elements, field_size);
                 }
@@ -223,7 +234,8 @@ impl Lowerer {
         let elem_is_struct = matches!(elem_ty, CType::Struct(_) | CType::Union(_));
         if elem_is_struct {
             if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
-                let scalars_per_elem = h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
+                let scalars_per_elem =
+                    h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
                 let mut item_pos = 0usize;
                 let mut ai = 0usize;
                 while ai < arr_size {
@@ -247,12 +259,15 @@ impl Lowerer {
             }
         }
 
-        let elem_is_pointer = h::type_has_pointer_elements(elem_ty, &*self.types.borrow_struct_layouts());
+        let elem_is_pointer =
+            h::type_has_pointer_elements(elem_ty, &*self.types.borrow_struct_layouts());
         let ptr_size = crate::common::types::target_ptr_size();
 
         let mut ai = 0usize;
         for item in inits {
-            if ai >= arr_size { break; }
+            if ai >= arr_size {
+                break;
+            }
 
             if let Initializer::Expr(ref expr) = item.init {
                 if elem_is_pointer {
@@ -286,7 +301,12 @@ impl Lowerer {
         current_field_idx: usize,
     ) -> usize {
         let desig_name = h::first_field_designator(item);
-        layout.resolve_init_field_idx(desig_name, current_field_idx, &*self.types.borrow_struct_layouts())
+        layout
+            .resolve_init_field_idx(
+                desig_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            )
             .unwrap_or(current_field_idx)
     }
 
@@ -413,7 +433,10 @@ impl Lowerer {
     }
 
     /// Get a StructLayout for a CType if it's a struct or union.
-    pub(super) fn get_struct_layout_for_ctype(&self, ty: &CType) -> Option<crate::common::types::RcLayout> {
+    pub(super) fn get_struct_layout_for_ctype(
+        &self,
+        ty: &CType,
+    ) -> Option<crate::common::types::RcLayout> {
         match ty {
             CType::Struct(key) | CType::Union(key) => {
                 self.types.borrow_struct_layouts().get(&**key).cloned()
@@ -421,5 +444,4 @@ impl Lowerer {
             _ => None,
         }
     }
-
 }

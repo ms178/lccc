@@ -7,21 +7,13 @@
 //! - expr_builtins_overflow.rs: overflow-checking arithmetic
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
-use crate::frontend::parser::ast::Expr;
-use crate::frontend::sema::builtins::{self, BuiltinKind, BuiltinIntrinsic};
-use crate::ir::reexports::{
-    CallInfo,
-    Instruction,
-    IntrinsicOp,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrUnaryOp,
-    Operand,
-    Terminator,
-};
-use crate::common::types::{AddressSpace, IrType, CType};
 use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::Expr;
+use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
+use crate::ir::reexports::{
+    CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator,
+};
 
 impl Lowerer {
     /// Determine the return type for creal/crealf/creall/cimag/cimagf/cimagl based on function name.
@@ -73,7 +65,10 @@ impl Lowerer {
         // Without folding, the branch survives into codegen and vmlinux
         // fails to link. Fold only when BOTH arguments are string literals —
         // everything else lowers normally.
-        if matches!(name, "__builtin_strcmp" | "__builtin_strncmp" | "__builtin_memcmp") {
+        if matches!(
+            name,
+            "__builtin_strcmp" | "__builtin_strncmp" | "__builtin_memcmp"
+        ) {
             fn literal_of(e: &Expr) -> Option<&str> {
                 match e {
                     Expr::StringLiteral(s, _) => Some(s.as_str()),
@@ -107,8 +102,12 @@ impl Lowerer {
                                 break;
                             }
                             // For strcmp/strncmp: stop at NUL.
-                            if name != "__builtin_memcmp" && ca == 0 { break; }
-                            if i >= ab.len() && i >= bb.len() { break; }
+                            if name != "__builtin_memcmp" && ca == 0 {
+                                break;
+                            }
+                            if i >= ab.len() && i >= bb.len() {
+                                break;
+                            }
                             i += 1;
                         }
                         return Some(Operand::Const(IrConst::I32(result.signum() as i32)));
@@ -163,7 +162,11 @@ impl Lowerer {
                         16 // default alignment
                     };
                     let dest = self.fresh_value();
-                    self.emit(Instruction::DynAlloca { dest, size: size_operand, align });
+                    self.emit(Instruction::DynAlloca {
+                        dest,
+                        size: size_operand,
+                        align,
+                    });
                     return Some(Operand::Value(dest));
                 }
                 return Some(Operand::Const(IrConst::I64(0)));
@@ -180,7 +183,9 @@ impl Lowerer {
                 if let Some(ap_expr) = args.first() {
                     let ap_ptr_op = self.lower_va_list_pointer(ap_expr);
                     let ap_ptr = self.operand_to_value(ap_ptr_op);
-                    self.emit(Instruction::VaStart { va_list_ptr: ap_ptr });
+                    self.emit(Instruction::VaStart {
+                        va_list_ptr: ap_ptr,
+                    });
                 }
                 return Some(Operand::Const(IrConst::I64(0)));
             }
@@ -188,7 +193,9 @@ impl Lowerer {
                 if let Some(ap_expr) = args.first() {
                     let ap_ptr_op = self.lower_va_list_pointer(ap_expr);
                     let ap_ptr = self.operand_to_value(ap_ptr_op);
-                    self.emit(Instruction::VaEnd { va_list_ptr: ap_ptr });
+                    self.emit(Instruction::VaEnd {
+                        va_list_ptr: ap_ptr,
+                    });
                 }
                 return Some(Operand::Const(IrConst::I64(0)));
             }
@@ -264,8 +271,12 @@ impl Lowerer {
                 let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
                 let variadic = libc_sig.is_some_and(|s| s.is_variadic);
                 let n_fixed = if variadic {
-                    libc_sig.map(|s| s.param_types.len()).unwrap_or(arg_vals.len())
-                } else { arg_vals.len() };
+                    libc_sig
+                        .map(|s| s.param_types.len())
+                        .unwrap_or(arg_vals.len())
+                } else {
+                    arg_vals.len()
+                };
                 let return_type = Self::builtin_return_type(name)
                     .or_else(|| libc_sig.map(|s| s.return_type))
                     .unwrap_or(crate::common::types::target_int_ir_type());
@@ -273,21 +284,29 @@ impl Lowerer {
                 self.emit(Instruction::Call {
                     func: libc_name.clone(),
                     info: CallInfo {
-                        dest: Some(dest), args: arg_vals, arg_types,
-                        return_type, is_variadic: variadic, num_fixed_args: n_fixed,
-                        struct_arg_sizes, struct_arg_aligns: vec![], struct_arg_classes: Vec::new(),
+                        dest: Some(dest),
+                        args: arg_vals,
+                        arg_types,
+                        return_type,
+                        is_variadic: variadic,
+                        num_fixed_args: n_fixed,
+                        struct_arg_sizes,
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
                         struct_arg_is_f128_sse: Vec::new(),
-                        is_sret: false, is_fastcall: false,
+                        is_sret: false,
+                        is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
                     },
                 });
                 Some(Operand::Value(dest))
             }
-            BuiltinKind::Identity => {
-                Some(args.first().map_or(Operand::Const(IrConst::I64(0)), |a| self.lower_expr(a)))
-            }
+            BuiltinKind::Identity => Some(
+                args.first()
+                    .map_or(Operand::Const(IrConst::I64(0)), |a| self.lower_expr(a)),
+            ),
             BuiltinKind::ConstantF128(bytes) => {
                 // _Float128 constant: full 16-byte binary128 payload carried
                 // as an I128 bit pattern (the F128-const materializers in
@@ -317,7 +336,12 @@ impl Lowerer {
     }
 
     /// Lower a builtin intrinsic (the BuiltinKind::Intrinsic arm of try_lower_builtin_call).
-    fn lower_builtin_intrinsic(&mut self, intrinsic: &BuiltinIntrinsic, name: &str, args: &[Expr]) -> Option<Operand> {
+    fn lower_builtin_intrinsic(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
         match intrinsic {
             BuiltinIntrinsic::FpCompare => self.lower_fp_compare(name, args),
             BuiltinIntrinsic::AddOverflow => self.lower_overflow_builtin(name, args, IrBinOp::Add),
@@ -331,7 +355,9 @@ impl Lowerer {
             BuiltinIntrinsic::Ffs => self.lower_ffs_intrinsic(name, args),
             BuiltinIntrinsic::Clrsb => self.lower_clrsb_intrinsic(name, args),
             BuiltinIntrinsic::Bswap => self.lower_bswap_intrinsic(name, args),
-            BuiltinIntrinsic::Popcount => self.lower_unary_intrinsic(name, args, IrUnaryOp::Popcount),
+            BuiltinIntrinsic::Popcount => {
+                self.lower_unary_intrinsic(name, args, IrUnaryOp::Popcount)
+            }
             BuiltinIntrinsic::Parity => self.lower_parity_intrinsic(name, args),
             BuiltinIntrinsic::ComplexReal => self.lower_complex_part(name, args, true),
             BuiltinIntrinsic::ComplexImag => self.lower_complex_part(name, args, false),
@@ -342,9 +368,7 @@ impl Lowerer {
                     Some(Operand::Const(IrConst::F64(0.0)))
                 }
             }
-            BuiltinIntrinsic::Fence => {
-                Some(Operand::Const(IrConst::I64(0)))
-            }
+            BuiltinIntrinsic::Fence => Some(Operand::Const(IrConst::I64(0))),
             BuiltinIntrinsic::FpClassify => self.lower_builtin_fpclassify(args),
             BuiltinIntrinsic::IsNan => self.lower_builtin_isnan(args),
             BuiltinIntrinsic::IsInf => self.lower_builtin_isinf(args),
@@ -393,7 +417,11 @@ impl Lowerer {
                 }
                 // Types 0 and 1: maximum estimate -> -1 (unknown)
                 // Types 2 and 3: minimum estimate -> 0 (unknown)
-                let result = if obj_type == 2 || obj_type == 3 { 0i64 } else { -1i64 };
+                let result = if obj_type == 2 || obj_type == 3 {
+                    0i64
+                } else {
+                    -1i64
+                };
                 Some(Operand::Const(IrConst::I64(result)))
             }
             // __builtin_classify_type(expr) -> GCC type class integer
@@ -426,9 +454,7 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             // __builtin_cpu_init() - no-op on glibc systems (auto-initialized)
-            BuiltinIntrinsic::CpuInit => {
-                Some(Operand::Const(IrConst::I32(0)))
-            }
+            BuiltinIntrinsic::CpuInit => Some(Operand::Const(IrConst::I32(0))),
             // __builtin_cpu_supports("feature") - returns 1 if feature is enabled for target.
             // For Raptor Lake (-march=raptorlake) we enable AES, PCLMUL, AVX, AVX2, etc.
             // This matches GCC's behavior where __builtin_cpu_supports checks runtime CPUID,
@@ -451,13 +477,42 @@ impl Lowerer {
                         // Features present on Raptor Lake (and the x86-64-v3
                         // baseline this project targets).
                         const PRESENT: &[&str] = &[
-                            "cmov", "mmx", "sse", "sse2", "sse3", "ssse3",
-                            "sse4.1", "sse4.2", "popcnt", "avx", "avx2",
-                            "fma", "bmi", "bmi2", "lzcnt", "movbe", "f16c",
-                            "aes", "pclmul", "pclmulqdq", "rdrnd", "rdrand",
-                            "rdseed", "sha", "adx", "fsgsbase", "xsave",
-                            "xsaveopt", "xsavec", "avxvnni", "vaes",
-                            "vpclmulqdq", "gfni", "cx16", "fxsr", "osxsave",
+                            "cmov",
+                            "mmx",
+                            "sse",
+                            "sse2",
+                            "sse3",
+                            "ssse3",
+                            "sse4.1",
+                            "sse4.2",
+                            "popcnt",
+                            "avx",
+                            "avx2",
+                            "fma",
+                            "bmi",
+                            "bmi2",
+                            "lzcnt",
+                            "movbe",
+                            "f16c",
+                            "aes",
+                            "pclmul",
+                            "pclmulqdq",
+                            "rdrnd",
+                            "rdrand",
+                            "rdseed",
+                            "sha",
+                            "adx",
+                            "fsgsbase",
+                            "xsave",
+                            "xsaveopt",
+                            "xsavec",
+                            "avxvnni",
+                            "vaes",
+                            "vpclmulqdq",
+                            "gfni",
+                            "cx16",
+                            "fxsr",
+                            "osxsave",
                         ];
                         if PRESENT.contains(&feat.as_str()) {
                             ret = 1;
@@ -469,163 +524,281 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I32(ret)))
             }
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
-            BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
-            | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause | BuiltinIntrinsic::X86Vzeroupper
-            | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp
+            BuiltinIntrinsic::X86Lfence
+            | BuiltinIntrinsic::X86Mfence
+            | BuiltinIntrinsic::X86Sfence
+            | BuiltinIntrinsic::X86Pause
+            | BuiltinIntrinsic::X86Vzeroupper
+            | BuiltinIntrinsic::X86Rdtsc
+            | BuiltinIntrinsic::X86Rdtscp
             | BuiltinIntrinsic::X86Clflush
-            | BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
-            | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
-            | BuiltinIntrinsic::X86Loaddqu | BuiltinIntrinsic::X86Pcmpeqb128
-            | BuiltinIntrinsic::X86Pcmpeqd128 | BuiltinIntrinsic::X86Psubusb128
+            | BuiltinIntrinsic::X86Movnti
+            | BuiltinIntrinsic::X86Movnti64
+            | BuiltinIntrinsic::X86Movntdq
+            | BuiltinIntrinsic::X86Movntpd
+            | BuiltinIntrinsic::X86Loaddqu
+            | BuiltinIntrinsic::X86Pcmpeqb128
+            | BuiltinIntrinsic::X86Pcmpeqd128
+            | BuiltinIntrinsic::X86Psubusb128
             | BuiltinIntrinsic::X86Psubsb128
-            | BuiltinIntrinsic::X86Por128 | BuiltinIntrinsic::X86Pand128
-            | BuiltinIntrinsic::X86Pxor128 | BuiltinIntrinsic::X86Set1Epi8
-            | BuiltinIntrinsic::X86Set1Epi32 | BuiltinIntrinsic::X86Aesenc128
-            | BuiltinIntrinsic::X86Aesenclast128 | BuiltinIntrinsic::X86Aesdec128
-            | BuiltinIntrinsic::X86Aesdeclast128 | BuiltinIntrinsic::X86Aesimc128
-            | BuiltinIntrinsic::X86Aeskeygenassist128 | BuiltinIntrinsic::X86Pclmulqdq128
-            | BuiltinIntrinsic::X86Pslldqi128 | BuiltinIntrinsic::X86Psrldqi128
-            | BuiltinIntrinsic::X86Psllqi128 | BuiltinIntrinsic::X86Psrlqi128
-            | BuiltinIntrinsic::X86Pshufd128 | BuiltinIntrinsic::X86Loadldi128
-            | BuiltinIntrinsic::X86Paddw128 | BuiltinIntrinsic::X86Psubw128
-            | BuiltinIntrinsic::X86Pmulhw128 | BuiltinIntrinsic::X86Pmaddwd128
-            | BuiltinIntrinsic::X86Pcmpgtw128 | BuiltinIntrinsic::X86Pcmpgtb128
-            | BuiltinIntrinsic::X86Psllwi128 | BuiltinIntrinsic::X86Psrlwi128
-            | BuiltinIntrinsic::X86Psrawi128 | BuiltinIntrinsic::X86Psradi128
-            | BuiltinIntrinsic::X86Pslldi128 | BuiltinIntrinsic::X86Psrldi128
-            | BuiltinIntrinsic::X86Paddd128 | BuiltinIntrinsic::X86Psubd128
-            | BuiltinIntrinsic::X86Packssdw128 | BuiltinIntrinsic::X86Packsswb128 | BuiltinIntrinsic::X86Packuswb128
-            | BuiltinIntrinsic::X86Punpcklbw128 | BuiltinIntrinsic::X86Punpckhbw128
-            | BuiltinIntrinsic::X86Punpcklwd128 | BuiltinIntrinsic::X86Punpckhwd128
-            | BuiltinIntrinsic::X86Set1Epi16 | BuiltinIntrinsic::X86Pinsrw128
-            | BuiltinIntrinsic::X86Cvtsi32Si128 | BuiltinIntrinsic::X86Pshuflw128
+            | BuiltinIntrinsic::X86Por128
+            | BuiltinIntrinsic::X86Pand128
+            | BuiltinIntrinsic::X86Pxor128
+            | BuiltinIntrinsic::X86Set1Epi8
+            | BuiltinIntrinsic::X86Set1Epi32
+            | BuiltinIntrinsic::X86Aesenc128
+            | BuiltinIntrinsic::X86Aesenclast128
+            | BuiltinIntrinsic::X86Aesdec128
+            | BuiltinIntrinsic::X86Aesdeclast128
+            | BuiltinIntrinsic::X86Aesimc128
+            | BuiltinIntrinsic::X86Aeskeygenassist128
+            | BuiltinIntrinsic::X86Pclmulqdq128
+            | BuiltinIntrinsic::X86Pslldqi128
+            | BuiltinIntrinsic::X86Psrldqi128
+            | BuiltinIntrinsic::X86Psllqi128
+            | BuiltinIntrinsic::X86Psrlqi128
+            | BuiltinIntrinsic::X86Pshufd128
+            | BuiltinIntrinsic::X86Loadldi128
+            | BuiltinIntrinsic::X86Paddw128
+            | BuiltinIntrinsic::X86Psubw128
+            | BuiltinIntrinsic::X86Pmulhw128
+            | BuiltinIntrinsic::X86Pmaddwd128
+            | BuiltinIntrinsic::X86Pcmpgtw128
+            | BuiltinIntrinsic::X86Pcmpgtb128
+            | BuiltinIntrinsic::X86Psllwi128
+            | BuiltinIntrinsic::X86Psrlwi128
+            | BuiltinIntrinsic::X86Psrawi128
+            | BuiltinIntrinsic::X86Psradi128
+            | BuiltinIntrinsic::X86Pslldi128
+            | BuiltinIntrinsic::X86Psrldi128
+            | BuiltinIntrinsic::X86Paddd128
+            | BuiltinIntrinsic::X86Psubd128
+            | BuiltinIntrinsic::X86Packssdw128
+            | BuiltinIntrinsic::X86Packsswb128
+            | BuiltinIntrinsic::X86Packuswb128
+            | BuiltinIntrinsic::X86Punpcklbw128
+            | BuiltinIntrinsic::X86Punpckhbw128
+            | BuiltinIntrinsic::X86Punpcklwd128
+            | BuiltinIntrinsic::X86Punpckhwd128
+            | BuiltinIntrinsic::X86Set1Epi16
+            | BuiltinIntrinsic::X86Pinsrw128
+            | BuiltinIntrinsic::X86Cvtsi32Si128
+            | BuiltinIntrinsic::X86Pshuflw128
             | BuiltinIntrinsic::X86Pshufhw128
-            | BuiltinIntrinsic::X86Storedqu | BuiltinIntrinsic::X86Storeldi128
-            | BuiltinIntrinsic::X86Pmovmskb128 | BuiltinIntrinsic::X86Pextrw128
-            | BuiltinIntrinsic::X86Cvtsi128Si32 | BuiltinIntrinsic::X86Cvtsi128Si64
-            | BuiltinIntrinsic::X86Crc32_8 | BuiltinIntrinsic::X86Crc32_16
-            | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
-            | BuiltinIntrinsic::X86Pinsrd128 | BuiltinIntrinsic::X86Pextrd128
-            | BuiltinIntrinsic::X86Pinsrb128 | BuiltinIntrinsic::X86Pextrb128
-            | BuiltinIntrinsic::X86Pinsrq128 | BuiltinIntrinsic::X86Pextrq128
-            | BuiltinIntrinsic::X86Paddb128 | BuiltinIntrinsic::X86Psubb128
-            | BuiltinIntrinsic::X86Psubusw128 | BuiltinIntrinsic::X86Psadbw128
-            | BuiltinIntrinsic::X86Pmullw128 | BuiltinIntrinsic::X86Pmaddubsw128
-            | BuiltinIntrinsic::X86Phaddw128 | BuiltinIntrinsic::X86Phaddd128
-            | BuiltinIntrinsic::X86Pshufb128 | BuiltinIntrinsic::X86Pabsb128
-            | BuiltinIntrinsic::X86Pabsw128 | BuiltinIntrinsic::X86Pabsd128
-            | BuiltinIntrinsic::X86Palignr128 | BuiltinIntrinsic::X86Pmaxub128
-            | BuiltinIntrinsic::X86Pminub128 | BuiltinIntrinsic::X86Pblendvb128
-            | BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128
-            | BuiltinIntrinsic::X86ShufPsValue | BuiltinIntrinsic::X86Vextractf128V
-            | BuiltinIntrinsic::X86MaxPs256V | BuiltinIntrinsic::X86MinPs256V
-            | BuiltinIntrinsic::X86AndPs256V | BuiltinIntrinsic::X86CmpPs256V
+            | BuiltinIntrinsic::X86Storedqu
+            | BuiltinIntrinsic::X86Storeldi128
+            | BuiltinIntrinsic::X86Pmovmskb128
+            | BuiltinIntrinsic::X86Pextrw128
+            | BuiltinIntrinsic::X86Cvtsi128Si32
+            | BuiltinIntrinsic::X86Cvtsi128Si64
+            | BuiltinIntrinsic::X86Crc32_8
+            | BuiltinIntrinsic::X86Crc32_16
+            | BuiltinIntrinsic::X86Crc32_32
+            | BuiltinIntrinsic::X86Crc32_64
+            | BuiltinIntrinsic::X86Pinsrd128
+            | BuiltinIntrinsic::X86Pextrd128
+            | BuiltinIntrinsic::X86Pinsrb128
+            | BuiltinIntrinsic::X86Pextrb128
+            | BuiltinIntrinsic::X86Pinsrq128
+            | BuiltinIntrinsic::X86Pextrq128
+            | BuiltinIntrinsic::X86Paddb128
+            | BuiltinIntrinsic::X86Psubb128
+            | BuiltinIntrinsic::X86Psubusw128
+            | BuiltinIntrinsic::X86Psadbw128
+            | BuiltinIntrinsic::X86Pmullw128
+            | BuiltinIntrinsic::X86Pmaddubsw128
+            | BuiltinIntrinsic::X86Phaddw128
+            | BuiltinIntrinsic::X86Phaddd128
+            | BuiltinIntrinsic::X86Pshufb128
+            | BuiltinIntrinsic::X86Pabsb128
+            | BuiltinIntrinsic::X86Pabsw128
+            | BuiltinIntrinsic::X86Pabsd128
+            | BuiltinIntrinsic::X86Palignr128
+            | BuiltinIntrinsic::X86Pmaxub128
+            | BuiltinIntrinsic::X86Pminub128
+            | BuiltinIntrinsic::X86Pblendvb128
+            | BuiltinIntrinsic::X86MaxPs128
+            | BuiltinIntrinsic::X86MinPs128
+            | BuiltinIntrinsic::X86ShufPsValue
+            | BuiltinIntrinsic::X86Vextractf128V
+            | BuiltinIntrinsic::X86MaxPs256V
+            | BuiltinIntrinsic::X86MinPs256V
+            | BuiltinIntrinsic::X86AndPs256V
+            | BuiltinIntrinsic::X86CmpPs256V
             | BuiltinIntrinsic::X86Pblendw128
-            | BuiltinIntrinsic::X86Pmovzxbw128 | BuiltinIntrinsic::X86Pmovzxwd128
-            | BuiltinIntrinsic::X86Psllw128 | BuiltinIntrinsic::X86Psrlw128
-            | BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Storeu256
-            | BuiltinIntrinsic::X86Load256 | BuiltinIntrinsic::X86Store256
-            | BuiltinIntrinsic::X86Paddb256 | BuiltinIntrinsic::X86Paddw256
-            | BuiltinIntrinsic::X86Paddd256 | BuiltinIntrinsic::X86Psubb256
-            | BuiltinIntrinsic::X86Psubw256 | BuiltinIntrinsic::X86Psubusw256
-            | BuiltinIntrinsic::X86Psadbw256 | BuiltinIntrinsic::X86Pmaddubsw256
-            | BuiltinIntrinsic::X86Pmaddwd256 | BuiltinIntrinsic::X86Pcmpeqb256
-            | BuiltinIntrinsic::X86Pmovmskb256 | BuiltinIntrinsic::X86Pshufb256
-            | BuiltinIntrinsic::X86Pabsb256 | BuiltinIntrinsic::X86Pabsw256
-            | BuiltinIntrinsic::X86Pmaxub256 | BuiltinIntrinsic::X86Pminub256
-            | BuiltinIntrinsic::X86Pxor256 | BuiltinIntrinsic::X86Por256
-            | BuiltinIntrinsic::X86Pand256 | BuiltinIntrinsic::X86Psllidi256
-            | BuiltinIntrinsic::X86Psrlidi256 | BuiltinIntrinsic::X86Psllwi256
-            | BuiltinIntrinsic::X86Psrlwi256 | BuiltinIntrinsic::X86Broadcast128to256
-            | BuiltinIntrinsic::X86Zext128to256 | BuiltinIntrinsic::X86Cast256to128
-            | BuiltinIntrinsic::X86Insert128to256 | BuiltinIntrinsic::X86SetEpi8_256
+            | BuiltinIntrinsic::X86Pmovzxbw128
+            | BuiltinIntrinsic::X86Pmovzxwd128
+            | BuiltinIntrinsic::X86Psllw128
+            | BuiltinIntrinsic::X86Psrlw128
+            | BuiltinIntrinsic::X86Loadu256
+            | BuiltinIntrinsic::X86Storeu256
+            | BuiltinIntrinsic::X86Load256
+            | BuiltinIntrinsic::X86Store256
+            | BuiltinIntrinsic::X86Paddb256
+            | BuiltinIntrinsic::X86Paddw256
+            | BuiltinIntrinsic::X86Paddd256
+            | BuiltinIntrinsic::X86Psubb256
+            | BuiltinIntrinsic::X86Psubw256
+            | BuiltinIntrinsic::X86Psubusw256
+            | BuiltinIntrinsic::X86Psadbw256
+            | BuiltinIntrinsic::X86Pmaddubsw256
+            | BuiltinIntrinsic::X86Pmaddwd256
+            | BuiltinIntrinsic::X86Pcmpeqb256
+            | BuiltinIntrinsic::X86Pmovmskb256
+            | BuiltinIntrinsic::X86Pshufb256
+            | BuiltinIntrinsic::X86Pabsb256
+            | BuiltinIntrinsic::X86Pabsw256
+            | BuiltinIntrinsic::X86Pmaxub256
+            | BuiltinIntrinsic::X86Pminub256
+            | BuiltinIntrinsic::X86Pxor256
+            | BuiltinIntrinsic::X86Por256
+            | BuiltinIntrinsic::X86Pand256
+            | BuiltinIntrinsic::X86Psllidi256
+            | BuiltinIntrinsic::X86Psrlidi256
+            | BuiltinIntrinsic::X86Psllwi256
+            | BuiltinIntrinsic::X86Psrlwi256
+            | BuiltinIntrinsic::X86Broadcast128to256
+            | BuiltinIntrinsic::X86Zext128to256
+            | BuiltinIntrinsic::X86Cast256to128
+            | BuiltinIntrinsic::X86Insert128to256
+            | BuiltinIntrinsic::X86SetEpi8_256
             | BuiltinIntrinsic::X86SetEpi16_256
-            | BuiltinIntrinsic::X86SetEpi32_256 | BuiltinIntrinsic::X86SetEpi64x256
+            | BuiltinIntrinsic::X86SetEpi32_256
+            | BuiltinIntrinsic::X86SetEpi64x256
             | BuiltinIntrinsic::X86Permutevar8x32
-            | BuiltinIntrinsic::X86Dpbusd128 | BuiltinIntrinsic::X86Dpbusds128
-            | BuiltinIntrinsic::X86Dpwusd128 | BuiltinIntrinsic::X86Dpwusds128
-            | BuiltinIntrinsic::X86Dpbusd256 | BuiltinIntrinsic::X86Dpbusds256
-            | BuiltinIntrinsic::X86Dpwusd256 | BuiltinIntrinsic::X86Dpwusds256
-            | BuiltinIntrinsic::X86Dpbssd128 | BuiltinIntrinsic::X86Dpbssds128
-            | BuiltinIntrinsic::X86Dpbsud128 | BuiltinIntrinsic::X86Dpbsuds128
-            | BuiltinIntrinsic::X86Dpbuud128 | BuiltinIntrinsic::X86Dpbuuds128
-            | BuiltinIntrinsic::X86Dpbssd256 | BuiltinIntrinsic::X86Dpbssds256
-            | BuiltinIntrinsic::X86Dpbsud256 | BuiltinIntrinsic::X86Dpbsuds256
-            | BuiltinIntrinsic::X86Dpbuud256 | BuiltinIntrinsic::X86Dpbuuds256
-            | BuiltinIntrinsic::X86Dpwuud128 | BuiltinIntrinsic::X86Dpwuuds128
-            | BuiltinIntrinsic::X86Dpwssd128 | BuiltinIntrinsic::X86Dpwssds128
-            | BuiltinIntrinsic::X86Dpwuud256 | BuiltinIntrinsic::X86Dpwuuds256
-            | BuiltinIntrinsic::X86Dpwssd256 | BuiltinIntrinsic::X86Dpwssds256
-            | BuiltinIntrinsic::X86Gf2p8mulb128 | BuiltinIntrinsic::X86Gf2p8affineqb128
+            | BuiltinIntrinsic::X86Dpbusd128
+            | BuiltinIntrinsic::X86Dpbusds128
+            | BuiltinIntrinsic::X86Dpwusd128
+            | BuiltinIntrinsic::X86Dpwusds128
+            | BuiltinIntrinsic::X86Dpbusd256
+            | BuiltinIntrinsic::X86Dpbusds256
+            | BuiltinIntrinsic::X86Dpwusd256
+            | BuiltinIntrinsic::X86Dpwusds256
+            | BuiltinIntrinsic::X86Dpbssd128
+            | BuiltinIntrinsic::X86Dpbssds128
+            | BuiltinIntrinsic::X86Dpbsud128
+            | BuiltinIntrinsic::X86Dpbsuds128
+            | BuiltinIntrinsic::X86Dpbuud128
+            | BuiltinIntrinsic::X86Dpbuuds128
+            | BuiltinIntrinsic::X86Dpbssd256
+            | BuiltinIntrinsic::X86Dpbssds256
+            | BuiltinIntrinsic::X86Dpbsud256
+            | BuiltinIntrinsic::X86Dpbsuds256
+            | BuiltinIntrinsic::X86Dpbuud256
+            | BuiltinIntrinsic::X86Dpbuuds256
+            | BuiltinIntrinsic::X86Dpwuud128
+            | BuiltinIntrinsic::X86Dpwuuds128
+            | BuiltinIntrinsic::X86Dpwssd128
+            | BuiltinIntrinsic::X86Dpwssds128
+            | BuiltinIntrinsic::X86Dpwuud256
+            | BuiltinIntrinsic::X86Dpwuuds256
+            | BuiltinIntrinsic::X86Dpwssd256
+            | BuiltinIntrinsic::X86Dpwssds256
+            | BuiltinIntrinsic::X86Gf2p8mulb128
+            | BuiltinIntrinsic::X86Gf2p8affineqb128
             | BuiltinIntrinsic::X86Gf2p8affineinvqb128
-            | BuiltinIntrinsic::X86Aesenc256 | BuiltinIntrinsic::X86Aesenclast256
-            | BuiltinIntrinsic::X86Aesdec256 | BuiltinIntrinsic::X86Aesdeclast256
+            | BuiltinIntrinsic::X86Aesenc256
+            | BuiltinIntrinsic::X86Aesenclast256
+            | BuiltinIntrinsic::X86Aesdec256
+            | BuiltinIntrinsic::X86Aesdeclast256
             | BuiltinIntrinsic::X86Vpclmulqdq256
-            | BuiltinIntrinsic::X86Paddusb128 | BuiltinIntrinsic::X86Paddsb128
-            | BuiltinIntrinsic::X86Paddusw128 | BuiltinIntrinsic::X86Paddsw128
-            | BuiltinIntrinsic::X86Psubsw128 | BuiltinIntrinsic::X86Pandn128
-            | BuiltinIntrinsic::X86Pcmpeqw128 | BuiltinIntrinsic::X86Pcmpgtd128
-            | BuiltinIntrinsic::X86Pavgb128 | BuiltinIntrinsic::X86Pavgw128
-            | BuiltinIntrinsic::X86Pminsw128 | BuiltinIntrinsic::X86Pmaxsw128
-            | BuiltinIntrinsic::X86Pmulhuw128 | BuiltinIntrinsic::X86Paddq128
-            | BuiltinIntrinsic::X86Psubq128 | BuiltinIntrinsic::X86Punpckldq128
-            | BuiltinIntrinsic::X86Punpckhdq128 | BuiltinIntrinsic::X86Punpcklqdq128
-            | BuiltinIntrinsic::X86Punpckhqdq128 | BuiltinIntrinsic::X86Setzero128
+            | BuiltinIntrinsic::X86Paddusb128
+            | BuiltinIntrinsic::X86Paddsb128
+            | BuiltinIntrinsic::X86Paddusw128
+            | BuiltinIntrinsic::X86Paddsw128
+            | BuiltinIntrinsic::X86Psubsw128
+            | BuiltinIntrinsic::X86Pandn128
+            | BuiltinIntrinsic::X86Pcmpeqw128
+            | BuiltinIntrinsic::X86Pcmpgtd128
+            | BuiltinIntrinsic::X86Pavgb128
+            | BuiltinIntrinsic::X86Pavgw128
+            | BuiltinIntrinsic::X86Pminsw128
+            | BuiltinIntrinsic::X86Pmaxsw128
+            | BuiltinIntrinsic::X86Pmulhuw128
+            | BuiltinIntrinsic::X86Paddq128
+            | BuiltinIntrinsic::X86Psubq128
+            | BuiltinIntrinsic::X86Punpckldq128
+            | BuiltinIntrinsic::X86Punpckhdq128
+            | BuiltinIntrinsic::X86Punpcklqdq128
+            | BuiltinIntrinsic::X86Punpckhqdq128
+            | BuiltinIntrinsic::X86Setzero128
             | BuiltinIntrinsic::X86Testz128
-            | BuiltinIntrinsic::X86Pmulld256 | BuiltinIntrinsic::X86Psubd256
-            | BuiltinIntrinsic::X86Paddq256 | BuiltinIntrinsic::X86Psubq256
-            | BuiltinIntrinsic::X86Pandn256 | BuiltinIntrinsic::X86Pcmpeqd256
-            | BuiltinIntrinsic::X86Pcmpeqq256 | BuiltinIntrinsic::X86Pcmpgtd256
-            | BuiltinIntrinsic::X86Pcmpgtq256 | BuiltinIntrinsic::X86Extracti128
+            | BuiltinIntrinsic::X86Pmulld256
+            | BuiltinIntrinsic::X86Psubd256
+            | BuiltinIntrinsic::X86Paddq256
+            | BuiltinIntrinsic::X86Psubq256
+            | BuiltinIntrinsic::X86Pandn256
+            | BuiltinIntrinsic::X86Pcmpeqd256
+            | BuiltinIntrinsic::X86Pcmpeqq256
+            | BuiltinIntrinsic::X86Pcmpgtd256
+            | BuiltinIntrinsic::X86Pcmpgtq256
+            | BuiltinIntrinsic::X86Extracti128
             | BuiltinIntrinsic::X86Setzero256
-            | BuiltinIntrinsic::X86AddPs256 | BuiltinIntrinsic::X86SubPs256
-            | BuiltinIntrinsic::X86MulPs256 | BuiltinIntrinsic::X86AddPd256
-            | BuiltinIntrinsic::X86SubPd256 | BuiltinIntrinsic::X86MulPd256
-            | BuiltinIntrinsic::X86LoaduPs256 | BuiltinIntrinsic::X86StoreuPs256
-            | BuiltinIntrinsic::X86LoaduPd256 | BuiltinIntrinsic::X86StoreuPd256
-            | BuiltinIntrinsic::X86Permute2x128 | BuiltinIntrinsic::X86Permute4x64
+            | BuiltinIntrinsic::X86AddPs256
+            | BuiltinIntrinsic::X86SubPs256
+            | BuiltinIntrinsic::X86MulPs256
+            | BuiltinIntrinsic::X86AddPd256
+            | BuiltinIntrinsic::X86SubPd256
+            | BuiltinIntrinsic::X86MulPd256
+            | BuiltinIntrinsic::X86LoaduPs256
+            | BuiltinIntrinsic::X86StoreuPs256
+            | BuiltinIntrinsic::X86LoaduPd256
+            | BuiltinIntrinsic::X86StoreuPd256
+            | BuiltinIntrinsic::X86Permute2x128
+            | BuiltinIntrinsic::X86Permute4x64
             | BuiltinIntrinsic::X86Pshufd256
-            | BuiltinIntrinsic::X86Punpcklbw256 | BuiltinIntrinsic::X86Punpckhbw256
-            | BuiltinIntrinsic::X86Punpcklwd256 | BuiltinIntrinsic::X86Punpckhwd256
-            | BuiltinIntrinsic::X86Punpckldq256 | BuiltinIntrinsic::X86Punpckhdq256
-            | BuiltinIntrinsic::X86Punpcklqdq256 | BuiltinIntrinsic::X86Punpckhqdq256
-            | BuiltinIntrinsic::X86Pslldqi256 | BuiltinIntrinsic::X86Psrldqi256
-            | BuiltinIntrinsic::X86Psllqi256 | BuiltinIntrinsic::X86Psrlqi256
-            | BuiltinIntrinsic::X86Pmullw256 | BuiltinIntrinsic::X86Pmulhw256
-            | BuiltinIntrinsic::X86Pminsd256 | BuiltinIntrinsic::X86Pmaxsd256
-            | BuiltinIntrinsic::X86Pmovzxbw256 | BuiltinIntrinsic::X86Pmovzxbd256
+            | BuiltinIntrinsic::X86Punpcklbw256
+            | BuiltinIntrinsic::X86Punpckhbw256
+            | BuiltinIntrinsic::X86Punpcklwd256
+            | BuiltinIntrinsic::X86Punpckhwd256
+            | BuiltinIntrinsic::X86Punpckldq256
+            | BuiltinIntrinsic::X86Punpckhdq256
+            | BuiltinIntrinsic::X86Punpcklqdq256
+            | BuiltinIntrinsic::X86Punpckhqdq256
+            | BuiltinIntrinsic::X86Pslldqi256
+            | BuiltinIntrinsic::X86Psrldqi256
+            | BuiltinIntrinsic::X86Psllqi256
+            | BuiltinIntrinsic::X86Psrlqi256
+            | BuiltinIntrinsic::X86Pmullw256
+            | BuiltinIntrinsic::X86Pmulhw256
+            | BuiltinIntrinsic::X86Pminsd256
+            | BuiltinIntrinsic::X86Pmaxsd256
+            | BuiltinIntrinsic::X86Pmovzxbw256
+            | BuiltinIntrinsic::X86Pmovzxbd256
             | BuiltinIntrinsic::X86Pmovzxwd256
-            | BuiltinIntrinsic::X86Pmovsxbw256 | BuiltinIntrinsic::X86Pmovsxbd256
+            | BuiltinIntrinsic::X86Pmovsxbw256
+            | BuiltinIntrinsic::X86Pmovsxbd256
             | BuiltinIntrinsic::X86Pmovsxwd256
-            | BuiltinIntrinsic::X86Psrawi256 | BuiltinIntrinsic::X86Psradi256
-            | BuiltinIntrinsic::X86Packssdw256 | BuiltinIntrinsic::X86Packuswb256
-            | BuiltinIntrinsic::X86Phaddw256 | BuiltinIntrinsic::X86Phaddd256
-            | BuiltinIntrinsic::X86Pabsd256 | BuiltinIntrinsic::X86Pmuludq256
-            | BuiltinIntrinsic::X86XorPs | BuiltinIntrinsic::X86AndPs
-            | BuiltinIntrinsic::X86OrPs | BuiltinIntrinsic::X86AddPs
-            | BuiltinIntrinsic::X86SubPs | BuiltinIntrinsic::X86MulPs
-            | BuiltinIntrinsic::X86AddPd | BuiltinIntrinsic::X86SubPd
+            | BuiltinIntrinsic::X86Psrawi256
+            | BuiltinIntrinsic::X86Psradi256
+            | BuiltinIntrinsic::X86Packssdw256
+            | BuiltinIntrinsic::X86Packuswb256
+            | BuiltinIntrinsic::X86Phaddw256
+            | BuiltinIntrinsic::X86Phaddd256
+            | BuiltinIntrinsic::X86Pabsd256
+            | BuiltinIntrinsic::X86Pmuludq256
+            | BuiltinIntrinsic::X86XorPs
+            | BuiltinIntrinsic::X86AndPs
+            | BuiltinIntrinsic::X86OrPs
+            | BuiltinIntrinsic::X86AddPs
+            | BuiltinIntrinsic::X86SubPs
+            | BuiltinIntrinsic::X86MulPs
+            | BuiltinIntrinsic::X86AddPd
+            | BuiltinIntrinsic::X86SubPd
             | BuiltinIntrinsic::X86MulPd
-            | BuiltinIntrinsic::X86MulEpu32 | BuiltinIntrinsic::X86MulEpi32
+            | BuiltinIntrinsic::X86MulEpu32
+            | BuiltinIntrinsic::X86MulEpi32
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
-            | BuiltinIntrinsic::X86CastReinterpret => {
-                self.lower_x86_intrinsic(intrinsic, args)
-            }
+            | BuiltinIntrinsic::X86CastReinterpret => self.lower_x86_intrinsic(intrinsic, args),
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
             // lane gather with constant indices (Clang/GCC generic shuffle).
-            BuiltinIntrinsic::ShuffleVector => {
-                self.lower_shufflevector(args)
-            }
+            BuiltinIntrinsic::ShuffleVector => self.lower_shufflevector(args),
             // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
-            BuiltinIntrinsic::LcccSimd => {
-                self.lower_lccc_simd(name, args)
-            }
+            BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
             // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
-            BuiltinIntrinsic::FortifyChk => {
-                self.lower_fortify_chk(name, args)
-            }
+            BuiltinIntrinsic::FortifyChk => self.lower_fortify_chk(name, args),
             // TODO: __builtin_va_arg_pack / __builtin_va_arg_pack_len are stubbed
             // to return 0. Proper implementation requires forwarding the caller's
             // variadic args during inlining. Since _FORTIFY_SOURCE is disabled,
@@ -658,7 +831,10 @@ impl Lowerer {
                     Operand::Const(IrConst::I64(0))
                 };
                 // Only level 0 is supported; for other levels return NULL
-                let is_level_zero = matches!(&level, Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::I32(0)));
+                let is_level_zero = matches!(
+                    &level,
+                    Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::I32(0))
+                );
                 if is_level_zero {
                     let op = if *intrinsic == BuiltinIntrinsic::FrameAddress {
                         IntrinsicOp::FrameAddress
@@ -720,9 +896,12 @@ impl Lowerer {
         // Only the non-v* printf-family _chk builtins are truly variadic (they take ...).
         // The v* variants (vsprintf_chk, etc.) take a va_list argument instead, which is
         // a regular pointer parameter, not variadic.
-        let is_variadic = matches!(name,
-            "__builtin___sprintf_chk" | "__builtin___snprintf_chk"
-            | "__builtin___printf_chk" | "__builtin___fprintf_chk"
+        let is_variadic = matches!(
+            name,
+            "__builtin___sprintf_chk"
+                | "__builtin___snprintf_chk"
+                | "__builtin___printf_chk"
+                | "__builtin___fprintf_chk"
         );
 
         // Lower all arguments in order
@@ -730,8 +909,8 @@ impl Lowerer {
         let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
 
         let dest = self.fresh_value();
-        let return_type = Self::builtin_return_type(name)
-            .unwrap_or(crate::common::types::target_int_ir_type());
+        let return_type =
+            Self::builtin_return_type(name).unwrap_or(crate::common::types::target_int_ir_type());
         let n_fixed = arg_vals.len(); // All explicitly passed args are "fixed" from our perspective
         let struct_arg_sizes = vec![None; arg_vals.len()];
         self.emit(Instruction::Call {
@@ -791,7 +970,12 @@ impl Lowerer {
         if name == "__builtin_isunordered" {
             let lhs_nan = self.emit_cmp_val(IrCmpOp::Ne, lhs, lhs, cmp_ty);
             let rhs_nan = self.emit_cmp_val(IrCmpOp::Ne, rhs, rhs, cmp_ty);
-            let dest = self.emit_binop_val(IrBinOp::Or, Operand::Value(lhs_nan), Operand::Value(rhs_nan), IrType::I32);
+            let dest = self.emit_binop_val(
+                IrBinOp::Or,
+                Operand::Value(lhs_nan),
+                Operand::Value(rhs_nan),
+                IrType::I32,
+            );
             return Some(Operand::Value(dest));
         }
 
@@ -800,7 +984,12 @@ impl Lowerer {
         if name == "__builtin_islessgreater" {
             let lt = self.emit_cmp_val(IrCmpOp::Slt, lhs, rhs, cmp_ty);
             let gt = self.emit_cmp_val(IrCmpOp::Sgt, lhs, rhs, cmp_ty);
-            let dest = self.emit_binop_val(IrBinOp::Or, Operand::Value(lt), Operand::Value(gt), IrType::I32);
+            let dest = self.emit_binop_val(
+                IrBinOp::Or,
+                Operand::Value(lt),
+                Operand::Value(gt),
+                IrType::I32,
+            );
             return Some(Operand::Value(dest));
         }
 
@@ -895,15 +1084,35 @@ impl Lowerer {
             (IrType::F64, 16usize, 8usize)
         };
         let alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 16, volatile: false, semantic_volatile: false });
-        self.emit(Instruction::Store { volatile: false, val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            ty: IrType::Ptr,
+            size: complex_size,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: real_val,
+            ptr: alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
         let imag_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
-            dest: imag_ptr, base: alloca,
+            dest: imag_ptr,
+            base: alloca,
             offset: Operand::Const(IrConst::I64(comp_size as i64)),
             ty: IrType::I8,
         });
-        self.emit(Instruction::Store { volatile: false, val: imag_val, ptr: imag_ptr, ty: comp_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: imag_val,
+            ptr: imag_ptr,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
         Some(Operand::Value(alloca))
     }
 
@@ -930,9 +1139,22 @@ impl Lowerer {
         }
         // By-value packed I128 (nested raw builtin): spill to a slot.
         let slot = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: slot, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca {
+            dest: slot,
+            ty: IrType::Ptr,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
         let val = self.operand_to_value(op);
-        self.emit(Instruction::Store { volatile: false, val: Operand::Value(val), ptr: slot, ty: IrType::I128, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(val),
+            ptr: slot,
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+        });
         Operand::Value(slot)
     }
 
@@ -941,7 +1163,13 @@ impl Lowerer {
     /// expression uses in lccc.
     fn pack_vec128_from_slot(&mut self, slot: crate::ir::reexports::Value) -> Operand {
         let lo = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false, dest: lo, ptr: slot, ty: IrType::I64, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: lo,
+            ptr: slot,
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+        });
         let hi_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
             dest: hi_ptr,
@@ -950,15 +1178,43 @@ impl Lowerer {
             ty: IrType::I8,
         });
         let hi = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false, dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: hi,
+            ptr: hi_ptr,
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+        });
         let lo128 = self.fresh_value();
-        self.emit(Instruction::Cast { dest: lo128, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
+        self.emit(Instruction::Cast {
+            dest: lo128,
+            src: Operand::Value(lo),
+            from_ty: IrType::U64,
+            to_ty: IrType::I128,
+        });
         let hi128 = self.fresh_value();
-        self.emit(Instruction::Cast { dest: hi128, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
+        self.emit(Instruction::Cast {
+            dest: hi128,
+            src: Operand::Value(hi),
+            from_ty: IrType::U64,
+            to_ty: IrType::I128,
+        });
         let shifted = self.fresh_value();
-        self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi128), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+        self.emit(Instruction::BinOp {
+            dest: shifted,
+            op: IrBinOp::Shl,
+            lhs: Operand::Value(hi128),
+            rhs: Operand::Const(IrConst::I64(64)),
+            ty: IrType::I128,
+        });
         let packed = self.fresh_value();
-        self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo128), ty: IrType::I128 });
+        self.emit(Instruction::BinOp {
+            dest: packed,
+            op: IrBinOp::Or,
+            lhs: Operand::Value(shifted),
+            rhs: Operand::Value(lo128),
+            ty: IrType::I128,
+        });
         Operand::Value(packed)
     }
 
@@ -977,14 +1233,24 @@ impl Lowerer {
         let v1p = self.operand_to_value(v1);
         let v2p = self.operand_to_value(v2);
         let result = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
         for lane in 0..4usize {
             let idx = match self.eval_const_expr(&args[2 + lane]) {
                 Some(IrConst::I64(v)) => v,
                 Some(IrConst::I32(v)) => v as i64,
                 Some(IrConst::I8(v)) => v as i64,
                 Some(IrConst::I16(v)) => v as i64,
-                other => panic!("__builtin_shufflevector: lane index {} is not an integer constant ({:?})", lane, other),
+                other => panic!(
+                    "__builtin_shufflevector: lane index {} is not an integer constant ({:?})",
+                    lane, other
+                ),
             };
             let (src, off) = if idx < 0 {
                 (v1p, 0i64)
@@ -993,15 +1259,40 @@ impl Lowerer {
             } else if idx < 8 {
                 (v2p, (idx - 4) * 4)
             } else {
-                panic!("__builtin_shufflevector: lane index {} out of range for 4-lane vectors", idx);
+                panic!(
+                    "__builtin_shufflevector: lane index {} out of range for 4-lane vectors",
+                    idx
+                );
             };
             let src_ptr = self.fresh_value();
-            self.emit(Instruction::GetElementPtr { dest: src_ptr, base: src, offset: Operand::Const(IrConst::I64(off)), ty: IrType::I8 });
+            self.emit(Instruction::GetElementPtr {
+                dest: src_ptr,
+                base: src,
+                offset: Operand::Const(IrConst::I64(off)),
+                ty: IrType::I8,
+            });
             let lane_val = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: lane_val, ptr: src_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: lane_val,
+                ptr: src_ptr,
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            });
             let dst_ptr = self.fresh_value();
-            self.emit(Instruction::GetElementPtr { dest: dst_ptr, base: result, offset: Operand::Const(IrConst::I64((lane * 4) as i64)), ty: IrType::I8 });
-            self.emit(Instruction::Store { volatile: false, val: Operand::Value(lane_val), ptr: dst_ptr, ty: IrType::I32, seg_override: AddressSpace::Default });
+            self.emit(Instruction::GetElementPtr {
+                dest: dst_ptr,
+                base: result,
+                offset: Operand::Const(IrConst::I64((lane * 4) as i64)),
+                ty: IrType::I8,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(lane_val),
+                ptr: dst_ptr,
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            });
         }
         // Raw builtin: return the vector BY VALUE (packed I128).
         Some(self.pack_vec128_from_slot(result))
@@ -1014,16 +1305,30 @@ impl Lowerer {
     /// - PtrStore: first arg is dest pointer, remaining args are data (movnti, storedqu, etc.)
     /// - Vec128: allocates 16-byte result slot, returns pointer (SSE/AES packed ops)
     /// - Scalar: returns a scalar value in a dest register (pmovmskb, crc32, pextrw, etc.)
-    fn lower_x86_intrinsic(&mut self, intrinsic: &BuiltinIntrinsic, args: &[Expr]) -> Option<Operand> {
+    fn lower_x86_intrinsic(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        args: &[Expr],
+    ) -> Option<Operand> {
         let op = x86_intrinsic_op(intrinsic);
         match x86_intrinsic_kind(intrinsic) {
             X86IntrinsicKind::Fence => {
-                self.emit(Instruction::Intrinsic { dest: None, op, dest_ptr: None, args: vec![] });
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: None,
+                    args: vec![],
+                });
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::VoidArgs => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                self.emit(Instruction::Intrinsic { dest: None, op, dest_ptr: None, args: arg_ops });
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: None,
+                    args: arg_ops,
+                });
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::PtrStore => {
@@ -1046,12 +1351,31 @@ impl Lowerer {
             }
             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let result_size = match x86_intrinsic_kind(intrinsic) { X86IntrinsicKind::Vec128 => 16, X86IntrinsicKind::Vec256 => 32, _ => unreachable!() };
+                let result_size = match x86_intrinsic_kind(intrinsic) {
+                    X86IntrinsicKind::Vec128 => 16,
+                    X86IntrinsicKind::Vec256 => 32,
+                    _ => unreachable!(),
+                };
                 let result_alloca = self.fresh_value();
-                let align = match result_size { 32 => 32usize, _ => 16usize };
-                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: result_size, align, volatile: false, semantic_volatile: false });
+                let align = match result_size {
+                    32 => 32usize,
+                    _ => 16usize,
+                };
+                self.emit(Instruction::Alloca {
+                    dest: result_alloca,
+                    ty: IrType::Ptr,
+                    size: result_size,
+                    align,
+                    volatile: false,
+                    semantic_volatile: false,
+                });
                 let dest_val = self.fresh_value();
-                self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(dest_val),
+                    op,
+                    dest_ptr: Some(result_alloca),
+                    args: arg_ops,
+                });
                 Some(Operand::Value(result_alloca))
             }
             X86IntrinsicKind::Vec128Value => {
@@ -1070,18 +1394,46 @@ impl Lowerer {
                 // already alloca pointers, nested raw-builtin results are
                 // packed I128 values that must be spilled to a slot first.
                 // Integer args (the imm8 of shufps/vextractf128) pass through.
-                let arg_ops: Vec<Operand> = args.iter().map(|a| {
-                    let is_int = self.get_expr_ctype(a).map(|ct| ct.is_integer()).unwrap_or(false);
-                    if is_int { self.lower_expr(a) } else { self.vec128_arg_ptr(a) }
-                }).collect();
+                let arg_ops: Vec<Operand> = args
+                    .iter()
+                    .map(|a| {
+                        let is_int = self
+                            .get_expr_ctype(a)
+                            .map(|ct| ct.is_integer())
+                            .unwrap_or(false);
+                        if is_int {
+                            self.lower_expr(a)
+                        } else {
+                            self.vec128_arg_ptr(a)
+                        }
+                    })
+                    .collect();
 
                 let result_alloca = self.fresh_value();
-                self.emit(Instruction::Alloca { dest: result_alloca, ty: IrType::Ptr, size: 16, align: 16, volatile: false, semantic_volatile: false });
+                self.emit(Instruction::Alloca {
+                    dest: result_alloca,
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                });
                 let dest_val = self.fresh_value();
-                self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result_alloca), args: arg_ops });
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(dest_val),
+                    op,
+                    dest_ptr: Some(result_alloca),
+                    args: arg_ops,
+                });
                 // lo half
                 let lo = self.fresh_value();
-                self.emit(Instruction::Load { volatile: false, dest: lo, ptr: result_alloca, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: lo,
+                    ptr: result_alloca,
+                    ty: IrType::I64,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                });
                 // hi half: result_alloca + 8 (GEP so analyses see a proper derived pointer)
                 let hi_ptr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
@@ -1091,21 +1443,54 @@ impl Lowerer {
                     ty: IrType::I8,
                 });
                 let hi = self.fresh_value();
-                self.emit(Instruction::Load { volatile: false, dest: hi, ptr: hi_ptr, ty: IrType::I64, seg_override: crate::common::types::AddressSpace::Default });
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: hi,
+                    ptr: hi_ptr,
+                    ty: IrType::I64,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                });
                 let lo128 = self.fresh_value();
-                self.emit(Instruction::Cast { dest: lo128, src: Operand::Value(lo), from_ty: IrType::U64, to_ty: IrType::I128 });
+                self.emit(Instruction::Cast {
+                    dest: lo128,
+                    src: Operand::Value(lo),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::I128,
+                });
                 let hi128 = self.fresh_value();
-                self.emit(Instruction::Cast { dest: hi128, src: Operand::Value(hi), from_ty: IrType::U64, to_ty: IrType::I128 });
+                self.emit(Instruction::Cast {
+                    dest: hi128,
+                    src: Operand::Value(hi),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::I128,
+                });
                 let shifted = self.fresh_value();
-                self.emit(Instruction::BinOp { dest: shifted, op: IrBinOp::Shl, lhs: Operand::Value(hi128), rhs: Operand::Const(IrConst::I64(64)), ty: IrType::I128 });
+                self.emit(Instruction::BinOp {
+                    dest: shifted,
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(hi128),
+                    rhs: Operand::Const(IrConst::I64(64)),
+                    ty: IrType::I128,
+                });
                 let packed = self.fresh_value();
-                self.emit(Instruction::BinOp { dest: packed, op: IrBinOp::Or, lhs: Operand::Value(shifted), rhs: Operand::Value(lo128), ty: IrType::I128 });
+                self.emit(Instruction::BinOp {
+                    dest: packed,
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(shifted),
+                    rhs: Operand::Value(lo128),
+                    ty: IrType::I128,
+                });
                 Some(Operand::Value(packed))
             }
             X86IntrinsicKind::Scalar => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest_val = self.fresh_value();
-                self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: None, args: arg_ops });
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(dest_val),
+                    op,
+                    dest_ptr: None,
+                    args: arg_ops,
+                });
                 Some(Operand::Value(dest_val))
             }
             X86IntrinsicKind::CastReinterpret => {
@@ -1145,76 +1530,149 @@ enum X86IntrinsicKind {
 /// Map a BuiltinIntrinsic to its emission pattern.
 fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     match intrinsic {
-        BuiltinIntrinsic::X86Lfence | BuiltinIntrinsic::X86Mfence
-        | BuiltinIntrinsic::X86Sfence | BuiltinIntrinsic::X86Pause | BuiltinIntrinsic::X86Vzeroupper => X86IntrinsicKind::Fence,
+        BuiltinIntrinsic::X86Lfence
+        | BuiltinIntrinsic::X86Mfence
+        | BuiltinIntrinsic::X86Sfence
+        | BuiltinIntrinsic::X86Pause
+        | BuiltinIntrinsic::X86Vzeroupper => X86IntrinsicKind::Fence,
 
         BuiltinIntrinsic::X86Clflush => X86IntrinsicKind::VoidArgs,
 
-        BuiltinIntrinsic::X86Movnti | BuiltinIntrinsic::X86Movnti64
-        | BuiltinIntrinsic::X86Movntdq | BuiltinIntrinsic::X86Movntpd
-        | BuiltinIntrinsic::X86Storedqu | BuiltinIntrinsic::X86Storeldi128
-        | BuiltinIntrinsic::X86Storeu256 | BuiltinIntrinsic::X86Store256
-        | BuiltinIntrinsic::X86StoreuPs256 | BuiltinIntrinsic::X86StoreuPd256 => X86IntrinsicKind::PtrStore,
+        BuiltinIntrinsic::X86Movnti
+        | BuiltinIntrinsic::X86Movnti64
+        | BuiltinIntrinsic::X86Movntdq
+        | BuiltinIntrinsic::X86Movntpd
+        | BuiltinIntrinsic::X86Storedqu
+        | BuiltinIntrinsic::X86Storeldi128
+        | BuiltinIntrinsic::X86Storeu256
+        | BuiltinIntrinsic::X86Store256
+        | BuiltinIntrinsic::X86StoreuPs256
+        | BuiltinIntrinsic::X86StoreuPd256 => X86IntrinsicKind::PtrStore,
 
-        BuiltinIntrinsic::X86Pmovmskb128 | BuiltinIntrinsic::X86Pextrw128
-        | BuiltinIntrinsic::X86Cvtsi128Si32 | BuiltinIntrinsic::X86Cvtsi128Si64
-        | BuiltinIntrinsic::X86Crc32_8 | BuiltinIntrinsic::X86Crc32_16
-        | BuiltinIntrinsic::X86Crc32_32 | BuiltinIntrinsic::X86Crc32_64
-        | BuiltinIntrinsic::X86Pextrd128 | BuiltinIntrinsic::X86Pextrb128
-        | BuiltinIntrinsic::X86Pextrq128 | BuiltinIntrinsic::X86Pmovmskb256
-        | BuiltinIntrinsic::X86Rdtsc | BuiltinIntrinsic::X86Rdtscp
+        BuiltinIntrinsic::X86Pmovmskb128
+        | BuiltinIntrinsic::X86Pextrw128
+        | BuiltinIntrinsic::X86Cvtsi128Si32
+        | BuiltinIntrinsic::X86Cvtsi128Si64
+        | BuiltinIntrinsic::X86Crc32_8
+        | BuiltinIntrinsic::X86Crc32_16
+        | BuiltinIntrinsic::X86Crc32_32
+        | BuiltinIntrinsic::X86Crc32_64
+        | BuiltinIntrinsic::X86Pextrd128
+        | BuiltinIntrinsic::X86Pextrb128
+        | BuiltinIntrinsic::X86Pextrq128
+        | BuiltinIntrinsic::X86Pmovmskb256
+        | BuiltinIntrinsic::X86Rdtsc
+        | BuiltinIntrinsic::X86Rdtscp
         | BuiltinIntrinsic::X86Testz128 => X86IntrinsicKind::Scalar,
 
-        BuiltinIntrinsic::X86Loadu256 | BuiltinIntrinsic::X86Load256
-        | BuiltinIntrinsic::X86Paddb256 | BuiltinIntrinsic::X86Paddw256 | BuiltinIntrinsic::X86Paddd256
-        | BuiltinIntrinsic::X86Psubb256 | BuiltinIntrinsic::X86Psubw256 | BuiltinIntrinsic::X86Psubusw256
-        | BuiltinIntrinsic::X86Psadbw256 | BuiltinIntrinsic::X86Pmaddubsw256 | BuiltinIntrinsic::X86Pmaddwd256
-        | BuiltinIntrinsic::X86Pcmpeqb256 | BuiltinIntrinsic::X86Pcmpgtb256
-        | BuiltinIntrinsic::X86Pshufb256 | BuiltinIntrinsic::X86Pabsb256
-        | BuiltinIntrinsic::X86Pabsw256 | BuiltinIntrinsic::X86Pmaxub256 | BuiltinIntrinsic::X86Pminub256
-        | BuiltinIntrinsic::X86Pxor256 | BuiltinIntrinsic::X86Por256 | BuiltinIntrinsic::X86Pand256
-        | BuiltinIntrinsic::X86Psllidi256 | BuiltinIntrinsic::X86Psrlidi256 | BuiltinIntrinsic::X86Psllwi256
-        | BuiltinIntrinsic::X86Psrlwi256 | BuiltinIntrinsic::X86Broadcast128to256 | BuiltinIntrinsic::X86Zext128to256
-        | BuiltinIntrinsic::X86Insert128to256 | BuiltinIntrinsic::X86SetEpi8_256
-        | BuiltinIntrinsic::X86SetEpi16_256 | BuiltinIntrinsic::X86SetEpi32_256
-        | BuiltinIntrinsic::X86SetEpi64x256 | BuiltinIntrinsic::X86Permutevar8x32
-        | BuiltinIntrinsic::X86Dpbusd256 | BuiltinIntrinsic::X86Dpbusds256
-        | BuiltinIntrinsic::X86Dpwusd256 | BuiltinIntrinsic::X86Dpwusds256 | BuiltinIntrinsic::X86Dpbssd256
-        | BuiltinIntrinsic::X86Dpbssds256 | BuiltinIntrinsic::X86Dpbsud256 | BuiltinIntrinsic::X86Dpbsuds256
-        | BuiltinIntrinsic::X86Dpbuud256 | BuiltinIntrinsic::X86Dpbuuds256 | BuiltinIntrinsic::X86Dpwuud256
-        | BuiltinIntrinsic::X86Dpwuuds256 | BuiltinIntrinsic::X86Dpwssd256 | BuiltinIntrinsic::X86Dpwssds256
-        | BuiltinIntrinsic::X86Aesenc256 | BuiltinIntrinsic::X86Aesenclast256 | BuiltinIntrinsic::X86Aesdec256
-        | BuiltinIntrinsic::X86Aesdeclast256 | BuiltinIntrinsic::X86Vpclmulqdq256
-        | BuiltinIntrinsic::X86Pmulld256 | BuiltinIntrinsic::X86Psubd256
-        | BuiltinIntrinsic::X86Paddq256 | BuiltinIntrinsic::X86Psubq256
-        | BuiltinIntrinsic::X86Pandn256 | BuiltinIntrinsic::X86Pcmpeqd256
-        | BuiltinIntrinsic::X86Pcmpeqq256 | BuiltinIntrinsic::X86Pcmpgtd256
-        | BuiltinIntrinsic::X86Pcmpgtq256 | BuiltinIntrinsic::X86Setzero256
-        | BuiltinIntrinsic::X86AddPs256 | BuiltinIntrinsic::X86SubPs256
-        | BuiltinIntrinsic::X86MulPs256 | BuiltinIntrinsic::X86AddPd256
-        | BuiltinIntrinsic::X86SubPd256 | BuiltinIntrinsic::X86MulPd256
-        | BuiltinIntrinsic::X86LoaduPs256 | BuiltinIntrinsic::X86LoaduPd256
-        | BuiltinIntrinsic::X86Permute2x128 | BuiltinIntrinsic::X86Permute4x64
+        BuiltinIntrinsic::X86Loadu256
+        | BuiltinIntrinsic::X86Load256
+        | BuiltinIntrinsic::X86Paddb256
+        | BuiltinIntrinsic::X86Paddw256
+        | BuiltinIntrinsic::X86Paddd256
+        | BuiltinIntrinsic::X86Psubb256
+        | BuiltinIntrinsic::X86Psubw256
+        | BuiltinIntrinsic::X86Psubusw256
+        | BuiltinIntrinsic::X86Psadbw256
+        | BuiltinIntrinsic::X86Pmaddubsw256
+        | BuiltinIntrinsic::X86Pmaddwd256
+        | BuiltinIntrinsic::X86Pcmpeqb256
+        | BuiltinIntrinsic::X86Pcmpgtb256
+        | BuiltinIntrinsic::X86Pshufb256
+        | BuiltinIntrinsic::X86Pabsb256
+        | BuiltinIntrinsic::X86Pabsw256
+        | BuiltinIntrinsic::X86Pmaxub256
+        | BuiltinIntrinsic::X86Pminub256
+        | BuiltinIntrinsic::X86Pxor256
+        | BuiltinIntrinsic::X86Por256
+        | BuiltinIntrinsic::X86Pand256
+        | BuiltinIntrinsic::X86Psllidi256
+        | BuiltinIntrinsic::X86Psrlidi256
+        | BuiltinIntrinsic::X86Psllwi256
+        | BuiltinIntrinsic::X86Psrlwi256
+        | BuiltinIntrinsic::X86Broadcast128to256
+        | BuiltinIntrinsic::X86Zext128to256
+        | BuiltinIntrinsic::X86Insert128to256
+        | BuiltinIntrinsic::X86SetEpi8_256
+        | BuiltinIntrinsic::X86SetEpi16_256
+        | BuiltinIntrinsic::X86SetEpi32_256
+        | BuiltinIntrinsic::X86SetEpi64x256
+        | BuiltinIntrinsic::X86Permutevar8x32
+        | BuiltinIntrinsic::X86Dpbusd256
+        | BuiltinIntrinsic::X86Dpbusds256
+        | BuiltinIntrinsic::X86Dpwusd256
+        | BuiltinIntrinsic::X86Dpwusds256
+        | BuiltinIntrinsic::X86Dpbssd256
+        | BuiltinIntrinsic::X86Dpbssds256
+        | BuiltinIntrinsic::X86Dpbsud256
+        | BuiltinIntrinsic::X86Dpbsuds256
+        | BuiltinIntrinsic::X86Dpbuud256
+        | BuiltinIntrinsic::X86Dpbuuds256
+        | BuiltinIntrinsic::X86Dpwuud256
+        | BuiltinIntrinsic::X86Dpwuuds256
+        | BuiltinIntrinsic::X86Dpwssd256
+        | BuiltinIntrinsic::X86Dpwssds256
+        | BuiltinIntrinsic::X86Aesenc256
+        | BuiltinIntrinsic::X86Aesenclast256
+        | BuiltinIntrinsic::X86Aesdec256
+        | BuiltinIntrinsic::X86Aesdeclast256
+        | BuiltinIntrinsic::X86Vpclmulqdq256
+        | BuiltinIntrinsic::X86Pmulld256
+        | BuiltinIntrinsic::X86Psubd256
+        | BuiltinIntrinsic::X86Paddq256
+        | BuiltinIntrinsic::X86Psubq256
+        | BuiltinIntrinsic::X86Pandn256
+        | BuiltinIntrinsic::X86Pcmpeqd256
+        | BuiltinIntrinsic::X86Pcmpeqq256
+        | BuiltinIntrinsic::X86Pcmpgtd256
+        | BuiltinIntrinsic::X86Pcmpgtq256
+        | BuiltinIntrinsic::X86Setzero256
+        | BuiltinIntrinsic::X86AddPs256
+        | BuiltinIntrinsic::X86SubPs256
+        | BuiltinIntrinsic::X86MulPs256
+        | BuiltinIntrinsic::X86AddPd256
+        | BuiltinIntrinsic::X86SubPd256
+        | BuiltinIntrinsic::X86MulPd256
+        | BuiltinIntrinsic::X86LoaduPs256
+        | BuiltinIntrinsic::X86LoaduPd256
+        | BuiltinIntrinsic::X86Permute2x128
+        | BuiltinIntrinsic::X86Permute4x64
         | BuiltinIntrinsic::X86Pshufd256
-        | BuiltinIntrinsic::X86Punpcklbw256 | BuiltinIntrinsic::X86Punpckhbw256
-        | BuiltinIntrinsic::X86Punpcklwd256 | BuiltinIntrinsic::X86Punpckhwd256
-        | BuiltinIntrinsic::X86Punpckldq256 | BuiltinIntrinsic::X86Punpckhdq256
-        | BuiltinIntrinsic::X86Punpcklqdq256 | BuiltinIntrinsic::X86Punpckhqdq256
-        | BuiltinIntrinsic::X86Pslldqi256 | BuiltinIntrinsic::X86Psrldqi256
-        | BuiltinIntrinsic::X86Psllqi256 | BuiltinIntrinsic::X86Psrlqi256
-        | BuiltinIntrinsic::X86Pmullw256 | BuiltinIntrinsic::X86Pmulhw256
-        | BuiltinIntrinsic::X86Pminsd256 | BuiltinIntrinsic::X86Pmaxsd256
-        | BuiltinIntrinsic::X86Pmovzxbw256 | BuiltinIntrinsic::X86Pmovzxbd256
+        | BuiltinIntrinsic::X86Punpcklbw256
+        | BuiltinIntrinsic::X86Punpckhbw256
+        | BuiltinIntrinsic::X86Punpcklwd256
+        | BuiltinIntrinsic::X86Punpckhwd256
+        | BuiltinIntrinsic::X86Punpckldq256
+        | BuiltinIntrinsic::X86Punpckhdq256
+        | BuiltinIntrinsic::X86Punpcklqdq256
+        | BuiltinIntrinsic::X86Punpckhqdq256
+        | BuiltinIntrinsic::X86Pslldqi256
+        | BuiltinIntrinsic::X86Psrldqi256
+        | BuiltinIntrinsic::X86Psllqi256
+        | BuiltinIntrinsic::X86Psrlqi256
+        | BuiltinIntrinsic::X86Pmullw256
+        | BuiltinIntrinsic::X86Pmulhw256
+        | BuiltinIntrinsic::X86Pminsd256
+        | BuiltinIntrinsic::X86Pmaxsd256
+        | BuiltinIntrinsic::X86Pmovzxbw256
+        | BuiltinIntrinsic::X86Pmovzxbd256
         | BuiltinIntrinsic::X86Pmovzxwd256
-        | BuiltinIntrinsic::X86Pmovsxbw256 | BuiltinIntrinsic::X86Pmovsxbd256
+        | BuiltinIntrinsic::X86Pmovsxbw256
+        | BuiltinIntrinsic::X86Pmovsxbd256
         | BuiltinIntrinsic::X86Pmovsxwd256
-        | BuiltinIntrinsic::X86Psrawi256 | BuiltinIntrinsic::X86Psradi256
-        | BuiltinIntrinsic::X86Packssdw256 | BuiltinIntrinsic::X86Packuswb256
-        | BuiltinIntrinsic::X86Phaddw256 | BuiltinIntrinsic::X86Phaddd256
-        | BuiltinIntrinsic::X86Pabsd256 | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
+        | BuiltinIntrinsic::X86Psrawi256
+        | BuiltinIntrinsic::X86Psradi256
+        | BuiltinIntrinsic::X86Packssdw256
+        | BuiltinIntrinsic::X86Packuswb256
+        | BuiltinIntrinsic::X86Phaddw256
+        | BuiltinIntrinsic::X86Phaddd256
+        | BuiltinIntrinsic::X86Pabsd256
+        | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
         // Raw GCC vector builtins (no _mm_ wrapper): value semantics.
-        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128Value,
+        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => {
+            X86IntrinsicKind::Vec128Value
+        }
         // __builtin_ia32_shufps returns BY VALUE (raw GCC builtin, no wrapper
         // deref); the imm8 rides as the last argument, which is exactly the
         // (a, b, imm) shape the ShufPs128 backend op consumes.
@@ -1223,8 +1681,10 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128Value,
         // 256-bit raw builtins: v8sf is pointer/sret convention everywhere,
         // so the Vec256 pointer-returning arm is already value-correct.
-        BuiltinIntrinsic::X86MaxPs256V | BuiltinIntrinsic::X86MinPs256V
-        | BuiltinIntrinsic::X86AndPs256V | BuiltinIntrinsic::X86CmpPs256V => X86IntrinsicKind::Vec256,
+        BuiltinIntrinsic::X86MaxPs256V
+        | BuiltinIntrinsic::X86MinPs256V
+        | BuiltinIntrinsic::X86AndPs256V
+        | BuiltinIntrinsic::X86CmpPs256V => X86IntrinsicKind::Vec256,
         _ => X86IntrinsicKind::Vec128,
     }
 }
@@ -1504,7 +1964,10 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Phaddd256 => IntrinsicOp::Phaddd256,
         BuiltinIntrinsic::X86Pabsd256 => IntrinsicOp::Pabsd256,
         BuiltinIntrinsic::X86Pmuludq256 => IntrinsicOp::Pmuludq256,
-        _ => unreachable!("x86_intrinsic_op called with non-X86 intrinsic: {:?}", intrinsic),
+        _ => unreachable!(
+            "x86_intrinsic_op called with non-X86 intrinsic: {:?}",
+            intrinsic
+        ),
     }
 }
 
@@ -1527,23 +1990,28 @@ fn classify_ctype(ty: &CType) -> i64 {
     // GCC __builtin_classify_type returns integer type classes.
     // GCC treats char, _Bool, and enum as integer_type_class (1) in practice.
     match ty {
-        CType::Void => 0,            // no_type_class
+        CType::Void => 0, // no_type_class
         CType::Bool
-        | CType::Char | CType::UChar
-        | CType::Short | CType::UShort
-        | CType::Int | CType::UInt
-        | CType::Long | CType::ULong
-        | CType::LongLong | CType::ULongLong
-        | CType::Int128 | CType::UInt128
-        | CType::Enum(_) => 1,       // integer_type_class
+        | CType::Char
+        | CType::UChar
+        | CType::Short
+        | CType::UShort
+        | CType::Int
+        | CType::UInt
+        | CType::Long
+        | CType::ULong
+        | CType::LongLong
+        | CType::ULongLong
+        | CType::Int128
+        | CType::UInt128
+        | CType::Enum(_) => 1, // integer_type_class
         CType::Float | CType::Double | CType::LongDouble | CType::Float128 => 8, // real_type_class
-        CType::ComplexFloat | CType::ComplexDouble
-        | CType::ComplexLongDouble => 9, // complex_type_class
-        CType::Pointer(_, _) => 5,      // pointer_type_class
-        CType::Array(_, _) => 5,     // GCC decays arrays to pointers
-        CType::Function(_) => 5,     // function decays to pointer
-        CType::Struct(_) => 12,      // record_type_class
-        CType::Union(_) => 13,       // union_type_class
-        CType::Vector(_, _) => 14,   // array_type_class (GCC classifies vectors here)
+        CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9, // complex_type_class
+        CType::Pointer(_, _) => 5, // pointer_type_class
+        CType::Array(_, _) => 5,   // GCC decays arrays to pointers
+        CType::Function(_) => 5,   // function decays to pointer
+        CType::Struct(_) => 12,    // record_type_class
+        CType::Union(_) => 13,     // union_type_class
+        CType::Vector(_, _) => 14, // array_type_class (GCC classifies vectors here)
     }
 }

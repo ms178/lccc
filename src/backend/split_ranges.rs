@@ -296,9 +296,7 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>, rew
                 rewrite_value(v, map);
             }
         }
-        Instruction::Intrinsic {
-            args, dest_ptr, ..
-        } => {
+        Instruction::Intrinsic { args, dest_ptr, .. } => {
             for a in args {
                 rewrite_operand(a, map);
             }
@@ -691,7 +689,8 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
             insert_entry_alloca(func, alloca_val, ty, true);
 
             {
-                let store = Instruction::Store { volatile: false,
+                let store = Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(Value(vid)),
                     ptr: alloca_val,
                     ty,
@@ -703,7 +702,8 @@ pub fn split_loop_transparent_ranges(func: &mut IrFunction, max_splits: usize) -
             }
 
             {
-                let load = Instruction::Load { volatile: false,
+                let load = Instruction::Load {
+                    volatile: false,
                     dest: new_val,
                     ptr: alloca_val,
                     ty,
@@ -803,9 +803,7 @@ fn pick_call_split_candidate(func: &IrFunction, rejected: &FxHashSet<u32>) -> Op
             continue;
         }
 
-        let si = liveness
-            .call_points
-            .partition_point(|&cp| cp <= iv.start);
+        let si = liveness.call_points.partition_point(|&cp| cp <= iv.start);
         let mut calls_in = 0u32;
         let mut local = true;
         let end_block = points.get(iv.end as usize).map(|p| p.block);
@@ -917,7 +915,8 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         if ci >= block.instructions.len() {
             continue;
         }
-        if !is_explicit_call(&block.instructions[ci]) && !is_liveness_call_like(&block.instructions[ci])
+        if !is_explicit_call(&block.instructions[ci])
+            && !is_liveness_call_like(&block.instructions[ci])
         {
             continue;
         }
@@ -930,7 +929,8 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         insert_instruction(
             &mut func.blocks[site_block],
             ci + 1,
-            Instruction::Load { volatile: false,
+            Instruction::Load {
+                volatile: false,
                 dest: new_val,
                 ptr: alloca_val,
                 ty,
@@ -940,7 +940,8 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         insert_instruction(
             &mut func.blocks[site_block],
             ci,
-            Instruction::Store { volatile: false,
+            Instruction::Store {
+                volatile: false,
                 val: Operand::Value(Value(vid)),
                 ptr: alloca_val,
                 ty,

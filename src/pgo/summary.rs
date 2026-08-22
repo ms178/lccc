@@ -181,13 +181,7 @@ pub fn entry_count_for<'a>(p: &'a ProfileData, unit: &str, name: &str) -> u64 {
         .map(|f| f.total_count)
         .unwrap_or(0)
 }
-pub fn edge_count_for<'a>(
-    p: &'a ProfileData,
-    unit: &str,
-    name: &str,
-    src: u32,
-    dst: u32,
-) -> u64 {
+pub fn edge_count_for<'a>(p: &'a ProfileData, unit: &str, name: &str, src: u32, dst: u32) -> u64 {
     crate::pgo::profile::get_for_unit(p, unit, name)
         .map(|f| f.edge_count(src, dst))
         .unwrap_or(0)
@@ -215,25 +209,47 @@ mod tests {
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         let second_max = sorted.get(1).copied().unwrap_or(0);
         if total == 0 {
-            return ProfileSummary { total, max, second_max, hot_threshold: 0, cold_threshold: 0 };
+            return ProfileSummary {
+                total,
+                max,
+                second_max,
+                hot_threshold: 0,
+                cold_threshold: 0,
+            };
         }
         let mut counts = v.to_vec();
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let mut cum = 0u64;
         let mut hot_threshold = 0u64;
         for &c in &counts {
-            if c == 0 { break; }
+            if c == 0 {
+                break;
+            }
             cum += c;
-            if (cum as f64) / (total as f64) >= hot_frac { hot_threshold = c; break; }
+            if (cum as f64) / (total as f64) >= hot_frac {
+                hot_threshold = c;
+                break;
+            }
         }
         let mut cum2 = 0u64;
         let mut cold_threshold = 0u64;
         for &c in counts.iter().rev() {
-            if c == 0 { continue; }
+            if c == 0 {
+                continue;
+            }
             cum2 += c;
-            if (cum2 as f64) / (total as f64) >= cold_frac { cold_threshold = c; break; }
+            if (cum2 as f64) / (total as f64) >= cold_frac {
+                cold_threshold = c;
+                break;
+            }
         }
-        ProfileSummary { total, max, second_max, hot_threshold, cold_threshold }
+        ProfileSummary {
+            total,
+            max,
+            second_max,
+            hot_threshold,
+            cold_threshold,
+        }
     }
 
     #[test]
@@ -241,14 +257,20 @@ mod tests {
         // adler32-style: three tied "hot" functions + a couple cold. Percentile
         // hot==cold==48 (collapse), and max == second_max -> NO dominance.
         let s = counts(&[48, 48, 48, 1, 1]);
-        assert!(!s.has_spread(), "tied-hot flat profile must not be informative");
+        assert!(
+            !s.has_spread(),
+            "tied-hot flat profile must not be informative"
+        );
     }
 
     #[test]
     fn dominant_hot_is_spread() {
         // expat-style: one clearly dominant hot function.
         let s = counts(&[2_014_727, 64, 1]);
-        assert!(s.has_spread(), "single dominant hot function must be informative");
+        assert!(
+            s.has_spread(),
+            "single dominant hot function must be informative"
+        );
     }
 
     #[test]

@@ -10,31 +10,17 @@
 //!
 //! Also handles VLA parameter stride computation and dimension collection.
 
+use super::definitions::{FuncSig, IrParamBuildResult, LocalInfo, ParamKind, VarInfo, VlaDimInfo};
+use super::func_state::FunctionBuildState;
+use super::lower::Lowerer;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::types::{AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::{
-    BlockItem,
-    CompoundStmt,
-    Expr,
-    ForInit,
-    FunctionDef,
-    ParamDecl,
-    Stmt,
-    TypeSpecifier,
+    BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, ParamDecl, Stmt, TypeSpecifier,
 };
 use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrConst,
-    IrFunction,
-    IrParam,
-    Operand,
-    Terminator,
-    Value,
+    Instruction, IrBinOp, IrConst, IrFunction, IrParam, Operand, Terminator, Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType};
-use super::lower::Lowerer;
-use super::definitions::{LocalInfo, VarInfo, FuncSig, IrParamBuildResult, ParamKind, VlaDimInfo};
-use super::func_state::FunctionBuildState;
 
 impl Lowerer {
     /// Lower a function definition to IR.
@@ -55,7 +41,9 @@ impl Lowerer {
         let return_is_bool = self.is_type_bool(&func.return_type);
         let base_return_type = self.type_spec_to_ir(&func.return_type);
         self.func_state = Some(FunctionBuildState::new(
-            func.name.clone(), base_return_type, return_is_bool,
+            func.name.clone(),
+            base_return_type,
+            return_is_bool,
         ));
         self.func_mut().return_ctype = Some(self.type_spec_to_ctype(&func.return_type));
         // Clear get_expr_ctype memoization cache: results depend on
@@ -109,7 +97,9 @@ impl Lowerer {
         // Record complex return type for expr_ctype resolution
         let ret_ctype = self.type_spec_to_ctype(&func.return_type);
         if ret_ctype.is_complex() {
-            self.types.func_return_ctypes.insert(func.name.clone(), ret_ctype.clone());
+            self.types
+                .func_return_ctypes
+                .insert(func.name.clone(), ret_ctype.clone());
         }
 
         // Use the return type from the already-registered signature, which has
@@ -154,7 +144,15 @@ impl Lowerer {
         // Check if function returns a large struct via sret
         if let Some(sig) = self.func_meta.sigs.get(&func.name) {
             if let Some(sret_size) = sig.sret_size {
-                params.push(IrParam { ty: IrType::Ptr, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
+                params.push(IrParam {
+                    ty: IrType::Ptr,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    struct_eightbyte_classes: Vec::new(),
+                    riscv_float_class: None,
+                    is_f128_sse: false,
+                });
                 uses_sret = true;
                 let _ = sret_size; // used for alloca sizing in allocate_function_params
             }
@@ -170,16 +168,30 @@ impl Lowerer {
                 // on x86-64/RISC-V it's passed as a struct (on stack / by reference).
                 if matches!(param_ctype, CType::ComplexLongDouble) && !decompose_cld {
                     // Fall through to struct handling below
-                } else if matches!(param_ctype, CType::ComplexDouble) && !self.decomposes_complex_double() {
+                } else if matches!(param_ctype, CType::ComplexDouble)
+                    && !self.decomposes_complex_double()
+                {
                     // i686: _Complex double (16 bytes) is passed as a struct on the stack.
                     // Fall through to struct handling below.
-                } else if matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float() {
+                } else if matches!(param_ctype, CType::ComplexFloat)
+                    && !self.decomposes_complex_float()
+                {
                     // i686: _Complex float (8 bytes) is passed as a struct on the stack.
                     // Fall through to struct handling below.
-                } else if matches!(param_ctype, CType::ComplexFloat) && self.uses_packed_complex_float() {
+                } else if matches!(param_ctype, CType::ComplexFloat)
+                    && self.uses_packed_complex_float()
+                {
                     // x86-64: _Complex float packed into single F64
                     let ir_idx = params.len();
-                    params.push(IrParam { ty: IrType::F64, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
+                    params.push(IrParam {
+                        ty: IrType::F64,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        struct_eightbyte_classes: Vec::new(),
+                        riscv_float_class: None,
+                        is_f128_sse: false,
+                    });
                     param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
                     continue;
                 } else {
@@ -187,9 +199,25 @@ impl Lowerer {
                     // ComplexLongDouble on ARM64 only)
                     let comp_ty = Self::complex_component_ir_type(&param_ctype);
                     let real_idx = params.len();
-                    params.push(IrParam { ty: comp_ty, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
+                    params.push(IrParam {
+                        ty: comp_ty,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        struct_eightbyte_classes: Vec::new(),
+                        riscv_float_class: None,
+                        is_f128_sse: false,
+                    });
                     let imag_idx = params.len();
-                    params.push(IrParam { ty: comp_ty, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None , is_f128_sse: false });
+                    params.push(IrParam {
+                        ty: comp_ty,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        struct_eightbyte_classes: Vec::new(),
+                        riscv_float_class: None,
+                        is_f128_sse: false,
+                    });
                     param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
                     continue;
                 }
@@ -203,7 +231,8 @@ impl Lowerer {
             // Vector types (e.g. __attribute__((vector_size(N)))) are passed by value
             // like structs: the data is copied into the callee's stack slot.
             let is_complex_as_struct = matches!(param_ctype, CType::ComplexLongDouble)
-                || (matches!(param_ctype, CType::ComplexDouble) && !self.decomposes_complex_double())
+                || (matches!(param_ctype, CType::ComplexDouble)
+                    && !self.decomposes_complex_double())
                 || (matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float());
             if self.is_type_struct_or_union(&param.type_spec)
                 || is_complex_as_struct
@@ -217,19 +246,28 @@ impl Lowerer {
                 };
                 // Compute struct alignment, per-eightbyte SysV ABI classification,
                 // and RISC-V LP64D float field classification
-                let (struct_align, struct_eightbyte_classes, riscv_float_class) = if struct_size.is_some() {
-                    if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
-                        let ctx = &*self.types.borrow_struct_layouts();
-                        let classes = layout.classify_sysv_eightbytes(ctx);
-                        let rv_class = layout.classify_riscv_float_fields(ctx);
-                        (Some(layout.align), classes, rv_class)
+                let (struct_align, struct_eightbyte_classes, riscv_float_class) =
+                    if struct_size.is_some() {
+                        if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
+                            let ctx = &*self.types.borrow_struct_layouts();
+                            let classes = layout.classify_sysv_eightbytes(ctx);
+                            let rv_class = layout.classify_riscv_float_fields(ctx);
+                            (Some(layout.align), classes, rv_class)
+                        } else {
+                            (None, Vec::new(), None)
+                        }
                     } else {
                         (None, Vec::new(), None)
-                    }
-                } else {
-                    (None, Vec::new(), None)
-                };
-                params.push(IrParam { ty: IrType::Ptr, noalias: false, struct_size, struct_align, struct_eightbyte_classes, riscv_float_class, is_f128_sse: false });
+                    };
+                params.push(IrParam {
+                    ty: IrType::Ptr,
+                    noalias: false,
+                    struct_size,
+                    struct_align,
+                    struct_eightbyte_classes,
+                    riscv_float_class,
+                    is_f128_sse: false,
+                });
                 param_kinds.push(ParamKind::Struct(ir_idx));
                 continue;
             }
@@ -241,7 +279,8 @@ impl Lowerer {
                 let ir_idx = params.len();
                 params.push(IrParam {
                     ty: IrType::U128,
-                    noalias: false, struct_size: Some(16),
+                    noalias: false,
+                    struct_size: Some(16),
                     struct_align: Some(16),
                     struct_eightbyte_classes: vec![
                         crate::common::types::EightbyteClass::Sse,
@@ -277,7 +316,11 @@ impl Lowerer {
             param_kinds.push(ParamKind::Normal(ir_idx));
         }
 
-        IrParamBuildResult { params, param_kinds, uses_sret }
+        IrParamBuildResult {
+            params,
+            param_kinds,
+            uses_sret,
+        }
     }
 
     /// Allocate function parameters as local variables (3-phase process).
@@ -288,18 +331,35 @@ impl Lowerer {
             let alloca = self.fresh_value();
             if info.uses_sret && ir_allocas.is_empty() {
                 let ptr_size = crate::common::types::target_ptr_size();
-                self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: ptr_size, align: 0, volatile: false, semantic_volatile: false });
+                self.emit(Instruction::Alloca {
+                    dest: alloca,
+                    ty: IrType::Ptr,
+                    size: ptr_size,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                });
                 self.func_mut().sret_ptr = Some(alloca);
                 ir_allocas.push(alloca);
                 continue;
             }
-            let size = param.ty.size().max(param.struct_size.unwrap_or(param.ty.size()));
+            let size = param
+                .ty
+                .size()
+                .max(param.struct_size.unwrap_or(param.ty.size()));
             // Carry the struct's ABI alignment onto its parameter alloca. Without
             // this, a by-value `_Alignas(16)` struct parameter is copied into an
             // 8-aligned slot in emit_store_params and `&s` (or an aligned vector
             // access on the param) sees a misaligned address.
             let align = param.struct_align.unwrap_or(0);
-            self.emit(Instruction::Alloca { dest: alloca, ty: param.ty, size, align, volatile: false, semantic_volatile: false });
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                ty: param.ty,
+                size,
+                align,
+                volatile: false,
+                semantic_volatile: false,
+            });
             ir_allocas.push(alloca);
         }
 
@@ -325,8 +385,13 @@ impl Lowerer {
             let ty_size = param.ty.size();
             if ty_size <= 8 {
                 let param_val = self.fresh_value();
-                self.emit(Instruction::ParamRef { dest: param_val, param_idx: i, ty: param.ty });
-                self.emit(Instruction::Store { volatile: false,
+                self.emit(Instruction::ParamRef {
+                    dest: param_val,
+                    param_idx: i,
+                    ty: param.ty,
+                });
+                self.emit(Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(param_val),
                     ptr: ir_allocas[i],
                     ty: param.ty,
@@ -340,7 +405,11 @@ impl Lowerer {
             let orig_param = &func.params[orig_idx];
             match kind {
                 ParamKind::Normal(ir_idx) => {
-                    self.register_normal_param(orig_param, &info.params[*ir_idx], ir_allocas[*ir_idx]);
+                    self.register_normal_param(
+                        orig_param,
+                        &info.params[*ir_idx],
+                        ir_allocas[*ir_idx],
+                    );
                 }
                 ParamKind::Struct(ir_idx) => {
                     self.register_struct_or_complex_param(orig_param, ir_allocas[*ir_idx]);
@@ -350,7 +419,9 @@ impl Lowerer {
                 }
                 ParamKind::ComplexDecomposed(real_ir_idx, imag_ir_idx) => {
                     self.reconstruct_decomposed_complex_param(
-                        orig_param, ir_allocas[*real_ir_idx], ir_allocas[*imag_ir_idx],
+                        orig_param,
+                        ir_allocas[*real_ir_idx],
+                        ir_allocas[*imag_ir_idx],
                     );
                 }
             }
@@ -363,12 +434,28 @@ impl Lowerer {
     fn register_normal_param(&mut self, orig_param: &ParamDecl, ir_param: &IrParam, alloca: Value) {
         let ty = ir_param.ty;
         let param_size = self.sizeof_type(&orig_param.type_spec).max(ty.size());
-        let elem_size = if ty == IrType::Ptr { self.pointee_elem_size(&orig_param.type_spec) } else { 0 };
-        let pointee_type = if ty == IrType::Ptr { self.pointee_ir_type(&orig_param.type_spec) } else { None };
-        let struct_layout = if ty == IrType::Ptr { self.get_struct_layout_for_pointer_param(&orig_param.type_spec) } else { None };
+        let elem_size = if ty == IrType::Ptr {
+            self.pointee_elem_size(&orig_param.type_spec)
+        } else {
+            0
+        };
+        let pointee_type = if ty == IrType::Ptr {
+            self.pointee_ir_type(&orig_param.type_spec)
+        } else {
+            None
+        };
+        let struct_layout = if ty == IrType::Ptr {
+            self.get_struct_layout_for_pointer_param(&orig_param.type_spec)
+        } else {
+            None
+        };
         let c_type = Some(self.param_ctype(orig_param));
         let is_bool = self.is_type_bool(&orig_param.type_spec);
-        let array_dim_strides = if ty == IrType::Ptr { self.compute_ptr_array_strides(&orig_param.type_spec) } else { vec![] };
+        let array_dim_strides = if ty == IrType::Ptr {
+            self.compute_ptr_array_strides(&orig_param.type_spec)
+        } else {
+            vec![]
+        };
 
         // Detect pointer-to-function-pointer parameters using the parser's
         // fptr_inner_ptr_depth field. This records how many `*` were inside the
@@ -377,16 +464,39 @@ impl Lowerer {
         // distinguishes `int (**fpp)(int)` (depth 2, ptr-to-func-ptr) from
         // `void *(*fp)(size_t)` (depth 1, func ptr returning void*), which
         // have identical CType representations.
-        let is_ptr_to_func_ptr = orig_param.fptr_params.is_some()
-            && orig_param.fptr_inner_ptr_depth >= 2;
+        let is_ptr_to_func_ptr =
+            orig_param.fptr_params.is_some() && orig_param.fptr_inner_ptr_depth >= 2;
 
         let name = orig_param.name.clone().unwrap_or_default();
-        self.insert_local_scoped(name, LocalInfo {
-            var: VarInfo { ty, elem_size, is_array: false, pointee_type, struct_layout, is_struct: false, array_dim_strides, c_type, is_ptr_to_func_ptr, address_space: AddressSpace::Default, explicit_alignment: None },
-            alloca, alloc_size: param_size, is_bool, static_global_name: None, vla_strides: vec![], vla_size: None, asm_register: None, asm_register_has_init: false, cleanup_fn: None,
-            is_const: orig_param.is_const,
-            base_type_volatile: orig_param.is_volatile,
-        });
+        self.insert_local_scoped(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty,
+                    elem_size,
+                    is_array: false,
+                    pointee_type,
+                    struct_layout,
+                    is_struct: false,
+                    array_dim_strides,
+                    c_type,
+                    is_ptr_to_func_ptr,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                },
+                alloca,
+                alloc_size: param_size,
+                is_bool,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                is_const: orig_param.is_const,
+                base_type_volatile: orig_param.is_volatile,
+            },
+        );
 
         // Register function pointer parameter signatures for indirect calls
         if let Some(ref fptr_params) = orig_param.fptr_params {
@@ -395,8 +505,13 @@ impl Lowerer {
                 _ => self.type_spec_to_ir(&orig_param.type_spec),
             };
             if let Some(ref name) = orig_param.name {
-                let param_tys: Vec<IrType> = fptr_params.iter().map(|fp| self.type_spec_to_ir(&fp.type_spec)).collect();
-                self.func_meta.ptr_sigs.insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                let param_tys: Vec<IrType> = fptr_params
+                    .iter()
+                    .map(|fp| self.type_spec_to_ir(&fp.type_spec))
+                    .collect();
+                self.func_meta
+                    .ptr_sigs
+                    .insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
             }
         } else if let Some(ref name) = orig_param.name {
             // Fallback: check if the parameter type is a bare function typedef
@@ -407,10 +522,14 @@ impl Lowerer {
             if let TypeSpecifier::TypedefName(tname) = &orig_param.type_spec {
                 if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
                     let ret_ty = self.type_spec_to_ir(&fti.return_type);
-                    let param_tys: Vec<IrType> = fti.params.iter()
+                    let param_tys: Vec<IrType> = fti
+                        .params
+                        .iter()
                         .map(|fp| self.type_spec_to_ir(&fp.type_spec))
                         .collect();
-                    self.func_meta.ptr_sigs.insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                    self.func_meta
+                        .ptr_sigs
+                        .insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
                 }
             }
         }
@@ -419,93 +538,260 @@ impl Lowerer {
     /// Register a struct/union or non-decomposed complex parameter as a local variable.
     fn register_struct_or_complex_param(&mut self, orig_param: &ParamDecl, alloca: Value) {
         let is_struct = self.is_type_struct_or_union(&orig_param.type_spec);
-        let layout = if is_struct { self.get_struct_layout_for_type(&orig_param.type_spec) } else { None };
-        let size = if is_struct { layout.as_ref().map_or(8, |l| l.size) } else { self.sizeof_type(&orig_param.type_spec) };
+        let layout = if is_struct {
+            self.get_struct_layout_for_type(&orig_param.type_spec)
+        } else {
+            None
+        };
+        let size = if is_struct {
+            layout.as_ref().map_or(8, |l| l.size)
+        } else {
+            self.sizeof_type(&orig_param.type_spec)
+        };
         let c_type = Some(self.type_spec_to_ctype(&orig_param.type_spec));
 
         let name = orig_param.name.clone().unwrap_or_default();
-        self.insert_local_scoped(name, LocalInfo {
-            var: VarInfo { ty: IrType::Ptr, elem_size: 0, is_array: false, pointee_type: None, struct_layout: layout, is_struct: true, array_dim_strides: vec![], c_type, is_ptr_to_func_ptr: false, address_space: AddressSpace::Default, explicit_alignment: None },
-            alloca, alloc_size: size, is_bool: false, static_global_name: None, vla_strides: vec![], vla_size: None, asm_register: None, asm_register_has_init: false, cleanup_fn: None,
-            is_const: orig_param.is_const,
-            base_type_volatile: orig_param.is_volatile,
-        });
+        self.insert_local_scoped(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: layout,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type,
+                    is_ptr_to_func_ptr: false,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                },
+                alloca,
+                alloc_size: size,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                is_const: orig_param.is_const,
+                base_type_volatile: orig_param.is_volatile,
+            },
+        );
     }
 
     /// Register a packed complex float parameter (x86-64 only) as a local variable.
     fn register_packed_complex_float_param(&mut self, orig_param: &ParamDecl, alloca: Value) {
         let ct = self.type_spec_to_ctype(&orig_param.type_spec);
         let name = orig_param.name.clone().unwrap_or_default();
-        self.insert_local_scoped(name, LocalInfo {
-            var: VarInfo { ty: IrType::Ptr, elem_size: 0, is_array: false, pointee_type: None, struct_layout: None, is_struct: true, array_dim_strides: vec![], c_type: Some(ct), is_ptr_to_func_ptr: false, address_space: AddressSpace::Default, explicit_alignment: None },
-            alloca, alloc_size: 8, is_bool: false, static_global_name: None, vla_strides: vec![], vla_size: None, asm_register: None, asm_register_has_init: false, cleanup_fn: None,
-            is_const: orig_param.is_const,
-            base_type_volatile: orig_param.is_volatile,
-        });
+        self.insert_local_scoped(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: None,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type: Some(ct),
+                    is_ptr_to_func_ptr: false,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                },
+                alloca,
+                alloc_size: 8,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                is_const: orig_param.is_const,
+                base_type_volatile: orig_param.is_volatile,
+            },
+        );
     }
 
     /// Reconstruct a decomposed complex parameter from its real/imag Phase 1 allocas.
-    fn reconstruct_decomposed_complex_param(&mut self, orig_param: &ParamDecl, real_alloca: Value, imag_alloca: Value) {
+    fn reconstruct_decomposed_complex_param(
+        &mut self,
+        orig_param: &ParamDecl,
+        real_alloca: Value,
+        imag_alloca: Value,
+    ) {
         let ct = self.type_spec_to_ctype(&orig_param.type_spec);
         let comp_ty = Self::complex_component_ir_type(&ct);
         let comp_size = Self::complex_component_size(&ct);
         let complex_size = ct.size();
 
         let complex_alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: complex_alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca {
+            dest: complex_alloca,
+            ty: IrType::Ptr,
+            size: complex_size,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
 
         let real_val = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false, dest: real_val, ptr: real_alloca, ty: comp_ty , seg_override: AddressSpace::Default });
-        self.emit(Instruction::Store { volatile: false, val: Operand::Value(real_val), ptr: complex_alloca, ty: comp_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: real_val,
+            ptr: real_alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(real_val),
+            ptr: complex_alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
 
         let imag_val = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false, dest: imag_val, ptr: imag_alloca, ty: comp_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: imag_val,
+            ptr: imag_alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
         let imag_ptr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr { dest: imag_ptr, base: complex_alloca, offset: Operand::Const(IrConst::I64(comp_size as i64)), ty: IrType::I8 });
-        self.emit(Instruction::Store { volatile: false, val: Operand::Value(imag_val), ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::GetElementPtr {
+            dest: imag_ptr,
+            base: complex_alloca,
+            offset: Operand::Const(IrConst::I64(comp_size as i64)),
+            ty: IrType::I8,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(imag_val),
+            ptr: imag_ptr,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
 
         let name = orig_param.name.clone().unwrap_or_default();
-        self.func_mut().locals.insert(name, LocalInfo {
-            var: VarInfo { ty: IrType::Ptr, elem_size: 0, is_array: false, pointee_type: None, struct_layout: None, is_struct: true, array_dim_strides: vec![], c_type: Some(ct), is_ptr_to_func_ptr: false, address_space: AddressSpace::Default, explicit_alignment: None },
-            alloca: complex_alloca, alloc_size: complex_size, is_bool: false, static_global_name: None, vla_strides: vec![], vla_size: None, asm_register: None, asm_register_has_init: false, cleanup_fn: None,
-            is_const: orig_param.is_const,
-            base_type_volatile: orig_param.is_volatile,
-        });
+        self.func_mut().locals.insert(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: None,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type: Some(ct),
+                    is_ptr_to_func_ptr: false,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                },
+                alloca: complex_alloca,
+                alloc_size: complex_size,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                is_const: orig_param.is_const,
+                base_type_volatile: orig_param.is_volatile,
+            },
+        );
     }
 
     /// Handle K&R default argument promotions: narrow promoted params back to declared types.
     /// float->double promotion: narrow double back to float.
     /// char/short->int promotion: narrow int back to char/short.
     fn handle_kr_float_promotion(&mut self, func: &FunctionDef) {
-        if !func.is_kr { return; }
+        if !func.is_kr {
+            return;
+        }
         for param in &func.params {
             let declared_ty = self.type_spec_to_ir(&param.type_spec);
             let name = param.name.clone().unwrap_or_default();
-            let local_info = match self.func_mut().locals.get(&name).cloned() { Some(i) => i, None => continue };
+            let local_info = match self.func_mut().locals.get(&name).cloned() {
+                Some(i) => i,
+                None => continue,
+            };
             match declared_ty {
                 IrType::F32 => {
                     // Received as F64, narrow to F32
                     let f64_val = self.fresh_value();
-                    self.emit(Instruction::Load { volatile: false, dest: f64_val, ptr: local_info.alloca, ty: IrType::F64 , seg_override: AddressSpace::Default });
-                    let f32_val = self.emit_cast_val(Operand::Value(f64_val), IrType::F64, IrType::F32);
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: f64_val,
+                        ptr: local_info.alloca,
+                        ty: IrType::F64,
+                        seg_override: AddressSpace::Default,
+                    });
+                    let f32_val =
+                        self.emit_cast_val(Operand::Value(f64_val), IrType::F64, IrType::F32);
                     let f32_alloca = self.fresh_value();
-                    self.emit(Instruction::Alloca { dest: f32_alloca, ty: IrType::F32, size: 4, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(f32_val), ptr: f32_alloca, ty: IrType::F32 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Alloca {
+                        dest: f32_alloca,
+                        ty: IrType::F32,
+                        size: 4,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: Operand::Value(f32_val),
+                        ptr: f32_alloca,
+                        ty: IrType::F32,
+                        seg_override: AddressSpace::Default,
+                    });
                     if let Some(local) = self.func_mut().locals.get_mut(&name) {
-                        local.alloca = f32_alloca; local.ty = IrType::F32; local.alloc_size = 4;
+                        local.alloca = f32_alloca;
+                        local.ty = IrType::F32;
+                        local.alloc_size = 4;
                     }
                 }
                 IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
                     // Received as I32, narrow to declared type
                     let i32_val = self.fresh_value();
-                    self.emit(Instruction::Load { volatile: false, dest: i32_val, ptr: local_info.alloca, ty: IrType::I32 , seg_override: AddressSpace::Default });
-                    let narrow_val = self.emit_cast_val(Operand::Value(i32_val), IrType::I32, declared_ty);
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: i32_val,
+                        ptr: local_info.alloca,
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    });
+                    let narrow_val =
+                        self.emit_cast_val(Operand::Value(i32_val), IrType::I32, declared_ty);
                     let narrow_alloca = self.fresh_value();
                     let size = declared_ty.size().max(1);
-                    self.emit(Instruction::Alloca { dest: narrow_alloca, ty: declared_ty, size, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { volatile: false, val: Operand::Value(narrow_val), ptr: narrow_alloca, ty: declared_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Alloca {
+                        dest: narrow_alloca,
+                        ty: declared_ty,
+                        size,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: Operand::Value(narrow_val),
+                        ptr: narrow_alloca,
+                        ty: declared_ty,
+                        seg_override: AddressSpace::Default,
+                    });
                     if let Some(local) = self.func_mut().locals.get_mut(&name) {
-                        local.alloca = narrow_alloca; local.ty = declared_ty; local.alloc_size = size;
+                        local.alloca = narrow_alloca;
+                        local.ty = declared_ty;
+                        local.alloc_size = size;
                     }
                 }
                 _ => {}
@@ -514,11 +800,25 @@ impl Lowerer {
     }
 
     /// Finalize a function: add implicit return, build IrFunction, push to module.
-    fn finalize_function(&mut self, func: &FunctionDef, return_type: IrType, params: Vec<IrParam>, uses_sret: bool) {
-        if !self.func_mut().instrs.is_empty() || self.func_mut().blocks.is_empty()
-           || !matches!(self.func_mut().blocks.last().map(|b| &b.terminator), Some(Terminator::Return(_)))
+    fn finalize_function(
+        &mut self,
+        func: &FunctionDef,
+        return_type: IrType,
+        params: Vec<IrParam>,
+        uses_sret: bool,
+    ) {
+        if !self.func_mut().instrs.is_empty()
+            || self.func_mut().blocks.is_empty()
+            || !matches!(
+                self.func_mut().blocks.last().map(|b| &b.terminator),
+                Some(Terminator::Return(_))
+            )
         {
-            let ret_op = if return_type == IrType::Void { None } else { Some(Operand::Const(IrConst::I32(0))) };
+            let ret_op = if return_type == IrType::Void {
+                None
+            } else {
+                Some(Operand::Const(IrConst::I32(0)))
+            };
             self.terminate(Terminator::Return(ret_op));
         }
 
@@ -534,16 +834,22 @@ impl Lowerer {
                 // SSE intrinsic lowering emits inline allocas deep in the block via
                 // self.emit(Alloca), and placing deferred allocas after those would put
                 // them after their uses, violating dominance.
-                let insert_pos = entry_block.instructions.iter()
+                let insert_pos = entry_block
+                    .instructions
+                    .iter()
                     .position(|inst| !matches!(inst, Instruction::Alloca { .. }))
                     .unwrap_or(entry_block.instructions.len());
                 // Splice deferred allocas at the insertion point.
                 let num_allocas = entry_allocas.len();
-                entry_block.instructions.splice(insert_pos..insert_pos, entry_allocas);
+                entry_block
+                    .instructions
+                    .splice(insert_pos..insert_pos, entry_allocas);
                 // Insert dummy spans for the spliced allocas
                 if !entry_block.source_spans.is_empty() {
                     let dummy_spans = vec![crate::common::source::Span::dummy(); num_allocas];
-                    entry_block.source_spans.splice(insert_pos..insert_pos, dummy_spans);
+                    entry_block
+                        .source_spans
+                        .splice(insert_pos..insert_pos, dummy_spans);
                 }
             }
         }
@@ -569,25 +875,35 @@ impl Lowerer {
         // Note: in GNU89 mode, `inline` without `extern` provides an external def,
         // so this rule does not apply.
         let is_c99_inline_def = !self.gnu89_inline
-            && func.attrs.is_inline() && !func.attrs.is_extern()
-            && !func.attrs.is_static() && !func.attrs.is_gnu_inline()
+            && func.attrs.is_inline()
+            && !func.attrs.is_extern()
+            && !func.attrs.is_static()
+            && !func.attrs.is_gnu_inline()
             && !self.has_non_inline_decl.contains(&func.name);
         // C99 inline-only definitions (inline without extern/static, all declarations
         // have inline) don't provide an external definition per C99 6.7.4p7.
         // We lower them as static so their bodies are available for inlining.
         // If all call sites are inlined, dead code elimination removes them.
         // If not inlined, they're emitted as local symbols (safe fallback).
-        let is_static = func.attrs.is_static() || self.static_functions.contains(&func.name)
-            || is_gnu_inline_no_extern_def || is_c99_inline_def;
+        let is_static = func.attrs.is_static()
+            || self.static_functions.contains(&func.name)
+            || is_gnu_inline_no_extern_def
+            || is_c99_inline_def;
         let next_val = self.func_mut().next_value;
         let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
         let global_init_labels = std::mem::take(&mut self.func_mut().global_init_label_blocks);
         // Get return eightbyte classes from the function's signature metadata
-        let ret_eightbyte_classes = self.func_meta.sigs.get(&func.name)
+        let ret_eightbyte_classes = self
+            .func_meta
+            .sigs
+            .get(&func.name)
             .map(|s| s.ret_eightbyte_classes.clone())
             .unwrap_or_default();
         // _Float128 returns come back in ONE XMM register (SysV psABI).
-        let ret_is_f128_sse = self.func_meta.sigs.get(&func.name)
+        let ret_is_f128_sse = self
+            .func_meta
+            .sigs
+            .get(&func.name)
             .map(|s| s.ret_is_f128_sse)
             .unwrap_or(false);
         // Use the lowerer's global next_label counter to ensure labels are globally unique
@@ -600,10 +916,17 @@ impl Lowerer {
             // gnulib's stdio.h) has already been collected into asm_label_map
             // by the signature pass, and call sites resolve through it, so we
             // only need to rename the emitted definition symbol here.
-            name: self.asm_label_map.get(&func.name).cloned().unwrap_or_else(|| func.name.clone()),
-            return_type, params,
+            name: self
+                .asm_label_map
+                .get(&func.name)
+                .cloned()
+                .unwrap_or_else(|| func.name.clone()),
+            return_type,
+            params,
             blocks: std::mem::take(&mut self.func_mut().blocks),
-            is_variadic: func.variadic, is_declaration: false, is_static,
+            is_variadic: func.variadic,
+            is_declaration: false,
+            is_static,
             is_inline: func.attrs.is_inline(),
             is_always_inline: func.attrs.is_always_inline(),
             is_noinline: func.attrs.is_noinline(),
@@ -626,7 +949,9 @@ impl Lowerer {
         };
         // Collect __attribute__((symver("..."))) directives
         if let Some(ref sv) = func.attrs.symver {
-            self.module.symver_directives.push((func.name.clone(), sv.clone()));
+            self.module
+                .symver_directives
+                .push((func.name.clone(), sv.clone()));
         }
         self.module.functions.push(ir_func);
         self.pop_scope();
@@ -695,9 +1020,19 @@ impl Lowerer {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
                     let dim_val = self.load_vla_dim_value(&dim_info.dim_expr_name);
                     let stride_val = if let Some(prev) = current_stride {
-                        self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_val), Operand::Value(prev), ptr_int_ty)
+                        self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(dim_val),
+                            Operand::Value(prev),
+                            ptr_int_ty,
+                        )
                     } else {
-                        self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_val), Operand::Const(IrConst::ptr_int(current_const_stride as i64)), ptr_int_ty)
+                        self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(dim_val),
+                            Operand::Const(IrConst::ptr_int(current_const_stride as i64)),
+                            ptr_int_ty,
+                        )
                     };
                     vla_strides[i] = Some(stride_val);
                     current_stride = Some(stride_val);
@@ -706,7 +1041,12 @@ impl Lowerer {
                     let const_dim = dim_info.const_size.unwrap_or(1) as usize;
                     if let Some(prev) = current_stride {
                         let ptr_int_ty = crate::common::types::target_int_ir_type();
-                        let result = self.emit_binop_val(IrBinOp::Mul, Operand::Value(prev), Operand::Const(IrConst::ptr_int(const_dim as i64)), ptr_int_ty);
+                        let result = self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(prev),
+                            Operand::Const(IrConst::ptr_int(const_dim as i64)),
+                            ptr_int_ty,
+                        );
                         vla_strides[i] = Some(result);
                         current_stride = Some(result);
                     } else {
@@ -725,8 +1065,13 @@ impl Lowerer {
     fn load_vla_dim_value(&mut self, dim_name: &str) -> Value {
         if let Some(info) = self.func_mut().locals.get(dim_name).cloned() {
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: info.alloca, ty: info.ty,
-             seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: info.alloca,
+                ty: info.ty,
+                seg_override: AddressSpace::Default,
+            });
             loaded
         } else {
             // Fallback: use constant 1
@@ -801,11 +1146,18 @@ impl Lowerer {
         result
     }
 
-    fn prescan_compound_stmt(compound: &CompoundStmt, depth: usize, result: &mut FxHashMap<String, usize>) {
+    fn prescan_compound_stmt(
+        compound: &CompoundStmt,
+        depth: usize,
+        result: &mut FxHashMap<String, usize>,
+    ) {
         // Match the lowering behavior: only push a scope (increment depth) when the
         // compound statement contains declarations. Declaration-free compound statements
         // don't push a scope in lower_compound_stmt, so we must not increment depth here.
-        let has_declarations = compound.items.iter().any(|item| matches!(item, BlockItem::Declaration(_)));
+        let has_declarations = compound
+            .items
+            .iter()
+            .any(|item| matches!(item, BlockItem::Declaration(_)));
         let inner_depth = if has_declarations { depth + 1 } else { depth };
         for item in &compound.items {
             match item {
@@ -837,7 +1189,9 @@ impl Lowerer {
             Stmt::For(init, _, _, body, _) => {
                 // C99: for-init declarations have their own scope, matching
                 // the push_scope() in lower_for_stmt.
-                let has_decl_init = init.as_ref().is_some_and(|i| matches!(i.as_ref(), ForInit::Declaration(_)));
+                let has_decl_init = init
+                    .as_ref()
+                    .is_some_and(|i| matches!(i.as_ref(), ForInit::Declaration(_)));
                 let for_depth = if has_decl_init { depth + 1 } else { depth };
                 Self::prescan_stmt(body, for_depth, result);
             }
@@ -848,9 +1202,14 @@ impl Lowerer {
                 Self::prescan_stmt(inner, depth, result);
             }
             // Leaf statements: no labels inside
-            Stmt::Expr(_) | Stmt::Return(_, _) | Stmt::Break(_) | Stmt::Continue(_) |
-            Stmt::Goto(_, _) | Stmt::GotoIndirect(_, _) | Stmt::Declaration(_) |
-            Stmt::InlineAsm { .. } => {}
+            Stmt::Expr(_)
+            | Stmt::Return(_, _)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Goto(_, _)
+            | Stmt::GotoIndirect(_, _)
+            | Stmt::Declaration(_)
+            | Stmt::InlineAsm { .. } => {}
         }
     }
 }

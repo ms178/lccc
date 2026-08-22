@@ -5,12 +5,12 @@
 //! shared `x86_common` module. Template substitution uses the shared parsing
 //! logic with an x86-64-specific operand emission callback.
 
-use std::borrow::Cow;
-use std::fmt::Write;
+use super::emit::X86Codegen;
+use crate::backend::x86_common;
 use crate::common::types::IrType;
 use crate::ir::reexports::BlockId;
-use crate::backend::x86_common;
-use super::emit::X86Codegen;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 impl X86Codegen {
     /// Substitute %0, %1, %[name], %k0, %b1, %w2, %q3, %h4, %c0, %P0, %a0, %n0, %l[name] etc.
@@ -31,8 +31,16 @@ impl X86Codegen {
         op_imm_symbols: &[Option<String>],
     ) -> String {
         x86_common::substitute_x86_asm_operands(
-            line, op_regs, op_names, op_is_memory, op_mem_addrs, op_types,
-            gcc_to_internal, goto_labels, op_imm_values, op_imm_symbols,
+            line,
+            op_regs,
+            op_names,
+            op_is_memory,
+            op_mem_addrs,
+            op_types,
+            gcc_to_internal,
+            goto_labels,
+            op_imm_values,
+            op_imm_symbols,
             Self::emit_operand_with_modifier,
         )
     }
@@ -56,8 +64,14 @@ impl X86Codegen {
     ) {
         // Try shared logic first (handles %n, %c/%P, memory, $symbol, $imm)
         if x86_common::emit_operand_common(
-            result, idx, modifier, op_regs, op_is_memory, op_mem_addrs,
-            op_imm_values, op_imm_symbols,
+            result,
+            idx,
+            modifier,
+            op_regs,
+            op_is_memory,
+            op_mem_addrs,
+            op_imm_values,
+            op_imm_symbols,
         ) {
             return;
         }
@@ -78,7 +92,8 @@ impl X86Codegen {
             }
         } else {
             // Register operand — apply size modifier, default is 64-bit
-            let effective_mod = modifier.or_else(|| Self::default_modifier_for_type(op_types.get(idx).copied()));
+            let effective_mod =
+                modifier.or_else(|| Self::default_modifier_for_type(op_types.get(idx).copied()));
             result.push('%');
             result.push_str(&Self::format_x86_reg(&op_regs[idx], effective_mod));
         }

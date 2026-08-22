@@ -1,12 +1,12 @@
-pub(crate) mod pipeline;
-pub(crate) mod macro_defs;
-pub(crate) mod conditionals;
 pub(crate) mod builtin_macros;
-pub(crate) mod utils;
-mod includes;
+pub(crate) mod conditionals;
 mod expr_eval;
-pub(crate) mod predefined_macros;
+mod includes;
+pub(crate) mod macro_defs;
+pub(crate) mod pipeline;
 mod pragmas;
+pub(crate) mod predefined_macros;
 mod text_processing;
+pub(crate) mod utils;
 
 pub(crate) use pipeline::Preprocessor;

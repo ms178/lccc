@@ -9,23 +9,41 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     }
 
     // NEON register-to-register move: mov v1.16b, v0.16b -> ORR v1.16b, v0.16b, v0.16b
-    if let (Some(Operand::RegArrangement { reg: rd_name, arrangement: arr_d }),
-            Some(Operand::RegArrangement { reg: rm_name, arrangement: _arr_m })) =
-        (operands.first(), operands.get(1))
+    if let (
+        Some(Operand::RegArrangement {
+            reg: rd_name,
+            arrangement: arr_d,
+        }),
+        Some(Operand::RegArrangement {
+            reg: rm_name,
+            arrangement: _arr_m,
+        }),
+    ) = (operands.first(), operands.get(1))
     {
         let rd = parse_reg_num(rd_name).ok_or("invalid NEON rd")?;
         let rm = parse_reg_num(rm_name).ok_or("invalid NEON rm")?;
         let q: u32 = if arr_d == "16b" { 1 } else { 0 };
         // ORR Vd.T, Vm.T, Vm.T: 0 Q 0 01110 10 1 Rm 0 00111 Rn Rd
-        let word = (q << 30) | (0b001110 << 24) | (0b10 << 22) | (1 << 21)
-            | (rm << 16) | (0b000111 << 10) | (rm << 5) | rd;
+        let word = (q << 30)
+            | (0b001110 << 24)
+            | (0b10 << 22)
+            | (1 << 21)
+            | (rm << 16)
+            | (0b000111 << 10)
+            | (rm << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
     // NEON lane insert: mov v0.d[1], x1 -> INS Vd.D[index], Xn
-    if let (Some(Operand::RegLane { reg: vd_name, elem_size, index }),
-            Some(Operand::Reg(rn_name))) =
-        (operands.first(), operands.get(1))
+    if let (
+        Some(Operand::RegLane {
+            reg: vd_name,
+            elem_size,
+            index,
+        }),
+        Some(Operand::Reg(rn_name)),
+    ) = (operands.first(), operands.get(1))
     {
         let vd = parse_reg_num(vd_name).ok_or("invalid NEON vd")?;
         let rn = parse_reg_num(rn_name).ok_or("invalid rn")?;
@@ -44,9 +62,14 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     }
 
     // NEON lane extract: mov x0, v0.d[1] -> UMOV Xd, Vn.D[index]
-    if let (Some(Operand::Reg(rd_name)),
-            Some(Operand::RegLane { reg: vn_name, elem_size, index })) =
-        (operands.first(), operands.get(1))
+    if let (
+        Some(Operand::Reg(rd_name)),
+        Some(Operand::RegLane {
+            reg: vn_name,
+            elem_size,
+            index,
+        }),
+    ) = (operands.first(), operands.get(1))
     {
         let rd = parse_reg_num(rd_name).ok_or("invalid rd")?;
         let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
@@ -59,14 +82,24 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
             "d" => (1, ((*index & 0x1) << 4) | 0b01000),
             _ => return Err(format!("unsupported element size for umov: {}", elem_size)),
         };
-        let word = (q << 30) | (0b001110000u32 << 21) | (imm5 << 16) | (0b001111 << 10) | (vn << 5) | rd;
+        let word =
+            (q << 30) | (0b001110000u32 << 21) | (imm5 << 16) | (0b001111 << 10) | (vn << 5) | rd;
         return Ok(EncodeResult::Word(word));
     }
 
     // NEON element-to-element move: mov v0.s[3], v1.s[0] -> INS Vd.Ts[i1], Vn.Ts[i2]
-    if let (Some(Operand::RegLane { reg: vd_name, elem_size: es_d, index: idx_d }),
-            Some(Operand::RegLane { reg: vn_name, elem_size: _es_n, index: idx_n })) =
-        (operands.first(), operands.get(1))
+    if let (
+        Some(Operand::RegLane {
+            reg: vd_name,
+            elem_size: es_d,
+            index: idx_d,
+        }),
+        Some(Operand::RegLane {
+            reg: vn_name,
+            elem_size: _es_n,
+            index: idx_n,
+        }),
+    ) = (operands.first(), operands.get(1))
     {
         let vd = parse_reg_num(vd_name).ok_or("invalid NEON vd")?;
         let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
@@ -79,7 +112,8 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
             "d" => ((idx_d << 4) | 0b01000, idx_n << 3),
             _ => return Err(format!("unsupported element size for ins: {}", es_d)),
         };
-        let word = ((0b01101110000u32 << 21) | (imm5 << 16)) | (imm4 << 11) | (1 << 10) | (vn << 5) | vd;
+        let word =
+            ((0b01101110000u32 << 21) | (imm5 << 16)) | (imm4 << 11) | (1 << 10) | (vn << 5) | vd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -110,7 +144,14 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
         if let Some((n, immr, imms)) = encode_bitmask_imm(imm as u64, is_64) {
             let sf = sf_bit(is_64);
             // ORR Rd, XZR, #imm: sf 01 100100 N immr imms 11111 Rd
-            let word = (sf << 31) | (0b01 << 29) | (0b100100 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (0b11111 << 5) | rd;
+            let word = (sf << 31)
+                | (0b01 << 29)
+                | (0b100100 << 23)
+                | (n << 22)
+                | (immr << 16)
+                | (imms << 10)
+                | (0b11111 << 5)
+                | rd;
             return Ok(EncodeResult::Word(word));
         }
 
@@ -119,7 +160,9 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     }
 
     // mov Xd, Xm -> ORR Xd, XZR, Xm
-    if let (Some(Operand::Reg(rd_name)), Some(Operand::Reg(rm_name))) = (operands.first(), operands.get(1)) {
+    if let (Some(Operand::Reg(rd_name)), Some(Operand::Reg(rm_name))) =
+        (operands.first(), operands.get(1))
+    {
         let rd = parse_reg_num(rd_name).ok_or("invalid rd")?;
         let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
         let is_64 = is_64bit_reg(rd_name);
@@ -180,7 +223,10 @@ pub(crate) fn encode_mov_wide_imm(rd: u32, is_64: bool, imm: u64) -> Result<Enco
 /// If the expression is a pure constant, returns Some((imm16, hw)) where
 /// imm16 is the relevant 16-bit chunk and hw is the halfword selector.
 /// If the expression contains a symbol reference, returns None (needs relocation).
-pub(crate) fn resolve_abs_g_modifier(kind: &str, symbol: &str) -> Result<Option<(u32, u32)>, String> {
+pub(crate) fn resolve_abs_g_modifier(
+    kind: &str,
+    symbol: &str,
+) -> Result<Option<(u32, u32)>, String> {
     let shift = match kind {
         "abs_g0" | "abs_g0_nc" | "abs_g0_s" => 0,
         "abs_g1" | "abs_g1_nc" | "abs_g1_s" => 16,
@@ -288,9 +334,16 @@ pub(crate) fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 // ── ADD/SUB ──────────────────────────────────────────────────────────────
 
-pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool) -> Result<EncodeResult, String> {
+pub(crate) fn encode_add_sub(
+    operands: &[Operand],
+    is_sub: bool,
+    set_flags: bool,
+) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
-        return Err(format!("add/sub requires 3 operands, got {}", operands.len()));
+        return Err(format!(
+            "add/sub requires 3 operands, got {}",
+            operands.len()
+        ));
     }
 
     // NEON vector form: ADD/SUB Vd.T, Vn.T, Vm.T
@@ -319,8 +372,12 @@ pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool
         let explicit_shift = if operands.len() > 3 {
             if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
                 kind == "lsl" && *amount == 12
-            } else { false }
-        } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let (imm12, sh) = if explicit_shift {
             // Explicit lsl #12: use the immediate as-is (must fit in 12 bits)
@@ -333,10 +390,20 @@ pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool
             // e.g., #4096 -> #1, lsl #12
             ((imm_val >> 12) as u32, 1u32)
         } else {
-            return Err(format!("immediate {} does not fit in add/sub imm12 encoding", imm_val));
+            return Err(format!(
+                "immediate {} does not fit in add/sub imm12 encoding",
+                imm_val
+            ));
         };
 
-        let word = (sf << 31) | (actual_op << 30) | (s_bit << 29) | (0b10001 << 24) | (sh << 22) | (imm12 << 10) | (rn << 5) | rd;
+        let word = (sf << 31)
+            | (actual_op << 30)
+            | (s_bit << 29)
+            | (0b10001 << 24)
+            | (sh << 22)
+            | (imm12 << 10)
+            | (rn << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -365,7 +432,9 @@ pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool
             });
         }
         if kind == "tprel_hi12" {
-            let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b10001 << 24) | (1 << 22)) | (rn << 5) | rd;
+            let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b10001 << 24) | (1 << 22))
+                | (rn << 5)
+                | rd;
             return Ok(EncodeResult::WordWithReloc {
                 word,
                 reloc: Relocation {
@@ -376,7 +445,12 @@ pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool
             });
         }
     }
-    if let Some(Operand::ModifierOffset { kind, symbol, offset }) = operands.get(2) {
+    if let Some(Operand::ModifierOffset {
+        kind,
+        symbol,
+        offset,
+    }) = operands.get(2)
+    {
         if kind == "lo12" {
             let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b10001 << 24)) | (rn << 5) | rd;
             return Ok(EncodeResult::WordWithReloc {
@@ -409,7 +483,13 @@ pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool
             };
             let imm3 = *amount & 0x7;
             // Extended register form: sf op S 01011 00 1 Rm option imm3 Rn Rd
-            let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24)) | (1 << 21) | (rm << 16) | (option << 13) | (imm3 << 10) | (rn << 5) | rd;
+            let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24))
+                | (1 << 21)
+                | (rm << 16)
+                | (option << 13)
+                | (imm3 << 10)
+                | (rn << 5)
+                | rd;
             return Ok(EncodeResult::Word(word));
         }
 
@@ -426,24 +506,34 @@ pub(crate) fn encode_add_sub(operands: &[Operand], is_sub: bool, set_flags: bool
         if (rn_is_sp || rd_is_sp) && operands.len() <= 3 {
             // Extended register form with UXTX #0: sf op S 01011 00 1 Rm 011 000 Rn Rd
             let option = if is_64 { 0b011u32 } else { 0b010u32 }; // UXTX for 64-bit, UXTW for 32-bit
-            let word = (((sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24)) | (1 << 21) | (rm << 16) | (option << 13)) | (rn << 5) | rd;
+            let word = (((sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24))
+                | (1 << 21)
+                | (rm << 16)
+                | (option << 13))
+                | (rn << 5)
+                | rd;
             return Ok(EncodeResult::Word(word));
         }
 
         // Check for shifted register: add Xd, Xn, Xm, lsl #N
-        let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
-            let st = match kind.as_str() {
-                "lsl" => 0b00u32,
-                "lsr" => 0b01,
-                "asr" => 0b10,
-                _ => 0b00,
+        let (shift_type, shift_amount) =
+            if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
+                let st = match kind.as_str() {
+                    "lsl" => 0b00u32,
+                    "lsr" => 0b01,
+                    "asr" => 0b10,
+                    _ => 0b00,
+                };
+                (st, *amount)
+            } else {
+                (0, 0)
             };
-            (st, *amount)
-        } else {
-            (0, 0)
-        };
 
-        let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24) | (shift_type << 22)) | (rm << 16) | ((shift_amount & 0x3F) << 10) | (rn << 5) | rd;
+        let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b01011 << 24) | (shift_type << 22))
+            | (rm << 16)
+            | ((shift_amount & 0x3F) << 10)
+            | (rn << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -469,7 +559,14 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
     // AND/ORR/EOR Rd, Rn, #imm (bitmask immediate)
     if let Some(Operand::Imm(imm)) = operands.get(2) {
         if let Some((n, immr, imms)) = encode_bitmask_imm(*imm as u64, is_64) {
-            let word = (sf << 31) | (opc << 29) | (0b100100 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+            let word = (sf << 31)
+                | (opc << 29)
+                | (0b100100 << 23)
+                | (n << 22)
+                | (immr << 16)
+                | (imms << 10)
+                | (rn << 5)
+                | rd;
             return Ok(EncodeResult::Word(word));
         }
         return Err(format!("cannot encode bitmask immediate: 0x{:x}", imm));
@@ -479,21 +576,25 @@ pub(crate) fn encode_logical(operands: &[Operand], opc: u32) -> Result<EncodeRes
     if let Some(Operand::Reg(rm_name)) = operands.get(2) {
         let rm = parse_reg_num(rm_name).ok_or("invalid rm")?;
 
-        let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
-            let st = match kind.as_str() {
-                "lsl" => 0b00u32,
-                "lsr" => 0b01,
-                "asr" => 0b10,
-                "ror" => 0b11,
-                _ => 0b00,
+        let (shift_type, shift_amount) =
+            if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
+                let st = match kind.as_str() {
+                    "lsl" => 0b00u32,
+                    "lsr" => 0b01,
+                    "asr" => 0b10,
+                    "ror" => 0b11,
+                    _ => 0b00,
+                };
+                (st, *amount)
+            } else {
+                (0, 0)
             };
-            (st, *amount)
-        } else {
-            (0, 0)
-        };
 
         let word = ((sf << 31) | (opc << 29) | (0b01010 << 24) | (shift_type << 22))
-            | (rm << 16) | ((shift_amount & 0x3F) << 10) | (rn << 5) | rd;
+            | (rm << 16)
+            | ((shift_amount & 0x3F) << 10)
+            | (rn << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -516,7 +617,11 @@ pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32
             continue;
         }
 
-        let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+        let mask = if size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << size) - 1
+        };
         let elem = val & mask;
 
         // Check that the pattern repeats
@@ -546,7 +651,11 @@ pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32
         let mut found_rotation = false;
         let mut rotation = 0u32;
         for r in 0..size {
-            let rot = if r == 0 { elem } else { ((elem >> r) | (elem << (size - r))) & mask };
+            let rot = if r == 0 {
+                elem
+            } else {
+                ((elem >> r) | (elem << (size - r))) & mask
+            };
             // Check if this is a contiguous run from bit 0
             let run = rot.trailing_ones();
             if run == ones {
@@ -611,7 +720,8 @@ pub(crate) fn encode_msub(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rm, _) = get_reg(operands, 2)?;
     let (ra, _) = get_reg(operands, 3)?;
     let sf = sf_bit(is_64);
-    let word = (sf << 31) | (0b0011011000 << 21) | (rm << 16) | (1 << 15) | (ra << 10) | (rn << 5) | rd;
+    let word =
+        (sf << 31) | (0b0011011000 << 21) | (rm << 16) | (1 << 15) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -622,8 +732,13 @@ pub(crate) fn encode_div(operands: &[Operand], unsigned: bool) -> Result<EncodeR
     let sf = sf_bit(is_64);
     let o1 = if unsigned { 0u32 } else { 1u32 };
     // Data-processing (2 source): sf 0 S=0 11010110 Rm 00001 o1 Rn Rd
-    let word = (sf << 31) | (0b0011010110 << 21) | (rm << 16)
-        | (0b00001 << 11) | (o1 << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (0b0011010110 << 21)
+        | (rm << 16)
+        | (0b00001 << 11)
+        | (o1 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -633,8 +748,7 @@ pub(crate) fn encode_smull(operands: &[Operand]) -> Result<EncodeResult, String>
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
     // SMADDL: 1 00 11011 001 Rm 0 11111 Rn Rd (Ra=XZR makes it SMULL)
-    let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16)
-        | (0b011111 << 10) | (rn << 5) | rd;
+    let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -644,8 +758,7 @@ pub(crate) fn encode_umull(operands: &[Operand]) -> Result<EncodeResult, String>
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
     // UMADDL: 1 00 11011 101 Rm 0 11111 Rn Rd (Ra=XZR makes it UMULL)
-    let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16)
-        | (0b011111 << 10) | (rn << 5) | rd;
+    let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16) | (0b011111 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -656,8 +769,7 @@ pub(crate) fn encode_smaddl(operands: &[Operand]) -> Result<EncodeResult, String
     let (rm, _) = get_reg(operands, 2)?;
     let (ra, _) = get_reg(operands, 3)?;
     // SMADDL: 1 00 11011 001 Rm 0 Ra Rn Rd
-    let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16)
-        | (ra << 10) | (rn << 5) | rd;
+    let word = (1u32 << 31) | (0b0011011001 << 21) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -668,8 +780,7 @@ pub(crate) fn encode_umaddl(operands: &[Operand]) -> Result<EncodeResult, String
     let (rm, _) = get_reg(operands, 2)?;
     let (ra, _) = get_reg(operands, 3)?;
     // UMADDL: 1 00 11011 101 Rm 0 Ra Rn Rd
-    let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16)
-        | (ra << 10) | (rn << 5) | rd;
+    let word = (1u32 << 31) | (0b0011011101 << 21) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -680,8 +791,13 @@ pub(crate) fn encode_mneg(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rm, _) = get_reg(operands, 2)?;
     let sf = sf_bit(is_64);
     // MSUB with Ra=XZR: sf 00 11011 000 Rm 1 11111 Rn Rd
-    let word = (sf << 31) | (0b0011011000 << 21) | (rm << 16)
-        | (1 << 15) | (0b11111 << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (0b0011011000 << 21)
+        | (rm << 16)
+        | (1 << 15)
+        | (0b11111 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -708,7 +824,8 @@ pub(crate) fn encode_neg(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rm, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
-    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
+    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2)
+    {
         let st = match kind.as_str() {
             "lsl" => 0b00u32,
             "lsr" => 0b01,
@@ -719,8 +836,14 @@ pub(crate) fn encode_neg(operands: &[Operand]) -> Result<EncodeResult, String> {
     } else {
         (0, 0)
     };
-    let word = (sf << 31) | (1 << 30) | (0b01011 << 24) | (shift_type << 22)
-        | (rm << 16) | ((shift_amount & 0x3F) << 10) | (0b11111 << 5) | rd;
+    let word = (sf << 31)
+        | (1 << 30)
+        | (0b01011 << 24)
+        | (shift_type << 22)
+        | (rm << 16)
+        | ((shift_amount & 0x3F) << 10)
+        | (0b11111 << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -729,7 +852,8 @@ pub(crate) fn encode_negs(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rm, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
-    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
+    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2)
+    {
         let st = match kind.as_str() {
             "lsl" => 0b00u32,
             "lsr" => 0b01,
@@ -740,8 +864,15 @@ pub(crate) fn encode_negs(operands: &[Operand]) -> Result<EncodeResult, String> 
     } else {
         (0, 0)
     };
-    let word = (sf << 31) | (1 << 30) | (1 << 29) | (0b01011 << 24) | (shift_type << 22)
-        | (rm << 16) | ((shift_amount & 0x3F) << 10) | (0b11111 << 5) | rd;
+    let word = (sf << 31)
+        | (1 << 30)
+        | (1 << 29)
+        | (0b01011 << 24)
+        | (shift_type << 22)
+        | (rm << 16)
+        | ((shift_amount & 0x3F) << 10)
+        | (0b11111 << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -754,7 +885,8 @@ pub(crate) fn encode_mvn(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
     let (rm, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
-    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
+    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(2)
+    {
         let st = match kind.as_str() {
             "lsl" => 0b00u32,
             "lsr" => 0b01,
@@ -766,8 +898,15 @@ pub(crate) fn encode_mvn(operands: &[Operand]) -> Result<EncodeResult, String> {
     } else {
         (0, 0)
     };
-    let word = (sf << 31) | (0b01 << 29) | (0b01010 << 24) | (shift_type << 22) | (1 << 21)
-        | (rm << 16) | ((shift_amount & 0x3F) << 10) | (0b11111 << 5) | rd;
+    let word = (sf << 31)
+        | (0b01 << 29)
+        | (0b01010 << 24)
+        | (shift_type << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | ((shift_amount & 0x3F) << 10)
+        | (0b11111 << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -787,7 +926,8 @@ pub(crate) fn encode_sbc(operands: &[Operand], set_flags: bool) -> Result<Encode
     let (rm, _) = get_reg(operands, 2)?;
     let sf = sf_bit(is_64);
     let s = if set_flags { 1u32 } else { 0 };
-    let word = ((sf << 31) | (1 << 30) | (s << 29) | (0b11010000 << 21) | (rm << 16)) | (rn << 5) | rd;
+    let word =
+        ((sf << 31) | (1 << 30) | (s << 29) | (0b11010000 << 21) | (rm << 16)) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -809,28 +949,53 @@ pub(crate) fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<Enco
                 // LSL #imm -> UBFM Rd, Rn, #(-imm mod width), #(width-1-imm)
                 let immr = (width - imm) % width;
                 let imms = width - 1 - imm;
-                let word = (sf << 31) | (0b10 << 29) | (0b100110 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+                let word = (sf << 31)
+                    | (0b10 << 29)
+                    | (0b100110 << 23)
+                    | (n << 22)
+                    | (immr << 16)
+                    | (imms << 10)
+                    | (rn << 5)
+                    | rd;
                 return Ok(EncodeResult::Word(word));
             }
             0b01 => {
                 // LSR #imm -> UBFM Rd, Rn, #imm, #(width-1)
                 let immr = imm;
                 let imms = width - 1;
-                let word = (sf << 31) | (0b10 << 29) | (0b100110 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+                let word = (sf << 31)
+                    | (0b10 << 29)
+                    | (0b100110 << 23)
+                    | (n << 22)
+                    | (immr << 16)
+                    | (imms << 10)
+                    | (rn << 5)
+                    | rd;
                 return Ok(EncodeResult::Word(word));
             }
             0b10 => {
                 // ASR #imm -> SBFM Rd, Rn, #imm, #(width-1)
                 let immr = imm;
                 let imms = width - 1;
-                let word = (sf << 31) | (0b100110 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+                let word = (sf << 31)
+                    | (0b100110 << 23)
+                    | (n << 22)
+                    | (immr << 16)
+                    | (imms << 10)
+                    | (rn << 5)
+                    | rd;
                 return Ok(EncodeResult::Word(word));
             }
             0b11 => {
                 // ROR #imm -> EXTR Rd, Rn, Rn, #imm
                 // EXTR: sf 0 0 100111 N 0 Rm imms Rn Rd
-                let word = (sf << 31) | (0b00100111 << 23) | (n << 22) | (rn << 16)
-                    | (imm << 10) | (rn << 5) | rd;
+                let word = (sf << 31)
+                    | (0b00100111 << 23)
+                    | (n << 22)
+                    | (rn << 16)
+                    | (imm << 10)
+                    | (rn << 5)
+                    | rd;
                 return Ok(EncodeResult::Word(word));
             }
             _ => {}
@@ -843,7 +1008,13 @@ pub(crate) fn encode_shift(operands: &[Operand], shift_type: u32) -> Result<Enco
         let sf = sf_bit(is_64);
         // Data-processing (2 source): sf 0 S=0 11010110 Rm 0010 op2 Rn Rd
         let op2 = shift_type; // 00=LSL, 01=LSR, 10=ASR, 11=ROR
-        let word = (sf << 31) | (0b0011010110 << 21) | (rm << 16) | (0b0010 << 12) | (op2 << 10) | (rn << 5) | rd;
+        let word = (sf << 31)
+            | (0b0011010110 << 21)
+            | (rm << 16)
+            | (0b0010 << 12)
+            | (op2 << 10)
+            | (rn << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -893,7 +1064,8 @@ pub(crate) fn encode_uxth(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
-    let word = ((sf << 31) | (0b10 << 29) | (0b100110 << 23) | (n << 22)) | (15 << 10) | (rn << 5) | rd;
+    let word =
+        ((sf << 31) | (0b10 << 29) | (0b100110 << 23) | (n << 22)) | (15 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -902,7 +1074,8 @@ pub(crate) fn encode_uxtb(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rn, _) = get_reg(operands, 1)?;
     let sf = sf_bit(is_64);
     let n = if is_64 { 1u32 } else { 0 };
-    let word = ((sf << 31) | (0b10 << 29) | (0b100110 << 23) | (n << 22)) | (7 << 10) | (rn << 5) | rd;
+    let word =
+        ((sf << 31) | (0b10 << 29) | (0b100110 << 23) | (n << 22)) | (7 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -919,8 +1092,14 @@ pub(crate) fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
         let (rm, _) = get_neon_reg(operands, 2)?;
         let q: u32 = if arr_d == "16b" { 1 } else { 0 };
         // ORN Vd.T, Vn.T, Vm.T: 0 Q 0 01110 11 1 Rm 000111 Rn Rd
-        let word = (q << 30) | (0b001110 << 24) | (0b11 << 22) | (1 << 21)
-            | (rm << 16) | (0b000111 << 10) | (rn << 5) | rd;
+        let word = (q << 30)
+            | (0b001110 << 24)
+            | (0b11 << 22)
+            | (1 << 21)
+            | (rm << 16)
+            | (0b000111 << 10)
+            | (rn << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -929,7 +1108,8 @@ pub(crate) fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rm, _) = get_reg(operands, 2)?;
     let sf = sf_bit(is_64);
 
-    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
+    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3)
+    {
         let st = match kind.as_str() {
             "lsl" => 0b00u32,
             "lsr" => 0b01,
@@ -943,8 +1123,15 @@ pub(crate) fn encode_orn(operands: &[Operand]) -> Result<EncodeResult, String> {
     };
 
     // ORN Rd, Rn, Rm [, shift #amount]: sf 01 01010 shift 1 Rm imm6 Rn Rd
-    let word = (sf << 31) | (0b01 << 29) | (0b01010 << 24) | (shift_type << 22) | (1 << 21)
-        | (rm << 16) | ((shift_amount & 0x3F) << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (0b01 << 29)
+        | (0b01010 << 24)
+        | (shift_type << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | ((shift_amount & 0x3F) << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -958,7 +1145,8 @@ pub(crate) fn encode_eon(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rm, _) = get_reg(operands, 2)?;
     let sf = sf_bit(is_64);
 
-    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
+    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3)
+    {
         let st = match kind.as_str() {
             "lsl" => 0b00u32,
             "lsr" => 0b01,
@@ -972,8 +1160,15 @@ pub(crate) fn encode_eon(operands: &[Operand]) -> Result<EncodeResult, String> {
     };
 
     // EON Rd, Rn, Rm [, shift #amount]: sf 10 01010 shift 1 Rm imm6 Rn Rd (opc=10, N=1)
-    let word = (sf << 31) | (0b10 << 29) | (0b01010 << 24) | (shift_type << 22) | (1 << 21)
-        | (rm << 16) | ((shift_amount & 0x3F) << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (0b10 << 29)
+        | (0b01010 << 24)
+        | (shift_type << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | ((shift_amount & 0x3F) << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -987,7 +1182,8 @@ pub(crate) fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> 
     let (rm, _) = get_reg(operands, 2)?;
     let sf = sf_bit(is_64);
 
-    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
+    let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3)
+    {
         let st = match kind.as_str() {
             "lsl" => 0b00u32,
             "lsr" => 0b01,
@@ -1001,8 +1197,15 @@ pub(crate) fn encode_bics(operands: &[Operand]) -> Result<EncodeResult, String> 
     };
 
     // BICS Rd, Rn, Rm [, shift #amount]: sf 11 01010 shift 1 Rm imm6 Rn Rd
-    let word = (sf << 31) | (0b11 << 29) | (0b01010 << 24) | (shift_type << 22) | (1 << 21)
-        | (rm << 16) | ((shift_amount & 0x3F) << 10) | (rn << 5) | rd;
+    let word = (sf << 31)
+        | (0b11 << 29)
+        | (0b01010 << 24)
+        | (shift_type << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | ((shift_amount & 0x3F) << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -1034,32 +1237,48 @@ pub(crate) fn encode_bic(operands: &[Operand]) -> Result<EncodeResult, String> {
         if let Some((n, immr, imms)) = encode_bitmask_imm(inverted, is_64) {
             // AND Rd, Rn, #~imm: sf 00 100100 N immr imms Rn Rd
             // AND Rd, Rn, #~imm encoding: sf=bit31, opc=00 (bits29:30), 100100 (bits23:28), N, immr, imms, Rn, Rd
-            let word = (sf << 31) | (0b100100 << 23) | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd;
+            let word = (sf << 31)
+                | (0b100100 << 23)
+                | (n << 22)
+                | (immr << 16)
+                | (imms << 10)
+                | (rn << 5)
+                | rd;
             return Ok(EncodeResult::Word(word));
         }
-        return Err(format!("cannot encode bitmask immediate for bic: 0x{:x} (inverted: 0x{:x})", imm, inverted));
+        return Err(format!(
+            "cannot encode bitmask immediate for bic: 0x{:x} (inverted: 0x{:x})",
+            imm, inverted
+        ));
     }
 
     // BIC Xd, Xn, Xm [, shift #amount]: sf 00 01010 shift 1 Rm imm6 Rn Rd (N=1)
     if let Some(Operand::Reg(rm_name)) = operands.get(2) {
         let rm = parse_reg_num(rm_name).ok_or("invalid rm register for bic")?;
 
-        let (shift_type, shift_amount) = if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
-            let st = match kind.as_str() {
-                "lsl" => 0b00u32,
-                "lsr" => 0b01,
-                "asr" => 0b10,
-                "ror" => 0b11,
-                _ => 0b00,
+        let (shift_type, shift_amount) =
+            if let Some(Operand::Shift { kind, amount }) = operands.get(3) {
+                let st = match kind.as_str() {
+                    "lsl" => 0b00u32,
+                    "lsr" => 0b01,
+                    "asr" => 0b10,
+                    "ror" => 0b11,
+                    _ => 0b00,
+                };
+                (st, *amount)
+            } else {
+                (0, 0)
             };
-            (st, *amount)
-        } else {
-            (0, 0)
-        };
 
         // BIC is AND with N=1 (bit 21): sf opc=00(bits29:30) 01010 shift 1 Rm imm6 Rn Rd
-        let word = (sf << 31) | (0b01010 << 24) | (shift_type << 22) | (1 << 21)
-            | (rm << 16) | ((shift_amount & 0x3F) << 10) | (rn << 5) | rd;
+        let word = (sf << 31)
+            | (0b01010 << 24)
+            | (shift_type << 22)
+            | (1 << 21)
+            | (rm << 16)
+            | ((shift_amount & 0x3F) << 10)
+            | (rn << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 

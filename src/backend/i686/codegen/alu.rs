@@ -28,11 +28,11 @@
 //! - ALU identities (+0/|0/^0/&-1/<<0) and commutative-immediate
 //!   canonicalisation: the IR already folds/canonicalises these (verified).
 
-use crate::ir::reexports::{IrBinOp, Operand, Value};
+use super::emit::{alu_mnemonic, shift_mnemonic, I686Codegen};
+use super::magic_div::{magic_s32, magic_u32};
 use crate::common::types::IrType;
 use crate::emit;
-use super::emit::{I686Codegen, alu_mnemonic, shift_mnemonic};
-use super::magic_div::{magic_s32, magic_u32};
+use crate::ir::reexports::{IrBinOp, Operand, Value};
 
 /// Location of a 32-bit binop operand for the direct-to-dest path.
 enum BinopLoc {
@@ -146,7 +146,9 @@ impl I686Codegen {
                 if let Some(&phys) = self.reg_assignments.get(&v.0) {
                     return Some(BinopLoc::Reg(super::emit::phys_reg_name(phys)));
                 }
-                self.state.get_slot(v.0).map(|slot| BinopLoc::Slot(self.slot_ref(slot)))
+                self.state
+                    .get_slot(v.0)
+                    .map(|slot| BinopLoc::Slot(self.slot_ref(slot)))
             }
         }
     }
@@ -372,21 +374,39 @@ impl I686Codegen {
     /// -> op src,%dst). Returns false when the shape doesn't fit; the caller
     /// falls back to the accumulator path. %eax/%ecx/%edx are untouched, so
     /// the accumulator cache stays valid.
-    fn try_emit_int_binop_direct(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand) -> bool {
+    fn try_emit_int_binop_direct(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> bool {
         use BinopLoc::*;
         // Only simple two-address ALU ops, shifts, and mul.
-        let is_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor);
+        let is_alu = matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+        );
         let is_mul = op == IrBinOp::Mul;
         let is_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
         if !is_alu && !is_mul && !is_shift {
             return false;
         }
-        let Some(dphys) = self.dest_reg(dest) else { return false };
+        let Some(dphys) = self.dest_reg(dest) else {
+            return false;
+        };
         let d = super::emit::phys_reg_name(dphys);
-        let Some(l) = self.binop_loc(lhs) else { return false };
-        let Some(r) = self.binop_loc(rhs) else { return false };
+        let Some(l) = self.binop_loc(lhs) else {
+            return false;
+        };
+        let Some(r) = self.binop_loc(rhs) else {
+            return false;
+        };
 
-        let commutative = matches!(op, IrBinOp::Add | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul);
+        let commutative = matches!(
+            op,
+            IrBinOp::Add | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul
+        );
         let lhs_is_d = matches!(&l, Reg(n) if *n == d);
         let rhs_is_d = matches!(&r, Reg(n) if *n == d);
 
@@ -424,17 +444,15 @@ impl I686Codegen {
                         }
                         emit!(self.state, "    imull ${}, %{}, %{}", i, n, d);
                     }
-                    Slot(sr) => {
-                        match i {
-                            0 => emit!(self.state, "    xorl %{}, %{}", d, d),
-                            1 => emit!(self.state, "    movl {}, %{}", sr, d),
-                            -1 => {
-                                emit!(self.state, "    movl {}, %{}", sr, d);
-                                emit!(self.state, "    negl %{}", d);
-                            }
-                            _ => emit!(self.state, "    imull ${}, {}, %{}", i, sr, d),
+                    Slot(sr) => match i {
+                        0 => emit!(self.state, "    xorl %{}, %{}", d, d),
+                        1 => emit!(self.state, "    movl {}, %{}", sr, d),
+                        -1 => {
+                            emit!(self.state, "    movl {}, %{}", sr, d);
+                            emit!(self.state, "    negl %{}", d);
                         }
-                    }
+                        _ => emit!(self.state, "    imull ${}, {}, %{}", i, sr, d),
+                    },
                     Imm(li) => {
                         let prod = li.wrapping_mul(i);
                         if prod == 0 {
@@ -544,14 +562,24 @@ impl I686Codegen {
         true
     }
 
-    pub(super) fn emit_int_binop_impl(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, _ty: IrType) {
+    pub(super) fn emit_int_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        _ty: IrType,
+    ) {
         // Direct-to-dest path: skip the accumulator entirely when the dest
         // has a register and both operands are register/slot/imm-resident.
         if self.try_emit_int_binop_direct(dest, op, lhs, rhs) {
             return;
         }
         // Immediate optimization for ALU ops
-        if matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+        if matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+        ) {
             if let Some(imm) = Self::const_as_imm32(rhs) {
                 self.operand_to_eax(lhs);
                 let mnem = alu_mnemonic(op);
@@ -689,7 +717,9 @@ impl I686Codegen {
                 // an i32 classifier value.
                 if let Some(imm) = Self::const_as_imm32(rhs) {
                     let bit = (imm as u32) % 32;
-                    self.state.out.emit_instr_imm_reg("    btl", bit as i64, "eax");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    btl", bit as i64, "eax");
                 } else {
                     // The index is wherever the shared staging above put it:
                     // a direct register home or %ecx. The old hardcoded

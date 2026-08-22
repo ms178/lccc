@@ -61,9 +61,21 @@ fn build_field_paths(func: &IrFunction) -> FxHashMap<u32, FieldPath> {
     let mut paths: FxHashMap<u32, FieldPath> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Alloca { dest, volatile, semantic_volatile, .. } = inst {
+            if let Instruction::Alloca {
+                dest,
+                volatile,
+                semantic_volatile,
+                ..
+            } = inst
+            {
                 if !volatile && !semantic_volatile {
-                    paths.insert(dest.0, FieldPath { root: dest.0, offset: 0 });
+                    paths.insert(
+                        dest.0,
+                        FieldPath {
+                            root: dest.0,
+                            offset: 0,
+                        },
+                    );
                 }
             }
         }
@@ -73,16 +85,26 @@ fn build_field_paths(func: &IrFunction) -> FxHashMap<u32, FieldPath> {
         for block in &func.blocks {
             for inst in &block.instructions {
                 let derived = match inst {
-                    Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
-                        c.to_i64().and_then(|off| {
-                            paths.get(&base.0).map(|p| {
-                                (dest.0, FieldPath { root: p.root, offset: p.offset + off })
-                            })
+                    Instruction::GetElementPtr {
+                        dest,
+                        base,
+                        offset: Operand::Const(c),
+                        ..
+                    } => c.to_i64().and_then(|off| {
+                        paths.get(&base.0).map(|p| {
+                            (
+                                dest.0,
+                                FieldPath {
+                                    root: p.root,
+                                    offset: p.offset + off,
+                                },
+                            )
                         })
-                    }
-                    Instruction::Copy { dest, src: Operand::Value(src) } => {
-                        paths.get(&src.0).copied().map(|p| (dest.0, p))
-                    }
+                    }),
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    } => paths.get(&src.0).copied().map(|p| (dest.0, p)),
                     _ => None,
                 };
                 if let Some((dest, path)) = derived {
@@ -174,7 +196,14 @@ fn apply_inst(
     changed: &mut usize,
 ) {
     match inst {
-        Instruction::Store { val, ptr, ty, seg_override, volatile, .. } => {
+        Instruction::Store {
+            val,
+            ptr,
+            ty,
+            seg_override,
+            volatile,
+            ..
+        } => {
             if *seg_override != AddressSpace::Default {
                 // Segment-relative store: target unknown, kill everything.
                 map.clear();
@@ -197,7 +226,14 @@ fn apply_inst(
                 map.clear();
             }
         }
-        Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
+        Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            seg_override,
+            volatile,
+            ..
+        } => {
             if *seg_override != AddressSpace::Default {
                 return;
             }
@@ -209,7 +245,10 @@ fn apply_inst(
             if let Some(fp) = paths.get(&ptr.0) {
                 if let Some(&(stored_v, store_size)) = map.get(fp) {
                     if rewrite && store_size == type_size(*ty) && stored_v.0 != dest.0 {
-                        *inst = Instruction::Copy { dest: *dest, src: Operand::Value(stored_v) };
+                        *inst = Instruction::Copy {
+                            dest: *dest,
+                            src: Operand::Value(stored_v),
+                        };
                         *changed += 1;
                     }
                 }
@@ -328,11 +367,17 @@ mod tests {
     }
 
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-        BasicBlock { label: BlockId(label), instructions, terminator, source_spans: vec![] }
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        }
     }
 
     fn store(val: u32, ptr: u32) -> Instruction {
-        Instruction::Store { volatile: false,
+        Instruction::Store {
+            volatile: false,
             val: Operand::Value(Value(val)),
             ptr: Value(ptr),
             ty: IrType::I64,
@@ -341,7 +386,8 @@ mod tests {
     }
 
     fn load(dest: u32, ptr: u32) -> Instruction {
-        Instruction::Load { volatile: false,
+        Instruction::Load {
+            volatile: false,
             dest: Value(dest),
             ptr: Value(ptr),
             ty: IrType::I64,
@@ -370,7 +416,10 @@ mod tests {
         assert_eq!(run(&mut f), 1);
         assert!(matches!(
             f.blocks[0].instructions[2],
-            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(7)) }
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Value(Value(7))
+            }
         ));
     }
 
@@ -394,7 +443,10 @@ mod tests {
             Terminator::Return(Some(Operand::Value(Value(2)))),
         )]);
         assert_eq!(run(&mut f), 0);
-        assert!(matches!(f.blocks[0].instructions[3], Instruction::Load { .. }));
+        assert!(matches!(
+            f.blocks[0].instructions[3],
+            Instruction::Load { .. }
+        ));
     }
 
     #[test]
@@ -427,7 +479,8 @@ mod tests {
             vec![
                 alloca(1),
                 alloca(3),
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(Value(1)), // address escapes!
                     ptr: Value(3),
                     ty: IrType::Ptr,
@@ -449,7 +502,10 @@ mod tests {
             vec![
                 alloca(1),
                 store(7, 1),
-                Instruction::Call { func: "opaque".into(), info: CallInfo::default() },
+                Instruction::Call {
+                    func: "opaque".into(),
+                    info: CallInfo::default(),
+                },
                 load(2, 1),
             ],
             Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -486,7 +542,10 @@ mod tests {
             ),
         ]);
         assert_eq!(run(&mut f), 0);
-        assert!(matches!(f.blocks[3].instructions[0], Instruction::Load { .. }));
+        assert!(matches!(
+            f.blocks[3].instructions[0],
+            Instruction::Load { .. }
+        ));
     }
 
     #[test]
@@ -512,7 +571,10 @@ mod tests {
         assert_eq!(run(&mut f), 1);
         assert!(matches!(
             f.blocks[3].instructions[0],
-            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(7)) }
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Value(Value(7))
+            }
         ));
     }
 
@@ -532,7 +594,8 @@ mod tests {
                 alloca(1),
                 store(7, 1),
                 gep3,
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(Value(9)),
                     ptr: Value(10),
                     ty: IrType::I8,
@@ -554,7 +617,8 @@ mod tests {
             vec![
                 alloca(1),
                 store(7, 1),
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(2),
                     ptr: Value(1),
                     ty: IrType::I32,
@@ -581,7 +645,8 @@ mod tests {
                     offset: Operand::Value(Value(99)),
                     ty: IrType::I8,
                 },
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(Value(9)),
                     ptr: Value(10),
                     ty: IrType::I8,

@@ -9,9 +9,9 @@ use crate::common::fx_hash::FxHashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 
-
 pub(super) fn create_plt_got(
-    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
+    objects: &[ElfObject],
+    globals: &mut FxHashMap<String, GlobalSymbol>,
 ) -> (Vec<String>, Vec<(String, bool)>) {
     let mut plt_names: Vec<String> = Vec::new();
     let mut got_only_names: Vec<String> = Vec::new();
@@ -21,25 +21,39 @@ pub(super) fn create_plt_got(
         for sec_idx in 0..obj.sections.len() {
             for rela in &obj.relocations[sec_idx] {
                 let si = rela.sym_idx as usize;
-                if si >= obj.symbols.len() { continue; }
+                if si >= obj.symbols.len() {
+                    continue;
+                }
                 let sym = &obj.symbols[si];
-                if sym.name.is_empty() { continue; }
-                let gsym_info = globals.get(sym.name.as_str()).map(|g| (g.is_dynamic, g.info & 0xf));
+                if sym.name.is_empty() {
+                    continue;
+                }
+                let gsym_info = globals
+                    .get(sym.name.as_str())
+                    .map(|g| (g.is_dynamic, g.info & 0xf));
 
                 match rela.rela_type {
-                    R_AARCH64_CALL26 | R_AARCH64_JUMP26 if gsym_info.map(|g| g.0).unwrap_or(false) => {
+                    R_AARCH64_CALL26 | R_AARCH64_JUMP26
+                        if gsym_info.map(|g| g.0).unwrap_or(false) =>
+                    {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type == STT_OBJECT {
                             if !copy_reloc_names.contains(&sym.name.to_string()) {
                                 copy_reloc_names.push(sym.name.to_string());
                             }
-                        } else if !plt_names.contains(&sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                        } else if !plt_names.contains(&sym.name.to_string()) {
+                            plt_names.push(sym.name.to_string());
+                        }
                     }
-                    R_AARCH64_ADR_PREL_PG_HI21 | R_AARCH64_ADD_ABS_LO12_NC
-                    | R_AARCH64_LDST64_ABS_LO12_NC | R_AARCH64_LDST32_ABS_LO12_NC
-                    | R_AARCH64_LDST8_ABS_LO12_NC | R_AARCH64_LDST16_ABS_LO12_NC
+                    R_AARCH64_ADR_PREL_PG_HI21
+                    | R_AARCH64_ADD_ABS_LO12_NC
+                    | R_AARCH64_LDST64_ABS_LO12_NC
+                    | R_AARCH64_LDST32_ABS_LO12_NC
+                    | R_AARCH64_LDST8_ABS_LO12_NC
+                    | R_AARCH64_LDST16_ABS_LO12_NC
                     | R_AARCH64_LDST128_ABS_LO12_NC
-                    if gsym_info.map(|g| g.0).unwrap_or(false) => {
+                        if gsym_info.map(|g| g.0).unwrap_or(false) =>
+                    {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type == STT_OBJECT {
                             if !copy_reloc_names.contains(&sym.name.to_string()) {
@@ -47,19 +61,25 @@ pub(super) fn create_plt_got(
                             }
                         } else {
                             // Function referenced via ADRP+ADD (e.g., taking address)
-                            if !plt_names.contains(&sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                            if !plt_names.contains(&sym.name.to_string()) {
+                                plt_names.push(sym.name.to_string());
+                            }
                         }
                     }
                     R_AARCH64_ABS64 if gsym_info.map(|g| g.0).unwrap_or(false) => {
                         let sym_type = gsym_info.map(|g| g.1).unwrap_or(0);
                         if sym_type != STT_OBJECT {
-                            if !plt_names.contains(&sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                            if !plt_names.contains(&sym.name.to_string()) {
+                                plt_names.push(sym.name.to_string());
+                            }
                         } else if !copy_reloc_names.contains(&sym.name.to_string()) {
                             copy_reloc_names.push(sym.name.to_string());
                         }
                     }
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => {
-                        if !got_only_names.contains(&sym.name.to_string()) && !plt_names.contains(&sym.name.to_string()) {
+                        if !got_only_names.contains(&sym.name.to_string())
+                            && !plt_names.contains(&sym.name.to_string())
+                        {
                             got_only_names.push(sym.name.to_string());
                         }
                     }
@@ -86,13 +106,17 @@ pub(super) fn create_plt_got(
     }
     // Mark aliases
     if !copy_reloc_lib_addrs.is_empty() {
-        let alias_names: Vec<String> = globals.iter()
+        let alias_names: Vec<String> = globals
+            .iter()
             .filter(|(name, g)| {
-                g.is_dynamic && !g.copy_reloc && (g.info & 0xf) == STT_OBJECT
+                g.is_dynamic
+                    && !g.copy_reloc
+                    && (g.info & 0xf) == STT_OBJECT
                     && !copy_reloc_names.contains(name)
-                    && g.from_lib.is_some() && g.lib_sym_value != 0
-                    && copy_reloc_lib_addrs.contains(
-                        &(g.from_lib.as_ref().unwrap().clone(), g.lib_sym_value))
+                    && g.from_lib.is_some()
+                    && g.lib_sym_value != 0
+                    && copy_reloc_lib_addrs
+                        .contains(&(g.from_lib.as_ref().unwrap().clone(), g.lib_sym_value))
             })
             .map(|(n, _)| n.clone())
             .collect();

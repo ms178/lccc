@@ -5,15 +5,11 @@
 //! shared module to avoid duplication with x86 and ARM.
 
 pub use crate::backend::elf::{
-    EM_RISCV,
-    SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_NOBITS, SHT_GROUP,
-    SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS,
-    STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_SECTION,
-    STV_DEFAULT,
-    SHN_UNDEF, SHN_ABS, SHN_COMMON,
-    parse_archive_members, parse_thin_archive_members, is_thin_archive,
-    LinkerSymbolAddresses, get_standard_linker_symbols,
+    get_standard_linker_symbols, is_thin_archive, parse_archive_members,
+    parse_thin_archive_members, LinkerSymbolAddresses, EM_RISCV, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS,
+    SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_PROGBITS, SHT_RELA,
+    SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT,
+    STT_SECTION, STV_DEFAULT,
 };
 
 use crate::backend::linker_common;
@@ -53,7 +49,10 @@ pub fn parse_archive(data: &[u8]) -> Result<Vec<(String, ElfObject)>, String> {
 
 /// Parse a GNU thin archive and return all ELF .o members.
 /// In thin archives, member data is stored in external files referenced by name.
-pub fn parse_thin_archive(data: &[u8], archive_path: &str) -> Result<Vec<(String, ElfObject)>, String> {
+pub fn parse_thin_archive(
+    data: &[u8],
+    archive_path: &str,
+) -> Result<Vec<(String, ElfObject)>, String> {
     let member_names = parse_thin_archive_members(data)?;
     let archive_dir = std::path::Path::new(archive_path)
         .parent()
@@ -62,8 +61,12 @@ pub fn parse_thin_archive(data: &[u8], archive_path: &str) -> Result<Vec<(String
     for name in member_names {
         let member_path = archive_dir.join(&name);
         let member_data = std::fs::read(&member_path).map_err(|e| {
-            format!("thin archive {}: failed to read member '{}': {}",
-                    archive_path, member_path.display(), e)
+            format!(
+                "thin archive {}: failed to read member '{}': {}",
+                archive_path,
+                member_path.display(),
+                e
+            )
         })?;
         if member_data.len() >= 4 && &member_data[0..4] == b"\x7fELF" {
             let full_name = format!("archive({})", name);
@@ -84,7 +87,6 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 /// Convenience wrapper that reads the file and delegates to
 /// `parse_shared_library_symbols`.
 pub fn read_shared_lib_symbols(path: &str) -> Result<Vec<DynSymbol>, String> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+    let data = std::fs::read(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
     parse_shared_library_symbols(&data, path)
 }

@@ -7,7 +7,9 @@ pub(crate) fn encode_lr(operands: &[Operand], funct3: u32) -> Result<EncodeResul
     let (rs1, _offset) = get_mem(operands, 1)?;
     // LR: funct7 = 00010 | aq | rl, rs2 = 0
     let funct7 = 0b0001000; // aq=0, rl=0 by default
-    Ok(EncodeResult::Word(encode_r(OP_AMO, rd, funct3, rs1, 0, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_AMO, rd, funct3, rs1, 0, funct7,
+    )))
 }
 
 pub(crate) fn encode_sc(operands: &[Operand], funct3: u32) -> Result<EncodeResult, String> {
@@ -15,18 +17,29 @@ pub(crate) fn encode_sc(operands: &[Operand], funct3: u32) -> Result<EncodeResul
     let rs2 = get_reg(operands, 1)?;
     let (rs1, _offset) = get_mem(operands, 2)?;
     let funct7 = 0b0001100; // SC: 00011 | aq=0 | rl=0
-    Ok(EncodeResult::Word(encode_r(OP_AMO, rd, funct3, rs1, rs2, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_AMO, rd, funct3, rs1, rs2, funct7,
+    )))
 }
 
-pub(crate) fn encode_amo(operands: &[Operand], funct3: u32, funct5: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_amo(
+    operands: &[Operand],
+    funct3: u32,
+    funct5: u32,
+) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
     let (rs1, _offset) = get_mem(operands, 2)?;
     let funct7 = funct5 << 2; // aq=0, rl=0
-    Ok(EncodeResult::Word(encode_r(OP_AMO, rd, funct3, rs1, rs2, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_AMO, rd, funct3, rs1, rs2, funct7,
+    )))
 }
 
-pub(crate) fn encode_lr_suffixed(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub(crate) fn encode_lr_suffixed(
+    mnemonic: &str,
+    operands: &[Operand],
+) -> Result<EncodeResult, String> {
     // Parse lr.w, lr.d, lr.w.aq, lr.w.rl, lr.w.aqrl, etc.
     let parts: Vec<&str> = mnemonic.split('.').collect();
     let funct3 = match parts.get(1).copied() {
@@ -38,10 +51,15 @@ pub(crate) fn encode_lr_suffixed(mnemonic: &str, operands: &[Operand]) -> Result
     let rd = get_reg(operands, 0)?;
     let (rs1, _) = get_mem(operands, 1)?;
     let funct7 = (0b00010 << 2) | (aq << 1) | rl;
-    Ok(EncodeResult::Word(encode_r(OP_AMO, rd, funct3, rs1, 0, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_AMO, rd, funct3, rs1, 0, funct7,
+    )))
 }
 
-pub(crate) fn encode_sc_suffixed(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub(crate) fn encode_sc_suffixed(
+    mnemonic: &str,
+    operands: &[Operand],
+) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = mnemonic.split('.').collect();
     let funct3 = match parts.get(1).copied() {
         Some("w") => 0b010,
@@ -53,10 +71,15 @@ pub(crate) fn encode_sc_suffixed(mnemonic: &str, operands: &[Operand]) -> Result
     let rs2 = get_reg(operands, 1)?;
     let (rs1, _) = get_mem(operands, 2)?;
     let funct7 = (0b00011 << 2) | (aq << 1) | rl;
-    Ok(EncodeResult::Word(encode_r(OP_AMO, rd, funct3, rs1, rs2, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_AMO, rd, funct3, rs1, rs2, funct7,
+    )))
 }
 
-pub(crate) fn encode_amo_suffixed(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+pub(crate) fn encode_amo_suffixed(
+    mnemonic: &str,
+    operands: &[Operand],
+) -> Result<EncodeResult, String> {
     // Parse e.g. amoswap.w.aqrl, amoadd.d.aq, etc.
     let parts: Vec<&str> = mnemonic.split('.').collect();
     if parts.len() < 2 {
@@ -88,7 +111,9 @@ pub(crate) fn encode_amo_suffixed(mnemonic: &str, operands: &[Operand]) -> Resul
     let rs2 = get_reg(operands, 1)?;
     let (rs1, _) = get_mem(operands, 2)?;
     let funct7 = (funct5 << 2) | (aq << 1) | rl;
-    Ok(EncodeResult::Word(encode_r(OP_AMO, rd, funct3, rs1, rs2, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        OP_AMO, rd, funct3, rs1, rs2, funct7,
+    )))
 }
 
 pub(crate) fn parse_aq_rl(suffixes: &[&str]) -> (u32, u32) {
@@ -98,7 +123,10 @@ pub(crate) fn parse_aq_rl(suffixes: &[&str]) -> (u32, u32) {
         match *s {
             "aq" => aq = 1,
             "rl" => rl = 1,
-            "aqrl" => { aq = 1; rl = 1; }
+            "aqrl" => {
+                aq = 1;
+                rl = 1;
+            }
             _ => {}
         }
     }

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::macro_defs::{MacroDef, parse_define};
+use super::macro_defs::{parse_define, MacroDef};
 use super::pipeline::Preprocessor;
 
 /// Maximum recursive inclusion depth, matching GCC's default of 200.
@@ -26,11 +26,29 @@ const MAX_INCLUDE_DEPTH: usize = 200;
 /// “all system headers win” policy that would break user -I shadowing for
 /// non-intrinsic files.
 const BUNDLED_X86_INTRINSIC_HEADERS: &[&str] = &[
-    "immintrin.h", "x86intrin.h", "xmmintrin.h", "emmintrin.h", "pmmintrin.h",
-    "tmmintrin.h", "smmintrin.h", "nmmintrin.h", "avxintrin.h", "avx2intrin.h",
-    "avx512fintrin.h", "fmaintrin.h", "bmi2intrin.h", "mmintrin.h", "shaintrin.h",
-    "vaesintrin.h", "vpclmulqdqintrin.h", "gfniintrin.h", "cetintrin.h",
-    "avx512bwintrin.h", "avx512cdintrin.h", "avx512dqintrin.h", "avx512vlintrin.h",
+    "immintrin.h",
+    "x86intrin.h",
+    "xmmintrin.h",
+    "emmintrin.h",
+    "pmmintrin.h",
+    "tmmintrin.h",
+    "smmintrin.h",
+    "nmmintrin.h",
+    "avxintrin.h",
+    "avx2intrin.h",
+    "avx512fintrin.h",
+    "fmaintrin.h",
+    "bmi2intrin.h",
+    "mmintrin.h",
+    "shaintrin.h",
+    "vaesintrin.h",
+    "vpclmulqdqintrin.h",
+    "gfniintrin.h",
+    "cetintrin.h",
+    "avx512bwintrin.h",
+    "avx512cdintrin.h",
+    "avx512dqintrin.h",
+    "avx512vlintrin.h",
 ];
 
 #[inline]
@@ -169,7 +187,9 @@ fn detect_include_guard(source: &str) -> Option<String> {
                         // This #endif closes the guard
                         found_endif = true;
                     }
-                } else if (after_hash.starts_with("else") || after_hash.starts_with("elif")) && if_depth == 1 {
+                } else if (after_hash.starts_with("else") || after_hash.starts_with("elif"))
+                    && if_depth == 1
+                {
                     // An #else/#elif at the outermost guard level means the
                     // header has different behavior on re-inclusion (e.g.,
                     // libev's ev_wrap.h defines macros on first include and
@@ -219,7 +239,10 @@ fn extract_identifier(s: &str) -> Option<String> {
 /// Strip inline block comments from a single line.
 /// Updates `in_block_comment` state for multi-line block comments.
 /// Also strips line comments (// ...).
-fn strip_inline_comments<'a>(line: &'a str, in_block_comment: &mut bool) -> std::borrow::Cow<'a, str> {
+fn strip_inline_comments<'a>(
+    line: &'a str,
+    in_block_comment: &mut bool,
+) -> std::borrow::Cow<'a, str> {
     // Fast path: no comment markers at all
     if !line.contains("/*") && !line.contains("//") {
         return std::borrow::Cow::Borrowed(line);
@@ -346,7 +369,12 @@ impl Preprocessor {
     /// or None if the include couldn't be resolved (falls back to old behavior).
     /// `line_num` is the 1-based source line and `col` is the 1-based column of `#`
     /// for diagnostics.
-    pub(super) fn handle_include(&mut self, path: &str, line_num: usize, col: usize) -> Option<String> {
+    pub(super) fn handle_include(
+        &mut self,
+        path: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
         let path = path.trim();
 
         // Expand macros in include path (for computed includes)
@@ -410,7 +438,11 @@ impl Preprocessor {
             // macro definitions active (e.g., TCC's x86_64-gen.c includes itself via
             // tcc.h with TARGET_DEFS_ONLY defined). Only block when nesting is excessive.
             {
-                let depth = self.include_stack.iter().filter(|p| *p == &resolved_path).count();
+                let depth = self
+                    .include_stack
+                    .iter()
+                    .filter(|p| *p == &resolved_path)
+                    .count();
                 if depth >= MAX_INCLUDE_DEPTH {
                     return Some(String::new());
                 }
@@ -490,7 +522,12 @@ impl Preprocessor {
     /// that contained the current file.
     /// `line_num` is the 1-based source line and `col` is the 1-based column of `#`
     /// for diagnostics.
-    pub(super) fn handle_include_next(&mut self, path: &str, line_num: usize, col: usize) -> Option<String> {
+    pub(super) fn handle_include_next(
+        &mut self,
+        path: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
         let path = path.trim();
 
         // Parse the include path
@@ -529,7 +566,9 @@ impl Preprocessor {
         let current_file = self.include_stack.last().cloned();
 
         // Resolve using include_next semantics
-        if let Some(resolved_path) = self.resolve_include_next_path(&include_path, current_file.as_ref()) {
+        if let Some(resolved_path) =
+            self.resolve_include_next_path(&include_path, current_file.as_ref())
+        {
             // Check for #pragma once (path and device/inode identity).
             if self.is_pragma_once_file(&resolved_path) {
                 return Some(String::new());
@@ -544,7 +583,11 @@ impl Preprocessor {
 
             // Check for excessive recursive inclusion
             {
-                let depth = self.include_stack.iter().filter(|p| *p == &resolved_path).count();
+                let depth = self
+                    .include_stack
+                    .iter()
+                    .filter(|p| *p == &resolved_path)
+                    .count();
                 if depth >= MAX_INCLUDE_DEPTH {
                     return Some(String::new());
                 }
@@ -592,10 +635,16 @@ impl Preprocessor {
     /// Resolve an include path using #include_next semantics: search from the
     /// next include path after the one containing the current file.
     /// `current_file` is the full path to the file containing the #include_next.
-    pub(super) fn resolve_include_next_path(&self, include_path: &str, current_file: Option<&PathBuf>) -> Option<PathBuf> {
+    pub(super) fn resolve_include_next_path(
+        &self,
+        include_path: &str,
+        current_file: Option<&PathBuf>,
+    ) -> Option<PathBuf> {
         // Collect all search paths in order:
         // -iquote -> -I -> -isystem -> default system -> -idirafter
-        let all_paths: Vec<&Path> = self.quote_include_paths.iter()
+        let all_paths: Vec<&Path> = self
+            .quote_include_paths
+            .iter()
             .chain(self.include_paths.iter())
             .chain(self.isystem_include_paths.iter())
             .chain(self.system_include_paths.iter())
@@ -638,7 +687,8 @@ impl Preprocessor {
                 if candidate.is_file() {
                     // Use canonicalize for comparison to detect same-file
                     let candidate_canon = std::fs::canonicalize(&candidate).ok();
-                    if let (Some(ref cur), Some(ref cand)) = (&current_file_canon, &candidate_canon) {
+                    if let (Some(ref cur), Some(ref cand)) = (&current_file_canon, &candidate_canon)
+                    {
                         if cur == cand {
                             continue;
                         }
@@ -665,7 +715,8 @@ impl Preprocessor {
     pub fn resolve_include_path(&mut self, include_path: &str, is_system: bool) -> Option<PathBuf> {
         // Compute cache key: (include_path, is_system, current_dir_for_quoted_includes)
         let current_dir_key = if !is_system {
-            self.include_stack.last()
+            self.include_stack
+                .last()
                 .and_then(|f| f.parent().map(|p| p.to_path_buf()))
                 .unwrap_or_default()
         } else {
@@ -683,7 +734,11 @@ impl Preprocessor {
     }
 
     /// Uncached include path resolution. Called by `resolve_include_path` on cache miss.
-    fn resolve_include_path_uncached(&self, include_path: &str, is_system: bool) -> Option<PathBuf> {
+    fn resolve_include_path_uncached(
+        &self,
+        include_path: &str,
+        is_system: bool,
+    ) -> Option<PathBuf> {
         // For quoted includes (#include "..."), search in this order:
         //   1. Current file's directory
         //   2. -iquote paths
@@ -705,7 +760,11 @@ impl Preprocessor {
         // headers shadowing LCCC's ABI-matched intrinsic declarations.
         if is_system && is_bundled_x86_intrinsic_header(include_path) {
             if let Some(bundled) = Preprocessor::bundled_include_dir() {
-                if self.system_include_paths.iter().any(|path| path == &bundled) {
+                if self
+                    .system_include_paths
+                    .iter()
+                    .any(|path| path == &bundled)
+                {
                     let candidate = bundled.join(include_path);
                     if candidate.is_file() {
                         return Some(make_absolute(&candidate));
@@ -786,14 +845,21 @@ impl Preprocessor {
         match header {
             "stdbool.h" => {
                 // Define true/false macros only when stdbool.h is explicitly included
-                crate::frontend::preprocessor::builtin_macros::define_stdbool_true_false(&mut self.macros);
+                crate::frontend::preprocessor::builtin_macros::define_stdbool_true_false(
+                    &mut self.macros,
+                );
             }
             "complex.h" => {
                 // C99 <complex.h> support - define standard complex macros
-                self.macros.define(parse_define("complex _Complex").expect("static define"));
-                self.macros.define(parse_define("_Complex_I (__extension__ 1.0fi)").expect("static define"));
-                self.macros.define(parse_define("I _Complex_I").expect("static define"));
-                self.macros.define(parse_define("__STDC_IEC_559_COMPLEX__ 1").expect("static define"));
+                self.macros
+                    .define(parse_define("complex _Complex").expect("static define"));
+                self.macros.define(
+                    parse_define("_Complex_I (__extension__ 1.0fi)").expect("static define"),
+                );
+                self.macros
+                    .define(parse_define("I _Complex_I").expect("static define"));
+                self.macros
+                    .define(parse_define("__STDC_IEC_559_COMPLEX__ 1").expect("static define"));
             }
             "stdarg.h" => {
                 // Define va_start/va_arg/va_end/va_copy as macros expanding to builtins.
@@ -856,33 +922,41 @@ impl Preprocessor {
         match header {
             "stdio.h" => {
                 // FILE type and standard streams (fallback only)
-                self.pending_injections.push("typedef struct _IO_FILE FILE;\n".to_string());
-                self.pending_injections.push("extern FILE *stdin;\n".to_string());
-                self.pending_injections.push("extern FILE *stdout;\n".to_string());
-                self.pending_injections.push("extern FILE *stderr;\n".to_string());
+                self.pending_injections
+                    .push("typedef struct _IO_FILE FILE;\n".to_string());
+                self.pending_injections
+                    .push("extern FILE *stdin;\n".to_string());
+                self.pending_injections
+                    .push("extern FILE *stdout;\n".to_string());
+                self.pending_injections
+                    .push("extern FILE *stderr;\n".to_string());
             }
             "errno.h" => {
                 // errno is typically a macro expanding to (*__errno_location())
                 // but for our purposes, treat it as an extern int
-                self.pending_injections.push("extern int errno;\n".to_string());
+                self.pending_injections
+                    .push("extern int errno;\n".to_string());
             }
             "complex.h" => {
                 // Declare complex math functions (fallback only)
-                self.pending_injections.push(concat!(
-                    "double creal(double _Complex __z);\n",
-                    "float crealf(float _Complex __z);\n",
-                    "long double creall(long double _Complex __z);\n",
-                    "double cimag(double _Complex __z);\n",
-                    "float cimagf(float _Complex __z);\n",
-                    "long double cimagl(long double _Complex __z);\n",
-                    "double _Complex conj(double _Complex __z);\n",
-                    "float _Complex conjf(float _Complex __z);\n",
-                    "long double _Complex conjl(long double _Complex __z);\n",
-                    "double cabs(double _Complex __z);\n",
-                    "float cabsf(float _Complex __z);\n",
-                    "double carg(double _Complex __z);\n",
-                    "float cargf(float _Complex __z);\n",
-                ).to_string());
+                self.pending_injections.push(
+                    concat!(
+                        "double creal(double _Complex __z);\n",
+                        "float crealf(float _Complex __z);\n",
+                        "long double creall(long double _Complex __z);\n",
+                        "double cimag(double _Complex __z);\n",
+                        "float cimagf(float _Complex __z);\n",
+                        "long double cimagl(long double _Complex __z);\n",
+                        "double _Complex conj(double _Complex __z);\n",
+                        "float _Complex conjf(float _Complex __z);\n",
+                        "long double _Complex conjl(long double _Complex __z);\n",
+                        "double cabs(double _Complex __z);\n",
+                        "float cabsf(float _Complex __z);\n",
+                        "double carg(double _Complex __z);\n",
+                        "float cargf(float _Complex __z);\n",
+                    )
+                    .to_string(),
+                );
             }
             _ => {}
         }

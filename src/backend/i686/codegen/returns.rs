@@ -1,10 +1,10 @@
 //! I686Codegen: return value operations.
 
-use crate::ir::reexports::{Operand, Value};
+use super::emit::I686Codegen;
+use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
-use crate::backend::traits::ArchCodegen;
-use super::emit::I686Codegen;
+use crate::ir::reexports::{Operand, Value};
 
 impl I686Codegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {

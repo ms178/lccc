@@ -4,15 +4,14 @@
 //! in x86/linker/elf.rs, arm/linker/elf.rs, and riscv/linker/elf_read.rs.
 //! The only parameter that differed was the expected e_machine value.
 
-use super::secdata::SectionData;
 use super::filemap::FileBacking;
+use super::secdata::SectionData;
+use super::types::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 use super::SymStr;
 use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL,
-    SHT_NOBITS, SHT_SYMTAB, SHT_RELA,
-    read_u16, read_u32, read_u64, read_i64, read_cstr, read_cstr_ref, slice_at, table_entry,
+    read_cstr, read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
+    ELFCLASS64, ELFDATA2LSB, ELF_MAGIC, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB,
 };
-use super::types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object};
 
 /// Parse an ELF64 relocatable object file (.o).
 ///
@@ -35,8 +34,12 @@ pub fn parse_elf64_object_at(
     expected_machine: u16,
 ) -> Result<Elf64Object, String> {
     parse_elf64_object_backed(
-        &FileBacking::owned(std::sync::Arc::clone(buf)), base, size,
-        source_name, expected_machine)
+        &FileBacking::owned(std::sync::Arc::clone(buf)),
+        base,
+        size,
+        source_name,
+        expected_machine,
+    )
 }
 
 /// Parse an ELF64 object from a standalone slice.
@@ -44,7 +47,11 @@ pub fn parse_elf64_object_at(
 /// Convenience wrapper for callers that do not hold an `Arc` buffer; it copies
 /// `data` once so section windows have something to share. Hot paths should
 /// use [`parse_elf64_object_at`].
-pub fn parse_elf64_object(data: &[u8], source_name: &str, expected_machine: u16) -> Result<Elf64Object, String> {
+pub fn parse_elf64_object(
+    data: &[u8],
+    source_name: &str,
+    expected_machine: u16,
+) -> Result<Elf64Object, String> {
     parse_elf64_object_inner(data, None, source_name, expected_machine)
 }
 
@@ -63,7 +70,10 @@ pub fn parse_elf64_object_backed(
 ) -> Result<Elf64Object, String> {
     let all = backing.as_slice();
     let Some(data) = all.get(base..base.checked_add(size).unwrap_or(usize::MAX)) else {
-        return Err(format!("{}: object extends past end of buffer", source_name));
+        return Err(format!(
+            "{}: object extends past end of buffer",
+            source_name
+        ));
     };
     parse_elf64_object_inner(data, Some((backing, base)), source_name, expected_machine)
 }
@@ -89,14 +99,19 @@ fn parse_elf64_object_inner(
 
     let e_type = read_u16(data, 16);
     if e_type != ET_REL {
-        return Err(format!("{}: not a relocatable object (type={})", source_name, e_type));
+        return Err(format!(
+            "{}: not a relocatable object (type={})",
+            source_name, e_type
+        ));
     }
 
     if expected_machine != 0 {
         let e_machine = read_u16(data, 18);
         if e_machine != expected_machine {
-            return Err(format!("{}: wrong machine type (expected={}, got={})",
-                source_name, expected_machine, e_machine));
+            return Err(format!(
+                "{}: wrong machine type (expected={}, got={})",
+                source_name, expected_machine, e_machine
+            ));
         }
     }
 
@@ -113,7 +128,10 @@ fn parse_elf64_object_inner(
     // A malformed e_shentsize would make every subsequent field read land at
     // the wrong offset; reject it up front rather than parsing garbage.
     if e_shentsize < 64 {
-        return Err(format!("{}: bogus e_shentsize {} (need >= 64)", source_name, e_shentsize));
+        return Err(format!(
+            "{}: bogus e_shentsize {} (need >= 64)",
+            source_name, e_shentsize
+        ));
     }
     // `Vec::with_capacity(e_shnum)` on an attacker-controlled u16 is bounded
     // (<= 65535 * 88 bytes), so no reservation guard is needed here.
@@ -122,7 +140,10 @@ fn parse_elf64_object_inner(
         // Overflow-safe: e_shoff is a full u64 and i * e_shentsize can itself
         // overflow, so both operations are checked.
         if table_entry(data, e_shoff, i, e_shentsize).is_none() {
-            return Err(format!("{}: section header {} out of bounds", source_name, i));
+            return Err(format!(
+                "{}: section header {} out of bounds",
+                source_name, i
+            ));
         }
         let off = e_shoff + i * e_shentsize;
         // ELF gABI: sh_addralign is 0 or a positive integral power of two.
@@ -139,7 +160,8 @@ fn parse_elf64_object_inner(
             return Err(format!(
                 "{}: section header {} has invalid sh_addralign 0x{:x} \
                  (must be 0 or a power of two)",
-                source_name, i, addralign));
+                source_name, i, addralign
+            ));
         }
         sections.push(Elf64Section {
             name_idx: read_u32(data, off),
@@ -201,10 +223,16 @@ fn parse_elf64_object_inner(
             // shared buffer (an archive member reading its neighbour) is still
             // rejected.
             if slice_at(data, start, len).is_none() {
-                return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
+                return Err(format!(
+                    "{}: section '{}' data out of bounds",
+                    source_name, sec.name
+                ));
             }
             let Some(sd) = SectionData::slice_backing(backing, origin + start, len) else {
-                return Err(format!("{}: section '{}' data out of bounds", source_name, sec.name));
+                return Err(format!(
+                    "{}: section '{}' data out of bounds",
+                    source_name, sec.name
+                ));
             };
             section_data.push(sd);
         }
@@ -226,12 +254,12 @@ fn parse_elf64_object_inner(
             // cost more than the section copy this type removed.
             let sym_data: &[u8] = section_data[i].as_slice();
             let sym_count = sym_data.len() / 24; // sizeof(Elf64_Sym) = 24
-            // Reserve the exact count up front. Growing one element at a time
-            // reallocated 15 times and memcpy'd 3.1 MB of Elf64Symbol on a
-            // 20 000-symbol object (DHAT). `sym_count` is derived from the
-            // section size, so this is exact, not a guess -- and it is bounded
-            // by the section that is already in memory, so a malformed header
-            // cannot make it request an absurd allocation.
+                                                 // Reserve the exact count up front. Growing one element at a time
+                                                 // reallocated 15 times and memcpy'd 3.1 MB of Elf64Symbol on a
+                                                 // 20 000-symbol object (DHAT). `sym_count` is derived from the
+                                                 // section size, so this is exact, not a guess -- and it is bounded
+                                                 // by the section that is already in memory, so a malformed header
+                                                 // cannot make it request an absurd allocation.
             symbols.reserve(sym_count);
             for j in 0..sym_count {
                 let off = j * 24;

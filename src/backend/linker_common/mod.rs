@@ -53,31 +53,31 @@
 
 // ── Submodule declarations ──────────────────────────────────────────────
 
-pub mod linker_script;
+mod archive;
+mod args;
 pub mod build_id;
-pub mod strmerge;
-mod types;
+mod check;
+pub mod comdat;
+mod dynamic;
+mod dynstr;
+mod eh_frame;
+pub mod filemap;
+mod gc_sections;
+mod hash;
+pub mod linker_script;
+mod mapfile;
+mod merge;
 pub mod parse_object;
 mod parse_shared;
-mod section_map;
-mod dynstr;
-mod hash;
-mod symbols;
-mod merge;
-mod dynamic;
-mod archive;
 mod resolve_lib;
-mod write;
-mod args;
-mod check;
-mod eh_frame;
-mod gc_sections;
-mod mapfile;
-mod version_script;
-mod symstr;
 mod secdata;
-pub mod filemap;
-pub mod comdat;
+mod section_map;
+pub mod strmerge;
+mod symbols;
+mod symstr;
+mod types;
+mod version_script;
+mod write;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -85,7 +85,7 @@ pub mod comdat;
 // callers see no change from the previous flat-file layout.
 
 // types.rs
-pub use types::{Elf64Section, Elf64Symbol, Elf64Rela, Elf64Object, DynSymbol};
+pub use types::{DynSymbol, Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 
 // parse_object.rs
 pub use parse_object::{parse_elf64_object, parse_elf64_object_at};
@@ -101,50 +101,50 @@ pub use dynstr::DynStrTab;
 pub use hash::{gnu_hash, sysv_hash};
 
 // symstr.rs
-pub use symstr::SymStr;
 pub use secdata::SectionData;
+pub use symstr::SymStr;
 
 // version_script.rs
-pub use version_script::{VersionScript, VersionNode, wildcard_match_pattern};
+pub use version_script::{wildcard_match_pattern, VersionNode, VersionScript};
 
 // mapfile.rs
-pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_map};
+pub use mapfile::{build_link_map, LinkMap, MapArchiveMember, MapSectionContribution};
 
 // symbols.rs
 pub use symbols::{
-    InputSection, OutputSection, GlobalSymbolOps,
-    is_linker_defined_symbol,
-    is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+    is_linker_defined_symbol, is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+    GlobalSymbolOps, InputSection, OutputSection,
 };
 
 // merge.rs
-pub use merge::{merge_sections_elf64, merge_sections_elf64_gc, allocate_common_symbols_elf64};
+pub use merge::{allocate_common_symbols_elf64, merge_sections_elf64, merge_sections_elf64_gc};
 
 // dynamic.rs
 pub use dynamic::{
-    load_shared_library_elf64,
-    load_shared_library_elf64_as_needed,
-    resolve_dynamic_symbols_elf64, register_symbols_elf64,
+    load_shared_library_elf64, load_shared_library_elf64_as_needed, register_symbols_elf64,
+    resolve_dynamic_symbols_elf64,
 };
 
 // archive.rs
-pub use archive::{load_archive_elf64, load_archive_elf64_shared,
-    load_archive_elf64_backed, load_thin_archive_elf64};
+pub use archive::{
+    load_archive_elf64, load_archive_elf64_backed, load_archive_elf64_shared,
+    load_thin_archive_elf64,
+};
 
 // resolve_lib.rs
 pub use resolve_lib::resolve_lib;
 
 // write.rs
-pub use write::{write_elf64_shdr, write_elf64_phdr, write_elf64_phdr_at, align_up_64, pad_to};
+pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};
 
 // args.rs
-pub use args::{parse_linker_args, exclude_libs_matches};
+pub use args::{exclude_libs_matches, parse_linker_args};
 
 // check.rs
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};
 
 // eh_frame.rs
-pub use eh_frame::{count_eh_frame_fdes, build_eh_frame_hdr};
+pub use eh_frame::{build_eh_frame_hdr, count_eh_frame_fdes};
 
 // gc_sections.rs
 pub use gc_sections::{gc_collect_sections_elf64, gc_collect_sections_elf64_roots};

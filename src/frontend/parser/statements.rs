@@ -4,9 +4,9 @@
 // break, continue, goto (including computed goto), labels, compound
 // statements, and inline assembly (GCC syntax).
 
-use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::Parser;
+use crate::frontend::lexer::token::TokenKind;
 
 impl Parser {
     pub(super) fn parse_compound_stmt(&mut self) -> CompoundStmt {
@@ -31,7 +31,7 @@ impl Parser {
         // Syntax: __label__ ident1, ident2, ... ;
         while matches!(self.peek(), TokenKind::GnuLabel) {
             self.advance(); // consume __label__
-            // Parse comma-separated list of label names
+                            // Parse comma-separated list of label names
             loop {
                 if let TokenKind::Identifier(name) = self.peek() {
                     local_labels.push(name.clone());
@@ -87,7 +87,10 @@ impl Parser {
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.shadowed_typedefs = saved_shadowed;
         self.attrs.restore_flags(saved_attr_flags);
-        CompoundStmt { items, local_labels }
+        CompoundStmt {
+            items,
+            local_labels,
+        }
     }
 
     pub(super) fn parse_stmt(&mut self) -> Stmt {
@@ -158,9 +161,7 @@ impl Parser {
                 self.expect_after(&TokenKind::Semicolon, "after do-while statement");
                 Stmt::DoWhile(Box::new(body), cond, span)
             }
-            TokenKind::For => {
-                self.parse_for_stmt()
-            }
+            TokenKind::For => self.parse_for_stmt(),
             TokenKind::LBrace => {
                 let compound = self.parse_compound_stmt();
                 Stmt::Compound(compound)
@@ -235,12 +236,14 @@ impl Parser {
                 // Check for label (identifier followed by colon)
                 let name_clone = name.clone();
                 let span = self.peek_span();
-                if self.pos + 1 < self.tokens.len() && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon) {
+                if self.pos + 1 < self.tokens.len()
+                    && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon)
+                {
                     self.advance(); // identifier
                     self.advance(); // colon
-                    // Skip optional label attributes: `label: __attribute__((unused));`
-                    // In GNU C, labels can have attributes (e.g., unused, hot, cold).
-                    // We consume and discard them since they only affect diagnostics.
+                                    // Skip optional label attributes: `label: __attribute__((unused));`
+                                    // In GNU C, labels can have attributes (e.g., unused, hot, cold).
+                                    // We consume and discard them since they only affect diagnostics.
                     self.skip_label_attributes();
                     let stmt = self.parse_stmt();
                     Stmt::Label(name_clone, Box::new(stmt), span)
@@ -250,9 +253,7 @@ impl Parser {
                     Stmt::Expr(Some(expr))
                 }
             }
-            TokenKind::Asm => {
-                self.parse_inline_asm()
-            }
+            TokenKind::Asm => self.parse_inline_asm(),
             TokenKind::Semicolon => {
                 self.advance();
                 Stmt::Expr(None)
@@ -306,7 +307,7 @@ impl Parser {
 
     fn parse_inline_asm(&mut self) -> Stmt {
         self.advance(); // consume 'asm' / '__asm__'
-        // Skip optional qualifiers: volatile, goto, inline
+                        // Skip optional qualifiers: volatile, goto, inline
         while matches!(self.peek(), TokenKind::Volatile)
             || matches!(self.peek(), TokenKind::Goto)
             || matches!(self.peek(), TokenKind::Inline)
@@ -350,7 +351,13 @@ impl Parser {
         self.expect_closing(&TokenKind::RParen, open);
         self.consume_if(&TokenKind::Semicolon);
 
-        Stmt::InlineAsm { template, outputs, inputs, clobbers, goto_labels }
+        Stmt::InlineAsm {
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            goto_labels,
+        }
     }
 
     fn parse_asm_string(&mut self) -> String {
@@ -414,7 +421,11 @@ impl Parser {
         let expr = self.parse_expr();
         self.expect_closing(&TokenKind::RParen, open);
 
-        AsmOperand { name, constraint, expr }
+        AsmOperand {
+            name,
+            constraint,
+            expr,
+        }
     }
 
     fn parse_asm_clobbers(&mut self) -> Vec<String> {

@@ -102,7 +102,9 @@ pub trait ArchCodegen {
     /// consult this: a same-slot copy is only a no-op when NEITHER side is
     /// register-resident (otherwise the register side is the live home and
     /// the copy must move the value into/out of it).
-    fn is_value_reg_assigned(&self, _vid: u32) -> bool { false }
+    fn is_value_reg_assigned(&self, _vid: u32) -> bool {
+        false
+    }
 
     /// The pointer directive for this architecture's data emission.
     fn ptr_directive(&self) -> PtrDirective;
@@ -193,7 +195,11 @@ pub trait ArchCodegen {
     /// path (their GlobalAddr instruction is skipped). MachInst cannot
     /// represent those as a register base, so such loads/stores must stay on
     /// the default path.
-    fn try_lower_machinst(&mut self, _inst: &Instruction, _folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>) -> bool {
+    fn try_lower_machinst(
+        &mut self,
+        _inst: &Instruction,
+        _folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
         false
     }
 
@@ -352,13 +358,27 @@ pub trait ArchCodegen {
 
     /// Emit a load using indexed addressing: dest = [base + (index << shift)].
     /// Returns false if it cannot be emitted (caller falls back to unfolding).
-    fn emit_load_indexed(&mut self, _dest: &Value, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+    fn emit_load_indexed(
+        &mut self,
+        _dest: &Value,
+        _base: &Value,
+        _index: &Value,
+        _shift: u8,
+        _ty: IrType,
+    ) -> bool {
         false
     }
 
     /// Emit a store using indexed addressing: [base + (index << shift)] = val.
     /// Returns false if it cannot be emitted (caller falls back to unfolding).
-    fn emit_store_indexed(&mut self, _val: &Operand, _base: &Value, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+    fn emit_store_indexed(
+        &mut self,
+        _val: &Operand,
+        _base: &Value,
+        _index: &Value,
+        _shift: u8,
+        _ty: IrType,
+    ) -> bool {
         false
     }
 
@@ -376,12 +396,26 @@ pub trait ArchCodegen {
     /// never-materialised GlobalAddr straight into the memory operand. Only
     /// consulted when the plain-register indexed fold was refused because the
     /// base has no register home. Default: unsupported.
-    fn emit_load_indexed_sym(&mut self, _dest: &Value, _sym: &str, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+    fn emit_load_indexed_sym(
+        &mut self,
+        _dest: &Value,
+        _sym: &str,
+        _index: &Value,
+        _shift: u8,
+        _ty: IrType,
+    ) -> bool {
         false
     }
 
     /// Store dual of [`Self::emit_load_indexed_sym`].
-    fn emit_store_indexed_sym(&mut self, _val: &Operand, _sym: &str, _index: &Value, _shift: u8, _ty: IrType) -> bool {
+    fn emit_store_indexed_sym(
+        &mut self,
+        _val: &Operand,
+        _sym: &str,
+        _index: &Value,
+        _shift: u8,
+        _ty: IrType,
+    ) -> bool {
         false
     }
 
@@ -445,12 +479,16 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Indirect(slot) => {
                     self.emit_load_ptr_from_slot(slot, base.0);
-                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
                     self.emit_typed_load_indirect(load_instr);
                 }
                 SlotAddr::Reg(reg) => {
                     self.emit_reg_to_addr(reg);
-                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
                     self.emit_typed_load_indirect(load_instr);
                 }
             }
@@ -485,13 +523,18 @@ pub trait ArchCodegen {
                     self.emit_typed_store_to_slot(store_instr, ty, folded_slot);
                 }
                 SlotAddr::Indirect(slot) => {
-                    self.emit_save_acc(); self.emit_load_ptr_from_slot(slot, base.0);
-                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
+                    self.emit_save_acc();
+                    self.emit_load_ptr_from_slot(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
                     self.emit_typed_store_indirect(store_instr, ty);
                 }
                 SlotAddr::Reg(reg) => {
                     self.emit_reg_to_addr(reg);
-                    if offset != 0 { self.emit_add_offset_to_addr_reg(offset); }
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg(offset);
+                    }
                     self.emit_typed_store_indirect(store_instr, ty);
                 }
             }
@@ -543,10 +586,14 @@ pub trait ArchCodegen {
         );
     }
 
-    fn supports_fused_float_mul_add(&self) -> bool { false }
+    fn supports_fused_float_mul_add(&self) -> bool {
+        false
+    }
 
     /// Whether the target can encode `other & ~value` directly.
-    fn supports_and_not(&self) -> bool { false }
+    fn supports_and_not(&self) -> bool {
+        false
+    }
 
     /// Emit an adjacent, single-use `not` + `and` pair. The default preserves
     /// semantics as two ordinary operations.
@@ -568,14 +615,23 @@ pub trait ArchCodegen {
     /// Whether the target can encode a shifted register directly as the second
     /// operand of an integer logical instruction (for example AArch64's
     /// `orr w0, w1, w2, lsr #5`).
-    fn supports_shifted_logical(&self) -> bool { false }
+    fn supports_shifted_logical(&self) -> bool {
+        false
+    }
 
     /// Emit `dest = other logical_op (shift_lhs shift_op shift_amount)`.
     /// Called only for an adjacent, single-use shift/logical pair.
-    fn emit_shifted_logical(&mut self, shift_dest: &Value, shift_op: IrBinOp,
-                            shift_lhs: &Operand, shift_amount: &Operand,
-                            logical_op: IrBinOp, other: &Operand,
-                            dest: &Value, ty: IrType) {
+    fn emit_shifted_logical(
+        &mut self,
+        shift_dest: &Value,
+        shift_op: IrBinOp,
+        shift_lhs: &Operand,
+        shift_amount: &Operand,
+        logical_op: IrBinOp,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+    ) {
         self.emit_int_binop(shift_dest, shift_op, shift_lhs, shift_amount, ty);
         self.emit_int_binop(dest, logical_op, other, &Operand::Value(*shift_dest), ty);
     }
@@ -958,8 +1014,7 @@ pub trait ArchCodegen {
 
     /// Stash whether the call's return value is _Float128 (ONE 16-byte XMM).
     /// x86-64 overrides this for use in emit_call_store_result.
-    fn set_call_ret_is_f128_sse(&mut self, _is_f128: bool) {
-    }
+    fn set_call_ret_is_f128_sse(&mut self, _is_f128: bool) {}
 
     /// Store the function's return value from ABI registers to the destination slot.
     ///
@@ -1064,7 +1119,10 @@ pub trait ArchCodegen {
                             self.emit_gep_direct_const(slot, off);
                         }
                         SlotAddr::Indirect(slot) => self.emit_gep_indirect_const(slot, off, base.0),
-                        SlotAddr::Reg(reg) => { self.emit_reg_to_acc(reg); self.emit_gep_add_const_to_acc(off); }
+                        SlotAddr::Reg(reg) => {
+                            self.emit_reg_to_acc(reg);
+                            self.emit_gep_add_const_to_acc(off);
+                        }
                     }
                     self.emit_store_result(dest);
                     return;
@@ -1105,7 +1163,10 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Direct(slot) => self.emit_slot_addr_to_secondary(slot, true, base.0),
                 SlotAddr::Indirect(slot) => self.emit_slot_addr_to_secondary(slot, false, base.0),
-                SlotAddr::Reg(reg) => { self.emit_reg_to_acc(reg); self.emit_acc_to_secondary(); }
+                SlotAddr::Reg(reg) => {
+                    self.emit_reg_to_acc(reg);
+                    self.emit_acc_to_secondary();
+                }
             }
         } else if let Some(br) = self.get_phys_reg_for_value(base.0) {
             // SOUNDNESS FALLBACK: slot-less register-resident base — move it
@@ -1206,7 +1267,10 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot, true, dest.0),
                 SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot, false, dest.0),
-                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); self.emit_memcpy_store_dest_from_acc(); }
+                SlotAddr::Reg(reg) => {
+                    self.emit_reg_to_addr(reg);
+                    self.emit_memcpy_store_dest_from_acc();
+                }
             }
         }
         if let Some(addr) = self.state_ref().resolve_slot_addr(src.0) {
@@ -1217,7 +1281,10 @@ pub trait ArchCodegen {
                 }
                 SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, src.0),
                 SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, src.0),
-                SlotAddr::Reg(reg) => { self.emit_reg_to_addr(reg); self.emit_memcpy_store_src_from_acc(); }
+                SlotAddr::Reg(reg) => {
+                    self.emit_reg_to_addr(reg);
+                    self.emit_memcpy_store_src_from_acc();
+                }
             }
         }
         self.emit_memcpy_impl(size);
@@ -1246,7 +1313,13 @@ pub trait ArchCodegen {
     /// `align` is the struct's alignment in bytes. Backends that fetch the
     /// struct from the overflow area must align it to `align` when `align > 8`
     /// (System V AMD64 psABI §3.5.7).
-    fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize);
+    fn emit_va_arg_struct(
+        &mut self,
+        dest_ptr: &Value,
+        va_list_ptr: &Value,
+        size: usize,
+        align: usize,
+    );
 
     /// Emit va_arg for struct types with eightbyte classification info.
     ///
@@ -1780,7 +1853,13 @@ pub trait ArchCodegen {
         let dummy_dest = Value(u32::MAX);
         self.emit_cmp(&dummy_dest, op, lhs, rhs, cmp_ty);
         // The accumulator holds the boolean result; select on it.
-        self.emit_select(dest, &Operand::Value(dummy_dest), true_val, false_val, sel_ty);
+        self.emit_select(
+            dest,
+            &Operand::Value(dummy_dest),
+            true_val,
+            false_val,
+            sel_ty,
+        );
         // Invalidate cache since dummy_dest may have polluted it.
         self.state().reg_cache.invalidate_all();
     }
@@ -1913,7 +1992,9 @@ pub trait ArchCodegen {
     /// Emit the function directive for the function type attribute.
     /// log2 of the function-entry alignment, or None for no alignment.
     /// Default none; the x86 backend overrides it from CodegenOptions.
-    fn function_alignment_log2(&self) -> Option<u32> { None }
+    fn function_alignment_log2(&self) -> Option<u32> {
+        None
+    }
 
     fn function_type_directive(&self) -> &'static str {
         "@function"
@@ -2189,8 +2270,16 @@ pub fn emit_store_default(
                     cg.emit_store_pair_indirect();
                 }
                 SlotAddr::Direct(slot) => cg.emit_store_pair_to_slot(slot),
-                SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_save_acc_pair(); cg.emit_store_pair_indirect(); }
-                SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_save_acc_pair(); cg.emit_store_pair_indirect(); }
+                SlotAddr::Indirect(slot) => {
+                    cg.emit_load_ptr_from_slot(slot, ptr.0);
+                    cg.emit_save_acc_pair();
+                    cg.emit_store_pair_indirect();
+                }
+                SlotAddr::Reg(reg) => {
+                    cg.emit_reg_to_addr(reg);
+                    cg.emit_save_acc_pair();
+                    cg.emit_store_pair_indirect();
+                }
             }
         }
         return;
@@ -2209,8 +2298,16 @@ pub fn emit_store_default(
                 cg.emit_load_operand(val);
                 cg.emit_typed_store_to_slot(store_instr, ty, slot);
             }
-            SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_load_operand(val); cg.emit_typed_store_indirect(store_instr, ty); }
-            SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_load_operand(val); cg.emit_typed_store_indirect(store_instr, ty); }
+            SlotAddr::Indirect(slot) => {
+                cg.emit_load_ptr_from_slot(slot, ptr.0);
+                cg.emit_load_operand(val);
+                cg.emit_typed_store_indirect(store_instr, ty);
+            }
+            SlotAddr::Reg(reg) => {
+                cg.emit_reg_to_addr(reg);
+                cg.emit_load_operand(val);
+                cg.emit_typed_store_indirect(store_instr, ty);
+            }
         }
     } else {
         cg.emit_load_operand(val);
@@ -2234,8 +2331,14 @@ pub fn emit_load_default(
                     cg.emit_load_pair_indirect();
                 }
                 SlotAddr::Direct(slot) => cg.emit_load_pair_from_slot(slot),
-                SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_load_pair_indirect(); }
-                SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_load_pair_indirect(); }
+                SlotAddr::Indirect(slot) => {
+                    cg.emit_load_ptr_from_slot(slot, ptr.0);
+                    cg.emit_load_pair_indirect();
+                }
+                SlotAddr::Reg(reg) => {
+                    cg.emit_reg_to_addr(reg);
+                    cg.emit_load_pair_indirect();
+                }
             }
             cg.emit_store_acc_pair(dest);
         }
@@ -2249,8 +2352,14 @@ pub fn emit_load_default(
                 cg.emit_typed_load_indirect(load_instr);
             }
             SlotAddr::Direct(slot) => cg.emit_typed_load_from_slot(load_instr, slot),
-            SlotAddr::Indirect(slot) => { cg.emit_load_ptr_from_slot(slot, ptr.0); cg.emit_typed_load_indirect(load_instr); }
-            SlotAddr::Reg(reg) => { cg.emit_reg_to_addr(reg); cg.emit_typed_load_indirect(load_instr); }
+            SlotAddr::Indirect(slot) => {
+                cg.emit_load_ptr_from_slot(slot, ptr.0);
+                cg.emit_typed_load_indirect(load_instr);
+            }
+            SlotAddr::Reg(reg) => {
+                cg.emit_reg_to_addr(reg);
+                cg.emit_typed_load_indirect(load_instr);
+            }
         }
         cg.emit_store_result(dest);
     }
@@ -2280,8 +2389,12 @@ pub fn emit_cast_default(
                     cg.state_ref().get_slot(dest.0),
                 ) {
                     if src_slot.0 != dest_slot.0 {
-                        cg.state().out.emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
-                        cg.state().out.emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
+                        cg.state()
+                            .out
+                            .emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
+                        cg.state()
+                            .out
+                            .emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
                     }
                 }
                 return;

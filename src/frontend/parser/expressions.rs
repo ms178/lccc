@@ -12,9 +12,9 @@
 //   -> parse_cast_expr -> parse_unary_expr -> parse_postfix_expr
 //   -> parse_primary_expr
 
-use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::Parser;
+use crate::frontend::lexer::token::TokenKind;
 
 /// C operator precedence levels (loosest to tightest binding).
 /// Used by the table-driven binary expression parser.
@@ -56,8 +56,10 @@ impl Parser {
         match ts {
             TypeSpecifier::Char | TypeSpecifier::UnsignedChar | TypeSpecifier::Bool => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed | TypeSpecifier::Unsigned => 4,
+            TypeSpecifier::Int
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned => 4,
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => 8, // 64-bit default
             TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => 8,
             TypeSpecifier::Float => 4,
@@ -116,7 +118,12 @@ impl Parser {
                 let then_expr = self.parse_expr();
                 self.expect_context(&TokenKind::Colon, "in conditional expression");
                 let else_expr = self.parse_conditional_expr();
-                Expr::Conditional(Box::new(cond), Box::new(then_expr), Box::new(else_expr), span)
+                Expr::Conditional(
+                    Box::new(cond),
+                    Box::new(then_expr),
+                    Box::new(else_expr),
+                    span,
+                )
             }
         } else {
             cond
@@ -298,9 +305,7 @@ impl Parser {
                 let expr = self.parse_cast_expr();
                 Expr::Deref(Box::new(expr), span)
             }
-            TokenKind::Sizeof => {
-                self.parse_sizeof_expr()
-            }
+            TokenKind::Sizeof => self.parse_sizeof_expr(),
             TokenKind::Alignof => {
                 let span = self.peek_span();
                 self.advance();
@@ -571,8 +576,9 @@ impl Parser {
                 let span = self.peek_span();
                 self.advance();
                 // Concatenate adjacent string literals (wide + narrow = wide)
-                while let TokenKind::StringLiteral(s2) | TokenKind::WideStringLiteral(s2)
-                    | TokenKind::Char16StringLiteral(s2) = self.peek()
+                while let TokenKind::StringLiteral(s2)
+                | TokenKind::WideStringLiteral(s2)
+                | TokenKind::Char16StringLiteral(s2) = self.peek()
                 {
                     result.push_str(s2);
                     self.advance();
@@ -622,7 +628,10 @@ impl Parser {
                     let open = self.peek_span();
                     self.advance();
                     let src_expr = self.parse_assignment_expr();
-                    self.expect_context(&TokenKind::Comma, "between '__builtin_convertvector' arguments");
+                    self.expect_context(
+                        &TokenKind::Comma,
+                        "between '__builtin_convertvector' arguments",
+                    );
                     let type_spec = self.parse_va_arg_type();
                     self.expect_closing(&TokenKind::RParen, open);
                     return Expr::ConvertVector(Box::new(src_expr), type_spec, span);
@@ -644,9 +653,7 @@ impl Parser {
                     expr
                 }
             }
-            TokenKind::Generic => {
-                self.parse_generic_selection()
-            }
+            TokenKind::Generic => self.parse_generic_selection(),
             TokenKind::Asm => {
                 // GCC asm expression
                 let span = self.peek_span();
@@ -676,7 +683,10 @@ impl Parser {
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after '__builtin_types_compatible_p'");
                 let type1 = self.parse_va_arg_type();
-                self.expect_context(&TokenKind::Comma, "between '__builtin_types_compatible_p' arguments");
+                self.expect_context(
+                    &TokenKind::Comma,
+                    "between '__builtin_types_compatible_p' arguments",
+                );
                 let type2 = self.parse_va_arg_type();
                 self.expect_closing(&TokenKind::RParen, open);
                 Expr::BuiltinTypesCompatibleP(type1, type2, span)
@@ -741,7 +751,11 @@ impl Parser {
             self.attrs.set_const(saved_const);
             self.expect_context(&TokenKind::Colon, "in '_Generic' association");
             let expr = self.parse_assignment_expr();
-            associations.push(GenericAssociation { type_spec, expr, is_const });
+            associations.push(GenericAssociation {
+                type_spec,
+                expr,
+                is_const,
+            });
             if !self.consume_if(&TokenKind::Comma) {
                 break;
             }

@@ -8,7 +8,7 @@
 use super::encoder::*;
 use crate::backend::elf::{ELFCLASS64, EM_X86_64};
 use crate::backend::elf_writer_common::{
-    X86Arch, ElfWriterCore, EncodeResult, EncoderReloc, JumpDetection,
+    ElfWriterCore, EncodeResult, EncoderReloc, JumpDetection, X86Arch,
 };
 
 /// x86-64 architecture implementation for the shared ELF writer.
@@ -49,15 +49,17 @@ impl X86Arch for X86_64Arch {
             }
         };
 
-        let relocations = encoder.relocations.into_iter().map(|r| {
-            EncoderReloc {
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| EncoderReloc {
                 offset: r.offset,
                 symbol: r.symbol,
                 reloc_type: r.reloc_type,
                 addend: r.addend,
                 diff_symbol: r.diff_symbol,
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(EncodeResult {
             bytes: encoder.bytes,
@@ -78,8 +80,7 @@ impl X86Arch for X86_64Arch {
         _section_data_len: u64,
     ) -> Result<EncodeResult, String> {
         use crate::backend::i686::assembler::encoder::{
-            InstructionEncoder as I686Encoder,
-            R_386_32, R_386_PC32, R_386_PLT32,
+            InstructionEncoder as I686Encoder, R_386_32, R_386_PC32, R_386_PLT32,
         };
         let mut encoder = I686Encoder::new();
         encoder.offset = 0;
@@ -90,24 +91,34 @@ impl X86Arch for X86_64Arch {
         // including the short-only forms (jecxz/jcxz/loop have no long form).
         let jump = {
             let mnem = &instr.mnemonic;
-            let is_jump = mnem == "jmp" || mnem == "loop"
-                || (mnem.starts_with('j') && mnem.len() >= 2);
+            let is_jump =
+                mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
                     let is_short_only = matches!(mnem.as_str(), "jecxz" | "jcxz" | "loop");
                     let is_conditional = mnem != "jmp";
                     if is_short_only && instr_len == 2 {
-                        Some(JumpDetection { is_conditional: true, already_short: true })
+                        Some(JumpDetection {
+                            is_conditional: true,
+                            already_short: true,
+                        })
                     } else {
                         let expected_len = if is_conditional { 6 } else { 5 };
                         if instr_len == expected_len {
-                            Some(JumpDetection { is_conditional, already_short: false })
+                            Some(JumpDetection {
+                                is_conditional,
+                                already_short: false,
+                            })
                         } else {
                             None
                         }
                     }
-                } else { None }
-            } else { None }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
         // The i686 encoder emits R_386_* relocation numbers, but the
@@ -126,9 +137,13 @@ impl X86Arch for X86_64Arch {
                 R_386_32 => R_X86_64_32,
                 R_386_PC32 => R_X86_64_PC32,
                 R_386_PLT32 => R_X86_64_PLT32,
-                other => return Err(format!(
-                    ".code32 in 64-bit object: relocation type {} for '{}' has no \
-                     R_X86_64_* equivalent with matching semantics", other, r.symbol)),
+                other => {
+                    return Err(format!(
+                        ".code32 in 64-bit object: relocation type {} for '{}' has no \
+                     R_X86_64_* equivalent with matching semantics",
+                        other, r.symbol
+                    ))
+                }
             };
             relocations.push(EncoderReloc {
                 offset: r.offset,
@@ -139,11 +154,19 @@ impl X86Arch for X86_64Arch {
             });
         }
 
-        Ok(EncodeResult { bytes: encoder.bytes, relocations, jump })
+        Ok(EncodeResult {
+            bytes: encoder.bytes,
+            relocations,
+            jump,
+        })
     }
 
-    fn elf_machine() -> u16 { EM_X86_64 }
-    fn elf_class() -> u8 { ELFCLASS64 }
+    fn elf_machine() -> u16 {
+        EM_X86_64
+    }
+    fn elf_class() -> u8 {
+        ELFCLASS64
+    }
 
     fn reloc_abs(size: usize) -> u32 {
         match size {
@@ -152,18 +175,38 @@ impl X86Arch for X86_64Arch {
             _ => R_X86_64_64,
         }
     }
-    fn reloc_abs64() -> u32 { R_X86_64_64 }
-    fn reloc_pc32() -> u32 { R_X86_64_PC32 }
-    fn reloc_pc64() -> u32 { R_X86_64_PC64 }
-    fn reloc_plt32() -> u32 { R_X86_64_PLT32 }
+    fn reloc_abs64() -> u32 {
+        R_X86_64_64
+    }
+    fn reloc_pc32() -> u32 {
+        R_X86_64_PC32
+    }
+    fn reloc_pc64() -> u32 {
+        R_X86_64_PC64
+    }
+    fn reloc_plt32() -> u32 {
+        R_X86_64_PLT32
+    }
 
-    fn uses_rel_format() -> bool { false }
+    fn uses_rel_format() -> bool {
+        false
+    }
 
-    fn reloc_pc8_internal() -> Option<u32> { Some(R_X86_64_PC8_INTERNAL) }
-    fn reloc_pc8() -> Option<u32> { Some(15) } // R_X86_64_PC8
-    fn reloc_abs32_for_internal() -> Option<u32> { Some(R_X86_64_32) }
-    fn supports_deferred_skips() -> bool { true }
-    fn resolve_set_aliases_in_data() -> bool { true }
+    fn reloc_pc8_internal() -> Option<u32> {
+        Some(R_X86_64_PC8_INTERNAL)
+    }
+    fn reloc_pc8() -> Option<u32> {
+        Some(15)
+    } // R_X86_64_PC8
+    fn reloc_abs32_for_internal() -> Option<u32> {
+        Some(R_X86_64_32)
+    }
+    fn supports_deferred_skips() -> bool {
+        true
+    }
+    fn resolve_set_aliases_in_data() -> bool {
+        true
+    }
 }
 
 /// Builds an ELF relocatable object file from parsed assembly items.

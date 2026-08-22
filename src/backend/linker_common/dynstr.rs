@@ -16,12 +16,19 @@ pub struct DynStrTab {
 
 impl DynStrTab {
     pub fn new() -> Self {
-        Self { data: vec![0], offsets: FxHashMap::default() }
+        Self {
+            data: vec![0],
+            offsets: FxHashMap::default(),
+        }
     }
 
     pub fn add(&mut self, s: &str) -> usize {
-        if s.is_empty() { return 0; }
-        if let Some(&off) = self.offsets.get(s) { return off; }
+        if s.is_empty() {
+            return 0;
+        }
+        if let Some(&off) = self.offsets.get(s) {
+            return off;
+        }
         let off = self.data.len();
         self.data.extend_from_slice(s.as_bytes());
         self.data.push(0);
@@ -30,7 +37,11 @@ impl DynStrTab {
     }
 
     pub fn get_offset(&self, s: &str) -> usize {
-        if s.is_empty() { 0 } else { self.offsets.get(s).copied().unwrap_or(0) }
+        if s.is_empty() {
+            0
+        } else {
+            self.offsets.get(s).copied().unwrap_or(0)
+        }
     }
 
     pub fn as_bytes(&self) -> &[u8] {

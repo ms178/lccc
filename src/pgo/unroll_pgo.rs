@@ -137,10 +137,14 @@ fn vectorize_profitable(trip: u64, body_insts: usize) -> bool {
 #[cfg(test)]
 mod vector_gate_tests {
     use super::vectorize_profitable;
-    #[test] fn short_loops_are_rejected() {
-        assert!(!vectorize_profitable(7, 8)); assert!(vectorize_profitable(8, 8));
+    #[test]
+    fn short_loops_are_rejected() {
+        assert!(!vectorize_profitable(7, 8));
+        assert!(vectorize_profitable(8, 8));
     }
-    #[test] fn large_loops_need_amortization() {
-        assert!(!vectorize_profitable(16, 81)); assert!(vectorize_profitable(32, 81));
+    #[test]
+    fn large_loops_need_amortization() {
+        assert!(!vectorize_profitable(16, 81));
+        assert!(vectorize_profitable(32, 81));
     }
 }

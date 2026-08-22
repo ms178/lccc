@@ -4,29 +4,13 @@
 //!
 //! Extracted from expr.rs to keep expression lowering manageable.
 
-use crate::frontend::parser::ast::{
-    BlockItem,
-    CompoundStmt,
-    Designator,
-    Expr,
-    GenericAssociation,
-    Initializer,
-    InitializerItem,
-    SizeofArg,
-    Stmt,
-    TypeSpecifier,
-};
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    Operand,
-    Terminator,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, CType};
 use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::{
+    BlockItem, CompoundStmt, Designator, Expr, GenericAssociation, Initializer, InitializerItem,
+    SizeofArg, Stmt, TypeSpecifier,
+};
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Terminator, Value};
 
 impl Lowerer {
     // -----------------------------------------------------------------------
@@ -71,13 +55,25 @@ impl Lowerer {
         // GCC extension: cast to union type, e.g. (union convert)x
         // Creates a temporary union, stores the value into the first matching member at offset 0.
         if let CType::Union(ref key) = target_ctype {
-            let union_size = self.types.borrow_struct_layouts().get(&**key).map(|l| l.size).unwrap_or(0);
+            let union_size = self
+                .types
+                .borrow_struct_layouts()
+                .get(&**key)
+                .map(|l| l.size)
+                .unwrap_or(0);
             let inner_ctype = self.expr_ctype(inner);
             let src = self.lower_expr(inner);
 
             // Allocate stack space for the union and zero-initialize it
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, size: union_size, ty: IrType::Ptr, align: 0, volatile: false, semantic_volatile: false });
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: union_size,
+                ty: IrType::Ptr,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            });
             self.zero_init_alloca(alloca, union_size);
 
             // If the source is an aggregate (struct/union), lower_expr returns a pointer
@@ -88,13 +84,23 @@ impl Lowerer {
                     let copy_size = src_size.min(union_size);
                     if copy_size > 0 {
                         let src_val = self.operand_to_value(src);
-                        self.emit(Instruction::Memcpy { dest: alloca, src: src_val, size: copy_size });
+                        self.emit(Instruction::Memcpy {
+                            dest: alloca,
+                            src: src_val,
+                            size: copy_size,
+                        });
                     }
                 }
                 _ => {
                     // Scalar source: store the value directly at offset 0
                     let store_ty = self.get_expr_type(inner);
-                    self.emit(Instruction::Store { volatile: false, val: src, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: src,
+                        ptr: alloca,
+                        ty: store_ty,
+                        seg_override: AddressSpace::Default,
+                    });
                 }
             }
 
@@ -117,7 +123,13 @@ impl Lowerer {
             let ptr = self.operand_to_value(src);
             let to_ty = self.type_spec_to_ir(target_type);
             let dest = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest, ptr, ty: to_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr,
+                ty: to_ty,
+                seg_override: AddressSpace::Default,
+            });
             return Operand::Value(dest);
         }
 
@@ -130,11 +142,24 @@ impl Lowerer {
             let from_ty = self.get_expr_type(inner);
 
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, size: vec_size, ty: IrType::Ptr, align: vec_size, volatile: false, semantic_volatile: false });
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: vec_size,
+                ty: IrType::Ptr,
+                align: vec_size,
+                volatile: false,
+                semantic_volatile: false,
+            });
             // Zero-initialize in case source is smaller than vector
             self.zero_init_alloca(alloca, vec_size);
             // Store scalar at offset 0 (bitwise reinterpretation)
-            self.emit(Instruction::Store { volatile: false, val: src, ptr: alloca, ty: from_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: src,
+                ptr: alloca,
+                ty: from_ty,
+                seg_override: AddressSpace::Default,
+            });
             return Operand::Value(alloca);
         }
 
@@ -150,10 +175,21 @@ impl Lowerer {
             // Different sizes: allocate new vector, memcpy what fits
             let src_val = self.operand_to_value(src);
             let alloca = self.fresh_value();
-            self.emit(Instruction::Alloca { dest: alloca, size: dst_size, ty: IrType::Ptr, align: dst_size, volatile: false, semantic_volatile: false });
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: dst_size,
+                ty: IrType::Ptr,
+                align: dst_size,
+                volatile: false,
+                semantic_volatile: false,
+            });
             self.zero_init_alloca(alloca, dst_size);
             let copy_size = src_size.min(dst_size);
-            self.emit(Instruction::Memcpy { dest: alloca, src: src_val, size: copy_size });
+            self.emit(Instruction::Memcpy {
+                dest: alloca,
+                src: src_val,
+                size: copy_size,
+            });
             return Operand::Value(alloca);
         }
 
@@ -229,13 +265,17 @@ impl Lowerer {
         let ctype = self.type_spec_to_ctype(type_spec);
         match (&ctype, init) {
             (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
-                let elem_size = elem_ct.size_ctx(&*self.types.borrow_struct_layouts()).max(1);
+                let elem_size = elem_ct
+                    .size_ctx(&*self.types.borrow_struct_layouts())
+                    .max(1);
                 // For char/unsigned char arrays with a single string literal initializer,
                 // the array size is the string length + 1 (null terminator)
                 if elem_size == 1 && items.len() == 1 {
                     if let Initializer::Expr(ref expr) = items[0].init {
-                        if let Expr::StringLiteral(ref s, _) | Expr::WideStringLiteral(ref s, _)
-                            | Expr::Char16StringLiteral(ref s, _) = expr {
+                        if let Expr::StringLiteral(ref s, _)
+                        | Expr::WideStringLiteral(ref s, _)
+                        | Expr::Char16StringLiteral(ref s, _) = expr
+                        {
                             if matches!(expr, Expr::StringLiteral(_, _)) {
                                 s.chars().count() + 1
                             } else if matches!(expr, Expr::Char16StringLiteral(_, _)) {
@@ -260,17 +300,28 @@ impl Lowerer {
         }
     }
 
-    pub(super) fn lower_compound_literal(&mut self, type_spec: &TypeSpecifier, init: &Initializer) -> Operand {
+    pub(super) fn lower_compound_literal(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+    ) -> Operand {
         let ty = self.type_spec_to_ir(type_spec);
         let ctype = self.type_spec_to_ctype(type_spec);
         let size = self.compound_literal_size(type_spec, init);
         let alloca = self.alloc_and_init_compound_literal(type_spec, init, ty, size);
 
         let struct_layout = self.get_struct_layout_for_type(type_spec);
-        let is_scalar = struct_layout.is_none() && !matches!(ctype, CType::Array(_, _)) && !ctype.is_vector();
+        let is_scalar =
+            struct_layout.is_none() && !matches!(ctype, CType::Array(_, _)) && !ctype.is_vector();
         if is_scalar {
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: alloca, ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: alloca,
+                ty,
+                seg_override: AddressSpace::Default,
+            });
             Operand::Value(loaded)
         } else {
             Operand::Value(alloca)
@@ -278,8 +329,12 @@ impl Lowerer {
     }
 
     pub(super) fn init_array_compound_literal(
-        &mut self, alloca: Value, items: &[InitializerItem], type_spec: &TypeSpecifier,
-        ty: IrType, size: usize,
+        &mut self,
+        alloca: Value,
+        items: &[InitializerItem],
+        type_spec: &TypeSpecifier,
+        ty: IrType,
+        size: usize,
     ) {
         let elem_size = self.compound_literal_elem_size(type_spec);
 
@@ -334,10 +389,9 @@ impl Lowerer {
                     // alloca pointer (not the struct data itself). We must memcpy
                     // from that alloca into the array element slot instead of storing
                     // the pointer value.
-                    let is_struct_elem = matches!(
-                        &elem_ctype,
-                        Some(CType::Struct(_)) | Some(CType::Union(_))
-                    ) && self.struct_value_size(expr).is_some();
+                    let is_struct_elem =
+                        matches!(&elem_ctype, Some(CType::Struct(_)) | Some(CType::Union(_)))
+                            && self.struct_value_size(expr).is_some();
 
                     if is_struct_elem {
                         let src_addr = self.get_struct_base_addr(expr);
@@ -352,15 +406,31 @@ impl Lowerer {
                             val
                         };
                         if current_idx == 0 && items.len() == 1 && elem_size == size {
-                            self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: alloca,
+                                ty,
+                                seg_override: AddressSpace::Default,
+                            });
                         } else {
                             let offset_val = Operand::Const(IrConst::ptr_int(elem_offset as i64));
                             let elem_ptr = self.fresh_value();
                             self.emit(Instruction::GetElementPtr {
-                                dest: elem_ptr, base: alloca, offset: offset_val, ty,
+                                dest: elem_ptr,
+                                base: alloca,
+                                offset: offset_val,
+                                ty,
                             });
-                            let store_ty = vector_elem_ir_ty.unwrap_or_else(|| Self::ir_type_for_size(elem_size));
-                            self.emit(Instruction::Store { volatile: false, val, ptr: elem_ptr, ty: store_ty , seg_override: AddressSpace::Default });
+                            let store_ty = vector_elem_ir_ty
+                                .unwrap_or_else(|| Self::ir_type_for_size(elem_size));
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: elem_ptr,
+                                ty: store_ty,
+                                seg_override: AddressSpace::Default,
+                            });
                         }
                     }
                 }
@@ -368,7 +438,8 @@ impl Lowerer {
                     // Handle list initializers for array elements (e.g., struct or nested array)
                     match &elem_ctype {
                         Some(CType::Struct(key)) | Some(CType::Union(key)) => {
-                            let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+                            let sub_layout =
+                                self.types.borrow_struct_layouts().get(&**key).cloned();
                             if let Some(sub_layout) = sub_layout {
                                 // Zero-init the element region first for partial initialization
                                 self.zero_init_region(alloca, elem_offset, elem_size);
@@ -385,11 +456,17 @@ impl Lowerer {
                                 self.zero_init_region(alloca, elem_offset, elem_size);
                             }
                             for (si, sub_item) in sub_items.iter().enumerate() {
-                                if si >= *inner_size { break; }
+                                if si >= *inner_size {
+                                    break;
+                                }
                                 if let Initializer::Expr(e) = &sub_item.init {
                                     let inner_offset = elem_offset + si * inner_elem_size;
                                     self.emit_init_expr_to_offset_bool(
-                                        e, alloca, inner_offset, inner_ir_ty, inner_is_bool,
+                                        e,
+                                        alloca,
+                                        inner_offset,
+                                        inner_ir_ty,
+                                        inner_is_bool,
                                     );
                                 }
                             }
@@ -399,13 +476,23 @@ impl Lowerer {
                             if let Some(first) = sub_items.first() {
                                 if let Initializer::Expr(expr) = &first.init {
                                     let val = self.lower_expr(expr);
-                                    let offset_val = Operand::Const(IrConst::ptr_int(elem_offset as i64));
+                                    let offset_val =
+                                        Operand::Const(IrConst::ptr_int(elem_offset as i64));
                                     let elem_ptr = self.fresh_value();
                                     self.emit(Instruction::GetElementPtr {
-                                        dest: elem_ptr, base: alloca, offset: offset_val, ty,
+                                        dest: elem_ptr,
+                                        base: alloca,
+                                        offset: offset_val,
+                                        ty,
                                     });
                                     let store_ty = Self::ir_type_for_size(elem_size);
-                                    self.emit(Instruction::Store { volatile: false, val, ptr: elem_ptr, ty: store_ty , seg_override: AddressSpace::Default });
+                                    self.emit(Instruction::Store {
+                                        volatile: false,
+                                        val,
+                                        ptr: elem_ptr,
+                                        ty: store_ty,
+                                        seg_override: AddressSpace::Default,
+                                    });
                                 }
                             }
                         }
@@ -476,14 +563,24 @@ impl Lowerer {
                 if let Some(elem_sz) = elem_size_opt {
                     // Both element and dimension are runtime
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_value), Operand::Value(elem_sz), ptr_int_ty);
+                    let mul = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_value),
+                        Operand::Value(elem_sz),
+                        ptr_int_ty,
+                    );
                     return Some(mul);
                 } else {
                     // Element is constant, dimension is runtime
                     let elem_size = self.sizeof_type(&elem_clone) as i64;
                     if elem_size > 1 {
                         let ptr_int_ty = crate::common::types::target_int_ir_type();
-                        let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_value), Operand::Const(IrConst::ptr_int(elem_size)), ptr_int_ty);
+                        let mul = self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(dim_value),
+                            Operand::Const(IrConst::ptr_int(elem_size)),
+                            ptr_int_ty,
+                        );
                         return Some(mul);
                     } else {
                         return Some(dim_value);
@@ -496,7 +593,12 @@ impl Lowerer {
                 let const_dim = self.expr_as_array_size(size_expr).unwrap_or(1);
                 if const_dim > 1 {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(elem_sz), Operand::Const(IrConst::ptr_int(const_dim)), ptr_int_ty);
+                    let mul = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(elem_sz),
+                        Operand::Const(IrConst::ptr_int(const_dim)),
+                        ptr_int_ty,
+                    );
                     return Some(mul);
                 } else {
                     return Some(elem_sz);
@@ -506,14 +608,22 @@ impl Lowerer {
         None
     }
 
-    pub(super) fn lower_generic_selection(&mut self, controlling: &Expr, associations: &[GenericAssociation]) -> Operand {
+    pub(super) fn lower_generic_selection(
+        &mut self,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) -> Operand {
         let selected = self.resolve_generic_selection(controlling, associations);
         self.lower_expr(selected)
     }
 
     /// Resolve a _Generic selection to the matching association expression.
     /// Used by both lower_generic_selection (rvalue) and lower_lvalue (lvalue context).
-    pub(super) fn resolve_generic_selection<'a>(&mut self, controlling: &Expr, associations: &'a [GenericAssociation]) -> &'a Expr {
+    pub(super) fn resolve_generic_selection<'a>(
+        &mut self,
+        controlling: &Expr,
+        associations: &'a [GenericAssociation],
+    ) -> &'a Expr {
         let controlling_ctype = self.get_expr_ctype(controlling);
         let controlling_ir_type = self.get_expr_type(controlling);
         // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue conversion,
@@ -521,7 +631,9 @@ impl Lowerer {
         // top-level qualifiers.
         let controlling_ctype = controlling_ctype.map(|ct| match ct {
             CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
-            CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default),
+            CType::Function(ft) => {
+                CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default)
+            }
             other => other,
         });
         // Determine if the controlling expression's type has a const-qualified pointee.
@@ -541,10 +653,12 @@ impl Lowerer {
         // (b) the controlling expression is a pointer with const pointee (ctrl_is_const=true),
         //     which means non-const pointer associations should not match.
         let has_const_differentiated_assocs = {
-            let non_default: Vec<_> = associations.iter()
+            let non_default: Vec<_> = associations
+                .iter()
                 .filter(|a| a.type_spec.is_some())
                 .collect();
-            let assocs_differ = non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
+            let assocs_differ =
+                non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
             assocs_differ || ctrl_is_const
         };
 
@@ -553,7 +667,9 @@ impl Lowerer {
 
         for assoc in associations {
             match &assoc.type_spec {
-                None => { default_expr = Some(&assoc.expr); }
+                None => {
+                    default_expr = Some(&assoc.expr);
+                }
                 Some(type_spec) => {
                     let assoc_ctype = self.type_spec_to_ctype(type_spec);
                     if let Some(ref ctrl_ct) = controlling_ctype {
@@ -580,7 +696,9 @@ impl Lowerer {
             }
         }
 
-        matched_expr.or(default_expr).unwrap_or(&associations[0].expr)
+        matched_expr
+            .or(default_expr)
+            .unwrap_or(&associations[0].expr)
     }
 
     pub(super) fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
@@ -632,13 +750,9 @@ impl Lowerer {
                 false
             }
             // Address-of: &y where y is `const int` produces `const int *`.
-            Expr::AddressOf(inner, _) => {
-                self.expr_is_const_qualified(inner)
-            }
+            Expr::AddressOf(inner, _) => self.expr_is_const_qualified(inner),
             // Comma: const-ness comes from the right-hand operand.
-            Expr::Comma(_, rhs, _) => {
-                self.expr_is_const_qualified(rhs)
-            }
+            Expr::Comma(_, rhs, _) => self.expr_is_const_qualified(rhs),
             _ => false,
         }
     }
@@ -648,10 +762,21 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     fn alloc_and_init_compound_literal(
-        &mut self, type_spec: &TypeSpecifier, init: &Initializer, ty: IrType, size: usize,
+        &mut self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+        ty: IrType,
+        size: usize,
     ) -> Value {
         let alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: alloca, size, ty, align: 0, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            size,
+            ty,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         match init {
             Initializer::Expr(expr) => {
@@ -666,11 +791,23 @@ impl Lowerer {
                         self.emit_string_to_alloca(alloca, s, 0, size);
                     } else {
                         let val = self.lower_expr(expr);
-                        self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Store {
+                            volatile: false,
+                            val,
+                            ptr: alloca,
+                            ty,
+                            seg_override: AddressSpace::Default,
+                        });
                     }
                 } else {
                     let val = self.lower_expr(expr);
-                    self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val,
+                        ptr: alloca,
+                        ty,
+                        seg_override: AddressSpace::Default,
+                    });
                 }
             }
             Initializer::List(items) => {
@@ -716,7 +853,8 @@ impl Lowerer {
             let addr = self.lvalue_addr(&lv);
             let result = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
-                dest: result, base: addr,
+                dest: result,
+                base: addr,
                 offset: Operand::Const(IrConst::I64(0)),
                 ty: IrType::Ptr,
             });
@@ -727,7 +865,10 @@ impl Lowerer {
             let dest = self.fresh_value();
             // Apply __asm__("label") redirect (e.g. stat -> stat64)
             let resolved = self.resolve_ref_name(name.as_str());
-            self.emit(Instruction::GlobalAddr { dest, name: resolved });
+            self.emit(Instruction::GlobalAddr {
+                dest,
+                name: resolved,
+            });
             return Operand::Value(dest);
         }
 
@@ -772,7 +913,9 @@ impl Lowerer {
                 // with the same name. Local variables shadow function names, so if a local
                 // variable called "link" exists, *link should dereference the variable,
                 // not be treated as a no-op function pointer dereference.
-                if self.known_functions.contains(name.as_str()) && self.lookup_var_info(name).is_none() {
+                if self.known_functions.contains(name.as_str())
+                    && self.lookup_var_info(name).is_none()
+                {
                     return true;
                 }
                 // Check if this variable is a function pointer (deref is no-op).
@@ -814,7 +957,9 @@ impl Lowerer {
                             // Extract the return type of the function pointer
                             if let Some(ret_ct) = ct.func_ptr_return_type(true) {
                                 // If the return type is a function pointer, deref is no-op
-                                if ret_ct.is_function_pointer() || matches!(&ret_ct, CType::Function(_)) {
+                                if ret_ct.is_function_pointer()
+                                    || matches!(&ret_ct, CType::Function(_))
+                                {
                                     return true;
                                 }
                             }
@@ -843,9 +988,10 @@ impl Lowerer {
         // (which need a real load despite having similar CType shapes).
         let pointee_is_no_load = |ct: &CType| -> bool {
             if let CType::Pointer(ref pointee, _) = ct {
-                matches!(pointee.as_ref(),
-                    CType::Array(_, _) | CType::Struct(_) | CType::Union(_) | CType::Vector(_, _))
-                    || pointee.is_complex()
+                matches!(
+                    pointee.as_ref(),
+                    CType::Array(_, _) | CType::Struct(_) | CType::Union(_) | CType::Vector(_, _)
+                ) || pointee.is_complex()
             } else {
                 false
             }
@@ -861,7 +1007,10 @@ impl Lowerer {
         }
         // Check if dereferencing yields an aggregate type.
         // In these cases, the result is an address (no Load needed).
-        if self.get_expr_ctype(inner).is_some_and(|ct| pointee_is_no_load(&ct)) {
+        if self
+            .get_expr_ctype(inner)
+            .is_some_and(|ct| pointee_is_no_load(&ct))
+        {
             return self.lower_expr(inner);
         }
         {
@@ -875,7 +1024,13 @@ impl Lowerer {
             // is an aggregate — so no Load is needed, just return the base address.
             if let CType::Array(ref elem, _) = inner_ct {
                 if elem.is_complex()
-                    || matches!(elem.as_ref(), CType::Struct(_) | CType::Union(_) | CType::Array(_, _) | CType::Vector(_, _))
+                    || matches!(
+                        elem.as_ref(),
+                        CType::Struct(_)
+                            | CType::Union(_)
+                            | CType::Array(_, _)
+                            | CType::Vector(_, _)
+                    )
                 {
                     return self.lower_expr(inner);
                 }
@@ -885,14 +1040,27 @@ impl Lowerer {
         let addr_space = self.get_addr_space_of_ptr_expr(inner);
         let ptr = self.lower_expr(inner);
         let dest = self.fresh_value();
-        let deref_ty = self.get_pointee_type_of_expr(inner).unwrap_or(crate::common::types::target_int_ir_type());
+        let deref_ty = self
+            .get_pointee_type_of_expr(inner)
+            .unwrap_or(crate::common::types::target_int_ir_type());
         let ptr_val = self.operand_to_value(ptr);
         let is_vol = self.pointee_expr_is_volatile(inner);
-        self.emit(Instruction::Load { volatile: is_vol, dest, ptr: ptr_val, ty: deref_ty, seg_override: addr_space });
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: ptr_val,
+            ty: deref_ty,
+            seg_override: addr_space,
+        });
         Operand::Value(dest)
     }
 
-    pub(super) fn lower_array_subscript(&mut self, expr: &Expr, base: &Expr, index: &Expr) -> Operand {
+    pub(super) fn lower_array_subscript(
+        &mut self,
+        expr: &Expr,
+        base: &Expr,
+        index: &Expr,
+    ) -> Operand {
         if self.subscript_result_is_array(expr) {
             let addr = self.compute_array_element_addr(base, index);
             return Operand::Value(addr);
@@ -913,7 +1081,13 @@ impl Lowerer {
         let addr = self.compute_array_element_addr(base, index);
         let dest = self.fresh_value();
         let is_vol = self.expr_access_is_volatile(expr);
-        self.emit(Instruction::Load { volatile: is_vol, dest, ptr: addr, ty: elem_ty, seg_override: addr_space });
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: addr,
+            ty: elem_ty,
+            seg_override: addr_space,
+        });
         Operand::Value(dest)
     }
 
@@ -921,7 +1095,12 @@ impl Lowerer {
     // Member access (s.field, p->field)
     // -----------------------------------------------------------------------
 
-    fn lower_member_access_impl(&mut self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> Operand {
+    fn lower_member_access_impl(
+        &mut self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Operand {
         let (field_offset, field_ty, bitfield, field_ctype) = if is_pointer {
             self.resolve_pointer_member_access_with_ctype(base_expr, field_name)
         } else {
@@ -944,18 +1123,18 @@ impl Lowerer {
 
         let field_addr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
-            dest: field_addr, base: base_addr,
+            dest: field_addr,
+            base: base_addr,
             offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
             ty: field_ty,
         });
 
         let is_addr_type = match &field_ctype {
-            Some(ct) => {
-                Self::is_aggregate_or_complex(ct)
-            }
+            Some(ct) => Self::is_aggregate_or_complex(ct),
             None => {
                 let resolved = self.resolve_field_ctype(base_expr, field_name, is_pointer);
-                resolved.as_ref()
+                resolved
+                    .as_ref()
                     .map(Self::is_aggregate_or_complex)
                     .unwrap_or(false)
             }
@@ -978,7 +1157,13 @@ impl Lowerer {
         } else {
             self.expr_access_is_volatile(base_expr)
         };
-        self.emit(Instruction::Load { volatile: is_vol, dest, ptr: field_addr, ty: field_ty, seg_override: addr_space });
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: field_addr,
+            ty: field_ty,
+            seg_override: addr_space,
+        });
         Operand::Value(dest)
     }
 
@@ -986,17 +1171,27 @@ impl Lowerer {
         self.lower_member_access_impl(base_expr, field_name, false)
     }
 
-    pub(super) fn lower_pointer_member_access(&mut self, base_expr: &Expr, field_name: &str) -> Operand {
+    pub(super) fn lower_pointer_member_access(
+        &mut self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> Operand {
         self.lower_member_access_impl(base_expr, field_name, true)
     }
 
     /// Check if a CType is an aggregate (array/struct/union) or complex type.
     /// These types are always accessed by address rather than loaded by value.
     fn is_aggregate_or_complex(ct: &CType) -> bool {
-        matches!(ct,
-            CType::Array(_, _) | CType::Struct(_) | CType::Union(_) |
-            CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble |
-            CType::Vector(_, _))
+        matches!(
+            ct,
+            CType::Array(_, _)
+                | CType::Struct(_)
+                | CType::Union(_)
+                | CType::ComplexFloat
+                | CType::ComplexDouble
+                | CType::ComplexLongDouble
+                | CType::Vector(_, _)
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1022,7 +1217,10 @@ impl Lowerer {
         // expressions that re-declare the same variable name (extremely common in
         // kernel macros like READ_ONCE, per-CPU accessors, container_of) permanently
         // overwrite the outer binding, producing wrong code.
-        let has_declarations = compound.items.iter().any(|item| matches!(item, BlockItem::Declaration(_)));
+        let has_declarations = compound
+            .items
+            .iter()
+            .any(|item| matches!(item, BlockItem::Declaration(_)));
         if has_declarations {
             self.push_scope();
         }
@@ -1091,7 +1289,11 @@ impl Lowerer {
     /// float->int = cvttps2dq (C cast semantics = truncation). The result is
     /// returned as the ALLOCA POINTER, matching every other vector
     /// expression convention (a raw-builtin caller then loads through it).
-    pub(super) fn lower_convertvector(&mut self, src_expr: &Expr, type_spec: &TypeSpecifier) -> Operand {
+    pub(super) fn lower_convertvector(
+        &mut self,
+        src_expr: &Expr,
+        type_spec: &TypeSpecifier,
+    ) -> Operand {
         use crate::ir::intrinsics::IntrinsicOp;
         let dst_ct = self.type_spec_to_ctype(type_spec);
         let src_ct = self.expr_ctype(src_expr);
@@ -1099,22 +1301,43 @@ impl Lowerer {
             matches!(&src_ct, CType::Vector(elem, _) if elem.is_floating()),
             matches!(&dst_ct, CType::Vector(elem, _) if elem.is_floating()),
         );
-        let src_size = match &src_ct { CType::Vector(_, s) => *s, _ => 16 };
-        let dst_size = match &dst_ct { CType::Vector(_, s) => *s, _ => 16 };
+        let src_size = match &src_ct {
+            CType::Vector(_, s) => *s,
+            _ => 16,
+        };
+        let dst_size = match &dst_ct {
+            CType::Vector(_, s) => *s,
+            _ => 16,
+        };
         if src_size != 16 || dst_size != 16 {
-            panic!("__builtin_convertvector: only 16-byte vectors are supported (got {} -> {})", src_size, dst_size);
+            panic!(
+                "__builtin_convertvector: only 16-byte vectors are supported (got {} -> {})",
+                src_size, dst_size
+            );
         }
         let src_ptr_op = self.lower_expr(src_expr);
         let src_ptr = self.operand_to_value(src_ptr_op);
         let result = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: result, ty: IrType::Ptr, size: 16, align: 0, volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: 16,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
         let op = match (src_is_float, dst_is_float) {
             (false, true) => IntrinsicOp::CvtEp32ToPs128,   // cvtdq2ps
             (true, false) => IntrinsicOp::CvttPs2Ep32_128,  // cvttps2dq (truncate)
             other => panic!("__builtin_convertvector: unsupported lane conversion {:?} (only int<->float 32-bit lanes)", other),
         };
         let dest_val = self.fresh_value();
-        self.emit(Instruction::Intrinsic { dest: Some(dest_val), op, dest_ptr: Some(result), args: vec![Operand::Value(src_ptr)] });
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest_val),
+            op,
+            dest_ptr: Some(result),
+            args: vec![Operand::Value(src_ptr)],
+        });
         Operand::Value(result)
     }
 
@@ -1173,7 +1396,11 @@ impl Lowerer {
         let va_list_ptr = self.operand_to_value(ap_val);
         let result_ty = self.resolve_va_arg_type(type_spec);
         let dest = self.fresh_value();
-        self.emit(Instruction::VaArg { dest, va_list_ptr, result_ty });
+        self.emit(Instruction::VaArg {
+            dest,
+            va_list_ptr,
+            result_ty,
+        });
         Operand::Value(dest)
     }
 
@@ -1245,7 +1472,8 @@ impl Lowerer {
                 size: alloc_size,
                 ty: IrType::I64,
                 align: struct_align,
-                volatile: false, semantic_volatile: false,
+                volatile: false,
+                semantic_volatile: false,
             });
             self.emit(Instruction::VaArgStruct {
                 dest_ptr: alloca,
@@ -1260,11 +1488,19 @@ impl Lowerer {
         // Non-x86-64 targets: small structs passed by value inline.
         // Read each slot from the va_list and store to a temporary alloca.
         let slot_size = if self.target == Target::I686 { 4 } else { 8 };
-        let default_slot_ty = if self.target == Target::I686 { IrType::I32 } else { IrType::I64 };
+        let default_slot_ty = if self.target == Target::I686 {
+            IrType::I32
+        } else {
+            IrType::I64
+        };
 
         // Number of slots needed (round up)
         let num_slots = struct_size.div_ceil(slot_size);
-        let alloc_size = if struct_size > 0 { num_slots * slot_size } else { slot_size };
+        let alloc_size = if struct_size > 0 {
+            num_slots * slot_size
+        } else {
+            slot_size
+        };
 
         // Allocate temporary storage for the struct
         let alloca = self.fresh_value();
@@ -1273,7 +1509,8 @@ impl Lowerer {
             size: alloc_size,
             ty: default_slot_ty,
             align: struct_align,
-            volatile: false, semantic_volatile: false,
+            volatile: false,
+            semantic_volatile: false,
         });
 
         // Get the va_list pointer (same logic as scalar va_arg)
@@ -1293,7 +1530,8 @@ impl Lowerer {
         //   store(aligned_ptr, va_list_ptr)
         if self.target == Target::Riscv64 && struct_align > slot_size {
             let cur_ptr = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false,
+            self.emit(Instruction::Load {
+                volatile: false,
                 dest: cur_ptr,
                 ptr: va_list_ptr,
                 ty: IrType::Ptr,
@@ -1312,7 +1550,8 @@ impl Lowerer {
                 Operand::Const(IrConst::I64(-align_val)),
                 IrType::Ptr,
             );
-            self.emit(Instruction::Store { volatile: false,
+            self.emit(Instruction::Store {
+                volatile: false,
                 val: Operand::Value(aligned),
                 ptr: va_list_ptr,
                 ty: IrType::Ptr,
@@ -1330,7 +1569,8 @@ impl Lowerer {
             });
             if i == 0 {
                 // Store directly to the alloca base
-                self.emit(Instruction::Store { volatile: false,
+                self.emit(Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(slot_val),
                     ptr: alloca,
                     ty: default_slot_ty,
@@ -1347,7 +1587,8 @@ impl Lowerer {
                     rhs: Operand::Const(IrConst::I64(offset)),
                     ty: IrType::Ptr,
                 });
-                self.emit(Instruction::Store { volatile: false,
+                self.emit(Instruction::Store {
+                    volatile: false,
                     val: Operand::Value(slot_val),
                     ptr: offset_ptr,
                     ty: default_slot_ty,
@@ -1383,8 +1624,14 @@ impl Lowerer {
         // The two F32 components (real, imag) are packed into a single 8-byte value:
         // - x86-64: packed in one XMM register, read as F64
         // - RISC-V: packed in one integer register, read as I64
-        if *ctype == CType::ComplexFloat && (self.target == Target::X86_64 || self.target == Target::Riscv64) {
-            let read_ty = if self.target == Target::X86_64 { IrType::F64 } else { IrType::I64 };
+        if *ctype == CType::ComplexFloat
+            && (self.target == Target::X86_64 || self.target == Target::Riscv64)
+        {
+            let read_ty = if self.target == Target::X86_64 {
+                IrType::F64
+            } else {
+                IrType::I64
+            };
             let packed = self.fresh_value();
             self.emit(Instruction::VaArg {
                 dest: packed,
@@ -1399,15 +1646,26 @@ impl Lowerer {
                 ty: IrType::Ptr,
                 size: 8,
                 align: 0,
-                volatile: false, semantic_volatile: false,
+                volatile: false,
+                semantic_volatile: false,
             });
-            self.emit(Instruction::Store { volatile: false, val: Operand::Value(packed), ptr: tmp_alloca, ty: read_ty,
-             seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(packed),
+                ptr: tmp_alloca,
+                ty: read_ty,
+                seg_override: AddressSpace::Default,
+            });
 
             // Load real part (first F32 at offset 0)
             let real_dest = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: real_dest, ptr: tmp_alloca, ty: IrType::F32,
-             seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: real_dest,
+                ptr: tmp_alloca,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
 
             // Load imag part (second F32 at offset +4)
             let imag_ptr = self.fresh_value();
@@ -1420,12 +1678,22 @@ impl Lowerer {
                 ty: ptr_int_ty,
             });
             let imag_dest = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: imag_dest, ptr: imag_ptr, ty: IrType::F32,
-             seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: imag_dest,
+                ptr: imag_ptr,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
 
             // Allocate and store the complex float value
             let alloca = self.alloca_complex(ctype);
-            self.store_complex_parts(alloca, Operand::Value(real_dest), Operand::Value(imag_dest), ctype);
+            self.store_complex_parts(
+                alloca,
+                Operand::Value(real_dest),
+                Operand::Value(imag_dest),
+                ctype,
+            );
             return Operand::Value(alloca);
         }
 
@@ -1472,7 +1740,12 @@ impl Lowerer {
 
         // Allocate stack space and store both components
         let alloca = self.alloca_complex(ctype);
-        self.store_complex_parts(alloca, Operand::Value(real_dest), Operand::Value(imag_dest), ctype);
+        self.store_complex_parts(
+            alloca,
+            Operand::Value(real_dest),
+            Operand::Value(imag_dest),
+            ctype,
+        );
 
         Operand::Value(alloca)
     }
@@ -1500,4 +1773,3 @@ impl Lowerer {
         IrType::from_ctype(&ctype)
     }
 }
-

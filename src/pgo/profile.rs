@@ -1,7 +1,7 @@
 //! Profile identity, deterministic merge, and fail-closed loading.
 use super::{FunctionProfile, ProfileData, ValueSite};
-use crate::ir::reexports::{IrFunction, Terminator};
 use crate::common::fx_hash::FxHashMap;
+use crate::ir::reexports::{IrFunction, Terminator};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -167,7 +167,11 @@ pub fn load_profile(path: &str) -> std::io::Result<ProfileData> {
         }
     }
     if warned > 0 {
-        eprintln!("lccc: PGO warning: skipped {} of {} profile file(s)", warned, files.len());
+        eprintln!(
+            "lccc: PGO warning: skipped {} of {} profile file(s)",
+            warned,
+            files.len()
+        );
     }
     if d.is_empty() {
         return Err(std::io::Error::new(
@@ -206,9 +210,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                     .edge_counts
                     .get(&(crate::pgo::instrument::VENTRY, f.entry_label))
                     .copied()
-                    .unwrap_or_else(|| {
-                        f.edge_counts.values().copied().max().unwrap_or(0)
-                    });
+                    .unwrap_or_else(|| f.edge_counts.values().copied().max().unwrap_or(0));
                 d.merge(n, f)?;
             }
             Ok(())
@@ -309,9 +311,7 @@ fn parse_file(p: &Path, d: &mut ProfileData) -> std::io::Result<()> {
                     .or_insert(0) = c;
             }
             "e" => {
-                let f = cur
-                    .as_mut()
-                    .ok_or_else(|| bad(p, n, "edge before func"))?;
+                let f = cur.as_mut().ok_or_else(|| bad(p, n, "edge before func"))?;
                 let src: u32 = a
                     .next()
                     .ok_or_else(|| bad(p, n, "missing edge src"))?
@@ -654,9 +654,11 @@ pub fn derive_block_counts(f: &IrFunction, fp: &mut super::FunctionProfile) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Operand, Terminator, IrParam, Instruction};
     use crate::common::types::IrType;
     use crate::ir::constants::IrConst;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, IrParam, Operand, Terminator,
+    };
 
     /// Build a minimal loop CFG:
     ///   b0 (entry) -> Branch b1
@@ -665,24 +667,63 @@ mod tests {
     ///   b3 (exit) Return
     fn loop_cfg() -> IrFunction {
         let mk = |label: u32, is: Vec<Instruction>, term: Terminator| BasicBlock {
-            label: BlockId(label), instructions: is, terminator: term, source_spans: vec![],
+            label: BlockId(label),
+            instructions: is,
+            terminator: term,
+            source_spans: vec![],
         };
         IrFunction {
             name: "loop_fn".into(),
             return_type: IrType::I32,
-            params: vec![IrParam{ty:IrType::I32,noalias:false,struct_size:None,struct_align:None,struct_eightbyte_classes:vec![],is_f128_sse:false,riscv_float_class:None}],
+            params: vec![IrParam {
+                ty: IrType::I32,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                struct_eightbyte_classes: vec![],
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
             blocks: vec![
                 mk(0, vec![], Terminator::Branch(BlockId(1))),
-                mk(1, vec![], Terminator::CondBranch{
-                    cond: Operand::Const(IrConst::I32(1)), true_label: BlockId(2), false_label: BlockId(3),
-                }),
+                mk(
+                    1,
+                    vec![],
+                    Terminator::CondBranch {
+                        cond: Operand::Const(IrConst::I32(1)),
+                        true_label: BlockId(2),
+                        false_label: BlockId(3),
+                    },
+                ),
                 mk(2, vec![], Terminator::Branch(BlockId(1))),
-                mk(3, vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+                mk(
+                    3,
+                    vec![],
+                    Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                ),
             ],
-            is_variadic:false,is_declaration:false,is_static:false,is_inline:false,is_always_inline:false,
-            is_noinline:false,next_value_id:0,next_label:0,section:None,visibility:None,is_weak:false,is_used:false,
-            has_inlined_calls:false,param_alloca_values:vec![],uses_sret:false,is_fastcall:false,is_naked:false,
-            global_init_label_blocks:vec![],ret_eightbyte_classes:vec![],ret_is_f128_sse:false,is_gnu_inline_def:false,loop_promoted_f64_values:vec![],
+            is_variadic: false,
+            is_declaration: false,
+            is_static: false,
+            is_inline: false,
+            is_always_inline: false,
+            is_noinline: false,
+            next_value_id: 0,
+            next_label: 0,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: vec![],
+            uses_sret: false,
+            is_fastcall: false,
+            is_naked: false,
+            global_init_label_blocks: vec![],
+            ret_eightbyte_classes: vec![],
+            ret_is_f128_sse: false,
+            is_gnu_inline_def: false,
+            loop_promoted_f64_values: vec![],
         }
     }
 
@@ -696,15 +737,25 @@ mod tests {
             total_count: 0,
             block_counts: FxHashMap::default(),
             edge_counts: FxHashMap::default(),
-            cfg_hash: 0, post_hash: 0, entry_label: 0, value_sites: vec![],
+            cfg_hash: 0,
+            post_hash: 0,
+            entry_label: 0,
+            value_sites: vec![],
         };
-        fp.edge_counts.insert((crate::pgo::instrument::VENTRY, 0), 10); // entry count
+        fp.edge_counts
+            .insert((crate::pgo::instrument::VENTRY, 0), 10); // entry count
         fp.edge_counts.insert((2, 1), 80); // instrumented backedge (latch -> header)
         derive_block_counts(&f, &mut fp);
         // The latch (b2) executes 80 times; the header executes entry + backedge.
-        assert_eq!(fp.block_count(BlockId(2)), 80,
-            "latch block must derive its count from flow conservation");
-        assert_eq!(fp.block_count(BlockId(1)), 90,
-            "header block must be entry + backedge executions");
+        assert_eq!(
+            fp.block_count(BlockId(2)),
+            80,
+            "latch block must derive its count from flow conservation"
+        );
+        assert_eq!(
+            fp.block_count(BlockId(1)),
+            90,
+            "header block must be entry + backedge executions"
+        );
     }
 }

@@ -1,8 +1,8 @@
 //! RiscvCodegen: integer/float arithmetic, unary ops, binop, copy.
 
-use crate::ir::reexports::{IrBinOp, Operand, Value};
-use crate::common::types::IrType;
 use super::emit::RiscvCodegen;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrBinOp, Operand, Value};
 
 impl RiscvCodegen {
     // ---- Unary ----
@@ -24,7 +24,10 @@ impl RiscvCodegen {
         // Zero-extend to 32 bits for 32-bit types, matching the convention
         // used by emit_bswap/clz (the upper half of a 64-bit neg on a
         // zero-extended U32 is 0xFFFFFFFF — x86-64 audit, claim 1).
-        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32) {
+        if matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        ) {
             self.state.emit("    slli t0, t0, 32");
             self.state.emit("    srli t0, t0, 32");
         }
@@ -32,7 +35,10 @@ impl RiscvCodegen {
 
     pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
         self.state.emit("    not t0, t0");
-        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32) {
+        if matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        ) {
             self.state.emit("    slli t0, t0, 32");
             self.state.emit("    srli t0, t0, 32");
         }
@@ -40,7 +46,14 @@ impl RiscvCodegen {
 
     // ---- Integer binop ----
 
-    pub(super) fn emit_int_binop_impl(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_int_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         // Note: i128 dispatch is handled by the shared emit_binop default in traits.rs.
         self.operand_to_t0(lhs);
         self.state.emit("    mv t1, t0");
@@ -91,7 +104,8 @@ impl RiscvCodegen {
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
         };
-        self.state.emit_fmt(format_args!("    {} t0, t1, t2", mnemonic));
+        self.state
+            .emit_fmt(format_args!("    {} t0, t1, t2", mnemonic));
 
         self.store_t0_to(dest);
     }

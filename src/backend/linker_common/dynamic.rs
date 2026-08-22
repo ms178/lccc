@@ -7,17 +7,14 @@
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
-use crate::backend::elf::{
-    ELF_MAGIC,
-    STB_WEAK,
-    STT_OBJECT, STT_SECTION, STT_FILE,
-    SHN_COMMON,
-    parse_linker_script_entries, LinkerScriptEntry,
-};
-use super::types::{Elf64Object, DynSymbol};
-use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 use super::parse_shared::{parse_shared_library_symbols, parse_soname};
 use super::resolve_lib::resolve_lib;
+use super::symbols::{is_linker_defined_symbol, GlobalSymbolOps};
+use super::types::{DynSymbol, Elf64Object};
+use crate::backend::elf::{
+    parse_linker_script_entries, LinkerScriptEntry, ELF_MAGIC, SHN_COMMON, STB_WEAK, STT_FILE,
+    STT_OBJECT, STT_SECTION,
+};
 
 /// Match dynamic symbols from a shared library against undefined globals.
 ///
@@ -76,7 +73,8 @@ pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
                     // Track WEAK STT_OBJECT for alias detection
                     let bind = dsym.info >> 4;
                     let stype = dsym.info & 0xf;
-                    if bind == STB_WEAK && stype == STT_OBJECT
+                    if bind == STB_WEAK
+                        && stype == STT_OBJECT
                         && !matched_weak_objects.contains(&(dsym.value, dsym.size))
                     {
                         matched_weak_objects.push((dsym.value, dsym.size));
@@ -151,7 +149,8 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
     if data.len() >= 4 && data[0..4] != ELF_MAGIC {
         if let Ok(text) = std::str::from_utf8(&data) {
             if let Some(entries) = parse_linker_script_entries(text) {
-                let script_dir = Path::new(path).parent()
+                let script_dir = Path::new(path)
+                    .parent()
                     .map(|p| p.to_string_lossy().to_string());
                 for entry in &entries {
                     let resolved_path = match entry {
@@ -160,14 +159,16 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
                                 Some(lib_path.clone())
                             } else if let Some(ref dir) = script_dir {
                                 let p = format!("{}/{}", dir, lib_path);
-                                if Path::new(&p).exists() { Some(p) } else { None }
+                                if Path::new(&p).exists() {
+                                    Some(p)
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
                         }
-                        LinkerScriptEntry::Lib(lib_name) => {
-                            resolve_lib(lib_name, lib_paths, false)
-                        }
+                        LinkerScriptEntry::Lib(lib_name) => resolve_lib(lib_name, lib_paths, false),
                     };
                     if let Some(resolved) = resolved_path {
                         let lib_data = std::fs::read(&resolved)
@@ -178,7 +179,12 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
                             continue;
                         }
                         load_shared_library_elf64_as_needed(
-                            &resolved, globals, needed_sonames, lib_paths, as_needed)?;
+                            &resolved,
+                            globals,
+                            needed_sonames,
+                            lib_paths,
+                            as_needed,
+                        )?;
                     }
                 }
                 return Ok(());
@@ -188,7 +194,8 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
     }
 
     let soname = parse_soname(&data).unwrap_or_else(|| {
-        Path::new(path).file_name()
+        Path::new(path)
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string())
     });
@@ -218,26 +225,33 @@ pub fn resolve_dynamic_symbols_elf64<G: GlobalSymbolOps>(
 ) -> Result<(), String> {
     // Check if there are any truly undefined symbols worth resolving
     let has_undefined = globals.iter().any(|(name, sym)| {
-        !sym.is_defined() && !sym.is_dynamic()
-            && !is_linker_defined_symbol(name)
+        !sym.is_defined() && !sym.is_dynamic() && !is_linker_defined_symbol(name)
     });
-    if !has_undefined { return Ok(()); }
+    if !has_undefined {
+        return Ok(());
+    }
 
     // Find default libraries in the search paths
     for lib_name in default_lib_names {
-        let lib_path = lib_search_paths.iter()
+        let lib_path = lib_search_paths
+            .iter()
             .map(|dir| format!("{}/{}", dir, lib_name))
             .find(|candidate| Path::new(candidate).exists());
 
         if let Some(lib_path) = lib_path {
-            let data = match std::fs::read(&lib_path) { Ok(d) => d, Err(_) => continue };
+            let data = match std::fs::read(&lib_path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
             let soname = parse_soname(&data).unwrap_or_else(|| {
-                Path::new(&lib_path).file_name()
+                Path::new(&lib_path)
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default()
             });
             let dyn_syms = match parse_shared_library_symbols(&data, &lib_path) {
-                Ok(s) => s, Err(_) => continue,
+                Ok(s) => s,
+                Err(_) => continue,
             };
 
             let lib_needed = match_shared_library_dynsyms(&dyn_syms, &soname, globals);
@@ -273,20 +287,28 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
     // Replacement through `*e = ..` reuses the existing key (no clone, one
     // hash); only genuinely new symbols pay the clone+insert.
     for sym in &obj.symbols {
-        if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
-        if sym.name.is_empty() || sym.is_local() { continue; }
+        if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
+            continue;
+        }
+        if sym.name.is_empty() || sym.is_local() {
+            continue;
+        }
 
         let is_defined = !sym.is_undefined() && sym.shndx != SHN_COMMON;
 
         if is_defined {
             match globals.get_mut(sym.name.as_str()) {
-                None => { globals.insert(sym.name.to_string(), G::new_defined(obj_idx, sym)); }
+                None => {
+                    globals.insert(sym.name.to_string(), G::new_defined(obj_idx, sym));
+                }
                 Some(e) => {
                     let e_weak = e.info() >> 4 == STB_WEAK;
                     // A tentative (COMMON) definition is superseded by any
                     // real definition (GNU ld / mold behavior).
                     let e_common = e.section_idx() == SHN_COMMON;
-                    if !e.is_defined() || should_replace_extra(e) || e_common
+                    if !e.is_defined()
+                        || should_replace_extra(e)
+                        || e_common
                         || (e_weak && sym.is_global())
                     {
                         *e = G::new_defined(obj_idx, sym);
@@ -304,7 +326,9 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
             }
         } else if sym.shndx == SHN_COMMON {
             match globals.get_mut(sym.name.as_str()) {
-                None => { globals.insert(sym.name.to_string(), G::new_common(obj_idx, sym)); }
+                None => {
+                    globals.insert(sym.name.to_string(), G::new_common(obj_idx, sym));
+                }
                 Some(e) => {
                     if !e.is_defined() {
                         *e = G::new_common(obj_idx, sym);

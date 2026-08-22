@@ -4,25 +4,17 @@
 //!
 //! This module implements Phases 2-7 of the three-tier stack allocation scheme.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrConst,
-    IrFunction,
-    Operand,
-    Value,
-};
-use crate::common::types::IrType;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::state::StackSlot;
-use crate::backend::regalloc::PhysReg;
 use crate::backend::liveness::{
-    for_each_operand_in_instruction, for_each_value_use_in_instruction,
-    for_each_operand_in_terminator, compute_live_intervals,
+    compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
 };
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::StackSlot;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
 
-use super::{
-    DeferredSlot, MultiBlockValue, BlockLocalValue, StackLayoutContext,
-};
+use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
 
 /// Determine if a non-alloca value can be assigned to a block-local pool slot (Tier 3).
 /// Returns `Some(def_block_idx)` if the value is defined and used only within a
@@ -204,16 +196,37 @@ pub(super) fn classify_instructions(
 
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Alloca { dest, size, ty, align, semantic_volatile, .. } = inst {
+            if let Instruction::Alloca {
+                dest,
+                size,
+                ty,
+                align,
+                semantic_volatile,
+                ..
+            } = inst
+            {
                 if *semantic_volatile {
                     state.volatile_alloca_values.insert(dest.0);
                 }
                 classify_alloca(
-                    state, dest, *size, *ty, *align, ctx,
-                    assign_slot, non_local_space, deferred_slots,
-                    block_space, max_block_local_space,
+                    state,
+                    dest,
+                    *size,
+                    *ty,
+                    *align,
+                    ctx,
+                    assign_slot,
+                    non_local_space,
+                    deferred_slots,
+                    block_space,
+                    max_block_local_space,
                 );
-            } else if let Instruction::InlineAsm { outputs, operand_types, .. } = inst {
+            } else if let Instruction::InlineAsm {
+                outputs,
+                operand_types,
+                ..
+            } = inst
+            {
                 // Promoted InlineAsm output values need stack slots to hold
                 // the output register value. These are "direct" slots (like
                 // allocas) -- the slot contains the value itself, not a pointer.
@@ -252,9 +265,12 @@ pub(super) fn classify_instructions(
                         // the low 32 bits. Without this, mem2reg-promoted 64-bit inline
                         // asm outputs (e.g., "+r" on unsigned long long) lose their high
                         // 32 bits when the value is copied to subsequent uses.
-                        if crate::common::types::target_is_32bit() && out_idx < operand_types.len() {
-                            let is_wide = matches!(operand_types[out_idx],
-                                IrType::F64 | IrType::I64 | IrType::U64);
+                        if crate::common::types::target_is_32bit() && out_idx < operand_types.len()
+                        {
+                            let is_wide = matches!(
+                                operand_types[out_idx],
+                                IrType::F64 | IrType::I64 | IrType::U64
+                            );
                             if is_wide {
                                 state.wide_values.insert(out_val.0);
                             }
@@ -265,7 +281,12 @@ pub(super) fn classify_instructions(
                         });
                     }
                 }
-            } else if let Instruction::ParamRef { dest, param_idx, ty } = inst {
+            } else if let Instruction::ParamRef {
+                dest,
+                param_idx,
+                ty,
+            } = inst
+            {
                 // ParamRef loads a parameter value from its alloca slot.
                 // Instead of allocating a separate stack slot for the ParamRef
                 // dest, reuse the param alloca's slot. This saves 8 bytes per
@@ -286,7 +307,8 @@ pub(super) fn classify_instructions(
                 if *param_idx < func.param_alloca_values.len() {
                     let alloca_val = func.param_alloca_values[*param_idx];
                     if !modified_param_allocas.contains(&alloca_val.0)
-                       && !reg_assigned.contains_key(&dest.0) {
+                        && !reg_assigned.contains_key(&dest.0)
+                    {
                         if let Some(&slot) = state.value_locations.get(&alloca_val.0) {
                             state.value_locations.insert(dest.0, slot);
                             // Propagate type tracking even when reusing the alloca
@@ -306,14 +328,24 @@ pub(super) fn classify_instructions(
                 }
                 // Fallthrough: if alloca not found or modified, classify normally.
                 classify_value(
-                    state, *dest, inst, ctx, reg_assigned,
-                    &mut collected_values, multi_block_values,
+                    state,
+                    *dest,
+                    inst,
+                    ctx,
+                    reg_assigned,
+                    &mut collected_values,
+                    multi_block_values,
                     block_local_values,
                 );
             } else if let Some(dest) = inst.dest() {
                 classify_value(
-                    state, dest, inst, ctx, reg_assigned,
-                    &mut collected_values, multi_block_values,
+                    state,
+                    dest,
+                    inst,
+                    ctx,
+                    reg_assigned,
+                    &mut collected_values,
+                    multi_block_values,
                     block_local_values,
                 );
             }
@@ -338,7 +370,11 @@ fn classify_alloca(
     // Recover over-aligned parameter allocas: the authoritative ABI alignment
     // (IrParam.struct_align) may exceed a pass-dropped `Alloca.align`.
     let effective_align = align.max(ctx.param_aligns.get(&dest.0).copied().unwrap_or(0));
-    let extra = if effective_align > 16 { effective_align - 1 } else { 0 };
+    let extra = if effective_align > 16 {
+        effective_align - 1
+    } else {
+        0
+    };
     let ptr_size = crate::common::types::target_ptr_size() as i64;
     // Alloca slots must be at least pointer-sized (8 bytes on 64-bit, 4 on 32-bit)
     // to safely hold ParamRef values that store via movq/sd (full register width).
@@ -365,7 +401,10 @@ fn classify_alloca(
     // Skip dead non-param allocas (never referenced by any instruction).
     if ctx.coalescable_allocas.dead.contains(&dest.0) {
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead (no recorded uses)", dest.0);
+            eprintln!(
+                "[SLOTS]   alloca v{} SKIPPED: dead (no recorded uses)",
+                dest.0
+            );
         }
         return;
     }
@@ -397,7 +436,9 @@ fn classify_alloca(
                 *max_block_local_space = new_space;
             }
             deferred_slots.push(DeferredSlot {
-                dest_id: dest.0, size: alloca_size, align: alloca_align,
+                dest_id: dest.0,
+                size: alloca_size,
+                align: alloca_align,
                 block_offset: before,
             });
             return;
@@ -423,14 +464,24 @@ fn classify_value(
 ) {
     let mut is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128));
     let is_f128 = matches!(inst.result_type(), Some(IrType::F128))
-        || matches!(inst, Instruction::Copy { src: Operand::Const(IrConst::LongDouble(..)), .. });
+        || matches!(
+            inst,
+            Instruction::Copy {
+                src: Operand::Const(IrConst::LongDouble(..)),
+                ..
+            }
+        );
 
     // Copy instructions have result_type() = None, so we must check whether
     // the source operand is an I128 value. If it is, the Copy dest also needs
     // a 16-byte slot; otherwise the codegen's emit_copy_i128 will overflow an
     // 8-byte slot into the adjacent stack slot, corrupting other values.
     if !is_i128 {
-        if let Instruction::Copy { src: Operand::Value(src_val), .. } = inst {
+        if let Instruction::Copy {
+            src: Operand::Value(src_val),
+            ..
+        } = inst
+        {
             if state.i128_values.contains(&src_val.0) {
                 is_i128 = true;
             }
@@ -442,13 +493,17 @@ fn classify_value(
     // width optimization. Slot allocation remains 8-byte minimum because
     // the backend's store/load paths aren't fully type-safe yet (some paths
     // always use movq/sd/str x0 regardless of IR type).
-    let is_small = !crate::common::types::target_is_32bit() && matches!(
-        inst.result_type(),
-        Some(IrType::I8) | Some(IrType::U8) |
-        Some(IrType::I16) | Some(IrType::U16) |
-        Some(IrType::I32) | Some(IrType::U32) |
-        Some(IrType::F32)
-    );
+    let is_small = !crate::common::types::target_is_32bit()
+        && matches!(
+            inst.result_type(),
+            Some(IrType::I8)
+                | Some(IrType::U8)
+                | Some(IrType::I16)
+                | Some(IrType::U16)
+                | Some(IrType::I32)
+                | Some(IrType::U32)
+                | Some(IrType::F32)
+        );
     let is_vector = state.vector_values.contains(&dest.0);
     let is_vector128 = state.vector128_values.contains(&dest.0);
     let memcpy_width = ctx.memcpy_value_sizes.get(&dest.0).copied().unwrap_or(0) as i64;
@@ -474,8 +529,10 @@ fn classify_value(
 
     // On 32-bit targets, track values wider than 32 bits for multi-word copy handling.
     if crate::common::types::target_is_32bit() {
-        let is_wide = matches!(inst.result_type(),
-            Some(IrType::F64) | Some(IrType::I64) | Some(IrType::U64));
+        let is_wide = matches!(
+            inst.result_type(),
+            Some(IrType::F64) | Some(IrType::I64) | Some(IrType::U64)
+        );
         if is_wide {
             state.wide_values.insert(dest.0);
         }
@@ -498,7 +555,10 @@ fn classify_value(
     // Skip register-assigned values (no stack slot needed).
     if reg_assigned.contains_key(&dest.0) {
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
-            eprintln!("[CLASSIFY] SSA {} is protected but register-assigned, skipping slot", dest.0);
+            eprintln!(
+                "[CLASSIFY] SSA {} is protected but register-assigned, skipping slot",
+                dest.0
+            );
         }
         return;
     }
@@ -506,7 +566,10 @@ fn classify_value(
     // Skip dead values (defined but never used).
     if !ctx.used_values.contains(&dest.0) {
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
-            eprintln!("[CLASSIFY] SSA {} is protected but not in used_values, skipping slot", dest.0);
+            eprintln!(
+                "[CLASSIFY] SSA {} is protected but not in used_values, skipping slot",
+                dest.0
+            );
         }
         return;
     }
@@ -524,22 +587,36 @@ fn classify_value(
     // Don't skip copy-aliased values that have cross-block uses: the alias
     // root might be block-local (Tier 3, reusable), but this value needs
     // its data to persist across blocks.
-    let has_cross_block_use = ctx.use_blocks_map.get(&dest.0)
-        .map(|blks| blks.iter().any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db)))
+    let has_cross_block_use = ctx
+        .use_blocks_map
+        .get(&dest.0)
+        .map(|blks| {
+            blks.iter()
+                .any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db))
+        })
         .unwrap_or(false);
     // Always classify copy-aliased values into their own slots. The
     // resolve_copy_aliases phase may later share the slot with the alias root
     // when safe (no interference), but values must have their own fallback slot
     // in case resolve_copy_aliases blocks the sharing due to liveness conflicts.
     // Skipping classification here can leave a live value without a location.
-    if !is_i128 && !is_f128 && !is_protected && !is_multi_def && !has_cross_block_use && is_copy_aliased {
+    if !is_i128
+        && !is_f128
+        && !is_protected
+        && !is_multi_def
+        && !has_cross_block_use
+        && is_copy_aliased
+    {
         if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
             // When slot coalescing is fully disabled, classify normally (fall through).
         }
         // Otherwise: fall through to normal classification — give the value its own slot.
     }
     if debug_protect && is_protected && is_copy_aliased {
-        eprintln!("[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway", dest.0);
+        eprintln!(
+            "[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway",
+            dest.0
+        );
     }
 
     // Skip immediately-consumed values: produced and consumed in adjacent
@@ -549,10 +626,11 @@ fn classify_value(
     // they can't fit in the 32-bit accumulator (EAX). F64 values use x87
     // and must be stored to memory between operations; I64/U64 need
     // multi-word handling via edx:eax pairs that require stack slots.
-    let is_wide_on_32bit = crate::common::types::target_is_32bit() && matches!(
-        inst.result_type(),
-        Some(IrType::F64) | Some(IrType::I64) | Some(IrType::U64)
-    );
+    let is_wide_on_32bit = crate::common::types::target_is_32bit()
+        && matches!(
+            inst.result_type(),
+            Some(IrType::F64) | Some(IrType::I64) | Some(IrType::U64)
+        );
     if !is_i128 && !is_f128 && !is_wide_on_32bit && ctx.immediately_consumed.contains(&dest.0) {
         return;
     }
@@ -614,7 +692,9 @@ pub(super) fn assign_tier3_block_local_slots(
                 *max_block_local_space = new_space;
             }
             deferred_slots.push(DeferredSlot {
-                dest_id: blv.dest_id, size: blv.slot_size, align: 0,
+                dest_id: blv.dest_id,
+                size: blv.slot_size,
+                align: 0,
                 block_offset: before,
             });
         }
@@ -722,7 +802,10 @@ pub(super) fn assign_tier3_block_local_slots(
     // Group block-local values by block, preserving definition order.
     let mut per_block: FxHashMap<usize, Vec<(u32, i64)>> = FxHashMap::default();
     for blv in block_local_values {
-        per_block.entry(blv.block_idx).or_default().push((blv.dest_id, blv.slot_size));
+        per_block
+            .entry(blv.block_idx)
+            .or_default()
+            .push((blv.dest_id, blv.slot_size));
     }
 
     // For each block, assign slots with greedy coloring.
@@ -742,7 +825,13 @@ pub(super) fn assign_tier3_block_local_slots(
             while i < active.len() {
                 if active[i].0 < my_def {
                     let (_, off, sz) = active.swap_remove(i);
-                    if sz >= 32 { free_32.push(off); } else if sz == 16 { free_16.push(off); } else { free_8.push(off); }
+                    if sz >= 32 {
+                        free_32.push(off);
+                    } else if sz == 16 {
+                        free_16.push(off);
+                    } else {
+                        free_8.push(off);
+                    }
                 } else {
                     i += 1;
                 }
@@ -751,18 +840,30 @@ pub(super) fn assign_tier3_block_local_slots(
             // Try to reuse a freed slot of matching size.
             // Protected values (DynAlloca results, vector temps) must get unique slots.
             let can_reuse = !state.protected_slot_values.contains(&dest_id);
-            let free_list = if slot_size >= 32 { &mut free_32 } else if slot_size == 16 { &mut free_16 } else { &mut free_8 };
+            let free_list = if slot_size >= 32 {
+                &mut free_32
+            } else if slot_size == 16 {
+                &mut free_16
+            } else {
+                &mut free_8
+            };
             let offset = if can_reuse && free_list.len() > 0 {
                 let reused = free_list.pop().unwrap();
                 if debug_protect {
-                    eprintln!("[PROTECT-T3] SSA {} reused block-local slot {}", dest_id, reused);
+                    eprintln!(
+                        "[PROTECT-T3] SSA {} reused block-local slot {}",
+                        dest_id, reused
+                    );
                 }
                 reused
             } else {
                 let off = block_peak;
                 block_peak += slot_size;
                 if debug_protect && !can_reuse {
-                    eprintln!("[PROTECT-T3] SSA {} is protected, forced new slot at offset {}", dest_id, off);
+                    eprintln!(
+                        "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
+                        dest_id, off
+                    );
                 }
                 off
             };
@@ -852,7 +953,8 @@ pub(super) fn finalize_deferred_slots(
         // Find the maximum alignment required by any deferred slot and align
         // non_local_space to it. This prevents alignment rounding in assign_slot
         // from causing adjacent slots to overlap when nls is not aligned.
-        let max_align = deferred_slots.iter()
+        let max_align = deferred_slots
+            .iter()
             .map(|ds| if ds.align > 0 { ds.align } else { 8 })
             .max()
             .unwrap_or(8);
@@ -862,12 +964,20 @@ pub(super) fn finalize_deferred_slots(
             non_local_space
         };
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-            eprintln!("[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}", aligned_nls, max_block_local_space, deferred_slots.len());
+            eprintln!(
+                "[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}",
+                aligned_nls,
+                max_block_local_space,
+                deferred_slots.len()
+            );
         }
         for ds in deferred_slots {
             let (slot, _) = assign_slot(aligned_nls + ds.block_offset, ds.size, ds.align);
             if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-                eprintln!("[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}", ds.dest_id, ds.block_offset, ds.size, ds.align, slot);
+                eprintln!(
+                    "[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}",
+                    ds.dest_id, ds.block_offset, ds.size, ds.align, slot
+                );
             }
             state.value_locations.insert(ds.dest_id, StackSlot(slot));
         }
@@ -1018,7 +1128,11 @@ pub(super) fn propagate_wide_values(
     let mut copy_edges: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Copy { dest, src: Operand::Value(src_val) } = inst {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src_val),
+            } = inst
+            {
                 copy_edges.push((dest.0, src_val.0));
             }
         }

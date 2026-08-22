@@ -253,9 +253,8 @@ pub fn try_read_u32(data: &[u8], offset: usize) -> Option<u32> {
 /// Read a little-endian u64 at `offset`, or `None` if out of bounds.
 #[inline]
 pub fn try_read_u64(data: &[u8], offset: usize) -> Option<u64> {
-    slice_at(data, offset, 8).map(|b| {
-        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    })
+    slice_at(data, offset, 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
 // ── Binary write helpers (little-endian, in-place) ───────────────────────────
@@ -365,12 +364,8 @@ pub fn elf64_sym_entry(
     let v = value.to_le_bytes();
     let z = size.to_le_bytes();
     [
-        n[0], n[1], n[2], n[3],
-        info,
-        other,
-        x[0], x[1],
-        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-        z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7],
+        n[0], n[1], n[2], n[3], info, other, x[0], x[1], v[0], v[1], v[2], v[3], v[4], v[5], v[6],
+        v[7], z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7],
     ]
 }
 
@@ -379,9 +374,16 @@ pub fn elf64_sym_entry(
 /// Append an ELF64 section header to `buf`.
 pub fn write_shdr64(
     buf: &mut Vec<u8>,
-    sh_name: u32, sh_type: u32, sh_flags: u64,
-    sh_addr: u64, sh_offset: u64, sh_size: u64,
-    sh_link: u32, sh_info: u32, sh_addralign: u64, sh_entsize: u64,
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
 ) {
     buf.extend_from_slice(&sh_name.to_le_bytes());
     buf.extend_from_slice(&sh_type.to_le_bytes());
@@ -398,9 +400,16 @@ pub fn write_shdr64(
 /// Append an ELF32 section header to `buf`.
 pub fn write_shdr32(
     buf: &mut Vec<u8>,
-    sh_name: u32, sh_type: u32, sh_flags: u32,
-    sh_addr: u32, sh_offset: u32, sh_size: u32,
-    sh_link: u32, sh_info: u32, sh_addralign: u32, sh_entsize: u32,
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u32,
+    sh_addr: u32,
+    sh_offset: u32,
+    sh_size: u32,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u32,
+    sh_entsize: u32,
 ) {
     buf.extend_from_slice(&sh_name.to_le_bytes());
     buf.extend_from_slice(&sh_type.to_le_bytes());
@@ -416,9 +425,16 @@ pub fn write_shdr32(
 
 /// Write an ELF64 program header to `buf` at offset `off`.
 pub fn write_phdr64(
-    buf: &mut [u8], off: usize,
-    p_type: u32, p_flags: u32, p_offset: u64,
-    p_vaddr: u64, p_paddr: u64, p_filesz: u64, p_memsz: u64, p_align: u64,
+    buf: &mut [u8],
+    off: usize,
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
 ) {
     w32(buf, off, p_type);
     w32(buf, off + 4, p_flags);
@@ -434,15 +450,29 @@ pub fn write_phdr64(
 /// This is a convenience wrapper around `write_phdr64` used by multiple linker
 /// backends to avoid repeating the vaddr twice.
 #[inline]
-pub fn wphdr(buf: &mut [u8], off: usize, pt: u32, flags: u32, foff: u64, va: u64, fsz: u64, msz: u64, align: u64) {
+pub fn wphdr(
+    buf: &mut [u8],
+    off: usize,
+    pt: u32,
+    flags: u32,
+    foff: u64,
+    va: u64,
+    fsz: u64,
+    msz: u64,
+    align: u64,
+) {
     write_phdr64(buf, off, pt, flags, foff, va, va, fsz, msz, align);
 }
 
 /// Write an ELF64 symbol table entry to `buf`.
 pub fn write_sym64(
     buf: &mut Vec<u8>,
-    st_name: u32, st_info: u8, st_other: u8, st_shndx: u16,
-    st_value: u64, st_size: u64,
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
 ) {
     buf.extend_from_slice(&st_name.to_le_bytes());
     buf.push(st_info);
@@ -455,8 +485,12 @@ pub fn write_sym64(
 /// Write an ELF32 symbol table entry to `buf`.
 pub fn write_sym32(
     buf: &mut Vec<u8>,
-    st_name: u32, st_value: u32, st_size: u32,
-    st_info: u8, st_other: u8, st_shndx: u16,
+    st_name: u32,
+    st_value: u32,
+    st_size: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
 ) {
     buf.extend_from_slice(&st_name.to_le_bytes());
     buf.extend_from_slice(&st_value.to_le_bytes());
@@ -515,8 +549,8 @@ mod bounds_tests {
         assert_eq!(slice_at(&data, 0, 4), Some(&data[..]));
         assert_eq!(slice_at(&data, 4, 0), Some(&[] as &[u8])); // empty at end is valid
         assert_eq!(slice_at(&data, 2, 2), Some(&[3u8, 4][..]));
-        assert_eq!(slice_at(&data, 3, 2), None);               // one past the end
-        assert_eq!(slice_at(&data, 5, 0), None);               // start beyond end
+        assert_eq!(slice_at(&data, 3, 2), None); // one past the end
+        assert_eq!(slice_at(&data, 5, 0), None); // start beyond end
     }
 
     #[test]
@@ -555,15 +589,18 @@ mod bounds_tests {
         let mut buf = vec![0xffu8; N + 16];
         for align in 0..16usize {
             for pos in 0..N {
-                for b in buf.iter_mut() { *b = 0xff; }
+                for b in buf.iter_mut() {
+                    *b = 0xff;
+                }
                 buf[align + pos] = 0;
                 let hay = &buf[align..align + N];
                 let naive = hay.iter().position(|&b| b == 0).unwrap_or(hay.len());
-                assert_eq!(memchr0(hay), naive,
-                           "align={align} pos={pos}");
+                assert_eq!(memchr0(hay), naive, "align={align} pos={pos}");
             }
             // No NUL at all: must report the full length.
-            for b in buf.iter_mut() { *b = 0xff; }
+            for b in buf.iter_mut() {
+                *b = 0xff;
+            }
             let hay = &buf[align..align + N];
             assert_eq!(memchr0(hay), N, "align={align} (no NUL)");
         }
@@ -603,9 +640,12 @@ mod bounds_tests {
     #[test]
     fn push_strtab_name_matches_safe_formulation() {
         let names: Vec<&[u8]> = vec![
-            b"", b"a", b"main", b"_ZTI1E",
+            b"",
+            b"a",
+            b"main",
+            b"_ZTI1E",
             b"a_very_long_mangled_symbol_name_that_exceeds_any_inline_buffer",
-            b"\xff\xfe non utf8",   // ELF names are bytes, not necessarily UTF-8
+            b"\xff\xfe non utf8", // ELF names are bytes, not necessarily UTF-8
         ];
 
         let mut fast: Vec<u8> = Vec::new();
@@ -623,7 +663,10 @@ mod bounds_tests {
             safe.push(0);
         }
 
-        assert_eq!(fast, safe, "string table bytes differ from the safe version");
+        assert_eq!(
+            fast, safe,
+            "string table bytes differ from the safe version"
+        );
         assert_eq!(fast_offs, safe_offs, "returned offsets differ");
 
         // Each returned offset must address exactly the name it was given,
@@ -679,15 +722,29 @@ mod bounds_tests {
         // Exactly-fitting reads are in bounds; one byte short must panic.
         assert_eq!(read_u64(&d[..8], 0), 0x0706050403020100);
         for f in [
-            (|| { read_u16(&[0u8; 1], 0); }) as fn(),
-            (|| { read_u32(&[0u8; 3], 0); }) as fn(),
-            (|| { read_u64(&[0u8; 7], 0); }) as fn(),
-            (|| { read_i32(&[0u8; 3], 0); }) as fn(),
-            (|| { read_i64(&[0u8; 7], 0); }) as fn(),
-            (|| { read_u64(&[0u8; 8], 1); }) as fn(),
+            (|| {
+                read_u16(&[0u8; 1], 0);
+            }) as fn(),
+            (|| {
+                read_u32(&[0u8; 3], 0);
+            }) as fn(),
+            (|| {
+                read_u64(&[0u8; 7], 0);
+            }) as fn(),
+            (|| {
+                read_i32(&[0u8; 3], 0);
+            }) as fn(),
+            (|| {
+                read_i64(&[0u8; 7], 0);
+            }) as fn(),
+            (|| {
+                read_u64(&[0u8; 8], 1);
+            }) as fn(),
         ] {
-            assert!(std::panic::catch_unwind(f).is_err(),
-                    "short read must panic, not read out of bounds");
+            assert!(
+                std::panic::catch_unwind(f).is_err(),
+                "short read must panic, not read out of bounds"
+            );
         }
     }
 
@@ -711,11 +768,15 @@ mod bounds_tests {
         // from_utf8 (valid UTF-8 sequences) or be rejected (invalid ones).
         for pos in 0..20usize {
             let mut buf = vec![b'x'; 20];
-            buf[pos] = 0xC3; buf[(pos + 1) % 20] = 0xA9; // 'é' when adjacent
+            buf[pos] = 0xC3;
+            buf[(pos + 1) % 20] = 0xA9; // 'é' when adjacent
             buf.push(0);
             let end = buf.len() - 1;
-            assert_eq!(read_cstr_ref(&buf, 0), std::str::from_utf8(&buf[..end]).ok(),
-                       "non-ascii at {pos}");
+            assert_eq!(
+                read_cstr_ref(&buf, 0),
+                std::str::from_utf8(&buf[..end]).ok(),
+                "non-ascii at {pos}"
+            );
         }
 
         // Invalid UTF-8 must be rejected, not silently reinterpreted.
@@ -744,12 +805,14 @@ mod bounds_tests {
             for pos in 0..n {
                 let mut v = base.clone();
                 v[pos] = 0x80;
-                assert_eq!(is_ascii_fast(&v), v.is_ascii(),
-                           "len {n}, high bit at {pos}");
+                assert_eq!(
+                    is_ascii_fast(&v),
+                    v.is_ascii(),
+                    "len {n}, high bit at {pos}"
+                );
                 let mut w = base.clone();
                 w[pos] = 0x7f; // highest still-ASCII byte
-                assert_eq!(is_ascii_fast(&w), w.is_ascii(),
-                           "len {n}, 0x7f at {pos}");
+                assert_eq!(is_ascii_fast(&w), w.is_ascii(), "len {n}, 0x7f at {pos}");
             }
         }
     }
@@ -764,7 +827,14 @@ mod bounds_tests {
             (0u32, 0u8, 0u8, 0u16, 0u64, 0u64),
             (1, 0x12, 0x03, 0xfff1, 0x0000_0000_0040_1000, 24),
             (u32::MAX, u8::MAX, u8::MAX, u16::MAX, u64::MAX, u64::MAX),
-            (0xdead_beef, 0x21, 0x02, 0x000e, 0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00),
+            (
+                0xdead_beef,
+                0x21,
+                0x02,
+                0x000e,
+                0x1122_3344_5566_7788,
+                0x99aa_bbcc_ddee_ff00,
+            ),
         ];
         for (name_off, info, other, shndx, value, size) in cases {
             let got = elf64_sym_entry(name_off, info, other, shndx, value, size);

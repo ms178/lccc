@@ -20,19 +20,25 @@ pub fn constraint_is_immediate_only(constraint: &str) -> bool {
         return false;
     }
     // Must have at least one immediate letter
-    let has_imm = stripped.chars().any(|c| matches!(c,
-        'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
-    ));
+    let has_imm = stripped.chars().any(|c| {
+        matches!(
+            c,
+            'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O'
+        )
+    });
     if !has_imm {
         return false;
     }
     // Must NOT have any register or memory alternative
-    let has_reg_or_mem = stripped.chars().any(|c| matches!(c,
-        'r' | 'q' | 'R' | 'l' |           // GP register
+    let has_reg_or_mem = stripped.chars().any(|c| {
+        matches!(
+            c,
+            'r' | 'q' | 'R' | 'l' |           // GP register
         'g' |                              // general (reg + mem + imm)
         'x' | 'v' | 'Y' |                 // FP register
         'a' | 'b' | 'c' | 'd' | 'S' | 'D' | // specific register
-        'm' | 'o' | 'V' | 'p' | 'Q'       // memory
-    ));
+        'm' | 'o' | 'V' | 'p' | 'Q' // memory
+        )
+    });
     !has_reg_or_mem && !stripped.chars().any(|c| c.is_ascii_digit())
 }

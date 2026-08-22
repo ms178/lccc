@@ -89,7 +89,10 @@ fn reloc_target(obj: &Elf64Object, sym_idx: u32) -> RelTarget {
         Some(sym) if !sym.name.is_empty() && !sym.is_local() => {
             RelTarget::Global(sym.name.to_string())
         }
-        Some(sym) => RelTarget::LocalSection { shndx: sym.shndx, value: sym.value },
+        Some(sym) => RelTarget::LocalSection {
+            shndx: sym.shndx,
+            value: sym.value,
+        },
         None => RelTarget::Unknown(sym_idx),
     }
 }
@@ -180,7 +183,10 @@ pub fn collect_candidates(objects: &[Elf64Object]) -> FxHashMap<u64, Vec<SecId>>
             if data.len() < 16 && data.iter().all(|&b| b == 0x00 || b == 0x90) {
                 continue;
             }
-            groups.entry(section_hash(obj, si, data)).or_default().push((oi, si));
+            groups
+                .entry(section_hash(obj, si, data))
+                .or_default()
+                .push((oi, si));
         }
     }
     groups.retain(|_, v| v.len() > 1);
@@ -271,11 +277,21 @@ impl IcfPlan {
 /// folds differently between runs is not reproducible.
 pub fn plan(objects: &[Elf64Object], safe_only: bool) -> IcfPlan {
     let groups = collect_candidates(objects);
-    let mut out = IcfPlan { result: IcfResult { candidate_groups: groups.len(), ..Default::default() }, ..Default::default() };
+    let mut out = IcfPlan {
+        result: IcfResult {
+            candidate_groups: groups.len(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     if groups.is_empty() {
         return out;
     }
-    let taken = if safe_only { address_taken_sections(objects) } else { FxHashSet::default() };
+    let taken = if safe_only {
+        address_taken_sections(objects)
+    } else {
+        FxHashSet::default()
+    };
 
     // Deterministic group order.
     let mut buckets: Vec<Vec<SecId>> = groups.into_values().collect();
@@ -341,26 +357,45 @@ pub fn parse_icf_mode(s: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::linker_common::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol, SectionData, SymStr};
+    use crate::backend::linker_common::{
+        Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol, SectionData, SymStr,
+    };
 
     fn sec(name: &str, data: &[u8], align: u64) -> Elf64Section {
         Elf64Section {
-            name_idx: 0, name: name.to_string(), sh_type: SHT_PROGBITS,
-            flags: SHF_EXECINSTR | 2 /* SHF_ALLOC */, addr: 0, offset: 0,
-            size: data.len() as u64, link: 0, info: 0, addralign: align, entsize: 0,
+            name_idx: 0,
+            name: name.to_string(),
+            sh_type: SHT_PROGBITS,
+            flags: SHF_EXECINSTR | 2, /* SHF_ALLOC */
+            addr: 0,
+            offset: 0,
+            size: data.len() as u64,
+            link: 0,
+            info: 0,
+            addralign: align,
+            entsize: 0,
         }
     }
 
     fn sym(name: &str, shndx: u16, value: u64, global: bool) -> Elf64Symbol {
         Elf64Symbol {
-            name_idx: 0, name: SymStr::new(name),
-            info: if global { 1 << 4 } else { 0 }, other: 0,
-            shndx, value, size: 0,
+            name_idx: 0,
+            name: SymStr::new(name),
+            info: if global { 1 << 4 } else { 0 },
+            other: 0,
+            shndx,
+            value,
+            size: 0,
         }
     }
 
     fn rela(offset: u64, sym_idx: u32, rela_type: u32, addend: i64) -> Elf64Rela {
-        Elf64Rela { offset, sym_idx, rela_type, addend }
+        Elf64Rela {
+            offset,
+            sym_idx,
+            rela_type,
+            addend,
+        }
     }
 
     /// Build one object: sections[i] has data[i], relocs[i], symbols shared.
@@ -372,7 +407,10 @@ mod tests {
             section_data.push(SectionData::owned(d.to_vec()));
         }
         Elf64Object {
-            sections, symbols, section_data, relocations: relocs,
+            sections,
+            symbols,
+            section_data,
+            relocations: relocs,
             source_name: "<test>".into(),
         }
     }
@@ -396,9 +434,12 @@ mod tests {
             ],
         );
         let p = plan(&[o], true);
-        assert!(p.is_empty(),
+        assert!(
+            p.is_empty(),
             "folded two sections that call different functions -- this is a \
-             miscompilation, not an optimisation: {:?}", p.redirect);
+             miscompilation, not an optimisation: {:?}",
+            p.redirect
+        );
     }
 
     /// The positive case: identical bytes calling the *same* function fold.
@@ -407,11 +448,19 @@ mod tests {
         let o = obj(
             &[CALL_RET, CALL_RET],
             vec![vec![rela(1, 2, PLT32, -4)], vec![rela(1, 2, PLT32, -4)]],
-            vec![sym("", 0, 0, false), sym("", 0, 0, false), sym("alpha", 0, 0, true)],
+            vec![
+                sym("", 0, 0, false),
+                sym("", 0, 0, false),
+                sym("alpha", 0, 0, true),
+            ],
         );
         let p = plan(&[o], true);
         assert_eq!(p.result.folded_sections, 1, "should fold one duplicate");
-        assert_eq!(p.resolve((0, 1)), (0, 0), "duplicate redirects to the first");
+        assert_eq!(
+            p.resolve((0, 1)),
+            (0, 0),
+            "duplicate redirects to the first"
+        );
         assert_eq!(p.resolve((0, 0)), (0, 0), "representative maps to itself");
     }
 
@@ -422,9 +471,16 @@ mod tests {
         let o = obj(
             &[CALL_RET, CALL_RET],
             vec![vec![rela(1, 2, PLT32, -4)], vec![rela(1, 2, PLT32, 4)]],
-            vec![sym("", 0, 0, false), sym("", 0, 0, false), sym("alpha", 0, 0, true)],
+            vec![
+                sym("", 0, 0, false),
+                sym("", 0, 0, false),
+                sym("alpha", 0, 0, true),
+            ],
         );
-        assert!(plan(&[o], true).is_empty(), "addend must be part of identity");
+        assert!(
+            plan(&[o], true).is_empty(),
+            "addend must be part of identity"
+        );
     }
 
     /// Under `safe`, a function whose address is taken elsewhere keeps its own
@@ -433,27 +489,44 @@ mod tests {
     fn address_taken_blocks_folding_in_safe_mode() {
         let mut o = obj(
             &[CALL_RET, CALL_RET],
-            vec![vec![rela(1, 2, PLT32, -4)], vec![rela(1, 2, PLT32, -4)], Vec::new()],
+            vec![
+                vec![rela(1, 2, PLT32, -4)],
+                vec![rela(1, 2, PLT32, -4)],
+                Vec::new(),
+            ],
             vec![
                 sym("", 0, 0, false),
                 sym("", 0, 0, false),
                 sym("alpha", 0, 0, true),
-                sym("dup", 1, 0, true),   // names section 1
+                sym("dup", 1, 0, true), // names section 1
             ],
         );
         // A data section holding an absolute pointer to `dup`.
         o.sections.push(Elf64Section {
-            name_idx: 0, name: ".data.ptr".into(), sh_type: SHT_PROGBITS,
-            flags: 2, addr: 0, offset: 0, size: 8, link: 0, info: 0,
-            addralign: 8, entsize: 0,
+            name_idx: 0,
+            name: ".data.ptr".into(),
+            sh_type: SHT_PROGBITS,
+            flags: 2,
+            addr: 0,
+            offset: 0,
+            size: 8,
+            link: 0,
+            info: 0,
+            addralign: 8,
+            entsize: 0,
         });
         o.section_data.push(SectionData::owned(vec![0u8; 8]));
         o.relocations[2] = vec![rela(0, 3, 1 /* R_X86_64_64 */, 0)];
 
-        assert!(plan(&[o.clone()], true).is_empty(),
-                "safe ICF must not fold an address-taken function");
-        assert_eq!(plan(&[o], false).result.folded_sections, 1,
-                   "--icf=all folds it anyway");
+        assert!(
+            plan(&[o.clone()], true).is_empty(),
+            "safe ICF must not fold an address-taken function"
+        );
+        assert_eq!(
+            plan(&[o], false).result.folded_sections,
+            1,
+            "--icf=all folds it anyway"
+        );
     }
 
     /// Different alignment means the compiler asked for something stricter;
@@ -463,7 +536,11 @@ mod tests {
         let mut o = obj(
             &[CALL_RET, CALL_RET],
             vec![vec![rela(1, 2, PLT32, -4)], vec![rela(1, 2, PLT32, -4)]],
-            vec![sym("", 0, 0, false), sym("", 0, 0, false), sym("alpha", 0, 0, true)],
+            vec![
+                sym("", 0, 0, false),
+                sym("", 0, 0, false),
+                sym("alpha", 0, 0, true),
+            ],
         );
         o.sections[1].addralign = 64;
         assert!(plan(&[o], true).is_empty(), "alignment is part of identity");
@@ -473,16 +550,22 @@ mod tests {
     /// run. Hash-map iteration order must not leak into the output.
     #[test]
     fn plan_is_deterministic() {
-        let build = || obj(
-            &[CALL_RET, CALL_RET, CALL_RET],
-            vec![
-                vec![rela(1, 3, PLT32, -4)],
-                vec![rela(1, 3, PLT32, -4)],
-                vec![rela(1, 3, PLT32, -4)],
-            ],
-            vec![sym("", 0, 0, false), sym("", 0, 0, false), sym("", 0, 0, false),
-                 sym("alpha", 0, 0, true)],
-        );
+        let build = || {
+            obj(
+                &[CALL_RET, CALL_RET, CALL_RET],
+                vec![
+                    vec![rela(1, 3, PLT32, -4)],
+                    vec![rela(1, 3, PLT32, -4)],
+                    vec![rela(1, 3, PLT32, -4)],
+                ],
+                vec![
+                    sym("", 0, 0, false),
+                    sym("", 0, 0, false),
+                    sym("", 0, 0, false),
+                    sym("alpha", 0, 0, true),
+                ],
+            )
+        };
         let first = plan(&[build()], true);
         for _ in 0..8 {
             let again = plan(&[build()], true);

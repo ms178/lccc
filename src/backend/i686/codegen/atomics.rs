@@ -1,13 +1,20 @@
 //! I686Codegen: atomic operations (RMW, cmpxchg, load, store, fence).
 
-use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
+use super::emit::I686Codegen;
 use crate::common::types::IrType;
 use crate::emit;
-use super::emit::I686Codegen;
+use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
 
 impl I686Codegen {
-    pub(super) fn emit_atomic_rmw_impl(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand,
-                       ty: IrType, _ordering: AtomicOrdering) {
+    pub(super) fn emit_atomic_rmw_impl(
+        &mut self,
+        dest: &Value,
+        op: AtomicRmwOp,
+        ptr: &Operand,
+        val: &Operand,
+        ty: IrType,
+        _ordering: AtomicOrdering,
+    ) {
         if self.is_atomic_wide(ty) {
             self.emit_atomic_rmw_wide(dest, op, ptr, val);
             return;
@@ -83,9 +90,17 @@ impl I686Codegen {
         self.store_eax_to(dest);
     }
 
-    pub(super) fn emit_atomic_cmpxchg_impl(&mut self, dest: &Value, ptr: &Operand, expected: &Operand,
-                           desired: &Operand, ty: IrType, _success: AtomicOrdering,
-                           _failure: AtomicOrdering, returns_bool: bool) {
+    pub(super) fn emit_atomic_cmpxchg_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        _success: AtomicOrdering,
+        _failure: AtomicOrdering,
+        returns_bool: bool,
+    ) {
         if self.is_atomic_wide(ty) {
             self.emit_atomic_cmpxchg_wide(dest, ptr, expected, desired, returns_bool);
             return;
@@ -116,7 +131,13 @@ impl I686Codegen {
         self.store_eax_to(dest);
     }
 
-    pub(super) fn emit_atomic_load_impl(&mut self, dest: &Value, ptr: &Operand, ty: IrType, _ordering: AtomicOrdering) {
+    pub(super) fn emit_atomic_load_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        ty: IrType,
+        _ordering: AtomicOrdering,
+    ) {
         if self.is_atomic_wide(ty) {
             self.emit_atomic_load_wide(dest, ptr);
             return;
@@ -129,7 +150,13 @@ impl I686Codegen {
         self.store_eax_to(dest);
     }
 
-    pub(super) fn emit_atomic_store_impl(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) {
+    pub(super) fn emit_atomic_store_impl(
+        &mut self,
+        ptr: &Operand,
+        val: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) {
         if self.is_atomic_wide(ty) {
             self.emit_atomic_store_wide(ptr, val);
             if matches!(ordering, AtomicOrdering::SeqCst) {

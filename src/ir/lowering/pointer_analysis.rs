@@ -4,22 +4,19 @@
 //! their pointee sizes (for pointer arithmetic scaling), and resolving pointee
 //! IR types (for correct loads/stores through pointer dereference and subscript).
 
-use crate::frontend::parser::ast::{
-    BinOp,
-    DerivedDeclarator,
-    Expr,
-    TypeSpecifier,
-    UnaryOp,
-};
-use crate::common::types::{AddressSpace, IrType, RcLayout, CType, target_ptr_size};
 use super::lower::Lowerer;
+use crate::common::types::{target_ptr_size, AddressSpace, CType, IrType, RcLayout};
+use crate::frontend::parser::ast::{BinOp, DerivedDeclarator, Expr, TypeSpecifier, UnaryOp};
 
 impl Lowerer {
     /// For a pointer-to-struct parameter type (e.g., `struct TAG *p`), get the
     /// pointed-to struct's layout. This enables `p->field` access.
     /// Also handles array typedef parameters (e.g., `typedef struct S arr[1]`)
     /// which decay to pointers in function parameters.
-    pub(super) fn get_struct_layout_for_pointer_param(&self, type_spec: &TypeSpecifier) -> Option<RcLayout> {
+    pub(super) fn get_struct_layout_for_pointer_param(
+        &self,
+        type_spec: &TypeSpecifier,
+    ) -> Option<RcLayout> {
         // Try TypeSpecifier match first
         let resolved = self.resolve_type_spec(type_spec);
         match resolved {
@@ -63,10 +60,19 @@ impl Lowerer {
     /// For `int *p` (type_spec=Int, derived=[Pointer]): returns Some(I32)
     /// For `int **pp` (type_spec=Int, derived=[Pointer, Pointer]): returns Some(Ptr)
     /// For `int a[10]` (type_spec=Int, derived=[Array(10)]): returns Some(I32)
-    pub(super) fn compute_pointee_type(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> Option<IrType> {
+    pub(super) fn compute_pointee_type(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Option<IrType> {
         // Count pointer and array levels
-        let ptr_count = derived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let ptr_count = derived
+            .iter()
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+            .count();
+        let has_array = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Array(_)));
 
         if ptr_count > 1 {
             // Multi-level pointer (e.g., int **pp) - pointee is a pointer
@@ -153,7 +159,8 @@ impl Lowerer {
                     }
                 }
             }
-            Expr::StringLiteral(_, _) | Expr::WideStringLiteral(_, _)
+            Expr::StringLiteral(_, _)
+            | Expr::WideStringLiteral(_, _)
             | Expr::Char16StringLiteral(_, _) => true,
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 match op {
@@ -199,7 +206,12 @@ impl Lowerer {
                 }
                 // Fallback: check IrType return type
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    if let Some(ret_ty) = self.func_meta.sigs.get(name.as_str()).map(|s| s.return_type) {
+                    if let Some(ret_ty) = self
+                        .func_meta
+                        .sigs
+                        .get(name.as_str())
+                        .map(|s| s.return_type)
+                    {
                         return ret_ty == IrType::Ptr;
                     }
                 }
@@ -312,12 +324,10 @@ impl Lowerer {
                 target_ptr_size()
             }
             Expr::PostfixOp(_, inner, _) => self.get_pointer_elem_size_from_expr(inner),
-            Expr::UnaryOp(op, inner, _) => {
-                match op {
-                    UnaryOp::PreInc | UnaryOp::PreDec => self.get_pointer_elem_size_from_expr(inner),
-                    _ => target_ptr_size(),
-                }
-            }
+            Expr::UnaryOp(op, inner, _) => match op {
+                UnaryOp::PreInc | UnaryOp::PreDec => self.get_pointer_elem_size_from_expr(inner),
+                _ => target_ptr_size(),
+            },
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 // ptr + int or ptr - int: get elem size from the pointer operand
                 match op {
@@ -340,7 +350,9 @@ impl Lowerer {
                     _ => target_ptr_size(),
                 }
             }
-            Expr::Conditional(_, then_expr, _, _) => self.get_pointer_elem_size_from_expr(then_expr),
+            Expr::Conditional(_, then_expr, _, _) => {
+                self.get_pointer_elem_size_from_expr(then_expr)
+            }
             Expr::GnuConditional(cond, _, _) => self.get_pointer_elem_size_from_expr(cond),
             Expr::Comma(_, rhs, _) => self.get_pointer_elem_size_from_expr(rhs),
             Expr::FunctionCall(_, _, _) => {
@@ -369,12 +381,15 @@ impl Lowerer {
                     }
                 }
             }
-            Expr::MemberAccess(base_expr, field_name, _) | Expr::PointerMemberAccess(base_expr, field_name, _) => {
+            Expr::MemberAccess(base_expr, field_name, _)
+            | Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 let is_ptr = matches!(expr, Expr::PointerMemberAccess(..));
                 if let Some(ctype) = self.resolve_field_ctype(base_expr, field_name, is_ptr) {
                     match &ctype {
                         CType::Array(elem_ty, _) => return self.resolve_ctype_size(elem_ty).max(1),
-                        CType::Pointer(pointee_ty, _) => return self.resolve_ctype_size(pointee_ty).max(1),
+                        CType::Pointer(pointee_ty, _) => {
+                            return self.resolve_ctype_size(pointee_ty).max(1)
+                        }
                         _ => {}
                     }
                 }
@@ -407,9 +422,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::PostfixOp(_, inner, _) => {
-                self.get_pointee_type_of_expr(inner)
-            }
+            Expr::PostfixOp(_, inner, _) => self.get_pointee_type_of_expr(inner),
             Expr::UnaryOp(UnaryOp::PreInc | UnaryOp::PreDec, inner, _) => {
                 self.get_pointee_type_of_expr(inner)
             }
@@ -444,17 +457,14 @@ impl Lowerer {
                 }
                 self.get_pointee_type_of_expr(else_expr)
             }
-            Expr::Comma(_, last, _) => {
-                self.get_pointee_type_of_expr(last)
-            }
+            Expr::Comma(_, last, _) => self.get_pointee_type_of_expr(last),
             Expr::AddressOf(inner, _) => {
                 let ty = self.get_expr_type(inner);
                 Some(ty)
             }
-            Expr::Assign(_, rhs, _) => {
-                self.get_pointee_type_of_expr(rhs)
-            }
-            Expr::MemberAccess(base_expr, field_name, _) | Expr::PointerMemberAccess(base_expr, field_name, _) => {
+            Expr::Assign(_, rhs, _) => self.get_pointee_type_of_expr(rhs),
+            Expr::MemberAccess(base_expr, field_name, _)
+            | Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 let is_ptr = matches!(expr, Expr::PointerMemberAccess(..));
                 if let Some(ctype) = self.resolve_field_ctype(base_expr, field_name, is_ptr) {
                     match ctype {

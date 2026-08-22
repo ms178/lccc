@@ -37,19 +37,12 @@
 //! or memory operations). This ensures the Select semantics (evaluate both
 //! operands) match the original branch semantics.
 
-use crate::ir::reexports::{
-    BasicBlock,
-    BlockId,
-    Instruction,
-    IrCmpOp,
-    IrFunction,
-    Operand,
-    Terminator,
-    Value,
-};
-use crate::ir::analysis;
-use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::analysis;
+use crate::ir::reexports::{
+    BasicBlock, BlockId, Instruction, IrCmpOp, IrFunction, Operand, Terminator, Value,
+};
 
 /// Run if-conversion on a single function.
 pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
@@ -111,7 +104,11 @@ fn rewrite_covered_arm_loads(
     let mut copy_of: FxHashMap<Value, Value> = FxHashMap::default();
     for b in &func.blocks {
         for i in &b.instructions {
-            if let Instruction::Copy { dest, src: Operand::Value(src) } = i {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+            } = i
+            {
                 copy_of.insert(*dest, *src);
             }
         }
@@ -129,7 +126,11 @@ fn rewrite_covered_arm_loads(
 
     for pred_idx in 0..func.blocks.len() {
         let (true_label, false_label) = match &func.blocks[pred_idx].terminator {
-            Terminator::CondBranch { true_label, false_label, .. } => (*true_label, *false_label),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => (*true_label, *false_label),
             _ => continue,
         };
         // The pred must not write memory between its load and the arm.
@@ -140,12 +141,20 @@ fn rewrite_covered_arm_loads(
         // preds hold only a handful of loads.
         let mut pred_loads: Vec<(Value, IrType, AddressSpace, Value)> = Vec::new();
         for inst in &func.blocks[pred_idx].instructions {
-            if let Instruction::Load { dest, ptr, ty, seg_override , ..} = inst {
+            if let Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } = inst
+            {
                 let root = resolve(ptr);
                 // On a duplicate, keep the last load (same value either way).
-                if let Some(entry) = pred_loads.iter_mut().find(|(p, t, s, _)| {
-                    *p == root && *t == *ty && *s == *seg_override
-                }) {
+                if let Some(entry) = pred_loads
+                    .iter_mut()
+                    .find(|(p, t, s, _)| *p == root && *t == *ty && *s == *seg_override)
+                {
                     entry.3 = *dest;
                 } else {
                     pred_loads.push((root, *ty, *seg_override, *dest));
@@ -156,7 +165,9 @@ fn rewrite_covered_arm_loads(
             continue;
         }
         for label in [true_label, false_label] {
-            let Some(&arm_idx) = label_to_idx.get(&label) else { continue };
+            let Some(&arm_idx) = label_to_idx.get(&label) else {
+                continue;
+            };
             if arm_idx == pred_idx {
                 continue;
             }
@@ -171,11 +182,19 @@ fn rewrite_covered_arm_loads(
             // Collect rewrites first (immutable), then apply.
             let mut pending: Vec<(usize, Value, Value)> = Vec::new();
             for (inst_pos, inst) in func.blocks[arm_idx].instructions.iter().enumerate() {
-                if let Instruction::Load { dest, ptr, ty, seg_override , ..} = inst {
+                if let Instruction::Load {
+                    dest,
+                    ptr,
+                    ty,
+                    seg_override,
+                    ..
+                } = inst
+                {
                     let root = resolve(ptr);
-                    if let Some((_, _, _, covering)) = pred_loads.iter().find(|(p, t, s, _)| {
-                        *p == root && *t == *ty && *s == *seg_override
-                    }) {
+                    if let Some((_, _, _, covering)) = pred_loads
+                        .iter()
+                        .find(|(p, t, s, _)| *p == root && *t == *ty && *s == *seg_override)
+                    {
                         pending.push((inst_pos, *dest, *covering));
                     } else if debug {
                         eprintln!("[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
@@ -183,7 +202,9 @@ fn rewrite_covered_arm_loads(
                             pred_loads.iter().map(|(p, t, _, d)| (p.0, *t, d.0)).collect::<Vec<_>>());
                         for b in &func.blocks {
                             for i in &b.instructions {
-                                if i.dest() == Some(*ptr) || pred_loads.iter().any(|(p, ..)| i.dest() == Some(*p)) {
+                                if i.dest() == Some(*ptr)
+                                    || pred_loads.iter().any(|(p, ..)| i.dest() == Some(*p))
+                                {
                                     eprintln!("[IFCONV]   def: {:?}", i);
                                 }
                             }
@@ -192,8 +213,10 @@ fn rewrite_covered_arm_loads(
                 }
             }
             for (inst_pos, dest, covering) in pending {
-                func.blocks[arm_idx].instructions[inst_pos] =
-                    Instruction::Copy { dest, src: Operand::Value(covering) };
+                func.blocks[arm_idx].instructions[inst_pos] = Instruction::Copy {
+                    dest,
+                    src: Operand::Value(covering),
+                };
                 rewrites += 1;
             }
         }
@@ -228,7 +251,6 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
         }
     }
 
-
     if diamonds.is_empty() {
         return rewrites;
     }
@@ -236,7 +258,8 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
     // (e.g., nested ternaries where converting one invalidates another).
     let mut converted = 0;
-    let mut modified_blocks: crate::common::fx_hash::FxHashSet<usize> = crate::common::fx_hash::FxHashSet::default();
+    let mut modified_blocks: crate::common::fx_hash::FxHashSet<usize> =
+        crate::common::fx_hash::FxHashSet::default();
     for diamond in &diamonds {
         // Skip if any of the diamond's blocks were already modified
         if modified_blocks.contains(&diamond.pred_idx)
@@ -330,17 +353,27 @@ fn is_constant_condition(block: &BasicBlock, cond: &Operand) -> bool {
             // where all operands are constants, within the same block.
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Copy { dest, src: Operand::Const(_) } if *dest == *v => {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Const(_),
+                    } if *dest == *v => {
                         return true;
                     }
                     Instruction::Cmp { dest, lhs, rhs, .. } if *dest == *v => {
-                        let lhs_const = matches!(lhs, Operand::Const(_)) || is_value_const_in_block(block, lhs);
-                        let rhs_const = matches!(rhs, Operand::Const(_)) || is_value_const_in_block(block, rhs);
+                        let lhs_const =
+                            matches!(lhs, Operand::Const(_)) || is_value_const_in_block(block, lhs);
+                        let rhs_const =
+                            matches!(rhs, Operand::Const(_)) || is_value_const_in_block(block, rhs);
                         if lhs_const && rhs_const {
                             return true;
                         }
                     }
-                    Instruction::Select { dest, true_val, false_val, .. } if *dest == *v => {
+                    Instruction::Select {
+                        dest,
+                        true_val,
+                        false_val,
+                        ..
+                    } if *dest == *v => {
                         // Select(cond, x, x) where both arms are the same constant
                         if same_value_or_both_zero(true_val, false_val) {
                             return true;
@@ -360,7 +393,11 @@ fn is_value_const_in_block(block: &BasicBlock, op: &Operand) -> bool {
         Operand::Const(_) => true,
         Operand::Value(v) => {
             for inst in &block.instructions {
-                if let Instruction::Copy { dest, src: Operand::Const(_) } = inst {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Const(_),
+                } = inst
+                {
                     if *dest == *v {
                         return true;
                     }
@@ -395,7 +432,9 @@ fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashS
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Cmp { dest, op, lhs, rhs, .. } => {
+                Instruction::Cmp {
+                    dest, op, lhs, rhs, ..
+                } => {
                     if matches!(lhs, Operand::Value(x) if x.0 == v.0)
                         || matches!(rhs, Operand::Value(x) if x.0 == v.0)
                     {
@@ -468,8 +507,8 @@ fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashS
         }
         match &block.terminator {
             // A branch condition is control flow — fine.
-            Terminator::CondBranch { cond, .. }
-                if matches!(cond, Operand::Value(x) if x.0 == v.0) => {}
+            Terminator::CondBranch { cond, .. } if matches!(cond, Operand::Value(x) if x.0 == v.0) =>
+                {}
             // Return/Switch/IndirectBranch use the value as data.
             Terminator::Return(Some(op)) if matches!(op, Operand::Value(x) if x.0 == v.0) => {
                 return false;
@@ -477,8 +516,7 @@ fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashS
             Terminator::Switch { val, .. } if matches!(val, Operand::Value(x) if x.0 == v.0) => {
                 return false;
             }
-            Terminator::IndirectBranch { target, .. }
-                if matches!(target, Operand::Value(x) if x.0 == v.0) =>
+            Terminator::IndirectBranch { target, .. } if matches!(target, Operand::Value(x) if x.0 == v.0) =>
             {
                 return false;
             }
@@ -500,7 +538,10 @@ fn value_only_controls_branch(func: &IrFunction, v: Value, visited: &mut FxHashS
 /// (false arm == constant 0) is intentionally still converted: if-converting
 /// it exposes the `Select(cond, Cmp, 0)` pattern the range-check fold
 /// collapses into a single `sub`+`cmp`, which then fuses into the `||` branch.
-fn skip_boolean_diamond(func: &IrFunction, phi_selects: &[(Value, IrType, Operand, Operand)]) -> bool {
+fn skip_boolean_diamond(
+    func: &IrFunction,
+    phi_selects: &[(Value, IrType, Operand, Operand)],
+) -> bool {
     if phi_selects.is_empty() {
         return false;
     }
@@ -528,9 +569,11 @@ fn detect_diamond(
 
     // Must end with a CondBranch
     let (cond, true_label, false_label) = match &pred_block.terminator {
-        Terminator::CondBranch { cond, true_label, false_label } => {
-            (cond, true_label, false_label)
-        }
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => (cond, true_label, false_label),
         _ => return None,
     };
 
@@ -592,7 +635,9 @@ fn detect_diamond(
     // Load + Cast chains (parameter loads + sign extensions) that inflate
     // the count. A typical arm: Load, Cast, Load, Cast, BinOp, Cast = 6 insts.
     const MAX_ARM_INSTS: usize = 8;
-    if true_block.instructions.len() > MAX_ARM_INSTS || false_block.instructions.len() > MAX_ARM_INSTS {
+    if true_block.instructions.len() > MAX_ARM_INSTS
+        || false_block.instructions.len() > MAX_ARM_INSTS
+    {
         return None;
     }
 
@@ -652,7 +697,9 @@ fn detect_diamond(
 
     // The merge block should only be reached from the two arms (and not from pred directly).
     // If the merge block has other predecessors, we need to preserve the Phi nodes for those.
-    let merge_preds_from_diamond = preds.row(merge_idx).iter()
+    let merge_preds_from_diamond = preds
+        .row(merge_idx)
+        .iter()
         .filter(|&&p| p as usize == true_idx || p as usize == false_idx)
         .count();
 
@@ -695,9 +742,11 @@ fn detect_triangle(
     let pred_block = &func.blocks[pred_idx];
 
     let (cond, true_label, false_label) = match &pred_block.terminator {
-        Terminator::CondBranch { cond, true_label, false_label } => {
-            (cond, true_label, false_label)
-        }
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => (cond, true_label, false_label),
         _ => return None,
     };
 
@@ -830,9 +879,19 @@ fn detect_triangle(
     // For a triangle, we set the missing arm to merge_idx with empty instructions.
     // apply_diamond will hoist the arm instructions and the empty side is a no-op.
     let (true_idx_out, false_idx_out, true_insts, false_insts) = if arm_is_true {
-        (arm_idx, merge_idx, arm_block.instructions.clone(), Vec::new())
+        (
+            arm_idx,
+            merge_idx,
+            arm_block.instructions.clone(),
+            Vec::new(),
+        )
     } else {
-        (merge_idx, arm_idx, Vec::new(), arm_block.instructions.clone())
+        (
+            merge_idx,
+            arm_idx,
+            Vec::new(),
+            arm_block.instructions.clone(),
+        )
     };
 
     Some(DiamondInfo {
@@ -871,13 +930,21 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
     let has_spans = !pred_block.source_spans.is_empty();
     for inst in &diamond.true_arm_insts {
         pred_block.instructions.push(inst.clone());
-        if has_spans { pred_block.source_spans.push(crate::common::source::Span::dummy()); }
+        if has_spans {
+            pred_block
+                .source_spans
+                .push(crate::common::source::Span::dummy());
+        }
     }
 
     // Add false arm instructions
     for inst in &diamond.false_arm_insts {
         pred_block.instructions.push(inst.clone());
-        if has_spans { pred_block.source_spans.push(crate::common::source::Span::dummy()); }
+        if has_spans {
+            pred_block
+                .source_spans
+                .push(crate::common::source::Span::dummy());
+        }
     }
 
     // 2. Add Select instructions for each Phi
@@ -889,14 +956,20 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
             false_val: *false_val,
             ty: *ty,
         });
-        if has_spans { pred_block.source_spans.push(crate::common::source::Span::dummy()); }
+        if has_spans {
+            pred_block
+                .source_spans
+                .push(crate::common::source::Span::dummy());
+        }
     }
 
     // 3. Change pred block's terminator to unconditional branch to merge
     pred_block.terminator = Terminator::Branch(merge_label);
 
     // 4. Remove the converted Phi nodes from the merge block
-    let converted_dests: crate::common::fx_hash::FxHashSet<u32> = diamond.phi_selects.iter()
+    let converted_dests: crate::common::fx_hash::FxHashSet<u32> = diamond
+        .phi_selects
+        .iter()
         .map(|(dest, _, _, _)| dest.0)
         .collect();
     {
@@ -976,7 +1049,11 @@ mod tests {
         func2.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
                 Instruction::Cmp {
                     dest: Value(1),
                     op: IrCmpOp::Eq,
@@ -1002,7 +1079,11 @@ mod tests {
         let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(1),
@@ -1045,13 +1126,20 @@ mod tests {
         let label_to_idx = analysis::build_label_map(&func);
         let (preds, _) = analysis::build_cfg(&func, &label_to_idx);
         let diamond = detect_diamond(&func, 0, &label_to_idx, &preds);
-        assert!(diamond.is_none(), "branch-only `||` diamond must not be converted");
+        assert!(
+            diamond.is_none(),
+            "branch-only `||` diamond must not be converted"
+        );
 
         // `&&` shape (false arm == const 0) => still converted (range fold needs it).
         let mut func2 = IrFunction::new("t2".to_string(), IrType::I32, vec![], false);
         func2.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 }],
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(1),
@@ -1091,10 +1179,11 @@ mod tests {
         func2.next_value_id = 6;
         let label_to_idx2 = analysis::build_label_map(&func2);
         let (preds2, _) = analysis::build_cfg(&func2, &label_to_idx2);
-        assert!(detect_diamond(&func2, 0, &label_to_idx2, &preds2).is_some(),
-                "branch-only `&&` diamond must still be converted for range folding");
+        assert!(
+            detect_diamond(&func2, 0, &label_to_idx2, &preds2).is_some(),
+            "branch-only `&&` diamond must still be converted for range folding"
+        );
     }
-
 
     #[test]
     fn test_simple_diamond_conversion() {
@@ -1136,16 +1225,14 @@ mod tests {
         // Block 3: merge with phi
         func.blocks.push(BasicBlock {
             label: BlockId(3),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(3),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I32(1)), BlockId(1)),
-                        (Operand::Const(IrConst::I32(0)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(1)), BlockId(1)),
+                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
         });
@@ -1158,7 +1245,13 @@ mod tests {
         // Block 0 should now have a Select instruction and branch to block3
         assert_eq!(func.blocks[0].instructions.len(), 1);
         match &func.blocks[0].instructions[0] {
-            Instruction::Select { dest, cond, true_val, false_val, ty } => {
+            Instruction::Select {
+                dest,
+                cond,
+                true_val,
+                false_val,
+                ty,
+            } => {
                 assert_eq!(dest.0, 3);
                 assert!(matches!(cond, Operand::Value(Value(0))));
                 assert!(matches!(true_val, Operand::Const(IrConst::I32(1))));
@@ -1169,10 +1262,16 @@ mod tests {
         }
 
         // Block 0 should now branch unconditionally to block3
-        assert!(matches!(func.blocks[0].terminator, Terminator::Branch(BlockId(3))));
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Branch(BlockId(3))
+        ));
 
         // Merge block should have no phi
-        assert!(!func.blocks[3].instructions.iter().any(|i| matches!(i, Instruction::Phi { .. })));
+        assert!(!func.blocks[3]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Phi { .. })));
     }
 
     #[test]
@@ -1197,15 +1296,13 @@ mod tests {
 
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::BinOp {
-                    dest: Value(1),
-                    op: IrBinOp::Sub,
-                    lhs: Operand::Value(Value(0)),
-                    rhs: Operand::Const(IrConst::I32(5)),
-                    ty: IrType::I32,
-                },
-            ],
+            instructions: vec![Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ty: IrType::I32,
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
@@ -1219,16 +1316,14 @@ mod tests {
 
         func.blocks.push(BasicBlock {
             label: BlockId(3),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(2),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Value(Value(1)), BlockId(1)),
-                        (Operand::Const(IrConst::I32(0)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(2),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(1)), BlockId(1)),
+                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
         });
@@ -1240,8 +1335,14 @@ mod tests {
 
         // Block 0 should have the hoisted BinOp and the Select
         assert_eq!(func.blocks[0].instructions.len(), 2);
-        assert!(matches!(func.blocks[0].instructions[0], Instruction::BinOp { .. }));
-        assert!(matches!(func.blocks[0].instructions[1], Instruction::Select { .. }));
+        assert!(matches!(
+            func.blocks[0].instructions[0],
+            Instruction::BinOp { .. }
+        ));
+        assert!(matches!(
+            func.blocks[0].instructions[1],
+            Instruction::Select { .. }
+        ));
     }
 
     #[test]
@@ -1251,15 +1352,14 @@ mod tests {
 
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::Alloca {
-                    dest: Value(10),
-                    ty: IrType::I32,
-                    size: 4,
-                    align: 4,
-                    volatile: false, semantic_volatile: false,
-                },
-            ],
+            instructions: vec![Instruction::Alloca {
+                dest: Value(10),
+                ty: IrType::I32,
+                size: 4,
+                align: 4,
+                volatile: false,
+                semantic_volatile: false,
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(1),
@@ -1272,7 +1372,13 @@ mod tests {
             label: BlockId(1),
             instructions: vec![
                 // Side-effecting store!
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(10), ty: IrType::I32, seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(10),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
@@ -1287,16 +1393,14 @@ mod tests {
 
         func.blocks.push(BasicBlock {
             label: BlockId(3),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(2),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I32(1)), BlockId(1)),
-                        (Operand::Const(IrConst::I32(0)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(2),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(1)), BlockId(1)),
+                    (Operand::Const(IrConst::I32(0)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
         });

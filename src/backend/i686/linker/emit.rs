@@ -3,12 +3,12 @@
 //! Phase 10: lays out segments, assigns addresses, applies relocations,
 //! builds PLT/GOT/dynamic sections, and writes the final ELF32 executable.
 
-use std::collections::BTreeSet;
 use crate::common::fx_hash::FxHashMap;
+use std::collections::BTreeSet;
 
-use super::types::*;
-use super::reloc::{self, RelocContext};
 use super::gnu_hash::build_gnu_hash_32;
+use super::reloc::{self, RelocContext};
+use super::types::*;
 use super::DynStrTab;
 use crate::backend::linker_common;
 
@@ -53,7 +53,14 @@ pub(super) fn emit_executable(
 
     // Build dynsym entries
     let mut dynsym_entries: Vec<Elf32Sym> = Vec::new();
-    dynsym_entries.push(Elf32Sym { name: 0, value: 0, size: 0, info: 0, other: 0, shndx: 0 });
+    dynsym_entries.push(Elf32Sym {
+        name: 0,
+        value: 0,
+        size: 0,
+        info: 0,
+        other: 0,
+        shndx: 0,
+    });
 
     let mut dynsym_map: FxHashMap<String, usize> = FxHashMap::default();
     let mut dynsym_names: Vec<String> = Vec::new();
@@ -64,13 +71,24 @@ pub(super) fn emit_executable(
         let name_off = dynstr.add(name);
         // Preserve original binding (STB_WEAK vs STB_GLOBAL)
         let (bind, stype) = if let Some(sym) = global_symbols.get(name) {
-            (sym.binding, if sym.sym_type != 0 { sym.sym_type } else { STT_FUNC })
+            (
+                sym.binding,
+                if sym.sym_type != 0 {
+                    sym.sym_type
+                } else {
+                    STT_FUNC
+                },
+            )
         } else {
             (STB_GLOBAL, STT_FUNC)
         };
         dynsym_entries.push(Elf32Sym {
-            name: name_off, value: 0, size: 0,
-            info: (bind << 4) | stype, other: 0, shndx: SHN_UNDEF,
+            name: name_off,
+            value: 0,
+            size: 0,
+            info: (bind << 4) | stype,
+            other: 0,
+            shndx: SHN_UNDEF,
         });
         dynsym_map.insert(name.clone(), idx);
         dynsym_names.push(name.clone());
@@ -83,8 +101,11 @@ pub(super) fn emit_executable(
         let name_off = dynstr.add(name);
         let sym = &global_symbols[name];
         dynsym_entries.push(Elf32Sym {
-            name: name_off, value: 0, size: sym.size,
-            info: (sym.binding << 4) | sym.sym_type, other: 0,
+            name: name_off,
+            value: 0,
+            size: sym.size,
+            info: (sym.binding << 4) | sym.sym_type,
+            other: 0,
             shndx: SHN_UNDEF,
         });
         dynsym_map.insert(name.clone(), idx);
@@ -94,7 +115,8 @@ pub(super) fn emit_executable(
     let gnu_hash_symoffset = dynsym_entries.len();
 
     // Copy-reloc symbols (hashed: defined in this executable)
-    let mut copy_syms_for_dynsym: Vec<String> = global_symbols.iter()
+    let mut copy_syms_for_dynsym: Vec<String> = global_symbols
+        .iter()
         .filter(|(_, s)| s.needs_copy && s.is_dynamic)
         .map(|(n, _)| n.clone())
         .collect();
@@ -105,15 +127,20 @@ pub(super) fn emit_executable(
         let name_off = dynstr.add(name);
         let sym = &global_symbols[name];
         dynsym_entries.push(Elf32Sym {
-            name: name_off, value: 0, size: sym.size,
-            info: (STB_GLOBAL << 4) | STT_OBJECT, other: 0, shndx: SHN_UNDEF,
+            name: name_off,
+            value: 0,
+            size: sym.size,
+            info: (STB_GLOBAL << 4) | STT_OBJECT,
+            other: 0,
+            shndx: SHN_UNDEF,
         });
         dynsym_map.insert(name.clone(), idx);
         dynsym_names.push(name.clone());
     }
 
     // Textrel symbols (hashed: need dynamic R_386_32 relocs)
-    let mut textrel_syms_for_dynsym: Vec<String> = global_symbols.iter()
+    let mut textrel_syms_for_dynsym: Vec<String> = global_symbols
+        .iter()
         .filter(|(_, s)| s.uses_textrel && s.is_dynamic)
         .map(|(n, _)| n.clone())
         .collect();
@@ -124,8 +151,12 @@ pub(super) fn emit_executable(
         let name_off = dynstr.add(name);
         let sym = &global_symbols[name];
         dynsym_entries.push(Elf32Sym {
-            name: name_off, value: 0, size: sym.size,
-            info: (sym.binding << 4) | sym.sym_type, other: 0, shndx: SHN_UNDEF,
+            name: name_off,
+            value: 0,
+            size: sym.size,
+            info: (sym.binding << 4) | sym.sym_type,
+            other: 0,
+            shndx: SHN_UNDEF,
         });
         dynsym_map.insert(name.clone(), idx);
         dynsym_names.push(name.clone());
@@ -137,7 +168,8 @@ pub(super) fn emit_executable(
     all_hashed_syms.extend(textrel_syms_for_dynsym.iter().cloned());
 
     // Build .gnu.hash and reorder hashed dynsym entries
-    let (gnu_hash_data, sorted_indices) = build_gnu_hash_32(&all_hashed_syms, gnu_hash_symoffset as u32);
+    let (gnu_hash_data, sorted_indices) =
+        build_gnu_hash_32(&all_hashed_syms, gnu_hash_symoffset as u32);
 
     if !sorted_indices.is_empty() {
         let hashed_start = gnu_hash_symoffset;
@@ -166,7 +198,10 @@ pub(super) fn emit_executable(
         if let Some(gs) = global_symbols.get(name) {
             if gs.is_dynamic {
                 if let Some(ref ver) = gs.version {
-                    lib_versions.entry(gs.dynlib.clone()).or_default().insert(ver.clone());
+                    lib_versions
+                        .entry(gs.dynlib.clone())
+                        .or_default()
+                        .insert(ver.clone());
                 }
             }
         }
@@ -189,12 +224,22 @@ pub(super) fn emit_executable(
     // Rebuild dynstr with version strings
     let mut dynstr2 = DynStrTab::new();
     let _ = dynstr2.add("");
-    for lib in &needed_libs { dynstr2.add(lib); }
-    for name in plt_symbols { dynstr2.add(name); }
-    for name in got_dyn_symbols { dynstr2.add(name); }
-    for name in &all_hashed_syms { dynstr2.add(name); }
+    for lib in &needed_libs {
+        dynstr2.add(lib);
+    }
+    for name in plt_symbols {
+        dynstr2.add(name);
+    }
+    for name in got_dyn_symbols {
+        dynstr2.add(name);
+    }
+    for name in &all_hashed_syms {
+        dynstr2.add(name);
+    }
     for (_, vers) in &lib_ver_list {
-        for v in vers { dynstr2.add(v); }
+        for v in vers {
+            dynstr2.add(v);
+        }
     }
     let dynstr_data = dynstr2.as_bytes().to_vec();
 
@@ -204,7 +249,9 @@ pub(super) fn emit_executable(
         needed_offsets.push(dynstr2.get_offset(lib));
     }
     for (i, entry) in dynsym_entries.iter_mut().enumerate() {
-        if i == 0 { continue; }
+        if i == 0 {
+            continue;
+        }
         let name = &dynsym_names[i - 1];
         entry.name = dynstr2.get_offset(name);
     }
@@ -215,13 +262,19 @@ pub(super) fn emit_executable(
         if i == 0 {
             versym_data.extend_from_slice(&0u16.to_le_bytes());
         } else {
-            let sym_name = if i - 1 < dynsym_names.len() { &dynsym_names[i - 1] } else { "" };
+            let sym_name = if i - 1 < dynsym_names.len() {
+                &dynsym_names[i - 1]
+            } else {
+                ""
+            };
             let gs = global_symbols.get(sym_name);
             if let Some(gs) = gs {
                 if gs.is_dynamic && !gs.dynlib.is_empty() {
                     if let Some(ref ver) = gs.version {
-                        let idx = ver_index_map.get(&(gs.dynlib.clone(), ver.clone()))
-                            .copied().unwrap_or(1);
+                        let idx = ver_index_map
+                            .get(&(gs.dynlib.clone(), ver.clone()))
+                            .copied()
+                            .unwrap_or(1);
                         versym_data.extend_from_slice(&idx.to_le_bytes());
                     } else {
                         versym_data.extend_from_slice(&1u16.to_le_bytes());
@@ -239,7 +292,9 @@ pub(super) fn emit_executable(
     let mut verneed_data: Vec<u8> = Vec::new();
     let mut verneed_count: u32 = 0;
     for (lib_i, (lib, vers)) in lib_ver_list.iter().enumerate() {
-        if !needed_libs.contains(lib) { continue; }
+        if !needed_libs.contains(lib) {
+            continue;
+        }
         let lib_name_off = dynstr2.get_offset(lib);
         let is_last_lib = lib_i == lib_ver_list.len() - 1;
 
@@ -247,7 +302,11 @@ pub(super) fn emit_executable(
         verneed_data.extend_from_slice(&(vers.len() as u16).to_le_bytes());
         verneed_data.extend_from_slice(&lib_name_off.to_le_bytes());
         verneed_data.extend_from_slice(&16u32.to_le_bytes());
-        let next_off = if is_last_lib { 0u32 } else { 16 + vers.len() as u32 * 16 };
+        let next_off = if is_last_lib {
+            0u32
+        } else {
+            16 + vers.len() as u32 * 16
+        };
         verneed_data.extend_from_slice(&next_off.to_le_bytes());
         verneed_count += 1;
 
@@ -268,16 +327,23 @@ pub(super) fn emit_executable(
     // ── Layout ────────────────────────────────────────────────────────────
     let ehdr_size: u32 = 52;
     let phdr_size: u32 = 32;
-    let has_tls_sections = output_sections.iter()
+    let has_tls_sections = output_sections
+        .iter()
         .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
 
     let mut num_phdrs: u32 = 1; // PHDR
-    if !is_static { num_phdrs += 1; } // INTERP
+    if !is_static {
+        num_phdrs += 1;
+    } // INTERP
     num_phdrs += 4; // LOAD x4 (headers, text, rodata, data)
-    if !is_static { num_phdrs += 1; } // DYNAMIC
+    if !is_static {
+        num_phdrs += 1;
+    } // DYNAMIC
     num_phdrs += 1; // GNU_STACK
     num_phdrs += 1; // GNU_EH_FRAME
-    if has_tls_sections { num_phdrs += 1; }
+    if has_tls_sections {
+        num_phdrs += 1;
+    }
 
     let phdrs_total_size = num_phdrs * phdr_size;
 
@@ -296,11 +362,16 @@ pub(super) fn emit_executable(
     let interp_offset = file_offset;
     let interp_vaddr = vaddr;
     let interp_size = interp_data.len() as u32;
-    if !is_static { file_offset += interp_size; vaddr += interp_size; }
+    if !is_static {
+        file_offset += interp_size;
+        vaddr += interp_size;
+    }
 
     // Note section
     let note_sec_idx = section_name_to_idx.get(".note").copied();
-    let note_size = note_sec_idx.map(|i| output_sections[i].data.len() as u32).unwrap_or(0);
+    let note_size = note_sec_idx
+        .map(|i| output_sections[i].data.len() as u32)
+        .unwrap_or(0);
     if note_size > 0 {
         if let Some(idx) = note_sec_idx {
             output_sections[idx].file_offset = file_offset;
@@ -311,45 +382,65 @@ pub(super) fn emit_executable(
     }
 
     // .gnu.hash
-    file_offset = align_up(file_offset, 4); vaddr = align_up(vaddr, 4);
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
     let gnu_hash_offset = file_offset;
     let gnu_hash_vaddr = vaddr;
     let gnu_hash_size = gnu_hash_data.len() as u32;
-    if !is_static { file_offset += gnu_hash_size; vaddr += gnu_hash_size; }
+    if !is_static {
+        file_offset += gnu_hash_size;
+        vaddr += gnu_hash_size;
+    }
 
     // .dynsym
     let dynsym_offset = file_offset;
     let dynsym_vaddr = vaddr;
     let dynsym_entsize: u32 = 16;
     let dynsym_size = (dynsym_entries.len() as u32) * dynsym_entsize;
-    if !is_static { file_offset += dynsym_size; vaddr += dynsym_size; }
+    if !is_static {
+        file_offset += dynsym_size;
+        vaddr += dynsym_size;
+    }
 
     // .dynstr
     let dynstr_offset = file_offset;
     let dynstr_vaddr = vaddr;
     let dynstr_size = dynstr_data.len() as u32;
-    if !is_static { file_offset += dynstr_size; vaddr += dynstr_size; }
+    if !is_static {
+        file_offset += dynstr_size;
+        vaddr += dynstr_size;
+    }
 
     // .gnu.version
     let versym_offset = file_offset;
     let versym_vaddr = vaddr;
     let versym_size = versym_data.len() as u32;
-    if !is_static && versym_size > 0 { file_offset += versym_size; vaddr += versym_size; }
+    if !is_static && versym_size > 0 {
+        file_offset += versym_size;
+        vaddr += versym_size;
+    }
 
     // .gnu.version_r
-    file_offset = align_up(file_offset, 4); vaddr = align_up(vaddr, 4);
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
     let verneed_offset = file_offset;
     let verneed_vaddr = vaddr;
     let verneed_size = verneed_data.len() as u32;
-    if !is_static && verneed_size > 0 { file_offset += verneed_size; vaddr += verneed_size; }
+    if !is_static && verneed_size > 0 {
+        file_offset += verneed_size;
+        vaddr += verneed_size;
+    }
 
     // .rel.dyn
-    file_offset = align_up(file_offset, 4); vaddr = align_up(vaddr, 4);
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
     let rel_dyn_offset = file_offset;
     let rel_dyn_vaddr = vaddr;
     let num_copy_relocs = copy_syms_for_dynsym.len();
     // Count actual R_386_32 relocations against textrel symbols
-    let num_text_relocs: usize = if textrel_syms_for_dynsym.is_empty() { 0 } else {
+    let num_text_relocs: usize = if textrel_syms_for_dynsym.is_empty() {
+        0
+    } else {
         let mut count = 0usize;
         for obj in inputs {
             for sec in &obj.sections {
@@ -357,7 +448,9 @@ pub(super) fn emit_executable(
                     if rel_type == R_386_32 {
                         if let Some(sym) = obj.symbols.get(sym_idx as usize) {
                             if let Some(gs) = global_symbols.get(sym.name.as_str()) {
-                                if gs.uses_textrel { count += 1; }
+                                if gs.uses_textrel {
+                                    count += 1;
+                                }
                             }
                         }
                     }
@@ -368,13 +461,19 @@ pub(super) fn emit_executable(
     };
     let num_rel_dyn = got_dyn_symbols.len() + num_copy_relocs + num_text_relocs;
     let rel_dyn_size = (num_rel_dyn as u32) * 8;
-    if !is_static { file_offset += rel_dyn_size; vaddr += rel_dyn_size; }
+    if !is_static {
+        file_offset += rel_dyn_size;
+        vaddr += rel_dyn_size;
+    }
 
     // .rel.plt
     let rel_plt_offset = file_offset;
     let rel_plt_vaddr = vaddr;
     let rel_plt_size = (num_plt as u32) * 8;
-    if !is_static { file_offset += rel_plt_size; vaddr += rel_plt_size; }
+    if !is_static {
+        file_offset += rel_plt_size;
+        vaddr += rel_plt_size;
+    }
 
     let ro_headers_end = file_offset;
 
@@ -382,7 +481,9 @@ pub(super) fn emit_executable(
     file_offset = align_up(file_offset, PAGE_SIZE);
     vaddr = align_up(vaddr, PAGE_SIZE);
     vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr < BASE_ADDR + file_offset { vaddr += PAGE_SIZE; }
+    if vaddr < BASE_ADDR + file_offset {
+        vaddr += PAGE_SIZE;
+    }
 
     let text_seg_file_start = file_offset;
     let text_seg_vaddr_start = vaddr;
@@ -393,29 +494,37 @@ pub(super) fn emit_executable(
     let init_size;
     if let Some(idx) = init_sec_idx {
         let a = output_sections[idx].align.max(4);
-        file_offset = align_up(file_offset, a); vaddr = align_up(vaddr, a);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
         init_vaddr = vaddr;
         init_size = output_sections[idx].data.len() as u32;
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
-        file_offset += init_size; vaddr += init_size;
+        file_offset += init_size;
+        vaddr += init_size;
     } else {
-        init_vaddr = vaddr; init_size = 0;
+        init_vaddr = vaddr;
+        init_size = 0;
     }
 
     // .plt
     let plt_entry_size: u32 = 16;
     let plt_header_size: u32 = if num_plt > 0 { 16 } else { 0 };
     let plt_total_size = plt_header_size + (num_plt as u32) * plt_entry_size;
-    file_offset = align_up(file_offset, 16); vaddr = align_up(vaddr, 16);
+    file_offset = align_up(file_offset, 16);
+    vaddr = align_up(vaddr, 16);
     let plt_offset = file_offset;
     let plt_vaddr = vaddr;
-    if plt_total_size > 0 { file_offset += plt_total_size; vaddr += plt_total_size; }
+    if plt_total_size > 0 {
+        file_offset += plt_total_size;
+        vaddr += plt_total_size;
+    }
 
     // .text
     if let Some(idx) = section_name_to_idx.get(".text").copied() {
         let a = output_sections[idx].align.max(16);
-        file_offset = align_up(file_offset, a); vaddr = align_up(vaddr, a);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
         file_offset += output_sections[idx].data.len() as u32;
@@ -428,33 +537,46 @@ pub(super) fn emit_executable(
     let fini_size;
     if let Some(idx) = fini_sec_idx {
         let a = output_sections[idx].align.max(4);
-        file_offset = align_up(file_offset, a); vaddr = align_up(vaddr, a);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
         fini_vaddr = vaddr;
         fini_size = output_sections[idx].data.len() as u32;
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
-        file_offset += fini_size; vaddr += fini_size;
+        file_offset += fini_size;
+        vaddr += fini_size;
     } else {
-        fini_vaddr = 0; fini_size = 0;
+        fini_vaddr = 0;
+        fini_size = 0;
     }
 
     // Layout custom executable sections (for __start_/__stop_ symbol auto-generation)
-    layout_custom_sections(section_name_to_idx, output_sections,
-        &mut file_offset, &mut vaddr, SHF_EXECINSTR);
+    layout_custom_sections(
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        SHF_EXECINSTR,
+    );
 
     // .iplt (IFUNC PLT entries for static linking)
     let iplt_entry_size: u32 = 8;
     let iplt_total_size = (num_ifunc as u32) * iplt_entry_size;
-    file_offset = align_up(file_offset, 8); vaddr = align_up(vaddr, 8);
+    file_offset = align_up(file_offset, 8);
+    vaddr = align_up(vaddr, 8);
     let iplt_offset = file_offset;
     let iplt_vaddr = vaddr;
-    if iplt_total_size > 0 { file_offset += iplt_total_size; vaddr += iplt_total_size; }
+    if iplt_total_size > 0 {
+        file_offset += iplt_total_size;
+        vaddr += iplt_total_size;
+    }
 
     let text_seg_file_end = file_offset;
     let text_seg_vaddr_end = vaddr;
 
     // ── Segment 2 (RO): .rodata + .eh_frame ──
-    file_offset = align_up(file_offset, PAGE_SIZE); vaddr = align_up(vaddr, PAGE_SIZE);
+    file_offset = align_up(file_offset, PAGE_SIZE);
+    vaddr = align_up(vaddr, PAGE_SIZE);
     vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
     if vaddr <= text_seg_vaddr_end {
         vaddr = align_up(text_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
@@ -465,7 +587,8 @@ pub(super) fn emit_executable(
 
     if let Some(idx) = section_name_to_idx.get(".rodata").copied() {
         let a = output_sections[idx].align.max(4);
-        file_offset = align_up(file_offset, a); vaddr = align_up(vaddr, a);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
         file_offset += output_sections[idx].data.len() as u32;
@@ -475,7 +598,8 @@ pub(super) fn emit_executable(
     let eh_frame_sec_idx = section_name_to_idx.get(".eh_frame").copied();
     if let Some(idx) = eh_frame_sec_idx {
         let a = output_sections[idx].align.max(4);
-        file_offset = align_up(file_offset, a); vaddr = align_up(vaddr, a);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
         file_offset += output_sections[idx].data.len() as u32;
@@ -487,7 +611,8 @@ pub(super) fn emit_executable(
     let mut eh_frame_hdr_offset = 0u32;
     let mut eh_frame_hdr_size = 0u32;
     if let Some(idx) = eh_frame_sec_idx {
-        let fde_count = crate::backend::linker_common::count_eh_frame_fdes(&output_sections[idx].data);
+        let fde_count =
+            crate::backend::linker_common::count_eh_frame_fdes(&output_sections[idx].data);
         if fde_count > 0 {
             eh_frame_hdr_size = (12 + 8 * fde_count) as u32;
             file_offset = align_up(file_offset, 4);
@@ -500,14 +625,20 @@ pub(super) fn emit_executable(
     }
 
     // Layout custom read-only sections (for __start_/__stop_ symbol auto-generation)
-    layout_custom_sections(section_name_to_idx, output_sections,
-        &mut file_offset, &mut vaddr, 0);
+    layout_custom_sections(
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        0,
+    );
 
     let rodata_seg_file_end = file_offset;
     let rodata_seg_vaddr_end = vaddr;
 
     // ── Segment 3 (RW): .init_array + .fini_array + .dynamic + .got + .got.plt + .data + .bss ──
-    file_offset = align_up(file_offset, PAGE_SIZE); vaddr = align_up(vaddr, PAGE_SIZE);
+    file_offset = align_up(file_offset, PAGE_SIZE);
+    vaddr = align_up(vaddr, PAGE_SIZE);
     vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
     if vaddr <= rodata_seg_vaddr_end {
         vaddr = align_up(rodata_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
@@ -518,32 +649,60 @@ pub(super) fn emit_executable(
 
     // .init_array
     let (init_array_vaddr, init_array_size) = layout_section(
-        ".init_array", section_name_to_idx, output_sections, &mut file_offset, &mut vaddr, 4,
+        ".init_array",
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        4,
     );
 
     // .fini_array
     let (fini_array_vaddr, fini_array_size) = layout_section(
-        ".fini_array", section_name_to_idx, output_sections, &mut file_offset, &mut vaddr, 4,
+        ".fini_array",
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        4,
     );
 
     // Layout custom writable sections (for __start_/__stop_ symbol auto-generation)
-    layout_custom_sections(section_name_to_idx, output_sections,
-        &mut file_offset, &mut vaddr, SHF_WRITE);
+    layout_custom_sections(
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        SHF_WRITE,
+    );
 
     // .dynamic
-    file_offset = align_up(file_offset, 4); vaddr = align_up(vaddr, 4);
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
     let dynamic_offset = file_offset;
     let dynamic_vaddr = vaddr;
     let num_dynamic_entries = count_dynamic_entries(
-        &needed_libs, init_vaddr, init_size, fini_vaddr, fini_size,
-        init_array_size, fini_array_size, num_plt, num_rel_dyn, verneed_size,
+        &needed_libs,
+        init_vaddr,
+        init_size,
+        fini_vaddr,
+        fini_size,
+        init_array_size,
+        fini_array_size,
+        num_plt,
+        num_rel_dyn,
+        verneed_size,
         num_text_relocs,
     );
     let dynamic_size = num_dynamic_entries * 8;
-    if !is_static { file_offset += dynamic_size; vaddr += dynamic_size; }
+    if !is_static {
+        file_offset += dynamic_size;
+        vaddr += dynamic_size;
+    }
 
     // .got
-    file_offset = align_up(file_offset, 4); vaddr = align_up(vaddr, 4);
+    file_offset = align_up(file_offset, 4);
+    vaddr = align_up(vaddr, 4);
     let got_offset = file_offset;
     let got_vaddr = vaddr;
     let got_reserved: usize = 1;
@@ -551,31 +710,44 @@ pub(super) fn emit_executable(
     let got_entry_size: u32 = 4;
     let got_size = (got_reserved + got_non_plt_entries) as u32 * got_entry_size;
     let needs_got_section = !is_static || got_non_plt_entries > 0 || num_plt > 0;
-    if needs_got_section { file_offset += got_size; vaddr += got_size; }
+    if needs_got_section {
+        file_offset += got_size;
+        vaddr += got_size;
+    }
 
     // .got.plt
     let gotplt_offset = file_offset;
     let gotplt_vaddr = vaddr;
     let gotplt_reserved: u32 = 3;
     let gotplt_size = (gotplt_reserved + num_plt as u32) * 4;
-    if !is_static && num_plt > 0 { file_offset += gotplt_size; vaddr += gotplt_size; }
+    if !is_static && num_plt > 0 {
+        file_offset += gotplt_size;
+        vaddr += gotplt_size;
+    }
 
     // IFUNC GOT
     let ifunc_got_offset = file_offset;
     let ifunc_got_vaddr = vaddr;
     let ifunc_got_size = (num_ifunc as u32) * 4;
-    if ifunc_got_size > 0 { file_offset += ifunc_got_size; vaddr += ifunc_got_size; }
+    if ifunc_got_size > 0 {
+        file_offset += ifunc_got_size;
+        vaddr += ifunc_got_size;
+    }
 
     // .rel.iplt
     let rel_iplt_offset = file_offset;
     let rel_iplt_vaddr = vaddr;
     let rel_iplt_size = (num_ifunc as u32) * 8;
-    if rel_iplt_size > 0 { file_offset += rel_iplt_size; vaddr += rel_iplt_size; }
+    if rel_iplt_size > 0 {
+        file_offset += rel_iplt_size;
+        vaddr += rel_iplt_size;
+    }
 
     // .data
     if let Some(idx) = section_name_to_idx.get(".data").copied() {
         let a = output_sections[idx].align.max(4);
-        file_offset = align_up(file_offset, a); vaddr = align_up(vaddr, a);
+        file_offset = align_up(file_offset, a);
+        vaddr = align_up(vaddr, a);
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
         file_offset += output_sections[idx].data.len() as u32;
@@ -583,8 +755,12 @@ pub(super) fn emit_executable(
     }
 
     // TLS sections
-    let (tls_addr, tls_file_offset, tls_file_size, tls_mem_size, tls_align) =
-        layout_tls(section_name_to_idx, output_sections, &mut file_offset, &mut vaddr);
+    let (tls_addr, tls_file_offset, tls_file_size, tls_mem_size, tls_align) = layout_tls(
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+    );
     let has_tls = tls_addr != 0;
 
     let data_seg_file_end = file_offset;
@@ -603,9 +779,11 @@ pub(super) fn emit_executable(
     }
 
     // Allocate BSS space for copy relocations
-    let mut copy_reloc_symbols: Vec<String> = global_symbols.iter()
+    let mut copy_reloc_symbols: Vec<String> = global_symbols
+        .iter()
         .filter(|(_, s)| s.needs_copy && s.is_dynamic)
-        .map(|(n, _)| n.clone()).collect();
+        .map(|(n, _)| n.clone())
+        .collect();
     copy_reloc_symbols.sort();
 
     for name in &copy_reloc_symbols {
@@ -624,12 +802,24 @@ pub(super) fn emit_executable(
 
     // ── Assign symbol addresses ──────────────────────────────────────────
     assign_symbol_addresses(
-        global_symbols, output_sections, got_base,
-        plt_vaddr, plt_header_size, plt_entry_size,
-        bss_vaddr, data_seg_vaddr_end, data_seg_vaddr_start,
-        text_seg_vaddr_end, dynamic_vaddr, is_static,
-        init_array_vaddr, init_array_size, fini_array_vaddr, fini_array_size,
-        rel_iplt_vaddr, rel_iplt_size,
+        global_symbols,
+        output_sections,
+        got_base,
+        plt_vaddr,
+        plt_header_size,
+        plt_entry_size,
+        bss_vaddr,
+        data_seg_vaddr_end,
+        data_seg_vaddr_start,
+        text_seg_vaddr_end,
+        dynamic_vaddr,
+        is_static,
+        init_array_vaddr,
+        init_array_size,
+        fini_array_vaddr,
+        fini_array_size,
+        rel_iplt_vaddr,
+        rel_iplt_size,
     );
 
     // Override IFUNC symbol addresses to point to IPLT entries
@@ -645,9 +835,11 @@ pub(super) fn emit_executable(
     let mut iplt_data: Vec<u8> = Vec::new();
     for i in 0..num_ifunc {
         let got_entry_addr = ifunc_got_vaddr + (i as u32) * 4;
-        iplt_data.push(0xff); iplt_data.push(0x25);
+        iplt_data.push(0xff);
+        iplt_data.push(0x25);
         iplt_data.extend_from_slice(&got_entry_addr.to_le_bytes());
-        iplt_data.push(0x66); iplt_data.push(0x90);
+        iplt_data.push(0x66);
+        iplt_data.push(0x90);
     }
 
     let mut ifunc_got_data: Vec<u8> = Vec::new();
@@ -663,8 +855,14 @@ pub(super) fn emit_executable(
     }
 
     // ── Build PLT ────────────────────────────────────────────────────────
-    let plt_data = build_plt(num_plt, plt_vaddr, plt_header_size, plt_entry_size,
-        gotplt_vaddr, gotplt_reserved);
+    let plt_data = build_plt(
+        num_plt,
+        plt_vaddr,
+        plt_header_size,
+        plt_entry_size,
+        gotplt_vaddr,
+        gotplt_reserved,
+    );
 
     // ── Apply relocations ────────────────────────────────────────────────
     let text_relocs;
@@ -790,14 +988,20 @@ pub(super) fn emit_executable(
     // .dynamic data
     let mut dynamic_data: Vec<u8> = Vec::new();
     if !is_static {
-        for &off in &needed_offsets { push_dyn(&mut dynamic_data, DT_NEEDED, off); }
+        for &off in &needed_offsets {
+            push_dyn(&mut dynamic_data, DT_NEEDED, off);
+        }
         push_dyn(&mut dynamic_data, DT_GNU_HASH_TAG, gnu_hash_vaddr);
         push_dyn(&mut dynamic_data, DT_STRTAB, dynstr_vaddr);
         push_dyn(&mut dynamic_data, DT_SYMTAB, dynsym_vaddr);
         push_dyn(&mut dynamic_data, DT_STRSZ, dynstr_size);
         push_dyn(&mut dynamic_data, DT_SYMENT, dynsym_entsize);
-        if init_vaddr != 0 && init_size > 0 { push_dyn(&mut dynamic_data, DT_INIT, init_vaddr); }
-        if fini_vaddr != 0 && fini_size > 0 { push_dyn(&mut dynamic_data, DT_FINI, fini_vaddr); }
+        if init_vaddr != 0 && init_size > 0 {
+            push_dyn(&mut dynamic_data, DT_INIT, init_vaddr);
+        }
+        if fini_vaddr != 0 && fini_size > 0 {
+            push_dyn(&mut dynamic_data, DT_FINI, fini_vaddr);
+        }
         if init_array_size > 0 {
             push_dyn(&mut dynamic_data, DT_INIT_ARRAY, init_array_vaddr);
             push_dyn(&mut dynamic_data, DT_INIT_ARRAYSZ, init_array_size);
@@ -830,9 +1034,15 @@ pub(super) fn emit_executable(
     }
 
     // Entry point
-    let entry_point = global_symbols.get("_start")
+    let entry_point = global_symbols
+        .get("_start")
         .map(|s| s.address)
-        .unwrap_or_else(|| global_symbols.get("main").map(|s| s.address).unwrap_or(BASE_ADDR));
+        .unwrap_or_else(|| {
+            global_symbols
+                .get("main")
+                .map(|s| s.address)
+                .unwrap_or(BASE_ADDR)
+        });
 
     // Patch dynsym for copy-reloc symbols
     for name in &copy_syms_for_dynsym {
@@ -864,9 +1074,15 @@ pub(super) fn emit_executable(
 
     // Program headers
     let mut phdr_pos = phdr_offset as usize;
-    let write_ph = |output: &mut Vec<u8>, pos: &mut usize,
-                    p_type: u32, p_off: u32, p_va: u32,
-                    p_filesz: u32, p_memsz: u32, p_flags: u32, p_align: u32| {
+    let write_ph = |output: &mut Vec<u8>,
+                    pos: &mut usize,
+                    p_type: u32,
+                    p_off: u32,
+                    p_va: u32,
+                    p_filesz: u32,
+                    p_memsz: u32,
+                    p_flags: u32,
+                    p_align: u32| {
         output[*pos..*pos + 4].copy_from_slice(&p_type.to_le_bytes());
         output[*pos + 4..*pos + 8].copy_from_slice(&p_off.to_le_bytes());
         output[*pos + 8..*pos + 12].copy_from_slice(&p_va.to_le_bytes());
@@ -878,36 +1094,123 @@ pub(super) fn emit_executable(
         *pos += phdr_size as usize;
     };
 
-    write_ph(&mut output, &mut phdr_pos, PT_PHDR, phdr_offset, phdr_vaddr,
-        phdrs_total_size, phdrs_total_size, PF_R, 4);
+    write_ph(
+        &mut output,
+        &mut phdr_pos,
+        PT_PHDR,
+        phdr_offset,
+        phdr_vaddr,
+        phdrs_total_size,
+        phdrs_total_size,
+        PF_R,
+        4,
+    );
     if !is_static {
-        write_ph(&mut output, &mut phdr_pos, PT_INTERP, interp_offset, interp_vaddr,
-            interp_size, interp_size, PF_R, 1);
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_INTERP,
+            interp_offset,
+            interp_vaddr,
+            interp_size,
+            interp_size,
+            PF_R,
+            1,
+        );
     }
-    write_ph(&mut output, &mut phdr_pos, PT_LOAD, 0, BASE_ADDR,
-        ro_headers_end, ro_headers_end, PF_R, PAGE_SIZE);
-    write_ph(&mut output, &mut phdr_pos, PT_LOAD, text_seg_file_start, text_seg_vaddr_start,
-        text_seg_file_end - text_seg_file_start, text_seg_vaddr_end - text_seg_vaddr_start,
-        PF_R | PF_X, PAGE_SIZE);
+    write_ph(
+        &mut output,
+        &mut phdr_pos,
+        PT_LOAD,
+        0,
+        BASE_ADDR,
+        ro_headers_end,
+        ro_headers_end,
+        PF_R,
+        PAGE_SIZE,
+    );
+    write_ph(
+        &mut output,
+        &mut phdr_pos,
+        PT_LOAD,
+        text_seg_file_start,
+        text_seg_vaddr_start,
+        text_seg_file_end - text_seg_file_start,
+        text_seg_vaddr_end - text_seg_vaddr_start,
+        PF_R | PF_X,
+        PAGE_SIZE,
+    );
     if rodata_seg_file_end - rodata_seg_file_start > 0 {
-        write_ph(&mut output, &mut phdr_pos, PT_LOAD, rodata_seg_file_start, rodata_seg_vaddr_start,
-            rodata_seg_file_end - rodata_seg_file_start, rodata_seg_vaddr_end - rodata_seg_vaddr_start,
-            PF_R, PAGE_SIZE);
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_LOAD,
+            rodata_seg_file_start,
+            rodata_seg_vaddr_start,
+            rodata_seg_file_end - rodata_seg_file_start,
+            rodata_seg_vaddr_end - rodata_seg_vaddr_start,
+            PF_R,
+            PAGE_SIZE,
+        );
     }
-    write_ph(&mut output, &mut phdr_pos, PT_LOAD, data_seg_file_start, data_seg_vaddr_start,
-        data_seg_file_end - data_seg_file_start, data_seg_vaddr_end - data_seg_vaddr_start,
-        PF_R | PF_W, PAGE_SIZE);
+    write_ph(
+        &mut output,
+        &mut phdr_pos,
+        PT_LOAD,
+        data_seg_file_start,
+        data_seg_vaddr_start,
+        data_seg_file_end - data_seg_file_start,
+        data_seg_vaddr_end - data_seg_vaddr_start,
+        PF_R | PF_W,
+        PAGE_SIZE,
+    );
     if !is_static {
-        write_ph(&mut output, &mut phdr_pos, PT_DYNAMIC, dynamic_offset, dynamic_vaddr,
-            dynamic_data.len() as u32, dynamic_data.len() as u32, PF_R | PF_W, 4);
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_DYNAMIC,
+            dynamic_offset,
+            dynamic_vaddr,
+            dynamic_data.len() as u32,
+            dynamic_data.len() as u32,
+            PF_R | PF_W,
+            4,
+        );
     }
-    write_ph(&mut output, &mut phdr_pos, PT_GNU_STACK, 0, 0, 0, 0, PF_R | PF_W, 0x10);
-    write_ph(&mut output, &mut phdr_pos, PT_GNU_EH_FRAME,
-        eh_frame_hdr_offset, eh_frame_hdr_vaddr,
-        eh_frame_hdr_size, eh_frame_hdr_size, PF_R, 4);
+    write_ph(
+        &mut output,
+        &mut phdr_pos,
+        PT_GNU_STACK,
+        0,
+        0,
+        0,
+        0,
+        PF_R | PF_W,
+        0x10,
+    );
+    write_ph(
+        &mut output,
+        &mut phdr_pos,
+        PT_GNU_EH_FRAME,
+        eh_frame_hdr_offset,
+        eh_frame_hdr_vaddr,
+        eh_frame_hdr_size,
+        eh_frame_hdr_size,
+        PF_R,
+        4,
+    );
     if has_tls {
-        write_ph(&mut output, &mut phdr_pos, PT_TLS, tls_file_offset, tls_addr,
-            tls_file_size, tls_mem_size, PF_R, tls_align);
+        write_ph(
+            &mut output,
+            &mut phdr_pos,
+            PT_TLS,
+            tls_file_offset,
+            tls_addr,
+            tls_file_size,
+            tls_mem_size,
+            PF_R,
+            tls_align,
+        );
     }
 
     // Write section data
@@ -923,12 +1226,22 @@ pub(super) fn emit_executable(
         write_data(&mut output, gnu_hash_offset, &gnu_hash_data);
         write_data(&mut output, dynsym_offset, &dynsym_data);
         write_data(&mut output, dynstr_offset, &dynstr_data);
-        if !versym_data.is_empty() { write_data(&mut output, versym_offset, &versym_data); }
-        if !verneed_data.is_empty() { write_data(&mut output, verneed_offset, &verneed_data); }
-        if !rel_dyn_data.is_empty() { write_data(&mut output, rel_dyn_offset, &rel_dyn_data); }
-        if !rel_plt_data.is_empty() { write_data(&mut output, rel_plt_offset, &rel_plt_data); }
+        if !versym_data.is_empty() {
+            write_data(&mut output, versym_offset, &versym_data);
+        }
+        if !verneed_data.is_empty() {
+            write_data(&mut output, verneed_offset, &verneed_data);
+        }
+        if !rel_dyn_data.is_empty() {
+            write_data(&mut output, rel_dyn_offset, &rel_dyn_data);
+        }
+        if !rel_plt_data.is_empty() {
+            write_data(&mut output, rel_plt_offset, &rel_plt_data);
+        }
         write_data(&mut output, dynamic_offset, &dynamic_data);
-        if !gotplt_data.is_empty() { write_data(&mut output, gotplt_offset, &gotplt_data); }
+        if !gotplt_data.is_empty() {
+            write_data(&mut output, gotplt_offset, &gotplt_data);
+        }
     }
     write_data(&mut output, plt_offset, &plt_data);
     write_data(&mut output, got_offset, &got_data);
@@ -943,7 +1256,9 @@ pub(super) fn emit_executable(
 
     // Write all output sections
     for sec in output_sections.iter() {
-        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() { continue; }
+        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() {
+            continue;
+        }
         let off = sec.file_offset as usize;
         let end = off + sec.data.len();
         if end <= output.len() {
@@ -952,8 +1267,7 @@ pub(super) fn emit_executable(
     }
 
     // Write to file
-    std::fs::write(output_path, &output)
-        .map_err(|e| format!("failed to write output: {}", e))?;
+    std::fs::write(output_path, &output).map_err(|e| format!("failed to write output: {}", e))?;
 
     #[cfg(unix)]
     {
@@ -1009,19 +1323,34 @@ pub(super) fn layout_custom_sections(
     required_flag: u32,
 ) {
     let standard_sections: &[&str] = &[
-        ".text", ".rodata", ".data", ".bss", ".init", ".fini",
-        ".init_array", ".fini_array", ".eh_frame", ".note",
-        ".tdata", ".tbss", ".tm_clone_table",
+        ".text",
+        ".rodata",
+        ".data",
+        ".bss",
+        ".init",
+        ".fini",
+        ".init_array",
+        ".fini_array",
+        ".eh_frame",
+        ".note",
+        ".tdata",
+        ".tbss",
+        ".tm_clone_table",
     ];
-    let mut custom: Vec<String> = section_name_to_idx.keys()
+    let mut custom: Vec<String> = section_name_to_idx
+        .keys()
         .filter(|name| {
-            if standard_sections.contains(&name.as_str()) { return false; }
+            if standard_sections.contains(&name.as_str()) {
+                return false;
+            }
             let idx = match section_name_to_idx.get(name.as_str()) {
                 Some(&i) => i,
                 None => return false,
             };
             let sec = &output_sections[idx];
-            if sec.flags & SHF_ALLOC == 0 { return false; }
+            if sec.flags & SHF_ALLOC == 0 {
+                return false;
+            }
             // Classify by flags: 0 = read-only (no write, no exec),
             // SHF_EXECINSTR = executable, SHF_WRITE = writable (but not executable,
             // since writable+executable sections go in the text segment).
@@ -1034,7 +1363,14 @@ pub(super) fn layout_custom_sections(
         .collect();
     custom.sort(); // Deterministic order
     for name in &custom {
-        layout_section(name, section_name_to_idx, output_sections, file_offset, vaddr, 4);
+        layout_section(
+            name,
+            section_name_to_idx,
+            output_sections,
+            file_offset,
+            vaddr,
+            4,
+        );
     }
 }
 
@@ -1077,32 +1413,61 @@ pub(super) fn layout_tls(
         output_sections[idx].addr = tls_addr + aligned;
         output_sections[idx].file_offset = *file_offset;
         tls_mem_size = aligned + output_sections[idx].data.len() as u32;
-        if a > tls_align { tls_align = a; }
+        if a > tls_align {
+            tls_align = a;
+        }
     }
 
     tls_mem_size = align_up(tls_mem_size, tls_align);
-    (tls_addr, tls_file_offset, tls_file_size, tls_mem_size, tls_align)
+    (
+        tls_addr,
+        tls_file_offset,
+        tls_file_size,
+        tls_mem_size,
+        tls_align,
+    )
 }
 
 fn count_dynamic_entries(
     needed_libs: &[String],
-    init_vaddr: u32, init_size: u32,
-    fini_vaddr: u32, fini_size: u32,
-    init_array_size: u32, fini_array_size: u32,
-    num_plt: usize, num_rel_dyn: usize, verneed_size: u32,
+    init_vaddr: u32,
+    init_size: u32,
+    fini_vaddr: u32,
+    fini_size: u32,
+    init_array_size: u32,
+    fini_array_size: u32,
+    num_plt: usize,
+    num_rel_dyn: usize,
+    verneed_size: u32,
     num_text_relocs: usize,
 ) -> u32 {
     let mut n: u32 = needed_libs.len() as u32;
     n += 5; // GNU_HASH, STRTAB, SYMTAB, STRSZ, SYMENT
-    if init_vaddr != 0 && init_size > 0 { n += 1; }
-    if fini_vaddr != 0 && fini_size > 0 { n += 1; }
-    if init_array_size > 0 { n += 2; }
-    if fini_array_size > 0 { n += 2; }
+    if init_vaddr != 0 && init_size > 0 {
+        n += 1;
+    }
+    if fini_vaddr != 0 && fini_size > 0 {
+        n += 1;
+    }
+    if init_array_size > 0 {
+        n += 2;
+    }
+    if fini_array_size > 0 {
+        n += 2;
+    }
     n += 1; // DEBUG
-    if num_plt > 0 { n += 4; }
-    if num_rel_dyn > 0 { n += 3; }
-    if verneed_size > 0 { n += 3; }
-    if num_text_relocs > 0 { n += 1; } // DT_TEXTREL
+    if num_plt > 0 {
+        n += 4;
+    }
+    if num_rel_dyn > 0 {
+        n += 3;
+    }
+    if verneed_size > 0 {
+        n += 3;
+    }
+    if num_text_relocs > 0 {
+        n += 1;
+    } // DT_TEXTREL
     n += 1; // DT_NULL
     n
 }
@@ -1111,19 +1476,44 @@ fn assign_symbol_addresses(
     global_symbols: &mut FxHashMap<String, LinkerSymbol>,
     output_sections: &[OutputSection],
     got_base: u32,
-    plt_vaddr: u32, plt_header_size: u32, plt_entry_size: u32,
-    bss_vaddr: u32, data_seg_vaddr_end: u32, data_seg_vaddr_start: u32,
-    text_seg_vaddr_end: u32, dynamic_vaddr: u32, is_static: bool,
-    init_array_vaddr: u32, init_array_size: u32,
-    fini_array_vaddr: u32, fini_array_size: u32,
-    rel_iplt_vaddr: u32, rel_iplt_size: u32,
+    plt_vaddr: u32,
+    plt_header_size: u32,
+    plt_entry_size: u32,
+    bss_vaddr: u32,
+    data_seg_vaddr_end: u32,
+    data_seg_vaddr_start: u32,
+    text_seg_vaddr_end: u32,
+    dynamic_vaddr: u32,
+    is_static: bool,
+    init_array_vaddr: u32,
+    init_array_size: u32,
+    fini_array_vaddr: u32,
+    fini_array_size: u32,
+    rel_iplt_vaddr: u32,
+    rel_iplt_size: u32,
 ) {
-    global_symbols.entry("_GLOBAL_OFFSET_TABLE_".to_string()).or_insert(LinkerSymbol {
-        address: got_base, size: 0, sym_type: STT_OBJECT, binding: STB_LOCAL,
-        visibility: STV_DEFAULT, is_defined: true, needs_plt: false, needs_got: false,
-        output_section: usize::MAX, section_offset: 0, plt_index: 0, got_index: 0,
-        is_dynamic: false, dynlib: String::new(), needs_copy: false, copy_addr: 0, version: None, uses_textrel: false,
-    });
+    global_symbols
+        .entry("_GLOBAL_OFFSET_TABLE_".to_string())
+        .or_insert(LinkerSymbol {
+            address: got_base,
+            size: 0,
+            sym_type: STT_OBJECT,
+            binding: STB_LOCAL,
+            visibility: STV_DEFAULT,
+            is_defined: true,
+            needs_plt: false,
+            needs_got: false,
+            output_section: usize::MAX,
+            section_offset: 0,
+            plt_index: 0,
+            got_index: 0,
+            is_dynamic: false,
+            dynlib: String::new(),
+            needs_copy: false,
+            copy_addr: 0,
+            version: None,
+            uses_textrel: false,
+        });
     if let Some(sym) = global_symbols.get_mut("_GLOBAL_OFFSET_TABLE_") {
         sym.address = got_base;
         sym.is_defined = true;
@@ -1147,7 +1537,8 @@ fn assign_symbol_addresses(
         rela_iplt_size: rel_iplt_size as u64,
     };
     let standard_syms = get_standard_linker_symbols(&linker_addrs);
-    let linker_sym_map: FxHashMap<&str, u64> = standard_syms.iter()
+    let linker_sym_map: FxHashMap<&str, u64> = standard_syms
+        .iter()
         .filter(|s| !s.name.starts_with("__rela_iplt"))
         .map(|s| (s.name, s.value))
         .collect();
@@ -1164,7 +1555,9 @@ fn assign_symbol_addresses(
         }
         if let Some(&value) = linker_sym_map.get(name.as_str()) {
             sym.address = value as u32;
-            if name == "__dso_handle" { sym.is_defined = true; }
+            if name == "__dso_handle" {
+                sym.is_defined = true;
+            }
         }
         match name.as_str() {
             "__bss_start__" => sym.address = bss_vaddr,
@@ -1195,27 +1588,38 @@ fn assign_symbol_addresses(
 }
 
 pub(super) fn build_plt(
-    num_plt: usize, plt_vaddr: u32, plt_header_size: u32, plt_entry_size: u32,
-    gotplt_vaddr: u32, gotplt_reserved: u32,
+    num_plt: usize,
+    plt_vaddr: u32,
+    plt_header_size: u32,
+    plt_entry_size: u32,
+    gotplt_vaddr: u32,
+    gotplt_reserved: u32,
 ) -> Vec<u8> {
     let mut plt_data: Vec<u8> = Vec::new();
-    if num_plt == 0 { return plt_data; }
+    if num_plt == 0 {
+        return plt_data;
+    }
 
     // PLT[0]: resolver stub
     let got1 = gotplt_vaddr + 4;
     let got2 = gotplt_vaddr + 8;
-    plt_data.push(0xff); plt_data.push(0x35);
+    plt_data.push(0xff);
+    plt_data.push(0x35);
     plt_data.extend_from_slice(&got1.to_le_bytes());
-    plt_data.push(0xff); plt_data.push(0x25);
+    plt_data.push(0xff);
+    plt_data.push(0x25);
     plt_data.extend_from_slice(&got2.to_le_bytes());
-    while plt_data.len() < plt_header_size as usize { plt_data.push(0x90); }
+    while plt_data.len() < plt_header_size as usize {
+        plt_data.push(0x90);
+    }
 
     // PLT[N]
     for i in 0..num_plt {
         let gotplt_entry = gotplt_vaddr + (gotplt_reserved + i as u32) * 4;
         let plt_entry_addr = plt_vaddr + plt_header_size + (i as u32) * plt_entry_size;
 
-        plt_data.push(0xff); plt_data.push(0x25);
+        plt_data.push(0xff);
+        plt_data.push(0x25);
         plt_data.extend_from_slice(&gotplt_entry.to_le_bytes());
         plt_data.push(0x68);
         plt_data.extend_from_slice(&(i as u32 * 8).to_le_bytes());

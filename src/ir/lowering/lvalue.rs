@@ -1,14 +1,8 @@
-use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, CType};
-use super::lower::Lowerer;
 use super::definitions::{LValue, LValueKind};
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl Lowerer {
     /// Try to get the lvalue (address) of an expression.
@@ -40,15 +34,25 @@ impl Lowerer {
                     // Static locals: emit fresh GlobalAddr at point of use
                     if let Some(global_name) = static_global_name {
                         let addr = self.fresh_value();
-                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name });
+                        self.emit(Instruction::GlobalAddr {
+                            dest: addr,
+                            name: global_name,
+                        });
                         return Some(LValue::address(addr, AddressSpace::Default, vol));
                     }
                     return Some(LValue::variable(alloca, vol));
                 }
                 // Static local variables: resolve through mangled name
-                if let Some(mangled) = self.func_state.as_ref().and_then(|fs| fs.static_local_names.get(name).cloned()) {
+                if let Some(mangled) = self
+                    .func_state
+                    .as_ref()
+                    .and_then(|fs| fs.static_local_names.get(name).cloned())
+                {
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: mangled });
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: mangled,
+                    });
                     return Some(LValue::address(addr, AddressSpace::Default, vol));
                 }
                 if let Some(ginfo) = self.globals.get(name) {
@@ -66,7 +70,10 @@ impl Lowerer {
                     // the address of __GI_x).
                     let resolved_name = self.resolve_ref_name(name);
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: resolved_name,
+                    });
                     Some(LValue::address(addr, addr_space, vol))
                 } else {
                     None
@@ -113,11 +120,15 @@ impl Lowerer {
                     Operand::Value(v) => v,
                     Operand::Const(_) => {
                         let tmp = self.fresh_value();
-                        self.emit(Instruction::Copy { dest: tmp, src: ptr_val });
+                        self.emit(Instruction::Copy {
+                            dest: tmp,
+                            src: ptr_val,
+                        });
                         tmp
                     }
                 };
-                let (field_offset, _field_ty) = self.resolve_pointer_member_access(base_expr, field_name);
+                let (field_offset, _field_ty) =
+                    self.resolve_pointer_member_access(base_expr, field_name);
                 let field_addr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
                     dest: field_addr,
@@ -180,7 +191,6 @@ impl Lowerer {
             LValueKind::Address(_, seg) => *seg,
         }
     }
-
 
     /// Pure (no-emission) predicate: is the ACCESS denoted by `expr` a C
     /// `volatile` access?  Covers the forms where qualifier information is
@@ -250,7 +260,13 @@ impl Lowerer {
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { volatile: lv.volatile, dest, ptr: addr, ty , seg_override });
+        self.emit(Instruction::Load {
+            volatile: lv.volatile,
+            dest,
+            ptr: addr,
+            ty,
+            seg_override,
+        });
         Operand::Value(dest)
     }
 
@@ -258,7 +274,13 @@ impl Lowerer {
     pub(super) fn store_lvalue_typed(&mut self, lv: &LValue, val: Operand, ty: IrType) {
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
-        self.emit(Instruction::Store { volatile: lv.volatile, val, ptr: addr, ty , seg_override });
+        self.emit(Instruction::Store {
+            volatile: lv.volatile,
+            val,
+            ptr: addr,
+            ty,
+            seg_override,
+        });
     }
 
     /// Compute the address of an array element: base_addr + index * elem_size.
@@ -269,15 +291,16 @@ impl Lowerer {
         // In C, a[i] == i[a] == *(a + i). The parser always puts the expression
         // before '[' as base and the one inside as index. We normalize so the
         // pointer/array is always the base.
-        let (actual_base, actual_index) = if self.expr_is_pointer(base) || self.expr_is_array_name(base) {
-            (base, index)
-        } else if self.expr_is_pointer(index) || self.expr_is_array_name(index) {
-            // Reverse subscript: integer[array] -> swap to array[integer]
-            (index, base)
-        } else {
-            // Default: assume first is base
-            (base, index)
-        };
+        let (actual_base, actual_index) =
+            if self.expr_is_pointer(base) || self.expr_is_array_name(base) {
+                (base, index)
+            } else if self.expr_is_pointer(index) || self.expr_is_array_name(index) {
+                // Reverse subscript: integer[array] -> swap to array[integer]
+                (index, base)
+            } else {
+                // Default: assume first is base
+                (base, index)
+            };
 
         let ptr_int_ty = crate::common::types::target_int_ir_type();
         let index_ty = self.get_expr_type(actual_index);
@@ -298,12 +321,22 @@ impl Lowerer {
         // Compute offset = index * stride (runtime VLA stride or compile-time elem_size)
         let offset = if let Some(stride_val) = vla_stride {
             // Use runtime VLA stride
-            let mul = self.emit_binop_val(IrBinOp::Mul, index_val, Operand::Value(stride_val), ptr_int_ty);
+            let mul = self.emit_binop_val(
+                IrBinOp::Mul,
+                index_val,
+                Operand::Value(stride_val),
+                ptr_int_ty,
+            );
             Operand::Value(mul)
         } else if elem_size == 1 {
             index_val
         } else {
-            let mul = self.emit_binop_val(IrBinOp::Mul, index_val, Operand::Const(IrConst::ptr_int(elem_size as i64)), ptr_int_ty);
+            let mul = self.emit_binop_val(
+                IrBinOp::Mul,
+                index_val,
+                Operand::Const(IrConst::ptr_int(elem_size as i64)),
+                ptr_int_ty,
+            );
             Operand::Value(mul)
         };
 
@@ -313,7 +346,10 @@ impl Lowerer {
             Operand::Value(v) => v,
             Operand::Const(_) => {
                 let tmp = self.fresh_value();
-                self.emit(Instruction::Copy { dest: tmp, src: base_addr });
+                self.emit(Instruction::Copy {
+                    dest: tmp,
+                    src: base_addr,
+                });
                 tmp
             }
         };
@@ -333,7 +369,11 @@ impl Lowerer {
         let root_name = self.get_array_root_name_from_base(base)?;
         let depth = self.count_subscript_depth(base);
 
-        if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(&root_name)) {
+        if let Some(info) = self
+            .func_state
+            .as_ref()
+            .and_then(|fs| fs.locals.get(&root_name))
+        {
             if !info.vla_strides.is_empty() && depth < info.vla_strides.len() {
                 return info.vla_strides[depth];
             }
@@ -349,40 +389,75 @@ impl Lowerer {
         match base {
             Expr::Identifier(name, _) => {
                 // Check locals first so inner-scope locals shadow statics
-                if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name).cloned()) {
+                if let Some(info) = self
+                    .func_state
+                    .as_ref()
+                    .and_then(|fs| fs.locals.get(name).cloned())
+                {
                     // Static locals: emit fresh GlobalAddr at point of use
                     if let Some(ref global_name) = info.static_global_name {
                         let addr = self.fresh_value();
-                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
-                        let is_inline_data = info.is_array || info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+                        self.emit(Instruction::GlobalAddr {
+                            dest: addr,
+                            name: global_name.clone(),
+                        });
+                        let is_inline_data =
+                            info.is_array || info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
                         if is_inline_data {
                             return Operand::Value(addr);
                         } else {
                             let loaded = self.fresh_value();
-                            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Load {
+                                volatile: false,
+                                dest: loaded,
+                                ptr: addr,
+                                ty: IrType::Ptr,
+                                seg_override: AddressSpace::Default,
+                            });
                             return Operand::Value(loaded);
                         }
                     }
-                    let is_inline_data = info.is_array || info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+                    let is_inline_data =
+                        info.is_array || info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
                     if is_inline_data {
                         return Operand::Value(info.alloca);
                     } else {
                         let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Load {
+                            volatile: false,
+                            dest: loaded,
+                            ptr: info.alloca,
+                            ty: IrType::Ptr,
+                            seg_override: AddressSpace::Default,
+                        });
                         return Operand::Value(loaded);
                     }
                 }
                 // Static locals: resolve via mangled name from globals
-                if let Some(mangled) = self.func_state.as_ref().and_then(|fs| fs.static_local_names.get(name).cloned()) {
+                if let Some(mangled) = self
+                    .func_state
+                    .as_ref()
+                    .and_then(|fs| fs.static_local_names.get(name).cloned())
+                {
                     if let Some(ginfo) = self.globals.get(&mangled).cloned() {
                         let addr = self.fresh_value();
-                        self.emit(Instruction::GlobalAddr { dest: addr, name: mangled });
-                        let is_inline_data = ginfo.is_array || ginfo.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+                        self.emit(Instruction::GlobalAddr {
+                            dest: addr,
+                            name: mangled,
+                        });
+                        let is_inline_data = ginfo.is_array
+                            || ginfo.c_type.as_ref().is_some_and(|ct| ct.is_vector());
                         if is_inline_data {
                             return Operand::Value(addr);
                         } else {
                             let loaded = self.fresh_value();
-                            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Load {
+                                volatile: false,
+                                dest: loaded,
+                                ptr: addr,
+                                ty: IrType::Ptr,
+                                seg_override: AddressSpace::Default,
+                            });
                             return Operand::Value(loaded);
                         }
                     }
@@ -394,13 +469,23 @@ impl Lowerer {
                     // R_X86_64_PC32 against undefined `_dl_argv`).
                     let resolved_name = self.resolve_ref_name(name);
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
-                    let is_inline_data = ginfo.is_array || ginfo.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: resolved_name,
+                    });
+                    let is_inline_data =
+                        ginfo.is_array || ginfo.c_type.as_ref().is_some_and(|ct| ct.is_vector());
                     if is_inline_data {
                         return Operand::Value(addr);
                     } else {
                         let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Load {
+                            volatile: false,
+                            dest: loaded,
+                            ptr: addr,
+                            ty: IrType::Ptr,
+                            seg_override: AddressSpace::Default,
+                        });
                         return Operand::Value(loaded);
                     }
                 }
@@ -420,7 +505,8 @@ impl Lowerer {
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // Check if the field is an array type - arrays decay to pointers,
                 // so we return the field address (not load the value).
-                let field_is_array = self.resolve_field_ctype(base_expr, field_name, false)
+                let field_is_array = self
+                    .resolve_field_ctype(base_expr, field_name, false)
                     .map(|ct| matches!(ct, CType::Array(_, _)))
                     .unwrap_or(false);
                 if field_is_array {
@@ -441,7 +527,8 @@ impl Lowerer {
             }
             Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 // Check if the field is an array type - arrays decay to pointers
-                let field_is_array = self.resolve_field_ctype(base_expr, field_name, true)
+                let field_is_array = self
+                    .resolve_field_ctype(base_expr, field_name, true)
                     .map(|ct| matches!(ct, CType::Array(_, _)))
                     .unwrap_or(false);
                 if field_is_array {
@@ -451,11 +538,15 @@ impl Lowerer {
                         Operand::Value(v) => v,
                         Operand::Const(_) => {
                             let tmp = self.fresh_value();
-                            self.emit(Instruction::Copy { dest: tmp, src: ptr_val });
+                            self.emit(Instruction::Copy {
+                                dest: tmp,
+                                src: ptr_val,
+                            });
                             tmp
                         }
                     };
-                    let (field_offset, _) = self.resolve_pointer_member_access(base_expr, field_name);
+                    let (field_offset, _) =
+                        self.resolve_pointer_member_access(base_expr, field_name);
                     let field_addr = self.fresh_value();
                     self.emit(Instruction::GetElementPtr {
                         dest: field_addr,
@@ -472,7 +563,8 @@ impl Lowerer {
                 // Handle *arr where arr is a multi-dimensional array.
                 // e.g., (*x)[i] where x is int[2][3]: *x yields int[3] (sub-array),
                 // which decays to a pointer = the base address of x.
-                let deref_yields_array = self.get_expr_ctype(base)
+                let deref_yields_array = self
+                    .get_expr_ctype(base)
                     .map(|ct| matches!(ct, CType::Array(_, _)))
                     .unwrap_or(false);
                 if deref_yields_array {
@@ -483,9 +575,7 @@ impl Lowerer {
                 // Otherwise, it's a normal pointer dereference - evaluate to get address
                 self.lower_expr(base)
             }
-            _ => {
-                self.lower_expr(base)
-            }
+            _ => self.lower_expr(base),
         }
     }
 
@@ -572,15 +662,21 @@ impl Lowerer {
             match &ctype {
                 CType::Array(elem_ty, _) => {
                     let sz = self.resolve_ctype_size(elem_ty);
-                    if sz > 0 { return Some(sz); }
+                    if sz > 0 {
+                        return Some(sz);
+                    }
                 }
                 CType::Pointer(pointee_ty, _) => {
                     let sz = self.resolve_ctype_size(pointee_ty);
-                    if sz > 0 { return Some(sz); }
+                    if sz > 0 {
+                        return Some(sz);
+                    }
                 }
                 CType::Vector(elem_ty, _) => {
                     let sz = self.resolve_ctype_size(elem_ty);
-                    if sz > 0 { return Some(sz); }
+                    if sz > 0 {
+                        return Some(sz);
+                    }
                 }
                 _ => {}
             }
@@ -616,15 +712,21 @@ impl Lowerer {
             match &ctype {
                 CType::Pointer(pointee, _) => {
                     let sz = self.resolve_ctype_size(pointee);
-                    if sz > 0 { return sz; }
+                    if sz > 0 {
+                        return sz;
+                    }
                 }
                 CType::Array(elem, _) => {
                     let sz = self.resolve_ctype_size(elem);
-                    if sz > 0 { return sz; }
+                    if sz > 0 {
+                        return sz;
+                    }
                 }
                 CType::Vector(elem, _) => {
                     let sz = self.resolve_ctype_size(elem);
-                    if sz > 0 { return sz; }
+                    if sz > 0 {
+                        return sz;
+                    }
                 }
                 _ => {}
             }
@@ -696,16 +798,28 @@ impl Lowerer {
         match ty {
             CType::Pointer(pointee, _) => {
                 let sz = self.resolve_ctype_size(pointee);
-                if sz > 0 { Some(sz) } else { None }
+                if sz > 0 {
+                    Some(sz)
+                } else {
+                    None
+                }
             }
             CType::Array(elem, _) => {
                 let sz = self.resolve_ctype_size(elem);
-                if sz > 0 { Some(sz) } else { None }
+                if sz > 0 {
+                    Some(sz)
+                } else {
+                    None
+                }
             }
             CType::Vector(elem, _) => {
                 // Vector element subscript: v[i] accesses the i-th scalar element
                 let sz = self.resolve_ctype_size(elem);
-                if sz > 0 { Some(sz) } else { None }
+                if sz > 0 {
+                    Some(sz)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -754,8 +868,9 @@ impl Lowerer {
         // Fall back to CType for typedef'd pointer/array types
         let ctype = self.type_spec_to_ctype(type_spec);
         match &ctype {
-            CType::Pointer(inner, _) | CType::Array(inner, _) =>
-                inner.size_ctx(&*self.types.borrow_struct_layouts()),
+            CType::Pointer(inner, _) | CType::Array(inner, _) => {
+                inner.size_ctx(&*self.types.borrow_struct_layouts())
+            }
             _ => 0,
         }
     }

@@ -17,7 +17,9 @@
 //! overhead and gives O(1) lookups with better cache locality.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
+use crate::ir::reexports::{
+    Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
+};
 
 /// Run copy propagation on the entire module.
 /// Returns the number of operand replacements made.
@@ -38,7 +40,9 @@ pub fn run(module: &mut IrModule) -> usize {
 pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
     let mut total = 0;
     for func in &mut module.functions {
-        if func.is_declaration { continue; }
+        if func.is_declaration {
+            continue;
+        }
 
         // Function-wide use counts. The intermediate `tmp` of a chain
         //   memcpy tmp, src
@@ -67,7 +71,10 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
             while i < block.instructions.len() {
                 let (tmp, src) = match block.instructions[i] {
                     Instruction::Memcpy { dest, src, .. } if dest != src => (dest, src),
-                    _ => { i += 1; continue; }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
                 };
                 // Soundness: `tmp` may be referenced only by this memcpy's
                 // dest and the chain consumer's src (2 uses total).
@@ -81,7 +88,10 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     let inst = &block.instructions[j];
                     match inst {
                         Instruction::Memcpy { src: copy_src, .. } if *copy_src == tmp => {
-                            if consumer.is_some() { safe = false; break; }
+                            if consumer.is_some() {
+                                safe = false;
+                                break;
+                            }
                             consumer = Some(j);
                         }
                         _ if inst.used_values().into_iter().any(|value| value == tmp.0) => {
@@ -98,15 +108,33 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     // was miscompiled: x_tmp3 was forwarded to re-read *c3,
                     // but *c3 had already been overwritten by *c0.
                     match inst {
-                        Instruction::Store { ptr, .. } if *ptr == src => { safe = false; break; }
-                        Instruction::Memcpy { dest, .. } if *dest == src => { safe = false; break; }
-                        Instruction::Intrinsic { dest_ptr: Some(dp), .. } if *dp == src => { safe = false; break; }
+                        Instruction::Store { ptr, .. } if *ptr == src => {
+                            safe = false;
+                            break;
+                        }
+                        Instruction::Memcpy { dest, .. } if *dest == src => {
+                            safe = false;
+                            break;
+                        }
+                        Instruction::Intrinsic {
+                            dest_ptr: Some(dp), ..
+                        } if *dp == src => {
+                            safe = false;
+                            break;
+                        }
                         _ => {}
                     }
                 }
-                let Some(consumer) = consumer else { i += 1; continue; };
-                if !safe { i += 1; continue; }
-                if let Instruction::Memcpy { src: copy_src, .. } = &mut block.instructions[consumer] {
+                let Some(consumer) = consumer else {
+                    i += 1;
+                    continue;
+                };
+                if !safe {
+                    i += 1;
+                    continue;
+                }
+                if let Instruction::Memcpy { src: copy_src, .. } = &mut block.instructions[consumer]
+                {
                     *copy_src = src;
                 }
                 block.instructions.remove(i);
@@ -126,7 +154,9 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
 pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
     let mut total = 0;
     for func in &mut module.functions {
-        if func.is_declaration { continue; }
+        if func.is_declaration {
+            continue;
+        }
         'restart: loop {
             for block_idx in 0..func.blocks.len() {
                 for copy_idx in 0..func.blocks[block_idx].instructions.len() {
@@ -134,65 +164,101 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                         Instruction::Memcpy { dest, src, size } => (dest, src, size),
                         _ => continue,
                     };
-                    if size < 128 || dest == src
+                    if size < 128
+                        || dest == src
                         || !is_local_alloca(func, dest)
                         || !is_local_alloca(func, src)
-                    { continue; }
+                    {
+                        continue;
+                    }
 
                     let dest_derived = collect_derived_pointers(func, dest);
                     let mut loads = Vec::with_capacity(16);
                     let mut safe = true;
                     for (bi, block) in func.blocks.iter().enumerate() {
                         for (ii, inst) in block.instructions.iter().enumerate() {
-                            if bi == block_idx && ii == copy_idx { continue; }
-                            let uses = inst.used_values().into_iter().any(|v| dest_derived.contains(&v));
-                            if !uses { continue; }
+                            if bi == block_idx && ii == copy_idx {
+                                continue;
+                            }
+                            let uses = inst
+                                .used_values()
+                                .into_iter()
+                                .any(|v| dest_derived.contains(&v));
+                            if !uses {
+                                continue;
+                            }
                             match inst {
                                 Instruction::GetElementPtr { base, .. }
                                     if dest_derived.contains(&base.0) => {}
                                 Instruction::Load { ptr, .. }
                                     if dest_derived.contains(&ptr.0)
-                                        && bi == block_idx && ii > copy_idx => {
+                                        && bi == block_idx
+                                        && ii > copy_idx =>
+                                {
                                     loads.push((bi, ii, *ptr));
                                 }
-                                _ => { safe = false; break; }
+                                _ => {
+                                    safe = false;
+                                    break;
+                                }
                             }
                         }
-                        if !safe { break; }
-                        if block.terminator.used_values().into_iter().any(|v| dest_derived.contains(&v)) {
+                        if !safe {
+                            break;
+                        }
+                        if block
+                            .terminator
+                            .used_values()
+                            .into_iter()
+                            .any(|v| dest_derived.contains(&v))
+                        {
                             safe = false;
                             break;
                         }
                     }
-                    if !safe || loads.is_empty() { continue; }
+                    if !safe || loads.is_empty() {
+                        continue;
+                    }
 
                     // No source write, call, or opaque operation may occur
                     // between the copy and any forwarded load on this path.
                     for &(_, load_idx, _) in &loads {
                         for inst in &func.blocks[block_idx].instructions[copy_idx + 1..load_idx] {
-                            if matches!(inst,
+                            if matches!(
+                                inst,
                                 Instruction::Store { .. }
-                                | Instruction::Memcpy { .. }
-                                | Instruction::Call { .. }
-                                | Instruction::CallIndirect { .. }
-                                | Instruction::InlineAsm { .. }
-                                | Instruction::Intrinsic { .. }
+                                    | Instruction::Memcpy { .. }
+                                    | Instruction::Call { .. }
+                                    | Instruction::CallIndirect { .. }
+                                    | Instruction::InlineAsm { .. }
+                                    | Instruction::Intrinsic { .. }
                             ) {
                                 safe = false;
                                 break;
                             }
                         }
-                        if !safe { break; }
+                        if !safe {
+                            break;
+                        }
                     }
-                    if !safe { continue; }
+                    if !safe {
+                        continue;
+                    }
 
                     // Resolve each destination-rooted pointer to a constant
                     // byte offset. Dynamic GEPs are rejected rather than
                     // guessing an alias relation.
-                    let mut gep_defs: FxHashMap<u32, (u32, i64, crate::common::types::IrType)> = FxHashMap::default();
+                    let mut gep_defs: FxHashMap<u32, (u32, i64, crate::common::types::IrType)> =
+                        FxHashMap::default();
                     for block in &func.blocks {
                         for inst in &block.instructions {
-                            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), ty } = inst {
+                            if let Instruction::GetElementPtr {
+                                dest,
+                                base,
+                                offset: Operand::Const(c),
+                                ty,
+                            } = inst
+                            {
                                 if let Some(offset) = c.to_i64() {
                                     gep_defs.insert(dest.0, (base.0, offset, *ty));
                                 }
@@ -205,8 +271,12 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                         let mut ty = crate::common::types::IrType::Ptr;
                         let mut seen = FxHashSet::default();
                         loop {
-                            if !seen.insert(current) { return None; }
-                            if current == dest.0 { return Some((offset, ty)); }
+                            if !seen.insert(current) {
+                                return None;
+                            }
+                            if current == dest.0 {
+                                return Some((offset, ty));
+                            }
                             let &(base, delta, gep_ty) = gep_defs.get(&current)?;
                             offset = offset.checked_add(delta)?;
                             ty = gep_ty;
@@ -215,10 +285,15 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                     };
                     let mut resolved = Vec::with_capacity(loads.len());
                     for &(bi, ii, ptr) in &loads {
-                        let Some((offset, ty)) = resolve(ptr) else { safe = false; break; };
+                        let Some((offset, ty)) = resolve(ptr) else {
+                            safe = false;
+                            break;
+                        };
                         resolved.push((bi, ii, offset, ty));
                     }
-                    if !safe { continue; }
+                    if !safe {
+                        continue;
+                    }
 
                     // Insert source-rooted GEPs immediately before loads, in
                     // reverse order to keep indices stable.
@@ -233,10 +308,9 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
                         };
                         func.blocks[block_idx].instructions.insert(load_idx, gep);
                         if func.blocks[block_idx].source_spans.len() >= load_idx {
-                            func.blocks[block_idx].source_spans.insert(
-                                load_idx,
-                                crate::common::source::Span::dummy(),
-                            );
+                            func.blocks[block_idx]
+                                .source_spans
+                                .insert(load_idx, crate::common::source::Span::dummy());
                         }
                         // The load shifted by one; locate the first load at or
                         // after the insertion point with the old destination-rooted ptr.
@@ -264,9 +338,11 @@ pub(crate) fn forward_large_memcpy_loads(module: &mut IrModule) -> usize {
 }
 
 fn is_local_alloca(func: &IrFunction, value: Value) -> bool {
-    func.blocks.iter().any(|block| block.instructions.iter().any(|inst| {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
         matches!(inst, Instruction::Alloca { dest, volatile: false, .. } if *dest == value)
-    }))
+    })
+    })
 }
 
 fn collect_derived_pointers(func: &IrFunction, root: Value) -> FxHashSet<u32> {
@@ -567,7 +643,9 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
         Instruction::SetReturnF128Second { src } => {
             count += replace_operand(src, copy_map);
         }
-        Instruction::InlineAsm { outputs, inputs, .. } => {
+        Instruction::InlineAsm {
+            outputs, inputs, ..
+        } => {
             // Output pointers are address operands (e.g. "=r"(*p) derefs): they
             // must participate in copy propagation like Intrinsic dest_ptr
             // below. Without this, a Copy/Load that materialized the pointer

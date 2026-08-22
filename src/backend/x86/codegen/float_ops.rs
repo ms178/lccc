@@ -1,10 +1,10 @@
 //! X86Codegen: floating-point binary operations and F128 negation.
 
-use crate::ir::reexports::{IrUnaryOp, IrConst, Operand, Value};
+use super::emit::X86Codegen;
+use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
 use crate::backend::cast::FloatOp;
 use crate::common::types::IrType;
-use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name, is_xmm_reg};
-use super::emit::X86Codegen;
+use crate::ir::reexports::{IrConst, IrUnaryOp, Operand, Value};
 
 impl X86Codegen {
     /// Load an F32/F64 operand into %xmm0, honoring a register-allocated XMM
@@ -20,14 +20,16 @@ impl X86Codegen {
                 if is_xmm_reg(reg) {
                     let name = phys_reg_name(reg);
                     if name != "xmm0" {
-                        self.state.emit_fmt(format_args!("    {} %{}, %xmm0", mov_instr, name));
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %xmm0", mov_instr, name));
                     }
                     return;
                 }
             }
             if let Some(slot) = self.state.get_slot(v.0) {
                 let sr = self.slot_ref(slot.0);
-                self.state.emit_fmt(format_args!("    {} {}, %xmm0", mov_instr, sr));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mov_instr, sr));
                 return;
             }
         }
@@ -38,7 +40,8 @@ impl X86Codegen {
                     self.state.emit("    xorpd %xmm0, %xmm0");
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm0", label));
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %xmm0", label));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
@@ -47,7 +50,8 @@ impl X86Codegen {
                     self.state.emit("    xorps %xmm0, %xmm0");
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm0", label));
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %xmm0", label));
                 }
             }
             _ => {
@@ -69,7 +73,8 @@ impl X86Codegen {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name(reg);
                 if name != "xmm0" {
-                    self.state.emit_fmt(format_args!("    {} %xmm0, %{}", mov_instr, name));
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %{}", mov_instr, name));
                 }
                 self.state.reg_cache.invalidate_acc();
                 return;
@@ -77,7 +82,8 @@ impl X86Codegen {
         }
         if let Some(slot) = self.state.get_slot(dest.0) {
             let sr = self.slot_ref(slot.0);
-            self.state.emit_fmt(format_args!("    {} %xmm0, {}", mov_instr, sr));
+            self.state
+                .emit_fmt(format_args!("    {} %xmm0, {}", mov_instr, sr));
             self.state.reg_cache.invalidate_acc();
             return;
         }
@@ -101,14 +107,16 @@ impl X86Codegen {
                 if is_xmm_reg(r) {
                     let name = phys_reg_name(r);
                     if name != reg {
-                        self.state.emit_fmt(format_args!("    {} %{}, %{}", mov_instr, name, reg));
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}", mov_instr, name, reg));
                     }
                     return;
                 }
             }
             if let Some(slot) = self.state.get_slot(v.0) {
                 let sr = self.slot_ref(slot.0);
-                self.state.emit_fmt(format_args!("    {} {}, %{}", mov_instr, sr, reg));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %{}", mov_instr, sr, reg));
                 return;
             }
         }
@@ -116,29 +124,35 @@ impl X86Codegen {
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
                 if bits == 0 {
-                    self.state.emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
+                    self.state
+                        .emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %{}", label, reg));
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %{}", label, reg));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
                 if bits == 0 {
-                    self.state.emit_fmt(format_args!("    xorps %{}, %{}", reg, reg));
+                    self.state
+                        .emit_fmt(format_args!("    xorps %{}, %{}", reg, reg));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %{}", label, reg));
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %{}", label, reg));
                 }
             }
             _ => {
                 self.operand_to_rax(op);
                 if ty == IrType::F32 {
                     self.state.emit("    movd %eax, %xmm1");
-                    self.state.emit_fmt(format_args!("    movss %xmm1, %{}", reg));
+                    self.state
+                        .emit_fmt(format_args!("    movss %xmm1, %{}", reg));
                 } else {
                     self.state.emit("    movq %rax, %xmm1");
-                    self.state.emit_fmt(format_args!("    movsd %xmm1, %{}", reg));
+                    self.state
+                        .emit_fmt(format_args!("    movsd %xmm1, %{}", reg));
                 }
             }
         }
@@ -148,7 +162,15 @@ impl X86Codegen {
     /// XMM-allocated destination), avoiding the store-to-home + reload-from-home
     /// pair the xmm0-scratch path pays on every link of an FP chain.
     /// Returns true when the op was emitted into `reg`.
-    fn emit_float_binop_into_reg(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType, reg: &str) -> bool {
+    fn emit_float_binop_into_reg(
+        &mut self,
+        dest: &Value,
+        op: FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        reg: &str,
+    ) -> bool {
         let Some(&dreg) = self.reg_assignments.get(&dest.0) else {
             return false;
         };
@@ -167,14 +189,20 @@ impl X86Codegen {
                 if let Some(&r) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(r) {
                         let name = phys_reg_name(r);
-                        self.state.emit_fmt(format_args!("    {}{} %{}, %{}, %{}", mnemonic, suffix, name, reg, reg));
+                        self.state.emit_fmt(format_args!(
+                            "    {}{} %{}, %{}, %{}",
+                            mnemonic, suffix, name, reg, reg
+                        ));
                         self.state.reg_cache.invalidate_acc();
                         return true;
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!("    {}{} {}, %{}, %{}", mnemonic, suffix, sr, reg, reg));
+                    self.state.emit_fmt(format_args!(
+                        "    {}{} {}, %{}, %{}",
+                        mnemonic, suffix, sr, reg, reg
+                    ));
                     self.state.reg_cache.invalidate_acc();
                     return true;
                 }
@@ -184,7 +212,10 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %{}, %{}",
+                    mnemonic, suffix, reg, reg
+                ));
             }
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
@@ -192,9 +223,13 @@ impl X86Codegen {
                     self.state.emit("    xorpd %xmm1, %xmm1");
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %{}, %{}",
+                    mnemonic, suffix, reg, reg
+                ));
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
@@ -202,9 +237,13 @@ impl X86Codegen {
                     self.state.emit("    xorps %xmm1, %xmm1");
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %{}, %{}",
+                    mnemonic, suffix, reg, reg
+                ));
             }
             _ => {
                 self.operand_to_rcx(rhs);
@@ -213,7 +252,10 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %{}, %{}", mnemonic, suffix, reg, reg));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %{}, %{}",
+                    mnemonic, suffix, reg, reg
+                ));
             }
         }
         self.state.reg_cache.invalidate_acc();
@@ -224,26 +266,41 @@ impl X86Codegen {
     /// XMM-allocated destination: compute straight into the dest register
     /// instead of the xmm0 scratch + GPR/store round-trip. Falls back to the
     /// xmm0 path when dest has no XMM home.
-    pub(super) fn emit_fp_scalar_unary(&mut self, dest: &Option<Value>, arg: &Operand, ty: IrType, inst: &str) {
+    pub(super) fn emit_fp_scalar_unary(
+        &mut self,
+        dest: &Option<Value>,
+        arg: &Operand,
+        ty: IrType,
+        inst: &str,
+    ) {
         if let Some(d) = dest {
             if let Some(&reg) = self.reg_assignments.get(&d.0) {
                 if is_xmm_reg(reg) {
                     let dname = phys_reg_name(reg);
                     self.load_fp_to_reg(arg, ty, dname);
-                    self.state.emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
                     self.state.reg_cache.invalidate_acc();
                     return;
                 }
             }
         }
         self.load_fp_to_xmm0(arg, ty);
-        self.state.emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+        self.state
+            .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
         if let Some(d) = dest {
             self.store_xmm0_fp_dest(d, ty);
         }
     }
 
-    pub(super) fn emit_float_binop_impl(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_float_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         if ty == IrType::F128 {
             let x87_op = match op {
                 FloatOp::Add => "faddp",
@@ -253,7 +310,8 @@ impl X86Codegen {
             };
             self.emit_f128_load_to_x87(lhs);
             self.emit_f128_load_to_x87(rhs);
-            self.state.emit_fmt(format_args!("    {} %st, %st(1)", x87_op));
+            self.state
+                .emit_fmt(format_args!("    {} %st, %st(1)", x87_op));
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
                 self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
                 self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
@@ -298,9 +356,13 @@ impl X86Codegen {
                     self.state.emit("    xorpd %xmm1, %xmm1");
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %xmm0, %xmm0",
+                    mnemonic, suffix
+                ));
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
@@ -308,9 +370,13 @@ impl X86Codegen {
                     self.state.emit("    xorps %xmm1, %xmm1");
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %xmm0, %xmm0",
+                    mnemonic, suffix
+                ));
             }
             Operand::Value(v) => {
                 // XMM register direct: if RHS is in xmm3-xmm7 (register allocator
@@ -319,14 +385,20 @@ impl X86Codegen {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(reg) {
                         let src_name = phys_reg_name(reg);
-                        self.state.emit_fmt(format_args!("    {}{} %{}, %xmm0, %xmm0", mnemonic, suffix, src_name));
+                        self.state.emit_fmt(format_args!(
+                            "    {}{} %{}, %xmm0, %xmm0",
+                            mnemonic, suffix, src_name
+                        ));
                         self.store_xmm0_fp_dest(dest, ty);
                         return;
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!("    {}{} {}, %xmm0, %xmm0", mnemonic, suffix, sr));
+                    self.state.emit_fmt(format_args!(
+                        "    {}{} {}, %xmm0, %xmm0",
+                        mnemonic, suffix, sr
+                    ));
                 } else {
                     self.operand_to_rcx(rhs);
                     if ty == IrType::F32 {
@@ -334,7 +406,10 @@ impl X86Codegen {
                     } else {
                         self.state.emit("    movq %rcx, %xmm1");
                     }
-                    self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
+                    self.state.emit_fmt(format_args!(
+                        "    {}{} %xmm1, %xmm0, %xmm0",
+                        mnemonic, suffix
+                    ));
                 }
             }
             _ => {
@@ -344,7 +419,10 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!("    {}{} %xmm1, %xmm0, %xmm0", mnemonic, suffix));
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %xmm1, %xmm0, %xmm0",
+                    mnemonic, suffix
+                ));
             }
         }
 
@@ -366,7 +444,13 @@ impl X86Codegen {
         }
     }
 
-    pub(super) fn emit_unaryop_impl(&mut self, dest: &Value, op: IrUnaryOp, src: &Operand, ty: IrType) {
+    pub(super) fn emit_unaryop_impl(
+        &mut self,
+        dest: &Value,
+        op: IrUnaryOp,
+        src: &Operand,
+        ty: IrType,
+    ) {
         if ty == IrType::F128 && op == IrUnaryOp::Neg {
             self.emit_f128_load_to_x87(src);
             self.state.emit("    fchs");
@@ -392,19 +476,25 @@ impl X86Codegen {
             if let Some(d_reg) = self.dest_reg(dest) {
                 if !is_xmm_reg(d_reg) {
                     let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
-                    let d_name = if use_32bit { phys_reg_name_32(d_reg) } else { phys_reg_name(d_reg) };
+                    let d_name = if use_32bit {
+                        phys_reg_name_32(d_reg)
+                    } else {
+                        phys_reg_name(d_reg)
+                    };
                     let suffix = if use_32bit { "l" } else { "q" };
 
                     match op {
                         IrUnaryOp::Neg => {
                             self.operand_to_callee_reg(src, d_reg);
-                            self.state.emit_fmt(format_args!("    neg{} %{}", suffix, d_name));
+                            self.state
+                                .emit_fmt(format_args!("    neg{} %{}", suffix, d_name));
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
                         IrUnaryOp::Not => {
                             self.operand_to_callee_reg(src, d_reg);
-                            self.state.emit_fmt(format_args!("    not{} %{}", suffix, d_name));
+                            self.state
+                                .emit_fmt(format_args!("    not{} %{}", suffix, d_name));
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
@@ -415,9 +505,16 @@ impl X86Codegen {
                                 let reg16 = typed_phys_reg_name(d_reg, ty);
                                 self.state.emit_fmt(format_args!("    rolw $8, %{}", reg16));
                             } else {
-                                let bswap_name = if use_32bit { phys_reg_name_32(d_reg) } else { phys_reg_name(d_reg) };
+                                let bswap_name = if use_32bit {
+                                    phys_reg_name_32(d_reg)
+                                } else {
+                                    phys_reg_name(d_reg)
+                                };
                                 let bswap_suffix = if use_32bit { "l" } else { "q" };
-                                self.state.emit_fmt(format_args!("    bswap{} %{}", bswap_suffix, bswap_name));
+                                self.state.emit_fmt(format_args!(
+                                    "    bswap{} %{}",
+                                    bswap_suffix, bswap_name
+                                ));
                             }
                             self.state.reg_cache.invalidate_acc();
                             return;
@@ -426,14 +523,24 @@ impl X86Codegen {
                             // popcnt is two-operand: popcnt %src, %dest
                             if let Some(s_reg) = self.operand_reg(src) {
                                 if !is_xmm_reg(s_reg) {
-                                    let s_name = if use_32bit { phys_reg_name_32(s_reg) } else { phys_reg_name(s_reg) };
-                                    self.state.emit_fmt(format_args!("    popcnt{} %{}, %{}", suffix, s_name, d_name));
+                                    let s_name = if use_32bit {
+                                        phys_reg_name_32(s_reg)
+                                    } else {
+                                        phys_reg_name(s_reg)
+                                    };
+                                    self.state.emit_fmt(format_args!(
+                                        "    popcnt{} %{}, %{}",
+                                        suffix, s_name, d_name
+                                    ));
                                     self.state.reg_cache.invalidate_acc();
                                     return;
                                 }
                             }
                             self.operand_to_callee_reg(src, d_reg);
-                            self.state.emit_fmt(format_args!("    popcnt{} %{}, %{}", suffix, d_name, d_name));
+                            self.state.emit_fmt(format_args!(
+                                "    popcnt{} %{}, %{}",
+                                suffix, d_name, d_name
+                            ));
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
@@ -455,19 +562,23 @@ impl X86Codegen {
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
                 if bits == 0 {
-                    self.state.emit_fmt(format_args!("    xorpd %{}, %{}", xmm, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    xorpd %{}, %{}", xmm, xmm));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movsd {}(%rip), %{}", label, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %{}", label, xmm));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
                 if bits == 0 {
-                    self.state.emit_fmt(format_args!("    xorps %{}, %{}", xmm, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    xorps %{}, %{}", xmm, xmm));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
                 }
             }
             Operand::Value(v) => {
@@ -503,7 +614,8 @@ impl X86Codegen {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let mov = if ty == IrType::F32 { "movss" } else { "movsd" };
                     let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!("    {} {}, %{}", mov, sr, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", mov, sr, xmm));
                     return;
                 }
                 // Reg cache check for accumulator. The acc cache means the value
@@ -528,9 +640,11 @@ impl X86Codegen {
                     self.operand_to_rcx(op);
                 }
                 if ty == IrType::F32 {
-                    self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
                 } else {
-                    self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
                 }
             }
             _ => {
@@ -543,9 +657,11 @@ impl X86Codegen {
                     self.operand_to_rcx(op);
                 }
                 if ty == IrType::F32 {
-                    self.state.emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
                 } else {
-                    self.state.emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
                 }
             }
         }
@@ -576,7 +692,11 @@ impl X86Codegen {
         add_dest: &Value,
         ty: IrType,
     ) {
-        let fma = if matches!(ty, IrType::F64) { "vfmadd231sd" } else { "vfmadd231ss" };
+        let fma = if matches!(ty, IrType::F64) {
+            "vfmadd231sd"
+        } else {
+            "vfmadd231ss"
+        };
 
         // Destructive-FMA coalescing: when linear scan assigned the result to
         // the accumulator's existing XMM home, compute there directly instead
@@ -595,9 +715,12 @@ impl X86Codegen {
                 if let Some(lhs_name) = xmm_home(mul_lhs).filter(|name| *name != dest_name) {
                     match mul_rhs {
                         Operand::Value(v) => {
-                            if let Some(rhs_name) = xmm_home(mul_rhs).filter(|name| *name != dest_name) {
+                            if let Some(rhs_name) =
+                                xmm_home(mul_rhs).filter(|name| *name != dest_name)
+                            {
                                 self.state.emit_fmt(format_args!(
-                                    "    {} %{}, %{}, %{}", fma, rhs_name, lhs_name, dest_name
+                                    "    {} %{}, %{}, %{}",
+                                    fma, rhs_name, lhs_name, dest_name
                                 ));
                                 self.state.reg_cache.invalidate_acc();
                                 return;
@@ -605,7 +728,8 @@ impl X86Codegen {
                             if let Some(slot) = self.state.get_slot(v.0) {
                                 let sr = self.slot_ref(slot.0);
                                 self.state.emit_fmt(format_args!(
-                                    "    {} {}, %{}, %{}", fma, sr, lhs_name, dest_name
+                                    "    {} {}, %{}, %{}",
+                                    fma, sr, lhs_name, dest_name
                                 ));
                                 self.state.reg_cache.invalidate_acc();
                                 return;
@@ -625,7 +749,8 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         let n = phys_reg_name(reg);
                         // reg form: src2=n, src1=xmm1, dest=xmm0
-                        self.state.emit_fmt(format_args!("    {} %{}, %xmm1, %xmm0", fma, n));
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %xmm1, %xmm0", fma, n));
                         self.store_xmm0_fp_dest(add_dest, ty);
                         return;
                     }
@@ -633,28 +758,33 @@ impl X86Codegen {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
                     // mem form: encoder wants (mem, vvvv, dst) = src2, src1, dest
-                    self.state.emit_fmt(format_args!("    {} {}, %xmm1, %xmm0", fma, sr));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %xmm1, %xmm0", fma, sr));
                     self.store_xmm0_fp_dest(add_dest, ty);
                     return;
                 }
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
             }
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
                 if bits != 0 {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
                 let label = self.state.get_fp_const_label(bits);
-                self.state.emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
             }
             _ => {
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
             }
         }
         self.store_xmm0_fp_dest(add_dest, ty);

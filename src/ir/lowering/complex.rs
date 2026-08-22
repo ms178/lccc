@@ -10,19 +10,12 @@
 //!   - _Complex long double: [f128 real, f128 imag] = 32 bytes, align 16 (x86-64)
 //!     24 bytes, align 4  (i686)
 
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::{BinOp, Expr, UnaryOp};
 use crate::ir::reexports::{
-    GlobalInit,
-    Instruction,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrUnaryOp,
-    Operand,
-    Value,
+    GlobalInit, Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType};
-use super::lower::Lowerer;
 
 impl Lowerer {
     /// Get the IR float type for a complex type's component.
@@ -42,7 +35,13 @@ impl Lowerer {
         match ctype {
             CType::ComplexFloat => 4,
             CType::ComplexDouble => 8,
-            CType::ComplexLongDouble => if target_is_32bit() { 12 } else { 16 },
+            CType::ComplexLongDouble => {
+                if target_is_32bit() {
+                    12
+                } else {
+                    16
+                }
+            }
             _ => 8,
         }
     }
@@ -56,7 +55,12 @@ impl Lowerer {
         let zero = Self::complex_zero(comp_ty);
         let real_nz = self.emit_cmp_val(IrCmpOp::Ne, real, zero, comp_ty);
         let imag_nz = self.emit_cmp_val(IrCmpOp::Ne, imag, zero, comp_ty);
-        let result = self.emit_binop_val(IrBinOp::Or, Operand::Value(real_nz), Operand::Value(imag_nz), crate::common::types::target_int_ir_type());
+        let result = self.emit_binop_val(
+            IrBinOp::Or,
+            Operand::Value(real_nz),
+            Operand::Value(imag_nz),
+            crate::common::types::target_int_ir_type(),
+        );
         Operand::Value(result)
     }
 
@@ -78,18 +82,26 @@ impl Lowerer {
             ty: IrType::Ptr,
             size,
             align: 0,
-            volatile: false, semantic_volatile: false,
+            volatile: false,
+            semantic_volatile: false,
         });
         alloca
     }
 
     /// Store a complex value (real, imag) into an alloca.
-    pub(super) fn store_complex_parts(&mut self, ptr: Value, real: Operand, imag: Operand, ctype: &CType) {
+    pub(super) fn store_complex_parts(
+        &mut self,
+        ptr: Value,
+        real: Operand,
+        imag: Operand,
+        ctype: &CType,
+    ) {
         let comp_ty = Self::complex_component_ir_type(ctype);
         let comp_size = Self::complex_component_size(ctype);
 
         // Store real part at offset 0
-        self.emit(Instruction::Store { volatile: false,
+        self.emit(Instruction::Store {
+            volatile: false,
             val: real,
             ptr,
             ty: comp_ty,
@@ -104,15 +116,21 @@ impl Lowerer {
             offset: Operand::Const(IrConst::ptr_int(comp_size as i64)),
             ty: IrType::I8, // byte offset
         });
-        self.emit(Instruction::Store { volatile: false, val: imag, ptr: imag_ptr, ty: comp_ty,
-         seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: imag,
+            ptr: imag_ptr,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
     }
 
     /// Load the real part of a complex value from a pointer.
     pub(super) fn load_complex_real(&mut self, ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false,
+        self.emit(Instruction::Load {
+            volatile: false,
             dest,
             ptr,
             ty: comp_ty,
@@ -133,7 +151,8 @@ impl Lowerer {
             ty: IrType::I8,
         });
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false,
+        self.emit(Instruction::Load {
+            volatile: false,
             dest,
             ptr: imag_ptr,
             ty: comp_ty,
@@ -162,7 +181,12 @@ impl Lowerer {
     }
 
     /// Lower a long double imaginary literal, preserving full x87 precision bytes.
-    pub(super) fn lower_imaginary_literal_ld(&mut self, val: f64, bytes: &[u8; 16], ctype: &CType) -> Operand {
+    pub(super) fn lower_imaginary_literal_ld(
+        &mut self,
+        val: f64,
+        bytes: &[u8; 16],
+        ctype: &CType,
+    ) -> Operand {
         let alloca = self.alloca_complex(ctype);
         let zero = Operand::Const(IrConst::long_double(0.0));
         let imag_val = Operand::Const(IrConst::long_double_with_bytes(val, *bytes));
@@ -209,7 +233,13 @@ impl Lowerer {
     /// Both real and imaginary parts use the same `op`:
     ///   add: (a+bi) + (c+di) = (a+c) + (b+d)i
     ///   sub: (a+bi) - (c+di) = (a-c) + (b-d)i
-    fn lower_complex_componentwise_binop(&mut self, op: IrBinOp, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+    fn lower_complex_componentwise_binop(
+        &mut self,
+        op: IrBinOp,
+        lhs_ptr: Value,
+        rhs_ptr: Value,
+        ctype: &CType,
+    ) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
         let lr = self.load_complex_real(lhs_ptr, ctype);
@@ -221,24 +251,45 @@ impl Lowerer {
         let imag_result = self.emit_binop_val(op, li, ri, comp_ty);
 
         let result = self.alloca_complex(ctype);
-        self.store_complex_parts(result, Operand::Value(real_result), Operand::Value(imag_result), ctype);
+        self.store_complex_parts(
+            result,
+            Operand::Value(real_result),
+            Operand::Value(imag_result),
+            ctype,
+        );
         Operand::Value(result)
     }
 
     /// Lower complex addition: (a+bi) + (c+di) = (a+c) + (b+d)i
-    pub(super) fn lower_complex_add(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+    pub(super) fn lower_complex_add(
+        &mut self,
+        lhs_ptr: Value,
+        rhs_ptr: Value,
+        ctype: &CType,
+    ) -> Operand {
         self.lower_complex_componentwise_binop(IrBinOp::Add, lhs_ptr, rhs_ptr, ctype)
     }
 
     /// Lower complex subtraction: (a+bi) - (c+di) = (a-c) + (b-d)i
-    pub(super) fn lower_complex_sub(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+    pub(super) fn lower_complex_sub(
+        &mut self,
+        lhs_ptr: Value,
+        rhs_ptr: Value,
+        ctype: &CType,
+    ) -> Operand {
         self.lower_complex_componentwise_binop(IrBinOp::Sub, lhs_ptr, rhs_ptr, ctype)
     }
 
     /// Lower real - complex: real - (c+di) = (real-c) + (-d)i
     /// Uses negation for the imaginary part instead of 0.0-d to preserve
     /// IEEE 754 negative zero: -(+0.0) = -0.0, but +0.0 - (+0.0) = +0.0.
-    pub(super) fn lower_real_minus_complex(&mut self, real_val: Operand, real_type: &CType, rhs_ptr: Value, ctype: &CType) -> Operand {
+    pub(super) fn lower_real_minus_complex(
+        &mut self,
+        real_val: Operand,
+        real_type: &CType,
+        rhs_ptr: Value,
+        ctype: &CType,
+    ) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
         // Cast the real scalar to the component type
@@ -257,15 +308,30 @@ impl Lowerer {
         let real_result = self.emit_binop_val(IrBinOp::Sub, converted_real, rr, comp_ty);
         // imag_part = -rhs_imag (not 0.0 - rhs_imag)
         let neg_i = self.fresh_value();
-        self.emit(Instruction::UnaryOp { dest: neg_i, op: IrUnaryOp::Neg, src: ri, ty: comp_ty });
+        self.emit(Instruction::UnaryOp {
+            dest: neg_i,
+            op: IrUnaryOp::Neg,
+            src: ri,
+            ty: comp_ty,
+        });
 
         let result = self.alloca_complex(ctype);
-        self.store_complex_parts(result, Operand::Value(real_result), Operand::Value(neg_i), ctype);
+        self.store_complex_parts(
+            result,
+            Operand::Value(real_result),
+            Operand::Value(neg_i),
+            ctype,
+        );
         Operand::Value(result)
     }
 
     /// Lower complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
-    pub(super) fn lower_complex_mul(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+    pub(super) fn lower_complex_mul(
+        &mut self,
+        lhs_ptr: Value,
+        rhs_ptr: Value,
+        ctype: &CType,
+    ) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
         let a = self.load_complex_real(lhs_ptr, ctype);
@@ -283,9 +349,19 @@ impl Lowerer {
         let bc = self.emit_binop_val(IrBinOp::Mul, b, c, comp_ty);
 
         // real = ac - bd
-        let real = self.emit_binop_val(IrBinOp::Sub, Operand::Value(ac), Operand::Value(bd), comp_ty);
+        let real = self.emit_binop_val(
+            IrBinOp::Sub,
+            Operand::Value(ac),
+            Operand::Value(bd),
+            comp_ty,
+        );
         // imag = ad + bc
-        let imag = self.emit_binop_val(IrBinOp::Add, Operand::Value(ad), Operand::Value(bc), comp_ty);
+        let imag = self.emit_binop_val(
+            IrBinOp::Add,
+            Operand::Value(ad),
+            Operand::Value(bc),
+            comp_ty,
+        );
 
         let result = self.alloca_complex(ctype);
         self.store_complex_parts(result, Operand::Value(real), Operand::Value(imag), ctype);
@@ -293,7 +369,12 @@ impl Lowerer {
     }
 
     /// Lower complex division: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
-    pub(super) fn lower_complex_div(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
+    pub(super) fn lower_complex_div(
+        &mut self,
+        lhs_ptr: Value,
+        rhs_ptr: Value,
+        ctype: &CType,
+    ) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
         let a = self.load_complex_real(lhs_ptr, ctype);
@@ -304,21 +385,46 @@ impl Lowerer {
         // denom = c*c + d*d
         let cc = self.emit_binop_val(IrBinOp::Mul, c, c, comp_ty);
         let dd = self.emit_binop_val(IrBinOp::Mul, d, d, comp_ty);
-        let denom = self.emit_binop_val(IrBinOp::Add, Operand::Value(cc), Operand::Value(dd), comp_ty);
+        let denom = self.emit_binop_val(
+            IrBinOp::Add,
+            Operand::Value(cc),
+            Operand::Value(dd),
+            comp_ty,
+        );
 
         // real_num = a*c + b*d
         let ac = self.emit_binop_val(IrBinOp::Mul, a, c, comp_ty);
         let bd = self.emit_binop_val(IrBinOp::Mul, b, d, comp_ty);
-        let real_num = self.emit_binop_val(IrBinOp::Add, Operand::Value(ac), Operand::Value(bd), comp_ty);
+        let real_num = self.emit_binop_val(
+            IrBinOp::Add,
+            Operand::Value(ac),
+            Operand::Value(bd),
+            comp_ty,
+        );
 
         // imag_num = b*c - a*d
         let bc = self.emit_binop_val(IrBinOp::Mul, b, c, comp_ty);
         let ad = self.emit_binop_val(IrBinOp::Mul, a, d, comp_ty);
-        let imag_num = self.emit_binop_val(IrBinOp::Sub, Operand::Value(bc), Operand::Value(ad), comp_ty);
+        let imag_num = self.emit_binop_val(
+            IrBinOp::Sub,
+            Operand::Value(bc),
+            Operand::Value(ad),
+            comp_ty,
+        );
 
         // real = real_num / denom, imag = imag_num / denom
-        let real = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(real_num), Operand::Value(denom), comp_ty);
-        let imag = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(imag_num), Operand::Value(denom), comp_ty);
+        let real = self.emit_binop_val(
+            IrBinOp::SDiv,
+            Operand::Value(real_num),
+            Operand::Value(denom),
+            comp_ty,
+        );
+        let imag = self.emit_binop_val(
+            IrBinOp::SDiv,
+            Operand::Value(imag_num),
+            Operand::Value(denom),
+            comp_ty,
+        );
 
         let result = self.alloca_complex(ctype);
         self.store_complex_parts(result, Operand::Value(real), Operand::Value(imag), ctype);
@@ -333,9 +439,19 @@ impl Lowerer {
         let i = self.load_complex_imag(ptr, ctype);
 
         let neg_r = self.fresh_value();
-        self.emit(Instruction::UnaryOp { dest: neg_r, op: IrUnaryOp::Neg, src: r, ty: comp_ty });
+        self.emit(Instruction::UnaryOp {
+            dest: neg_r,
+            op: IrUnaryOp::Neg,
+            src: r,
+            ty: comp_ty,
+        });
         let neg_i = self.fresh_value();
-        self.emit(Instruction::UnaryOp { dest: neg_i, op: IrUnaryOp::Neg, src: i, ty: comp_ty });
+        self.emit(Instruction::UnaryOp {
+            dest: neg_i,
+            op: IrUnaryOp::Neg,
+            src: i,
+            ty: comp_ty,
+        });
 
         let result = self.alloca_complex(ctype);
         self.store_complex_parts(result, Operand::Value(neg_r), Operand::Value(neg_i), ctype);
@@ -354,7 +470,12 @@ impl Lowerer {
             let i = self.load_complex_imag(ptr_val, &inner_ctype);
 
             let neg_i = self.fresh_value();
-            self.emit(Instruction::UnaryOp { dest: neg_i, op: IrUnaryOp::Neg, src: i, ty: comp_ty });
+            self.emit(Instruction::UnaryOp {
+                dest: neg_i,
+                op: IrUnaryOp::Neg,
+                src: i,
+                ty: comp_ty,
+            });
 
             let result = self.alloca_complex(&inner_ctype);
             self.store_complex_parts(result, r, Operand::Value(neg_i), &inner_ctype);
@@ -366,7 +487,12 @@ impl Lowerer {
     }
 
     /// Create a complex value from a real scalar (real part = scalar, imag = 0).
-    pub(super) fn real_to_complex(&mut self, real_val: Operand, real_type: &CType, complex_type: &CType) -> Operand {
+    pub(super) fn real_to_complex(
+        &mut self,
+        real_val: Operand,
+        real_type: &CType,
+        complex_type: &CType,
+    ) -> Operand {
         let real_ir = IrType::from_ctype(real_type);
         self.scalar_to_complex(real_val, real_ir, complex_type)
     }
@@ -374,7 +500,12 @@ impl Lowerer {
     /// Create a complex value from a scalar given its IR type (real part = scalar, imag = 0).
     /// This is preferred over real_to_complex when the CType may be inaccurate (e.g., for
     /// function calls where expr_ctype may not correctly resolve the return type).
-    pub(super) fn scalar_to_complex(&mut self, real_val: Operand, src_ir_ty: IrType, complex_type: &CType) -> Operand {
+    pub(super) fn scalar_to_complex(
+        &mut self,
+        real_val: Operand,
+        src_ir_ty: IrType,
+        complex_type: &CType,
+    ) -> Operand {
         let comp_ty = Self::complex_component_ir_type(complex_type);
         let zero = match comp_ty {
             IrType::F32 => Operand::Const(IrConst::F32(0.0)),
@@ -396,7 +527,12 @@ impl Lowerer {
     }
 
     /// Convert a complex value from one complex type to another (e.g., ComplexFloat -> ComplexDouble).
-    pub(super) fn complex_to_complex(&mut self, ptr: Value, from_type: &CType, to_type: &CType) -> Operand {
+    pub(super) fn complex_to_complex(
+        &mut self,
+        ptr: Value,
+        from_type: &CType,
+        to_type: &CType,
+    ) -> Operand {
         let from_comp = Self::complex_component_ir_type(from_type);
         let to_comp = Self::complex_component_ir_type(to_type);
 
@@ -432,9 +568,21 @@ impl Lowerer {
     pub(super) fn expr_ctype(&self, expr: &Expr) -> CType {
         // Handle complex-specific cases that get_expr_ctype doesn't cover
         match expr {
-            Expr::BinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
-                | BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
-                | BinOp::Shl | BinOp::Shr, lhs, rhs, _) => {
+            Expr::BinaryOp(
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr,
+                lhs,
+                rhs,
+                _,
+            ) => {
                 let lt = self.expr_ctype(lhs);
                 let rt = self.expr_ctype(rhs);
                 // GCC vector extensions: if either operand is a vector, result is that vector type
@@ -465,8 +613,15 @@ impl Lowerer {
                     }
                     // conj/conjf/conjl preserve the argument's complex type, but
                     // the registered function signature always says ComplexDouble.
-                    if matches!(name.as_str(), "conj" | "conjf" | "conjl"
-                        | "__builtin_conj" | "__builtin_conjf" | "__builtin_conjl") {
+                    if matches!(
+                        name.as_str(),
+                        "conj"
+                            | "conjf"
+                            | "conjl"
+                            | "__builtin_conj"
+                            | "__builtin_conjf"
+                            | "__builtin_conjl"
+                    ) {
                         if let Some(first_arg) = args.first() {
                             let arg_ct = self.expr_ctype(first_arg);
                             if arg_ct.is_complex() {
@@ -539,15 +694,24 @@ impl Lowerer {
             _ => {
                 // Both are integer types - promote to ComplexDouble (C default)
                 // But check if one is already complex
-                if a.is_complex() { return a.clone(); }
-                if b.is_complex() { return b.clone(); }
+                if a.is_complex() {
+                    return a.clone();
+                }
+                if b.is_complex() {
+                    return b.clone();
+                }
                 CType::ComplexDouble
             }
         }
     }
 
     /// Convert a value to a complex type, handling both real-to-complex and complex-to-complex.
-    pub(super) fn convert_to_complex(&mut self, val: Operand, from_type: &CType, to_type: &CType) -> Operand {
+    pub(super) fn convert_to_complex(
+        &mut self,
+        val: Operand,
+        from_type: &CType,
+        to_type: &CType,
+    ) -> Operand {
         if from_type.is_complex() {
             if from_type == to_type {
                 val
@@ -562,7 +726,12 @@ impl Lowerer {
     }
 
     /// Lower assignment to a complex variable.
-    pub(super) fn lower_complex_assign(&mut self, lhs: &Expr, rhs: &Expr, lhs_ct: &CType) -> Operand {
+    pub(super) fn lower_complex_assign(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        lhs_ct: &CType,
+    ) -> Operand {
         let rhs_ct = self.expr_ctype(rhs);
         let rhs_val = self.lower_expr(rhs);
 
@@ -600,18 +769,32 @@ impl Lowerer {
         match expr {
             Expr::Identifier(name, _) => {
                 // Look up in locals
-                if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name).cloned()) {
+                if let Some(info) = self
+                    .func_state
+                    .as_ref()
+                    .and_then(|fs| fs.locals.get(name).cloned())
+                {
                     return info.alloca;
                 }
                 // Check static locals
-                if let Some(mangled) = self.func_state.as_ref().and_then(|fs| fs.static_local_names.get(name).cloned()) {
+                if let Some(mangled) = self
+                    .func_state
+                    .as_ref()
+                    .and_then(|fs| fs.static_local_names.get(name).cloned())
+                {
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: mangled });
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: mangled,
+                    });
                     return addr;
                 }
                 // Global
                 let addr = self.fresh_value();
-                self.emit(Instruction::GlobalAddr { dest: addr, name: name.to_string() });
+                self.emit(Instruction::GlobalAddr {
+                    dest: addr,
+                    name: name.to_string(),
+                });
                 addr
             }
             Expr::Deref(inner, _) => {
@@ -624,8 +807,13 @@ impl Lowerer {
                 let ct = self.expr_ctype(expr);
                 let elem_size = self.resolve_ctype_size(&ct);
                 let scaled = self.scale_index(idx_val, elem_size);
-                
-                self.emit_binop_val(IrBinOp::Add, base_val, scaled, crate::common::types::target_int_ir_type())
+
+                self.emit_binop_val(
+                    IrBinOp::Add,
+                    base_val,
+                    scaled,
+                    crate::common::types::target_int_ir_type(),
+                )
             }
             Expr::MemberAccess(base, field, _) => {
                 // Get base struct address and add field offset
@@ -633,7 +821,8 @@ impl Lowerer {
                 if let CType::Struct(ref key) | CType::Union(ref key) = base_ct {
                     let field_offset = {
                         let layouts = self.types.borrow_struct_layouts();
-                        layouts.get(&**key)
+                        layouts
+                            .get(&**key)
                             .and_then(|layout| layout.field_offset(field, &*layouts))
                             .map(|(offset, _)| offset)
                     };
@@ -644,7 +833,8 @@ impl Lowerer {
                         }
                         let dest = self.fresh_value();
                         self.emit(Instruction::GetElementPtr {
-                            dest, base: base_ptr,
+                            dest,
+                            base: base_ptr,
                             offset: Operand::Const(IrConst::ptr_int(offset as i64)),
                             ty: IrType::I8,
                         });
@@ -663,7 +853,8 @@ impl Lowerer {
                     if let CType::Struct(ref key) | CType::Union(ref key) = **inner {
                         let field_offset = {
                             let layouts = self.types.borrow_struct_layouts();
-                            layouts.get(&**key)
+                            layouts
+                                .get(&**key)
                                 .and_then(|layout| layout.field_offset(field, &*layouts))
                                 .map(|(offset, _)| offset)
                         };
@@ -673,7 +864,8 @@ impl Lowerer {
                             }
                             let dest = self.fresh_value();
                             self.emit(Instruction::GetElementPtr {
-                                dest, base: base_ptr,
+                                dest,
+                                base: base_ptr,
                                 offset: Operand::Const(IrConst::ptr_int(offset as i64)),
                                 ty: IrType::I8,
                             });
@@ -693,7 +885,14 @@ impl Lowerer {
 
     /// Lower complex equality/inequality comparison.
     /// Two complex numbers are equal iff both real and imaginary parts are equal.
-    pub(super) fn lower_complex_comparison(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr, lhs_ct: &CType, rhs_ct: &CType) -> Operand {
+    pub(super) fn lower_complex_comparison(
+        &mut self,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lhs_ct: &CType,
+        rhs_ct: &CType,
+    ) -> Operand {
         let result_ct = self.common_complex_type(lhs_ct, rhs_ct);
         let comp_ty = Self::complex_component_ir_type(&result_ct);
 
@@ -718,13 +917,26 @@ impl Lowerer {
         // Combine: both must be equal for == (either not equal for !=)
         let int_ty = crate::common::types::target_int_ir_type();
         let result = match op {
-            BinOp::Eq => {
-                self.emit_binop_val(IrBinOp::And, Operand::Value(real_eq), Operand::Value(imag_eq), int_ty)
-            }
+            BinOp::Eq => self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(real_eq),
+                Operand::Value(imag_eq),
+                int_ty,
+            ),
             BinOp::Ne => {
                 // a != b iff !(a.re == b.re && a.im == b.im)
-                let both_eq = self.emit_binop_val(IrBinOp::And, Operand::Value(real_eq), Operand::Value(imag_eq), int_ty);
-                self.emit_cmp_val(IrCmpOp::Eq, Operand::Value(both_eq), Operand::Const(IrConst::ptr_int(0)), int_ty)
+                let both_eq = self.emit_binop_val(
+                    IrBinOp::And,
+                    Operand::Value(real_eq),
+                    Operand::Value(imag_eq),
+                    int_ty,
+                );
+                self.emit_cmp_val(
+                    IrCmpOp::Eq,
+                    Operand::Value(both_eq),
+                    Operand::Const(IrConst::ptr_int(0)),
+                    int_ty,
+                )
             }
             _ => unreachable!("complex comparison only supports Eq/Ne, got: {:?}", op),
         };
@@ -733,7 +945,11 @@ impl Lowerer {
 
     /// Evaluate a complex expression for global initialization.
     /// Returns a GlobalInit::Array with [real, imag] constant values.
-    pub(super) fn eval_complex_global_init(&self, expr: &Expr, target_ctype: &CType) -> Option<GlobalInit> {
+    pub(super) fn eval_complex_global_init(
+        &self,
+        expr: &Expr,
+        target_ctype: &CType,
+    ) -> Option<GlobalInit> {
         let (real, imag) = self.eval_complex_const(expr)?;
         match target_ctype {
             CType::ComplexFloat => Some(GlobalInit::Array(vec![
@@ -790,13 +1006,9 @@ impl Lowerer {
                 Some((-v.0, -v.1))
             }
             // Unary plus
-            Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
-                self.eval_complex_const(inner)
-            }
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_complex_const(inner),
             // Cast to complex
-            Expr::Cast(_, inner, _) => {
-                self.eval_complex_const(inner)
-            }
+            Expr::Cast(_, inner, _) => self.eval_complex_const(inner),
             // Real number literal -> (val, 0)
             _ => {
                 if let Some(val) = self.eval_const_expr(expr) {
@@ -844,7 +1056,8 @@ impl Lowerer {
         let mut new_types = Vec::with_capacity(arg_types.len() * 2);
         let mut new_struct_sizes = Vec::with_capacity(struct_arg_sizes.len() * 2);
         let mut new_struct_aligns = Vec::with_capacity(struct_arg_aligns.len() * 2);
-        let mut new_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = Vec::with_capacity(struct_arg_classes.len() * 2);
+        let mut new_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> =
+            Vec::with_capacity(struct_arg_classes.len() * 2);
 
         for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
             let ctype = pctypes.get(i);
@@ -854,7 +1067,9 @@ impl Lowerer {
             let is_complex_float = match ctype {
                 Some(CType::ComplexFloat) => true,
                 None => {
-                    *ty == IrType::Ptr && i < args.len() && matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
+                    *ty == IrType::Ptr
+                        && i < args.len()
+                        && matches!(self.expr_ctype(&args[i]), CType::ComplexFloat)
                 }
                 _ => false,
             };
@@ -862,19 +1077,32 @@ impl Lowerer {
             // Check for ComplexFloat with packed convention:
             // - x86-64: always pack (2xF32 into 1xF64 in XMM register)
             // - RISC-V variadic: pack (2xF32 into 1xI64 in GP register)
-            let should_pack = is_complex_float && (uses_packed_cf || (packs_cf_variadic && is_variadic_arg));
+            let should_pack =
+                is_complex_float && (uses_packed_cf || (packs_cf_variadic && is_variadic_arg));
 
             if should_pack {
                 let ptr = self.operand_to_value(*val);
                 let packed = self.fresh_value();
                 if packs_cf_variadic && is_variadic_arg && !uses_packed_cf {
                     // RISC-V variadic: load as I64 (two packed F32s in one GP register)
-                    self.emit(Instruction::Load { volatile: false, dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: packed,
+                        ptr,
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                    });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::I64);
                 } else {
                     // x86-64: load as F64 (two packed F32s in one XMM register)
-                    self.emit(Instruction::Load { volatile: false, dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: packed,
+                        ptr,
+                        ty: IrType::F64,
+                        seg_override: AddressSpace::Default,
+                    });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::F64);
                 }
@@ -901,7 +1129,11 @@ impl Lowerer {
             let is_x86_64 = self.target == crate::backend::Target::X86_64;
 
             let resolved_ctype = ctype.cloned().unwrap_or_else(|| {
-                if *ty == IrType::Ptr && i < args.len() { self.expr_ctype(&args[i]) } else { CType::Int }
+                if *ty == IrType::Ptr && i < args.len() {
+                    self.expr_ctype(&args[i])
+                } else {
+                    CType::Int
+                }
             });
 
             // On x86-64, don't decompose _Complex double - pass as 16-byte struct [Sse, Sse]

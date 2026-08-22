@@ -30,17 +30,30 @@ pub enum Operand {
     Mem { base: String, offset: i64 },
     /// Memory operand with symbolic offset expression: [base, #(sym_expr)] or [base, #(sym_expr)]!
     /// Used when the offset is a label/symbol expression that can't be resolved at parse time.
-    MemExpr { base: String, expr: String, writeback: bool },
+    MemExpr {
+        base: String,
+        expr: String,
+        writeback: bool,
+    },
     /// Memory operand with pre-index writeback: [base, #offset]!
     MemPreIndex { base: String, offset: i64 },
     /// Memory operand with post-index writeback: [base], #offset
     MemPostIndex { base: String, offset: i64 },
     /// Memory operand with register offset: [base, Xm]
-    MemRegOffset { base: String, index: String, extend: Option<String>, shift: Option<u8> },
+    MemRegOffset {
+        base: String,
+        index: String,
+        extend: Option<String>,
+        shift: Option<u8>,
+    },
     /// :lo12:symbol or :got_lo12:symbol modifier
     Modifier { kind: String, symbol: String },
     /// :lo12:symbol+offset
-    ModifierOffset { kind: String, symbol: String, offset: i64 },
+    ModifierOffset {
+        kind: String,
+        symbol: String,
+        offset: i64,
+    },
     /// Shift: lsl #N, lsr #N, asr #N
     Shift { kind: String, amount: u32 },
     /// Extend: sxtw, uxtw, sxtx, etc. with optional shift amount
@@ -56,7 +69,11 @@ pub enum Operand {
     /// NEON register with arrangement specifier: v0.8b, v0.16b, v0.4s, etc.
     RegArrangement { reg: String, arrangement: String },
     /// NEON register with lane index: v0.d[1], v0.b[0], v0.s[2], etc.
-    RegLane { reg: String, elem_size: String, index: u32 },
+    RegLane {
+        reg: String,
+        elem_size: String,
+        index: u32,
+    },
     /// NEON register list: {v0.16b}, {v0.16b, v1.16b}, etc.
     RegList(Vec<Operand>),
     /// NEON register list with element index: {v0.s, v1.s}[0], {v0.d, v1.d}[1], etc.
@@ -156,7 +173,11 @@ pub enum AsmDirective {
     /// CFI directive (ignored for code generation)
     Cfi,
     /// `.incbin "file"[, skip[, count]]` — include binary file contents
-    Incbin { path: String, skip: u64, count: Option<u64> },
+    Incbin {
+        path: String,
+        skip: u64,
+        count: Option<u64>,
+    },
     /// Raw bytes emitted from .float, .double, etc.
     RawBytes(Vec<u8>),
     /// Literal pool dump: `.ltorg` or `.pool`
@@ -197,8 +218,10 @@ pub enum AsmStatement {
 /// Expand .rept/.endr, .irp/.endr, and .irpc/.endr blocks by repeating contained lines.
 // TODO: extract expand_rept_blocks to shared module (duplicated in ARM, RISC-V, x86 parsers)
 fn is_rept_start(trimmed: &str) -> bool {
-    trimmed.starts_with(".rept ") || trimmed.starts_with(".rept\t")
-    || trimmed.starts_with(".rep ") || trimmed.starts_with(".rep\t")
+    trimmed.starts_with(".rept ")
+        || trimmed.starts_with(".rept\t")
+        || trimmed.starts_with(".rep ")
+        || trimmed.starts_with(".rep\t")
 }
 
 fn is_irp_start(trimmed: &str) -> bool {
@@ -252,7 +275,10 @@ fn estimate_line_bytes(trimmed: &str) -> u64 {
     // Strip leading labels like "661:" from lines like "661: bl foo"
     let content = if let Some(pos) = trimmed.find(':') {
         let before = &trimmed[..pos];
-        if before.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        if before
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        {
             trimmed[pos + 1..].trim()
         } else {
             trimmed
@@ -266,17 +292,43 @@ fn estimate_line_bytes(trimmed: &str) -> u64 {
     // Directives
     if content.starts_with('.') {
         let lower = content.to_lowercase();
-        if lower.starts_with(".byte ") { return 1; }
-        if lower.starts_with(".hword ") || lower.starts_with(".short ") || lower.starts_with(".2byte ") { return 2; }
-        if lower.starts_with(".word ") || lower.starts_with(".long ") || lower.starts_with(".4byte ") || lower.starts_with(".inst ") { return 4; }
-        if lower.starts_with(".quad ") || lower.starts_with(".xword ") || lower.starts_with(".8byte ") { return 8; }
+        if lower.starts_with(".byte ") {
+            return 1;
+        }
+        if lower.starts_with(".hword ")
+            || lower.starts_with(".short ")
+            || lower.starts_with(".2byte ")
+        {
+            return 2;
+        }
+        if lower.starts_with(".word ")
+            || lower.starts_with(".long ")
+            || lower.starts_with(".4byte ")
+            || lower.starts_with(".inst ")
+        {
+            return 4;
+        }
+        if lower.starts_with(".quad ")
+            || lower.starts_with(".xword ")
+            || lower.starts_with(".8byte ")
+        {
+            return 8;
+        }
         // .zero N, .space N, .skip N
-        if lower.starts_with(".zero ") || lower.starts_with(".space ") || lower.starts_with(".skip ") {
+        if lower.starts_with(".zero ")
+            || lower.starts_with(".space ")
+            || lower.starts_with(".skip ")
+        {
             let arg = content.split_whitespace().nth(1).unwrap_or("0");
-            if let Ok(n) = arg.trim_end_matches(',').parse::<u64>() { return n; }
+            if let Ok(n) = arg.trim_end_matches(',').parse::<u64>() {
+                return n;
+            }
         }
         // .ascii "str" / .asciz "str" — approximate
-        if lower.starts_with(".ascii") || lower.starts_with(".asciz") || lower.starts_with(".string") {
+        if lower.starts_with(".ascii")
+            || lower.starts_with(".asciz")
+            || lower.starts_with(".string")
+        {
             // Don't try to be exact; these are rarely used in .rept context
             return 0;
         }
@@ -358,17 +410,21 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
     // Track numeric label positions (byte offsets) for resolving backward refs
-    let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> = crate::common::fx_hash::FxHashMap::default();
+    let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> =
+        crate::common::fx_hash::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
         if is_rept_start(&trimmed) {
             let prefix_len = if trimmed.starts_with(".rept") { 5 } else { 4 };
             let count_str = trimmed[prefix_len..].trim();
-            let count_val = resolve_rept_label_expr(count_str, &label_positions)
-                .unwrap_or(0);
+            let count_val = resolve_rept_label_expr(count_str, &label_positions).unwrap_or(0);
             // Treat negative counts as 0 (matches GNU as behavior)
-            let count = if count_val < 0 { 0usize } else { count_val as usize };
+            let count = if count_val < 0 {
+                0usize
+            } else {
+                count_val as usize
+            };
             let body = collect_block_body(lines, &mut i)?;
             let expanded_body = expand_rept_blocks(&body)?;
             for _ in 0..count {
@@ -386,10 +442,13 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             let body = collect_block_body(lines, &mut i)?;
             for val in &values {
                 // Substitute \var with val in each body line
-                let subst_body: Vec<String> = body.iter().map(|line| {
-                    let pattern = format!("\\{}", var);
-                    asm_preprocess::replace_macro_param(line, &pattern, val)
-                }).collect();
+                let subst_body: Vec<String> = body
+                    .iter()
+                    .map(|line| {
+                        let pattern = format!("\\{}", var);
+                        asm_preprocess::replace_macro_param(line, &pattern, val)
+                    })
+                    .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
                 let expanded = expand_rept_blocks(&subst_refs)?;
                 result.extend(expanded);
@@ -406,12 +465,16 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             for ch in char_str.chars() {
                 // Substitute \var with the current character in each body line
                 let ch_str = ch.to_string();
-                let subst_body: Vec<String> = body.iter().map(|line| {
-                    let pattern = format!("\\{}", var);
-                    let substituted = asm_preprocess::replace_macro_param(line, &pattern, &ch_str);
-                    // Strip GAS macro argument delimiters: \() resolves to empty string
-                    substituted.replace("\\()", "")
-                }).collect();
+                let subst_body: Vec<String> = body
+                    .iter()
+                    .map(|line| {
+                        let pattern = format!("\\{}", var);
+                        let substituted =
+                            asm_preprocess::replace_macro_param(line, &pattern, &ch_str);
+                        // Strip GAS macro argument delimiters: \() resolves to empty string
+                        substituted.replace("\\()", "")
+                    })
+                    .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
                 let expanded = expand_rept_blocks(&subst_refs)?;
                 result.extend(expanded);
@@ -457,13 +520,17 @@ fn split_macro_args(s: &str) -> Vec<String> {
     // Determine if commas are present (outside parens) — if so, use comma-only splitting
     let has_commas = {
         let mut depth = 0i32;
-        s.bytes().any(|b| {
-            match b {
-                b'(' => { depth += 1; false }
-                b')' => { depth -= 1; false }
-                b',' if depth == 0 => true,
-                _ => false,
+        s.bytes().any(|b| match b {
+            b'(' => {
+                depth += 1;
+                false
             }
+            b')' => {
+                depth -= 1;
+                false
+            }
+            b',' if depth == 0 => true,
+            _ => false,
         })
     };
     let mut args = Vec::new();
@@ -494,17 +561,27 @@ fn split_macro_args(s: &str) -> Vec<String> {
                 // Check if the whitespace is part of an arithmetic expression.
                 let trimmed_so_far = current.trim();
                 let last_is_num_or_op = trimmed_so_far.is_empty()
-                    || trimmed_so_far.chars().last().is_some_and(|c| c.is_ascii_digit() || c == ')');
+                    || trimmed_so_far
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_digit() || c == ')');
                 // Peek ahead: skip whitespace to see what follows
                 let mut peek = i + 1;
                 while peek < bytes.len() && (bytes[peek] == b' ' || bytes[peek] == b'\t') {
                     peek += 1;
                 }
-                let next_is_op = peek < bytes.len() && matches!(bytes[peek], b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b'~');
+                let next_is_op = peek < bytes.len()
+                    && matches!(
+                        bytes[peek],
+                        b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b'~'
+                    );
                 let next_is_num_after_op = if !current.is_empty() {
                     let last_ch = current.as_bytes()[current.len() - 1];
-                    matches!(last_ch, b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b'~' | b'(')
-                        && peek < bytes.len() && (bytes[peek].is_ascii_digit() || bytes[peek] == b'(')
+                    matches!(
+                        last_ch,
+                        b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b'~' | b'('
+                    ) && peek < bytes.len()
+                        && (bytes[peek].is_ascii_digit() || bytes[peek] == b'(')
                 } else {
                     false
                 };
@@ -566,7 +643,10 @@ struct MacroDef {
 fn parse_macro_directive(trimmed: &str) -> (String, Vec<String>, Vec<Option<String>>, bool) {
     let rest = trimmed[".macro".len()..].trim();
     let (name, params_str) = match rest.find([' ', '\t', ',']) {
-        Some(pos) => (rest[..pos].trim(), rest[pos..].trim().trim_start_matches(',')),
+        Some(pos) => (
+            rest[..pos].trim(),
+            rest[pos..].trim().trim_start_matches(','),
+        ),
         None => (rest, ""),
     };
     let mut params = Vec::new();
@@ -577,7 +657,11 @@ fn parse_macro_directive(trimmed: &str) -> (String, Vec<String>, Vec<Option<Stri
         //   .macro foo enable = 1    =>  param "enable", default "1"
         // First try comma-separated specs, then handle space-separated with '=' merging.
         let specs: Vec<&str> = if params_str.contains(',') {
-            params_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+            params_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
             // Space-separated: merge "name = value" triples into single specs.
             let tokens: Vec<&str> = params_str.split_whitespace().collect();
@@ -605,7 +689,9 @@ fn parse_macro_directive(trimmed: &str) -> (String, Vec<String>, Vec<Option<Stri
             // process directly here
             for m in &merged {
                 let s = m.trim();
-                if s.is_empty() { continue; }
+                if s.is_empty() {
+                    continue;
+                }
                 if let Some(eq_pos) = s.find('=') {
                     params.push(s[..eq_pos].to_string());
                     defaults.push(Some(s[eq_pos + 1..].to_string()));
@@ -674,7 +760,13 @@ fn collect_macro_body(lines: &[&str], start: usize) -> (Vec<String>, usize) {
 ///
 /// Handles both positional and named arguments (e.g., `shift=1`).
 /// Falls back to default values when arguments are not provided.
-fn substitute_params(body: &[String], params: &[String], defaults: &[Option<String>], args: &[String], _has_vararg: bool) -> Vec<String> {
+fn substitute_params(
+    body: &[String],
+    params: &[String],
+    defaults: &[Option<String>],
+    args: &[String],
+    _has_vararg: bool,
+) -> Vec<String> {
     // Build a map of param_name -> value, considering named args and defaults.
     let mut param_values: Vec<String> = Vec::with_capacity(params.len());
     // Start with defaults or "0" for each param
@@ -705,18 +797,21 @@ fn substitute_params(body: &[String], params: &[String], defaults: &[Option<Stri
     let mut sorted_indices: Vec<usize> = (0..params.len()).collect();
     sorted_indices.sort_by(|&a, &b| params[b].len().cmp(&params[a].len()));
 
-    body.iter().map(|body_line| {
-        let mut expanded = body_line.clone();
-        for &pi in &sorted_indices {
-            let pattern = format!("\\{}", params[pi]);
-            expanded = asm_preprocess::replace_macro_param(&expanded, &pattern, &param_values[pi]);
-        }
-        // Strip GAS macro argument delimiters: \() resolves to empty string.
-        // Used in GAS macros to separate parameter names from adjacent text,
-        // e.g., \param\().suffix → value.suffix after substitution.
-        expanded = expanded.replace("\\()", "");
-        expanded
-    }).collect()
+    body.iter()
+        .map(|body_line| {
+            let mut expanded = body_line.clone();
+            for &pi in &sorted_indices {
+                let pattern = format!("\\{}", params[pi]);
+                expanded =
+                    asm_preprocess::replace_macro_param(&expanded, &pattern, &param_values[pi]);
+            }
+            // Strip GAS macro argument delimiters: \() resolves to empty string.
+            // Used in GAS macros to separate parameter names from adjacent text,
+            // e.g., \param\().suffix → value.suffix after substitution.
+            expanded = expanded.replace("\\()", "");
+            expanded
+        })
+        .collect()
 }
 
 /// Expand .macro/.endm definitions and macro invocations in a single pass.
@@ -755,10 +850,21 @@ fn expand_macros_impl(
             // Collect macro definition (with nested depth tracking)
             let (name, params, defaults, has_vararg) = parse_macro_directive(&trimmed);
             let (body, end_idx) = collect_macro_body(lines, i + 1);
-            macros.insert(name, MacroDef { params, defaults, body, has_vararg });
+            macros.insert(
+                name,
+                MacroDef {
+                    params,
+                    defaults,
+                    body,
+                    has_vararg,
+                },
+            );
             i = end_idx + 1;
             continue;
-        } else if trimmed == ".endm" || trimmed.starts_with(".endm ") || trimmed.starts_with(".endm\t") {
+        } else if trimmed == ".endm"
+            || trimmed.starts_with(".endm ")
+            || trimmed.starts_with(".endm\t")
+        {
             // Stray .endm — skip
             i += 1;
             continue;
@@ -783,11 +889,20 @@ fn expand_macros_impl(
                     let mac_defaults = macros[rest_first_word].defaults.clone();
                     let mac_body = macros[rest_first_word].body.clone();
                     let mac_vararg = macros[rest_first_word].has_vararg;
-                    let macro_args_str = rest_after_label[rest_first_word.len()..].trim().to_string();
+                    let macro_args_str =
+                        rest_after_label[rest_first_word.len()..].trim().to_string();
                     let macro_args = split_macro_args(&macro_args_str);
-                    let mut expanded_lines = substitute_params(&mac_body, &mac_params, &mac_defaults, &macro_args, mac_vararg);
+                    let mut expanded_lines = substitute_params(
+                        &mac_body,
+                        &mac_params,
+                        &mac_defaults,
+                        &macro_args,
+                        mac_vararg,
+                    );
                     let ctr_str = counter.to_string();
-                    for line in &mut expanded_lines { *line = line.replace("\\@", &ctr_str); }
+                    for line in &mut expanded_lines {
+                        *line = line.replace("\\@", &ctr_str);
+                    }
                     *counter += 1;
                     let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
                     let re_expanded = expand_macros_impl(&refs, macros, depth + 1, counter)?;
@@ -815,16 +930,28 @@ fn expand_macros_impl(
                         let mut pos = 0;
                         for _ in 0..non_vararg_count {
                             // Skip whitespace/commas
-                            while pos < args_str.len() && (args_str.as_bytes()[pos] == b' ' || args_str.as_bytes()[pos] == b'\t' || args_str.as_bytes()[pos] == b',') {
+                            while pos < args_str.len()
+                                && (args_str.as_bytes()[pos] == b' '
+                                    || args_str.as_bytes()[pos] == b'\t'
+                                    || args_str.as_bytes()[pos] == b',')
+                            {
                                 pos += 1;
                             }
                             // Skip the arg token
-                            while pos < args_str.len() && args_str.as_bytes()[pos] != b',' && args_str.as_bytes()[pos] != b' ' && args_str.as_bytes()[pos] != b'\t' {
+                            while pos < args_str.len()
+                                && args_str.as_bytes()[pos] != b','
+                                && args_str.as_bytes()[pos] != b' '
+                                && args_str.as_bytes()[pos] != b'\t'
+                            {
                                 pos += 1;
                             }
                         }
                         // Skip separator after last non-vararg arg
-                        while pos < args_str.len() && (args_str.as_bytes()[pos] == b' ' || args_str.as_bytes()[pos] == b'\t' || args_str.as_bytes()[pos] == b',') {
+                        while pos < args_str.len()
+                            && (args_str.as_bytes()[pos] == b' '
+                                || args_str.as_bytes()[pos] == b'\t'
+                                || args_str.as_bytes()[pos] == b',')
+                        {
                             pos += 1;
                         }
                         let raw_vararg = args_str[pos..].to_string();
@@ -836,9 +963,12 @@ fn expand_macros_impl(
                 } else {
                     split_macro_args(&args_str)
                 };
-                let mut expanded_lines = substitute_params(&mac_body, &mac_params, &mac_defaults, &args, mac_vararg);
+                let mut expanded_lines =
+                    substitute_params(&mac_body, &mac_params, &mac_defaults, &args, mac_vararg);
                 let ctr_str = counter.to_string();
-                for line in &mut expanded_lines { *line = line.replace("\\@", &ctr_str); }
+                for line in &mut expanded_lines {
+                    *line = line.replace("\\@", &ctr_str);
+                }
                 *counter += 1;
                 // Recursively expand the result (may define new macros, invoke others)
                 let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
@@ -872,8 +1002,11 @@ fn resolve_set_constants(lines: &[String]) -> Vec<String> {
     // constants that are reassigned (e.g., .Lasm_alt_mode in kernel ALTERNATIVE macros).
     for line in lines {
         let trimmed = strip_comment(line).trim().to_lowercase();
-        if trimmed.starts_with(".set ") || trimmed.starts_with(".set\t")
-           || trimmed.starts_with(".equ ") || trimmed.starts_with(".equ\t") {
+        if trimmed.starts_with(".set ")
+            || trimmed.starts_with(".set\t")
+            || trimmed.starts_with(".equ ")
+            || trimmed.starts_with(".equ\t")
+        {
             let rest = strip_comment(line).trim();
             let directive_len = 4; // both .set and .equ are 4 chars
             let args = rest[directive_len..].trim();
@@ -946,7 +1079,8 @@ fn resolve_register_aliases(lines: &[String]) -> Vec<String> {
             // Ensure it's " .req " or "\t.req " (not part of a longer directive like .reqXYZ)
             let after_req = req_pos + 4;
             if req_pos > 0
-                && (trimmed.as_bytes()[req_pos - 1] == b' ' || trimmed.as_bytes()[req_pos - 1] == b'\t')
+                && (trimmed.as_bytes()[req_pos - 1] == b' '
+                    || trimmed.as_bytes()[req_pos - 1] == b'\t')
                 && after_req < trimmed.len()
                 && (trimmed.as_bytes()[after_req] == b' ' || trimmed.as_bytes()[after_req] == b'\t')
             {
@@ -973,50 +1107,58 @@ fn resolve_register_aliases(lines: &[String]) -> Vec<String> {
     sorted_aliases.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
     // Second pass: substitute aliases in all lines
-    lines.iter().map(|line| {
-        let trimmed = strip_comment(line).trim();
-        // Skip .req/.unreq definition lines — leave them as-is
-        if trimmed.contains(" .req ") || trimmed.contains("\t.req\t") || trimmed.contains("\t.req ")
-            || trimmed.contains(" .unreq ") || trimmed.contains("\t.unreq\t") || trimmed.contains("\t.unreq ")
-        {
-            return line.clone();
-        }
-        // Skip directives (starting with .) — aliases are only used in instructions
-        if trimmed.starts_with('.') {
-            return line.clone();
-        }
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
-            return line.clone();
-        }
-        let mut result = line.clone();
-        for (name, register) in &sorted_aliases {
-            let name_bytes = name.as_bytes();
-            let mut new_result = String::with_capacity(result.len());
-            let bytes = result.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if i + name_bytes.len() <= bytes.len()
-                    && &bytes[i..i + name_bytes.len()] == name_bytes
-                {
-                    // Check word boundary before
-                    let before_ok = i == 0 || !is_alias_ident_char(bytes[i - 1]);
-                    // Check word boundary after
-                    let after_pos = i + name_bytes.len();
-                    let after_ok = after_pos >= bytes.len() || !is_alias_ident_char(bytes[after_pos]);
-                    if before_ok && after_ok {
-                        new_result.push_str(register);
-                        i += name_bytes.len();
-                        continue;
-                    }
-                }
-                new_result.push(bytes[i] as char);
-                i += 1;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = strip_comment(line).trim();
+            // Skip .req/.unreq definition lines — leave them as-is
+            if trimmed.contains(" .req ")
+                || trimmed.contains("\t.req\t")
+                || trimmed.contains("\t.req ")
+                || trimmed.contains(" .unreq ")
+                || trimmed.contains("\t.unreq\t")
+                || trimmed.contains("\t.unreq ")
+            {
+                return line.clone();
             }
-            result = new_result;
-        }
-        result
-    }).collect()
+            // Skip directives (starting with .) — aliases are only used in instructions
+            if trimmed.starts_with('.') {
+                return line.clone();
+            }
+            // Skip empty lines and comments
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+                return line.clone();
+            }
+            let mut result = line.clone();
+            for (name, register) in &sorted_aliases {
+                let name_bytes = name.as_bytes();
+                let mut new_result = String::with_capacity(result.len());
+                let bytes = result.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if i + name_bytes.len() <= bytes.len()
+                        && &bytes[i..i + name_bytes.len()] == name_bytes
+                    {
+                        // Check word boundary before
+                        let before_ok = i == 0 || !is_alias_ident_char(bytes[i - 1]);
+                        // Check word boundary after
+                        let after_pos = i + name_bytes.len();
+                        let after_ok =
+                            after_pos >= bytes.len() || !is_alias_ident_char(bytes[after_pos]);
+                        if before_ok && after_ok {
+                            new_result.push_str(register);
+                            i += name_bytes.len();
+                            continue;
+                        }
+                    }
+                    new_result.push(bytes[i] as char);
+                    i += 1;
+                }
+                result = new_result;
+            }
+            result
+        })
+        .collect()
 }
 
 /// Check if a byte is a valid identifier character for register alias matching.
@@ -1035,10 +1177,16 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     // Strip // and @ line comments BEFORE splitting on semicolons, so that
     // semicolons inside comments (e.g. "// struct {int a;} *p;") don't cause
     // spurious splits.
-    let presplit: Vec<String> = text.lines().flat_map(|line| {
-        let line = strip_comment(line);
-        split_on_semicolons(line).into_iter().map(|s| s.to_string()).collect::<Vec<_>>()
-    }).collect();
+    let presplit: Vec<String> = text
+        .lines()
+        .flat_map(|line| {
+            let line = strip_comment(line);
+            split_on_semicolons(line)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let presplit_refs: Vec<&str> = presplit.iter().map(|s| s.as_str()).collect();
 
     // Expand .macro/.endm definitions and invocations
@@ -1060,7 +1208,8 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     // any_taken = whether any branch in this if/elseif/else chain was taken.
     let mut if_stack: Vec<(bool, bool)> = Vec::new();
     // Track defined symbols for .ifdef/.ifndef
-    let mut defined_symbols: crate::common::fx_hash::FxHashSet<String> = crate::common::fx_hash::FxHashSet::default();
+    let mut defined_symbols: crate::common::fx_hash::FxHashSet<String> =
+        crate::common::fx_hash::FxHashSet::default();
     for (line_num, line) in expanded_lines.iter().enumerate() {
         let line = line.trim();
 
@@ -1082,13 +1231,19 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with(".endif") {
             if if_stack.pop().is_none() {
-                return Err(format!("Line {}: .endif without matching .if", line_num + 1));
+                return Err(format!(
+                    "Line {}: .endif without matching .if",
+                    line_num + 1
+                ));
             }
             continue;
         }
         // .elseif / .elsif — else-if branch (must be checked BEFORE .else)
-        if lower.starts_with(".elseif ") || lower.starts_with(".elseif\t")
-            || lower.starts_with(".elsif ") || lower.starts_with(".elsif\t") {
+        if lower.starts_with(".elseif ")
+            || lower.starts_with(".elseif\t")
+            || lower.starts_with(".elsif ")
+            || lower.starts_with(".elsif\t")
+        {
             let len = if_stack.len();
             if len > 0 {
                 let parent_active = if len >= 2 { if_stack[len - 2].0 } else { true };
@@ -1099,13 +1254,20 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
                     let cond_str = line[keyword_len..].trim();
                     let result = eval_if_condition(cond_str);
                     if_stack[len - 1].0 = result;
-                    if result { if_stack[len - 1].1 = true; }
+                    if result {
+                        if_stack[len - 1].1 = true;
+                    }
                 }
             }
             continue;
         }
-        if lower == ".else" || (lower.starts_with(".else") && !lower.starts_with(".elseif") && !lower.starts_with(".elsif")
-            && lower.len() >= 5 && (lower.len() == 5 || lower.as_bytes()[5].is_ascii_whitespace())) {
+        if lower == ".else"
+            || (lower.starts_with(".else")
+                && !lower.starts_with(".elseif")
+                && !lower.starts_with(".elsif")
+                && lower.len() >= 5
+                && (lower.len() == 5 || lower.as_bytes()[5].is_ascii_whitespace()))
+        {
             let len = if_stack.len();
             if len > 0 {
                 let parent_active = if len >= 2 { if_stack[len - 2].0 } else { true };
@@ -1122,7 +1284,11 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
             let cond_str = if line.len() > 3 { line[3..].trim() } else { "" };
             // Evaluate the condition: if we're already in a false block, push false
             let active = if if_stack.last().map(|&(a, _)| a).unwrap_or(true) {
-                if cond_str.is_empty() { false } else { eval_if_condition(cond_str) }
+                if cond_str.is_empty() {
+                    false
+                } else {
+                    eval_if_condition(cond_str)
+                }
             } else {
                 false
             };
@@ -1464,8 +1630,12 @@ fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
 
     // Register alias: "name .req register" or "name .unreq register"
     // These define register aliases and can be safely ignored.
-    if trimmed.contains(" .req ") || trimmed.contains("\t.req\t") || trimmed.contains("\t.req ")
-        || trimmed.contains(" .unreq ") || trimmed.contains("\t.unreq\t") || trimmed.contains("\t.unreq ")
+    if trimmed.contains(" .req ")
+        || trimmed.contains("\t.req\t")
+        || trimmed.contains("\t.req ")
+        || trimmed.contains(" .unreq ")
+        || trimmed.contains("\t.unreq\t")
+        || trimmed.contains("\t.unreq ")
     {
         return Ok(vec![AsmStatement::Empty]);
     }
@@ -1486,7 +1656,8 @@ fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
 
 fn parse_directive(line: &str) -> Result<AsmStatement, String> {
     // Split directive name from arguments
-    let (name, args) = if line.starts_with(".inst") && line.len() > 5 && line.as_bytes()[5] == b'(' {
+    let (name, args) = if line.starts_with(".inst") && line.len() > 5 && line.as_bytes()[5] == b'('
+    {
         // Handle .inst(expr) without space: ".inst(0x...)" -> name=".inst", args="(0x...)"
         (".inst", line[5..].trim())
     } else if let Some(space_pos) = line.find([' ', '\t']) {
@@ -1527,14 +1698,20 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".type" => parse_type_directive(args)?,
         ".size" => parse_size_directive(args)?,
         ".align" | ".p2align" => {
-            let align_val: u64 = args.trim().split(',').next()
+            let align_val: u64 = args
+                .trim()
+                .split(',')
+                .next()
                 .and_then(|s| parse_int_literal(s.trim()).ok())
                 .unwrap_or(0) as u64;
             // AArch64 .align N means 2^N bytes (same as .p2align)
             AsmDirective::Align(1u64 << align_val)
         }
         ".balign" => {
-            let align_val: u64 = args.trim().split(',').next()
+            let align_val: u64 = args
+                .trim()
+                .split(',')
+                .next()
                 .and_then(|s| parse_int_literal(s.trim()).ok())
                 .unwrap_or(1) as u64;
             AsmDirective::Balign(align_val)
@@ -1562,7 +1739,8 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".zero" | ".space" => {
             let parts: Vec<&str> = args.trim().split(',').collect();
             let size: usize = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("invalid .zero size: {}", args))? as usize;
+                .map_err(|_| format!("invalid .zero size: {}", args))?
+                as usize;
             let fill: u8 = if parts.len() > 1 {
                 parse_data_value(parts[1].trim())? as u8
             } else {
@@ -1574,16 +1752,19 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // .fill repeat, size, value
             let parts: Vec<&str> = args.splitn(3, ',').collect();
             let repeat = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))? as u64;
+                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))?
+                as u64;
             let size = if parts.len() > 1 {
                 parse_int_literal(parts[1].trim())
-                    .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))? as u64
+                    .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
+                    as u64
             } else {
                 1
             };
             let value = if parts.len() > 2 {
                 parse_int_literal(parts[2].trim())
-                    .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))? as u64
+                    .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
+                    as u64
             } else {
                 0
             };
@@ -1616,12 +1797,12 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".set" | ".equ" => {
             let parts: Vec<&str> = args.splitn(2, ',').collect();
             if parts.len() == 2 {
-                AsmDirective::Set(
-                    parts[0].trim().to_string(),
-                    parts[1].trim().to_string(),
-                )
+                AsmDirective::Set(parts[0].trim().to_string(), parts[1].trim().to_string())
             } else {
-                return Err(format!("malformed .set directive: expected 'name, value', got '{}'", args));
+                return Err(format!(
+                    "malformed .set directive: expected 'name, value', got '{}'",
+                    args
+                ));
             }
         }
         ".symver" => {
@@ -1645,13 +1826,25 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             }
         }
         // CFI directives
-        ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa_offset"
-        | ".cfi_offset" | ".cfi_def_cfa_register" | ".cfi_restore"
-        | ".cfi_remember_state" | ".cfi_restore_state"
-        | ".cfi_adjust_cfa_offset" | ".cfi_def_cfa"
-        | ".cfi_sections" | ".cfi_personality" | ".cfi_lsda"
-        | ".cfi_rel_offset" | ".cfi_register" | ".cfi_return_column"
-        | ".cfi_undefined" | ".cfi_same_value" | ".cfi_escape" => AsmDirective::Cfi,
+        ".cfi_startproc"
+        | ".cfi_endproc"
+        | ".cfi_def_cfa_offset"
+        | ".cfi_offset"
+        | ".cfi_def_cfa_register"
+        | ".cfi_restore"
+        | ".cfi_remember_state"
+        | ".cfi_restore_state"
+        | ".cfi_adjust_cfa_offset"
+        | ".cfi_def_cfa"
+        | ".cfi_sections"
+        | ".cfi_personality"
+        | ".cfi_lsda"
+        | ".cfi_rel_offset"
+        | ".cfi_register"
+        | ".cfi_return_column"
+        | ".cfi_undefined"
+        | ".cfi_same_value"
+        | ".cfi_escape" => AsmDirective::Cfi,
         ".pushsection" => {
             // .pushsection name,"flags",@type - same syntax as .section
             match parse_section_directive(args)? {
@@ -1682,10 +1875,14 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
                 .map_err(|_| ".incbin: invalid UTF-8 in path".to_string())?;
             let skip = if parts.len() > 1 {
                 parts[1].trim().parse::<u64>().unwrap_or(0)
-            } else { 0 };
+            } else {
+                0
+            };
             let count = if parts.len() > 2 {
                 Some(parts[2].trim().parse::<u64>().unwrap_or(0))
-            } else { None };
+            } else {
+                None
+            };
             AsmDirective::Incbin { path, skip, count }
         }
         ".unreq" => {
@@ -1700,7 +1897,9 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // .float val1, val2, ... — emit 32-bit IEEE floats
             let mut bytes = Vec::new();
             for part in args.split(',') {
-                let val: f32 = part.trim().parse()
+                let val: f32 = part
+                    .trim()
+                    .parse()
                     .map_err(|_| format!("invalid .float value: {}", part.trim()))?;
                 bytes.extend_from_slice(&val.to_le_bytes());
             }
@@ -1710,19 +1909,24 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // .double val1, val2, ... — emit 64-bit IEEE floats
             let mut bytes = Vec::new();
             for part in args.split(',') {
-                let val: f64 = part.trim().parse()
+                let val: f64 = part
+                    .trim()
+                    .parse()
                     .map_err(|_| format!("invalid .double value: {}", part.trim()))?;
                 bytes.extend_from_slice(&val.to_le_bytes());
             }
             AsmDirective::RawBytes(bytes)
         }
         // Other directives we can safely ignore
-        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym"
-        | ".build_attributes" | ".eabi_attribute"
-        | ".arch" | ".arch_extension" | ".cpu"
-        | ".ltorg" | ".pool" => AsmDirective::Ltorg,
+        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes"
+        | ".eabi_attribute" | ".arch" | ".arch_extension" | ".cpu" | ".ltorg" | ".pool" => {
+            AsmDirective::Ltorg
+        }
         _ => {
-            return Err(format!("unsupported AArch64 assembler directive: {} {}", name, args));
+            return Err(format!(
+                "unsupported AArch64 assembler directive: {} {}",
+                name, args
+            ));
         }
     };
 
@@ -1814,8 +2018,13 @@ fn parse_operands(s: &str) -> Result<Vec<Operand>, String> {
             continue;
         }
         if j + 1 < operands.len() {
-            if let (Operand::Mem { base, offset: 0 }, Operand::Imm(off)) = (&operands[j], &operands[j + 1]) {
-                merged.push(Operand::MemPostIndex { base: base.clone(), offset: *off });
+            if let (Operand::Mem { base, offset: 0 }, Operand::Imm(off)) =
+                (&operands[j], &operands[j + 1])
+            {
+                merged.push(Operand::MemPostIndex {
+                    base: base.clone(),
+                    offset: *off,
+                });
                 skip_next = true;
                 continue;
             }
@@ -1844,9 +2053,11 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
             if rest.starts_with('[') && rest.ends_with(']') {
                 let idx_str = &rest[1..rest.len() - 1];
                 // Use expression evaluator to handle arithmetic like [1 - 1]
-                let idx_result = idx_str.parse::<u32>()
-                    .ok()
-                    .or_else(|| asm_expr::parse_integer_expr(idx_str).ok().and_then(|v| u32::try_from(v).ok()));
+                let idx_result = idx_str.parse::<u32>().ok().or_else(|| {
+                    asm_expr::parse_integer_expr(idx_str)
+                        .ok()
+                        .and_then(|v| u32::try_from(v).ok())
+                });
                 if let Some(idx) = idx_result {
                     let list_str = &s[..close_brace + 1];
                     let inner = &list_str[1..list_str.len() - 1];
@@ -1884,7 +2095,11 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
 
     // Shift: lsl, lsr, asr, ror
     let lower = s.to_lowercase();
-    if lower.starts_with("lsl ") || lower.starts_with("lsr ") || lower.starts_with("asr ") || lower.starts_with("ror ") {
+    if lower.starts_with("lsl ")
+        || lower.starts_with("lsr ")
+        || lower.starts_with("asr ")
+        || lower.starts_with("ror ")
+    {
         let kind = &lower[..3];
         let amount_str = s[4..].trim();
         let amount = if let Some(stripped) = amount_str.strip_prefix('#') {
@@ -1892,16 +2107,24 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
         } else {
             parse_int_literal(amount_str)?
         };
-        return Ok(Operand::Shift { kind: kind.to_string(), amount: amount as u32 });
+        return Ok(Operand::Shift {
+            kind: kind.to_string(),
+            amount: amount as u32,
+        });
     }
 
     // Extend specifiers: sxtw, uxtw, sxtx, uxtx, sxth, uxth, sxtb, uxtb
     // May appear alone (sxtw) or with shift (sxtw #2)
     {
-        let extend_prefixes = ["sxtw", "sxtx", "sxth", "sxtb", "uxtw", "uxtx", "uxth", "uxtb"];
+        let extend_prefixes = [
+            "sxtw", "sxtx", "sxth", "sxtb", "uxtw", "uxtx", "uxth", "uxtb",
+        ];
         for prefix in &extend_prefixes {
             if lower == *prefix {
-                return Ok(Operand::Extend { kind: prefix.to_string(), amount: 0 });
+                return Ok(Operand::Extend {
+                    kind: prefix.to_string(),
+                    amount: 0,
+                });
             }
             if lower.starts_with(prefix) && lower.as_bytes().get(prefix.len()) == Some(&b' ') {
                 let amount_str = s[prefix.len()..].trim();
@@ -1910,15 +2133,18 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
                 } else {
                     parse_int_literal(amount_str)?
                 };
-                return Ok(Operand::Extend { kind: prefix.to_string(), amount: amount as u32 });
+                return Ok(Operand::Extend {
+                    kind: prefix.to_string(),
+                    amount: amount as u32,
+                });
             }
         }
     }
 
     // Barrier options
     match lower.as_str() {
-        "ish" | "ishld" | "ishst" | "sy" | "ld" | "st" | "osh" | "oshld" | "oshst"
-        | "nsh" | "nshld" | "nshst" => {
+        "ish" | "ishld" | "ishst" | "sy" | "ld" | "st" | "osh" | "oshld" | "oshst" | "nsh"
+        | "nshld" | "nshst" => {
             // Store original case: this name may be a C symbol colliding with an ARM keyword
             return Ok(Operand::Barrier(s.to_string()));
         }
@@ -1927,8 +2153,8 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
 
     // Condition codes (for csel, csinc, etc.)
     match lower.as_str() {
-        "eq" | "ne" | "cs" | "hs" | "cc" | "lo" | "mi" | "pl" | "vs" | "vc"
-        | "hi" | "ls" | "ge" | "lt" | "gt" | "le" | "al" | "nv" => {
+        "eq" | "ne" | "cs" | "hs" | "cc" | "lo" | "mi" | "pl" | "vs" | "vc" | "hi" | "ls"
+        | "ge" | "lt" | "gt" | "le" | "al" | "nv" => {
             // Store original case: this name may be a C symbol colliding with an ARM keyword
             return Ok(Operand::Cond(s.to_string()));
         }
@@ -1945,9 +2171,11 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
                     let elem_size = arr_part[..bracket_pos].to_lowercase();
                     let idx_str = &arr_part[bracket_pos + 1..arr_part.len() - 1];
                     // Use expression evaluator to handle arithmetic like [1 - 1]
-                    let idx_result = idx_str.parse::<u32>()
-                        .ok()
-                        .or_else(|| asm_expr::parse_integer_expr(idx_str).ok().and_then(|v| u32::try_from(v).ok()));
+                    let idx_result = idx_str.parse::<u32>().ok().or_else(|| {
+                        asm_expr::parse_integer_expr(idx_str)
+                            .ok()
+                            .and_then(|v| u32::try_from(v).ok())
+                    });
                     if let Some(idx) = idx_result {
                         if matches!(elem_size.as_str(), "b" | "h" | "s" | "d") {
                             return Ok(Operand::RegLane {
@@ -1968,8 +2196,21 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
         let arr_part = &s[dot_pos + 1..];
         if is_register(reg_part) {
             let arr_lower = arr_part.to_lowercase();
-            if matches!(arr_lower.as_str(), "8b" | "16b" | "4h" | "8h" | "2s" | "4s" | "1d" | "2d" | "1q"
-                | "b" | "h" | "s" | "d") {
+            if matches!(
+                arr_lower.as_str(),
+                "8b" | "16b"
+                    | "4h"
+                    | "8h"
+                    | "2s"
+                    | "4s"
+                    | "1d"
+                    | "2d"
+                    | "1q"
+                    | "b"
+                    | "h"
+                    | "s"
+                    | "d"
+            ) {
                 return Ok(Operand::RegArrangement {
                     reg: reg_part.to_string(),
                     arrangement: arr_lower,
@@ -1986,7 +2227,10 @@ fn parse_single_operand(s: &str) -> Result<Operand, String> {
     // Bare integer (without # prefix) - some inline asm constraints emit these
     // e.g., "eor w9, w10, 255" or "ccmp x10, x13, 0, eq"
     // Also handles negative like -1, -2, etc.
-    if s.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-') {
+    if s.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '-')
+    {
         if let Ok(val) = parse_int_literal(s) {
             return Ok(Operand::Imm(val));
         }
@@ -2049,8 +2293,16 @@ fn parse_register_list(s: &str) -> Result<Operand, String> {
                     let start = parse_reg_num_simple(lreg);
                     let end = parse_reg_num_simple(rreg);
                     if let (Some(s_num), Some(e_num)) = (start, end) {
-                        let prefix = if lreg.starts_with('v') || lreg.starts_with('V') { "v".to_string() } else { lreg.chars().next().unwrap().to_string() };
-                        let count = if e_num >= s_num { e_num - s_num + 1 } else { (32 - s_num) + e_num + 1 };
+                        let prefix = if lreg.starts_with('v') || lreg.starts_with('V') {
+                            "v".to_string()
+                        } else {
+                            lreg.chars().next().unwrap().to_string()
+                        };
+                        let count = if e_num >= s_num {
+                            e_num - s_num + 1
+                        } else {
+                            (32 - s_num) + e_num + 1
+                        };
                         for i in 0..count {
                             let reg_num = (s_num + i) % 32;
                             regs.push(Operand::RegArrangement {
@@ -2074,9 +2326,28 @@ fn parse_register_list(s: &str) -> Result<Operand, String> {
 
 fn parse_reg_num_simple(reg: &str) -> Option<u32> {
     let s = reg.trim();
-    if s.len() < 2 { return None; }
+    if s.len() < 2 {
+        return None;
+    }
     let first = s.chars().next()?;
-    if matches!(first, 'v' | 'V' | 'x' | 'X' | 'w' | 'W' | 'q' | 'Q' | 'd' | 'D' | 's' | 'S' | 'h' | 'H' | 'b' | 'B') {
+    if matches!(
+        first,
+        'v' | 'V'
+            | 'x'
+            | 'X'
+            | 'w'
+            | 'W'
+            | 'q'
+            | 'Q'
+            | 'd'
+            | 'D'
+            | 's'
+            | 'S'
+            | 'h'
+            | 'H'
+            | 'b'
+            | 'B'
+    ) {
         s[1..].parse::<u32>().ok()
     } else {
         None
@@ -2118,14 +2389,21 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
             }
             Err(_) => {
                 // Expression contains symbols/labels — defer resolution
-                return Ok(Operand::MemExpr { base, expr: imm_str.to_string(), writeback: has_writeback });
+                return Ok(Operand::MemExpr {
+                    base,
+                    expr: imm_str.to_string(),
+                    writeback: has_writeback,
+                });
             }
         }
     }
 
     // Handle bare immediate without # prefix (e.g., [sp, -16]! or [x0, 8])
     // Check if the second operand starts with a digit or minus sign followed by a digit
-    if second.starts_with('-') || second.starts_with('+') || second.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+    if second.starts_with('-')
+        || second.starts_with('+')
+        || second.bytes().next().is_some_and(|b| b.is_ascii_digit())
+    {
         if let Ok(offset) = parse_int_literal(second) {
             if has_writeback {
                 return Ok(Operand::MemPreIndex { base, offset });
@@ -2150,7 +2428,11 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
                     shift: None,
                 });
             }
-            Operand::ModifierOffset { kind, symbol, offset } => {
+            Operand::ModifierOffset {
+                kind,
+                symbol,
+                offset,
+            } => {
                 return Ok(Operand::MemRegOffset {
                     base,
                     index: format!(":{}:{}+{}", kind, symbol, offset),
@@ -2204,10 +2486,8 @@ fn parse_extend_shift(s: &str) -> (Option<String>, Option<u8>) {
         None
     };
     match kind {
-        "lsl" | "lsr" | "asr" | "ror" | "sxtw" | "sxtx" | "sxth" | "sxtb"
-        | "uxtw" | "uxtx" | "uxth" | "uxtb" => {
-            (Some(kind.to_string()), shift)
-        }
+        "lsl" | "lsr" | "asr" | "ror" | "sxtw" | "sxtx" | "sxth" | "sxtb" | "uxtw" | "uxtx"
+        | "uxth" | "uxtb" => (Some(kind.to_string()), shift),
         _ => (None, None),
     }
 }
@@ -2215,7 +2495,9 @@ fn parse_extend_shift(s: &str) -> (Option<String>, Option<u8>) {
 fn parse_modifier(s: &str) -> Result<Operand, String> {
     // :kind:symbol or :kind:symbol+offset
     let s = s.trim_start_matches(':');
-    let colon_pos = s.find(':').ok_or("malformed modifier, expected :kind:symbol")?;
+    let colon_pos = s
+        .find(':')
+        .ok_or("malformed modifier, expected :kind:symbol")?;
     let kind = s[..colon_pos].to_string();
     let rest = &s[colon_pos + 1..];
 
@@ -2224,7 +2506,11 @@ fn parse_modifier(s: &str) -> Result<Operand, String> {
         let symbol = rest[..plus_pos].trim().to_string();
         let offset_str = rest[plus_pos + 1..].trim();
         if let Ok(offset) = parse_int_literal(offset_str) {
-            return Ok(Operand::ModifierOffset { kind, symbol, offset });
+            return Ok(Operand::ModifierOffset {
+                kind,
+                symbol,
+                offset,
+            });
         }
     }
     if let Some(minus_pos) = rest.rfind('-') {
@@ -2232,12 +2518,19 @@ fn parse_modifier(s: &str) -> Result<Operand, String> {
             let symbol = rest[..minus_pos].trim().to_string();
             let offset_str = &rest[minus_pos..]; // includes the '-'
             if let Ok(offset) = parse_int_literal(offset_str) {
-                return Ok(Operand::ModifierOffset { kind, symbol, offset });
+                return Ok(Operand::ModifierOffset {
+                    kind,
+                    symbol,
+                    offset,
+                });
             }
         }
     }
 
-    Ok(Operand::Modifier { kind, symbol: rest.trim().to_string() })
+    Ok(Operand::Modifier {
+        kind,
+        symbol: rest.trim().to_string(),
+    })
 }
 
 fn parse_immediate(s: &str) -> Result<Operand, String> {
@@ -2301,12 +2594,17 @@ fn is_register(s: &str) -> bool {
 /// Parse a `.section name,"flags",@type` directive.
 fn parse_section_directive(args: &str) -> Result<AsmDirective, String> {
     let parts = split_section_args(args);
-    let name = parts.first()
+    let name = parts
+        .first()
         .map(|s| s.trim().trim_matches('"').to_string())
         .unwrap_or_else(|| ".text".to_string());
     let flags = parts.get(1).map(|s| s.trim().trim_matches('"').to_string());
     let section_type = parts.get(2).map(|s| s.trim().to_string());
-    Ok(AsmDirective::Section(SectionDirective { name, flags, section_type }))
+    Ok(AsmDirective::Section(SectionDirective {
+        name,
+        flags,
+        section_type,
+    }))
 }
 
 /// Split section directive args, respecting quoted strings.
@@ -2358,7 +2656,10 @@ fn parse_type_directive(args: &str) -> Result<AsmDirective, String> {
 fn parse_size_directive(args: &str) -> Result<AsmDirective, String> {
     let parts: Vec<&str> = args.splitn(2, ',').collect();
     if parts.len() != 2 {
-        return Err(format!("malformed .size directive: expected 'name, expr', got '{}'", args));
+        return Err(format!(
+            "malformed .size directive: expected 'name, expr', got '{}'",
+            args
+        ));
     }
     let sym = parts[0].trim().to_string();
     let expr_str = parts[1].trim();
@@ -2378,7 +2679,10 @@ fn parse_size_directive(args: &str) -> Result<AsmDirective, String> {
 fn parse_comm_directive(args: &str) -> Result<AsmDirective, String> {
     let parts: Vec<&str> = args.split(',').collect();
     if parts.len() < 2 {
-        return Err(format!("malformed .comm directive: expected 'name, size[, align]', got '{}'", args));
+        return Err(format!(
+            "malformed .comm directive: expected 'name, size[, align]', got '{}'",
+            args
+        ));
     }
     let sym = parts[0].trim().to_string();
     let size: u64 = parts[1].trim().parse().unwrap_or(0);
@@ -2414,7 +2718,12 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
         // Check if it looks like an expression with operators (for deferred evaluation)
-        if trimmed.contains('-') || trimmed.contains('+') || trimmed.contains(">>") || trimmed.contains("<<") || trimmed.starts_with('(') {
+        if trimmed.contains('-')
+            || trimmed.contains('+')
+            || trimmed.contains(">>")
+            || trimmed.contains("<<")
+            || trimmed.starts_with('(')
+        {
             vals.push(DataValue::Expr(trimmed.to_string()));
         } else {
             // Symbol reference
@@ -2477,13 +2786,19 @@ fn strip_sym_parens(s: &str) -> &str {
             match ch {
                 '(' => depth += 1,
                 ')' => {
-                    if depth == 0 { return s; }
+                    if depth == 0 {
+                        return s;
+                    }
                     depth -= 1;
                 }
                 _ => {}
             }
         }
-        if depth == 0 { strip_sym_parens(inner) } else { s }
+        if depth == 0 {
+            strip_sym_parens(inner)
+        } else {
+            s
+        }
     } else {
         s
     }
@@ -2609,8 +2924,16 @@ fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
     let mut depth = 0i32;
     while i < len {
         match bytes[i] {
-            b'(' => { depth += 1; i += 1; continue; }
-            b')' => { depth -= 1; i += 1; continue; }
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
             _ => {}
         }
         if depth > 0 {
@@ -2619,11 +2942,19 @@ fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
         }
         if bytes[i] == b'-' {
             let left_char = bytes[i - 1];
-            let left_ok = left_char.is_ascii_alphanumeric() || left_char == b'_' || left_char == b'.' || left_char == b' ' || left_char == b')';
+            let left_ok = left_char.is_ascii_alphanumeric()
+                || left_char == b'_'
+                || left_char == b'.'
+                || left_char == b' '
+                || left_char == b')';
             let right_start = expr[i + 1..].trim_start();
             if !right_start.is_empty() {
                 let right_char = right_start.as_bytes()[0];
-                let right_ok = right_char.is_ascii_alphabetic() || right_char == b'_' || right_char == b'.' || right_char.is_ascii_digit() || right_char == b'(';
+                let right_ok = right_char.is_ascii_alphabetic()
+                    || right_char == b'_'
+                    || right_char == b'.'
+                    || right_char.is_ascii_digit()
+                    || right_char == b'(';
                 if left_ok && right_ok {
                     return Some(i);
                 }

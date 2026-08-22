@@ -18,25 +18,18 @@
 //! - Pointer arithmetic on global addresses
 //!   These remain in the lowerer since they require IR-level state.
 
-use crate::common::types::CType;
-use crate::common::types::AddressSpace;
+use super::analysis::FunctionInfo;
+use super::type_context::TypeContext;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
-use crate::ir::reexports::IrConst;
-use crate::frontend::parser::ast::{
-    BinOp,
-    DerivedDeclarator,
-    Expr,
-    ExprId,
-    SizeofArg,
-    StructFieldDecl,
-    TypeSpecifier,
-    UnaryOp,
-};
-use super::type_context::TypeContext;
-use super::analysis::FunctionInfo;
-use crate::common::symbol_table::SymbolTable;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::symbol_table::SymbolTable;
+use crate::common::types::AddressSpace;
+use crate::common::types::CType;
+use crate::frontend::parser::ast::{
+    BinOp, DerivedDeclarator, Expr, ExprId, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
+};
+use crate::ir::reexports::IrConst;
 
 /// Map from AST expression node identity to its pre-computed compile-time constant.
 ///
@@ -84,19 +77,22 @@ impl<'a> SemaConstEval<'a> {
 
         match expr {
             // Literals: delegate to shared evaluation
-            Expr::IntLiteral(..) | Expr::LongLiteral(..) | Expr::LongLongLiteral(..)
-            | Expr::UIntLiteral(..) | Expr::ULongLiteral(..) | Expr::ULongLongLiteral(..)
-            | Expr::CharLiteral(..) | Expr::FloatLiteral(..)
-            | Expr::FloatLiteralF32(..) | Expr::FloatLiteralLongDouble(..) => {
-                shared_const_eval::eval_literal(expr)
-            }
+            Expr::IntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::CharLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..) => shared_const_eval::eval_literal(expr),
 
-            Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
-                self.eval_const_expr(inner)
-            }
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned(inner));
+                let promoted =
+                    shared_const_eval::promote_sub_int(val, self.is_expr_unsigned(inner));
                 const_arith::negate_const(promoted)
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
@@ -108,15 +104,16 @@ impl<'a> SemaConstEval<'a> {
                 // the bitwise NOT must be truncated to 32 bits. Without this, ~0u
                 // produces I64(-1) (all 64 bits set) instead of I64(0xFFFFFFFF).
                 // Check the promoted type's actual width via the inner expression type.
-                let inner_ctype = self.lookup_expr_type(inner)
+                let inner_ctype = self
+                    .lookup_expr_type(inner)
                     .or_else(|| self.infer_expr_ctype(inner));
-                let is_32bit_type = inner_ctype.as_ref().map_or(
-                    matches!(result, IrConst::I32(_)),
-                    |ct| {
-                        let size = self.ctype_size(ct);
-                        size <= 4
-                    },
-                );
+                let is_32bit_type =
+                    inner_ctype
+                        .as_ref()
+                        .map_or(matches!(result, IrConst::I32(_)), |ct| {
+                            let size = self.ctype_size(ct);
+                            size <= 4
+                        });
                 if is_32bit_type && is_unsigned {
                     // Truncate to 32-bit unsigned: mask to 0xFFFFFFFF and store as I64
                     if let Some(v) = result.to_i64() {
@@ -146,18 +143,30 @@ impl<'a> SemaConstEval<'a> {
                 let r = self.eval_const_expr(rhs);
                 if let (Some(ref lv), Some(ref rv)) = (&l, &r) {
                     // Derive operand CTypes for signedness/width determination.
-                    let lhs_ctype = self.lookup_expr_type(lhs)
+                    let lhs_ctype = self
+                        .lookup_expr_type(lhs)
                         .or_else(|| self.infer_expr_ctype(lhs))
                         .or_else(|| Self::ctype_from_ir_const(lv));
-                    let rhs_ctype = self.lookup_expr_type(rhs)
+                    let rhs_ctype = self
+                        .lookup_expr_type(rhs)
                         .or_else(|| self.infer_expr_ctype(rhs))
                         .or_else(|| Self::ctype_from_ir_const(rv));
-                    let lhs_size = lhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct).max(4));
+                    let lhs_size = lhs_ctype
+                        .as_ref()
+                        .map_or(4, |ct| self.ctype_size(ct).max(4));
                     let lhs_unsigned = lhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
-                    let rhs_size = rhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct).max(4));
+                    let rhs_size = rhs_ctype
+                        .as_ref()
+                        .map_or(4, |ct| self.ctype_size(ct).max(4));
                     let rhs_unsigned = rhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
                     let result = shared_const_eval::eval_binop_with_types(
-                        op, lv, rv, lhs_size, lhs_unsigned, rhs_size, rhs_unsigned,
+                        op,
+                        lv,
+                        rv,
+                        lhs_size,
+                        lhs_unsigned,
+                        rhs_size,
+                        rhs_unsigned,
                     );
                     if result.is_some() {
                         return result;
@@ -217,7 +226,8 @@ impl<'a> SemaConstEval<'a> {
                 if let IrConst::I128(v128) = src_val {
                     let target_size = self.ctype_size(&target_ctype);
                     // Determine source signedness for int-to-float conversions
-                    let src_unsigned = self.lookup_expr_type(inner)
+                    let src_unsigned = self
+                        .lookup_expr_type(inner)
                         .is_some_and(|ct| ct.is_unsigned());
                     return self.cast_i128_to_ctype(v128, &target_ctype, target_size, src_unsigned);
                 }
@@ -234,7 +244,8 @@ impl<'a> SemaConstEval<'a> {
                 // but (unsigned __int128)(0xFFFFFFFFFFFFFFFFULL) should be 0x0000...FFFF (zero-extend).
                 if target_size == 16 && !matches!(&target_ctype, CType::LongDouble) {
                     // Determine source signedness: try type map first, then infer, default signed
-                    let src_signed = self.lookup_expr_type(inner)
+                    let src_signed = self
+                        .lookup_expr_type(inner)
                         .or_else(|| self.infer_expr_ctype(inner))
                         .is_none_or(|ct| !ct.is_unsigned());
                     let v128 = if src_signed {
@@ -260,8 +271,12 @@ impl<'a> SemaConstEval<'a> {
                 // (not target) to correctly interpret the bit pattern. E.g.,
                 // (double)(unsigned long)0xFFFFFFFFFFFFFFFF should produce
                 // 18446744073709551615.0, not -1.0.
-                if matches!(target_ctype, CType::Float | CType::Double | CType::LongDouble) {
-                    let src_signed = self.lookup_expr_type(inner)
+                if matches!(
+                    target_ctype,
+                    CType::Float | CType::Double | CType::LongDouble
+                ) {
+                    let src_signed = self
+                        .lookup_expr_type(inner)
                         .or_else(|| self.infer_expr_ctype(inner))
                         .is_none_or(|ct| !ct.is_unsigned());
                     return self.bits_to_irconst(truncated, &target_ctype, src_signed);
@@ -325,7 +340,9 @@ impl<'a> SemaConstEval<'a> {
                 if let Expr::Identifier(name, _) = inner_expr.as_ref() {
                     if let Some(sym) = self.symbols.lookup(name) {
                         if let Some(explicit_align) = sym.explicit_alignment {
-                            let natural = sym.ty.preferred_align_ctx(&*self.types.borrow_struct_layouts());
+                            let natural = sym
+                                .ty
+                                .preferred_align_ctx(&*self.types.borrow_struct_layouts());
                             return Some(IrConst::I64(natural.max(explicit_align) as i64));
                         }
                     }
@@ -364,16 +381,14 @@ impl<'a> SemaConstEval<'a> {
             }
 
             // AddressOf for offsetof patterns: &((type*)0)->member
-            Expr::AddressOf(inner, _) => {
-                self.eval_offsetof_pattern(inner)
-            }
+            Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
 
             // Handle compile-time builtin function calls in constant expressions.
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    shared_const_eval::eval_builtin_call(
-                        name.as_str(), args, &|e| self.eval_const_expr(e),
-                    )
+                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
+                        self.eval_const_expr(e)
+                    })
                 } else {
                     None
                 }
@@ -392,7 +407,11 @@ impl<'a> SemaConstEval<'a> {
                 let target_ctype = self.type_spec_to_ctype(target_type);
                 let target_width = self.ctype_size(&target_ctype) * 8;
                 let target_signed = !target_ctype.is_unsigned() && !target_ctype.is_pointer_like();
-                Some(const_arith::truncate_and_extend_bits(bits, target_width, target_signed))
+                Some(const_arith::truncate_and_extend_bits(
+                    bits,
+                    target_width,
+                    target_signed,
+                ))
             }
             _ => {
                 let val = self.eval_const_expr(expr)?;
@@ -415,15 +434,18 @@ impl<'a> SemaConstEval<'a> {
             Expr::PointerMemberAccess(base, field_name, _) => {
                 let (type_spec, base_offset) = self.extract_null_pointer_cast_with_offset(base)?;
                 let layout = self.get_struct_layout_for_type(&type_spec)?;
-                let (field_offset, field_ty) = layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
+                let (field_offset, field_ty) =
+                    layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
                 Some((base_offset + field_offset, field_ty))
             }
             Expr::MemberAccess(base, field_name, _) => {
                 // First try: base is *((type*)0) (deref pattern)
                 if let Expr::Deref(inner, _) = base.as_ref() {
-                    let (type_spec, base_offset) = self.extract_null_pointer_cast_with_offset(inner)?;
+                    let (type_spec, base_offset) =
+                        self.extract_null_pointer_cast_with_offset(inner)?;
                     let layout = self.get_struct_layout_for_type(&type_spec)?;
-                    let (field_offset, field_ty) = layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
+                    let (field_offset, field_ty) =
+                        layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
                     return Some((base_offset + field_offset, field_ty));
                 }
                 // Second try: base is itself an offsetof sub-expression (chained access)
@@ -450,7 +472,10 @@ impl<'a> SemaConstEval<'a> {
                     CType::Array(elem, _) => (**elem).clone(),
                     _ => return None,
                 };
-                Some(((base_offset as i64 + idx * elem_size as i64) as usize, elem_ty))
+                Some((
+                    (base_offset as i64 + idx * elem_size as i64) as usize,
+                    elem_ty,
+                ))
             }
             _ => None,
         }
@@ -472,7 +497,10 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Get the struct layout for a type specifier.
-    fn get_struct_layout_for_type(&self, type_spec: &TypeSpecifier) -> Option<crate::common::types::RcLayout> {
+    fn get_struct_layout_for_type(
+        &self,
+        type_spec: &TypeSpecifier,
+    ) -> Option<crate::common::types::RcLayout> {
         let ctype = self.type_spec_to_ctype(type_spec);
         match &ctype {
             CType::Struct(key) | CType::Union(key) => {
@@ -567,8 +595,15 @@ impl<'a> SemaConstEval<'a> {
 
     /// Cast a long double value (with f128 bytes) to a target CType.
     /// Uses full precision for integer conversions.
-    fn cast_long_double_to_ctype(&self, fv: f64, bytes: &[u8; 16], target: &CType) -> Option<IrConst> {
-        use crate::common::long_double::{f128_bytes_to_i64, f128_bytes_to_u64, f128_bytes_to_i128, f128_bytes_to_u128};
+    fn cast_long_double_to_ctype(
+        &self,
+        fv: f64,
+        bytes: &[u8; 16],
+        target: &CType,
+    ) -> Option<IrConst> {
+        use crate::common::long_double::{
+            f128_bytes_to_i128, f128_bytes_to_i64, f128_bytes_to_u128, f128_bytes_to_u64,
+        };
         Some(match target {
             CType::Float => IrConst::F32(fv as f32),
             CType::Double => IrConst::F64(fv),
@@ -638,7 +673,11 @@ impl<'a> SemaConstEval<'a> {
             }
             4 => {
                 if matches!(target, CType::Float) {
-                    let int_val = if target_signed { bits as i64 as f32 } else { bits as f32 };
+                    let int_val = if target_signed {
+                        bits as i64 as f32
+                    } else {
+                        bits as f32
+                    };
                     IrConst::F32(int_val)
                 } else if !target_signed {
                     // Unsigned 32-bit: use I64 to preserve unsigned semantics.
@@ -651,7 +690,11 @@ impl<'a> SemaConstEval<'a> {
             }
             8 => {
                 if matches!(target, CType::Double) {
-                    let int_val = if target_signed { bits as i64 as f64 } else { bits as f64 };
+                    let int_val = if target_signed {
+                        bits as i64 as f64
+                    } else {
+                        bits as f64
+                    };
                     IrConst::F64(int_val)
                 } else {
                     IrConst::I64(bits as i64)
@@ -687,7 +730,13 @@ impl<'a> SemaConstEval<'a> {
     /// u64-based eval_const_expr_as_bits path, which would truncate the upper 64 bits.
     /// For targets <= 64 bits, extract the lower bits. For 128-bit targets, preserve
     /// the full value.
-    fn cast_i128_to_ctype(&self, v128: i128, target: &CType, target_size: usize, src_unsigned: bool) -> Option<IrConst> {
+    fn cast_i128_to_ctype(
+        &self,
+        v128: i128,
+        target: &CType,
+        target_size: usize,
+        src_unsigned: bool,
+    ) -> Option<IrConst> {
         let bits_lo = v128 as u64; // lower 64 bits
         let target_signed = !target.is_unsigned() && !target.is_pointer_like();
         Some(match target_size {
@@ -709,7 +758,11 @@ impl<'a> SemaConstEval<'a> {
             4 => {
                 if matches!(target, CType::Float) {
                     // int-to-float: signedness comes from the source type
-                    let fv = if src_unsigned { (v128 as u128) as f32 } else { v128 as f32 };
+                    let fv = if src_unsigned {
+                        (v128 as u128) as f32
+                    } else {
+                        v128 as f32
+                    };
                     IrConst::F32(fv)
                 } else if !target_signed {
                     IrConst::I64(bits_lo as u32 as i64)
@@ -719,7 +772,11 @@ impl<'a> SemaConstEval<'a> {
             }
             8 => {
                 if matches!(target, CType::Double) {
-                    let fv = if src_unsigned { (v128 as u128) as f64 } else { v128 as f64 };
+                    let fv = if src_unsigned {
+                        (v128 as u128) as f64
+                    } else {
+                        v128 as f64
+                    };
                     IrConst::F64(fv)
                 } else {
                     IrConst::I64(bits_lo as i64)
@@ -794,8 +851,10 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Void => Some(0),
             TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed | TypeSpecifier::Unsigned => Some(4),
+            TypeSpecifier::Int
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned => Some(4),
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => Some(ptr_sz),
             TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => Some(8),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
@@ -825,9 +884,12 @@ impl<'a> SemaConstEval<'a> {
                     let struct_fields = self.convert_struct_fields(fields);
                     if !struct_fields.is_empty() {
                         let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                        let mut layout = crate::common::types::StructLayout::for_struct_with_packing(
-                            &struct_fields, max_field_align, &*self.types.borrow_struct_layouts()
-                        );
+                        let mut layout =
+                            crate::common::types::StructLayout::for_struct_with_packing(
+                                &struct_fields,
+                                max_field_align,
+                                &*self.types.borrow_struct_layouts(),
+                            );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
                                 layout.align = *a;
@@ -852,7 +914,9 @@ impl<'a> SemaConstEval<'a> {
                     if !union_fields.is_empty() {
                         let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                         let mut layout = crate::common::types::StructLayout::for_union_with_packing(
-                            &union_fields, max_field_align, &*self.types.borrow_struct_layouts()
+                            &union_fields,
+                            max_field_align,
+                            &*self.types.borrow_struct_layouts(),
                         );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
@@ -868,9 +932,11 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::Enum(name, variants, is_packed) => {
                 // Check if this is a forward reference to a known packed enum
-                let effective_packed = *is_packed || name.as_ref()
-                    .and_then(|n| self.types.packed_enum_types.get(n))
-                    .is_some();
+                let effective_packed = *is_packed
+                    || name
+                        .as_ref()
+                        .and_then(|n| self.types.packed_enum_types.get(n))
+                        .is_some();
                 if !effective_packed {
                     Some(4)
                 } else {
@@ -925,18 +991,50 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Void | TypeSpecifier::Bool => 1,
             TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed | TypeSpecifier::Unsigned => 4,
+            TypeSpecifier::Int
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned => 4,
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => ptr_sz,
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => if ptr_sz == 4 { 4 } else { 8 },
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    8
+                }
+            }
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
             TypeSpecifier::Float => 4,
-            TypeSpecifier::Double => if ptr_sz == 4 { 4 } else { 8 },
+            TypeSpecifier::Double => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    8
+                }
+            }
             // On i686, long double is 80-bit x87 aligned to 4 bytes
-            TypeSpecifier::LongDouble => if ptr_sz == 4 { 4 } else { 16 },
+            TypeSpecifier::LongDouble => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    16
+                }
+            }
             TypeSpecifier::ComplexFloat => 4,
-            TypeSpecifier::ComplexDouble => if ptr_sz == 4 { 4 } else { 8 },
-            TypeSpecifier::ComplexLongDouble => if ptr_sz == 4 { 4 } else { 16 },
+            TypeSpecifier::ComplexDouble => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    8
+                }
+            }
+            TypeSpecifier::ComplexLongDouble => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    16
+                }
+            }
             TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
             TypeSpecifier::Array(elem, _) => self.alignof_type_spec(elem),
             TypeSpecifier::Struct(tag, fields, is_packed, pragma_pack, struct_aligned) => {
@@ -950,9 +1048,12 @@ impl<'a> SemaConstEval<'a> {
                     let struct_fields = self.convert_struct_fields(fields);
                     if !struct_fields.is_empty() {
                         let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                        let mut layout = crate::common::types::StructLayout::for_struct_with_packing(
-                            &struct_fields, max_field_align, &*self.types.borrow_struct_layouts()
-                        );
+                        let mut layout =
+                            crate::common::types::StructLayout::for_struct_with_packing(
+                                &struct_fields,
+                                max_field_align,
+                                &*self.types.borrow_struct_layouts(),
+                            );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
                                 layout.align = *a;
@@ -975,7 +1076,9 @@ impl<'a> SemaConstEval<'a> {
                     if !union_fields.is_empty() {
                         let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
                         let mut layout = crate::common::types::StructLayout::for_union_with_packing(
-                            &union_fields, max_field_align, &*self.types.borrow_struct_layouts()
+                            &union_fields,
+                            max_field_align,
+                            &*self.types.borrow_struct_layouts(),
                         );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
@@ -988,9 +1091,11 @@ impl<'a> SemaConstEval<'a> {
                 struct_aligned.unwrap_or(1)
             }
             TypeSpecifier::Enum(name, variants, is_packed) => {
-                let effective_packed = *is_packed || name.as_ref()
-                    .and_then(|n| self.types.packed_enum_types.get(n))
-                    .is_some();
+                let effective_packed = *is_packed
+                    || name
+                        .as_ref()
+                        .and_then(|n| self.types.packed_enum_types.get(n))
+                        .is_some();
                 if !effective_packed {
                     4
                 } else {
@@ -1054,30 +1159,37 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Convert struct field declarations to StructField for layout computation.
-    fn convert_struct_fields(&self, fields: &[StructFieldDecl]) -> Vec<crate::common::types::StructField> {
-        fields.iter().map(|f| {
-            let ty = ctype_from_type_spec_with_derived(&f.type_spec, &f.derived, self.types);
-            let name = f.name.clone().unwrap_or_default();
-            let bit_width = f.bit_width.as_ref().and_then(|bw| {
-                self.eval_const_expr(bw)?.to_i64().map(|v| v as u32)
-            });
-            let field_alignment = {
-                let mut align = f.alignment;
-                if let TypeSpecifier::TypedefName(td_name) = &f.type_spec {
-                    if let Some(&ta) = self.types.typedef_alignments.get(td_name) {
-                        align = Some(align.map_or(ta, |a| a.max(ta)));
+    fn convert_struct_fields(
+        &self,
+        fields: &[StructFieldDecl],
+    ) -> Vec<crate::common::types::StructField> {
+        fields
+            .iter()
+            .map(|f| {
+                let ty = ctype_from_type_spec_with_derived(&f.type_spec, &f.derived, self.types);
+                let name = f.name.clone().unwrap_or_default();
+                let bit_width = f
+                    .bit_width
+                    .as_ref()
+                    .and_then(|bw| self.eval_const_expr(bw)?.to_i64().map(|v| v as u32));
+                let field_alignment = {
+                    let mut align = f.alignment;
+                    if let TypeSpecifier::TypedefName(td_name) = &f.type_spec {
+                        if let Some(&ta) = self.types.typedef_alignments.get(td_name) {
+                            align = Some(align.map_or(ta, |a| a.max(ta)));
+                        }
                     }
+                    align
+                };
+                crate::common::types::StructField {
+                    name,
+                    ty,
+                    bit_width,
+                    alignment: field_alignment,
+                    is_packed: f.is_packed,
                 }
-                align
-            };
-            crate::common::types::StructField {
-                name,
-                ty,
-                bit_width,
-                alignment: field_alignment,
-                is_packed: f.is_packed,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Check if an expression is always non-zero at compile time, even if we
@@ -1116,15 +1228,21 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::Float => CType::Float,
         TypeSpecifier::Double => CType::Double,
         TypeSpecifier::LongDouble => CType::LongDouble,
-        TypeSpecifier::Pointer(inner, addr_space) => CType::Pointer(Box::new(ctype_from_type_spec(inner, types)), *addr_space),
+        TypeSpecifier::Pointer(inner, addr_space) => {
+            CType::Pointer(Box::new(ctype_from_type_spec(inner, types)), *addr_space)
+        }
         TypeSpecifier::Array(elem, size) => {
             let elem_ty = ctype_from_type_spec(elem, types);
             // TODO: evaluate array size expression when available
             let array_size = size.as_ref().and_then(|s| {
                 // Try simple literal evaluation for array sizes
                 match s.as_ref() {
-                    Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-                    Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
+                    Expr::IntLiteral(n, _)
+                    | Expr::LongLiteral(n, _)
+                    | Expr::LongLongLiteral(n, _) => Some(*n as usize),
+                    Expr::UIntLiteral(n, _)
+                    | Expr::ULongLiteral(n, _)
+                    | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
                     _ => None,
                 }
             });
@@ -1207,8 +1325,12 @@ fn ctype_from_type_spec_with_derived(
             DerivedDeclarator::Array(Some(size_expr)) => {
                 let expr: &Expr = size_expr;
                 let size = match expr {
-                    Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-                    Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
+                    Expr::IntLiteral(n, _)
+                    | Expr::LongLiteral(n, _)
+                    | Expr::LongLongLiteral(n, _) => Some(*n as usize),
+                    Expr::UIntLiteral(n, _)
+                    | Expr::ULongLiteral(n, _)
+                    | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
                     _ => None,
                 };
                 ty = CType::Array(Box::new(ty), size);
@@ -1217,7 +1339,8 @@ fn ctype_from_type_spec_with_derived(
                 ty = CType::Array(Box::new(ty), None);
             }
             DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {
-                ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default); // function -> pointer
+                ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
+                // function -> pointer
             }
         }
     }

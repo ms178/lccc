@@ -66,14 +66,40 @@ impl LayoutPlan {
             }
         }
         for &(_name, emit) in special {
-            if emit { hdr = hdr.saturating_add(1); }
+            if emit {
+                hdr = hdr.saturating_add(1);
+            }
         }
-        let symtab_shidx = if has_symtab { let s = hdr; hdr = hdr.saturating_add(1); s } else { 0 };
-        let strtab_shidx = if has_strtab { let s = hdr; hdr = hdr.saturating_add(1); s } else { 0 };
-        let shstrtab_shidx = if has_shstrtab { let s = hdr; hdr = hdr.saturating_add(1); s } else { 0 };
+        let symtab_shidx = if has_symtab {
+            let s = hdr;
+            hdr = hdr.saturating_add(1);
+            s
+        } else {
+            0
+        };
+        let strtab_shidx = if has_strtab {
+            let s = hdr;
+            hdr = hdr.saturating_add(1);
+            s
+        } else {
+            0
+        };
+        let shstrtab_shidx = if has_shstrtab {
+            let s = hdr;
+            hdr = hdr.saturating_add(1);
+            s
+        } else {
+            0
+        };
         LayoutPlan {
-            out_sec_to_hdr, symtab_shidx, strtab_shidx, shstrtab_shidx,
-            sh_count: hdr, shdr_offset, ph_count, phdr_offset,
+            out_sec_to_hdr,
+            symtab_shidx,
+            strtab_shidx,
+            shstrtab_shidx,
+            sh_count: hdr,
+            shdr_offset,
+            ph_count,
+            phdr_offset,
         }
     }
 
@@ -139,7 +165,11 @@ impl SegmentPacker {
     #[inline]
     pub fn new(base: u64, page_size: u64) -> Self {
         debug_assert!(page_size.is_power_of_two() && page_size > 0);
-        Self { base, page_size, bias: 0 }
+        Self {
+            base,
+            page_size,
+            bias: 0,
+        }
     }
 
     /// Virtual address currently assigned to file offset `off`.
@@ -199,9 +229,12 @@ mod packer_tests {
             let mut p = SegmentPacker::new(base, PAGE);
             for seg in 0..8 {
                 for off in [0u64, 1, 7, 63, 0xfff, 0x1000, 0x1001, 0x12345, 1 << 20] {
-                    assert!(p.is_congruent(off),
-                            "base={base:#x} seg={seg} off={off:#x} \
-                             vaddr={:#x}", p.vaddr(off));
+                    assert!(
+                        p.is_congruent(off),
+                        "base={base:#x} seg={seg} off={off:#x} \
+                             vaddr={:#x}",
+                        p.vaddr(off)
+                    );
                 }
                 p.new_segment();
             }
@@ -216,7 +249,11 @@ mod packer_tests {
         let before = p.vaddr(off);
         p.new_segment();
         let after = p.vaddr(off);
-        assert_eq!(after - before, PAGE, "address must advance exactly one page");
+        assert_eq!(
+            after - before,
+            PAGE,
+            "address must advance exactly one page"
+        );
         assert_eq!(p.bias(), PAGE);
         // The caller's file offset is untouched — that is the whole point.
         assert!(p.is_congruent(off));
@@ -232,7 +269,9 @@ mod packer_tests {
         let ends = [0x470u64, 0x6d0, 0x8c0];
         let mut prev_v = 0;
         for (i, &off) in ends.iter().enumerate() {
-            if i > 0 { p.new_segment(); }
+            if i > 0 {
+                p.new_segment();
+            }
             let v = p.vaddr(off);
             assert!(p.is_congruent(off));
             if i > 0 {
@@ -251,8 +290,11 @@ mod packer_tests {
         for off in [0u64, 1, 0x8c0, 0xfff, 0x1000, 0x1234] {
             let pad = p.padding_to_page(off);
             assert!(pad < PAGE, "padding must be less than a page, got {pad:#x}");
-            assert_eq!(p.vaddr(off + pad) % PAGE, 0,
-                       "off={off:#x} pad={pad:#x} did not reach a page boundary");
+            assert_eq!(
+                p.vaddr(off + pad) % PAGE,
+                0,
+                "off={off:#x} pad={pad:#x} did not reach a page boundary"
+            );
             if p.vaddr(off) % PAGE == 0 {
                 assert_eq!(pad, 0, "already-aligned offset must need no padding");
             }

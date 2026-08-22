@@ -3,9 +3,9 @@
 //! After register allocation rewrites all MachReg::Vreg to MachReg::Phys,
 //! this module pattern-matches each MachInst to produce text assembly.
 
-use crate::backend::regalloc::PhysReg;
-use crate::backend::common::AsmOutput;
 use super::machinst::*;
+use crate::backend::common::AsmOutput;
+use crate::backend::regalloc::PhysReg;
 
 /// Public accessor for register name (used by resolve_stack_vregs for AllocaAddr).
 pub fn reg_name_pub(r: MachReg) -> &'static str {
@@ -20,15 +20,28 @@ pub fn reg_name_pub(r: MachReg) -> &'static str {
 fn reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         0 => "rax",
-        1 => "rbx", 2 => "r12", 3 => "r13", 4 => "r14", 5 => "r15",
+        1 => "rbx",
+        2 => "r12",
+        3 => "r13",
+        4 => "r14",
+        5 => "r15",
         6 => "rbp",
         7 => "rcx",
-        10 => "r11", 11 => "r10", 12 => "r8", 13 => "r9",
-        14 => "rdi", 15 => "rsi", 16 => "rdx",
+        10 => "r11",
+        11 => "r10",
+        12 => "r8",
+        13 => "r9",
+        14 => "rdi",
+        15 => "rsi",
+        16 => "rdx",
         // XMM registers — shouldn't normally appear in GPR MachInst, but handle
         // gracefully for values that got XMM allocation from the main allocator.
-        20 => "xmm2", 21 => "xmm3", 22 => "xmm4", 23 => "xmm5",
-        24 => "xmm6", 25 => "xmm7",
+        20 => "xmm2",
+        21 => "xmm3",
+        22 => "xmm4",
+        23 => "xmm5",
+        24 => "xmm6",
+        25 => "xmm7",
         _ => "rax", // fallback for unexpected register IDs
     }
 }
@@ -37,11 +50,20 @@ fn reg_name(reg: PhysReg) -> &'static str {
 fn reg_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         0 => "eax",
-        1 => "ebx", 2 => "r12d", 3 => "r13d", 4 => "r14d", 5 => "r15d",
+        1 => "ebx",
+        2 => "r12d",
+        3 => "r13d",
+        4 => "r14d",
+        5 => "r15d",
         6 => "ebp",
         7 => "ecx",
-        10 => "r11d", 11 => "r10d", 12 => "r8d", 13 => "r9d",
-        14 => "edi", 15 => "esi", 16 => "edx",
+        10 => "r11d",
+        11 => "r10d",
+        12 => "r8d",
+        13 => "r9d",
+        14 => "edi",
+        15 => "esi",
+        16 => "edx",
         _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
@@ -50,11 +72,20 @@ fn reg_name_32(reg: PhysReg) -> &'static str {
 fn reg_name_16(reg: PhysReg) -> &'static str {
     match reg.0 {
         0 => "ax",
-        1 => "bx", 2 => "r12w", 3 => "r13w", 4 => "r14w", 5 => "r15w",
+        1 => "bx",
+        2 => "r12w",
+        3 => "r13w",
+        4 => "r14w",
+        5 => "r15w",
         6 => "bp",
         7 => "cx",
-        10 => "r11w", 11 => "r10w", 12 => "r8w", 13 => "r9w",
-        14 => "di", 15 => "si", 16 => "dx",
+        10 => "r11w",
+        11 => "r10w",
+        12 => "r8w",
+        13 => "r9w",
+        14 => "di",
+        15 => "si",
+        16 => "dx",
         _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
@@ -63,11 +94,20 @@ fn reg_name_16(reg: PhysReg) -> &'static str {
 fn reg_name_8(reg: PhysReg) -> &'static str {
     match reg.0 {
         0 => "al",
-        1 => "bl", 2 => "r12b", 3 => "r13b", 4 => "r14b", 5 => "r15b",
+        1 => "bl",
+        2 => "r12b",
+        3 => "r13b",
+        4 => "r14b",
+        5 => "r15b",
         6 => "bpl",
         7 => "cl",
-        10 => "r11b", 11 => "r10b", 12 => "r8b", 13 => "r9b",
-        14 => "dil", 15 => "sil", 16 => "dl",
+        10 => "r11b",
+        11 => "r10b",
+        12 => "r8b",
+        13 => "r9b",
+        14 => "dil",
+        15 => "sil",
+        16 => "dl",
         _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
@@ -103,7 +143,12 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
                 format!("{}({})", offset, base_name)
             }
         }
-        MachOperand::MemIndex { base, index, scale, offset } => {
+        MachOperand::MemIndex {
+            base,
+            index,
+            scale,
+            offset,
+        } => {
             let base_name = fmt_reg(base, OpSize::S64);
             let index_name = fmt_reg(index, OpSize::S64);
             if *offset == 0 {
@@ -129,17 +174,13 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
     }
 }
 
-
 /// If `op` is an immediate outside the signed-32-bit range, materialize it
 /// into %rax with movabsq and return a register operand (plus the emitted
 /// movabsq line). x86 `cmp/test` (like all ALU ops) only support imm32
 /// sign-extended operands; using the raw 64-bit immediate would truncate it
 /// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
 /// check compiled to `cmp $0x55667788`).
-fn materialize_large_imm(
-    op: &MachOperand,
-    out: &mut AsmOutput,
-) -> MachOperand {
+fn materialize_large_imm(op: &MachOperand, out: &mut AsmOutput) -> MachOperand {
     match op {
         MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
             out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
@@ -216,9 +257,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
                     return;
                 }
-                (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
-                (MachOperand::Mem { .. }, MachOperand::StackSlot(_)) |
-                (MachOperand::StackSlot(_), MachOperand::Mem { .. }) => {
+                (MachOperand::Mem { .. }, MachOperand::Mem { .. })
+                | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
+                | (MachOperand::StackSlot(_), MachOperand::Mem { .. }) => {
                     // Also mem-to-mem: use rax relay
                     let src_str = fmt_operand(src, *size, out);
                     let dst_str = fmt_operand(dst, *size, out);
@@ -263,14 +304,25 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             let suffix = size.suffix();
             let src_str = fmt_operand(src, *size, out);
             let dst_str = fmt_reg(dst, *size);
-            out.emit_fmt(format_args!("    {}{} {}, {}", mnem, suffix, src_str, dst_str));
+            out.emit_fmt(format_args!(
+                "    {}{} {}, {}",
+                mnem, suffix, src_str, dst_str
+            ));
         }
 
-        MachInst::Imul3 { imm, src, dst, size } => {
+        MachInst::Imul3 {
+            imm,
+            src,
+            dst,
+            size,
+        } => {
             let suffix = size.suffix();
             let src_str = fmt_reg(src, *size);
             let dst_str = fmt_reg(dst, *size);
-            out.emit_fmt(format_args!("    imul{} ${}, {}, {}", suffix, imm, src_str, dst_str));
+            out.emit_fmt(format_args!(
+                "    imul{} ${}, {}, {}",
+                suffix, imm, src_str, dst_str
+            ));
         }
 
         MachInst::Neg { dst, size } => {
@@ -285,7 +337,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             out.emit_fmt(format_args!("    not{} {}", suffix, dst_str));
         }
 
-        MachInst::Shift { op, amount, dst, size } => {
+        MachInst::Shift {
+            op,
+            amount,
+            dst,
+            size,
+        } => {
             let mnem = shift_mnemonic(*op, *size);
             let dst_str = fmt_reg(dst, *size);
             match amount {
@@ -299,21 +356,35 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             }
         }
 
-        MachInst::Lea { base, index, offset, dst } => {
+        MachInst::Lea {
+            base,
+            index,
+            offset,
+            dst,
+        } => {
             let base_str = fmt_reg(base, OpSize::S64);
             let dst_str = fmt_reg(dst, OpSize::S64);
             if let Some((idx, scale)) = index {
                 let idx_str = fmt_reg(idx, OpSize::S64);
                 if *offset == 0 {
-                    out.emit_fmt(format_args!("    leaq ({}, {}, {}), {}", base_str, idx_str, scale, dst_str));
+                    out.emit_fmt(format_args!(
+                        "    leaq ({}, {}, {}), {}",
+                        base_str, idx_str, scale, dst_str
+                    ));
                 } else {
-                    out.emit_fmt(format_args!("    leaq {}({}, {}, {}), {}", offset, base_str, idx_str, scale, dst_str));
+                    out.emit_fmt(format_args!(
+                        "    leaq {}({}, {}, {}), {}",
+                        offset, base_str, idx_str, scale, dst_str
+                    ));
                 }
             } else if *offset == 0 {
                 // lea (%base), %dst — just a mov
                 out.emit_fmt(format_args!("    movq {}, {}", base_str, dst_str));
             } else {
-                out.emit_fmt(format_args!("    leaq {}({}), {}", offset, base_str, dst_str));
+                out.emit_fmt(format_args!(
+                    "    leaq {}({}), {}",
+                    offset, base_str, dst_str
+                ));
             }
         }
 
@@ -329,7 +400,11 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             out.emit("    xorl %edx, %edx");
         }
 
-        MachInst::Div { divisor, signed, size } => {
+        MachInst::Div {
+            divisor,
+            signed,
+            size,
+        } => {
             let mnem = if *signed { "idiv" } else { "div" };
             let suffix = size.suffix();
             let div_str = fmt_operand(divisor, *size, out);
@@ -344,11 +419,13 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             lhs = materialize_large_imm(&lhs, out);
             rhs = materialize_large_imm(&rhs, out);
             // x86 cmp can't have two memory operands — load rhs to rax
-            let both_mem = matches!((&lhs, &rhs),
-                (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
-                (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
-                (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
-                (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
+            let both_mem = matches!(
+                (&lhs, &rhs),
+                (MachOperand::StackSlot(_), MachOperand::StackSlot(_))
+                    | (MachOperand::Mem { .. }, MachOperand::Mem { .. })
+                    | (MachOperand::StackSlot(_), MachOperand::Mem { .. })
+                    | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
+            );
             if both_mem {
                 let rhs_str = fmt_operand(&rhs, *size, out);
                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
@@ -370,11 +447,13 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             lhs = materialize_large_imm(&lhs, out);
             rhs = materialize_large_imm(&rhs, out);
             // x86 test can't have two memory operands — load one to rax
-            let both_mem = matches!((&lhs, &rhs),
-                (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) |
-                (MachOperand::Mem { .. }, MachOperand::Mem { .. }) |
-                (MachOperand::StackSlot(_), MachOperand::Mem { .. }) |
-                (MachOperand::Mem { .. }, MachOperand::StackSlot(_)));
+            let both_mem = matches!(
+                (&lhs, &rhs),
+                (MachOperand::StackSlot(_), MachOperand::StackSlot(_))
+                    | (MachOperand::Mem { .. }, MachOperand::Mem { .. })
+                    | (MachOperand::StackSlot(_), MachOperand::Mem { .. })
+                    | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
+            );
             if both_mem {
                 let rhs_str = fmt_operand(&rhs, *size, out);
                 let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
@@ -394,7 +473,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             out.emit_fmt(format_args!("    set{} {}", cc_str, dst_str));
         }
 
-        MachInst::Movzx { src, dst, from_size, to_size } => {
+        MachInst::Movzx {
+            src,
+            dst,
+            from_size,
+            to_size,
+        } => {
             let src_str = fmt_operand(src, *from_size, out);
             // movzbl/movzwl always use 32-bit dest (implicit zero-extend to 64-bit).
             // A 32->64 zero-extension is a plain movl: writing a 32-bit
@@ -407,12 +491,21 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 (OpSize::S16, _) => "movzwl",
                 _ => "movl",
             };
-            let actual_dst_size = if *to_size == OpSize::S64 { OpSize::S32 } else { *to_size };
+            let actual_dst_size = if *to_size == OpSize::S64 {
+                OpSize::S32
+            } else {
+                *to_size
+            };
             let dst_str = fmt_reg(dst, actual_dst_size);
             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
         }
 
-        MachInst::Movsx { src, dst, from_size, to_size } => {
+        MachInst::Movsx {
+            src,
+            dst,
+            from_size,
+            to_size,
+        } => {
             let src_str = fmt_operand(src, *from_size, out);
             let dst_str = fmt_reg(dst, *to_size);
             let mnem = match (from_size, to_size) {
@@ -431,7 +524,10 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             let suffix = size.suffix();
             let src_str = fmt_operand(src, *size, out);
             let dst_str = fmt_reg(dst, *size);
-            out.emit_fmt(format_args!("    cmov{}{} {}, {}", cc_str, suffix, src_str, dst_str));
+            out.emit_fmt(format_args!(
+                "    cmov{}{} {}, {}",
+                cc_str, suffix, src_str, dst_str
+            ));
         }
 
         MachInst::Jcc { cc, target } => {

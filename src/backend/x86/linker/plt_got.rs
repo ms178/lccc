@@ -8,13 +8,17 @@ use crate::common::fx_hash::FxHashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 
-pub(super) fn collect_ifunc_symbols(globals: &FxHashMap<String, GlobalSymbol>, _is_static: bool) -> Vec<String> {
+pub(super) fn collect_ifunc_symbols(
+    globals: &FxHashMap<String, GlobalSymbol>,
+    _is_static: bool,
+) -> Vec<String> {
     // IFUNCs need IRELATIVE handling in BOTH static and dynamic executables.
     // Static: .rela.iplt applied by glibc csu via __rela_iplt_start/end.
     // Dynamic: IRELATIVE entries appended to .rela.dyn, applied by ld.so.
     // Without this, calls bind directly to the RESOLVER, so callers receive
     // the implementation's address as the "return value" of the call.
-    let mut ifunc_symbols: Vec<String> = globals.iter()
+    let mut ifunc_symbols: Vec<String> = globals
+        .iter()
         .filter(|(_, g)| g.defined_in.is_some() && (g.info & 0xf) == STT_GNU_IFUNC)
         .map(|(n, _)| n.clone())
         .collect();
@@ -43,7 +47,8 @@ pub(super) struct AbsDynReloc {
 }
 
 pub(super) fn create_plt_got(
-    objects: &[ElfObject], globals: &mut FxHashMap<String, GlobalSymbol>,
+    objects: &[ElfObject],
+    globals: &mut FxHashMap<String, GlobalSymbol>,
 ) -> (Vec<String>, Vec<(String, bool)>, Vec<AbsDynReloc>) {
     // Ordered vectors preserve deterministic layout; the shadow HashSets make
     // membership tests O(1). With tens of thousands of GOT symbols (e.g. a
@@ -62,10 +67,16 @@ pub(super) fn create_plt_got(
         for sec_idx in 0..obj.sections.len() {
             for rela in &obj.relocations[sec_idx] {
                 let si = rela.sym_idx as usize;
-                if si >= obj.symbols.len() { continue; }
+                if si >= obj.symbols.len() {
+                    continue;
+                }
                 let sym = &obj.symbols[si];
-                if sym.name.is_empty() || sym.is_local() { continue; }
-                let gsym_info = globals.get(sym.name.as_str()).map(|g| (g.is_dynamic, g.info & 0xf));
+                if sym.name.is_empty() || sym.is_local() {
+                    continue;
+                }
+                let gsym_info = globals
+                    .get(sym.name.as_str())
+                    .map(|g| (g.is_dynamic, g.info & 0xf));
 
                 match rela.rela_type {
                     R_X86_64_PLT32 | R_X86_64_PC32 if gsym_info.map(|g| g.0).unwrap_or(false) => {
@@ -77,7 +88,9 @@ pub(super) fn create_plt_got(
                             }
                         } else {
                             // Dynamic function symbol - needs PLT
-                            if plt_set.insert(sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                            if plt_set.insert(sym.name.to_string()) {
+                                plt_names.push(sym.name.to_string());
+                            }
                         }
                     }
                     R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
@@ -92,7 +105,9 @@ pub(super) fn create_plt_got(
                         }
                     }
                     R_X86_64_GOTTPOFF => {
-                        if !plt_set.contains(sym.name.as_str()) && got_only_set.insert(sym.name.to_string()) {
+                        if !plt_set.contains(sym.name.as_str())
+                            && got_only_set.insert(sym.name.to_string())
+                        {
                             got_only_names.push(sym.name.to_string());
                         }
                     }
@@ -103,7 +118,8 @@ pub(super) fn create_plt_got(
                         // (no GOT entry needed).
                         if gsym_info.map(|g| g.0).unwrap_or(false)
                             && !plt_set.contains(sym.name.as_str())
-                            && got_only_set.insert(sym.name.to_string()) {
+                            && got_only_set.insert(sym.name.to_string())
+                        {
                             got_only_names.push(sym.name.to_string());
                         }
                     }
@@ -113,7 +129,9 @@ pub(super) fn create_plt_got(
                             if sym_type != STT_OBJECT {
                                 // Function pointer initialised from a dynamic
                                 // function: the canonical address is its PLT entry.
-                                if plt_set.insert(sym.name.to_string()) { plt_names.push(sym.name.to_string()); }
+                                if plt_set.insert(sym.name.to_string()) {
+                                    plt_names.push(sym.name.to_string());
+                                }
                             } else {
                                 // Absolute 64-bit reference to a dynamic DATA
                                 // symbol, e.g. the `_ZTVN10__cxxabiv1*` vtable
@@ -137,7 +155,9 @@ pub(super) fn create_plt_got(
                                     addend: rela.addend,
                                 });
                             }
-                        } else if !plt_set.contains(sym.name.as_str()) && got_only_set.insert(sym.name.to_string()) {
+                        } else if !plt_set.contains(sym.name.as_str())
+                            && got_only_set.insert(sym.name.to_string())
+                        {
                             got_only_names.push(sym.name.to_string());
                         }
                     }
@@ -167,13 +187,17 @@ pub(super) fn create_plt_got(
     }
     // Also mark aliases (other dynamic STT_OBJECT symbols at the same library address)
     if !copy_reloc_lib_addrs.is_empty() {
-        let alias_names: Vec<String> = globals.iter()
+        let alias_names: Vec<String> = globals
+            .iter()
             .filter(|(name, g)| {
-                g.is_dynamic && !g.copy_reloc && (g.info & 0xf) == STT_OBJECT
+                g.is_dynamic
+                    && !g.copy_reloc
+                    && (g.info & 0xf) == STT_OBJECT
                     && !copy_reloc_set.contains(*name)
-                    && g.from_lib.is_some() && g.lib_sym_value != 0
-                    && copy_reloc_lib_addrs.contains(
-                        &(g.from_lib.as_ref().unwrap().clone(), g.lib_sym_value))
+                    && g.from_lib.is_some()
+                    && g.lib_sym_value != 0
+                    && copy_reloc_lib_addrs
+                        .contains(&(g.from_lib.as_ref().unwrap().clone(), g.lib_sym_value))
             })
             .map(|(n, _)| n.clone())
             .collect();

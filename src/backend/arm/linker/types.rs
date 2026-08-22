@@ -3,10 +3,10 @@
 //! Defines the `GlobalSymbol` type used by all linker phases, plus
 //! architecture-specific constants (base address, page size, interpreter path).
 
-use crate::backend::linker_common;
-use linker_common::{GlobalSymbolOps, Elf64Symbol};
-use super::elf::SHN_UNDEF;
 use super::elf::SHN_COMMON;
+use super::elf::SHN_UNDEF;
+use crate::backend::linker_common;
+use linker_common::{Elf64Symbol, GlobalSymbolOps};
 
 /// Dynamic linker path for AArch64
 pub const INTERP: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
@@ -39,36 +39,66 @@ pub struct GlobalSymbol {
 }
 
 impl GlobalSymbolOps for GlobalSymbol {
-    fn is_defined(&self) -> bool { self.defined_in.is_some() }
-    fn is_dynamic(&self) -> bool { self.is_dynamic }
-    fn info(&self) -> u8 { self.info }
-    fn section_idx(&self) -> u16 { self.section_idx }
-    fn value(&self) -> u64 { self.value }
-    fn size(&self) -> u64 { self.size }
+    fn is_defined(&self) -> bool {
+        self.defined_in.is_some()
+    }
+    fn is_dynamic(&self) -> bool {
+        self.is_dynamic
+    }
+    fn info(&self) -> u8 {
+        self.info
+    }
+    fn section_idx(&self) -> u16 {
+        self.section_idx
+    }
+    fn value(&self) -> u64 {
+        self.value
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
     fn new_defined(obj_idx: usize, sym: &Elf64Symbol) -> Self {
         GlobalSymbol {
-            value: sym.value, size: sym.size, info: sym.info,
-            defined_in: Some(obj_idx), from_lib: None,
-            plt_idx: None, got_idx: None,
-            section_idx: sym.shndx, is_dynamic: false, copy_reloc: false,
+            value: sym.value,
+            size: sym.size,
+            info: sym.info,
+            defined_in: Some(obj_idx),
+            from_lib: None,
+            plt_idx: None,
+            got_idx: None,
+            section_idx: sym.shndx,
+            is_dynamic: false,
+            copy_reloc: false,
             lib_sym_value: 0,
         }
     }
     fn new_common(obj_idx: usize, sym: &Elf64Symbol) -> Self {
         GlobalSymbol {
-            value: sym.value, size: sym.size, info: sym.info,
-            defined_in: Some(obj_idx), from_lib: None,
-            plt_idx: None, got_idx: None,
-            section_idx: SHN_COMMON, is_dynamic: false, copy_reloc: false,
+            value: sym.value,
+            size: sym.size,
+            info: sym.info,
+            defined_in: Some(obj_idx),
+            from_lib: None,
+            plt_idx: None,
+            got_idx: None,
+            section_idx: SHN_COMMON,
+            is_dynamic: false,
+            copy_reloc: false,
             lib_sym_value: 0,
         }
     }
     fn new_undefined(sym: &Elf64Symbol) -> Self {
         GlobalSymbol {
-            value: 0, size: 0, info: sym.info,
-            defined_in: None, from_lib: None,
-            plt_idx: None, got_idx: None,
-            section_idx: SHN_UNDEF, is_dynamic: false, copy_reloc: false,
+            value: 0,
+            size: 0,
+            info: sym.info,
+            defined_in: None,
+            from_lib: None,
+            plt_idx: None,
+            got_idx: None,
+            section_idx: SHN_UNDEF,
+            is_dynamic: false,
+            copy_reloc: false,
             lib_sym_value: 0,
         }
     }
@@ -78,10 +108,16 @@ impl GlobalSymbolOps for GlobalSymbol {
     }
     fn new_dynamic(dsym: &linker_common::DynSymbol, soname: &str) -> Self {
         GlobalSymbol {
-            value: 0, size: dsym.size, info: dsym.info,
-            defined_in: None, from_lib: Some(soname.to_string()),
-            plt_idx: None, got_idx: None,
-            section_idx: SHN_UNDEF, is_dynamic: true, copy_reloc: false,
+            value: 0,
+            size: dsym.size,
+            info: dsym.info,
+            defined_in: None,
+            from_lib: Some(soname.to_string()),
+            plt_idx: None,
+            got_idx: None,
+            section_idx: SHN_UNDEF,
+            is_dynamic: true,
+            copy_reloc: false,
             lib_sym_value: dsym.value,
         }
     }

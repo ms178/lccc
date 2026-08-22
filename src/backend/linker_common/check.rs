@@ -5,8 +5,8 @@
 
 use crate::common::fx_hash::FxHashMap;
 
+use super::symbols::{is_linker_defined_symbol, GlobalSymbolOps};
 use crate::backend::elf::STB_WEAK;
-use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 
 /// Check for undefined symbols in the global symbol table and return an error
 /// if any truly undefined symbols are found.
@@ -34,9 +34,11 @@ pub fn check_undefined_symbols_elf64_verbose<G: GlobalSymbolOps>(
     max_report: usize,
     objects: &[super::types::Elf64Object],
 ) -> Result<(), String> {
-    let mut truly_undefined: Vec<&String> = globals.iter()
+    let mut truly_undefined: Vec<&String> = globals
+        .iter()
         .filter(|(name, sym)| {
-            !sym.is_defined() && !sym.is_dynamic()
+            !sym.is_defined()
+                && !sym.is_dynamic()
                 && (sym.info() >> 4) != STB_WEAK
                 && !is_linker_defined_symbol(name)
         })
@@ -51,14 +53,18 @@ pub fn check_undefined_symbols_elf64_verbose<G: GlobalSymbolOps>(
     if objects.is_empty() {
         return Err(format!(
             "undefined symbols: {}",
-            truly_undefined.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            truly_undefined
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
     // Locate the first reference site of each undefined symbol: scan
     // relocations, then attribute the reloc offset to the enclosing FUNC
     // symbol of the section being relocated.
-    use crate::backend::elf::{STT_FUNC, SHN_UNDEF};
+    use crate::backend::elf::{SHN_UNDEF, STT_FUNC};
     let mut msg = String::from("undefined symbols:\n");
     for name in &truly_undefined {
         let mut site: Option<(String, Option<String>)> = None; // (object, function)
@@ -66,16 +72,26 @@ pub fn check_undefined_symbols_elf64_verbose<G: GlobalSymbolOps>(
             for (sec_idx, relas) in obj.relocations.iter().enumerate() {
                 for rela in relas {
                     let si = rela.sym_idx as usize;
-                    if si >= obj.symbols.len() { continue; }
-                    if obj.symbols[si].name != ***name { continue; }
-                    if obj.symbols[si].shndx != SHN_UNDEF { continue; }
+                    if si >= obj.symbols.len() {
+                        continue;
+                    }
+                    if obj.symbols[si].name != ***name {
+                        continue;
+                    }
+                    if obj.symbols[si].shndx != SHN_UNDEF {
+                        continue;
+                    }
                     // Find the FUNC symbol covering rela.offset in sec_idx.
-                    let func = obj.symbols.iter()
-                        .filter(|s| s.sym_type() == STT_FUNC
-                            && s.shndx as usize == sec_idx
-                            && s.value <= rela.offset
-                            && (s.size == 0 || rela.offset < s.value + s.size)
-                            && !s.name.is_empty())
+                    let func = obj
+                        .symbols
+                        .iter()
+                        .filter(|s| {
+                            s.sym_type() == STT_FUNC
+                                && s.shndx as usize == sec_idx
+                                && s.value <= rela.offset
+                                && (s.size == 0 || rela.offset < s.value + s.size)
+                                && !s.name.is_empty()
+                        })
                         .max_by_key(|s| s.value)
                         .map(|s| s.name.clone());
                     site = Some((obj.source_name.clone(), func.map(|s| s.to_string())));
@@ -87,12 +103,14 @@ pub fn check_undefined_symbols_elf64_verbose<G: GlobalSymbolOps>(
             Some((obj, Some(func))) => {
                 msg.push_str(&format!(
                     "  undefined reference to `{}'\n    referenced from {} (in function `{}')\n",
-                    name, obj, func));
+                    name, obj, func
+                ));
             }
             Some((obj, None)) => {
                 msg.push_str(&format!(
                     "  undefined reference to `{}'\n    referenced from {}\n",
-                    name, obj));
+                    name, obj
+                ));
             }
             None => {
                 msg.push_str(&format!("  undefined reference to `{}'\n", name));

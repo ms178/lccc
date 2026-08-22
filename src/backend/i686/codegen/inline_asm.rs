@@ -7,12 +7,12 @@
 //! Template parsing delegates to the shared `x86_common` module. Only operand
 //! emission differs from x86-64 (no RIP-relative addressing, 32-bit default).
 
-use std::borrow::Cow;
-use std::fmt::Write;
+use super::emit::I686Codegen;
+use crate::backend::x86_common;
 use crate::common::types::IrType;
 use crate::ir::reexports::BlockId;
-use crate::backend::x86_common;
-use super::emit::I686Codegen;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 impl I686Codegen {
     /// Substitute %0, %1, %[name], %k0, %b1, %w2, %h3, %c0, %P0, %a0, %n0, %l[name] etc.
@@ -33,8 +33,16 @@ impl I686Codegen {
         op_imm_symbols: &[Option<String>],
     ) -> String {
         x86_common::substitute_x86_asm_operands(
-            line, op_regs, op_names, op_is_memory, op_mem_addrs, op_types,
-            gcc_to_internal, goto_labels, op_imm_values, op_imm_symbols,
+            line,
+            op_regs,
+            op_names,
+            op_is_memory,
+            op_mem_addrs,
+            op_types,
+            gcc_to_internal,
+            goto_labels,
+            op_imm_values,
+            op_imm_symbols,
             Self::emit_i686_operand,
         )
     }
@@ -57,8 +65,14 @@ impl I686Codegen {
     ) {
         // Try shared logic first (handles %n, %c/%P, memory, $symbol, $imm)
         if x86_common::emit_operand_common(
-            result, idx, modifier, op_regs, op_is_memory, op_mem_addrs,
-            op_imm_values, op_imm_symbols,
+            result,
+            idx,
+            modifier,
+            op_regs,
+            op_is_memory,
+            op_mem_addrs,
+            op_imm_values,
+            op_imm_symbols,
         ) {
             return;
         }
@@ -79,7 +93,8 @@ impl I686Codegen {
             }
         } else {
             // Register operand — apply size modifier, default is 32-bit
-            let effective_mod = modifier.or_else(|| Self::i686_default_modifier_for_type(op_types.get(idx).copied()));
+            let effective_mod = modifier
+                .or_else(|| Self::i686_default_modifier_for_type(op_types.get(idx).copied()));
             result.push('%');
             result.push_str(&Self::format_i686_reg(&op_regs[idx], effective_mod));
         }

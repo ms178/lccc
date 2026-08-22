@@ -4,16 +4,11 @@
 //! variable initialization lowering. It handles writing constants, bitfields,
 //! complex numbers, struct layouts, and array fills into byte buffers.
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::ir::reexports::{GlobalInit, IrConst};
-use crate::common::types::{IrType, StructLayout, CType};
-use super::lower::Lowerer;
 use super::global_init_helpers as h;
+use super::lower::Lowerer;
+use crate::common::types::{CType, IrType, StructLayout};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
+use crate::ir::reexports::{GlobalInit, IrConst};
 
 /// Result of filling an array/FAM field in fill_struct_global_bytes,
 /// indicating how to advance the item index.
@@ -56,34 +51,62 @@ impl Lowerer {
 
             let designator_name = h::first_field_designator(item);
             let array_start_idx = self.extract_index_designator(item, designator_name.is_some());
-            let resolution = layout.resolve_init_field(designator_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = layout.resolve_init_field(
+                designator_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
             let field_idx = match &resolution {
                 Some(crate::common::types::InitFieldResolution::Direct(idx)) => *idx,
-                Some(crate::common::types::InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
-                    let extra_desigs = if item.designators.len() > 1 { &item.designators[1..] } else { &[] };
-                    if let Some(res) = h::resolve_anonymous_member(layout, *anon_field_idx, inner_name, &item.init, extra_desigs, &self.types.borrow_struct_layouts()) {
-                        self.fill_struct_global_bytes(&[res.sub_item], &res.sub_layout, bytes, base_offset + res.anon_offset);
+                Some(crate::common::types::InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
+                    let extra_desigs = if item.designators.len() > 1 {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    if let Some(res) = h::resolve_anonymous_member(
+                        layout,
+                        *anon_field_idx,
+                        inner_name,
+                        &item.init,
+                        extra_desigs,
+                        &self.types.borrow_struct_layouts(),
+                    ) {
+                        self.fill_struct_global_bytes(
+                            &[res.sub_item],
+                            &res.sub_layout,
+                            bytes,
+                            base_offset + res.anon_offset,
+                        );
                     }
                     item_idx += 1;
                     current_field_idx = *anon_field_idx + 1;
                     continue;
                 }
                 None => {
-                    if designator_name.is_some() { item_idx += 1; continue; }
+                    if designator_name.is_some() {
+                        item_idx += 1;
+                        continue;
+                    }
                     break;
                 }
             };
             let field_layout = &layout.fields[field_idx];
             let field_offset = base_offset + field_layout.offset;
 
-            let is_anon = h::is_anon_member_designator(
-                designator_name, &field_layout.name, &field_layout.ty);
+            let is_anon =
+                h::is_anon_member_designator(designator_name, &field_layout.name, &field_layout.ty);
             let has_nested = h::has_nested_field_designator(item);
 
             match &field_layout.ty {
                 // Nested designator or anonymous member designator into struct/union
                 CType::Struct(key) | CType::Union(key) if has_nested || is_anon => {
-                    if let Some(sub_layout) = self.types.borrow_struct_layouts().get(&**key).cloned() {
+                    if let Some(sub_layout) =
+                        self.types.borrow_struct_layouts().get(&**key).cloned()
+                    {
                         let sub_item = if is_anon && !has_nested {
                             // Pass all designators through for anonymous member field lookup
                             item.clone()
@@ -93,7 +116,12 @@ impl Lowerer {
                                 init: item.init.clone(),
                             }
                         };
-                        self.fill_struct_global_bytes(&[sub_item], &sub_layout, bytes, field_offset);
+                        self.fill_struct_global_bytes(
+                            &[sub_item],
+                            &sub_layout,
+                            bytes,
+                            field_offset,
+                        );
                     }
                     item_idx += 1;
                 }
@@ -102,7 +130,13 @@ impl Lowerer {
                 // items for subsequent array positions (C11 6.7.9p17).
                 CType::Array(elem_ty, Some(arr_size)) if has_nested => {
                     let arr_size = *arr_size;
-                    let desig_idx = self.fill_nested_designator_array(item, elem_ty, arr_size, bytes, field_offset);
+                    let desig_idx = self.fill_nested_designator_array(
+                        item,
+                        elem_ty,
+                        arr_size,
+                        bytes,
+                        field_offset,
+                    );
                     item_idx += 1;
                     // Continue consuming subsequent non-designated items for positions
                     // desig_idx+1, desig_idx+2, ... within the same array field
@@ -117,7 +151,11 @@ impl Lowerer {
                         }
                         if let Initializer::Expr(ref expr) = next_item.init {
                             let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                            let val = if elem_is_bool { val.bool_normalize() } else { val };
+                            let val = if elem_is_bool {
+                                val.bool_normalize()
+                            } else {
+                                val
+                            };
                             let elem_offset = field_offset + ai * elem_size;
                             self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                         } else {
@@ -129,9 +167,14 @@ impl Lowerer {
                 }
                 // Struct or union field (non-nested designator)
                 CType::Struct(key) | CType::Union(key) => {
-                    if let Some(sub_layout) = self.types.borrow_struct_layouts().get(&**key).cloned() {
+                    if let Some(sub_layout) =
+                        self.types.borrow_struct_layouts().get(&**key).cloned()
+                    {
                         item_idx += self.fill_composite_field(
-                            &items[item_idx..], &sub_layout, bytes, field_offset,
+                            &items[item_idx..],
+                            &sub_layout,
+                            bytes,
+                            field_offset,
                         );
                     } else {
                         item_idx += 1;
@@ -140,8 +183,13 @@ impl Lowerer {
                 // Fixed-size array field
                 CType::Array(elem_ty, Some(arr_size)) => {
                     let advanced = self.fill_array_field(
-                        items, item_idx, elem_ty, *arr_size,
-                        bytes, field_offset, array_start_idx,
+                        items,
+                        item_idx,
+                        elem_ty,
+                        *arr_size,
+                        bytes,
+                        field_offset,
+                        array_start_idx,
                     );
                     if advanced.skip_update {
                         item_idx = advanced.new_item_idx;
@@ -152,9 +200,8 @@ impl Lowerer {
                 }
                 // Flexible array member (FAM)
                 CType::Array(elem_ty, None) => {
-                    let advanced = self.fill_fam_field(
-                        items, item_idx, elem_ty, bytes, field_offset,
-                    );
+                    let advanced =
+                        self.fill_fam_field(items, item_idx, elem_ty, bytes, field_offset);
                     if advanced.skip_update {
                         item_idx = advanced.new_item_idx;
                         current_field_idx = field_idx + 1;
@@ -164,7 +211,12 @@ impl Lowerer {
                 }
                 // Complex field: write {real, imag} pair to bytes
                 CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => {
-                    self.write_complex_field_to_bytes(bytes, field_offset, &field_layout.ty, &item.init);
+                    self.write_complex_field_to_bytes(
+                        bytes,
+                        field_offset,
+                        &field_layout.ty,
+                        &item.init,
+                    );
                     item_idx += 1;
                 }
                 // Scalar field (possibly bitfield)
@@ -177,8 +229,17 @@ impl Lowerer {
                     } else {
                         raw_val
                     };
-                    if let (Some(bit_offset), Some(bit_width)) = (field_layout.bit_offset, field_layout.bit_width) {
-                        self.write_bitfield_to_bytes(bytes, field_offset, &val, field_ir_ty, bit_offset, bit_width);
+                    if let (Some(bit_offset), Some(bit_width)) =
+                        (field_layout.bit_offset, field_layout.bit_width)
+                    {
+                        self.write_bitfield_to_bytes(
+                            bytes,
+                            field_offset,
+                            &val,
+                            field_ir_ty,
+                            bit_offset,
+                            bit_width,
+                        );
                     } else {
                         self.write_const_to_bytes(bytes, field_offset, &val, field_ir_ty);
                     }
@@ -216,7 +277,11 @@ impl Lowerer {
             match desig {
                 Designator::Field(name) => {
                     let sub_layout = self.get_struct_layout_for_ctype(&current_ty)?;
-                    let resolution = sub_layout.resolve_init_field(Some(name.as_str()), 0, &*self.types.borrow_struct_layouts())?;
+                    let resolution = sub_layout.resolve_init_field(
+                        Some(name.as_str()),
+                        0,
+                        &*self.types.borrow_struct_layouts(),
+                    )?;
                     match resolution {
                         crate::common::types::InitFieldResolution::Direct(fi) => {
                             byte_offset += sub_layout.fields[fi].offset;
@@ -224,12 +289,19 @@ impl Lowerer {
                             bit_offset = sub_layout.fields[fi].bit_offset;
                             bit_width = sub_layout.fields[fi].bit_width;
                         }
-                        crate::common::types::InitFieldResolution::AnonymousMember { anon_field_idx, inner_name } => {
+                        crate::common::types::InitFieldResolution::AnonymousMember {
+                            anon_field_idx,
+                            inner_name,
+                        } => {
                             // Add anonymous member's offset, then resolve inner field
                             let anon_field = &sub_layout.fields[anon_field_idx];
                             byte_offset += anon_field.offset;
                             let anon_layout = self.get_struct_layout_for_ctype(&anon_field.ty)?;
-                            let inner_fi = anon_layout.resolve_init_field_idx(Some(inner_name.as_str()), 0, &*self.types.borrow_struct_layouts())?;
+                            let inner_fi = anon_layout.resolve_init_field_idx(
+                                Some(inner_name.as_str()),
+                                0,
+                                &*self.types.borrow_struct_layouts(),
+                            )?;
                             byte_offset += anon_layout.fields[inner_fi].offset;
                             current_ty = anon_layout.fields[inner_fi].ty.clone();
                             bit_offset = anon_layout.fields[inner_fi].bit_offset;
@@ -239,7 +311,8 @@ impl Lowerer {
                 }
                 Designator::Index(idx_expr) => {
                     if let CType::Array(elem_ty, _) = &current_ty {
-                        let idx = self.eval_const_expr(idx_expr)
+                        let idx = self
+                            .eval_const_expr(idx_expr)
                             .and_then(|c| c.to_usize())
                             .unwrap_or(0);
                         byte_offset += idx * self.resolve_ctype_size(elem_ty);
@@ -255,13 +328,22 @@ impl Lowerer {
             }
         }
 
-        Some(DesignatorDrillResult { target_ty: current_ty, byte_offset, bit_offset, bit_width })
+        Some(DesignatorDrillResult {
+            target_ty: current_ty,
+            byte_offset,
+            bit_offset,
+            bit_width,
+        })
     }
 
     // --- fill_struct_global_bytes helpers ---
 
     /// Extract an array index designator from an initializer item.
-    pub(super) fn extract_index_designator(&self, item: &InitializerItem, has_field_desig: bool) -> Option<usize> {
+    pub(super) fn extract_index_designator(
+        &self,
+        item: &InitializerItem,
+        has_field_desig: bool,
+    ) -> Option<usize> {
         if has_field_desig {
             item.designators.iter().find_map(|d| {
                 if let Designator::Index(ref idx_expr) = d {
@@ -300,7 +382,9 @@ impl Lowerer {
     pub(super) fn write_string_to_bytes(bytes: &mut [u8], offset: usize, s: &str, max_len: usize) {
         let str_chars: Vec<u8> = s.chars().map(|c| c as u8).collect();
         for (i, &b) in str_chars.iter().enumerate() {
-            if i >= max_len { break; }
+            if i >= max_len {
+                break;
+            }
             if offset + i < bytes.len() {
                 bytes[offset + i] = b;
             }
@@ -313,8 +397,12 @@ impl Lowerer {
     /// Process a nested designator into an array field (e.g., .field[idx] = val).
     /// Returns the array index that was designated.
     pub(super) fn fill_nested_designator_array(
-        &self, item: &InitializerItem, elem_ty: &CType, arr_size: usize,
-        bytes: &mut [u8], field_offset: usize,
+        &self,
+        item: &InitializerItem,
+        elem_ty: &CType,
+        arr_size: usize,
+        bytes: &mut [u8],
+        field_offset: usize,
     ) -> usize {
         let elem_size = self.resolve_ctype_size(elem_ty);
         let elem_ir_ty = IrType::from_ctype(elem_ty);
@@ -325,13 +413,19 @@ impl Lowerer {
         let remaining = &item.designators[1..];
 
         // Find first Index designator (outer array index)
-        let (first_idx_pos, idx) = remaining.iter().enumerate().find_map(|(i, d)| {
-            if let Designator::Index(ref idx_expr) = d {
-                self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()).map(|v| (i, v))
-            } else {
-                None
-            }
-        }).unwrap_or((0, 0));
+        let (first_idx_pos, idx) = remaining
+            .iter()
+            .enumerate()
+            .find_map(|(i, d)| {
+                if let Designator::Index(ref idx_expr) = d {
+                    self.eval_const_expr(idx_expr)
+                        .and_then(|c| c.to_usize())
+                        .map(|v| (i, v))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((0, 0));
 
         if idx >= arr_size {
             return idx;
@@ -343,13 +437,15 @@ impl Lowerer {
         let after_first_idx = &remaining[first_idx_pos + 1..];
 
         // Collect remaining Field designators for struct drilling
-        let remaining_field_desigs: Vec<_> = after_first_idx.iter()
+        let remaining_field_desigs: Vec<_> = after_first_idx
+            .iter()
             .filter(|d| matches!(d, Designator::Field(_)))
             .cloned()
             .collect();
 
         // Collect remaining Index designators for multi-dimensional array drilling
-        let remaining_index_desigs: Vec<_> = after_first_idx.iter()
+        let remaining_index_desigs: Vec<_> = after_first_idx
+            .iter()
             .filter(|d| matches!(d, Designator::Index(_)))
             .cloned()
             .collect();
@@ -379,13 +475,16 @@ impl Lowerer {
             // elem_ty is the inner array type (e.g., float[10] for float a[3][10])
             if let CType::Array(inner_elem_ty, Some(inner_size)) = elem_ty {
                 // Recursively handle the inner array with the remaining index designators
-                let inner_idx = remaining_index_desigs.iter().find_map(|d| {
-                    if let Designator::Index(ref idx_expr) = d {
-                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                    } else {
-                        None
-                    }
-                }).unwrap_or(0);
+                let inner_idx = remaining_index_desigs
+                    .iter()
+                    .find_map(|d| {
+                        if let Designator::Index(ref idx_expr) = d {
+                            self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
                 if inner_idx < *inner_size {
                     let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
                     let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
@@ -394,7 +493,9 @@ impl Lowerer {
                     // Check for even more Index designators (3D+ arrays)
                     let further_indices: Vec<_> = remaining_index_desigs[1..].to_vec();
                     if !further_indices.is_empty() {
-                        if let CType::Array(_deeper_elem, Some(_deeper_size)) = inner_elem_ty.as_ref() {
+                        if let CType::Array(_deeper_elem, Some(_deeper_size)) =
+                            inner_elem_ty.as_ref()
+                        {
                             // Build sub-item with remaining indices as [Field("dummy"), Index(...)]
                             // Actually we can recursively call ourselves
                             let sub_item = InitializerItem {
@@ -406,18 +507,28 @@ impl Lowerer {
                                 init: item.init.clone(),
                             };
                             self.fill_nested_designator_array(
-                                &sub_item, inner_elem_ty, *inner_size,
-                                bytes, elem_offset,
+                                &sub_item,
+                                inner_elem_ty,
+                                *inner_size,
+                                bytes,
+                                elem_offset,
                             );
                         }
                     } else if let Initializer::Expr(ref expr) = item.init {
                         if let Expr::StringLiteral(s, _) = expr {
-                            if let CType::Array(deep_inner, Some(deep_size)) = inner_elem_ty.as_ref() {
+                            if let CType::Array(deep_inner, Some(deep_size)) =
+                                inner_elem_ty.as_ref()
+                            {
                                 if matches!(deep_inner.as_ref(), CType::Char | CType::UChar) {
                                     Self::write_string_to_bytes(bytes, inner_offset, s, *deep_size);
                                 } else {
                                     let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                    self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
+                                    self.write_const_to_bytes(
+                                        bytes,
+                                        inner_offset,
+                                        &val,
+                                        inner_ir_ty,
+                                    );
                                 }
                             } else {
                                 let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
@@ -443,7 +554,11 @@ impl Lowerer {
                         self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                     }
                 } else if matches!(elem_ty, CType::Char | CType::UChar) {
-                    let val = s.chars().next().map(|c| IrConst::I8(c as u8 as i8)).unwrap_or(IrConst::I8(0));
+                    let val = s
+                        .chars()
+                        .next()
+                        .map(|c| IrConst::I8(c as u8 as i8))
+                        .unwrap_or(IrConst::I8(0));
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 } else {
                     let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
@@ -452,7 +567,11 @@ impl Lowerer {
             } else {
                 let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
                 // _Bool elements: normalize (any nonzero -> 1) per C11 6.3.1.2
-                let val = if *elem_ty == CType::Bool { val.bool_normalize() } else { val };
+                let val = if *elem_ty == CType::Bool {
+                    val.bool_normalize()
+                } else {
+                    val
+                };
                 self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
             }
         } else if let Initializer::List(ref sub_items) = item.init {
@@ -463,17 +582,25 @@ impl Lowerer {
                     let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
                     let inner_is_bool = **inner_elem_ty == CType::Bool;
                     for (si, sub_item) in sub_items.iter().enumerate() {
-                        if si >= *inner_size { break; }
+                        if si >= *inner_size {
+                            break;
+                        }
                         if let Initializer::Expr(ref expr) = sub_item.init {
                             let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                            let val = if inner_is_bool { val.bool_normalize() } else { val };
+                            let val = if inner_is_bool {
+                                val.bool_normalize()
+                            } else {
+                                val
+                            };
                             let inner_offset = elem_offset + si * inner_elem_size;
                             self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
                         }
                     }
                 }
                 CType::Struct(ref key) | CType::Union(ref key) => {
-                    if let Some(sub_layout) = self.types.borrow_struct_layouts().get(&**key).cloned() {
+                    if let Some(sub_layout) =
+                        self.types.borrow_struct_layouts().get(&**key).cloned()
+                    {
                         self.fill_struct_global_bytes(sub_items, &sub_layout, bytes, elem_offset);
                     }
                 }
@@ -486,8 +613,11 @@ impl Lowerer {
     /// Fill a composite (struct/union) field from an initializer.
     /// Returns the number of items consumed.
     pub(super) fn fill_composite_field(
-        &self, items: &[InitializerItem], sub_layout: &StructLayout,
-        bytes: &mut [u8], field_offset: usize,
+        &self,
+        items: &[InitializerItem],
+        sub_layout: &StructLayout,
+        bytes: &mut [u8],
+        field_offset: usize,
     ) -> usize {
         match &items[0].init {
             Initializer::List(sub_items) => {
@@ -513,8 +643,13 @@ impl Lowerer {
                     self.fill_struct_global_bytes(&[stripped], sub_layout, bytes, field_offset);
                     1
                 } else {
-                    let consumed = self.fill_struct_global_bytes(items, sub_layout, bytes, field_offset);
-                    if consumed == 0 { 1 } else { consumed }
+                    let consumed =
+                        self.fill_struct_global_bytes(items, sub_layout, bytes, field_offset);
+                    if consumed == 0 {
+                        1
+                    } else {
+                        consumed
+                    }
                 }
             }
         }
@@ -539,32 +674,73 @@ impl Lowerer {
         match &item.init {
             Initializer::List(sub_items) => {
                 // Check for brace-wrapped string literal: { "hello" }
-                if self.try_fill_string_literal_init(sub_items, elem_ty, arr_size, bytes, field_offset) {
-                    return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
+                if self.try_fill_string_literal_init(
+                    sub_items,
+                    elem_ty,
+                    arr_size,
+                    bytes,
+                    field_offset,
+                ) {
+                    return ArrayFillResult {
+                        new_item_idx: item_idx + 1,
+                        skip_update: true,
+                    };
                 }
                 if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
-                    self.fill_array_of_composites(sub_items, elem_ty, arr_size, elem_size, bytes, field_offset);
+                    self.fill_array_of_composites(
+                        sub_items,
+                        elem_ty,
+                        arr_size,
+                        elem_size,
+                        bytes,
+                        field_offset,
+                    );
                 } else if let CType::Array(inner_elem, Some(inner_size)) = elem_ty {
                     // Multi-dimensional array field (e.g., int a[2][3] or struct S a[2][2][2]).
                     // Each sub-item is a brace group for one element of the outer dimension.
                     self.fill_multidim_array_field(
-                        sub_items, inner_elem, *inner_size, arr_size, elem_size,
-                        bytes, field_offset,
+                        sub_items,
+                        inner_elem,
+                        *inner_size,
+                        arr_size,
+                        elem_size,
+                        bytes,
+                        field_offset,
                     );
                 } else if elem_ty.is_complex() {
                     // Array of complex elements: each sub-item initializes one complex value
-                    self.fill_array_of_complex(sub_items, elem_ty, arr_size, elem_size, bytes, field_offset);
+                    self.fill_array_of_complex(
+                        sub_items,
+                        elem_ty,
+                        arr_size,
+                        elem_size,
+                        bytes,
+                        field_offset,
+                    );
                 } else {
-                    self.fill_array_of_scalars(sub_items, arr_size, elem_size, elem_ir_ty, bytes, field_offset);
+                    self.fill_array_of_scalars(
+                        sub_items,
+                        arr_size,
+                        elem_size,
+                        elem_ir_ty,
+                        bytes,
+                        field_offset,
+                    );
                 }
-                ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
+                ArrayFillResult {
+                    new_item_idx: item_idx + 1,
+                    skip_update: false,
+                }
             }
             Initializer::Expr(expr) => {
                 // String literal for char array
                 if let Expr::StringLiteral(s, _) = expr {
                     if matches!(elem_ty, CType::Char | CType::UChar) {
                         Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
-                        return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
+                        return ArrayFillResult {
+                            new_item_idx: item_idx + 1,
+                            skip_update: true,
+                        };
                     }
                 }
                 // Flat init from consecutive items.
@@ -574,39 +750,82 @@ impl Lowerer {
                 let leaf_composite = Self::leaf_composite_type(elem_ty);
                 let new_idx = if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
                     self.fill_flat_array_of_composites(
-                        items, item_idx, elem_ty, arr_size, elem_size, elem_ir_ty,
-                        bytes, field_offset, start_ai,
+                        items,
+                        item_idx,
+                        elem_ty,
+                        arr_size,
+                        elem_size,
+                        elem_ir_ty,
+                        bytes,
+                        field_offset,
+                        start_ai,
                     )
                 } else if let Some(composite_ty) = leaf_composite {
                     // Multi-dimensional array of structs/unions: flat init fills composites
                     let composite_size = self.resolve_ctype_size(composite_ty);
                     let composite_ir_ty = IrType::from_ctype(composite_ty);
-                    let total_composites = if composite_size > 0 { (arr_size * elem_size) / composite_size } else { 0 };
+                    let total_composites = if composite_size > 0 {
+                        (arr_size * elem_size) / composite_size
+                    } else {
+                        0
+                    };
                     self.fill_flat_array_of_composites(
-                        items, item_idx, composite_ty, total_composites, composite_size, composite_ir_ty,
-                        bytes, field_offset, start_ai,
+                        items,
+                        item_idx,
+                        composite_ty,
+                        total_composites,
+                        composite_size,
+                        composite_ir_ty,
+                        bytes,
+                        field_offset,
+                        start_ai,
                     )
                 } else if matches!(elem_ty, CType::Array(_, _)) {
                     // Multi-dimensional array of scalars: use leaf element size
                     let leaf_size = self.leaf_elem_size(elem_ty);
                     let leaf_ir_ty = Self::leaf_ir_type(elem_ty);
-                    let total_scalars = if leaf_size > 0 { (arr_size * elem_size) / leaf_size } else { 0 };
+                    let total_scalars = if leaf_size > 0 {
+                        (arr_size * elem_size) / leaf_size
+                    } else {
+                        0
+                    };
                     self.fill_flat_array_of_scalars(
-                        items, item_idx, total_scalars, leaf_size, leaf_ir_ty,
-                        bytes, field_offset, start_ai,
+                        items,
+                        item_idx,
+                        total_scalars,
+                        leaf_size,
+                        leaf_ir_ty,
+                        bytes,
+                        field_offset,
+                        start_ai,
                     )
                 } else if elem_ty.is_complex() {
                     self.fill_flat_array_of_complex(
-                        items, item_idx, elem_ty, arr_size, elem_size,
-                        bytes, field_offset, start_ai,
+                        items,
+                        item_idx,
+                        elem_ty,
+                        arr_size,
+                        elem_size,
+                        bytes,
+                        field_offset,
+                        start_ai,
                     )
                 } else {
                     self.fill_flat_array_of_scalars(
-                        items, item_idx, arr_size, elem_size, elem_ir_ty,
-                        bytes, field_offset, start_ai,
+                        items,
+                        item_idx,
+                        arr_size,
+                        elem_size,
+                        elem_ir_ty,
+                        bytes,
+                        field_offset,
+                        start_ai,
                     )
                 };
-                ArrayFillResult { new_item_idx: new_idx, skip_update: true }
+                ArrayFillResult {
+                    new_item_idx: new_idx,
+                    skip_update: true,
+                }
             }
         }
     }
@@ -632,8 +851,11 @@ impl Lowerer {
                 Initializer::List(inner_items) => {
                     // Brace group for this outer element: recurse into inner array
                     self.fill_array_field_recursive(
-                        inner_items, inner_elem_ty, inner_arr_size,
-                        bytes, elem_offset,
+                        inner_items,
+                        inner_elem_ty,
+                        inner_arr_size,
+                        bytes,
+                        elem_offset,
                     );
                     sub_idx += 1;
                 }
@@ -655,12 +877,19 @@ impl Lowerer {
                         // The leaf elements are structs/unions: fill them field by field
                         let composite_layout = self.get_composite_layout(composite_ty);
                         let composite_size = self.resolve_ctype_size(composite_ty);
-                        let composites_per_outer = if composite_size > 0 { outer_elem_size / composite_size } else { 0 };
+                        let composites_per_outer = if composite_size > 0 {
+                            outer_elem_size / composite_size
+                        } else {
+                            0
+                        };
                         let mut ci = 0usize;
                         while sub_idx < sub_items.len() && ci < composites_per_outer {
                             let comp_offset = elem_offset + ci * composite_size;
                             let consumed = self.fill_struct_global_bytes(
-                                &sub_items[sub_idx..], &composite_layout, bytes, comp_offset,
+                                &sub_items[sub_idx..],
+                                &composite_layout,
+                                bytes,
+                                comp_offset,
                             );
                             sub_idx += consumed.max(1);
                             ci += 1;
@@ -668,13 +897,22 @@ impl Lowerer {
                     } else {
                         // Leaf elements are scalars
                         let leaf_size = self.leaf_elem_size(inner_elem_ty);
-                        let scalars_per_outer = if leaf_size > 0 { outer_elem_size / leaf_size } else { 1 };
+                        let scalars_per_outer = if leaf_size > 0 {
+                            outer_elem_size / leaf_size
+                        } else {
+                            1
+                        };
                         let leaf_ir_ty = Self::leaf_ir_type(inner_elem_ty);
                         let mut filled = 0usize;
                         while sub_idx < sub_items.len() && filled < scalars_per_outer {
                             if let Initializer::Expr(e) = &sub_items[sub_idx].init {
                                 let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
-                                self.write_const_to_bytes(bytes, elem_offset + filled * leaf_size, &val, leaf_ir_ty);
+                                self.write_const_to_bytes(
+                                    bytes,
+                                    elem_offset + filled * leaf_size,
+                                    &val,
+                                    leaf_ir_ty,
+                                );
                                 sub_idx += 1;
                                 filled += 1;
                             } else {
@@ -703,8 +941,13 @@ impl Lowerer {
         if let CType::Array(inner_elem, Some(inner_size)) = elem_ty {
             // Still multi-dimensional: recurse
             self.fill_multidim_array_field(
-                items, inner_elem, *inner_size, arr_size, elem_size,
-                bytes, field_offset,
+                items,
+                inner_elem,
+                *inner_size,
+                arr_size,
+                elem_size,
+                bytes,
+                field_offset,
             );
         } else if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
             self.fill_array_of_composites(items, elem_ty, arr_size, elem_size, bytes, field_offset);
@@ -769,12 +1012,19 @@ impl Lowerer {
                 let elem_layout = self.get_struct_layout_for_ctype(elem_ty);
                 for (ai, sub_item) in sub_items.iter().enumerate() {
                     let elem_offset = field_offset + ai * elem_size;
-                    if elem_offset + elem_size > bytes.len() { break; }
+                    if elem_offset + elem_size > bytes.len() {
+                        break;
+                    }
                     if let Some(ref layout) = elem_layout {
                         // Struct/union element: recursively fill
                         match &sub_item.init {
                             Initializer::List(nested_items) => {
-                                self.fill_struct_global_bytes(nested_items, layout, bytes, elem_offset);
+                                self.fill_struct_global_bytes(
+                                    nested_items,
+                                    layout,
+                                    bytes,
+                                    elem_offset,
+                                );
                             }
                             Initializer::Expr(_) => {
                                 let val = self.eval_init_scalar(&sub_item.init);
@@ -786,7 +1036,10 @@ impl Lowerer {
                         self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                     }
                 }
-                ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
+                ArrayFillResult {
+                    new_item_idx: item_idx + 1,
+                    skip_update: false,
+                }
             }
             Initializer::Expr(expr) => {
                 // String literal initializing a char FAM: write bytes directly
@@ -794,7 +1047,10 @@ impl Lowerer {
                     if matches!(elem_ty, CType::Char | CType::UChar) {
                         let max_len = bytes.len().saturating_sub(field_offset);
                         Self::write_string_to_bytes(bytes, field_offset, s, max_len);
-                        return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
+                        return ArrayFillResult {
+                            new_item_idx: item_idx + 1,
+                            skip_update: true,
+                        };
                     }
                 }
                 let mut ai = 0usize;
@@ -807,7 +1063,9 @@ impl Lowerer {
                 let mut new_idx = item_idx + 1;
                 while new_idx < items.len() {
                     let next_item = &items[new_idx];
-                    if !next_item.designators.is_empty() { break; }
+                    if !next_item.designators.is_empty() {
+                        break;
+                    }
                     if let Initializer::Expr(e) = &next_item.init {
                         let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
                         let elem_offset = field_offset + ai * elem_size;
@@ -820,7 +1078,10 @@ impl Lowerer {
                         break;
                     }
                 }
-                ArrayFillResult { new_item_idx: new_idx, skip_update: true }
+                ArrayFillResult {
+                    new_item_idx: new_idx,
+                    skip_update: true,
+                }
             }
         }
     }
@@ -828,8 +1089,12 @@ impl Lowerer {
     /// Try to interpret a brace-wrapped init list as a string literal for a char array.
     /// Returns true if handled.
     pub(super) fn try_fill_string_literal_init(
-        &self, sub_items: &[InitializerItem], elem_ty: &CType, arr_size: usize,
-        bytes: &mut [u8], field_offset: usize,
+        &self,
+        sub_items: &[InitializerItem],
+        elem_ty: &CType,
+        arr_size: usize,
+        bytes: &mut [u8],
+        field_offset: usize,
     ) -> bool {
         if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
@@ -844,8 +1109,13 @@ impl Lowerer {
 
     /// Fill an array of struct/union elements from a braced sub-item list.
     pub(super) fn fill_array_of_composites(
-        &self, sub_items: &[InitializerItem], elem_ty: &CType,
-        arr_size: usize, elem_size: usize, bytes: &mut [u8], field_offset: usize,
+        &self,
+        sub_items: &[InitializerItem],
+        elem_ty: &CType,
+        arr_size: usize,
+        elem_size: usize,
+        bytes: &mut [u8],
+        field_offset: usize,
     ) {
         let sub_layout = self.get_composite_layout(elem_ty);
         let mut sub_idx = 0usize;
@@ -857,7 +1127,9 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             match &sub_items[sub_idx].init {
                 Initializer::List(inner_items) => {
@@ -865,7 +1137,12 @@ impl Lowerer {
                     sub_idx += 1;
                 }
                 Initializer::Expr(_) => {
-                    let consumed = self.fill_struct_global_bytes(&sub_items[sub_idx..], &sub_layout, bytes, elem_offset);
+                    let consumed = self.fill_struct_global_bytes(
+                        &sub_items[sub_idx..],
+                        &sub_layout,
+                        bytes,
+                        elem_offset,
+                    );
                     sub_idx += consumed;
                 }
             }
@@ -875,8 +1152,13 @@ impl Lowerer {
 
     /// Fill an array of scalar elements from a braced sub-item list (with designator support).
     pub(super) fn fill_array_of_scalars(
-        &self, sub_items: &[InitializerItem], arr_size: usize,
-        elem_size: usize, elem_ir_ty: IrType, bytes: &mut [u8], field_offset: usize,
+        &self,
+        sub_items: &[InitializerItem],
+        arr_size: usize,
+        elem_size: usize,
+        elem_ir_ty: IrType,
+        bytes: &mut [u8],
+        field_offset: usize,
     ) {
         let mut ai = 0usize;
         for sub_item in sub_items {
@@ -885,7 +1167,9 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             let val = self.eval_init_scalar(&sub_item.init);
             self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
@@ -896,8 +1180,13 @@ impl Lowerer {
     /// Fill an array of complex elements from a braced sub-item list.
     /// Each sub-item initializes one complex element using write_complex_field_to_bytes.
     pub(super) fn fill_array_of_complex(
-        &self, sub_items: &[InitializerItem], complex_ctype: &CType,
-        arr_size: usize, elem_size: usize, bytes: &mut [u8], field_offset: usize,
+        &self,
+        sub_items: &[InitializerItem],
+        complex_ctype: &CType,
+        arr_size: usize,
+        elem_size: usize,
+        bytes: &mut [u8],
+        field_offset: usize,
     ) {
         let mut ai = 0usize;
         for sub_item in sub_items {
@@ -906,7 +1195,9 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             self.write_complex_field_to_bytes(bytes, elem_offset, complex_ctype, &sub_item.init);
             ai += 1;
@@ -916,15 +1207,23 @@ impl Lowerer {
     /// Fill flat init of an array of complex elements from consecutive items.
     /// Each item initializes one complex element. Returns the new item_idx.
     pub(super) fn fill_flat_array_of_complex(
-        &self, items: &[InitializerItem], item_idx: usize,
-        complex_ctype: &CType, arr_size: usize, elem_size: usize,
-        bytes: &mut [u8], field_offset: usize, start_ai: usize,
+        &self,
+        items: &[InitializerItem],
+        item_idx: usize,
+        complex_ctype: &CType,
+        arr_size: usize,
+        elem_size: usize,
+        bytes: &mut [u8],
+        field_offset: usize,
+        start_ai: usize,
     ) -> usize {
         let mut consumed = 0usize;
         let mut ai = start_ai;
         while ai < arr_size && (item_idx + consumed) < items.len() {
             let cur_item = &items[item_idx + consumed];
-            if !cur_item.designators.is_empty() && consumed > 0 { break; }
+            if !cur_item.designators.is_empty() && consumed > 0 {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             self.write_complex_field_to_bytes(bytes, elem_offset, complex_ctype, &cur_item.init);
             consumed += 1;
@@ -936,22 +1235,38 @@ impl Lowerer {
     /// Fill flat init of an array of composites from consecutive items.
     /// Returns the new item_idx.
     pub(super) fn fill_flat_array_of_composites(
-        &self, items: &[InitializerItem], mut item_idx: usize,
-        elem_ty: &CType, arr_size: usize, elem_size: usize, elem_ir_ty: IrType,
-        bytes: &mut [u8], field_offset: usize, start_ai: usize,
+        &self,
+        items: &[InitializerItem],
+        mut item_idx: usize,
+        elem_ty: &CType,
+        arr_size: usize,
+        elem_size: usize,
+        elem_ir_ty: IrType,
+        bytes: &mut [u8],
+        field_offset: usize,
+        start_ai: usize,
     ) -> usize {
         let sub_layout = self.get_composite_layout(elem_ty);
         if matches!(elem_ty, CType::Struct(_)) {
             for ai in start_ai..arr_size {
-                if item_idx >= items.len() { break; }
+                if item_idx >= items.len() {
+                    break;
+                }
                 let elem_offset = field_offset + ai * elem_size;
-                let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, elem_offset);
+                let consumed = self.fill_struct_global_bytes(
+                    &items[item_idx..],
+                    &sub_layout,
+                    bytes,
+                    elem_offset,
+                );
                 item_idx += consumed;
             }
         } else {
             // Union: take one item per element
             for ai in start_ai..arr_size {
-                if item_idx >= items.len() { break; }
+                if item_idx >= items.len() {
+                    break;
+                }
                 let elem_offset = field_offset + ai * elem_size;
                 if let Initializer::Expr(e) = &items[item_idx].init {
                     let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
@@ -966,15 +1281,23 @@ impl Lowerer {
     /// Fill flat init of an array of scalars from consecutive items.
     /// Returns the new item_idx.
     pub(super) fn fill_flat_array_of_scalars(
-        &self, items: &[InitializerItem], item_idx: usize,
-        arr_size: usize, elem_size: usize, elem_ir_ty: IrType,
-        bytes: &mut [u8], field_offset: usize, start_ai: usize,
+        &self,
+        items: &[InitializerItem],
+        item_idx: usize,
+        arr_size: usize,
+        elem_size: usize,
+        elem_ir_ty: IrType,
+        bytes: &mut [u8],
+        field_offset: usize,
+        start_ai: usize,
     ) -> usize {
         let mut consumed = 0usize;
         let mut ai = start_ai;
         while ai < arr_size && (item_idx + consumed) < items.len() {
             let cur_item = &items[item_idx + consumed];
-            if !cur_item.designators.is_empty() && consumed > 0 { break; }
+            if !cur_item.designators.is_empty() && consumed > 0 {
+                break;
+            }
             if let Initializer::Expr(e) = &cur_item.init {
                 let val = self.eval_const_expr(e).unwrap_or(IrConst::I64(0));
                 let elem_offset = field_offset + ai * elem_size;
@@ -1008,7 +1331,9 @@ impl Lowerer {
         base_offset: usize,
         region_size: usize,
     ) {
-        if struct_size == 0 { return; }
+        if struct_size == 0 {
+            return;
+        }
 
         // Determine the stride for elements at this brace level.
         // If we have strides info, use it; otherwise treat each item as one struct.
@@ -1020,7 +1345,11 @@ impl Lowerer {
             (struct_size, &array_dim_strides[0..0])
         };
 
-        let num_elems = if this_stride > 0 { region_size / this_stride } else { 0 };
+        let num_elems = if this_stride > 0 {
+            region_size / this_stride
+        } else {
+            0
+        };
         let mut current_idx = 0usize;
         let mut item_idx = 0usize;
 
@@ -1029,13 +1358,17 @@ impl Lowerer {
 
             // Check for multi-dimensional index designators: [i][j]...
             // Collect all Index designators to compute the correct element index at this level
-            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
-                if let Designator::Index(ref idx_expr) = d {
-                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                } else {
-                    None
-                }
-            }).collect();
+            let index_designators: Vec<usize> = item
+                .designators
+                .iter()
+                .filter_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             let has_index_designator = !index_designators.is_empty();
             if has_index_designator {
@@ -1051,7 +1384,11 @@ impl Lowerer {
                     let mut sub_byte_offset = 0usize;
                     let mut sub_strides = remaining_strides;
                     for &idx in &index_designators[1..] {
-                        let sub_stride = if !sub_strides.is_empty() { sub_strides[0] } else { struct_size };
+                        let sub_stride = if !sub_strides.is_empty() {
+                            sub_strides[0]
+                        } else {
+                            struct_size
+                        };
                         sub_byte_offset += idx * sub_stride;
                         if sub_strides.len() > 1 {
                             sub_strides = &sub_strides[1..];
@@ -1062,20 +1399,41 @@ impl Lowerer {
 
                     // Handle field designator for [i][j].field = val
                     let field_designator_name = item.designators.iter().find_map(|d| {
-                        if let Designator::Field(ref name) = d { Some(name.clone()) } else { None }
+                        if let Designator::Field(ref name) = d {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
                     });
 
                     match &item.init {
                         Initializer::Expr(expr) => {
                             if let Some(ref fname) = field_designator_name {
                                 if let Some(val) = self.eval_const_expr(expr) {
-                                    if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
+                                    if let Some(field) =
+                                        layout.fields.iter().find(|f| &f.name == fname)
+                                    {
                                         let field_ir_ty = IrType::from_ctype(&field.ty);
-                                        let write_offset = elem_offset + sub_byte_offset + field.offset;
-                                        if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
-                                            self.write_bitfield_to_bytes(bytes, write_offset, &val, field_ir_ty, bo, bw);
+                                        let write_offset =
+                                            elem_offset + sub_byte_offset + field.offset;
+                                        if let (Some(bo), Some(bw)) =
+                                            (field.bit_offset, field.bit_width)
+                                        {
+                                            self.write_bitfield_to_bytes(
+                                                bytes,
+                                                write_offset,
+                                                &val,
+                                                field_ir_ty,
+                                                bo,
+                                                bw,
+                                            );
                                         } else if write_offset + field_ir_ty.size() <= bytes.len() {
-                                            self.write_const_to_bytes(bytes, write_offset, &val, field_ir_ty);
+                                            self.write_const_to_bytes(
+                                                bytes,
+                                                write_offset,
+                                                &val,
+                                                field_ir_ty,
+                                            );
                                         }
                                     }
                                 }
@@ -1084,7 +1442,12 @@ impl Lowerer {
                                 if let Some(_val) = self.eval_const_expr(expr) {
                                     let write_offset = elem_offset + sub_byte_offset;
                                     // Write struct fields sequentially from this position
-                                    self.fill_struct_global_bytes(std::slice::from_ref(item), layout, bytes, write_offset);
+                                    self.fill_struct_global_bytes(
+                                        std::slice::from_ref(item),
+                                        layout,
+                                        bytes,
+                                        write_offset,
+                                    );
                                 }
                             }
                         }
@@ -1092,11 +1455,21 @@ impl Lowerer {
                             let write_offset = elem_offset + sub_byte_offset;
                             if !sub_strides.is_empty() && sub_strides[0] > struct_size {
                                 self.fill_multidim_struct_array_bytes(
-                                    sub_items, layout, struct_size, sub_strides,
-                                    bytes, write_offset, sub_strides[0],
+                                    sub_items,
+                                    layout,
+                                    struct_size,
+                                    sub_strides,
+                                    bytes,
+                                    write_offset,
+                                    sub_strides[0],
                                 );
                             } else {
-                                self.fill_struct_global_bytes(sub_items, layout, bytes, write_offset);
+                                self.fill_struct_global_bytes(
+                                    sub_items,
+                                    layout,
+                                    bytes,
+                                    write_offset,
+                                );
                             }
                         }
                     }
@@ -1109,7 +1482,9 @@ impl Lowerer {
             if current_idx >= num_elems {
                 // Only skip items without a designator that would reset the index;
                 // designated items explicitly set current_idx above
-                if !has_index_designator { break; }
+                if !has_index_designator {
+                    break;
+                }
                 item_idx += 1;
                 continue;
             }
@@ -1131,8 +1506,13 @@ impl Lowerer {
                         // This brace group represents a sub-array (not a single struct).
                         // Recurse with the next dimension's strides.
                         self.fill_multidim_struct_array_bytes(
-                            sub_items, layout, struct_size, remaining_strides,
-                            bytes, elem_offset, this_stride,
+                            sub_items,
+                            layout,
+                            struct_size,
+                            remaining_strides,
+                            bytes,
+                            elem_offset,
+                            this_stride,
                         );
                     } else {
                         // This brace group represents a single struct initializer.
@@ -1147,9 +1527,21 @@ impl Lowerer {
                             if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
                                 let field_ir_ty = IrType::from_ctype(&field.ty);
                                 if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
-                                    self.write_bitfield_to_bytes(bytes, elem_offset + field.offset, &val, field_ir_ty, bo, bw);
+                                    self.write_bitfield_to_bytes(
+                                        bytes,
+                                        elem_offset + field.offset,
+                                        &val,
+                                        field_ir_ty,
+                                        bo,
+                                        bw,
+                                    );
                                 } else {
-                                    self.write_const_to_bytes(bytes, elem_offset + field.offset, &val, field_ir_ty);
+                                    self.write_const_to_bytes(
+                                        bytes,
+                                        elem_offset + field.offset,
+                                        &val,
+                                        field_ir_ty,
+                                    );
                                 }
                             }
                         }
@@ -1157,13 +1549,24 @@ impl Lowerer {
                     } else {
                         // Flat init: consume items for struct fields sequentially.
                         // Fill structs one by one across the entire region.
-                        let max_structs = if struct_size > 0 { region_size / struct_size } else { 0 };
+                        let max_structs = if struct_size > 0 {
+                            region_size / struct_size
+                        } else {
+                            0
+                        };
                         let flat_struct_base = (elem_offset - base_offset) / struct_size;
                         let mut fi = flat_struct_base;
                         while item_idx < items.len() && fi < max_structs {
                             let byte_off = base_offset + fi * struct_size;
-                            if byte_off + struct_size > bytes.len() { break; }
-                            let consumed = self.fill_struct_global_bytes(&items[item_idx..], layout, bytes, byte_off);
+                            if byte_off + struct_size > bytes.len() {
+                                break;
+                            }
+                            let consumed = self.fill_struct_global_bytes(
+                                &items[item_idx..],
+                                layout,
+                                bytes,
+                                byte_off,
+                            );
                             item_idx += consumed.max(1);
                             fi += 1;
                         }
@@ -1183,14 +1586,17 @@ impl Lowerer {
     /// Like `get_struct_layout_for_ctype` but returns a fallback empty layout instead of None.
     /// Panics if called on a non-composite type.
     pub(super) fn get_composite_layout(&self, ty: &CType) -> crate::common::types::RcLayout {
-        self.get_struct_layout_for_ctype(ty)
-            .unwrap_or_else(|| {
-                if matches!(ty, CType::Struct(_) | CType::Union(_)) {
-                    if matches!(ty, CType::Union(_)) { StructLayout::empty_union_rc() } else { StructLayout::empty_rc() }
+        self.get_struct_layout_for_ctype(ty).unwrap_or_else(|| {
+            if matches!(ty, CType::Struct(_) | CType::Union(_)) {
+                if matches!(ty, CType::Union(_)) {
+                    StructLayout::empty_union_rc()
                 } else {
-                    unreachable!("get_composite_layout called on non-composite type")
+                    StructLayout::empty_rc()
                 }
-            })
+            } else {
+                unreachable!("get_composite_layout called on non-composite type")
+            }
+        })
     }
 
     /// Fill a byte buffer from a list of scalar initializer items.
@@ -1215,7 +1621,10 @@ impl Lowerer {
                 }
             }
             let byte_offset = current_idx * elem_size;
-            if byte_offset >= max_size { current_idx += 1; continue; }
+            if byte_offset >= max_size {
+                current_idx += 1;
+                continue;
+            }
             if let Initializer::Expr(ref e) = item.init {
                 if let Some(val) = self.eval_const_expr(e) {
                     let e_ty = self.get_expr_type(e);
@@ -1228,7 +1637,12 @@ impl Lowerer {
     }
 
     /// Push a constant value as individual bytes into a compound init element list.
-    pub(super) fn push_const_as_bytes(&self, elements: &mut Vec<GlobalInit>, val: &IrConst, size: usize) {
+    pub(super) fn push_const_as_bytes(
+        &self,
+        elements: &mut Vec<GlobalInit>,
+        val: &IrConst,
+        size: usize,
+    ) {
         let mut bytes = Vec::with_capacity(size);
         if self.is_x86() {
             val.push_le_bytes_x86(&mut bytes, size);
@@ -1243,7 +1657,13 @@ impl Lowerer {
     }
 
     /// Write an IrConst value to a byte buffer at the given offset using the field's IR type.
-    pub(super) fn write_const_to_bytes(&self, bytes: &mut [u8], offset: usize, val: &IrConst, ty: IrType) {
+    pub(super) fn write_const_to_bytes(
+        &self,
+        bytes: &mut [u8],
+        offset: usize,
+        val: &IrConst,
+        ty: IrType,
+    ) {
         let coerced = val.coerce_to(ty);
         let size = ty.size();
         let mut le_buf = Vec::with_capacity(size);
@@ -1263,11 +1683,23 @@ impl Lowerer {
 
     /// Write a bitfield value into a byte buffer at the given offset.
     /// Uses read-modify-write to pack the value at the correct bit position.
-    pub(super) fn write_bitfield_to_bytes(&self, bytes: &mut [u8], offset: usize, val: &IrConst, ty: IrType, bit_offset: u32, bit_width: u32) {
+    pub(super) fn write_bitfield_to_bytes(
+        &self,
+        bytes: &mut [u8],
+        offset: usize,
+        val: &IrConst,
+        ty: IrType,
+        bit_offset: u32,
+        bit_width: u32,
+    ) {
         let int_val = val.to_u64().unwrap_or(0);
 
         let size = ty.size();
-        let mask = if bit_width >= 64 { u64::MAX } else { (1u64 << bit_width) - 1 };
+        let mask = if bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_width) - 1
+        };
         let field_val = (int_val & mask) << bit_offset;
         let clear_mask = !(mask << bit_offset);
 
@@ -1305,15 +1737,18 @@ impl Lowerer {
 
         // Try to extract (real, imag) from the initializer
         let (real, imag) = match init {
-            Initializer::Expr(expr) => {
-                self.eval_complex_const_public(expr).unwrap_or((0.0, 0.0))
-            }
+            Initializer::Expr(expr) => self.eval_complex_const_public(expr).unwrap_or((0.0, 0.0)),
             Initializer::List(items) => {
                 // Handle "braces around scalar" for _Complex (C11 6.7.9):
                 // If the list has a single item that is itself a List, unwrap the extra braces.
                 if items.len() == 1 && items[0].designators.is_empty() {
                     if let Initializer::List(_) = &items[0].init {
-                        return self.write_complex_field_to_bytes(bytes, field_offset, complex_ctype, &items[0].init);
+                        return self.write_complex_field_to_bytes(
+                            bytes,
+                            field_offset,
+                            complex_ctype,
+                            &items[0].init,
+                        );
                     }
                 }
                 // If the list has a single expression that is complex-typed,
@@ -1324,14 +1759,17 @@ impl Lowerer {
                             pair
                         } else {
                             // Fall through to scalar {real} treatment below
-                            let real_val = self.eval_const_expr(e).and_then(|c| match c {
-                                IrConst::F64(v) => Some(v),
-                                IrConst::F32(v) => Some(v as f64),
-                                IrConst::I64(v) => Some(v as f64),
-                                IrConst::I32(v) => Some(v as f64),
-                                IrConst::LongDouble(v, _) => Some(v),
-                                _ => None,
-                            }).unwrap_or(0.0);
+                            let real_val = self
+                                .eval_const_expr(e)
+                                .and_then(|c| match c {
+                                    IrConst::F64(v) => Some(v),
+                                    IrConst::F32(v) => Some(v as f64),
+                                    IrConst::I64(v) => Some(v as f64),
+                                    IrConst::I32(v) => Some(v as f64),
+                                    IrConst::LongDouble(v, _) => Some(v),
+                                    _ => None,
+                                })
+                                .unwrap_or(0.0);
                             (real_val, 0.0)
                         }
                     } else {
@@ -1339,34 +1777,40 @@ impl Lowerer {
                     }
                 } else {
                     // {real, imag} or {real} (imag defaults to 0)
-                    let real_val = items.first().and_then(|item| {
-                        if let Initializer::Expr(e) = &item.init {
-                            self.eval_const_expr(e).and_then(|c| match c {
-                                IrConst::F64(v) => Some(v),
-                                IrConst::F32(v) => Some(v as f64),
-                                IrConst::I64(v) => Some(v as f64),
-                                IrConst::I32(v) => Some(v as f64),
-                                IrConst::LongDouble(v, _) => Some(v),
-                                _ => None,
-                            })
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(0.0);
-                    let imag_val = items.get(1).and_then(|item| {
-                        if let Initializer::Expr(e) = &item.init {
-                            self.eval_const_expr(e).and_then(|c| match c {
-                                IrConst::F64(v) => Some(v),
-                                IrConst::F32(v) => Some(v as f64),
-                                IrConst::I64(v) => Some(v as f64),
-                                IrConst::I32(v) => Some(v as f64),
-                                IrConst::LongDouble(v, _) => Some(v),
-                                _ => None,
-                            })
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(0.0);
+                    let real_val = items
+                        .first()
+                        .and_then(|item| {
+                            if let Initializer::Expr(e) = &item.init {
+                                self.eval_const_expr(e).and_then(|c| match c {
+                                    IrConst::F64(v) => Some(v),
+                                    IrConst::F32(v) => Some(v as f64),
+                                    IrConst::I64(v) => Some(v as f64),
+                                    IrConst::I32(v) => Some(v as f64),
+                                    IrConst::LongDouble(v, _) => Some(v),
+                                    _ => None,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0.0);
+                    let imag_val = items
+                        .get(1)
+                        .and_then(|item| {
+                            if let Initializer::Expr(e) = &item.init {
+                                self.eval_const_expr(e).and_then(|c| match c {
+                                    IrConst::F64(v) => Some(v),
+                                    IrConst::F32(v) => Some(v as f64),
+                                    IrConst::I64(v) => Some(v as f64),
+                                    IrConst::I32(v) => Some(v as f64),
+                                    IrConst::LongDouble(v, _) => Some(v),
+                                    _ => None,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0.0);
                     (real_val, imag_val)
                 }
             }
@@ -1378,20 +1822,35 @@ impl Lowerer {
                 let real_const = IrConst::F32(real as f32);
                 let imag_const = IrConst::F32(imag as f32);
                 self.write_const_to_bytes(bytes, field_offset, &real_const, IrType::F32);
-                self.write_const_to_bytes(bytes, field_offset + comp_size, &imag_const, IrType::F32);
+                self.write_const_to_bytes(
+                    bytes,
+                    field_offset + comp_size,
+                    &imag_const,
+                    IrType::F32,
+                );
             }
             CType::ComplexLongDouble => {
                 let real_const = IrConst::long_double(real);
                 let imag_const = IrConst::long_double(imag);
                 self.write_const_to_bytes(bytes, field_offset, &real_const, IrType::F128);
-                self.write_const_to_bytes(bytes, field_offset + comp_size, &imag_const, IrType::F128);
+                self.write_const_to_bytes(
+                    bytes,
+                    field_offset + comp_size,
+                    &imag_const,
+                    IrType::F128,
+                );
             }
             _ => {
                 // ComplexDouble
                 let real_const = IrConst::F64(real);
                 let imag_const = IrConst::F64(imag);
                 self.write_const_to_bytes(bytes, field_offset, &real_const, IrType::F64);
-                self.write_const_to_bytes(bytes, field_offset + comp_size, &imag_const, IrType::F64);
+                self.write_const_to_bytes(
+                    bytes,
+                    field_offset + comp_size,
+                    &imag_const,
+                    IrType::F64,
+                );
             }
         }
     }

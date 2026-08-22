@@ -1,30 +1,14 @@
-use crate::frontend::parser::ast::{
-    BlockItem,
-    CompoundStmt,
-    Declaration,
-    DerivedDeclarator,
-    Designator,
-    Expr,
-    InitDeclarator,
-    Initializer,
-    InitializerItem,
-    Stmt,
-    TypeSpecifier,
-};
-use crate::ir::reexports::{
-    GlobalInit,
-    Instruction,
-    IrBinOp,
-    IrConst,
-    IrGlobal,
-    Operand,
-    Terminator,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, CType, StructLayout, target_int_ir_type};
+use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo, LocalInfo};
 use super::lower::Lowerer;
-use super::definitions::{LocalInfo, GlobalInfo, DeclAnalysis, FuncSig};
+use crate::common::types::{target_int_ir_type, AddressSpace, CType, IrType, StructLayout};
+use crate::frontend::parser::ast::{
+    BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator,
+    Initializer, InitializerItem, Stmt, TypeSpecifier,
+};
 use crate::frontend::sema::type_context::extract_fptr_typedef_info;
+use crate::ir::reexports::{
+    GlobalInit, Instruction, IrBinOp, IrConst, IrGlobal, Operand, Terminator, Value,
+};
 
 impl Lowerer {
     pub(super) fn lower_compound_stmt(&mut self, compound: &CompoundStmt) {
@@ -43,7 +27,10 @@ impl Lowerer {
 
         // Check if this block contains any declarations. If not, we can skip
         // scope tracking entirely since statements don't introduce new bindings.
-        let has_declarations = compound.items.iter().any(|item| matches!(item, BlockItem::Declaration(_)));
+        let has_declarations = compound
+            .items
+            .iter()
+            .any(|item| matches!(item, BlockItem::Declaration(_)));
 
         if has_declarations {
             // Push a scope frame to track additions/modifications in this block.
@@ -133,13 +120,21 @@ impl Lowerer {
             // would get align=0 (default platform alignment) instead of 16,
             // causing misaligned stack slots on i686.
             let type_align = self.alignof_type(type_spec);
-            let alloca_align = if type_align > explicit_align { type_align } else { explicit_align };
+            let alloca_align = if type_align > explicit_align {
+                type_align
+            } else {
+                explicit_align
+            };
 
             let alloca = if let Some(vla_size_val) = vla_size {
                 self.emit_vla_alloca(vla_size_val, alloca_align)
             } else {
                 self.emit_entry_alloca(
-                    if da.is_array || da.is_struct || is_complex { IrType::Ptr } else { da.var_ty },
+                    if da.is_array || da.is_struct || is_complex {
+                        IrType::Ptr
+                    } else {
+                        da.var_ty
+                    },
                     da.actual_alloc_size,
                     alloca_align,
                     // The OBJECT is volatile only when the base type's
@@ -150,20 +145,41 @@ impl Lowerer {
                 )
             };
 
-            self.register_local_var(decl, declarator, type_spec, &da, alloca, alloca_align, vla_size);
+            self.register_local_var(
+                decl,
+                declarator,
+                type_spec,
+                &da,
+                alloca,
+                alloca_align,
+                vla_size,
+            );
             self.track_fptr_sig(declarator, type_spec);
 
             if let Some(ref init) = declarator.init {
-                self.lower_local_var_init(init, decl, declarator, &da, alloca, is_complex, &complex_elem_ctype);
+                self.lower_local_var_init(
+                    init,
+                    decl,
+                    declarator,
+                    &da,
+                    alloca,
+                    is_complex,
+                    &complex_elem_ctype,
+                );
             }
         }
     }
 
     /// Resolve typeof/auto_type to a concrete TypeSpecifier, or return the original.
     fn resolve_local_type_spec<'a>(
-        &mut self, decl: &'a Declaration, resolved: &'a mut Option<TypeSpecifier>,
+        &mut self,
+        decl: &'a Declaration,
+        resolved: &'a mut Option<TypeSpecifier>,
     ) -> &'a TypeSpecifier {
-        if !matches!(&decl.type_spec, TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_) | TypeSpecifier::AutoType) {
+        if !matches!(
+            &decl.type_spec,
+            TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_) | TypeSpecifier::AutoType
+        ) {
             return &decl.type_spec;
         }
         let ts = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
@@ -202,7 +218,9 @@ impl Lowerer {
             }
             if let Some(fti) = extract_fptr_typedef_info(type_spec, &declarator.derived) {
                 self.types.func_ptr_typedefs.insert(declarator.name.clone());
-                self.types.func_ptr_typedef_info.insert(declarator.name.clone(), fti);
+                self.types
+                    .func_ptr_typedef_info
+                    .insert(declarator.name.clone(), fti);
             }
             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
@@ -222,16 +240,20 @@ impl Lowerer {
                         CType::Struct(k) | CType::Union(k) => k.to_string(),
                         _ => unreachable!(),
                     };
-                    let layout_copy = self.types.borrow_struct_layouts()
+                    let layout_copy = self
+                        .types
+                        .borrow_struct_layouts()
                         .get(&new_key)
                         .map(|l| l.as_ref().clone());
                     if let Some(layout) = layout_copy {
-                        self.types.insert_struct_layout_scoped_from_ref(&old_key, layout);
+                        self.types
+                            .insert_struct_layout_scoped_from_ref(&old_key, layout);
                     }
                     resolved_ctype = existing.clone();
                 }
             }
-            self.types.insert_typedef_scoped(declarator.name.clone(), resolved_ctype);
+            self.types
+                .insert_typedef_scoped(declarator.name.clone(), resolved_ctype);
 
             let effective_alignment = {
                 let mut align = decl.alignment;
@@ -239,22 +261,28 @@ impl Lowerer {
                     let real_sizeof = self.sizeof_type(sizeof_ts);
                     align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
                 }
-                align.or_else(|| {
-                    decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts))
-                })
+                align.or_else(|| decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)))
             };
             if let Some(align) = effective_alignment {
-                self.types.insert_typedef_alignment_scoped(declarator.name.clone(), align);
+                self.types
+                    .insert_typedef_alignment_scoped(declarator.name.clone(), align);
             }
             if self.func_state.is_some() {
-                if let Some(vla_size) = self.compute_vla_runtime_size(type_spec, &declarator.derived) {
-                    self.func_mut().insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size);
+                if let Some(vla_size) =
+                    self.compute_vla_runtime_size(type_spec, &declarator.derived)
+                {
+                    self.func_mut()
+                        .insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size);
                 }
             }
         }
     }
 
-    fn detect_complex_array_elem(&self, type_spec: &TypeSpecifier, da: &DeclAnalysis) -> Option<CType> {
+    fn detect_complex_array_elem(
+        &self,
+        type_spec: &TypeSpecifier,
+        da: &DeclAnalysis,
+    ) -> Option<CType> {
         if da.is_array && !da.is_pointer {
             let ctype = self.type_spec_to_ctype(type_spec);
             match ctype {
@@ -296,7 +324,11 @@ impl Lowerer {
             if frame.scope_stack_save.is_none() {
                 let scope_save = self.fresh_value();
                 self.emit(Instruction::StackSave { dest: scope_save });
-                self.func_mut().scope_stack.last_mut().unwrap().scope_stack_save = Some(scope_save);
+                self.func_mut()
+                    .scope_stack
+                    .last_mut()
+                    .unwrap()
+                    .scope_stack_save = Some(scope_save);
             }
         }
         let vla_align = explicit_align.max(16);
@@ -309,9 +341,14 @@ impl Lowerer {
     }
 
     fn register_local_var(
-        &mut self, decl: &Declaration, declarator: &InitDeclarator,
-        type_spec: &TypeSpecifier, da: &DeclAnalysis, alloca: Value,
-        explicit_align: usize, vla_size: Option<Value>,
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        type_spec: &TypeSpecifier,
+        da: &DeclAnalysis,
+        alloca: Value,
+        explicit_align: usize,
+        vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
         local_info.var.address_space = decl.address_space;
@@ -326,7 +363,8 @@ impl Lowerer {
             }
         }
         local_info.asm_register = declarator.attrs.asm_register.clone();
-        local_info.asm_register_has_init = declarator.attrs.asm_register.is_some() && declarator.init.is_some();
+        local_info.asm_register_has_init =
+            declarator.attrs.asm_register.is_some() && declarator.init.is_some();
         local_info.cleanup_fn = declarator.attrs.cleanup_fn.clone();
         if let Some(ref cleanup_fn_name) = declarator.attrs.cleanup_fn {
             if let Some(frame) = self.func_mut().scope_stack.last_mut() {
@@ -343,8 +381,11 @@ impl Lowerer {
                 // FunctionPointer, ...]. Pointers before the FunctionPointer include the
                 // syntax marker (1) plus any return-type pointer indirections.
                 // If there are return-type pointers, the return type is a pointer.
-                let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                let ptr_count_before = declarator.derived[..i]
+                    .iter()
+                    .filter(|d| {
+                        matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_))
+                    })
                     .count();
                 // Subtract 1 for the syntax marker pointer
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
@@ -353,22 +394,32 @@ impl Lowerer {
                 } else {
                     self.type_spec_to_ir(type_spec)
                 };
-                let param_tys: Vec<IrType> = params.iter().map(|p| {
-                    self.type_spec_to_ir(&p.type_spec)
-                }).collect();
-                self.func_meta.ptr_sigs.insert(declarator.name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                let param_tys: Vec<IrType> = params
+                    .iter()
+                    .map(|p| self.type_spec_to_ir(&p.type_spec))
+                    .collect();
+                self.func_meta
+                    .ptr_sigs
+                    .insert(declarator.name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
                 break;
             }
         }
     }
 
     fn lower_local_var_init(
-        &mut self, init: &Initializer, decl: &Declaration, declarator: &InitDeclarator,
-        da: &DeclAnalysis, alloca: Value, is_complex: bool, complex_elem_ctype: &Option<CType>,
+        &mut self,
+        init: &Initializer,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        da: &DeclAnalysis,
+        alloca: Value,
+        is_complex: bool,
+        complex_elem_ctype: &Option<CType>,
     ) {
         match init {
             Initializer::Expr(expr) => {
-                if decl.is_const() && !da.is_pointer && !da.is_array && !da.is_struct && !is_complex {
+                if decl.is_const() && !da.is_pointer && !da.is_array && !da.is_struct && !is_complex
+                {
                     if let Some(const_val) = self.eval_const_expr(expr) {
                         if let Some(ival) = self.const_to_i64(&const_val) {
                             self.insert_const_local_scoped(declarator.name.clone(), ival);
@@ -379,8 +430,13 @@ impl Lowerer {
             }
             Initializer::List(items) => {
                 self.lower_local_init_list(
-                    items, alloca, da, is_complex, complex_elem_ctype,
-                    decl, &declarator.name,
+                    items,
+                    alloca,
+                    da,
+                    is_complex,
+                    complex_elem_ctype,
+                    decl,
+                    &declarator.name,
                 );
             }
         }
@@ -389,7 +445,13 @@ impl Lowerer {
     /// Handle static local variable declarations: emit as globals with mangled names.
     /// Static locals are initialized once at program start (via .data/.bss),
     /// not at every function call.
-    fn lower_local_static_decl(&mut self, decl: &Declaration, declarator: &InitDeclarator, da: &DeclAnalysis, type_spec: &TypeSpecifier) {
+    fn lower_local_static_decl(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        da: &DeclAnalysis,
+        type_spec: &TypeSpecifier,
+    ) {
         let static_id = self.next_static_local;
         let static_name = format!("{}.{}.{}", self.func_mut().name, declarator.name, static_id);
 
@@ -412,15 +474,21 @@ impl Lowerer {
         // 8-byte .quad 0, corrupting the array layout.
         let init = if let Some(ref initializer) = declarator.init {
             let init_base_ty = if da.is_pointer && !da.is_array {
-                da.var_ty  // scalar pointer: var_ty = Ptr
+                da.var_ty // scalar pointer: var_ty = Ptr
             } else if da.is_array_of_pointers || da.is_array_of_func_ptrs {
-                IrType::Ptr  // pointer array: each element is Ptr
+                IrType::Ptr // pointer array: each element is Ptr
             } else {
                 da.base_ty
             };
             self.lower_global_init(
-                initializer, type_spec, init_base_ty, da.is_array,
-                da.elem_size, da.actual_alloc_size, &da.struct_layout, &da.array_dim_strides,
+                initializer,
+                type_spec,
+                init_base_ty,
+                da.is_array,
+                da.elem_size,
+                da.actual_alloc_size,
+                &da.struct_layout,
+                &da.array_dim_strides,
             )
         } else {
             GlobalInit::Zero
@@ -432,7 +500,11 @@ impl Lowerer {
         // `static struct fxregs_state fxregs` would get da.var_ty.align() == 1
         // (IrType::I8) instead of the struct's required 16-byte alignment.
         let c_align = self.alignof_type(type_spec);
-        let natural = if c_align > 0 { c_align.max(da.var_ty.align()) } else { da.var_ty.align() };
+        let natural = if c_align > 0 {
+            c_align.max(da.var_ty.align())
+        } else {
+            da.var_ty.align()
+        };
 
         // Respect explicit __attribute__((aligned(N))) / _Alignas(N) on static locals.
         // Resolve _Alignas(type) via the lowerer for accurate typedef resolution.
@@ -461,8 +533,10 @@ impl Lowerer {
         let global_ty = da.resolve_global_ty(&init);
 
         // For pointer variables, decl.is_const refers to the pointee type, not the variable.
-        let var_is_const = decl.is_const() && !da.is_pointer
-            && !da.is_array_of_pointers && !da.is_array_of_func_ptrs;
+        let var_is_const = decl.is_const()
+            && !da.is_pointer
+            && !da.is_array_of_pointers
+            && !da.is_array_of_func_ptrs;
 
         self.emitted_global_names.insert(static_name.clone());
         self.module.globals.push(IrGlobal {
@@ -504,8 +578,11 @@ impl Lowerer {
         // promotions (e.g. float->double for unprototyped `float (*sfp)()`).
         for (i, d) in declarator.derived.iter().enumerate() {
             if let DerivedDeclarator::FunctionPointer(params, _) = d {
-                let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                let ptr_count_before = declarator.derived[..i]
+                    .iter()
+                    .filter(|d| {
+                        matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_))
+                    })
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
                 let ret_ty = if return_type_ptrs > 0 {
@@ -513,10 +590,13 @@ impl Lowerer {
                 } else {
                     self.type_spec_to_ir(type_spec)
                 };
-                let param_tys: Vec<IrType> = params.iter().map(|p| {
-                    self.type_spec_to_ir(&p.type_spec)
-                }).collect();
-                self.func_meta.ptr_sigs.insert(declarator.name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                let param_tys: Vec<IrType> = params
+                    .iter()
+                    .map(|p| self.type_spec_to_ir(&p.type_spec))
+                    .collect();
+                self.func_meta
+                    .ptr_sigs
+                    .insert(declarator.name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
                 break;
             }
         }
@@ -569,11 +649,23 @@ impl Lowerer {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { volatile: false, val, ptr: dest_addr, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: dest_addr,
+                    ty: comp_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { volatile: false, val: zero, ptr: dest_addr, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: zero,
+                ptr: dest_addr,
+                ty: comp_ty,
+                seg_override: AddressSpace::Default,
+            });
         }
         // Store imag part
         let imag_ptr = self.emit_gep_offset(dest_addr, comp_size, IrType::I8);
@@ -582,18 +674,36 @@ impl Lowerer {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { volatile: false, val, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val,
+                    ptr: imag_ptr,
+                    ty: comp_ty,
+                    seg_override: AddressSpace::Default,
+                });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { volatile: false, val: zero, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: zero,
+                ptr: imag_ptr,
+                ty: comp_ty,
+                seg_override: AddressSpace::Default,
+            });
         }
     }
 
     /// Emit a complex expression to a memory location at the given offset.
     /// Handles integer-to-complex conversion properly by using lower_expr_to_complex
     /// and then memcpy-ing the result to the destination.
-    pub(super) fn emit_complex_expr_to_offset(&mut self, expr: &Expr, base_alloca: Value, offset: usize, complex_ctype: &CType) {
+    pub(super) fn emit_complex_expr_to_offset(
+        &mut self,
+        expr: &Expr,
+        base_alloca: Value,
+        offset: usize,
+        complex_ctype: &CType,
+    ) {
         let complex_size = complex_ctype.size();
         let src = self.lower_expr_to_complex(expr, complex_ctype);
         let dest_addr = self.emit_gep_offset(base_alloca, offset, IrType::Ptr);
@@ -631,14 +741,18 @@ impl Lowerer {
         base: Value,
         layout: &StructLayout,
     ) {
-        use crate::common::types::InitFieldResolution;
         use super::global_init_helpers as h;
+        use crate::common::types::InitFieldResolution;
         let mut current_field_idx = 0usize;
         let mut item_idx = 0usize;
         while item_idx < items.len() {
             let item = &items[item_idx];
             let desig_name = h::first_field_designator(item);
-            let resolution = match layout.resolve_init_field(desig_name, current_field_idx, &*self.types.borrow_struct_layouts()) {
+            let resolution = match layout.resolve_init_field(
+                desig_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            ) {
                 Some(r) => r,
                 None => break,
             };
@@ -651,7 +765,8 @@ impl Lowerer {
                     // drill into it and consume multiple init items for inner fields.
                     if desig_name.is_none() && f.name.is_empty() && f.bit_width.is_none() {
                         if let CType::Struct(key) | CType::Union(key) = &f.ty {
-                            let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+                            let sub_layout =
+                                self.types.borrow_struct_layouts().get(&**key).cloned();
                             if let Some(sub_layout) = sub_layout {
                                 let anon_offset = f.offset;
                                 let sub_base = self.emit_gep_offset(base, anon_offset, IrType::Ptr);
@@ -666,12 +781,18 @@ impl Lowerer {
                                     current_field_idx = *idx + 1;
                                     continue;
                                 }
-                                let anon_field_count = sub_layout.fields.iter()
+                                let anon_field_count = sub_layout
+                                    .fields
+                                    .iter()
                                     .filter(|ff| !ff.name.is_empty() || ff.bit_width.is_none())
                                     .count();
                                 let remaining = &items[item_idx..];
                                 let consume_count = remaining.len().min(anon_field_count);
-                                self.lower_local_struct_init(&remaining[..consume_count], sub_base, &sub_layout);
+                                self.lower_local_struct_init(
+                                    &remaining[..consume_count],
+                                    sub_base,
+                                    &sub_layout,
+                                );
                                 item_idx += consume_count;
                                 current_field_idx = *idx + 1;
                                 continue;
@@ -680,9 +801,23 @@ impl Lowerer {
                     }
                     *idx
                 }
-                InitFieldResolution::AnonymousMember { anon_field_idx, inner_name } => {
-                    let extra_desigs = if item.designators.len() > 1 { &item.designators[1..] } else { &[] };
-                    let anon_res = h::resolve_anonymous_member(layout, *anon_field_idx, inner_name, &item.init, extra_desigs, &self.types.borrow_struct_layouts());
+                InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                } => {
+                    let extra_desigs = if item.designators.len() > 1 {
+                        &item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let anon_res = h::resolve_anonymous_member(
+                        layout,
+                        *anon_field_idx,
+                        inner_name,
+                        &item.init,
+                        extra_desigs,
+                        &self.types.borrow_struct_layouts(),
+                    );
                     if let Some(res) = anon_res {
                         let sub_base = self.emit_gep_offset(base, res.anon_offset, IrType::Ptr);
                         self.lower_local_struct_init(&[res.sub_item], sub_base, &res.sub_layout);
@@ -749,27 +884,46 @@ impl Lowerer {
                                 let str_len = s.chars().count() + 1; // +1 for null terminator
                                 for i in str_len..arr_size {
                                     let val = Operand::Const(IrConst::I8(0));
-                                    self.emit_store_at_offset(base, field_offset + i, val, IrType::I8);
+                                    self.emit_store_at_offset(
+                                        base,
+                                        field_offset + i,
+                                        val,
+                                        IrType::I8,
+                                    );
                                 }
                             } else {
                                 let val = self.lower_and_cast_init_expr(e, field_ty);
                                 let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
-                                self.emit(Instruction::Store { volatile: false, val, ptr: field_addr, ty: field_ty , seg_override: AddressSpace::Default });
+                                self.emit(Instruction::Store {
+                                    volatile: false,
+                                    val,
+                                    ptr: field_addr,
+                                    ty: field_ty,
+                                    seg_override: AddressSpace::Default,
+                                });
                             }
                         } else if let CType::Struct(ref key) | CType::Union(ref key) = **elem_ty {
                             // Array-of-structs field with flat expression initializer:
                             // delegate to emit_struct_init which knows how to consume
                             // the right number of flat items for each struct element.
                             let elem_size = self.resolve_ctype_size(elem_ty);
-                            let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+                            let sub_layout =
+                                self.types.borrow_struct_layouts().get(&**key).cloned();
                             if let Some(sub_layout) = sub_layout {
                                 let mut ai = 0usize;
                                 let mut consumed_total = 0usize;
                                 while ai < arr_size {
                                     let elem_offset = field_offset + ai * elem_size;
                                     let remaining = &items[item_idx + consumed_total..];
-                                    if remaining.is_empty() { break; }
-                                    let consumed = self.emit_struct_init(remaining, base, &sub_layout, elem_offset);
+                                    if remaining.is_empty() {
+                                        break;
+                                    }
+                                    let consumed = self.emit_struct_init(
+                                        remaining,
+                                        base,
+                                        &sub_layout,
+                                        elem_offset,
+                                    );
                                     consumed_total += consumed.max(1);
                                     ai += 1;
                                 }
@@ -787,7 +941,13 @@ impl Lowerer {
                             let elem_is_bool = **elem_ty == CType::Bool;
                             let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
                             let field_addr = self.emit_gep_offset(base, field_offset, elem_ir_ty);
-                            self.emit(Instruction::Store { volatile: false, val, ptr: field_addr, ty: elem_ir_ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: field_addr,
+                                ty: elem_ir_ty,
+                                seg_override: AddressSpace::Default,
+                            });
                             // Consume additional items for remaining array elements
                             let mut arr_idx = 1usize;
                             while arr_idx < arr_size && item_idx + 1 < items.len() {
@@ -800,24 +960,47 @@ impl Lowerer {
                                 }
                                 let expr_opt = match &next_item.init {
                                     Initializer::Expr(next_e) => Some(next_e),
-                                    Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
+                                    Initializer::List(sub_items) => {
+                                        Self::unwrap_nested_init_expr(sub_items)
+                                    }
                                 };
                                 if let Some(next_e) = expr_opt {
-                                    let next_val = self.lower_init_expr_bool_aware(next_e, elem_ir_ty, elem_is_bool);
+                                    let next_val = self.lower_init_expr_bool_aware(
+                                        next_e,
+                                        elem_ir_ty,
+                                        elem_is_bool,
+                                    );
                                     let offset = field_offset + arr_idx * elem_size;
                                     let elem_addr = self.emit_gep_offset(base, offset, elem_ir_ty);
-                                    self.emit(Instruction::Store { volatile: false, val: next_val, ptr: elem_addr, ty: elem_ir_ty , seg_override: AddressSpace::Default });
+                                    self.emit(Instruction::Store {
+                                        volatile: false,
+                                        val: next_val,
+                                        ptr: elem_addr,
+                                        ty: elem_ir_ty,
+                                        seg_override: AddressSpace::Default,
+                                    });
                                 }
                                 arr_idx += 1;
                             }
                         }
                     } else {
-                        let val = self.lower_init_expr_bool_aware(e, field_ty, field.ty == CType::Bool);
+                        let val =
+                            self.lower_init_expr_bool_aware(e, field_ty, field.ty == CType::Bool);
                         let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
-                        if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-                            self.store_bitfield(field_addr, field_ty, bit_offset, bit_width, val, false);
+                        if let (Some(bit_offset), Some(bit_width)) =
+                            (field.bit_offset, field.bit_width)
+                        {
+                            self.store_bitfield(
+                                field_addr, field_ty, bit_offset, bit_width, val, false,
+                            );
                         } else {
-                            self.emit(Instruction::Store { volatile: false, val, ptr: field_addr, ty: field_ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: field_addr,
+                                ty: field_ty,
+                                seg_override: AddressSpace::Default,
+                            });
                         }
                     }
                 }
@@ -899,8 +1082,18 @@ impl Lowerer {
                 if let Some(first) = items.first() {
                     if let Initializer::Expr(e) = &first.init {
                         let field_ir_ty = IrType::from_ctype(field_ctype);
-                        let val = self.lower_init_expr_bool_aware(e, field_ir_ty, *field_ctype == CType::Bool);
-                        self.emit(Instruction::Store { volatile: false, val, ptr: base, ty: field_ir_ty , seg_override: AddressSpace::Default });
+                        let val = self.lower_init_expr_bool_aware(
+                            e,
+                            field_ir_ty,
+                            *field_ctype == CType::Bool,
+                        );
+                        self.emit(Instruction::Store {
+                            volatile: false,
+                            val,
+                            ptr: base,
+                            ty: field_ir_ty,
+                            seg_override: AddressSpace::Default,
+                        });
                     }
                 }
             }
@@ -954,13 +1147,17 @@ impl Lowerer {
 
         for item in items {
             // Check for multi-dimensional index designators: [i][j]...
-            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
-                if let Designator::Index(ref idx_expr) = d {
-                    self.eval_const_expr_for_designator(idx_expr)
-                } else {
-                    None
-                }
-            }).collect();
+            let index_designators: Vec<usize> = item
+                .designators
+                .iter()
+                .filter_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr_for_designator(idx_expr)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             if !index_designators.is_empty() {
                 // Compute flat scalar index from multi-dimensional indices
@@ -978,15 +1175,29 @@ impl Lowerer {
                     Initializer::List(sub_items) => {
                         // Set flat_index to designated position and recurse
                         *flat_index = target_flat;
-                        let remaining_dims = array_dim_strides.len().saturating_sub(index_designators.len());
-                        let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
+                        let remaining_dims = array_dim_strides
+                            .len()
+                            .saturating_sub(index_designators.len());
+                        let sub_strides =
+                            &array_dim_strides[array_dim_strides.len() - remaining_dims..];
                         if remaining_dims > 0 {
-                            self.lower_array_init_recursive(sub_items, alloca, base_ty, sub_strides, flat_index);
+                            self.lower_array_init_recursive(
+                                sub_items,
+                                alloca,
+                                base_ty,
+                                sub_strides,
+                                flat_index,
+                            );
                         } else {
                             for sub_item in sub_items {
                                 if let Initializer::Expr(e) = &sub_item.init {
                                     let val = self.lower_and_cast_init_expr(e, base_ty);
-                                    self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
+                                    self.emit_array_element_store(
+                                        alloca,
+                                        val,
+                                        *flat_index * elem_size,
+                                        base_ty,
+                                    );
                                     *flat_index += 1;
                                 }
                             }
@@ -995,13 +1206,23 @@ impl Lowerer {
                     Initializer::Expr(e) => {
                         if base_ty == IrType::I8 || base_ty == IrType::U8 {
                             if let Expr::StringLiteral(s, _) = e {
-                                self.emit_string_to_alloca(alloca, s, target_flat * elem_size, sub_elem_count * elem_size);
+                                self.emit_string_to_alloca(
+                                    alloca,
+                                    s,
+                                    target_flat * elem_size,
+                                    sub_elem_count * elem_size,
+                                );
                                 *flat_index = target_flat + sub_elem_count;
                                 continue;
                             }
                         }
                         let val = self.lower_and_cast_init_expr(e, base_ty);
-                        self.emit_array_element_store(alloca, val, target_flat * elem_size, base_ty);
+                        self.emit_array_element_store(
+                            alloca,
+                            val,
+                            target_flat * elem_size,
+                            base_ty,
+                        );
                         *flat_index = target_flat + 1;
                     }
                 }
@@ -1012,13 +1233,24 @@ impl Lowerer {
             match &item.init {
                 Initializer::List(sub_items) => {
                     if array_dim_strides.len() > 1 {
-                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[1..], flat_index);
+                        self.lower_array_init_recursive(
+                            sub_items,
+                            alloca,
+                            base_ty,
+                            &array_dim_strides[1..],
+                            flat_index,
+                        );
                     } else {
                         // Bottom level: treat as flat elements
                         for sub_item in sub_items {
                             if let Initializer::Expr(e) = &sub_item.init {
                                 let val = self.lower_and_cast_init_expr(e, base_ty);
-                                self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
+                                self.emit_array_element_store(
+                                    alloca,
+                                    val,
+                                    *flat_index * elem_size,
+                                    base_ty,
+                                );
                                 *flat_index += 1;
                             }
                         }
@@ -1038,7 +1270,12 @@ impl Lowerer {
                     if base_ty == IrType::I8 || base_ty == IrType::U8 {
                         if let Expr::StringLiteral(s, _) = e {
                             let max_str_bytes = sub_elem_count * elem_size;
-                            self.emit_string_to_alloca(alloca, s, *flat_index * elem_size, max_str_bytes);
+                            self.emit_string_to_alloca(
+                                alloca,
+                                s,
+                                *flat_index * elem_size,
+                                max_str_bytes,
+                            );
                             let string_stride = if array_dim_strides.len() >= 2 {
                                 array_dim_strides[array_dim_strides.len() - 2]
                             } else {
@@ -1066,7 +1303,12 @@ impl Lowerer {
 
     /// Lower an init expression with bool-aware handling.
     /// For bool targets, normalizes to 0/1. For other types, casts to target_ty.
-    pub(super) fn lower_init_expr_bool_aware(&mut self, expr: &Expr, target_ty: IrType, is_bool: bool) -> Operand {
+    pub(super) fn lower_init_expr_bool_aware(
+        &mut self,
+        expr: &Expr,
+        target_ty: IrType,
+        is_bool: bool,
+    ) -> Operand {
         if is_bool {
             let val = self.lower_expr(expr);
             let expr_ty = self.get_expr_type(expr);
@@ -1102,7 +1344,9 @@ impl Lowerer {
             }
             Stmt::Expr(None) => {}
             Stmt::Compound(compound) => self.lower_compound_stmt(compound),
-            Stmt::If(cond, then_stmt, else_stmt, _span) => self.lower_if_stmt(cond, then_stmt, else_stmt.as_deref()),
+            Stmt::If(cond, then_stmt, else_stmt, _span) => {
+                self.lower_if_stmt(cond, then_stmt, else_stmt.as_deref())
+            }
             Stmt::While(cond, body, _span) => self.lower_while_stmt(cond, body),
             Stmt::For(init, cond, inc, body, _span) => self.lower_for_stmt(init, cond, inc, body),
             Stmt::DoWhile(body, cond, _span) => self.lower_do_while_stmt(body, cond),
@@ -1110,7 +1354,9 @@ impl Lowerer {
             Stmt::Continue(_span) => self.lower_continue_stmt(),
             Stmt::Switch(expr, body, _span) => self.lower_switch_stmt(expr, body),
             Stmt::Case(expr, stmt, _span) => self.lower_case_stmt(expr, stmt),
-            Stmt::CaseRange(low_expr, high_expr, stmt, _span) => self.lower_case_range_stmt(low_expr, high_expr, stmt),
+            Stmt::CaseRange(low_expr, high_expr, stmt, _span) => {
+                self.lower_case_range_stmt(low_expr, high_expr, stmt)
+            }
             Stmt::Default(stmt, _span) => self.lower_default_stmt(stmt),
             Stmt::Goto(label, _span) => self.lower_goto_stmt(label),
             Stmt::GotoIndirect(expr, _span) => self.lower_goto_indirect_stmt(expr),
@@ -1119,7 +1365,13 @@ impl Lowerer {
                 self.func_mut().current_span = decl.span;
                 self.lower_local_decl(decl);
             }
-            Stmt::InlineAsm { template, outputs, inputs, clobbers, goto_labels } => {
+            Stmt::InlineAsm {
+                template,
+                outputs,
+                inputs,
+                clobbers,
+                goto_labels,
+            } => {
                 self.lower_inline_asm_stmt(template, outputs, inputs, clobbers, goto_labels);
             }
         }
@@ -1135,13 +1387,16 @@ impl Lowerer {
         derived: &[DerivedDeclarator],
     ) -> Option<Value> {
         // Collect array dimensions from derived declarators
-        let array_dims: Vec<&Option<Box<Expr>>> = derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
-                Some(size)
-            } else {
-                None
-            }
-        }).collect();
+        let array_dims: Vec<&Option<Box<Expr>>> = derived
+            .iter()
+            .filter_map(|d| {
+                if let DerivedDeclarator::Array(size) = d {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         if array_dims.is_empty() {
             // Check if the type_spec itself is an Array (typedef'd VLA)
@@ -1183,12 +1438,22 @@ impl Lowerer {
 
                 let ptr_int_ty = target_int_ir_type();
                 result = if let Some(prev) = result {
-                    let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(prev), Operand::Value(dim_value), ptr_int_ty);
+                    let mul = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(prev),
+                        Operand::Value(dim_value),
+                        ptr_int_ty,
+                    );
                     Some(mul)
                 } else {
                     // First runtime dim: multiply by accumulated constants
                     if const_product > 1 {
-                        let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_value), Operand::Const(IrConst::ptr_int(const_product as i64)), ptr_int_ty);
+                        let mul = self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(dim_value),
+                            Operand::Const(IrConst::ptr_int(const_product as i64)),
+                            ptr_int_ty,
+                        );
                         const_product = 1;
                         Some(mul)
                     } else {
@@ -1202,7 +1467,12 @@ impl Lowerer {
         if let Some(prev) = result {
             if const_product > 1 {
                 let ptr_int_ty = target_int_ir_type();
-                let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(prev), Operand::Const(IrConst::ptr_int(const_product as i64)), ptr_int_ty);
+                let mul = self.emit_binop_val(
+                    IrBinOp::Mul,
+                    Operand::Value(prev),
+                    Operand::Const(IrConst::ptr_int(const_product as i64)),
+                    ptr_int_ty,
+                );
                 return Some(mul);
             }
             return Some(prev);
@@ -1229,13 +1499,16 @@ impl Lowerer {
         derived: &[DerivedDeclarator],
     ) -> Vec<Option<Value>> {
         // Collect array dimensions from derived declarators
-        let array_dims: Vec<&Option<Box<Expr>>> = derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
-                Some(size)
-            } else {
-                None
-            }
-        }).collect();
+        let array_dims: Vec<&Option<Box<Expr>>> = derived
+            .iter()
+            .filter_map(|d| {
+                if let DerivedDeclarator::Array(size) = d {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         if array_dims.len() < 2 {
             // For 1D VLAs, no stride info needed (the element size is known at compile time)
@@ -1341,11 +1614,23 @@ impl Lowerer {
     /// derivation appears in the derived list alongside Array entries.
     /// If the outermost (last) derivation is an Array and there's a Pointer
     /// before it, the array elements are pointers (8 bytes on 64-bit).
-    fn vla_base_element_size(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> usize {
-        let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
-        let has_func_ptr = derived.iter().any(|d| matches!(d,
-            DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+    fn vla_base_element_size(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> usize {
+        let has_pointer = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+        let has_func_ptr = derived.iter().any(|d| {
+            matches!(
+                d,
+                DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)
+            )
+        });
+        let has_array = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Array(_)));
         let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array(_)));
 
         if has_array && (has_pointer || has_func_ptr) && last_is_array {
@@ -1374,7 +1659,12 @@ impl Lowerer {
                 let dim_value = self.operand_to_value(dim_val);
                 if elem_size > 1 {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let mul = self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_value), Operand::Const(IrConst::ptr_int(elem_size as i64)), ptr_int_ty);
+                    let mul = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_value),
+                        Operand::Const(IrConst::ptr_int(elem_size as i64)),
+                        ptr_int_ty,
+                    );
                     Some(mul)
                 } else {
                     Some(dim_value)

@@ -1,8 +1,8 @@
 //! X86Codegen: global address, label address, TLS global address operations.
 
-use crate::ir::reexports::{Operand, Value};
+use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, X86Codegen};
 use crate::common::types::IrType;
-use super::emit::{X86Codegen, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, is_xmm_reg};
+use crate::ir::reexports::{Operand, Value};
 
 impl X86Codegen {
     /// GOTPCREL references must use the BASE symbol name: for a versioned
@@ -21,9 +21,12 @@ impl X86Codegen {
                 let d_name = phys_reg_name(d_reg);
                 if self.state.needs_got_for_addr(name) {
                     let n = self.got_name(name);
-                    self.state.emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, d_name));
+                    self.state
+                        .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, d_name));
                 } else {
-                    self.state.out.emit_instr_sym_base_reg("    leaq", name, "rip", d_name);
+                    self.state
+                        .out
+                        .emit_instr_sym_base_reg("    leaq", name, "rip", d_name);
                 }
                 self.state.reg_cache.invalidate_acc();
                 return;
@@ -31,9 +34,12 @@ impl X86Codegen {
         }
         if self.state.needs_got_for_addr(name) {
             let n = self.got_name(name);
-            self.state.emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %rax", n));
+            self.state
+                .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %rax", n));
         } else {
-            self.state.out.emit_instr_sym_base_reg("    leaq", name, "rip", "rax");
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", name, "rip", "rax");
         }
         self.store_rax_to(dest);
     }
@@ -60,9 +66,15 @@ impl X86Codegen {
         // shorter and avoids creating a temporary live range for the offset.
         if let Operand::Const(c) = offset {
             if let Some(raw) = c.to_i64() {
-                let disp = if subtract { raw.checked_neg() } else { Some(raw) };
-                if let Some(disp) = disp.filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v)) {
-                    let target = self.dest_reg(dest)
+                let disp = if subtract {
+                    raw.checked_neg()
+                } else {
+                    Some(raw)
+                };
+                if let Some(disp) = disp.filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v))
+                {
+                    let target = self
+                        .dest_reg(dest)
                         .filter(|r| !is_xmm_reg(*r))
                         .map(phys_reg_name)
                         .unwrap_or("rax");
@@ -73,9 +85,9 @@ impl X86Codegen {
                     } else {
                         format!("{name}{disp}")
                     };
-                    self.state.out.emit_instr_sym_base_reg(
-                        "    leaq", &sym, "rip", target,
-                    );
+                    self.state
+                        .out
+                        .emit_instr_sym_base_reg("    leaq", &sym, "rip", target);
                     if target == "rax" {
                         self.store_rax_to(dest);
                     } else {
@@ -93,9 +105,9 @@ impl X86Codegen {
             if !is_xmm_reg(off_reg) && !is_xmm_reg(dst_reg) && off_reg != dst_reg {
                 let off_name = phys_reg_name(off_reg);
                 let dst_name = phys_reg_name(dst_reg);
-                self.state.out.emit_instr_sym_base_reg(
-                    "    leaq", name, "rip", dst_name,
-                );
+                self.state
+                    .out
+                    .emit_instr_sym_base_reg("    leaq", name, "rip", dst_name);
                 self.state.emit_fmt(format_args!(
                     "    {}q %{}, %{}",
                     if subtract { "sub" } else { "add" },
@@ -132,11 +144,13 @@ impl X86Codegen {
         // in PIC mode (globals_tls regression: static __thread read garbage
         // when GOTTPOFF was forced for a local symbol).
         if self.state.pic_mode && !self.state.local_symbols.contains(name) {
-            self.state.emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
+            self.state
+                .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
             self.state.emit("    addq %fs:0, %rax");
         } else {
             self.state.emit("    movq %fs:0, %rax");
-            self.state.emit_fmt(format_args!("    leaq {}@TPOFF(%rax), %rax", name));
+            self.state
+                .emit_fmt(format_args!("    leaq {}@TPOFF(%rax), %rax", name));
         }
         self.store_rax_to(dest);
     }
@@ -146,12 +160,16 @@ impl X86Codegen {
         if let Some(d_reg) = self.dest_reg(dest) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name(d_reg);
-                self.state.out.emit_instr_sym_imm_reg("    movq", name, d_name);
+                self.state
+                    .out
+                    .emit_instr_sym_imm_reg("    movq", name, d_name);
                 self.state.reg_cache.invalidate_acc();
                 return;
             }
         }
-        self.state.out.emit_instr_sym_imm_reg("    movq", name, "rax");
+        self.state
+            .out
+            .emit_instr_sym_imm_reg("    movq", name, "rax");
         self.store_rax_to(dest);
     }
 
@@ -189,7 +207,10 @@ impl X86Codegen {
                 } else {
                     phys_reg_name(d_reg)
                 };
-                self.state.emit_fmt(format_args!("    {} {}(%rip), %{}", load_instr, sym, d_name));
+                self.state.emit_fmt(format_args!(
+                    "    {} {}(%rip), %{}",
+                    load_instr, sym, d_name
+                ));
                 self.state.reg_cache.invalidate_acc();
                 return;
             }
@@ -210,7 +231,10 @@ impl X86Codegen {
         }
         let load_instr = Self::mov_load_for_type(ty);
         let dest_reg = Self::load_dest_reg(ty);
-        self.state.emit_fmt(format_args!("    {} {}(%rip), {}", load_instr, sym, dest_reg));
+        self.state.emit_fmt(format_args!(
+            "    {} {}(%rip), {}",
+            load_instr, sym, dest_reg
+        ));
         self.emit_store_result_impl(dest);
     }
 
@@ -235,7 +259,10 @@ impl X86Codegen {
                 } else {
                     let store_instr = Self::mov_store_for_type(ty);
                     let v_name = typed_phys_reg_name(v_reg, ty);
-                    self.state.emit_fmt(format_args!("    {} %{}, {}(%rip)", store_instr, v_name, sym));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, {}(%rip)",
+                        store_instr, v_name, sym
+                    ));
                     return;
                 }
             }
@@ -257,7 +284,10 @@ impl X86Codegen {
         self.emit_load_operand_impl(val);
         let store_instr = Self::mov_store_for_type(ty);
         let store_reg = Self::reg_for_type("rax", ty);
-        self.state.emit_fmt(format_args!("    {} %{}, {}(%rip)", store_instr, store_reg, sym));
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}(%rip)",
+            store_instr, store_reg, sym
+        ));
     }
 
     pub(super) fn emit_label_addr_impl(&mut self, dest: &Value, label: &str) {
@@ -265,12 +295,16 @@ impl X86Codegen {
         if let Some(d_reg) = self.dest_reg(dest) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name(d_reg);
-                self.state.out.emit_instr_sym_base_reg("    leaq", label, "rip", d_name);
+                self.state
+                    .out
+                    .emit_instr_sym_base_reg("    leaq", label, "rip", d_name);
                 self.state.reg_cache.invalidate_acc();
                 return;
             }
         }
-        self.state.out.emit_instr_sym_base_reg("    leaq", label, "rip", "rax");
+        self.state
+            .out
+            .emit_instr_sym_base_reg("    leaq", label, "rip", "rax");
         self.store_rax_to(dest);
     }
 
@@ -298,7 +332,9 @@ impl X86Codegen {
             }
         }
         if let Some(slot) = self.state.get_slot(dest.0) {
-            self.state.out.emit_instr_reg_rbp("    movdqu", "xmm0", slot.0);
+            self.state
+                .out
+                .emit_instr_reg_rbp("    movdqu", "xmm0", slot.0);
             return;
         }
         self.operand_to_reg(&Operand::Value(*dest), "rax");

@@ -67,7 +67,11 @@ impl SectionData {
     /// Empty section (`SHT_NOBITS`, or a zero-length section).
     #[inline]
     pub fn empty() -> Self {
-        SectionData { buf: FileBacking::owned(Arc::from(&[][..])), start: 0, end: 0 }
+        SectionData {
+            buf: FileBacking::owned(Arc::from(&[][..])),
+            start: 0,
+            end: 0,
+        }
     }
 
     /// A window `[start, start + len)` into an existing shared buffer.
@@ -90,7 +94,11 @@ impl SectionData {
         if end > buf.as_slice().len() {
             return None;
         }
-        Some(SectionData { buf: buf.clone(), start, end })
+        Some(SectionData {
+            buf: buf.clone(),
+            start,
+            end,
+        })
     }
 
     /// Take ownership of bytes that do not come from an input file
@@ -98,7 +106,11 @@ impl SectionData {
     #[inline]
     pub fn owned(bytes: Vec<u8>) -> Self {
         let end = bytes.len();
-        SectionData { buf: FileBacking::owned(Arc::from(bytes)), start: 0, end }
+        SectionData {
+            buf: FileBacking::owned(Arc::from(bytes)),
+            start: 0,
+            end,
+        }
     }
 
     #[inline]
@@ -190,7 +202,14 @@ mod tests {
     #[test]
     fn slice_windows_expose_exact_range() {
         let b = buf(64);
-        for (start, len) in [(0usize, 0usize), (0, 1), (0, 64), (10, 20), (63, 1), (64, 0)] {
+        for (start, len) in [
+            (0usize, 0usize),
+            (0, 1),
+            (0, 64),
+            (10, 20),
+            (63, 1),
+            (64, 0),
+        ] {
             let sd = SectionData::slice(&b, start, len)
                 .unwrap_or_else(|| panic!("in-bounds slice {start}+{len} rejected"));
             assert_eq!(sd.len(), len, "len for {start}+{len}");
@@ -208,10 +227,19 @@ mod tests {
     fn out_of_range_and_overflowing_windows_are_rejected() {
         let b = buf(16);
         assert!(SectionData::slice(&b, 0, 17).is_none(), "past end");
-        assert!(SectionData::slice(&b, 16, 1).is_none(), "starts at end, non-empty");
+        assert!(
+            SectionData::slice(&b, 16, 1).is_none(),
+            "starts at end, non-empty"
+        );
         assert!(SectionData::slice(&b, 17, 0).is_none(), "starts past end");
-        assert!(SectionData::slice(&b, usize::MAX, 1).is_none(), "offset overflow");
-        assert!(SectionData::slice(&b, 1, usize::MAX).is_none(), "length overflow");
+        assert!(
+            SectionData::slice(&b, usize::MAX, 1).is_none(),
+            "offset overflow"
+        );
+        assert!(
+            SectionData::slice(&b, 1, usize::MAX).is_none(),
+            "length overflow"
+        );
     }
 
     /// Cloning must share, not copy: that is the entire point of the type.
@@ -288,25 +316,25 @@ mod tests {
         const MARKER: &[u8] = b"ALIASME!";
         let mut f = vec![0u8; 64];
         f[0..4].copy_from_slice(b"\x7fELF");
-        f[4] = 2;            // ELFCLASS64
-        f[5] = 1;            // ELFDATA2LSB
-        f[6] = 1;            // EV_CURRENT
-        f[16..18].copy_from_slice(&1u16.to_le_bytes());   // ET_REL
-        f[18..20].copy_from_slice(&62u16.to_le_bytes());  // EM_X86_64
+        f[4] = 2; // ELFCLASS64
+        f[5] = 1; // ELFDATA2LSB
+        f[6] = 1; // EV_CURRENT
+        f[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
+        f[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         let data_off = 64usize;
         f.extend_from_slice(MARKER);
         let shoff = f.len();
         f[40..48].copy_from_slice(&(shoff as u64).to_le_bytes()); // e_shoff
-        f[58..60].copy_from_slice(&64u16.to_le_bytes());          // e_shentsize
-        f[60..62].copy_from_slice(&2u16.to_le_bytes());           // e_shnum
-        f[62..64].copy_from_slice(&0u16.to_le_bytes());           // e_shstrndx
+        f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        f[60..62].copy_from_slice(&2u16.to_le_bytes()); // e_shnum
+        f[62..64].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
 
         // SHT_NULL, then our PROGBITS section.
         f.extend_from_slice(&[0u8; 64]);
         let mut sh = [0u8; 64];
-        sh[4..8].copy_from_slice(&1u32.to_le_bytes());                    // SHT_PROGBITS
-        sh[24..32].copy_from_slice(&(data_off as u64).to_le_bytes());      // sh_offset
-        sh[32..40].copy_from_slice(&(MARKER.len() as u64).to_le_bytes());  // sh_size
+        sh[4..8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+        sh[24..32].copy_from_slice(&(data_off as u64).to_le_bytes()); // sh_offset
+        sh[32..40].copy_from_slice(&(MARKER.len() as u64).to_le_bytes()); // sh_size
         f.extend_from_slice(&sh);
 
         let buf: Arc<[u8]> = Arc::from(f);
@@ -319,10 +347,12 @@ mod tests {
         assert_eq!(&**sd, MARKER, "section contents");
 
         let p = sd.as_slice().as_ptr() as usize;
-        assert!(p >= buf_start && p < buf_end,
-                "section data at {p:#x} is outside the input buffer \
+        assert!(
+            p >= buf_start && p < buf_end,
+            "section data at {p:#x} is outside the input buffer \
                  [{buf_start:#x}, {buf_end:#x}) -- it was COPIED, so the \
-                 zero-copy property regressed");
+                 zero-copy property regressed"
+        );
         assert_eq!(p, buf_start + data_off, "window must point at sh_offset");
     }
 
@@ -334,10 +364,14 @@ mod tests {
         let b = buf(128);
         // Window arithmetic is what enforces this; verify the primitive
         // refuses a range outside the object extent it is given.
-        assert!(SectionData::slice(&b, 100, 40).is_none(),
-                "range past buffer end must be refused");
-        assert!(SectionData::slice(&b, 100, 28).is_some(),
-                "range ending exactly at buffer end is fine");
+        assert!(
+            SectionData::slice(&b, 100, 40).is_none(),
+            "range past buffer end must be refused"
+        );
+        assert!(
+            SectionData::slice(&b, 100, 28).is_some(),
+            "range ending exactly at buffer end is fine"
+        );
     }
 
     /// The whole point of the mmap work: an object parsed from a mapped file

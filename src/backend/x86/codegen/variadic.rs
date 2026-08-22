@@ -25,9 +25,9 @@
 //!
 //! Correctness is a hard constraint: fast wrong codegen is worthless.
 
-use crate::ir::reexports::Value;
+use super::emit::{phys_reg_name, X86Codegen};
 use crate::common::types::{EightbyteClass, IrType};
-use super::emit::{X86Codegen, phys_reg_name};
+use crate::ir::reexports::Value;
 
 /// gp_offset exclusive upper bound (6 integer arg regs × 8 bytes).
 const GP_MAX: i64 = 48;
@@ -43,7 +43,12 @@ impl X86Codegen {
     // va_arg — scalar
     // =========================================================================
 
-    pub(super) fn emit_va_arg_impl(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
+    pub(super) fn emit_va_arg_impl(
+        &mut self,
+        dest: &Value,
+        va_list_ptr: &Value,
+        result_ty: IrType,
+    ) {
         // long double (x87 80-bit in a 16-byte slot): always MEMORY.
         if result_ty.is_long_double() {
             self.emit_va_arg_long_double(dest, va_list_ptr);
@@ -311,12 +316,7 @@ impl X86Codegen {
         }
 
         // ==== Register path (fall-through). %eax = gp_offset, %edx = fp_offset. ====
-        self.emit_va_arg_struct_register_path(
-            eightbyte_classes,
-            gp_count,
-            fp_count,
-            &label_end,
-        );
+        self.emit_va_arg_struct_register_path(eightbyte_classes, gp_count, fp_count, &label_end);
 
         // ==== Memory (overflow) path. %rcx = &va_list, %rdi = dest still live. ====
         self.state.out.emit_named_label(&label_mem);
@@ -420,7 +420,10 @@ impl X86Codegen {
     fn emit_va_arg_struct_overflow_body(&mut self, size: usize, align: usize) {
         self.state.emit("    movq 8(%rcx), %rsi"); // overflow_arg_area
         if align > 8 {
-            debug_assert!(align.is_power_of_two(), "struct align must be a power of two");
+            debug_assert!(
+                align.is_power_of_two(),
+                "struct align must be a power of two"
+            );
             self.state
                 .emit_fmt(format_args!("    addq ${}, %rsi", align - 1));
             self.state
@@ -435,8 +438,10 @@ impl X86Codegen {
         let mut remaining = size;
         if !self.no_sse {
             while remaining >= 16 {
-                self.state.emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", off));
-                self.state.emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", off));
+                self.state
+                    .emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", off));
+                self.state
+                    .emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", off));
                 off += 16;
                 remaining -= 16;
             }
@@ -457,7 +462,8 @@ impl X86Codegen {
 
         // Advance overflow_arg_area past the struct (round_up(size, 8)).
         let advance = (size.div_ceil(8) * 8) as i64;
-        self.state.emit_fmt(format_args!("    addq ${}, %rsi", advance));
+        self.state
+            .emit_fmt(format_args!("    addq ${}, %rsi", advance));
         self.state.emit("    movq %rsi, 8(%rcx)");
     }
 
@@ -469,7 +475,9 @@ impl X86Codegen {
         // &va_list → %rax
         if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
             let reg_name = phys_reg_name(reg);
-            self.state.out.emit_instr_reg_reg("    movq", reg_name, "rax");
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rax");
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             if self.state.is_alloca(va_list_ptr.0) {
                 self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
@@ -507,7 +515,9 @@ impl X86Codegen {
 
         // reg_save_area (negative offset from rbp).
         let reg_save = self.reg_save_area_offset;
-        self.state.out.emit_instr_rbp_reg("    leaq", reg_save, "rcx");
+        self.state
+            .out
+            .emit_instr_rbp_reg("    leaq", reg_save, "rcx");
         self.state.emit("    movq %rcx, 16(%rax)");
 
         self.state.reg_cache.invalidate_all();

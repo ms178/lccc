@@ -28,15 +28,8 @@
 //! the same type can be narrowed, since sign/zero extension preserves
 //! the ordering of values.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrFunction,
-    Operand,
-};
 use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand};
 
 /// Information about a Cast instruction (widening).
 #[derive(Clone)]
@@ -81,8 +74,15 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
     let mut widen_map: Vec<Option<CastInfo>> = vec![None; max_id + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Cast { dest, src, from_ty, to_ty } = inst {
-                let is_widen = from_ty.is_integer() && (*to_ty == IrType::I64 || *to_ty == IrType::U64)
+            if let Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                let is_widen = from_ty.is_integer()
+                    && (*to_ty == IrType::I64 || *to_ty == IrType::U64)
                     && from_ty.size() < to_ty.size();
                 if is_widen {
                     let id = dest.0 as usize;
@@ -102,7 +102,14 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
     let mut binop_map: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst {
+            if let Instruction::BinOp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
                 if *ty == IrType::I64 || *ty == IrType::U64 {
                     let id = dest.0 as usize;
                     if id <= max_id {
@@ -150,7 +157,8 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
 
     let mut narrowed_map: Vec<Option<IrType>> = vec![None; max_id + 1];
 
-    changes += narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &mut narrowed_map);
+    changes +=
+        narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_through_stores(func, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
@@ -209,7 +217,12 @@ fn narrow_through_stores(
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Cast { dest, from_ty, to_ty, .. } => {
+                Instruction::Cast {
+                    dest,
+                    from_ty,
+                    to_ty,
+                    ..
+                } => {
                     if (*to_ty == IrType::I64 || *to_ty == IrType::U64)
                         && from_ty.is_integer()
                         && from_ty.size() == 4
@@ -236,7 +249,14 @@ fn narrow_through_stores(
         let mut changed = false;
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst {
+                if let Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } = inst
+                {
                     if !(*ty == IrType::I64 || *ty == IrType::U64) {
                         continue;
                     }
@@ -260,19 +280,20 @@ fn narrow_through_stores(
     // Disqualification is monotone; iterate until stable.
     loop {
         let mut disqualified = false;
-        let mut mark_bad = |v: &Operand, ok: bool, ntype: &mut Vec<Option<IrType>>, max_id: usize| {
-            if let Operand::Value(vv) = v {
-                let id = vv.0 as usize;
-                if id <= max_id && ntype[id].is_some() && !ok {
-                    ntype[id] = None;
-                    true
+        let mut mark_bad =
+            |v: &Operand, ok: bool, ntype: &mut Vec<Option<IrType>>, max_id: usize| {
+                if let Operand::Value(vv) = v {
+                    let id = vv.0 as usize;
+                    if id <= max_id && ntype[id].is_some() && !ok {
+                        ntype[id] = None;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
-            } else {
-                false
-            }
-        };
+            };
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
@@ -285,12 +306,18 @@ fn narrow_through_stores(
                                         Some(t) => t.size() == ty.size(),
                                         None => true,
                                     }
-                                } else { true }
+                                } else {
+                                    true
+                                }
                             }
                             _ => true,
                         };
-                        if mark_bad(val, val_ok, &mut ntype, max_id) { disqualified = true; }
-                        if mark_bad(&Operand::Value(*ptr), false, &mut ntype, max_id) { disqualified = true; }
+                        if mark_bad(val, val_ok, &mut ntype, max_id) {
+                            disqualified = true;
+                        }
+                        if mark_bad(&Operand::Value(*ptr), false, &mut ntype, max_id) {
+                            disqualified = true;
+                        }
                     }
                     Instruction::Cast { src, to_ty, .. } => {
                         let src_ok = match src {
@@ -305,11 +332,15 @@ fn narrow_through_stores(
                                         }
                                         None => true,
                                     }
-                                } else { true }
+                                } else {
+                                    true
+                                }
                             }
                             _ => true,
                         };
-                        if mark_bad(src, src_ok, &mut ntype, max_id) { disqualified = true; }
+                        if mark_bad(src, src_ok, &mut ntype, max_id) {
+                            disqualified = true;
+                        }
                     }
                     Instruction::BinOp { dest, lhs, rhs, .. } => {
                         let did = dest.0 as usize;
@@ -320,14 +351,20 @@ fn narrow_through_stores(
                                     let id = v.0 as usize;
                                     if id <= max_id {
                                         match ntype[id] {
-                                            Some(t) => dest_narrow.is_some_and(|dt| dt.size() == t.size()),
+                                            Some(t) => {
+                                                dest_narrow.is_some_and(|dt| dt.size() == t.size())
+                                            }
                                             None => true,
                                         }
-                                    } else { true }
+                                    } else {
+                                        true
+                                    }
                                 }
                                 _ => true,
                             };
-                            if mark_bad(opnd, ok, &mut ntype, max_id) { disqualified = true; }
+                            if mark_bad(opnd, ok, &mut ntype, max_id) {
+                                disqualified = true;
+                            }
                         }
                     }
                     _ => {
@@ -364,12 +401,26 @@ fn narrow_through_stores(
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
             match inst {
-                Instruction::BinOp { dest, lhs, rhs, ty, .. } => {
+                Instruction::BinOp {
+                    dest, lhs, rhs, ty, ..
+                } => {
                     let id = dest.0 as usize;
                     if id <= max_id {
                         if let Some(t) = ntype[id] {
-                            let nl = try_narrow_operand(lhs, t, Some(&load_type_map), widen_map, narrowed_map);
-                            let nr = try_narrow_operand(rhs, t, Some(&load_type_map), widen_map, narrowed_map);
+                            let nl = try_narrow_operand(
+                                lhs,
+                                t,
+                                Some(&load_type_map),
+                                widen_map,
+                                narrowed_map,
+                            );
+                            let nr = try_narrow_operand(
+                                rhs,
+                                t,
+                                Some(&load_type_map),
+                                widen_map,
+                                narrowed_map,
+                            );
                             if let (Some(a), Some(b)) = (nl, nr) {
                                 *lhs = a;
                                 *rhs = b;
@@ -386,9 +437,13 @@ fn narrow_through_stores(
                         if id <= max_id {
                             if let Some(t) = ntype[id] {
                                 if t.size() == ty.size() {
-                                    if let Some(new_op) =
-                                        try_narrow_operand(val, t, Some(&load_type_map), widen_map, narrowed_map)
-                                    {
+                                    if let Some(new_op) = try_narrow_operand(
+                                        val,
+                                        t,
+                                        Some(&load_type_map),
+                                        widen_map,
+                                        narrowed_map,
+                                    ) {
                                         *val = new_op;
                                         changes += 1;
                                     }
@@ -497,11 +552,18 @@ fn narrow_binops_with_cast(
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Instruction::Cast { dest, src: Operand::Value(src_val), from_ty, to_ty } = inst {
+            if let Instruction::Cast {
+                dest,
+                src: Operand::Value(src_val),
+                from_ty,
+                to_ty,
+            } = inst
+            {
                 // Must be a narrowing cast from I64 to a smaller integer type
                 if !((*from_ty == IrType::I64 || *from_ty == IrType::U64)
                     && to_ty.is_integer()
-                    && to_ty.size() < from_ty.size()) {
+                    && to_ty.size() < from_ty.size())
+                {
                     continue;
                 }
 
@@ -522,23 +584,30 @@ fn narrow_binops_with_cast(
                 // the upper bits are just copies of the sign/zero bit, and the
                 // lower bits of the result are identical to doing the shift in
                 // the narrow type.
-                let is_safe_op = matches!(binop_info.op,
-                    IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul |
-                    IrBinOp::And | IrBinOp::Or | IrBinOp::Xor |
-                    IrBinOp::Shl
+                let is_safe_op = matches!(
+                    binop_info.op,
+                    IrBinOp::Add
+                        | IrBinOp::Sub
+                        | IrBinOp::Mul
+                        | IrBinOp::And
+                        | IrBinOp::Or
+                        | IrBinOp::Xor
+                        | IrBinOp::Shl
                 );
                 let is_safe_shift = if binop_info.op == IrBinOp::AShr {
                     // AShr narrowing is safe when the LHS was sign-extended
                     // from a signed type of the same size as the target.
                     // sext(x, I32->I64) >> k has the same low 32 bits as
                     // x >> k (I32 arithmetic right shift).
-                    to_ty.is_signed() && is_widened_from_matching_type(&binop_info.lhs, *to_ty, widen_map)
+                    to_ty.is_signed()
+                        && is_widened_from_matching_type(&binop_info.lhs, *to_ty, widen_map)
                 } else if binop_info.op == IrBinOp::LShr {
                     // LShr narrowing is safe when the LHS was zero-extended
                     // from an unsigned type of the same size as the target.
                     // zext(x, U32->U64) >> k has the same low 32 bits as
                     // x >> k (U32 logical right shift).
-                    to_ty.is_unsigned() && is_widened_from_matching_type(&binop_info.lhs, *to_ty, widen_map)
+                    to_ty.is_unsigned()
+                        && is_widened_from_matching_type(&binop_info.lhs, *to_ty, widen_map)
                 } else {
                     false
                 };
@@ -551,8 +620,10 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
-                let narrow_lhs = try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
-                let narrow_rhs = try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map);
+                let narrow_lhs =
+                    try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
+                let narrow_rhs =
+                    try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map);
 
                 if let (Some(new_lhs), Some(new_rhs)) = (narrow_lhs, narrow_rhs) {
                     let narrow_dest = *dest;
@@ -611,7 +682,14 @@ fn narrow_binops_without_cast(
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst {
+            if let Instruction::BinOp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
                 if !(*ty == IrType::I64 || *ty == IrType::U64) {
                     continue;
                 }
@@ -624,17 +702,27 @@ fn narrow_binops_without_cast(
                     continue;
                 }
 
-                let lhs_narrow_ty = operand_narrow_type(lhs, &load_type_map, widen_map, narrowed_map);
-                let rhs_narrow_ty = operand_narrow_type(rhs, &load_type_map, widen_map, narrowed_map);
+                let lhs_narrow_ty =
+                    operand_narrow_type(lhs, &load_type_map, widen_map, narrowed_map);
+                let rhs_narrow_ty =
+                    operand_narrow_type(rhs, &load_type_map, widen_map, narrowed_map);
 
                 let target_ty = match (lhs_narrow_ty, rhs_narrow_ty) {
                     (Some(lt), Some(rt)) if lt == rt => lt,
                     (Some(lt), Some(rt)) if lt.size() == rt.size() => lt,
                     (Some(t), None) => {
-                        if try_narrow_const_operand(rhs, t).is_some() { t } else { continue; }
+                        if try_narrow_const_operand(rhs, t).is_some() {
+                            t
+                        } else {
+                            continue;
+                        }
                     }
                     (None, Some(t)) => {
-                        if try_narrow_const_operand(lhs, t).is_some() { t } else { continue; }
+                        if try_narrow_const_operand(lhs, t).is_some() {
+                            t
+                        } else {
+                            continue;
+                        }
                     }
                     _ => continue,
                 };
@@ -671,8 +759,20 @@ fn narrow_binops_without_cast(
                     }
                 }
 
-                let new_lhs = try_narrow_operand(lhs, target_ty, Some(&load_type_map), widen_map, narrowed_map);
-                let new_rhs = try_narrow_operand(rhs, target_ty, Some(&load_type_map), widen_map, narrowed_map);
+                let new_lhs = try_narrow_operand(
+                    lhs,
+                    target_ty,
+                    Some(&load_type_map),
+                    widen_map,
+                    narrowed_map,
+                );
+                let new_rhs = try_narrow_operand(
+                    rhs,
+                    target_ty,
+                    Some(&load_type_map),
+                    widen_map,
+                    narrowed_map,
+                );
                 if let (Some(nl), Some(nr)) = (new_lhs, new_rhs) {
                     *lhs = nl;
                     *rhs = nr;
@@ -691,16 +791,20 @@ fn narrow_binops_without_cast(
 /// the same type. Only safe when the extension kind matches the comparison
 /// kind (signed cmp needs signed extension, unsigned cmp needs unsigned).
 /// Eq/Ne are safe with either extension kind.
-fn narrow_cmps(
-    func: &mut IrFunction,
-    widen_map: &[Option<CastInfo>],
-) -> usize {
+fn narrow_cmps(func: &mut IrFunction, widen_map: &[Option<CastInfo>]) -> usize {
     let max_id = widen_map.len() - 1;
     let mut changes = 0;
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Instruction::Cmp { dest, op, lhs, rhs, ty } = inst {
+            if let Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
                 if !(*ty == IrType::I64 || *ty == IrType::U64) {
                     continue;
                 }
@@ -708,14 +812,22 @@ fn narrow_cmps(
                 let lhs_cast = match lhs {
                     Operand::Value(v) => {
                         let id = v.0 as usize;
-                        if id <= max_id { widen_map[id].as_ref() } else { None }
+                        if id <= max_id {
+                            widen_map[id].as_ref()
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };
                 let rhs_cast = match rhs {
                     Operand::Value(v) => {
                         let id = v.0 as usize;
-                        if id <= max_id { widen_map[id].as_ref() } else { None }
+                        if id <= max_id {
+                            widen_map[id].as_ref()
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };
@@ -726,10 +838,14 @@ fn narrow_cmps(
                     continue;
                 };
 
-                let is_signed_cmp = matches!(op,
-                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
-                let is_unsigned_cmp = matches!(op,
-                    IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge);
+                let is_signed_cmp = matches!(
+                    op,
+                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+                );
+                let is_unsigned_cmp = matches!(
+                    op,
+                    IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+                );
 
                 if is_signed_cmp && narrow_ty.is_unsigned() {
                     continue;
@@ -739,13 +855,21 @@ fn narrow_cmps(
                 }
 
                 let new_lhs = if let Some(info) = lhs_cast {
-                    if info.from_ty == narrow_ty { info.src } else { continue; }
+                    if info.from_ty == narrow_ty {
+                        info.src
+                    } else {
+                        continue;
+                    }
                 } else {
                     continue;
                 };
 
                 let new_rhs = if let Some(info) = rhs_cast {
-                    if info.from_ty == narrow_ty { info.src } else { continue; }
+                    if info.from_ty == narrow_ty {
+                        info.src
+                    } else {
+                        continue;
+                    }
                 } else if let Operand::Const(c) = rhs {
                     if let Some(narrow_c) = try_narrow_const_for_cmp(c, narrow_ty) {
                         Operand::Const(narrow_c)
@@ -772,7 +896,11 @@ fn narrow_cmps(
 /// (same size and same signedness). Used to validate that right-shift narrowing
 /// is safe: AShr requires the LHS was sign-extended (signed type), and LShr
 /// requires the LHS was zero-extended (unsigned type).
-fn is_widened_from_matching_type(op: &Operand, target_ty: IrType, widen_map: &[Option<CastInfo>]) -> bool {
+fn is_widened_from_matching_type(
+    op: &Operand,
+    target_ty: IrType,
+    widen_map: &[Option<CastInfo>],
+) -> bool {
     if let Operand::Value(v) = op {
         let id = v.0 as usize;
         if id < widen_map.len() {
@@ -808,8 +936,10 @@ fn try_narrow_operand(
             if let Some(ltm) = load_type_map {
                 if id < ltm.len() {
                     if let Some(ty) = &ltm[id] {
-                        if *ty == target_ty || (ty.size() == target_ty.size()
-                            && ty.is_unsigned() == target_ty.is_unsigned()) {
+                        if *ty == target_ty
+                            || (ty.size() == target_ty.size()
+                                && ty.is_unsigned() == target_ty.is_unsigned())
+                        {
                             return Some(Operand::Value(*v));
                         }
                     }
@@ -819,8 +949,9 @@ fn try_narrow_operand(
             if id < widen_map.len() {
                 if let Some(info) = &widen_map[id] {
                     if info.from_ty == target_ty
-                       || (info.from_ty.size() == target_ty.size()
-                           && info.from_ty.is_unsigned() == target_ty.is_unsigned()) {
+                        || (info.from_ty.size() == target_ty.size()
+                            && info.from_ty.is_unsigned() == target_ty.is_unsigned())
+                    {
                         return Some(info.src);
                     }
                 }
@@ -829,17 +960,16 @@ fn try_narrow_operand(
             if id < narrowed_map.len() {
                 if let Some(nt) = &narrowed_map[id] {
                     if *nt == target_ty
-                       || (nt.size() == target_ty.size()
-                           && nt.is_unsigned() == target_ty.is_unsigned()) {
+                        || (nt.size() == target_ty.size()
+                            && nt.is_unsigned() == target_ty.is_unsigned())
+                    {
                         return Some(Operand::Value(*v));
                     }
                 }
             }
             None
         }
-        Operand::Const(c) => {
-            try_narrow_const(c, target_ty).map(Operand::Const)
-        }
+        Operand::Const(c) => try_narrow_const(c, target_ty).map(Operand::Const),
     }
 }
 
@@ -888,7 +1018,11 @@ fn try_narrow_const_operand(op: &Operand, target_ty: IrType) -> Option<IrConst> 
 /// U32 accepts any value in [i32::MIN, u32::MAX] because only the low 32 bits
 /// matter. When `require_roundtrip` is true (comparisons), U32 requires
 /// val >= 0 so the value survives zero-extension back to 64 bits.
-fn try_narrow_const_core(c: &IrConst, target_ty: IrType, require_roundtrip: bool) -> Option<IrConst> {
+fn try_narrow_const_core(
+    c: &IrConst,
+    target_ty: IrType,
+    require_roundtrip: bool,
+) -> Option<IrConst> {
     let val = match c {
         IrConst::I64(v) => *v,
         IrConst::I32(v) => *v as i64,
@@ -910,7 +1044,11 @@ fn try_narrow_const_core(c: &IrConst, target_ty: IrType, require_roundtrip: bool
         IrType::U32 => {
             // For bit-preserving ops, accept [i32::MIN, u32::MAX] (low 32 bits matter).
             // For comparisons, require [0, u32::MAX] (value must round-trip through zext).
-            let lo = if require_roundtrip { 0 } else { i32::MIN as i64 };
+            let lo = if require_roundtrip {
+                0
+            } else {
+                i32::MIN as i64
+            };
             if val >= lo && val <= u32::MAX as i64 {
                 Some(IrConst::from_i64(val, IrType::U32))
             } else {
@@ -1015,7 +1153,13 @@ mod tests {
         // The last instruction should now be a BinOp in I32
         let last = &func.blocks[0].instructions[2];
         match last {
-            Instruction::BinOp { op: IrBinOp::Add, ty: IrType::I32, lhs, rhs, .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                ty: IrType::I32,
+                lhs,
+                rhs,
+                ..
+            } => {
                 // LHS should be the original %0 (unwrapped from the widening cast)
                 assert!(matches!(lhs, Operand::Value(Value(0))));
                 // RHS should be I32(5) (narrowed constant)
@@ -1057,7 +1201,13 @@ mod tests {
 
         let cmp = &func.blocks[0].instructions[1];
         match cmp {
-            Instruction::Cmp { op: IrCmpOp::Sge, ty: IrType::I32, lhs, rhs, .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Sge,
+                ty: IrType::I32,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(lhs, Operand::Value(Value(0))));
                 assert!(matches!(rhs, Operand::Const(IrConst::I32(256))));
             }
@@ -1099,7 +1249,8 @@ mod tests {
         if let Instruction::BinOp { ty, .. } = binop {
             assert!(
                 *ty == IrType::I64 || *ty == IrType::U64,
-                "AND with all-ones mask should NOT be narrowed, got {:?}", ty
+                "AND with all-ones mask should NOT be narrowed, got {:?}",
+                ty
             );
         } // Phase 4 might have transformed it differently
     }
@@ -1181,7 +1332,13 @@ mod tests {
         // The last instruction should now be a BinOp AShr in I32
         let last = &func.blocks[0].instructions[2];
         match last {
-            Instruction::BinOp { op: IrBinOp::AShr, ty: IrType::I32, lhs, rhs, .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::AShr,
+                ty: IrType::I32,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(lhs, Operand::Value(Value(0))));
                 assert!(matches!(rhs, Operand::Const(IrConst::I32(3))));
             }
@@ -1302,9 +1459,18 @@ mod tests {
 
         let last = &func.blocks[0].instructions[2];
         match last {
-            Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, lhs, rhs, .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::LShr,
+                ty: IrType::U32,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(lhs, Operand::Value(Value(0))));
-                assert!(matches!(rhs, Operand::Const(IrConst::I32(3) | IrConst::I64(3))));
+                assert!(matches!(
+                    rhs,
+                    Operand::Const(IrConst::I32(3) | IrConst::I64(3))
+                ));
             }
             other => panic!("Expected narrowed BinOp LShr U32, got {:?}", other),
         }

@@ -7,20 +7,13 @@
 //! performance win for translation units that include many header-defined static
 //! or inline functions.
 
-use std::collections::VecDeque;
+use super::lower::Lowerer;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::frontend::parser::ast::{
-    BlockItem,
-    CompoundStmt,
-    Expr,
-    ExternalDecl,
-    ForInit,
-    FunctionDef,
-    Initializer,
-    Stmt,
+    BlockItem, CompoundStmt, Expr, ExternalDecl, ForInit, FunctionDef, Initializer, Stmt,
     TranslationUnit,
 };
-use super::lower::Lowerer;
+use std::collections::VecDeque;
 
 impl Lowerer {
     /// Returns true if a function definition can be skipped when unreferenced.
@@ -36,8 +29,10 @@ impl Lowerer {
         // Note: in GNU89 mode, `inline` without `extern` provides an external def,
         // so this rule does not apply.
         let is_c99_inline_only = !self.gnu89_inline
-            && func.attrs.is_inline() && !func.attrs.is_extern()
-            && !func.attrs.is_static() && !func.attrs.is_gnu_inline()
+            && func.attrs.is_inline()
+            && !func.attrs.is_extern()
+            && !func.attrs.is_static()
+            && !func.attrs.is_gnu_inline()
             && !self.has_non_inline_decl.contains(&func.name);
         func.attrs.is_static() || is_gnu_inline_no_extern_def || is_c99_inline_only
     }
@@ -50,7 +45,10 @@ impl Lowerer {
     /// 2. Build a per-function reference map for skippable functions
     /// 3. Worklist-based transitive closure: when a skippable function becomes
     ///    reachable, add its references to the worklist
-    pub(super) fn collect_referenced_static_functions(&self, tu: &TranslationUnit) -> FxHashSet<String> {
+    pub(super) fn collect_referenced_static_functions(
+        &self,
+        tu: &TranslationUnit,
+    ) -> FxHashSet<String> {
         let mut referenced = FxHashSet::default();
         // Map from skippable function name -> set of functions it references
         let mut skippable_refs: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
@@ -124,7 +122,11 @@ impl Lowerer {
     }
 
     /// Collect function name references from a compound statement.
-    pub(super) fn collect_refs_from_compound(&self, compound: &CompoundStmt, refs: &mut FxHashSet<String>) {
+    pub(super) fn collect_refs_from_compound(
+        &self,
+        compound: &CompoundStmt,
+        refs: &mut FxHashSet<String>,
+    ) {
         for item in &compound.items {
             match item {
                 BlockItem::Declaration(decl) => {
@@ -193,8 +195,12 @@ impl Lowerer {
                         }
                     }
                 }
-                if let Some(c) = cond { self.collect_refs_from_expr(c, refs); }
-                if let Some(i) = inc { self.collect_refs_from_expr(i, refs); }
+                if let Some(c) = cond {
+                    self.collect_refs_from_expr(c, refs);
+                }
+                if let Some(i) = inc {
+                    self.collect_refs_from_expr(i, refs);
+                }
                 self.collect_refs_from_stmt(body, refs);
             }
             Stmt::Switch(expr, body, _) => {
@@ -228,7 +234,9 @@ impl Lowerer {
             Stmt::GotoIndirect(expr, _) => {
                 self.collect_refs_from_expr(expr, refs);
             }
-            Stmt::InlineAsm { inputs, outputs, .. } => {
+            Stmt::InlineAsm {
+                inputs, outputs, ..
+            } => {
                 for op in inputs.iter().chain(outputs.iter()) {
                     self.collect_refs_from_expr(&op.expr, refs);
                 }
@@ -247,14 +255,18 @@ impl Lowerer {
             }
             Expr::FunctionCall(callee, args, _) => {
                 self.collect_refs_from_expr(callee, refs);
-                for arg in args { self.collect_refs_from_expr(arg, refs); }
+                for arg in args {
+                    self.collect_refs_from_expr(arg, refs);
+                }
             }
-            Expr::BinaryOp(_, lhs, rhs, _) | Expr::Assign(lhs, rhs, _)
+            Expr::BinaryOp(_, lhs, rhs, _)
+            | Expr::Assign(lhs, rhs, _)
             | Expr::CompoundAssign(_, lhs, rhs, _) => {
                 self.collect_refs_from_expr(lhs, refs);
                 self.collect_refs_from_expr(rhs, refs);
             }
-            Expr::UnaryOp(_, operand, _) | Expr::PostfixOp(_, operand, _)
+            Expr::UnaryOp(_, operand, _)
+            | Expr::PostfixOp(_, operand, _)
             | Expr::Cast(_, operand, _) => {
                 self.collect_refs_from_expr(operand, refs);
             }
@@ -298,7 +310,11 @@ impl Lowerer {
     }
 
     /// Collect function name references from an initializer.
-    pub(super) fn collect_refs_from_initializer(&self, init: &Initializer, refs: &mut FxHashSet<String>) {
+    pub(super) fn collect_refs_from_initializer(
+        &self,
+        init: &Initializer,
+        refs: &mut FxHashSet<String>,
+    ) {
         match init {
             Initializer::Expr(e) => self.collect_refs_from_expr(e, refs),
             Initializer::List(items) => {

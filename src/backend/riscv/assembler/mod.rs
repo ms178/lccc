@@ -10,20 +10,27 @@
 //! - `compress.rs`   – RV64C compressed instruction support (32-bit → 16-bit)
 //! - `elf_writer.rs` – Write ELF object files with sections, symbols, and relocations
 
-pub mod parser;
-pub mod encoder;
 pub mod compress;
 pub mod elf_writer;
+pub mod encoder;
+pub mod parser;
 
-use parser::parse_asm;
-use elf_writer::{ElfWriter, EF_RISCV_RVC, EF_RISCV_FLOAT_ABI_SINGLE, EF_RISCV_FLOAT_ABI_DOUBLE, EF_RISCV_FLOAT_ABI_QUAD};
 use crate::backend::elf::{ELFCLASS32, ELFCLASS64};
+use elf_writer::{
+    ElfWriter, EF_RISCV_FLOAT_ABI_DOUBLE, EF_RISCV_FLOAT_ABI_QUAD, EF_RISCV_FLOAT_ABI_SINGLE,
+    EF_RISCV_RVC,
+};
+use parser::parse_asm;
 
 /// Assemble RISC-V assembly text into an ELF object file, with extra args.
 ///
 /// Supports `-mabi=` to control ELF float ABI flags and ELF class (32/64-bit),
 /// and `-march=` to control ELF class (rv32 vs rv64) and RVC flag.
-pub fn assemble_with_args(asm_text: &str, output_path: &str, extra_args: &[String]) -> Result<(), String> {
+pub fn assemble_with_args(
+    asm_text: &str,
+    output_path: &str,
+    extra_args: &[String],
+) -> Result<(), String> {
     let statements = parse_asm(asm_text)?;
     let mut writer = ElfWriter::new();
 
@@ -82,7 +89,11 @@ fn elf_flags_for_abi(abi: &str, has_rvc: bool) -> u32 {
         "lp64q" | "ilp32q" => EF_RISCV_FLOAT_ABI_QUAD,
         _ => EF_RISCV_FLOAT_ABI_DOUBLE, // default
     };
-    if has_rvc { float_abi | EF_RISCV_RVC } else { float_abi }
+    if has_rvc {
+        float_abi | EF_RISCV_RVC
+    } else {
+        float_abi
+    }
 }
 
 /// Check if a -march= string includes the 'c' (compressed) extension.

@@ -32,13 +32,13 @@
 //!
 //! Safe degradation is “don't promote”.
 
+use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
-use super::loop_analysis;
 use std::sync::OnceLock;
 
 const MAX_PROMOTIONS: usize = 64;
@@ -255,7 +255,11 @@ fn alloca_access_is_nonfaulting(
     }
 
     let required_align = access_ty.align();
-    let object_align = if *align == 0 { object_ty.align() } else { *align };
+    let object_align = if *align == 0 {
+        object_ty.align()
+    } else {
+        *align
+    };
     object_align % required_align == 0 && offset % required_align == 0
 }
 
@@ -298,7 +302,10 @@ fn disjoint(paths: &FxHashMap<u32, Path>, a: Value, a_ty: IrType, b: Value, b_ty
     ae <= pb.offset || be <= pa.offset
 }
 
-pub(crate) fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Value) -> Option<(u32, i64)> {
+pub(crate) fn resolve_ptr_chain(
+    defs: &FxHashMap<u32, &Instruction>,
+    start: Value,
+) -> Option<(u32, i64)> {
     let mut cur = start;
     let mut off: i64 = 0;
     let mut seen = FxHashSet::default();
@@ -325,8 +332,9 @@ pub(crate) fn resolve_ptr_chain(defs: &FxHashMap<u32, &Instruction>, start: Valu
                 rhs,
                 ..
             } => match (lhs, rhs) {
-                (Operand::Value(v), Operand::Const(c))
-                | (Operand::Const(c), Operand::Value(v)) => c.to_i64().map(|k| (*v, k)),
+                (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) => {
+                    c.to_i64().map(|k| (*v, k))
+                }
                 _ => None,
             },
             _ => None,
@@ -353,7 +361,10 @@ pub(crate) struct LinForm {
     pub(crate) march: i64,
 }
 
-pub(crate) fn striding_phi(defs: &FxHashMap<u32, &Instruction>, phi_v: Value) -> Option<(Operand, i64)> {
+pub(crate) fn striding_phi(
+    defs: &FxHashMap<u32, &Instruction>,
+    phi_v: Value,
+) -> Option<(Operand, i64)> {
     let Instruction::Phi { incoming, .. } = *defs.get(&phi_v.0)? else {
         return None;
     };
@@ -438,7 +449,8 @@ pub(crate) fn resolve_lin_form(
                     f.konst = f.konst.checked_add(c.to_i64()?)?;
                 }
                 Operand::Value(ov) => {
-                    let g = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *ov, fuel)?;
+                    let g =
+                        resolve_lin_form(func, defs, lp_body, def_block, cur_header, *ov, fuel)?;
                     f = merge_forms(f, g)?;
                 }
             }
@@ -456,7 +468,8 @@ pub(crate) fn resolve_lin_form(
                 merge_forms(fa, fb)
             }
             (Operand::Value(a), Operand::Const(c)) | (Operand::Const(c), Operand::Value(a)) => {
-                let mut fa = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *a, fuel)?;
+                let mut fa =
+                    resolve_lin_form(func, defs, lp_body, def_block, cur_header, *a, fuel)?;
                 fa.konst = fa.konst.checked_add(c.to_i64()?)?;
                 Some(fa)
             }
@@ -537,10 +550,7 @@ pub(crate) fn resolve_lin_form(
             }
             let mut iv_sym = None;
             for binst in &func.blocks[outer_header].instructions {
-                let Instruction::Phi {
-                    dest, ty: ity, ..
-                } = binst
-                else {
+                let Instruction::Phi { dest, ty: ity, .. } = binst else {
                     continue;
                 };
                 if *ity == IrType::Ptr {
@@ -633,8 +643,24 @@ fn affine_disjoint(
     if def_block.get(&cand.0).is_some_and(|b| lp_body.contains(b)) {
         return false;
     }
-    let cf = resolve_lin_form(func, defs, lp_body, def_block, header_idx, cand, RESOLVE_FUEL);
-    let sf = resolve_lin_form(func, defs, lp_body, def_block, header_idx, store, RESOLVE_FUEL);
+    let cf = resolve_lin_form(
+        func,
+        defs,
+        lp_body,
+        def_block,
+        header_idx,
+        cand,
+        RESOLVE_FUEL,
+    );
+    let sf = resolve_lin_form(
+        func,
+        defs,
+        lp_body,
+        def_block,
+        header_idx,
+        store,
+        RESOLVE_FUEL,
+    );
     if promote_debug() {
         eprintln!(
             "[AFFINE] cand={} -> {:?}; store={} -> {:?}",
@@ -848,9 +874,7 @@ fn rewrite_uses_in_inst(inst: &mut Instruction, from: u32, to: u32) {
                 rewrite_value(v, from, to);
             }
         }
-        Instruction::Intrinsic {
-            args, dest_ptr, ..
-        } => {
+        Instruction::Intrinsic { args, dest_ptr, .. } => {
             for a in args {
                 rewrite_operand(a, from, to);
             }
@@ -1114,15 +1138,7 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             // store on a source-level zero-trip path. Require either a proved
             // safe local access or must-execute proofs for both operations.
             if !accesses_may_be_speculated(
-                &defs,
-                &paths,
-                ptr,
-                load_ty,
-                load_seg,
-                &cfg.idom,
-                load_b,
-                *store_b,
-                exit_from,
+                &defs, &paths, ptr, load_ty, load_seg, &cfg.idom, load_b, *store_b, exit_from,
             ) {
                 continue;
             }
@@ -1131,15 +1147,7 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             let mut may_alias = |other: Value, other_ty: IrType| {
                 !disjoint(&paths, ptr, load_ty, other, other_ty)
                     && !affine_disjoint(
-                        func,
-                        &defs,
-                        &lp.body,
-                        &def_block,
-                        lp.header,
-                        ptr,
-                        load_ty,
-                        other,
-                        other_ty,
+                        func, &defs, &lp.body, &def_block, lp.header, ptr, load_ty, other, other_ty,
                     )
             };
             for (&other_ptr, other_stores) in &stores {
@@ -1212,7 +1220,8 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     insert_inst(
         &mut func.blocks[plan.preheader],
         preheader_end,
-        Instruction::Load { volatile: false,
+        Instruction::Load {
+            volatile: false,
             dest: init,
             ptr: plan.ptr,
             ty: plan.load_ty,
@@ -1261,7 +1270,8 @@ fn apply_promotion(func: &mut IrFunction, plan: PromotePlan) -> usize {
     insert_inst(
         &mut func.blocks[plan.exit_block],
         exit_insert,
-        Instruction::Store { volatile: false,
+        Instruction::Store {
+            volatile: false,
             val: exit_val,
             ptr: plan.ptr,
             ty: plan.load_ty,
@@ -1373,15 +1383,39 @@ mod tests {
         let _restore = RestorePointerSize(crate::common::types::target_ptr_size());
         assert_eq!(byte_size(IrType::I32), Some(4));
         let mut paths = FxHashMap::default();
-        paths.insert(1, Path { root: TAG_ALLOCA | 1, offset: 0 });
-        paths.insert(2, Path { root: TAG_ALLOCA | 1, offset: 4 });
+        paths.insert(
+            1,
+            Path {
+                root: TAG_ALLOCA | 1,
+                offset: 0,
+            },
+        );
+        paths.insert(
+            2,
+            Path {
+                root: TAG_ALLOCA | 1,
+                offset: 4,
+            },
+        );
 
         crate::common::types::set_target_ptr_size(4);
         assert_eq!(byte_size(IrType::Ptr), Some(4));
-        assert!(disjoint(&paths, Value(1), IrType::Ptr, Value(2), IrType::Ptr));
+        assert!(disjoint(
+            &paths,
+            Value(1),
+            IrType::Ptr,
+            Value(2),
+            IrType::Ptr
+        ));
         crate::common::types::set_target_ptr_size(8);
         assert_eq!(byte_size(IrType::Ptr), Some(8));
-        assert!(!disjoint(&paths, Value(1), IrType::Ptr, Value(2), IrType::Ptr));
+        assert!(!disjoint(
+            &paths,
+            Value(1),
+            IrType::Ptr,
+            Value(2),
+            IrType::Ptr
+        ));
         assert!(!is_promotable_type(IrType::I128));
         assert!(!is_promotable_type(IrType::F128));
     }
@@ -1652,7 +1686,8 @@ mod tests {
                         volatile: false,
                         semantic_volatile: false,
                     },
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(0)),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1664,7 +1699,8 @@ mod tests {
             block(
                 1,
                 vec![
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1677,7 +1713,8 @@ mod tests {
                         rhs: Operand::Const(IrConst::I32(1)),
                         ty: IrType::I32,
                     },
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Value(Value(2)),
                         ptr: Value(0),
                         ty: IrType::I32,

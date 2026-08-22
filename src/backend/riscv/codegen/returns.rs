@@ -1,7 +1,7 @@
 //! RiscvCodegen: return value handling.
 
-use crate::ir::reexports::{IrConst, Operand, Value};
 use super::emit::RiscvCodegen;
+use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl RiscvCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {

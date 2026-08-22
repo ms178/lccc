@@ -6,10 +6,10 @@ use super::*;
 /// The vtypei is specified as a sequence of operands: e.g., e8, m8, ta, ma
 /// Returns the encoded vtypei value.
 pub(crate) fn parse_vtypei(operands: &[Operand], start_idx: usize) -> Result<u32, String> {
-    let mut sew: u32 = 0;  // SEW encoding (3 bits): e8=000, e16=001, e32=010, e64=011
+    let mut sew: u32 = 0; // SEW encoding (3 bits): e8=000, e16=001, e32=010, e64=011
     let mut lmul: u32 = 0; // LMUL encoding (3 bits): m1=000, m2=001, m4=010, m8=011, mf2=111, mf4=110, mf8=101
-    let mut ta: u32 = 0;   // Tail agnostic
-    let mut ma: u32 = 0;   // Mask agnostic
+    let mut ta: u32 = 0; // Tail agnostic
+    let mut ma: u32 = 0; // Mask agnostic
 
     for i in start_idx..operands.len() {
         let name = match &operands[i] {
@@ -61,7 +61,12 @@ pub(crate) fn encode_vsetivli(operands: &[Operand]) -> Result<EncodeResult, Stri
     let uimm = get_imm(operands, 1)? as u32 & 0x1F;
     let vtypei = parse_vtypei(operands, 2)?;
     // bits [31:30] = 11 for vsetivli
-    let word = (0b11u32 << 30) | ((vtypei & 0x3FF) << 20) | (uimm << 15) | (0b111 << 12) | (rd << 7) | OP_V;
+    let word = (0b11u32 << 30)
+        | ((vtypei & 0x3FF) << 20)
+        | (uimm << 15)
+        | (0b111 << 12)
+        | (rd << 7)
+        | OP_V;
     Ok(EncodeResult::Word(word))
 }
 
@@ -78,7 +83,11 @@ pub(crate) fn encode_vsetvl(operands: &[Operand]) -> Result<EncodeResult, String
 /// Encode vector unit-stride load: vle{8,16,32,64}.v vd, (rs1)
 /// Format: nf[31:29] | mew[28] | mop[27:26]=00 | vm[25] | lumop[24:20] | rs1[19:15] | width[14:12] | vd[11:7] | 0000111
 /// For unit-stride: mop=00, lumop=00000 (or 01011 for whole-reg/mask)
-pub(crate) fn encode_vload(operands: &[Operand], width: u32, lumop: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_vload(
+    operands: &[Operand],
+    width: u32,
+    lumop: u32,
+) -> Result<EncodeResult, String> {
     let vd = get_vreg(operands, 0)?;
     // The second operand should be a memory operand (rs1) like (a1)
     let rs1 = match operands.get(1) {
@@ -94,14 +103,17 @@ pub(crate) fn encode_vload(operands: &[Operand], width: u32, lumop: u32) -> Resu
     // vm=1 means unmasked (no v0.t)
     let vm: u32 = 1;
     // nf=000 (single segment), mew=0, mop=00 (bits 31:26 = 0)
-    let word = (vm << 25)
-        | (lumop << 20) | (rs1 << 15) | (width << 12) | (vd << 7) | OP_LOAD_FP;
+    let word = (vm << 25) | (lumop << 20) | (rs1 << 15) | (width << 12) | (vd << 7) | OP_LOAD_FP;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode vector unit-stride store: vse{8,16,32,64}.v vs3, (rs1)
 /// Format: nf[31:29] | mew[28] | mop[27:26]=00 | vm[25] | sumop[24:20] | rs1[19:15] | width[14:12] | vs3[11:7] | 0100111
-pub(crate) fn encode_vstore(operands: &[Operand], width: u32, sumop: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_vstore(
+    operands: &[Operand],
+    width: u32,
+    sumop: u32,
+) -> Result<EncodeResult, String> {
     let vs3 = get_vreg(operands, 0)?;
     let rs1 = match operands.get(1) {
         Some(Operand::Mem { base, offset: 0 }) => {
@@ -114,8 +126,7 @@ pub(crate) fn encode_vstore(operands: &[Operand], width: u32, sumop: u32) -> Res
     };
     let vm: u32 = 1;
     // nf=000, mew=0, mop=00 (bits 31:26 = 0)
-    let word = (vm << 25)
-        | (sumop << 20) | (rs1 << 15) | (width << 12) | (vs3 << 7) | OP_STORE_FP;
+    let word = (vm << 25) | (sumop << 20) | (rs1 << 15) | (width << 12) | (vs3 << 7) | OP_STORE_FP;
     Ok(EncodeResult::Word(word))
 }
 
@@ -125,7 +136,7 @@ pub(crate) fn encode_v_arith_vv(operands: &[Operand], funct6: u32) -> Result<Enc
     let vs2 = get_vreg(operands, 1)?;
     let vs1 = get_vreg(operands, 2)?;
     let vm: u32 = 1; // unmasked
-    // funct3=000 (OPIVV)
+                     // funct3=000 (OPIVV)
     let word = (funct6 << 26) | (vm << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | OP_V;
     Ok(EncodeResult::Word(word))
 }
@@ -136,7 +147,8 @@ pub(crate) fn encode_v_arith_vx(operands: &[Operand], funct6: u32) -> Result<Enc
     let vs2 = get_vreg(operands, 1)?;
     let rs1 = get_reg(operands, 2)?;
     let vm: u32 = 1;
-    let word = (funct6 << 26) | (vm << 25) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | OP_V;
+    let word =
+        (funct6 << 26) | (vm << 25) | (vs2 << 20) | (rs1 << 15) | (0b100 << 12) | (vd << 7) | OP_V;
     Ok(EncodeResult::Word(word))
 }
 
@@ -146,7 +158,13 @@ pub(crate) fn encode_v_arith_vi(operands: &[Operand], funct6: u32) -> Result<Enc
     let vs2 = get_vreg(operands, 1)?;
     let simm5 = get_imm(operands, 2)? as u32 & 0x1F;
     let vm: u32 = 1;
-    let word = (funct6 << 26) | (vm << 25) | (vs2 << 20) | (simm5 << 15) | (0b011 << 12) | (vd << 7) | OP_V;
+    let word = (funct6 << 26)
+        | (vm << 25)
+        | (vs2 << 20)
+        | (simm5 << 15)
+        | (0b011 << 12)
+        | (vd << 7)
+        | OP_V;
     Ok(EncodeResult::Word(word))
 }
 
@@ -173,7 +191,8 @@ pub(crate) fn encode_vmv_v_i(operands: &[Operand]) -> Result<EncodeResult, Strin
     let vd = get_vreg(operands, 0)?;
     let simm5 = get_imm(operands, 1)? as u32 & 0x1F;
     // funct6=010111, vm=1, vs2=0
-    let word = (0b010111u32 << 26) | (1u32 << 25) | (simm5 << 15) | (0b011 << 12) | (vd << 7) | OP_V;
+    let word =
+        (0b010111u32 << 26) | (1u32 << 25) | (simm5 << 15) | (0b011 << 12) | (vd << 7) | OP_V;
     Ok(EncodeResult::Word(word))
 }
 
@@ -182,35 +201,63 @@ pub(crate) fn encode_vmv_v_i(operands: &[Operand]) -> Result<EncodeResult, Strin
 pub(crate) fn encode_vid_v(operands: &[Operand]) -> Result<EncodeResult, String> {
     let vd = get_vreg(operands, 0)?;
     // vs2=0 (bits 24:20), funct6=010100, vm=1
-    let word = (0b010100u32 << 26) | (1u32 << 25) | (0b10001u32 << 15) | (0b010 << 12) | (vd << 7) | OP_V;
+    let word =
+        (0b010100u32 << 26) | (1u32 << 25) | (0b10001u32 << 15) | (0b010 << 12) | (vd << 7) | OP_V;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode Zvksh/Zvksed crypto instructions with VI format
 /// vsm3c.vi, vsm4k.vi: funct6 | vm=1 | vs2 | uimm5 | 010 | vd | OP_V_CRYPTO
-pub(crate) fn encode_v_crypto_vi(operands: &[Operand], funct6: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_v_crypto_vi(
+    operands: &[Operand],
+    funct6: u32,
+) -> Result<EncodeResult, String> {
     let vd = get_vreg(operands, 0)?;
     let vs2 = get_vreg(operands, 1)?;
     let uimm5 = get_imm(operands, 2)? as u32 & 0x1F;
-    let word = (funct6 << 26) | (1u32 << 25) | (vs2 << 20) | (uimm5 << 15) | (0b010 << 12) | (vd << 7) | OP_V_CRYPTO;
+    let word = (funct6 << 26)
+        | (1u32 << 25)
+        | (vs2 << 20)
+        | (uimm5 << 15)
+        | (0b010 << 12)
+        | (vd << 7)
+        | OP_V_CRYPTO;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode Zvksh crypto instructions with VV format
 /// vsm3me.vv: funct6 | vm=1 | vs2 | vs1 | 010 | vd | OP_V_CRYPTO
-pub(crate) fn encode_v_crypto_vv(operands: &[Operand], funct6: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_v_crypto_vv(
+    operands: &[Operand],
+    funct6: u32,
+) -> Result<EncodeResult, String> {
     let vd = get_vreg(operands, 0)?;
     let vs2 = get_vreg(operands, 1)?;
     let vs1 = get_vreg(operands, 2)?;
-    let word = (funct6 << 26) | (1u32 << 25) | (vs2 << 20) | (vs1 << 15) | (0b010 << 12) | (vd << 7) | OP_V_CRYPTO;
+    let word = (funct6 << 26)
+        | (1u32 << 25)
+        | (vs2 << 20)
+        | (vs1 << 15)
+        | (0b010 << 12)
+        | (vd << 7)
+        | OP_V_CRYPTO;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode Zvksed crypto instructions with VS format
 /// vsm4r.vs: funct6 | vm=1 | vs2 | 10000 | 010 | vd | OP_V_CRYPTO
-pub(crate) fn encode_v_crypto_vs(operands: &[Operand], funct6: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_v_crypto_vs(
+    operands: &[Operand],
+    funct6: u32,
+) -> Result<EncodeResult, String> {
     let vd = get_vreg(operands, 0)?;
     let vs2 = get_vreg(operands, 1)?;
-    let word = (funct6 << 26) | (1u32 << 25) | (vs2 << 20) | (0b10000u32 << 15) | (0b010 << 12) | (vd << 7) | OP_V_CRYPTO;
+    let word = (funct6 << 26)
+        | (1u32 << 25)
+        | (vs2 << 20)
+        | (0b10000u32 << 15)
+        | (0b010 << 12)
+        | (vd << 7)
+        | OP_V_CRYPTO;
     Ok(EncodeResult::Word(word))
 }

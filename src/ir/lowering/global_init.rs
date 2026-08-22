@@ -13,12 +13,7 @@
 //! for each initializer category, keeping each function short and readable.
 
 use crate::frontend::parser::ast::{
-    BinOp,
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-    TypeSpecifier,
+    BinOp, Designator, Expr, Initializer, InitializerItem, TypeSpecifier,
 };
 use crate::ir::reexports::{GlobalInit, IrConst, IrGlobal};
 
@@ -28,9 +23,9 @@ enum StringLitKind {
     Wide,
     Char16,
 }
-use crate::common::types::{IrType, StructLayout, RcLayout, CType};
-use super::lower::Lowerer;
 use super::global_init_helpers as h;
+use super::lower::Lowerer;
+use crate::common::types::{CType, IrType, RcLayout, StructLayout};
 
 // =============================================================================
 // Top-level entry point
@@ -57,13 +52,25 @@ impl Lowerer {
 
         match init {
             Initializer::Expr(expr) => self.lower_global_init_expr(
-                expr, type_spec, base_ty, is_array, struct_layout,
-                is_long_double_target, is_bool_target,
+                expr,
+                type_spec,
+                base_ty,
+                is_array,
+                struct_layout,
+                is_long_double_target,
+                is_bool_target,
             ),
             Initializer::List(items) => self.lower_global_init_list(
-                items, type_spec, base_ty, is_array, elem_size, total_size,
-                struct_layout, array_dim_strides,
-                is_long_double_target, is_bool_target,
+                items,
+                type_spec,
+                base_ty,
+                is_array,
+                elem_size,
+                total_size,
+                struct_layout,
+                array_dim_strides,
+                is_long_double_target,
+                is_bool_target,
             ),
         }
     }
@@ -92,8 +99,13 @@ impl Lowerer {
         if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
             if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
                 return self.lower_global_init_expr(
-                    selected, type_spec, base_ty, is_array, _struct_layout,
-                    is_long_double_target, is_bool_target,
+                    selected,
+                    type_spec,
+                    base_ty,
+                    is_array,
+                    _struct_layout,
+                    is_long_double_target,
+                    is_bool_target,
                 );
             }
         }
@@ -120,9 +132,13 @@ impl Lowerer {
                     return GlobalInit::Scalar(IrConst::I128(bits as i128));
                 }
             }
-            return GlobalInit::Scalar(
-                self.coerce_scalar_const(val, expr, base_ty, is_long_double_target, is_bool_target)
-            );
+            return GlobalInit::Scalar(self.coerce_scalar_const(
+                val,
+                expr,
+                base_ty,
+                is_long_double_target,
+                is_bool_target,
+            ));
         }
 
         // String literal (narrow, wide, or char16)
@@ -147,7 +163,8 @@ impl Lowerer {
                 }
                 // (void*) &(CompoundLiteral) – cast wrapping address-of compound literal
                 if let Expr::AddressOf(inner, _) = stripped {
-                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref()
+                    {
                         return self.create_compound_literal_global(cl_type_spec, cl_init);
                     }
                 }
@@ -156,9 +173,7 @@ impl Lowerer {
 
         // Compound literal used directly as initializer value
         if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = expr {
-            return self.lower_compound_literal_init(
-                cl_type_spec, cl_init, base_ty, is_array,
-            );
+            return self.lower_compound_literal_init(cl_type_spec, cl_init, base_ty, is_array);
         }
 
         // String literal with offset: "str" + N or "str" - N
@@ -260,8 +275,8 @@ impl Lowerer {
     /// `1.5F128` literal or a `_Float128`-typed constant).
     fn const_to_f128_bits(val: &IrConst) -> Option<u128> {
         use crate::common::long_double::{
-            f64_to_f128_bytes_lossless, i128_to_f128_bytes, i64_to_f128_bytes,
-            u128_to_f128_bytes, u64_to_f128_bytes,
+            f64_to_f128_bytes_lossless, i128_to_f128_bytes, i64_to_f128_bytes, u128_to_f128_bytes,
+            u64_to_f128_bytes,
         };
         let le = |b: [u8; 16]| u128::from_le_bytes(b);
         Some(match val {
@@ -402,12 +417,19 @@ impl Lowerer {
         // Aggregate compound literal: recursively lower using its own type info.
         let cl_base_ty = self.type_spec_to_ir(cl_type_spec);
         let cl_layout = self.get_struct_layout_for_type(cl_type_spec);
-        let cl_size = cl_layout.as_ref()
+        let cl_size = cl_layout
+            .as_ref()
             .map_or_else(|| self.sizeof_type(cl_type_spec), |l| l.size);
         let cl_is_array = matches!(cl_ctype, CType::Array(..));
         self.lower_global_init(
-            cl_init, cl_type_spec, cl_base_ty, cl_is_array,
-            0, cl_size, &cl_layout, &[],
+            cl_init,
+            cl_type_spec,
+            cl_base_ty,
+            cl_is_array,
+            0,
+            cl_size,
+            &cl_layout,
+            &[],
         )
     }
 }
@@ -451,9 +473,15 @@ impl Lowerer {
         // Array with elements
         if is_array && elem_size > 0 {
             return self.lower_array_init(
-                items, type_spec, base_ty, elem_size, total_size,
-                struct_layout, array_dim_strides,
-                is_long_double_target, is_bool_target,
+                items,
+                type_spec,
+                base_ty,
+                elem_size,
+                total_size,
+                struct_layout,
+                array_dim_strides,
+                is_long_double_target,
+                is_bool_target,
             );
         }
 
@@ -509,27 +537,40 @@ impl Lowerer {
     }
 
     /// Lower a scalar value wrapped in braces: `int x = { 1 };` or `int x = {{{1}}}`.
-    fn lower_scalar_with_braces(&mut self, items: &[InitializerItem], base_ty: IrType) -> Option<GlobalInit> {
+    fn lower_scalar_with_braces(
+        &mut self,
+        items: &[InitializerItem],
+        base_ty: IrType,
+    ) -> Option<GlobalInit> {
         let expr = Self::unwrap_nested_init_expr(items)?;
         if let Some(val) = self.eval_const_expr(expr) {
             let expr_ty = self.get_expr_type(expr);
-            return Some(GlobalInit::Scalar(self.coerce_const_to_type_with_src(val, base_ty, expr_ty)));
+            return Some(GlobalInit::Scalar(
+                self.coerce_const_to_type_with_src(val, base_ty, expr_ty),
+            ));
         }
         self.eval_global_addr_expr(expr)
     }
 
     /// Fallback: emit all items as an array of constants.
     fn lower_fallback_array(&self, items: &[InitializerItem], base_ty: IrType) -> GlobalInit {
-        let values: Vec<IrConst> = items.iter().map(|item| {
-            if let Initializer::Expr(expr) = &item.init {
-                self.eval_const_expr(expr)
-                    .map(|v| v.coerce_to(base_ty))
-                    .unwrap_or_else(|| self.zero_const(base_ty))
-            } else {
-                self.zero_const(base_ty)
-            }
-        }).collect();
-        if values.is_empty() { GlobalInit::Zero } else { GlobalInit::Array(values) }
+        let values: Vec<IrConst> = items
+            .iter()
+            .map(|item| {
+                if let Initializer::Expr(expr) = &item.init {
+                    self.eval_const_expr(expr)
+                        .map(|v| v.coerce_to(base_ty))
+                        .unwrap_or_else(|| self.zero_const(base_ty))
+                } else {
+                    self.zero_const(base_ty)
+                }
+            })
+            .collect();
+        if values.is_empty() {
+            GlobalInit::Zero
+        } else {
+            GlobalInit::Array(values)
+        }
     }
 }
 
@@ -554,20 +595,32 @@ impl Lowerer {
         is_bool_target: bool,
     ) -> GlobalInit {
         let num_elems = self.compute_num_elems(
-            base_ty, elem_size, total_size, struct_layout, is_long_double_target,
+            base_ty,
+            elem_size,
+            total_size,
+            struct_layout,
+            is_long_double_target,
         );
 
         // Struct array (byte-serialized or compound for pointer fields)
         if let Some(ref layout) = struct_layout {
             return self.lower_struct_array_init(
-                items, layout, num_elems, total_size, array_dim_strides,
+                items,
+                layout,
+                num_elems,
+                total_size,
+                array_dim_strides,
             );
         }
 
         // Pointer array or array with address expressions (needs .quad directives)
         if self.array_needs_compound_init(items, base_ty, elem_size, array_dim_strides) {
             return self.lower_pointer_array_init(
-                items, base_ty, elem_size, total_size, array_dim_strides,
+                items,
+                base_ty,
+                elem_size,
+                total_size,
+                array_dim_strides,
             );
         }
 
@@ -575,16 +628,19 @@ impl Lowerer {
         {
             let ctype = self.type_spec_to_ctype(type_spec);
             if let Some((elem_ct, vec_num_elems)) = ctype.vector_info() {
-                return self.lower_vector_array_init(
-                    items, elem_ct, vec_num_elems, num_elems,
-                );
+                return self.lower_vector_array_init(items, elem_ct, vec_num_elems, num_elems);
             }
         }
 
         // Plain scalar array (possibly multi-dimensional)
         self.lower_scalar_array_init(
-            items, base_ty, num_elems, total_size, array_dim_strides,
-            is_long_double_target, is_bool_target,
+            items,
+            base_ty,
+            num_elems,
+            total_size,
+            array_dim_strides,
+            is_long_double_target,
+            is_bool_target,
         )
     }
 
@@ -623,7 +679,10 @@ impl Lowerer {
         if has_ptr_fields {
             if array_dim_strides.len() > 1 {
                 return self.lower_struct_array_with_ptrs_multidim(
-                    items, layout, total_size, array_dim_strides,
+                    items,
+                    layout,
+                    total_size,
+                    array_dim_strides,
                 );
             }
             return self.lower_struct_array_with_ptrs(items, layout, num_elems);
@@ -632,8 +691,13 @@ impl Lowerer {
         let struct_size = layout.size;
         let mut bytes = vec![0u8; total_size];
         self.fill_multidim_struct_array_bytes(
-            items, layout, struct_size, array_dim_strides,
-            &mut bytes, 0, total_size,
+            items,
+            layout,
+            struct_size,
+            array_dim_strides,
+            &mut bytes,
+            0,
+            total_size,
         );
         let values: Vec<IrConst> = bytes.iter().map(|&b| IrConst::I8(b as i8)).collect();
         GlobalInit::Array(values)
@@ -649,26 +713,31 @@ impl Lowerer {
         elem_size: usize,
         array_dim_strides: &[usize],
     ) -> bool {
-        let is_multidim_char_array = matches!(base_ty, IrType::I8 | IrType::U8)
-            && array_dim_strides.len() > 1;
+        let is_multidim_char_array =
+            matches!(base_ty, IrType::I8 | IrType::U8) && array_dim_strides.len() > 1;
         let is_ptr_array = elem_size > base_ty.size().max(1);
 
         let has_addr_exprs = items.iter().any(|item| {
             if let Initializer::Expr(expr) = &item.init {
                 // Resolve _Generic to its selected expression for detection
-                let expr = if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
-                    if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
-                        selected
+                let expr =
+                    if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
+                        if let Some(selected) =
+                            self.resolve_generic_selection_expr(controlling, associations)
+                        {
+                            selected
+                        } else {
+                            expr
+                        }
                     } else {
                         expr
-                    }
-                } else {
-                    expr
-                };
+                    };
                 if matches!(expr, Expr::StringLiteral(_, _)) {
                     return !is_multidim_char_array;
                 }
-                if matches!(Self::strip_casts(expr), Expr::LabelAddr(_, _)) || Self::expr_contains_label_addr(expr) {
+                if matches!(Self::strip_casts(expr), Expr::LabelAddr(_, _))
+                    || Self::expr_contains_label_addr(expr)
+                {
                     return true;
                 }
                 let is_const = self.eval_const_expr(expr).is_some();
@@ -682,9 +751,12 @@ impl Lowerer {
             h::init_contains_addr_expr(item, is_multidim_char_array, &self.types.enum_constants)
         });
 
-        has_addr_exprs || (is_ptr_array && !is_multidim_char_array && items.iter().any(|item| {
-            h::init_contains_string_literal(item)
-        }))
+        has_addr_exprs
+            || (is_ptr_array
+                && !is_multidim_char_array
+                && items
+                    .iter()
+                    .any(|item| h::init_contains_string_literal(item)))
     }
 
     /// Lower a pointer array or array with address relocations.
@@ -705,19 +777,24 @@ impl Lowerer {
             1
         };
         let mut elements: Vec<GlobalInit> = (0..flat_num_elems).map(|_| GlobalInit::Zero).collect();
-        let is_structured = outer_stride > 1 && items.iter().any(|item| {
-            matches!(&item.init, Initializer::List(_))
-        });
+        let is_structured = outer_stride > 1
+            && items
+                .iter()
+                .any(|item| matches!(&item.init, Initializer::List(_)));
 
         let mut current_idx = 0usize;
         for item in items {
-            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
-                if let Designator::Index(ref idx_expr) = d {
-                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                } else {
-                    None
-                }
-            }).collect();
+            let index_designators: Vec<usize> = item
+                .designators
+                .iter()
+                .filter_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             if !index_designators.is_empty() {
                 current_idx = index_designators[0];
@@ -725,8 +802,9 @@ impl Lowerer {
 
             let flat_idx = if index_designators.len() > 1 {
                 self.compute_flat_index_from_designators(
-                    &index_designators, array_dim_strides,
-                    elem_size.max(base_ty.size().max(1))
+                    &index_designators,
+                    array_dim_strides,
+                    elem_size.max(base_ty.size().max(1)),
                 )
             } else if is_structured {
                 current_idx * outer_stride
@@ -751,20 +829,28 @@ impl Lowerer {
                         let mut inner_idx = 0usize;
                         for sub in sub_items {
                             // Check for inner designator
-                            let inner_desig: Vec<usize> = sub.designators.iter().filter_map(|d| {
-                                if let Designator::Index(ref idx_expr) = d {
-                                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                                } else {
-                                    None
-                                }
-                            }).collect();
+                            let inner_desig: Vec<usize> = sub
+                                .designators
+                                .iter()
+                                .filter_map(|d| {
+                                    if let Designator::Index(ref idx_expr) = d {
+                                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
                             if !inner_desig.is_empty() {
                                 inner_idx = inner_desig[0];
                             }
                             let target_idx = flat_idx + inner_idx * inner_stride;
                             if target_idx < flat_num_elems {
                                 let mut elem_parts = Vec::new();
-                                self.collect_compound_init_element(&sub.init, &mut elem_parts, elem_size);
+                                self.collect_compound_init_element(
+                                    &sub.init,
+                                    &mut elem_parts,
+                                    elem_size,
+                                );
                                 for (i, elem) in elem_parts.into_iter().enumerate() {
                                     if target_idx + i < flat_num_elems {
                                         let elem = match elem {
@@ -840,15 +926,16 @@ impl Lowerer {
                 GlobalInit::Scalar(ref c) => {
                     let val_bytes = c.to_le_bytes();
                     let len = val_bytes.len().min(base_type_size);
-                    bytes[byte_offset..byte_offset + len]
-                        .copy_from_slice(&val_bytes[..len]);
+                    bytes[byte_offset..byte_offset + len].copy_from_slice(&val_bytes[..len]);
                 }
                 GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => {
                     ptr_ranges.push((byte_offset, elem));
                 }
                 GlobalInit::GlobalLabelDiff(lab1, lab2, _) => {
-                    ptr_ranges.push((byte_offset,
-                        GlobalInit::GlobalLabelDiff(lab1, lab2, ptr_size)));
+                    ptr_ranges.push((
+                        byte_offset,
+                        GlobalInit::GlobalLabelDiff(lab1, lab2, ptr_size),
+                    ));
                 }
                 _ => {}
             }
@@ -927,17 +1014,27 @@ impl Lowerer {
         let total_scalars = num_elems * vec_num_elems;
         let mut values = vec![self.zero_const(elem_ir_ty); total_scalars];
         for (arr_idx, item) in items.iter().enumerate() {
-            if arr_idx >= num_elems { break; }
+            if arr_idx >= num_elems {
+                break;
+            }
             let base_offset = arr_idx * vec_num_elems;
             match &item.init {
                 Initializer::Expr(expr) => {
                     self.collect_vector_scalars_from_expr(
-                        expr, elem_ir_ty, vec_num_elems, &mut values, base_offset,
+                        expr,
+                        elem_ir_ty,
+                        vec_num_elems,
+                        &mut values,
+                        base_offset,
                     );
                 }
                 Initializer::List(sub_items) => {
                     self.collect_vector_scalars_from_items(
-                        sub_items, elem_ir_ty, vec_num_elems, &mut values, base_offset,
+                        sub_items,
+                        elem_ir_ty,
+                        vec_num_elems,
+                        &mut values,
+                        base_offset,
                     );
                 }
             }
@@ -959,7 +1056,11 @@ impl Lowerer {
         if let Expr::CompoundLiteral(_ts, ref cl_init, _) = inner {
             if let Initializer::List(sub_items) = cl_init.as_ref() {
                 self.collect_vector_scalars_from_items(
-                    sub_items, elem_ir_ty, vec_num_elems, values, base_offset,
+                    sub_items,
+                    elem_ir_ty,
+                    vec_num_elems,
+                    values,
+                    base_offset,
                 );
             }
         }
@@ -975,11 +1076,14 @@ impl Lowerer {
         base_offset: usize,
     ) {
         for (vi, sub) in sub_items.iter().enumerate() {
-            if vi >= vec_num_elems { break; }
+            if vi >= vec_num_elems {
+                break;
+            }
             if let Initializer::Expr(ref sub_expr) = sub.init {
                 if let Some(val) = self.eval_const_expr(sub_expr) {
                     let expr_ty = self.get_expr_type(sub_expr);
-                    values[base_offset + vi] = self.coerce_const_to_type_with_src(val, elem_ir_ty, expr_ty);
+                    values[base_offset + vi] =
+                        self.coerce_const_to_type_with_src(val, elem_ir_ty, expr_ty);
                 }
             }
         }
@@ -1002,13 +1106,15 @@ impl Lowerer {
             // Multi-dimensional array: flatten nested init lists
             let innermost_stride = array_dim_strides.last().copied().unwrap_or(1).max(1);
             let total_scalar_elems = total_size / innermost_stride;
-            let mut values_flat = vec![
-                self.typed_zero_const(base_ty, is_long_double_target);
-                total_scalar_elems
-            ];
+            let mut values_flat =
+                vec![self.typed_zero_const(base_ty, is_long_double_target); total_scalar_elems];
             let mut flat = Vec::with_capacity(total_scalar_elems);
             self.flatten_global_array_init_bool(
-                items, array_dim_strides, base_ty, &mut flat, is_bool_target,
+                items,
+                array_dim_strides,
+                base_ty,
+                &mut flat,
+                is_bool_target,
             );
             for (i, v) in flat.into_iter().enumerate() {
                 if i < total_scalar_elems {
@@ -1028,7 +1134,8 @@ impl Lowerer {
                 }
                 if current_idx < num_elems {
                     let val = self.eval_array_element(&item.init, base_ty, is_bool_target);
-                    values[current_idx] = Self::maybe_promote_long_double(val, is_long_double_target);
+                    values[current_idx] =
+                        Self::maybe_promote_long_double(val, is_long_double_target);
                 }
                 current_idx += 1;
             }
@@ -1045,7 +1152,9 @@ impl Lowerer {
     ) -> IrConst {
         match init {
             Initializer::Expr(expr) => {
-                let raw = self.eval_const_expr(expr).unwrap_or(self.zero_const(base_ty));
+                let raw = self
+                    .eval_const_expr(expr)
+                    .unwrap_or(self.zero_const(base_ty));
                 if is_bool_target {
                     raw.bool_normalize()
                 } else {
@@ -1058,7 +1167,10 @@ impl Lowerer {
                 for sub in sub_items {
                     self.flatten_global_init_item(&sub.init, base_ty, &mut sub_vals);
                 }
-                let raw = sub_vals.into_iter().next().unwrap_or(self.zero_const(base_ty));
+                let raw = sub_vals
+                    .into_iter()
+                    .next()
+                    .unwrap_or(self.zero_const(base_ty));
                 if is_bool_target {
                     raw.bool_normalize()
                 } else {
@@ -1078,7 +1190,9 @@ impl Lowerer {
         let elem_ir_ty = IrType::from_ctype(elem_ct);
         let mut values = vec![self.zero_const(elem_ir_ty); num_elems];
         for (idx, item) in items.iter().enumerate() {
-            if idx >= num_elems { break; }
+            if idx >= num_elems {
+                break;
+            }
             if let Initializer::Expr(expr) = &item.init {
                 if let Some(val) = self.eval_const_expr(expr) {
                     let expr_ty = self.get_expr_type(expr);
@@ -1100,10 +1214,9 @@ impl Lowerer {
     /// `&"hello"[2]`, etc.
     pub(super) fn eval_string_literal_addr_expr(&mut self, expr: &Expr) -> Option<GlobalInit> {
         match expr {
-            Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => {
-                self.eval_string_literal_with_offset(lhs, rhs, false)
-                    .or_else(|| self.eval_string_literal_with_offset(rhs, lhs, false))
-            }
+            Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => self
+                .eval_string_literal_with_offset(lhs, rhs, false)
+                .or_else(|| self.eval_string_literal_with_offset(rhs, lhs, false)),
             Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) => {
                 self.eval_string_literal_with_offset(lhs, rhs, true)
             }
@@ -1181,20 +1294,21 @@ impl Lowerer {
         self.next_anon_struct += 1;
 
         let is_array = matches!(type_spec, TypeSpecifier::Array(_, _));
-        let (elem_size, base_ty, computed_alloc_size) = if let TypeSpecifier::Array(ref elem_ts, _) = type_spec {
-            let elem_ir_ty = self.type_spec_to_ir(elem_ts);
-            let e_size = self.sizeof_type(elem_ts);
-            let num_elems = if let Initializer::List(items) = init {
-                items.len()
+        let (elem_size, base_ty, computed_alloc_size) =
+            if let TypeSpecifier::Array(ref elem_ts, _) = type_spec {
+                let elem_ir_ty = self.type_spec_to_ir(elem_ts);
+                let e_size = self.sizeof_type(elem_ts);
+                let num_elems = if let Initializer::List(items) = init {
+                    items.len()
+                } else {
+                    1
+                };
+                (e_size, elem_ir_ty, e_size * num_elems)
             } else {
-                1
+                let ty = self.type_spec_to_ir(type_spec);
+                let size = self.sizeof_type(type_spec);
+                (0, ty, size)
             };
-            (e_size, elem_ir_ty, e_size * num_elems)
-        } else {
-            let ty = self.type_spec_to_ir(type_spec);
-            let size = self.sizeof_type(type_spec);
-            (0, ty, size)
-        };
 
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         // For arrays, struct_layout is for the element type, not the whole array,
@@ -1202,13 +1316,23 @@ impl Lowerer {
         let alloc_size = if is_array {
             computed_alloc_size
         } else {
-            struct_layout.as_ref().map_or(computed_alloc_size, |l| l.size)
+            struct_layout
+                .as_ref()
+                .map_or(computed_alloc_size, |l| l.size)
         };
-        let align = struct_layout.as_ref()
+        let align = struct_layout
+            .as_ref()
             .map_or(base_ty.align(), |l| l.align.max(base_ty.align()));
 
         let global_init = self.lower_global_init(
-            init, type_spec, base_ty, is_array, elem_size, alloc_size, &struct_layout, &[],
+            init,
+            type_spec,
+            base_ty,
+            is_array,
+            elem_size,
+            alloc_size,
+            &struct_layout,
+            &[],
         );
 
         let global_ty = if matches!(&global_init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_)))
@@ -1265,7 +1389,11 @@ impl Lowerer {
     }
 
     /// Compute extra bytes needed for a flexible array member (FAM).
-    pub(super) fn compute_fam_extra_size(&self, items: &[InitializerItem], layout: &StructLayout) -> usize {
+    pub(super) fn compute_fam_extra_size(
+        &self,
+        items: &[InitializerItem],
+        layout: &StructLayout,
+    ) -> usize {
         let last_field = match layout.fields.last() {
             Some(f) => f,
             None => return 0,
@@ -1300,7 +1428,11 @@ impl Lowerer {
     }
 
     /// Check if a struct initializer contains fields needing address relocations.
-    pub(super) fn struct_init_has_addr_fields(&self, items: &[InitializerItem], layout: &StructLayout) -> bool {
+    pub(super) fn struct_init_has_addr_fields(
+        &self,
+        items: &[InitializerItem],
+        layout: &StructLayout,
+    ) -> bool {
         let mut current_field_idx = 0usize;
         let mut item_idx = 0usize;
 
@@ -1339,13 +1471,18 @@ impl Lowerer {
                 && matches!(&item.init, Initializer::Expr(_))
                 && item.designators.is_empty()
             {
-                let scalars_needed = h::count_flat_init_scalars(field_ty, &*self.types.borrow_struct_layouts());
+                let scalars_needed =
+                    h::count_flat_init_scalars(field_ty, &*self.types.borrow_struct_layouts());
                 if scalars_needed > 1 {
                     // Check remaining consumed items for address expressions
                     for offset in 1..scalars_needed {
                         let idx = item_idx + offset;
-                        if idx >= items.len() { break; }
-                        if !items[idx].designators.is_empty() { break; }
+                        if idx >= items.len() {
+                            break;
+                        }
+                        if !items[idx].designators.is_empty() {
+                            break;
+                        }
                         if self.init_has_addr_exprs(&items[idx].init) {
                             return true;
                         }
@@ -1358,19 +1495,25 @@ impl Lowerer {
 
             // Also for array fields with flat init, advance by the total scalars count
             if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
-                if matches!(&item.init, Initializer::Expr(_))
-                    && item.designators.is_empty()
-                {
-                    let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
+                if matches!(&item.init, Initializer::Expr(_)) && item.designators.is_empty() {
+                    let is_string_literal =
+                        matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::UChar);
                     if !(is_string_literal && is_char_array) {
-                        let scalars_per_elem = h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
+                        let scalars_per_elem = h::count_flat_init_scalars(
+                            elem_ty,
+                            &*self.types.borrow_struct_layouts(),
+                        );
                         let total_scalars = arr_size * scalars_per_elem;
                         // Check all consumed items for address expressions
                         for offset in 0..total_scalars {
                             let idx = item_idx + offset;
-                            if idx >= items.len() { break; }
-                            if !items[idx].designators.is_empty() && offset > 0 { break; }
+                            if idx >= items.len() {
+                                break;
+                            }
+                            if !items[idx].designators.is_empty() && offset > 0 {
+                                break;
+                            }
                             if self.init_has_addr_exprs(&items[idx].init) {
                                 return true;
                             }
@@ -1406,7 +1549,9 @@ impl Lowerer {
                 {
                     return true;
                 }
-                if self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some() {
+                if self.eval_const_expr(expr).is_none()
+                    && self.eval_global_addr_expr(expr).is_some()
+                {
                     return true;
                 }
                 if let Expr::AddressOf(inner, _) = expr {
@@ -1425,8 +1570,12 @@ impl Lowerer {
                     if h::type_has_pointer_elements(elem_ty, &*self.types.borrow_struct_layouts()) {
                         for i in 1..*arr_size {
                             let next = item_idx + i;
-                            if next >= items.len() { break; }
-                            if !items[next].designators.is_empty() { break; }
+                            if next >= items.len() {
+                                break;
+                            }
+                            if !items[next].designators.is_empty() {
+                                break;
+                            }
                             if self.init_has_addr_exprs(&items[next].init) {
                                 return true;
                             }
@@ -1505,9 +1654,9 @@ impl Lowerer {
                 }
                 self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()
             }
-            Initializer::List(items) => {
-                items.iter().any(|item| self.init_has_addr_exprs(&item.init))
-            }
+            Initializer::List(items) => items
+                .iter()
+                .any(|item| self.init_has_addr_exprs(&item.init)),
         }
     }
 }
@@ -1540,7 +1689,11 @@ impl Lowerer {
 
     /// Inline a string literal into a values array for a sub-array element.
     fn inline_string_to_values(
-        &self, s: &str, sub_elem_count: usize, base_ty: IrType, values: &mut Vec<IrConst>,
+        &self,
+        s: &str,
+        sub_elem_count: usize,
+        base_ty: IrType,
+        values: &mut Vec<IrConst>,
     ) {
         let start_len = values.len();
         for c in s.chars() {
@@ -1580,18 +1733,28 @@ impl Lowerer {
         let mut current_outer_idx = 0usize;
 
         for item in items {
-            let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
-                if let Designator::Index(ref idx_expr) = d {
-                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                } else {
-                    None
-                }
-            }).collect();
+            let index_designators: Vec<usize> = item
+                .designators
+                .iter()
+                .filter_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             if !index_designators.is_empty() {
                 self.flatten_designated_item(
-                    item, &index_designators, array_dim_strides, base_ty,
-                    base_type_size, sub_elem_count, values, is_bool_target,
+                    item,
+                    &index_designators,
+                    array_dim_strides,
+                    base_ty,
+                    base_type_size,
+                    sub_elem_count,
+                    values,
+                    is_bool_target,
                 );
                 current_outer_idx = index_designators[0] + 1;
                 continue;
@@ -1599,8 +1762,14 @@ impl Lowerer {
 
             // Sequential processing (no designator)
             self.flatten_sequential_item(
-                item, array_dim_strides, base_ty, sub_elem_count,
-                start_len, &mut current_outer_idx, values, is_bool_target,
+                item,
+                array_dim_strides,
+                base_ty,
+                sub_elem_count,
+                start_len,
+                &mut current_outer_idx,
+                values,
+                is_bool_target,
             );
         }
     }
@@ -1653,7 +1822,9 @@ impl Lowerer {
         is_bool_target: bool,
     ) {
         let flat_idx = self.compute_flat_index_from_designators(
-            index_designators, array_dim_strides, base_type_size
+            index_designators,
+            array_dim_strides,
+            base_type_size,
         );
         // Pad up to flat_idx if needed
         while values.len() <= flat_idx {
@@ -1663,13 +1834,26 @@ impl Lowerer {
         let zero_fn = || self.zero_const(base_ty);
         match &item.init {
             Initializer::List(sub_items) => {
-                let remaining_dims = array_dim_strides.len().saturating_sub(index_designators.len());
+                let remaining_dims = array_dim_strides
+                    .len()
+                    .saturating_sub(index_designators.len());
                 let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
                 let mut tmp = Vec::new();
                 if sub_strides.is_empty() || remaining_dims == 0 {
-                    self.flatten_global_init_item_bool(&item.init, base_ty, &mut tmp, is_bool_target);
+                    self.flatten_global_init_item_bool(
+                        &item.init,
+                        base_ty,
+                        &mut tmp,
+                        is_bool_target,
+                    );
                 } else {
-                    self.flatten_global_array_init_bool(sub_items, sub_strides, base_ty, &mut tmp, is_bool_target);
+                    self.flatten_global_array_init_bool(
+                        sub_items,
+                        sub_strides,
+                        base_ty,
+                        &mut tmp,
+                        is_bool_target,
+                    );
                 }
                 Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
             }
@@ -1734,7 +1918,11 @@ impl Lowerer {
                 }
                 let mut sub_values = Vec::with_capacity(sub_elem_count);
                 self.flatten_global_array_init_bool(
-                    sub_items, &array_dim_strides[1..], base_ty, &mut sub_values, is_bool_target,
+                    sub_items,
+                    &array_dim_strides[1..],
+                    base_ty,
+                    &mut sub_values,
+                    is_bool_target,
                 );
                 while sub_values.len() < sub_elem_count {
                     sub_values.push(self.zero_const(base_ty));
@@ -1812,12 +2000,20 @@ impl Lowerer {
 
     /// Conditionally promote a value to long double.
     fn maybe_promote_long_double(val: IrConst, is_long_double: bool) -> IrConst {
-        if is_long_double { Self::promote_to_long_double(val) } else { val }
+        if is_long_double {
+            Self::promote_to_long_double(val)
+        } else {
+            val
+        }
     }
 
     /// Get the appropriate zero constant for a type, considering long double.
     fn typed_zero_const(&self, base_ty: IrType, is_long_double: bool) -> IrConst {
-        if is_long_double { IrConst::long_double(0.0) } else { self.zero_const(base_ty) }
+        if is_long_double {
+            IrConst::long_double(0.0)
+        } else {
+            self.zero_const(base_ty)
+        }
     }
 
     /// Collect a single compound initializer element, handling nested lists.
@@ -1831,15 +2027,18 @@ impl Lowerer {
             Initializer::Expr(expr) => {
                 // Resolve _Generic selections to their selected expression
                 // before any other processing.
-                let expr = if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
-                    if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
-                        selected
+                let expr =
+                    if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
+                        if let Some(selected) =
+                            self.resolve_generic_selection_expr(controlling, associations)
+                        {
+                            selected
+                        } else {
+                            expr
+                        }
                     } else {
                         expr
-                    }
-                } else {
-                    expr
-                };
+                    };
                 if let Expr::StringLiteral(s, _) = expr {
                     let label = self.intern_string_literal(s);
                     elements.push(GlobalInit::GlobalAddr(label));
@@ -1856,7 +2055,11 @@ impl Lowerer {
                     let val = match val {
                         IrConst::I32(v) if elem_size == 8 => IrConst::I64(v as i64),
                         IrConst::I16(v) if elem_size >= 4 => {
-                            if elem_size == 8 { IrConst::I64(v as i64) } else { IrConst::I32(v as i32) }
+                            if elem_size == 8 {
+                                IrConst::I64(v as i64)
+                            } else {
+                                IrConst::I32(v as i32)
+                            }
                         }
                         other => other,
                     };
@@ -1931,7 +2134,12 @@ impl Lowerer {
     }
 
     /// Flatten a single initializer item, recursing into nested lists.
-    fn flatten_global_init_item(&self, init: &Initializer, base_ty: IrType, values: &mut Vec<IrConst>) {
+    fn flatten_global_init_item(
+        &self,
+        init: &Initializer,
+        base_ty: IrType,
+        values: &mut Vec<IrConst>,
+    ) {
         self.flatten_global_init_item_bool(init, base_ty, values, false)
     }
 

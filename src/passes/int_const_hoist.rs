@@ -13,10 +13,10 @@
 //! already free. A hoisted value is reused by nested loops (the outer
 //! preheader dominates them) but never across sibling loops.
 
+use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
-use super::loop_analysis;
 
 /// Run integer-constant hoisting on a function. Returns the number of
 /// distinct constants materialized in preheaders.
@@ -26,7 +26,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
     let cfg = analysis::CfgAnalysis::build(func);
     let mut loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
-        cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom));
+        cfg.num_blocks,
+        &cfg.preds,
+        &cfg.succs,
+        &cfg.idom,
+    ));
     if loops.is_empty() {
         return 0;
     }
@@ -60,7 +64,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         for bits in consts {
             // Reuse a previously hoisted value when its definition dominates
             // this loop (i.e. this loop is nested inside the defining one).
-            let reusable = hoisted.get(&bits).filter(|(_, body)| lp.body.is_subset(body));
+            let reusable = hoisted
+                .get(&bits)
+                .filter(|(_, body)| lp.body.is_subset(body));
             let new_val = if let Some(&(vid, _)) = reusable {
                 vid
             } else {

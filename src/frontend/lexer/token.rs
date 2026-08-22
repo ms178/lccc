@@ -10,8 +10,8 @@ pub enum TokenKind {
     ULongLiteral(u64),     // ul/UL suffix (unsigned long)
     LongLongLiteral(i64),  // ll/LL suffix (signed long long, always 64-bit)
     ULongLongLiteral(u64), // ull/ULL suffix (unsigned long long, always 64-bit)
-    FloatLiteral(f64),             // no suffix (double)
-    FloatLiteralF32(f64),          // f/F suffix (float, 32-bit)
+    FloatLiteral(f64),     // no suffix (double)
+    FloatLiteralF32(f64),  // f/F suffix (float, 32-bit)
     /// Long double literal (l/L suffix). Stores (f64_approx, f128_bytes).
     /// f128_bytes is IEEE 754 binary128 format with full 112-bit mantissa precision.
     FloatLiteralLongDouble(f64, [u8; 16]),
@@ -87,8 +87,8 @@ pub enum TokenKind {
     Asm,
     Attribute,
     Extension,
-    Builtin,         // __builtin_va_list (used as type name)
-    BuiltinVaArg,    // __builtin_va_arg(expr, type) - special syntax
+    Builtin,                 // __builtin_va_list (used as type name)
+    BuiltinVaArg,            // __builtin_va_arg(expr, type) - special syntax
     BuiltinTypesCompatibleP, // __builtin_types_compatible_p(type, type) - special syntax
     /// __int128 / __int128_t type keyword (GCC extension, signed)
     Int128,
@@ -126,58 +126,58 @@ pub enum TokenKind {
     PragmaVisibilityPop,
 
     // Punctuation
-    LParen,     // (
-    RParen,     // )
-    LBrace,     // {
-    RBrace,     // }
-    LBracket,   // [
-    RBracket,   // ]
-    Semicolon,  // ;
-    Comma,      // ,
-    Dot,        // .
-    Arrow,      // ->
-    Ellipsis,   // ...
+    LParen,    // (
+    RParen,    // )
+    LBrace,    // {
+    RBrace,    // }
+    LBracket,  // [
+    RBracket,  // ]
+    Semicolon, // ;
+    Comma,     // ,
+    Dot,       // .
+    Arrow,     // ->
+    Ellipsis,  // ...
 
     // Operators
-    Plus,       // +
-    Minus,      // -
-    Star,       // *
-    Slash,      // /
-    Percent,    // %
-    Amp,        // &
-    Pipe,       // |
-    Caret,      // ^
-    Tilde,      // ~
-    Bang,       // !
-    Assign,     // =
-    Less,       // <
-    Greater,    // >
-    Question,   // ?
-    Colon,      // :
+    Plus,     // +
+    Minus,    // -
+    Star,     // *
+    Slash,    // /
+    Percent,  // %
+    Amp,      // &
+    Pipe,     // |
+    Caret,    // ^
+    Tilde,    // ~
+    Bang,     // !
+    Assign,   // =
+    Less,     // <
+    Greater,  // >
+    Question, // ?
+    Colon,    // :
 
     // Compound operators
-    PlusPlus,   // ++
-    MinusMinus, // --
-    PlusAssign, // +=
-    MinusAssign,// -=
-    StarAssign, // *=
-    SlashAssign,// /=
-    PercentAssign, // %=
-    AmpAssign,  // &=
-    PipeAssign, // |=
-    CaretAssign,// ^=
-    LessLess,   // <<
-    GreaterGreater, // >>
-    LessLessAssign, // <<=
+    PlusPlus,             // ++
+    MinusMinus,           // --
+    PlusAssign,           // +=
+    MinusAssign,          // -=
+    StarAssign,           // *=
+    SlashAssign,          // /=
+    PercentAssign,        // %=
+    AmpAssign,            // &=
+    PipeAssign,           // |=
+    CaretAssign,          // ^=
+    LessLess,             // <<
+    GreaterGreater,       // >>
+    LessLessAssign,       // <<=
     GreaterGreaterAssign, // >>=
-    EqualEqual, // ==
-    BangEqual,  // !=
-    LessEqual,  // <=
-    GreaterEqual, // >=
-    AmpAmp,     // &&
-    PipePipe,   // ||
-    Hash,       // # (used in preprocessor)
-    HashHash,   // ## (used in preprocessor)
+    EqualEqual,           // ==
+    BangEqual,            // !=
+    LessEqual,            // <=
+    GreaterEqual,         // >=
+    AmpAmp,               // &&
+    PipePipe,             // ||
+    Hash,                 // # (used in preprocessor)
+    HashHash,             // ## (used in preprocessor)
 
     // Special
     Eof,
@@ -211,16 +211,19 @@ impl std::fmt::Display for TokenKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Literals - described generically like GCC
-            TokenKind::IntLiteral(_) | TokenKind::UIntLiteral(_) |
-            TokenKind::LongLiteral(_) | TokenKind::ULongLiteral(_) |
-            TokenKind::LongLongLiteral(_) | TokenKind::ULongLongLiteral(_) =>
-                write!(f, "integer constant"),
-            TokenKind::FloatLiteral(_) | TokenKind::FloatLiteralF32(_) |
-            TokenKind::FloatLiteralLongDouble(_, _) | TokenKind::FloatLiteralF128(_, _) =>
-                write!(f, "floating constant"),
-            TokenKind::ImaginaryLiteral(_) | TokenKind::ImaginaryLiteralF32(_) |
-            TokenKind::ImaginaryLiteralLongDouble(_, _) =>
-                write!(f, "imaginary constant"),
+            TokenKind::IntLiteral(_)
+            | TokenKind::UIntLiteral(_)
+            | TokenKind::LongLiteral(_)
+            | TokenKind::ULongLiteral(_)
+            | TokenKind::LongLongLiteral(_)
+            | TokenKind::ULongLongLiteral(_) => write!(f, "integer constant"),
+            TokenKind::FloatLiteral(_)
+            | TokenKind::FloatLiteralF32(_)
+            | TokenKind::FloatLiteralLongDouble(_, _)
+            | TokenKind::FloatLiteralF128(_, _) => write!(f, "floating constant"),
+            TokenKind::ImaginaryLiteral(_)
+            | TokenKind::ImaginaryLiteralF32(_)
+            | TokenKind::ImaginaryLiteralLongDouble(_, _) => write!(f, "imaginary constant"),
             TokenKind::StringLiteral(_) => write!(f, "string literal"),
             TokenKind::WideStringLiteral(_) => write!(f, "wide string literal"),
             TokenKind::Char16StringLiteral(_) => write!(f, "char16_t string literal"),
@@ -297,11 +300,14 @@ impl std::fmt::Display for TokenKind {
             TokenKind::SegFs => write!(f, "'__seg_fs'"),
 
             // Pragma tokens
-            TokenKind::PragmaPackSet(_) | TokenKind::PragmaPackPush(_) |
-            TokenKind::PragmaPackPushOnly | TokenKind::PragmaPackPop |
-            TokenKind::PragmaPackReset => write!(f, "'#pragma pack'"),
-            TokenKind::PragmaVisibilityPush(_) | TokenKind::PragmaVisibilityPop =>
-                write!(f, "'#pragma GCC visibility'"),
+            TokenKind::PragmaPackSet(_)
+            | TokenKind::PragmaPackPush(_)
+            | TokenKind::PragmaPackPushOnly
+            | TokenKind::PragmaPackPop
+            | TokenKind::PragmaPackReset => write!(f, "'#pragma pack'"),
+            TokenKind::PragmaVisibilityPush(_) | TokenKind::PragmaVisibilityPop => {
+                write!(f, "'#pragma GCC visibility'")
+            }
 
             // Punctuation - shown as quoted symbols
             TokenKind::LParen => write!(f, "'('"),
@@ -383,9 +389,23 @@ impl TokenKind {
         }
         // Fast reject by first character: keywords only start with these 16 chars.
         let first = s.as_bytes()[0];
-        if !matches!(first,
-            b'_' | b'a' | b'b' | b'c' | b'd' | b'e' | b'f' | b'g' |
-            b'i' | b'l' | b'r' | b's' | b't' | b'u' | b'v' | b'w'
+        if !matches!(
+            first,
+            b'_' | b'a'
+                | b'b'
+                | b'c'
+                | b'd'
+                | b'e'
+                | b'f'
+                | b'g'
+                | b'i'
+                | b'l'
+                | b'r'
+                | b's'
+                | b't'
+                | b'u'
+                | b'v'
+                | b'w'
         ) {
             return None;
         }

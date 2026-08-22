@@ -1,14 +1,18 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
-use crate::ir::reexports::{IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Instruction, Operand, Terminator, Value};
-use crate::common::types::{AddressSpace, EightbyteClass, IrType};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::call_abi::{ParamClass, classify_params};
+use super::emit::{
+    collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name, X86Codegen, X86_ARG_REGS,
+    X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
+};
+use crate::backend::call_abi::{classify_params, ParamClass};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::liveness::{for_each_operand_in_instruction, for_each_operand_in_terminator};
 use crate::backend::regalloc::PhysReg;
-use super::emit::{X86Codegen, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
-                     phys_reg_name, collect_inline_asm_callee_saved_x86, X86_ARG_REGS, is_xmm_reg};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::{AddressSpace, EightbyteClass, IrType};
+use crate::ir::reexports::{
+    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
+};
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -57,7 +61,9 @@ impl X86Codegen {
                                 needs_fp = true;
                             }
                         }
-                        Instruction::VaArgStruct { eightbyte_classes, .. } => {
+                        Instruction::VaArgStruct {
+                            eightbyte_classes, ..
+                        } => {
                             for c in eightbyte_classes {
                                 match c {
                                     EightbyteClass::Integer | EightbyteClass::NoClass => {
@@ -139,7 +145,8 @@ impl X86Codegen {
         } else {
             &X86_CALLEE_SAVED
         };
-        let mut available_regs = crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
+        let mut available_regs =
+            crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
         let mut has_indirect_call = false;
@@ -148,15 +155,17 @@ impl X86Codegen {
         let mut has_atomic_rmw = false;
         // Track rdx-clobbering patterns for conditional rdx allocation
         let mut has_div_rem = false;
-        let mut has_gep = false;       // GEP → indirect stores → emit_save_acc uses rdx
-        let mut has_switch = false;    // Switch → jump tables use rdx
-        let mut has_select = false;    // Select → cmov path uses rdx
+        let mut has_gep = false; // GEP → indirect stores → emit_save_acc uses rdx
+        let mut has_switch = false; // Switch → jump tables use rdx
+        let mut has_select = false; // Select → cmov path uses rdx
         let mut has_rdx_intrinsic = false; // Fixed-scratch intrinsic paths overwrite rdx
         let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Call { .. } => { has_calls = true; }
+                    Instruction::Call { .. } => {
+                        has_calls = true;
+                    }
                     Instruction::CallIndirect { .. } => {
                         has_calls = true;
                         has_indirect_call = true;
@@ -165,7 +174,10 @@ impl X86Codegen {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
                         }
-                        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+                        if matches!(
+                            op,
+                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+                        ) {
                             has_div_rem = true;
                         }
                     }
@@ -176,24 +188,31 @@ impl X86Codegen {
                     }
                     Instruction::Cast { from_ty, to_ty, .. } => {
                         if matches!(from_ty, IrType::I128 | IrType::U128)
-                            || matches!(to_ty, IrType::I128 | IrType::U128) {
+                            || matches!(to_ty, IrType::I128 | IrType::U128)
+                        {
                             has_i128_ops = true;
                         }
                         // Detect I32/U32 widening to 64-bit: requires sign-extension.
                         if matches!(from_ty, IrType::I32 | IrType::U32)
-                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr)
+                        {
                             has_i32_widening = true;
                         }
                     }
-                    Instruction::Cmp { ty, .. }
-                    | Instruction::Store { ty, .. } => {
+                    Instruction::Cmp { ty, .. } | Instruction::Store { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
                         }
                     }
-                    Instruction::AtomicRmw { .. } => { has_atomic_rmw = true; }
-                    Instruction::GetElementPtr { .. } => { has_gep = true; }
-                    Instruction::Select { .. } => { has_select = true; }
+                    Instruction::AtomicRmw { .. } => {
+                        has_atomic_rmw = true;
+                    }
+                    Instruction::GetElementPtr { .. } => {
+                        has_gep = true;
+                    }
+                    Instruction::Select { .. } => {
+                        has_select = true;
+                    }
                     Instruction::Intrinsic { op, .. } => {
                         // These x86 emitters use rdx as an unmodeled fixed
                         // scratch (or architectural output for rdtsc).  Keep
@@ -228,7 +247,8 @@ impl X86Codegen {
         // r10: use call *%rax instead of call *%r10 (frees r10 for non-call-spanning).
         // Exception: indirect branch thunks still use r10 (rare).
         if has_i128_ops {
-            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15); // r8, r9, rdi, rsi
+            caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15);
+            // r8, r9, rdi, rsi
         }
         // r8: atomic RMW uses rdi instead of r8 (frees r8 unless i128 excludes it).
         // rdx (PhysReg 16) is available as caller-saved when no instruction
@@ -249,7 +269,10 @@ impl X86Codegen {
         if crate::backend::regalloc::x86_param_caller_homes_safe(func) {
             let preferred = [14u8, 15, 16, 12, 13, 10, 11];
             caller_saved_regs.sort_by_key(|reg| {
-                preferred.iter().position(|&id| id == reg.0).unwrap_or(preferred.len())
+                preferred
+                    .iter()
+                    .position(|&id| id == reg.0)
+                    .unwrap_or(preferred.len())
             });
         }
 
@@ -276,8 +299,8 @@ impl X86Codegen {
         // upper bits and the 64-bit use of `w` (when register-allocated) would
         // read garbage. (Sound: adding values to this set only ever emits more
         // movslq, never removes one, so it cannot miscompile.)
-        let is_64 = |t: &IrType| matches!(t,
-            IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F128);
+        let is_64 =
+            |t: &IrType| matches!(t, IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F128);
         let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
         // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
         // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
@@ -291,23 +314,35 @@ impl X86Codegen {
             for inst in &block.instructions {
                 match inst {
                     Instruction::BinOp { ty, lhs, rhs, .. } if is_64(ty) => {
-                        mark(lhs, &mut needs_sext_set); mark(rhs, &mut needs_sext_set);
+                        mark(lhs, &mut needs_sext_set);
+                        mark(rhs, &mut needs_sext_set);
                     }
                     Instruction::Cmp { ty, lhs, rhs, .. } if is_64(ty) => {
-                        mark(lhs, &mut needs_sext_set); mark(rhs, &mut needs_sext_set);
+                        mark(lhs, &mut needs_sext_set);
+                        mark(rhs, &mut needs_sext_set);
                     }
                     Instruction::Store { ty, val, .. } if is_64(ty) => {
                         mark(val, &mut needs_sext_set);
                     }
-                    Instruction::Cast { src, from_ty, to_ty, .. }
-                        if matches!(from_ty, IrType::I32 | IrType::U32) && is_64(to_ty) => {
+                    Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } if matches!(from_ty, IrType::I32 | IrType::U32) && is_64(to_ty) => {
                         mark(src, &mut needs_sext_set);
                     }
                     Instruction::GetElementPtr { offset, .. } => {
                         mark(offset, &mut needs_sext_set);
                     }
-                    Instruction::Select { ty, true_val, false_val, .. } if is_64(ty) => {
-                        mark(true_val, &mut needs_sext_set); mark(false_val, &mut needs_sext_set);
+                    Instruction::Select {
+                        ty,
+                        true_val,
+                        false_val,
+                        ..
+                    } if is_64(ty) => {
+                        mark(true_val, &mut needs_sext_set);
+                        mark(false_val, &mut needs_sext_set);
                     }
                     Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                         for (arg, at) in info.args.iter().zip(info.arg_types.iter()) {
@@ -355,7 +390,13 @@ impl X86Codegen {
                 }
             }
             for inst in &block.instructions {
-                if let Instruction::AtomicCmpxchg { expected, desired, ty, .. } = inst {
+                if let Instruction::AtomicCmpxchg {
+                    expected,
+                    desired,
+                    ty,
+                    ..
+                } = inst
+                {
                     if is_64(ty) {
                         mark(expected, &mut needs_sext_set);
                         mark(desired, &mut needs_sext_set);
@@ -482,9 +523,7 @@ impl X86Codegen {
                         // pending_cmp handshake, so fusing them would strand
                         // the forward chain (consumer reads a boolean that was
                         // never materialized).
-                        if !ty.is_integer()
-                            || crate::backend::generation::is_wide_int_type(*ty)
-                        {
+                        if !ty.is_integer() || crate::backend::generation::is_wide_int_type(*ty) {
                             continue;
                         }
                         // Walk forward over Copies that forward the cmp value.
@@ -495,8 +534,10 @@ impl X86Codegen {
                         let mut forward_dests: Vec<u32> = Vec::new();
                         while k < insts.len() {
                             match &insts[k] {
-                                Instruction::Copy { dest: cd, src: Operand::Value(sv) }
-                                    if sv.0 == cur => {
+                                Instruction::Copy {
+                                    dest: cd,
+                                    src: Operand::Value(sv),
+                                } if sv.0 == cur => {
                                     // Flag-neutral forwarding copy.
                                     //
                                     // SOUNDNESS: with flag fusion, the Cmp
@@ -532,9 +573,12 @@ impl X86Codegen {
                                 // This is what lets the range-check fold's
                                 // `Cmp -> Cast(bool, I8->I64) -> CondBranch`
                                 // fuse into `cmp; jcc` (Expat's name scanner).
-                                Instruction::Cast { dest: cd, src: Operand::Value(sv), from_ty, to_ty }
-                                    if sv.0 == cur && from_ty.is_integer() && to_ty.is_integer() =>
-                                {
+                                Instruction::Cast {
+                                    dest: cd,
+                                    src: Operand::Value(sv),
+                                    from_ty,
+                                    to_ty,
+                                } if sv.0 == cur && from_ty.is_integer() && to_ty.is_integer() => {
                                     if use_counts.get(&cd.0).copied().unwrap_or(0) != 1 {
                                         chain_single_use = false;
                                         break;
@@ -543,7 +587,10 @@ impl X86Codegen {
                                     cur = cd.0;
                                     k += 1;
                                 }
-                                Instruction::Select { cond: Operand::Value(v), .. } if v.0 == cur => {
+                                Instruction::Select {
+                                    cond: Operand::Value(v),
+                                    ..
+                                } if v.0 == cur => {
                                     // The copy chain must terminate here (the
                                     // final value has exactly one use: this
                                     // select).
@@ -558,9 +605,17 @@ impl X86Codegen {
                         if is_consumer && chain_single_use {
                             fused.insert(dest.0, cur);
                             fused_forward.extend(forward_dests.iter().copied());
-                        } else if !is_consumer && chain_single_use && k == insts.len() && insts.len() >= 1 {
+                        } else if !is_consumer
+                            && chain_single_use
+                            && k == insts.len()
+                            && insts.len() >= 1
+                        {
                             // Check the block terminator as the consumer.
-                            if let Terminator::CondBranch { cond: Operand::Value(v), .. } = &block.terminator {
+                            if let Terminator::CondBranch {
+                                cond: Operand::Value(v),
+                                ..
+                            } = &block.terminator
+                            {
                                 if v.0 == cur && use_counts.get(&cur).copied().unwrap_or(0) == 1 {
                                     fused.insert(dest.0, cur);
                                     fused_forward.extend(forward_dests.iter().copied());
@@ -592,9 +647,13 @@ impl X86Codegen {
                 let insts = &block.instructions;
                 for (ii, inst) in insts.iter().enumerate() {
                     let (cdest, cop, clhs, crhs, cty) = match inst {
-                        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-                            (dest.0, *op, lhs.clone(), rhs.clone(), *ty)
-                        }
+                        Instruction::Cmp {
+                            dest,
+                            op,
+                            lhs,
+                            rhs,
+                            ty,
+                        } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
                         _ => continue,
                     };
                     if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
@@ -608,9 +667,7 @@ impl X86Codegen {
                     // them to emit_i128_cmp, which ignores cmp_replay AND
                     // could not be replayed by emit_int_cmp_replay_insn
                     // (multi-instruction 128-bit compare).
-                    if !cty.is_integer()
-                        || crate::backend::generation::is_wide_int_type(cty)
-                    {
+                    if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
                         continue;
                     }
                     // Replay soundness: the operands are re-materialized at the
@@ -645,7 +702,11 @@ impl X86Codegen {
                         if jj == ii {
                             continue;
                         }
-                        if let Instruction::Select { cond: Operand::Value(v), .. } = other {
+                        if let Instruction::Select {
+                            cond: Operand::Value(v),
+                            ..
+                        } = other
+                        {
                             if v.0 == cdest {
                                 used_by_select = true;
                                 break;
@@ -653,8 +714,10 @@ impl X86Codegen {
                         }
                     }
                     if !used_by_select {
-                        if let Terminator::CondBranch { cond: Operand::Value(v), .. } =
-                            &block.terminator
+                        if let Terminator::CondBranch {
+                            cond: Operand::Value(v),
+                            ..
+                        } = &block.terminator
                         {
                             if v.0 == cdest {
                                 used_by_select = true;
@@ -672,7 +735,6 @@ impl X86Codegen {
             self.fused_forward_dests = fused_forward;
             self.value_use_counts = use_counts;
 
-
             self.value_types = value_types;
         }
 
@@ -684,7 +746,9 @@ impl X86Codegen {
         // fail-closed contract: full PIC and weak PIE externs still materialize.
         let never_materialized = {
             let mut gmap = crate::backend::generation::build_global_addr_map_for(
-                func, &self.state.tls_symbols);
+                func,
+                &self.state.tls_symbols,
+            );
             gmap.retain(|_, sym| {
                 // Strip a composed constant displacement. Symbol names emitted
                 // by C cannot contain '+'; '-' here is only the map's suffix.
@@ -693,11 +757,10 @@ impl X86Codegen {
                     && !self.state.tls_symbols.contains(base)
                     && !self.state.absolute_symbols.contains(base)
             });
-            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(
-                func, &gmap);
+            let mut set =
+                crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
             set.extend(
-                crate::backend::generation::build_rematerializable_global_addr_set_for(
-                    func, &gmap),
+                crate::backend::generation::build_rematerializable_global_addr_set_for(func, &gmap),
             );
             self.state.never_materialized_values = set.clone();
             set
@@ -731,15 +794,20 @@ impl X86Codegen {
         let never_materialized = if std::env::var_os("CCC_NO_X64_IMMED_NOHOME").is_some() {
             never_materialized
         } else {
-            let classes = std::env::var("CCC_X64_NOHOME_CLASSES").unwrap_or_else(|_| "ret,store,copy,cast,unary,binop".into());
+            let classes = std::env::var("CCC_X64_NOHOME_CLASSES")
+                .unwrap_or_else(|_| "ret,store,copy,cast,unary,binop".into());
             let has = |c: &str| classes == "all" || classes.split(',').any(|x| x.trim() == c);
-            let skip: crate::common::fx_hash::FxHashSet<u32> = crate::backend::regalloc::analyze_accumulator_assignments(
-                func,
-                crate::backend::regalloc::AccumulatorPolicy {
-                    operand_order: crate::backend::regalloc::AccumulatorOperandOrder::LhsFirst,
-                    return_consumes_accumulator: false,
-                },
-            ).into_iter().map(|a| a.value_id).collect();
+            let skip: crate::common::fx_hash::FxHashSet<u32> =
+                crate::backend::regalloc::analyze_accumulator_assignments(
+                    func,
+                    crate::backend::regalloc::AccumulatorPolicy {
+                        operand_order: crate::backend::regalloc::AccumulatorOperandOrder::LhsFirst,
+                        return_consumes_accumulator: false,
+                    },
+                )
+                .into_iter()
+                .map(|a| a.value_id)
+                .collect();
             if skip.is_empty() {
                 never_materialized
             } else {
@@ -777,7 +845,14 @@ impl X86Codegen {
                 let mut narrowing_cast_values = crate::common::fx_hash::FxHashSet::default();
                 for block in &func.blocks {
                     for inst in &block.instructions {
-                        if let Instruction::Cast { dest, src, from_ty, to_ty, .. } = inst {
+                        if let Instruction::Cast {
+                            dest,
+                            src,
+                            from_ty,
+                            to_ty,
+                            ..
+                        } = inst
+                        {
                             if from_ty.is_integer()
                                 && to_ty.is_integer()
                                 && to_ty.size() < from_ty.size()
@@ -798,8 +873,7 @@ impl X86Codegen {
                 }
                 let mut set = never_materialized;
                 set.extend(skip.into_iter().filter(|v| {
-                    !narrowing_cast_values.contains(v)
-                        && cls_of.get(v).is_some_and(|c| has(c))
+                    !narrowing_cast_values.contains(v) && cls_of.get(v).is_some_and(|c| has(c))
                 }));
                 set
             }
@@ -829,20 +903,27 @@ impl X86Codegen {
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
         let (reg_assigned, cached_liveness, caller_save_spans, accumulator_assignments) =
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
-            func, available_regs, caller_saved_regs, &asm_clobbered_regs,
-            &mut self.reg_assignments, &mut self.used_callee_saved,
-            false, Some(never_materialized), call_arg_regs, indirect_target_regs,
-            // Session 28: x86-64 emits SIB indexed addressing directly at
-            // the Load/Store (emit_load_indexed/emit_store_indexed) AND
-            // folds constant-offset GEPs with register bases
-            // (const_offset_fold_reg_base_ok): BOTH forms consume address
-            // registers RA-invisibly at the access position.
-            // collect_folded_gep_links_all extends const-fold base intervals
-            // plus indexed-fold base AND index intervals to their consumers,
-            // so every address register survives intervening calls and value
-            // staging (zlib-ng gz_reset NULL-store crash class).
-            crate::backend::generation::collect_folded_gep_links_all(func),
-        );
+                func,
+                available_regs,
+                caller_saved_regs,
+                &asm_clobbered_regs,
+                &mut self.reg_assignments,
+                &mut self.used_callee_saved,
+                false,
+                Some(never_materialized),
+                call_arg_regs,
+                indirect_target_regs,
+                // Session 28: x86-64 emits SIB indexed addressing directly at
+                // the Load/Store (emit_load_indexed/emit_store_indexed) AND
+                // folds constant-offset GEPs with register bases
+                // (const_offset_fold_reg_base_ok): BOTH forms consume address
+                // registers RA-invisibly at the access position.
+                // collect_folded_gep_links_all extends const-fold base intervals
+                // plus indexed-fold base AND index intervals to their consumers,
+                // so every address register survives intervening calls and value
+                // staging (zlib-ng gz_reset NULL-store crash class).
+                crate::backend::generation::collect_folded_gep_links_all(func),
+            );
 
         // MachInst is profitable on straight-line and modest-CFG code, but its
         // current local scheduler regressed gzip's large hot loops by ~3% even
@@ -867,8 +948,7 @@ impl X86Codegen {
             })
             .unwrap_or(0);
         self.machinst_function_enabled = self.machinst_enabled
-            && (loop_insts <= max_loop_insts
-                || std::env::var("CCC_MI_FORCE_LOOPS").is_ok());
+            && (loop_insts <= max_loop_insts || std::env::var("CCC_MI_FORCE_LOOPS").is_ok());
         if std::env::var("CCC_MI_DEBUG").is_ok() {
             eprintln!(
                 "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={}",
@@ -876,158 +956,141 @@ impl X86Codegen {
             );
         }
 
-
-            // W2 Load->Cast fold (2026-08-10): when a Load's result is used
-            // EXACTLY ONCE and that sole use is an ADJACENT Cast whose
-            // zero-extension is already provided by the load opcode
-            // (movzbl/movzwl write a fully zero-extended 32-bit register;
-            // movl zero-extends to 64), AND the cast's dest holds a GPR
-            // register, the load targets that register directly and the cast
-            // emits nothing. Removes the `movzbl (%p),%rX; mov %rX,%rYd`
-            // staging pair — 33% of gzip-9 cycles sat in that pattern in
-            // longest_match.
-            //
-            // SOUNDNESS (debugged 2026-08-10 on simd_crc_adler):
-            // (a) runs AFTER regalloc so reg_assignments is THIS function's;
-            // (b) ADJACENCY: the cast must immediately follow the load, so no
-            //     program point exists between them;
-            // (c) REGISTER-FREE-AT-LOAD: no OTHER value assigned to the cast
-            //     dest's register may have a live interval covering the load
-            //     point — otherwise the early load clobbers a value still
-            //     needed (the simd_crc_adler corruption: fold loaded into r13
-            //     which still held a value consumed by the next instruction).
-            // use_counts includes terminator uses, so "exactly one use" is
-            // faithful; the load's dest keeps its own (now never-written)
-            // home, which nothing reads.
-            let mut cast_by_src: FxHashMap<u32, (Value, IrType, IrType)> =
-                FxHashMap::default();
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::Cast {
-                        dest,
-                        src: Operand::Value(sv),
-                        from_ty,
-                        to_ty,
-                    } = inst
-                    {
-                        cast_by_src
-                            .entry(sv.0)
-                            .or_insert((*dest, *from_ty, *to_ty));
-                    }
+        // W2 Load->Cast fold (2026-08-10): when a Load's result is used
+        // EXACTLY ONCE and that sole use is an ADJACENT Cast whose
+        // zero-extension is already provided by the load opcode
+        // (movzbl/movzwl write a fully zero-extended 32-bit register;
+        // movl zero-extends to 64), AND the cast's dest holds a GPR
+        // register, the load targets that register directly and the cast
+        // emits nothing. Removes the `movzbl (%p),%rX; mov %rX,%rYd`
+        // staging pair — 33% of gzip-9 cycles sat in that pattern in
+        // longest_match.
+        //
+        // SOUNDNESS (debugged 2026-08-10 on simd_crc_adler):
+        // (a) runs AFTER regalloc so reg_assignments is THIS function's;
+        // (b) ADJACENCY: the cast must immediately follow the load, so no
+        //     program point exists between them;
+        // (c) REGISTER-FREE-AT-LOAD: no OTHER value assigned to the cast
+        //     dest's register may have a live interval covering the load
+        //     point — otherwise the early load clobbers a value still
+        //     needed (the simd_crc_adler corruption: fold loaded into r13
+        //     which still held a value consumed by the next instruction).
+        // use_counts includes terminator uses, so "exactly one use" is
+        // faithful; the load's dest keeps its own (now never-written)
+        // home, which nothing reads.
+        let mut cast_by_src: FxHashMap<u32, (Value, IrType, IrType)> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Cast {
+                    dest,
+                    src: Operand::Value(sv),
+                    from_ty,
+                    to_ty,
+                } = inst
+                {
+                    cast_by_src.entry(sv.0).or_insert((*dest, *from_ty, *to_ty));
                 }
             }
-            let mut lcf: FxHashMap<u32, (PhysReg, u32)> = FxHashMap::default();
-            let mut fcd: FxHashSet<u32> = FxHashSet::default();
-            if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_err() {
-                // Program-point numbering matching liveness.rs (1 per
-                // instruction + 1 per terminator, in block order).
-                let intervals: Vec<(u32, u32, u32)> = cached_liveness
-                    .as_ref()
-                    .map(|l| {
-                        l.intervals
-                            .iter()
-                            .map(|iv| (iv.value_id, iv.start, iv.end))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let mut pp: u32 = 0;
-                for block in &func.blocks {
-                    let insts = &block.instructions;
-                    for ii in 0..insts.len() {
-                        let load_pp = pp;
-                        if let Instruction::Load {
-                            dest,
-                            ty,
-                            seg_override,
-                            ..
-                        } = &insts[ii]
-                        {
-                            let ok_ty = matches!(
-                                ty,
-                                IrType::U8 | IrType::U16 | IrType::U32
-                            ) && *seg_override == AddressSpace::Default;
-                            let single_use = self
-                                .value_use_counts
-                                .get(&dest.0)
-                                .copied()
-                                .unwrap_or(0)
-                                == 1;
-                            let adjacent_cast = matches!(
-                                insts.get(ii + 1),
-                                Some(Instruction::Cast {
-                                    src: Operand::Value(sv),
-                                    ..
-                                }) if sv.0 == dest.0
-                            );
-                            if ok_ty && single_use && adjacent_cast {
-                                if let Some((cd, from, to)) = cast_by_src.get(&dest.0) {
-                                    let width_ok = *from == *ty
-                                        && matches!(
-                                            (ty, to),
-                                            (IrType::U8, IrType::I32)
-                                                | (IrType::U8, IrType::U32)
-                                                | (IrType::U8, IrType::I64)
-                                                | (IrType::U8, IrType::U64)
-                                                | (IrType::U16, IrType::I32)
-                                                | (IrType::U16, IrType::U32)
-                                                | (IrType::U16, IrType::I64)
-                                                | (IrType::U16, IrType::U64)
-                                                | (IrType::U32, IrType::I32)
-                                                | (IrType::U32, IrType::U32)
-                                                | (IrType::U32, IrType::I64)
-                                                | (IrType::U32, IrType::U64)
-                                        );
-                                    if width_ok {
-                                        if let Some(reg) =
-                                            self.reg_assignments.get(&cd.0).copied()
-                                        {
-                                            if !is_xmm_reg(reg) {
-                                                // Register-free-at-load guard.
-                                                let mut conflict = false;
-                                                for &(vid, s, e) in &intervals {
-                                                    if vid != cd.0
-                                                        && s <= load_pp
-                                                        && load_pp <= e
+        }
+        let mut lcf: FxHashMap<u32, (PhysReg, u32)> = FxHashMap::default();
+        let mut fcd: FxHashSet<u32> = FxHashSet::default();
+        if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_err() {
+            // Program-point numbering matching liveness.rs (1 per
+            // instruction + 1 per terminator, in block order).
+            let intervals: Vec<(u32, u32, u32)> = cached_liveness
+                .as_ref()
+                .map(|l| {
+                    l.intervals
+                        .iter()
+                        .map(|iv| (iv.value_id, iv.start, iv.end))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut pp: u32 = 0;
+            for block in &func.blocks {
+                let insts = &block.instructions;
+                for ii in 0..insts.len() {
+                    let load_pp = pp;
+                    if let Instruction::Load {
+                        dest,
+                        ty,
+                        seg_override,
+                        ..
+                    } = &insts[ii]
+                    {
+                        let ok_ty = matches!(ty, IrType::U8 | IrType::U16 | IrType::U32)
+                            && *seg_override == AddressSpace::Default;
+                        let single_use =
+                            self.value_use_counts.get(&dest.0).copied().unwrap_or(0) == 1;
+                        let adjacent_cast = matches!(
+                            insts.get(ii + 1),
+                            Some(Instruction::Cast {
+                                src: Operand::Value(sv),
+                                ..
+                            }) if sv.0 == dest.0
+                        );
+                        if ok_ty && single_use && adjacent_cast {
+                            if let Some((cd, from, to)) = cast_by_src.get(&dest.0) {
+                                let width_ok = *from == *ty
+                                    && matches!(
+                                        (ty, to),
+                                        (IrType::U8, IrType::I32)
+                                            | (IrType::U8, IrType::U32)
+                                            | (IrType::U8, IrType::I64)
+                                            | (IrType::U8, IrType::U64)
+                                            | (IrType::U16, IrType::I32)
+                                            | (IrType::U16, IrType::U32)
+                                            | (IrType::U16, IrType::I64)
+                                            | (IrType::U16, IrType::U64)
+                                            | (IrType::U32, IrType::I32)
+                                            | (IrType::U32, IrType::U32)
+                                            | (IrType::U32, IrType::I64)
+                                            | (IrType::U32, IrType::U64)
+                                    );
+                                if width_ok {
+                                    if let Some(reg) = self.reg_assignments.get(&cd.0).copied() {
+                                        if !is_xmm_reg(reg) {
+                                            // Register-free-at-load guard.
+                                            let mut conflict = false;
+                                            for &(vid, s, e) in &intervals {
+                                                if vid != cd.0 && s <= load_pp && load_pp <= e {
+                                                    if let Some(&r) = self.reg_assignments.get(&vid)
                                                     {
-                                                        if let Some(&r) = self
-                                                            .reg_assignments
-                                                            .get(&vid)
-                                                        {
-                                                            if r == reg {
-                                                                conflict = true;
-                                                                break;
-                                                            }
+                                                        if r == reg {
+                                                            conflict = true;
+                                                            break;
                                                         }
                                                     }
                                                 }
-                                                if !conflict {
-                                                    lcf.insert(dest.0, (reg, cd.0));
-                                                    fcd.insert(cd.0);
-                                                }
+                                            }
+                                            if !conflict {
+                                                lcf.insert(dest.0, (reg, cd.0));
+                                                fcd.insert(cd.0);
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        pp += 1;
                     }
-                    pp += 1; // terminator
+                    pp += 1;
                 }
-                if std::env::var("CCC_DEBUG_LOAD_CAST_FOLD").is_ok() && !lcf.is_empty() {
-                    eprintln!(
+                pp += 1; // terminator
+            }
+            if std::env::var("CCC_DEBUG_LOAD_CAST_FOLD").is_ok() && !lcf.is_empty() {
+                eprintln!(
                         "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
                         func.name,
                         lcf.len()
                     );
-                }
-                if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_ok() {
-                    lcf.clear();
-                    fcd.clear();
-                }
             }
-            self.load_cast_fold = lcf;
-            self.folded_cast_dests = fcd;
+            if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_ok() {
+                lcf.clear();
+                fcd.clear();
+            }
+        }
+        self.load_cast_fold = lcf;
+        self.folded_cast_dests = fcd;
         // FPO (RSP mode): callee saves are movq'd into the frame at offsets -8..-N*8
         // from the virtual rbp. callee_save_reserve shifts local slots below them.
         // RBP (push mode): pushes go BEFORE subq and are at -8(%rbp)..-N*8(%rbp).
@@ -1045,24 +1108,34 @@ impl X86Codegen {
         let callee_save_reserve = if n_callee > 0 { n_callee * 8 + 8 } else { 0 };
         // Capture before `self.state` is mutably borrowed by the layout closure.
         let fpo = self.state.omit_frame_pointer;
-        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
-        let mut space = calculate_stack_space_common(&mut self.state, func, callee_save_reserve, |space, alloc_size, align| {
-            let effective_align = if align > 0 { align.max(8) } else { 8 };
-            let alloc = (alloc_size + 7) & !7;
-            let mut new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
-            // FPO: the virtual frame base (rsp + frame_size) is entry %rsp,
-            // which is ≡ 8 (mod 16) because the caller's CALL pushed the return
-            // address. A slot assigned here at offset ≡ 0 (mod A) therefore
-            // lands at ≡ 8 (mod 16) — misaligned for any A >= 16. Shifting the
-            // slot by 8 makes the final address (entry_rsp + offset) ≡
-            // (8 + A-8) = 0 (mod A), exactly right for every power-of-two
-            // alignment >= 16 (16, 32, 64, ...). (rbp mode is unaffected:
-            // %rbp = entry_rsp - 8 is already 16-aligned.)
-            if fpo && effective_align >= 16 {
-                new_space += 8;
-            }
-            (-new_space, new_space)
-        }, &reg_assigned, &X86_CALLEE_SAVED, cached_liveness);
+        self.state.ra_accumulator_values =
+            accumulator_assignments.iter().map(|a| a.value_id).collect();
+        let mut space = calculate_stack_space_common(
+            &mut self.state,
+            func,
+            callee_save_reserve,
+            |space, alloc_size, align| {
+                let effective_align = if align > 0 { align.max(8) } else { 8 };
+                let alloc = (alloc_size + 7) & !7;
+                let mut new_space =
+                    ((space + alloc + effective_align - 1) / effective_align) * effective_align;
+                // FPO: the virtual frame base (rsp + frame_size) is entry %rsp,
+                // which is ≡ 8 (mod 16) because the caller's CALL pushed the return
+                // address. A slot assigned here at offset ≡ 0 (mod A) therefore
+                // lands at ≡ 8 (mod 16) — misaligned for any A >= 16. Shifting the
+                // slot by 8 makes the final address (entry_rsp + offset) ≡
+                // (8 + A-8) = 0 (mod A), exactly right for every power-of-two
+                // alignment >= 16 (16, 32, 64, ...). (rbp mode is unaffected:
+                // %rbp = entry_rsp - 8 is already 16-aligned.)
+                if fpo && effective_align >= 16 {
+                    new_space += 8;
+                }
+                (-new_space, new_space)
+            },
+            &reg_assigned,
+            &X86_CALLEE_SAVED,
+            cached_liveness,
+        );
 
         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
         self.caller_save_spill_slots.clear();
@@ -1116,7 +1189,11 @@ impl X86Codegen {
                 return if self.func_has_calls { 8 } else { 0 };
             }
             let aligned = (raw_space + 15) & !15;
-            if aligned % 16 == 0 { aligned + 8 } else { aligned }
+            if aligned % 16 == 0 {
+                aligned + 8
+            } else {
+                aligned
+            }
         } else {
             if raw_space <= 0 {
                 // Frame-pointer path: `push %rbp` already realigns entry
@@ -1162,21 +1239,27 @@ impl X86Codegen {
                 }
                 let local_size = frame_size - n_saves * 8;
                 if local_size > 0 {
-                    self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subq", local_size, "rsp");
                 }
             } else {
                 if frame_size > 0 {
-                    self.state.out.emit_instr_imm_reg("    subq", frame_size, "rsp");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subq", frame_size, "rsp");
                 }
                 for (i, &reg) in used_regs.iter().enumerate() {
                     let reg_name = phys_reg_name(reg);
                     let rsp_offset = frame_size - (i as i64 + 1) * 8;
-                    self.state.emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
                 }
             }
             if self.state.emit_cfi {
                 let actual_stack = frame_size.max(n_saves * 8);
-                self.state.emit_fmt(format_args!("    .cfi_def_cfa_offset {}", actual_stack + 8));
+                self.state
+                    .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", actual_stack + 8));
             }
             self.state.out.use_rsp_addressing = true;
             self.state.out.rsp_frame_size = frame_size;
@@ -1207,17 +1290,27 @@ impl X86Codegen {
                 const PAGE_SIZE: i64 = 4096;
                 if local_size > PAGE_SIZE {
                     let probe_label = self.state.fresh_label("stack_probe");
-                    self.state.out.emit_instr_imm_reg("    movq", local_size, "r11");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", local_size, "r11");
                     self.state.out.emit_named_label(&probe_label);
-                    self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
                     self.state.emit("    orl $0, (%rsp)");
-                    self.state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
-                    self.state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
                     self.state.out.emit_jcc_label("    ja", &probe_label);
                     self.state.emit("    subq %r11, %rsp");
                     self.state.emit("    orl $0, (%rsp)");
                 } else {
-                    self.state.out.emit_instr_imm_reg("    subq", local_size, "rsp");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subq", local_size, "rsp");
                 }
             }
         }
@@ -1227,15 +1320,18 @@ impl X86Codegen {
         // LCCC's peephole pre-scan; it names the final direct slot address.
         // This avoids treating a volatile local as an ordinary dead stack
         // temporary after register/FP shuttle rewrites.
-        let mut volatile_ids: Vec<u32> = self.state.volatile_alloca_values.iter().copied().collect();
+        let mut volatile_ids: Vec<u32> =
+            self.state.volatile_alloca_values.iter().copied().collect();
         volatile_ids.sort_unstable();
         for id in volatile_ids {
             if let Some(slot) = self.state.get_slot(id) {
                 if self.state.out.use_rsp_addressing {
                     let off = self.state.out.rsp_frame_size + slot.0;
-                    self.state.emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rsp)", off));
+                    self.state
+                        .emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rsp)", off));
                 } else {
-                    self.state.emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rbp)", slot.0));
+                    self.state
+                        .emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rbp)", slot.0));
                 }
             }
         }
@@ -1255,9 +1351,11 @@ impl X86Codegen {
                 let gp_start = self.num_named_int_params.min(6);
                 let gp_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                 for i in gp_start..6 {
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movq", gp_regs[i], base + (i as i64) * 8);
+                    self.state.out.emit_instr_reg_rbp(
+                        "    movq",
+                        gp_regs[i],
+                        base + (i as i64) * 8,
+                    );
                 }
             }
 
@@ -1302,7 +1400,9 @@ impl X86Codegen {
             if use_push_pop {
                 let local_size = frame_size - num_saved * 8;
                 if local_size > 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", local_size, "rsp");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    addq", local_size, "rsp");
                 }
                 for &reg in used_regs.iter().rev() {
                     let reg_name = phys_reg_name(reg);
@@ -1312,16 +1412,20 @@ impl X86Codegen {
                 for (i, &reg) in used_regs.iter().enumerate() {
                     let reg_name = phys_reg_name(reg);
                     let offset = frame_size - (i as i64 + 1) * 8;
-                    self.state.emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
+                    self.state
+                        .emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
                 }
                 if frame_size > 0 {
-                    self.state.out.emit_instr_imm_reg("    addq", frame_size, "rsp");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    addq", frame_size, "rsp");
                 }
             }
         } else {
             // Traditional epilogue: restore from pushes, then popq %rbp
             if num_saved > 0 {
-                self.state.emit_fmt(format_args!("    leaq {}(%rbp), %rsp", -(num_saved * 8)));
+                self.state
+                    .emit_fmt(format_args!("    leaq {}(%rbp), %rsp", -(num_saved * 8)));
             } else {
                 self.state.emit("    movq %rbp, %rsp");
             }
@@ -1335,18 +1439,21 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
-        let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
+        let xmm_regs = [
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        ];
         let config = self.call_abi_config_impl();
         let param_classes = classify_params(func, &config);
         self.state.param_classes = param_classes.clone();
         self.state.num_params = func.params.len();
         self.state.func_is_variadic = func.is_variadic;
 
-        self.state.param_alloca_slots = (0..func.params.len()).map(|i| {
-            find_param_alloca(func, i).and_then(|(dest, ty)| {
-                self.state.get_slot(dest.0).map(|slot| (slot, ty))
+        self.state.param_alloca_slots = (0..func.params.len())
+            .map(|i| {
+                find_param_alloca(func, i)
+                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
             })
-        }).collect();
+            .collect();
 
         // Build a map of param_idx -> ParamRef dest Value for fast lookup.
         // This is used to optimize parameter storage: when the ParamRef dest
@@ -1355,7 +1462,10 @@ impl X86Codegen {
         let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::ParamRef { dest, param_idx, .. } = inst {
+                if let Instruction::ParamRef {
+                    dest, param_idx, ..
+                } = inst
+                {
                     if *param_idx < paramref_dests.len() {
                         paramref_dests[*param_idx] = Some(*dest);
                     }
@@ -1370,7 +1480,8 @@ impl X86Codegen {
 
         // Build a map from physical register -> list of param indices that use it,
         // so we can detect when two params share the same callee-saved register.
-        let mut reg_to_params: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> = crate::common::fx_hash::FxHashMap::default();
+        let mut reg_to_params: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
+            crate::common::fx_hash::FxHashMap::default();
         for (i, _) in func.params.iter().enumerate() {
             if let Some(paramref_dest) = paramref_dests[i] {
                 if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
@@ -1392,9 +1503,8 @@ impl X86Codegen {
         // incoming argument.  Emit them after collection in a dependency-safe
         // order and break cycles through reserved scratch %rax.
         // (param_idx, current source, original ABI source, destination, home)
-        let mut gpr_prestores: Vec<(
-            usize, &'static str, &'static str, &'static str, PhysReg
-        )> = Vec::new();
+        let mut gpr_prestores: Vec<(usize, &'static str, &'static str, &'static str, PhysReg)> =
+            Vec::new();
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
@@ -1413,7 +1523,10 @@ impl X86Codegen {
                     .is_some();
                 if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
                     let reg = self.reg_assignments.get(&paramref_dest.0);
-                    eprintln!("[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}", i, paramref_dest.0, has_slot, reg);
+                    eprintln!(
+                        "[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}",
+                        i, paramref_dest.0, has_slot, reg
+                    );
                 }
                 if !has_slot {
                     if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
@@ -1434,12 +1547,16 @@ impl X86Codegen {
                         let is_caller_saved_gpr = (10..=16).contains(&phys_reg.0);
                         let is_xmm = super::emit::is_xmm_reg(phys_reg);
                         if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
-                            let shared = reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
-                            eprintln!("[PRE-STORE]   callee={} caller={} shared={} class={:?}",
-                                is_callee_saved, is_caller_saved_gpr, shared, class);
+                            let shared =
+                                reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
+                            eprintln!(
+                                "[PRE-STORE]   callee={} caller={} shared={} class={:?}",
+                                is_callee_saved, is_caller_saved_gpr, shared, class
+                            );
                         }
                         if is_callee_saved || is_caller_saved_gpr || is_xmm {
-                            let shared = reg_to_params.get(&phys_reg.0)
+                            let shared = reg_to_params
+                                .get(&phys_reg.0)
                                 .is_some_and(|users| users.len() > 1);
                             if !shared {
                                 let dest_reg = phys_reg_name(phys_reg);
@@ -1448,8 +1565,9 @@ impl X86Codegen {
                                     if is_caller_saved_gpr {
                                         gpr_prestores.push((i, source, source, dest_reg, phys_reg));
                                     } else {
-                                        self.state.out.emit_instr_reg_reg(
-                                            "    movq", source, dest_reg);
+                                        self.state
+                                            .out
+                                            .emit_instr_reg_reg("    movq", source, dest_reg);
                                         self.state.param_pre_stored.insert(i);
                                         self.param_source_regs.insert(phys_reg.0, source);
                                     }
@@ -1474,25 +1592,52 @@ impl X86Codegen {
                 // DEBUG: dump entry block instructions for this param
                 if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
                     if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
-                        eprintln!("[PARAM-STORE] param {} has alloca dest={}, no ParamRef", i, alloca_dest.0);
-                        eprintln!("[PARAM-STORE] has_slot={}", self.state.get_slot(alloca_dest.0).is_some());
+                        eprintln!(
+                            "[PARAM-STORE] param {} has alloca dest={}, no ParamRef",
+                            i, alloca_dest.0
+                        );
+                        eprintln!(
+                            "[PARAM-STORE] has_slot={}",
+                            self.state.get_slot(alloca_dest.0).is_some()
+                        );
                         for (bi, block) in func.blocks.iter().enumerate() {
                             for inst in &block.instructions {
                                 match inst {
-                                    Instruction::Store { ptr, val, .. } if ptr.0 == alloca_dest.0 =>
-                                        eprintln!("[PARAM-STORE]   block[{}] Store to alloca: val={:?}", bi, val),
-                                    Instruction::Load { ptr, dest, .. } if ptr.0 == alloca_dest.0 =>
-                                        eprintln!("[PARAM-STORE]   block[{}] Load from alloca: dest={}", bi, dest.0),
-                                    Instruction::Copy { dest, src } =>
-                                        eprintln!("[PARAM-STORE]   block[{}] Copy dest={} src={:?}", bi, dest.0, src),
-                                    Instruction::ParamRef { dest, param_idx, .. } =>
-                                        eprintln!("[PARAM-STORE]   block[{}] ParamRef dest={} idx={}", bi, dest.0, param_idx),
+                                    Instruction::Store { ptr, val, .. }
+                                        if ptr.0 == alloca_dest.0 =>
+                                    {
+                                        eprintln!(
+                                            "[PARAM-STORE]   block[{}] Store to alloca: val={:?}",
+                                            bi, val
+                                        )
+                                    }
+                                    Instruction::Load { ptr, dest, .. }
+                                        if ptr.0 == alloca_dest.0 =>
+                                    {
+                                        eprintln!(
+                                            "[PARAM-STORE]   block[{}] Load from alloca: dest={}",
+                                            bi, dest.0
+                                        )
+                                    }
+                                    Instruction::Copy { dest, src } => eprintln!(
+                                        "[PARAM-STORE]   block[{}] Copy dest={} src={:?}",
+                                        bi, dest.0, src
+                                    ),
+                                    Instruction::ParamRef {
+                                        dest, param_idx, ..
+                                    } => eprintln!(
+                                        "[PARAM-STORE]   block[{}] ParamRef dest={} idx={}",
+                                        bi, dest.0, param_idx
+                                    ),
                                     _ => {}
                                 }
                             }
                         }
                         for (&vid, &reg) in self.reg_assignments.iter() {
-                            eprintln!("[PARAM-STORE]   reg_assign: val={} -> PhysReg({})", vid, reg.0);
+                            eprintln!(
+                                "[PARAM-STORE]   reg_assign: val={} -> PhysReg({})",
+                                vid, reg.0
+                            );
                         }
                     }
                 }
@@ -1531,13 +1676,18 @@ impl X86Codegen {
                             }
                         }
                         // Propagate through Copy chains
-                        let mut all_vals: crate::common::fx_hash::FxHashSet<u32> = param_vals.iter().copied().collect();
+                        let mut all_vals: crate::common::fx_hash::FxHashSet<u32> =
+                            param_vals.iter().copied().collect();
                         let mut changed_prop = true;
                         while changed_prop {
                             changed_prop = false;
                             for block in &func.blocks {
                                 for inst in &block.instructions {
-                                    if let Instruction::Copy { dest, src: crate::ir::instruction::Operand::Value(v) } = inst {
+                                    if let Instruction::Copy {
+                                        dest,
+                                        src: crate::ir::instruction::Operand::Value(v),
+                                    } = inst
+                                    {
                                         if all_vals.contains(&v.0) && all_vals.insert(dest.0) {
                                             changed_prop = true;
                                         }
@@ -1553,9 +1703,13 @@ impl X86Codegen {
                                     let dest_reg = phys_reg_name(phys_reg);
                                     if let ParamClass::IntReg { reg_idx } = class {
                                         self.state.out.emit_instr_reg_reg(
-                                            "    movq", X86_ARG_REGS[reg_idx], dest_reg);
+                                            "    movq",
+                                            X86_ARG_REGS[reg_idx],
+                                            dest_reg,
+                                        );
                                         self.state.param_pre_stored.insert(i);
-                                        self.param_source_regs.insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
+                                        self.param_source_regs
+                                            .insert(phys_reg.0, X86_ARG_REGS[reg_idx]);
                                         break;
                                     }
                                 }
@@ -1588,43 +1742,95 @@ impl X86Codegen {
                     // uninitialized memory and trigger valgrind errors.
                     // The typed load in emit_param_ref_impl correctly extracts only the
                     // meaningful bytes (e.g., movslq for I32).
-                    self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[reg_idx], slot.0);
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", X86_ARG_REGS[reg_idx], slot.0);
                 }
                 ParamClass::FloatReg { reg_idx } => {
                     if ty == IrType::F32 {
-                        self.state.out.emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
                         self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
                     } else {
-                        self.state.out.emit_instr_reg_rbp("    movq", xmm_regs[reg_idx], slot.0);
+                        self.state
+                            .out
+                            .emit_instr_reg_rbp("    movq", xmm_regs[reg_idx], slot.0);
                     }
                 }
                 ParamClass::I128RegPair { base_reg_idx } => {
-                    self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[base_reg_idx], slot.0);
-                    self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[base_reg_idx + 1], slot.0 + 8);
+                    self.state.out.emit_instr_reg_rbp(
+                        "    movq",
+                        X86_ARG_REGS[base_reg_idx],
+                        slot.0,
+                    );
+                    self.state.out.emit_instr_reg_rbp(
+                        "    movq",
+                        X86_ARG_REGS[base_reg_idx + 1],
+                        slot.0 + 8,
+                    );
                 }
                 ParamClass::StructByValReg { base_reg_idx, size } => {
-                    self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[base_reg_idx], slot.0);
+                    self.state.out.emit_instr_reg_rbp(
+                        "    movq",
+                        X86_ARG_REGS[base_reg_idx],
+                        slot.0,
+                    );
                     if size > 8 {
-                        self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[base_reg_idx + 1], slot.0 + 8);
+                        self.state.out.emit_instr_reg_rbp(
+                            "    movq",
+                            X86_ARG_REGS[base_reg_idx + 1],
+                            slot.0 + 8,
+                        );
                     }
                 }
-                ParamClass::StructSseReg { lo_fp_idx, hi_fp_idx, .. } => {
-                    self.state.out.emit_instr_reg_rbp("    movq", xmm_regs[lo_fp_idx], slot.0);
+                ParamClass::StructSseReg {
+                    lo_fp_idx,
+                    hi_fp_idx,
+                    ..
+                } => {
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", xmm_regs[lo_fp_idx], slot.0);
                     if let Some(hi) = hi_fp_idx {
-                        self.state.out.emit_instr_reg_rbp("    movq", xmm_regs[hi], slot.0 + 8);
+                        self.state
+                            .out
+                            .emit_instr_reg_rbp("    movq", xmm_regs[hi], slot.0 + 8);
                     }
                 }
                 ParamClass::F128SseReg { reg_idx } => {
                     // _Float128: the full 16 bytes arrive in ONE XMM register.
-                    self.state.out.emit_instr_reg_rbp("    movdqu", xmm_regs[reg_idx], slot.0);
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movdqu", xmm_regs[reg_idx], slot.0);
                 }
-                ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, .. } => {
-                    self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[int_reg_idx], slot.0);
-                    self.state.out.emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0 + 8);
+                ParamClass::StructMixedIntSseReg {
+                    int_reg_idx,
+                    fp_reg_idx,
+                    ..
+                } => {
+                    self.state.out.emit_instr_reg_rbp(
+                        "    movq",
+                        X86_ARG_REGS[int_reg_idx],
+                        slot.0,
+                    );
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0 + 8);
                 }
-                ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, .. } => {
-                    self.state.out.emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0);
-                    self.state.out.emit_instr_reg_rbp("    movq", X86_ARG_REGS[int_reg_idx], slot.0 + 8);
+                ParamClass::StructMixedSseIntReg {
+                    fp_reg_idx,
+                    int_reg_idx,
+                    ..
+                } => {
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0);
+                    self.state.out.emit_instr_reg_rbp(
+                        "    movq",
+                        X86_ARG_REGS[int_reg_idx],
+                        slot.0 + 8,
+                    );
                 }
                 ParamClass::F128AlwaysStack { offset } => {
                     let src = stack_base + offset;
@@ -1635,8 +1841,12 @@ impl X86Codegen {
                     let src = stack_base + offset;
                     self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
                     self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
-                    self.state.out.emit_instr_rbp_reg("    movq", src + 8, "rax");
-                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg("    movq", src + 8, "rax");
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
                 }
                 ParamClass::StackScalar { offset } => {
                     // Load from caller's stack frame and store full 8 bytes to ensure
@@ -1645,7 +1855,8 @@ impl X86Codegen {
                     self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
                     self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
                 }
-                ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
+                ParamClass::StructStack { offset, size }
+                | ParamClass::LargeStructStack { offset, size } => {
                     let src = stack_base + offset;
                     let n_qwords = size.div_ceil(8);
                     // Over-aligned (>16) parameter allocas have their slot
@@ -1667,7 +1878,9 @@ impl X86Codegen {
                             .emit_instr_imm_reg("    andq", -(a as i64), "rcx");
                         for qi in 0..n_qwords {
                             let src_off = src + (qi as i64 * 8);
-                            self.state.out.emit_instr_rbp_reg("    movq", src_off, "rax");
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", src_off, "rax");
                             self.state
                                 .emit_fmt(format_args!("    movq %rax, {}(%rcx)", qi * 8));
                         }
@@ -1675,15 +1888,22 @@ impl X86Codegen {
                         for qi in 0..n_qwords {
                             let src_off = src + (qi as i64 * 8);
                             let dst_off = slot.0 + (qi as i64 * 8);
-                            self.state.out.emit_instr_rbp_reg("    movq", src_off, "rax");
-                            self.state.out.emit_instr_reg_rbp("    movq", "rax", dst_off);
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", src_off, "rax");
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movq", "rax", dst_off);
                         }
                     }
                 }
-                ParamClass::F128FpReg { .. } | ParamClass::F128GpPair { .. } | ParamClass::F128Stack { .. } |
-                ParamClass::LargeStructByRefReg { .. } | ParamClass::LargeStructByRefStack { .. } |
-                ParamClass::StructSplitRegStack { .. } |
-                ParamClass::ZeroSizeSkip => {}
+                ParamClass::F128FpReg { .. }
+                | ParamClass::F128GpPair { .. }
+                | ParamClass::F128Stack { .. }
+                | ParamClass::LargeStructByRefReg { .. }
+                | ParamClass::LargeStructByRefStack { .. }
+                | ParamClass::StructSplitRegStack { .. }
+                | ParamClass::ZeroSizeSkip => {}
             }
         }
 
@@ -1697,9 +1917,10 @@ impl X86Codegen {
             while !pending.is_empty() {
                 let ready = pending.iter().enumerate().find_map(|(idx, cand)| {
                     let dest = cand.3;
-                    let clobbers_other_source = pending.iter().enumerate().any(
-                        |(j, other)| j != idx && other.1 == dest
-                    );
+                    let clobbers_other_source = pending
+                        .iter()
+                        .enumerate()
+                        .any(|(j, other)| j != idx && other.1 == dest);
                     (!clobbers_other_source).then_some(idx)
                 });
                 if let Some(idx) = ready {
@@ -1740,12 +1961,14 @@ impl X86Codegen {
                     // of a DIFFERENT pending param (reading that ABI register
                     // later would yield the overwritten home value). Compare
                     // names: the home is xmm2..xmm15, ABI args are xmm0..xmm7.
-                    let clobbers = pending.iter().any(|&(j, j_abi, _, _, _)| {
-                        j != i && dest == xmm_regs[j_abi]
-                    });
+                    let clobbers = pending
+                        .iter()
+                        .any(|&(j, j_abi, _, _, _)| j != i && dest == xmm_regs[j_abi]);
                     if !clobbers {
                         let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
                         self.state.param_pre_stored.insert(i);
                         progressed = true;
                     } else {
@@ -1771,7 +1994,9 @@ impl X86Codegen {
                     };
                     if let Some(scratch) = scratch {
                         let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], scratch);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], scratch);
                         self.state.param_pre_stored.insert(i);
                         scratch_saves.push((dest, is_f32, scratch));
                         let _ = home;
@@ -1779,7 +2004,9 @@ impl X86Codegen {
                     } else {
                         // Degenerate (every XMM is a pending home): emit directly.
                         let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                        self.state.out.emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
                         self.state.param_pre_stored.insert(i);
                         pending.remove(0);
                     }
@@ -1811,13 +2038,16 @@ impl X86Codegen {
                 let load_instr = Self::mov_load_for_type(alloca_ty);
                 let reg = Self::load_dest_reg(alloca_ty);
                 let sr = self.slot_ref(slot.0);
-                self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);
                 return;
             }
         }
 
-        let xmm_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
+        let xmm_regs = [
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        ];
         let class = self.state.param_classes[param_idx];
         let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
@@ -1840,16 +2070,24 @@ impl X86Codegen {
                 // must never rewrite this read through that copy — it would
                 // silently substitute the wrong parameter. The marker is
                 // consumed by `pin_param_abi_reads` in the text peephole.
-                self.state.emit_fmt(format_args!("    # LCCC_PARAM_ABI_READ {}", src_reg));
-                self.state.emit_fmt(format_args!("    {} %{}, {}", load_instr, src_reg, dest_reg));
+                self.state
+                    .emit_fmt(format_args!("    # LCCC_PARAM_ABI_READ {}", src_reg));
+                self.state.emit_fmt(format_args!(
+                    "    {} %{}, {}",
+                    load_instr, src_reg, dest_reg
+                ));
                 self.store_rax_to(dest);
             }
             ParamClass::FloatReg { reg_idx } => {
                 if ty == IrType::F32 {
-                    self.state.out.emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
                     self.store_rax_to(dest);
                 } else {
-                    self.state.out.emit_instr_reg_reg("    movq", xmm_regs[reg_idx], "rax");
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movq", xmm_regs[reg_idx], "rax");
                     self.store_rax_to(dest);
                 }
             }
@@ -1858,7 +2096,8 @@ impl X86Codegen {
                 let load_instr = Self::mov_load_for_type(ty);
                 let reg = Self::load_dest_reg(ty);
                 let sr = self.slot_ref(src);
-                self.state.emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);
             }
             _ => {}

@@ -23,8 +23,10 @@ impl Driver {
         // .od - heatshrink uses for dynamic-variant objects
         // .lo - libtool object files
         // .obj - Windows-style object files sometimes used in cross-platform projects
-        if path.ends_with(".os") || path.ends_with(".od")
-            || path.ends_with(".lo") || path.ends_with(".obj")
+        if path.ends_with(".os")
+            || path.ends_with(".od")
+            || path.ends_with(".lo")
+            || path.ends_with(".obj")
         {
             return true;
         }
@@ -84,8 +86,10 @@ impl Driver {
     /// the -x language override. This is used for stdin ("-") and for files
     /// like /dev/null where the extension doesn't indicate assembly.
     pub(super) fn is_explicit_assembly(&self) -> bool {
-        matches!(self.explicit_language.as_deref(),
-            Some("assembler") | Some("assembler-with-cpp"))
+        matches!(
+            self.explicit_language.as_deref(),
+            Some("assembler") | Some("assembler-with-cpp")
+        )
     }
 
     /// Strip GCC-style line markers (`# <num> "file"`) from preprocessed output.
@@ -97,10 +101,13 @@ impl Driver {
             if !trimmed.starts_with('#') {
                 return false;
             }
-            trimmed[1..].trim_start().starts_with(|c: char| c.is_ascii_digit())
+            trimmed[1..]
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit())
         }
 
-        let mut result: String = input.lines()
+        let mut result: String = input
+            .lines()
             .filter(|line| !is_line_marker(line))
             .collect::<Vec<_>>()
             .join("\n");

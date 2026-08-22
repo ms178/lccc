@@ -10,21 +10,14 @@
 //!
 //! Reference: "A Simple, Fast Dominance Algorithm" by Cooper, Harvey, Kennedy (2001)
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use std::collections::VecDeque;
-use crate::ir::reexports::{
-    BlockId,
-    Instruction,
-    IrConst,
-    IrFunction,
-    IrModule,
-    Operand,
-    Terminator,
-    Value,
-};
-use crate::ir::analysis;
 use crate::backend::inline_asm::constraint_is_memory_only;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
+use crate::ir::analysis;
+use crate::ir::reexports::{
+    BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value,
+};
+use std::collections::VecDeque;
 
 /// Maximum byte size for an alloca to be considered promotable to an SSA register.
 /// This corresponds to the width of a general-purpose register (8 bytes on 64-bit,
@@ -48,7 +41,10 @@ const MAX_PROMOTABLE_ALLOCA_SIZE: usize = 8;
 /// span for the appended tail — never a crash.
 #[inline]
 fn span_at(spans: &[crate::common::source::Span], idx: usize) -> crate::common::source::Span {
-    spans.get(idx).copied().unwrap_or_else(crate::common::source::Span::dummy)
+    spans
+        .get(idx)
+        .copied()
+        .unwrap_or_else(crate::common::source::Span::dummy)
 }
 
 pub fn promote_allocas(module: &mut IrModule) {
@@ -96,11 +92,18 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
     // Step 1: Identify promotable allocas
     let mut alloca_infos = find_promotable_allocas(func, promote_params);
     if std::env::var("CCC_DEBUG_MEM2REG").is_ok() {
-        let total_allocas: usize = func.blocks[0].instructions.iter()
+        let total_allocas: usize = func.blocks[0]
+            .instructions
+            .iter()
             .filter(|i| matches!(i, Instruction::Alloca { .. }))
             .count();
-        eprintln!("[mem2reg] func '{}': {} total allocas, {} promotable, {} params",
-            func.name, total_allocas, alloca_infos.len(), func.params.len());
+        eprintln!(
+            "[mem2reg] func '{}': {} total allocas, {} promotable, {} params",
+            func.name,
+            total_allocas,
+            alloca_infos.len(),
+            func.params.len()
+        );
     }
     if alloca_infos.is_empty() {
         return;
@@ -132,9 +135,13 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
     let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
 
     // Compute per-alloca phi cost: sum of predecessor counts at all phi sites
-    let total_phi_cost: usize = alloca_infos.iter().enumerate()
+    let total_phi_cost: usize = alloca_infos
+        .iter()
+        .enumerate()
         .map(|(alloca_idx, _)| {
-            phi_locations.iter().enumerate()
+            phi_locations
+                .iter()
+                .enumerate()
                 .filter(|(_, phi_set)| phi_set.contains(&alloca_idx))
                 .map(|(block_idx, _)| preds.len(block_idx))
                 .sum::<usize>()
@@ -143,9 +150,13 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
 
     if total_phi_cost > MAX_PHI_COPY_COST {
         // Compute per-alloca costs and remove the most expensive first
-        let mut alloca_phi_costs: Vec<(usize, usize)> = alloca_infos.iter().enumerate()
+        let mut alloca_phi_costs: Vec<(usize, usize)> = alloca_infos
+            .iter()
+            .enumerate()
             .map(|(alloca_idx, _)| {
-                let cost: usize = phi_locations.iter().enumerate()
+                let cost: usize = phi_locations
+                    .iter()
+                    .enumerate()
                     .filter(|(_, phi_set)| phi_set.contains(&alloca_idx))
                     .map(|(block_idx, _)| preds.len(block_idx))
                     .sum();
@@ -165,7 +176,9 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
         }
 
         if !remove_set.is_empty() {
-            alloca_infos = alloca_infos.into_iter().enumerate()
+            alloca_infos = alloca_infos
+                .into_iter()
+                .enumerate()
                 .filter(|(idx, _)| !remove_set.contains(idx))
                 .map(|(_, info)| info)
                 .collect();
@@ -181,7 +194,14 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
 
     // Step 6: Rename variables
     let dom_children = analysis::build_dom_tree_children(num_blocks, &idom);
-    rename_variables(func, &alloca_infos, &phi_locations, &dom_children, &preds, &label_to_idx);
+    rename_variables(
+        func,
+        &alloca_infos,
+        &phi_locations,
+        &dom_children,
+        &preds,
+        &label_to_idx,
+    );
 }
 
 /// Find all allocas that can be promoted to SSA registers.
@@ -203,7 +223,14 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
         .instructions
         .iter()
         .filter_map(|inst| {
-            if let Instruction::Alloca { dest, ty, size, volatile, .. } = inst {
+            if let Instruction::Alloca {
+                dest,
+                ty,
+                size,
+                volatile,
+                ..
+            } = inst
+            {
                 let idx = alloca_index;
                 alloca_index += 1;
                 // Skip parameter allocas when not promoting params
@@ -241,7 +268,14 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     // into inline asm "i" constraints and other optimizations.
     for block in &func.blocks[1..] {
         for inst in &block.instructions {
-            if let Instruction::Alloca { dest, ty, size, volatile, .. } = inst {
+            if let Instruction::Alloca {
+                dest,
+                ty,
+                size,
+                volatile,
+                ..
+            } = inst
+            {
                 if *volatile {
                     continue;
                 }
@@ -294,7 +328,9 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                 // the alloca because the inline asm writes directly to the alloca's
                 // stack memory through the template (the backend substitutes the
                 // stack-relative address like -8(%rbp) for the operand).
-                Instruction::InlineAsm { outputs, inputs, .. } => {
+                Instruction::InlineAsm {
+                    outputs, inputs, ..
+                } => {
                     // Output pointers: treat as definitions of the alloca,
                     // unless the constraint is memory-only (=m) in which case
                     // the alloca must keep its stack slot.
@@ -347,13 +383,11 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     all_allocas
         .into_iter()
         .filter(|(v, _, _)| !disqualified.contains(&v.0))
-        .map(|(alloca_value, ty, _)| {
-            AllocaInfo {
-                alloca_value,
-                ty,
-                def_blocks: def_blocks.remove(&alloca_value.0).unwrap_or_default(),
-                use_blocks: use_blocks.remove(&alloca_value.0).unwrap_or_default(),
-            }
+        .map(|(alloca_value, ty, _)| AllocaInfo {
+            alloca_value,
+            ty,
+            def_blocks: def_blocks.remove(&alloca_value.0).unwrap_or_default(),
+            use_blocks: use_blocks.remove(&alloca_value.0).unwrap_or_default(),
         })
         // Only promote allocas that are actually used (have loads or stores)
         .filter(|info| !info.def_blocks.is_empty() || !info.use_blocks.is_empty())
@@ -401,7 +435,6 @@ fn insert_phis(
 
     phi_locations
 }
-
 
 /// Rename variables to complete SSA construction.
 /// This traverses the dominator tree, maintaining stacks of current definitions
@@ -544,22 +577,48 @@ fn rename_block(
     let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
     for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
         match inst {
-            Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+                ..
+            } => {
                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
                     // Replace load with copy from current SSA value
-                    let current_val = def_stacks[alloca_idx].last().cloned()
+                    let current_val = def_stacks[alloca_idx]
+                        .last()
+                        .cloned()
                         .unwrap_or(Operand::Const(IrConst::zero(ty)));
                     new_instructions.push(Instruction::Copy {
                         dest,
                         src: current_val,
                     });
-                    if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
+                    if has_spans {
+                        new_spans.push(span_at(&old_spans, inst_idx));
+                    }
                 } else {
-                    new_instructions.push(Instruction::Load { volatile, dest, ptr, ty, seg_override });
-                    if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
+                    new_instructions.push(Instruction::Load {
+                        volatile,
+                        dest,
+                        ptr,
+                        ty,
+                        seg_override,
+                    });
+                    if has_spans {
+                        new_spans.push(span_at(&old_spans, inst_idx));
+                    }
                 }
             }
-            Instruction::Store { val, ptr, ty, seg_override, volatile, .. } => {
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+                ..
+            } => {
                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
                     // Push the stored value onto the def stack.
                     // Narrow constants to match the alloca type: the IR lowering
@@ -577,13 +636,27 @@ fn rename_block(
                     // Remove the store (it's now represented by the SSA def)
                     // (span is dropped along with the instruction)
                 } else {
-                    new_instructions.push(Instruction::Store { volatile, val, ptr, ty, seg_override });
-                    if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
+                    new_instructions.push(Instruction::Store {
+                        volatile,
+                        val,
+                        ptr,
+                        ty,
+                        seg_override,
+                    });
+                    if has_spans {
+                        new_spans.push(span_at(&old_spans, inst_idx));
+                    }
                 }
             }
             Instruction::InlineAsm {
-                template, mut outputs, inputs, clobbers,
-                operand_types, goto_labels, input_symbols, seg_overrides,
+                template,
+                mut outputs,
+                inputs,
+                clobbers,
+                operand_types,
+                goto_labels,
+                input_symbols,
+                seg_overrides,
             } => {
                 // Snapshot def stacks BEFORE processing outputs, so goto
                 // targets see the values that were live at the point of the
@@ -591,7 +664,9 @@ fn rename_block(
                 if !goto_labels.is_empty() {
                     let snapshot: Vec<Operand> = (0..alloca_infos.len())
                         .map(|ai| {
-                            def_stacks[ai].last().cloned()
+                            def_stacks[ai]
+                                .last()
+                                .cloned()
                                 .unwrap_or(Operand::Const(IrConst::zero(alloca_infos[ai].ty)))
                         })
                         .collect();
@@ -610,14 +685,24 @@ fn rename_block(
                     }
                 }
                 new_instructions.push(Instruction::InlineAsm {
-                    template, outputs, inputs, clobbers,
-                    operand_types, goto_labels, input_symbols, seg_overrides,
+                    template,
+                    outputs,
+                    inputs,
+                    clobbers,
+                    operand_types,
+                    goto_labels,
+                    input_symbols,
+                    seg_overrides,
                 });
-                if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
+                if has_spans {
+                    new_spans.push(span_at(&old_spans, inst_idx));
+                }
             }
             other => {
                 new_instructions.push(other);
-                if has_spans { new_spans.push(span_at(&old_spans, inst_idx)); }
+                if has_spans {
+                    new_spans.push(span_at(&old_spans, inst_idx));
+                }
             }
         }
     }
@@ -658,8 +743,12 @@ fn rename_block(
                         let current_val = if let Some(snapshot) = goto_snapshot {
                             snapshot[alloca_idx]
                         } else {
-                            def_stacks[alloca_idx].last().cloned()
-                                .unwrap_or(Operand::Const(IrConst::zero(alloca_infos[alloca_idx].ty)))
+                            def_stacks[alloca_idx]
+                                .last()
+                                .cloned()
+                                .unwrap_or(Operand::Const(IrConst::zero(
+                                    alloca_infos[alloca_idx].ty,
+                                )))
                         };
                         incoming.push((current_val, current_block_label));
                     }
@@ -681,9 +770,7 @@ fn rename_block(
     // Build a set of goto-target block indices for quick lookup.
     let goto_target_indices: FxHashMap<usize, &Vec<Operand>> = goto_label_snapshots
         .iter()
-        .filter_map(|(label, snapshot)| {
-            label_to_idx.get(label).map(|&idx| (idx, snapshot))
-        })
+        .filter_map(|(label, snapshot)| label_to_idx.get(label).map(|&idx| (idx, snapshot)))
         .collect();
 
     for child in children {
@@ -735,14 +822,20 @@ fn rename_block(
 fn get_successor_labels(term: &Terminator) -> Vec<BlockId> {
     match term {
         Terminator::Branch(label) => vec![*label],
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             if true_label == false_label {
                 vec![*true_label]
             } else {
                 vec![*true_label, *false_label]
             }
         }
-        Terminator::IndirectBranch { possible_targets, .. } => possible_targets.clone(),
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => possible_targets.clone(),
         Terminator::Switch { cases, default, .. } => {
             let mut targets = vec![*default];
             for &(_, label) in cases {
@@ -783,7 +876,8 @@ fn remove_promoted_instructions(func: &mut IrFunction, alloca_to_idx: &FxHashMap
             block.source_spans.retain(|_| {
                 let keep = match &insts[span_idx] {
                     Instruction::Alloca { dest, .. } => {
-                        !alloca_to_idx.contains_key(&dest.0) || param_alloca_values.contains(&dest.0)
+                        !alloca_to_idx.contains_key(&dest.0)
+                            || param_alloca_values.contains(&dest.0)
                     }
                     Instruction::Store { ptr, .. } => !alloca_to_idx.contains_key(&ptr.0),
                     Instruction::Load { ptr, .. } => !alloca_to_idx.contains_key(&ptr.0),
@@ -797,7 +891,8 @@ fn remove_promoted_instructions(func: &mut IrFunction, alloca_to_idx: &FxHashMap
             match inst {
                 Instruction::Alloca { dest, .. } => {
                     // Keep parameter allocas, remove promoted non-parameter allocas
-                    if alloca_to_idx.contains_key(&dest.0) && !param_alloca_values.contains(&dest.0) {
+                    if alloca_to_idx.contains_key(&dest.0) && !param_alloca_values.contains(&dest.0)
+                    {
                         false // remove
                     } else {
                         true // keep
@@ -846,12 +941,30 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // store 42, %0
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 // %1 = load %0
-                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -869,11 +982,15 @@ mod tests {
         // The alloca should be removed, store removed, load replaced with copy
         let entry = &func.blocks[0];
         // Should have just a Copy instruction (load was replaced)
-        assert!(entry.instructions.iter().any(|inst| matches!(inst, Instruction::Copy { .. })));
+        assert!(entry
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Copy { .. })));
         // Should not have any Store to the promoted alloca
-        assert!(!entry.instructions.iter().any(|inst|
-            matches!(inst, Instruction::Store { ptr: Value(0), .. })
-        ));
+        assert!(!entry
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. })));
     }
 
     #[test]
@@ -886,7 +1003,15 @@ mod tests {
         let mut func = IrFunction::new(
             "f".to_string(),
             IrType::I32,
-            vec![IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None, is_f128_sse: false }],
+            vec![IrParam {
+                ty: IrType::I32,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+                is_f128_sse: false,
+            }],
             false,
         );
 
@@ -895,14 +1020,35 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32 (param)
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // %1 = alloca i32 (x)
-                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // %2 = load %0 (read param)
-                Instruction::Load { volatile: false, dest: Value(2), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(2),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 // %3 = cmp ne %2, 0
                 Instruction::Cmp {
-                    dest: Value(3), op: IrCmpOp::Ne,
+                    dest: Value(3),
+                    op: IrCmpOp::Ne,
                     lhs: Operand::Value(Value(2)),
                     rhs: Operand::Const(IrConst::I32(0)),
                     ty: IrType::I32,
@@ -919,10 +1065,13 @@ mod tests {
         // then: store 1 to x, branch to merge
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(1)), ptr: Value(1), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
-            ],
+            instructions: vec![Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::I32(1)),
+                ptr: Value(1),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
@@ -930,10 +1079,13 @@ mod tests {
         // else: store 2 to x, branch to merge
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(2)), ptr: Value(1), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
-            ],
+            instructions: vec![Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::I32(2)),
+                ptr: Value(1),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
@@ -941,9 +1093,13 @@ mod tests {
         // merge: load x, return
         func.blocks.push(BasicBlock {
             label: BlockId(3),
-            instructions: vec![
-                Instruction::Load { volatile: false, dest: Value(4), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
-            ],
+            instructions: vec![Instruction::Load {
+                volatile: false,
+                dest: Value(4),
+                ptr: Value(1),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
         });
@@ -955,7 +1111,10 @@ mod tests {
         let func = &module.functions[0];
         // The merge block should have a phi node
         let merge = &func.blocks[3];
-        let has_phi = merge.instructions.iter().any(|inst| matches!(inst, Instruction::Phi { .. }));
+        let has_phi = merge
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Phi { .. }));
         assert!(has_phi, "Expected phi node in merge block");
 
         // Verify phi has two incoming values
@@ -971,9 +1130,21 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 // Pass address to a function (address-taken)
                 Instruction::Call {
                     func: "use_ptr".to_string(),
@@ -992,9 +1163,16 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,},
+                        ret_is_f128_sse: false,
+                    },
                 },
-                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1006,9 +1184,10 @@ mod tests {
 
         // The alloca should NOT be promoted (address is taken by call)
         let func = &module.functions[0];
-        let has_alloca = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Alloca { dest: Value(0), .. })
-        );
+        let has_alloca = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Alloca { dest: Value(0), .. }));
         assert!(has_alloca, "Address-taken alloca should not be promoted");
     }
 
@@ -1021,10 +1200,36 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false }, // sum
-                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false }, // i
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(0)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                }, // sum
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                }, // i
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(0)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(0)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1034,9 +1239,16 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(1),
             instructions: vec![
-                Instruction::Load { volatile: false, dest: Value(2), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(2),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::Cmp {
-                    dest: Value(3), op: IrCmpOp::Slt,
+                    dest: Value(3),
+                    op: IrCmpOp::Slt,
                     lhs: Operand::Value(Value(2)),
                     rhs: Operand::Const(IrConst::I32(10)),
                     ty: IrType::I32,
@@ -1054,22 +1266,48 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(2),
             instructions: vec![
-                Instruction::Load { volatile: false, dest: Value(4), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
-                Instruction::Load { volatile: false, dest: Value(5), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(4),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(5),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::BinOp {
-                    dest: Value(6), op: IrBinOp::Add,
+                    dest: Value(6),
+                    op: IrBinOp::Add,
                     lhs: Operand::Value(Value(4)),
                     rhs: Operand::Value(Value(5)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { volatile: false, val: Operand::Value(Value(6)), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(6)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
                 Instruction::BinOp {
-                    dest: Value(7), op: IrBinOp::Add,
+                    dest: Value(7),
+                    op: IrBinOp::Add,
                     lhs: Operand::Value(Value(5)),
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { volatile: false, val: Operand::Value(Value(7)), ptr: Value(1), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(7)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1078,9 +1316,13 @@ mod tests {
         // exit: load sum, return
         func.blocks.push(BasicBlock {
             label: BlockId(3),
-            instructions: vec![
-                Instruction::Load { volatile: false, dest: Value(8), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
-            ],
+            instructions: vec![Instruction::Load {
+                volatile: false,
+                dest: Value(8),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
             source_spans: Vec::new(),
         });
@@ -1092,7 +1334,9 @@ mod tests {
         let func = &module.functions[0];
         // loop_header should have phi nodes for sum and i
         let header = &func.blocks[1];
-        let phi_count = header.instructions.iter()
+        let phi_count = header
+            .instructions
+            .iter()
             .filter(|inst| matches!(inst, Instruction::Phi { .. }))
             .count();
         assert_eq!(phi_count, 2, "Loop header should have 2 phi nodes");
@@ -1107,10 +1351,28 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32 (volatile)
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: true, semantic_volatile: true },
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
-                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32 , seg_override: AddressSpace::Default },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: true,
+                    semantic_volatile: true,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1122,14 +1384,23 @@ mod tests {
 
         // The volatile alloca should NOT be promoted
         let func = &module.functions[0];
-        let has_alloca = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Alloca { dest: Value(0), volatile: true, semantic_volatile: true, .. })
-        );
+        let has_alloca = func.blocks[0].instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Alloca {
+                    dest: Value(0),
+                    volatile: true,
+                    semantic_volatile: true,
+                    ..
+                }
+            )
+        });
         assert!(has_alloca, "Volatile alloca should not be promoted");
         // Store should still exist
-        let has_store = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Store { ptr: Value(0), .. })
-        );
+        let has_store = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. }));
         assert!(has_store, "Store to volatile alloca should not be removed");
     }
 
@@ -1198,7 +1469,14 @@ mod tests {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i64
-                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I64,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // inline_asm outputs=[("=r", %0)]
                 Instruction::InlineAsm {
                     template: String::new(),
@@ -1211,8 +1489,13 @@ mod tests {
                     seg_overrides: vec![AddressSpace::Default],
                 },
                 // %1 = load %0
-                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I64,
-                    seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1225,37 +1508,52 @@ mod tests {
 
         let func = &module.functions[0];
         // The alloca should be gone (promoted)
-        let has_alloca = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Alloca { .. })
+        let has_alloca = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Alloca { .. }));
+        assert!(
+            !has_alloca,
+            "Alloca should be promoted when used only as InlineAsm output"
         );
-        assert!(!has_alloca, "Alloca should be promoted when used only as InlineAsm output");
 
         // The InlineAsm should now have a fresh SSA value as output (not the alloca)
         let asm_output = func.blocks[0].instructions.iter().find_map(|inst| {
             if let Instruction::InlineAsm { outputs, .. } = inst {
-                Some(outputs[0].1.0) // Value ID of first output
+                Some(outputs[0].1 .0) // Value ID of first output
             } else {
                 None
             }
         });
         assert!(asm_output.is_some(), "InlineAsm instruction should exist");
         let fresh_id = asm_output.unwrap();
-        assert_ne!(fresh_id, 0, "InlineAsm output should be a fresh value, not the original alloca");
+        assert_ne!(
+            fresh_id, 0,
+            "InlineAsm output should be a fresh value, not the original alloca"
+        );
 
         // The load should be replaced with a Copy from the fresh value
         let has_copy_from_fresh = func.blocks[0].instructions.iter().any(|inst| {
-            if let Instruction::Copy { src: Operand::Value(v), .. } = inst {
+            if let Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } = inst
+            {
                 v.0 == fresh_id
             } else {
                 false
             }
         });
-        assert!(has_copy_from_fresh, "Load should be replaced with Copy from fresh InlineAsm output");
+        assert!(
+            has_copy_from_fresh,
+            "Load should be replaced with Copy from fresh InlineAsm output"
+        );
 
         // No Load instruction should remain (it was promoted to Copy)
-        let has_load = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Load { .. })
-        );
+        let has_load = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Load { .. }));
         assert!(!has_load, "Load from promoted alloca should be removed");
     }
 
@@ -1267,14 +1565,27 @@ mod tests {
         // Pattern: asm("csrrw %0, satp, %1" : "+m"(*ptr) : ...)
         //
         // The alloca's address is taken (used as input Value), so it must stay.
-        let mut func = IrFunction::new("test_asm_no_promote".to_string(), IrType::I64, vec![], false);
+        let mut func = IrFunction::new(
+            "test_asm_no_promote".to_string(),
+            IrType::I64,
+            vec![],
+            false,
+        );
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i64
-                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I64,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // store 42, %0
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Const(IrConst::I64(42)),
                     ptr: Value(0),
                     ty: IrType::I64,
@@ -1293,8 +1604,13 @@ mod tests {
                     seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
                 },
                 // %1 = load %0
-                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I64,
-                    seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1307,10 +1623,14 @@ mod tests {
 
         let func = &module.functions[0];
         // The alloca should still exist (NOT promoted because address is taken via input)
-        let has_alloca = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Alloca { .. })
+        let has_alloca = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Alloca { .. }));
+        assert!(
+            has_alloca,
+            "Alloca should NOT be promoted when its address is used as InlineAsm input Value"
         );
-        assert!(has_alloca, "Alloca should NOT be promoted when its address is used as InlineAsm input Value");
     }
 
     #[test]
@@ -1321,12 +1641,24 @@ mod tests {
         // the backend to lose the stack address, resulting in writes to garbage.
         //
         // Pattern: asm("mov %1, %0" : "=m"(result) : "r"(value))
-        let mut func = IrFunction::new("test_asm_mem_output_only".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new(
+            "test_asm_mem_output_only".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
                 // %0 = alloca i32 (for "=m" output)
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // inline_asm outputs=[("=m", %0)] inputs=[("r", const 42)]
                 // Output is memory-only; alloca must NOT be promoted.
                 Instruction::InlineAsm {
@@ -1340,8 +1672,13 @@ mod tests {
                     seg_overrides: vec![AddressSpace::Default],
                 },
                 // %1 = load %0
-                Instruction::Load { volatile: false, dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                    seg_override: AddressSpace::Default },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
             source_spans: Vec::new(),
@@ -1355,9 +1692,13 @@ mod tests {
         let func = &module.functions[0];
         // The alloca MUST still exist — it was NOT promoted because the "=m"
         // constraint means the inline asm writes directly to stack memory.
-        let has_alloca = func.blocks[0].instructions.iter().any(|inst|
-            matches!(inst, Instruction::Alloca { .. })
+        let has_alloca = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Alloca { .. }));
+        assert!(
+            has_alloca,
+            "Alloca should NOT be promoted when used as =m inline asm output"
         );
-        assert!(has_alloca, "Alloca should NOT be promoted when used as =m inline asm output");
     }
 }

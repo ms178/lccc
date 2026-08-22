@@ -3,10 +3,10 @@
 //! Shared utilities that eliminate duplicated regalloc setup boilerplate
 //! across all four backends (x86-64, i686, AArch64, RISC-V 64).
 
-use crate::ir::reexports::{Instruction, IrFunction, Value};
-use crate::common::types::IrType;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::super::regalloc::PhysReg;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrFunction, Value};
 
 // ── Register allocation helpers ───────────────────────────────────────────
 
@@ -28,11 +28,25 @@ pub fn run_regalloc_and_merge_clobbers(
     reg_assignments: &mut FxHashMap<u32, PhysReg>,
     used_callee_saved: &mut Vec<PhysReg>,
     allow_inline_asm_regalloc: bool,
-) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>, Vec<super::super::regalloc::AccumulatorAssignment>) {
+) -> (
+    FxHashMap<u32, PhysReg>,
+    Option<super::super::liveness::LivenessResult>,
+    FxHashMap<u8, Vec<(u32, u32)>>,
+    Vec<super::super::regalloc::AccumulatorAssignment>,
+) {
     run_regalloc_and_merge_clobbers_ex(
-        func, available_regs, caller_saved_regs, asm_clobbered_regs,
-        reg_assignments, used_callee_saved, allow_inline_asm_regalloc, None, Vec::new(), Vec::new(),
-        crate::common::fx_hash::FxHashMap::default())
+        func,
+        available_regs,
+        caller_saved_regs,
+        asm_clobbered_regs,
+        reg_assignments,
+        used_callee_saved,
+        allow_inline_asm_regalloc,
+        None,
+        Vec::new(),
+        Vec::new(),
+        crate::common::fx_hash::FxHashMap::default(),
+    )
 }
 
 /// Extended variant taking the set of values codegen will never materialize
@@ -75,19 +89,29 @@ fn collect_abi_reg_hints(
             Some(PhysReg(12)), // r8
             Some(PhysReg(13)), // r9
         ]
-    } else if available_regs.iter().any(|r| r.0 == 19)
-        && caller_saved_regs.iter().any(|r| r.0 == 4)
+    } else if available_regs.iter().any(|r| r.0 == 19) && caller_saved_regs.iter().any(|r| r.0 == 4)
     {
         // AArch64's current caller pool opens x4..x8. x0..x3 remain scratch.
-        vec![None, None, None, None, Some(PhysReg(4)), Some(PhysReg(5)),
-             Some(PhysReg(6)), Some(PhysReg(7))]
+        vec![
+            None,
+            None,
+            None,
+            None,
+            Some(PhysReg(4)),
+            Some(PhysReg(5)),
+            Some(PhysReg(6)),
+            Some(PhysReg(7)),
+        ]
     } else {
         return hints;
     };
 
     for block in &func.blocks {
         for inst in &block.instructions {
-            let Instruction::ParamRef { dest, param_idx, .. } = inst else {
+            let Instruction::ParamRef {
+                dest, param_idx, ..
+            } = inst
+            else {
                 continue;
             };
             let Some(Some(reg)) = mapping.get(*param_idx) else {
@@ -114,7 +138,12 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     call_arg_regs: Vec<PhysReg>,
     indirect_target_regs: Vec<PhysReg>,
     folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
-) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>, FxHashMap<u8, Vec<(u32, u32)>>, Vec<super::super::regalloc::AccumulatorAssignment>) {
+) -> (
+    FxHashMap<u32, PhysReg>,
+    Option<super::super::liveness::LivenessResult>,
+    FxHashMap<u8, Vec<(u32, u32)>>,
+    Vec<super::super::regalloc::AccumulatorAssignment>,
+) {
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
     let has_scalar_fp = func.blocks.iter().any(|block| {
@@ -137,31 +166,57 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             if matches!(inst, Instruction::Memcpy { .. }) {
                 return true;
             }
-            let Instruction::Intrinsic { op, .. } = inst else { return false; };
+            let Instruction::Intrinsic { op, .. } = inst else {
+                return false;
+            };
             use crate::ir::intrinsics::IntrinsicOp;
-            matches!(op,
-                IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
-                IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
-                IntrinsicOp::VecZeroF32x8 | IntrinsicOp::VecZeroF32x4 |
-                IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
-                IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-                IntrinsicOp::VecLoadF32x8 | IntrinsicOp::VecLoadF32x4 |
-                IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
-                IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-                IntrinsicOp::VecAddF32x8 | IntrinsicOp::VecAddF32x4 |
-                IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
-                IntrinsicOp::VecMulF32x8 | IntrinsicOp::VecMulF32x4 |
-                IntrinsicOp::VecFmaF64x4 | IntrinsicOp::VecFmaF32x8 |
-                IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
-                IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
-                IntrinsicOp::VecHorizontalAddF32x8 | IntrinsicOp::VecHorizontalAddF32x4 |
-                IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
-                IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
-                IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
-                IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
-                IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
-                IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
-                IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4)
+            matches!(
+                op,
+                IntrinsicOp::VecZeroF64x4
+                    | IntrinsicOp::VecZeroF64x2
+                    | IntrinsicOp::VecZeroI32x8
+                    | IntrinsicOp::VecZeroI32x4
+                    | IntrinsicOp::VecZeroF32x8
+                    | IntrinsicOp::VecZeroF32x4
+                    | IntrinsicOp::VecLoadF64x4
+                    | IntrinsicOp::VecLoadF64x2
+                    | IntrinsicOp::VecLoadI32x8
+                    | IntrinsicOp::VecLoadI32x4
+                    | IntrinsicOp::VecLoadF32x8
+                    | IntrinsicOp::VecLoadF32x4
+                    | IntrinsicOp::VecAddF64x4
+                    | IntrinsicOp::VecAddF64x2
+                    | IntrinsicOp::VecAddI32x8
+                    | IntrinsicOp::VecAddI32x4
+                    | IntrinsicOp::VecAddF32x8
+                    | IntrinsicOp::VecAddF32x4
+                    | IntrinsicOp::VecMulF64x4
+                    | IntrinsicOp::VecMulF64x2
+                    | IntrinsicOp::VecMulF32x8
+                    | IntrinsicOp::VecMulF32x4
+                    | IntrinsicOp::VecFmaF64x4
+                    | IntrinsicOp::VecFmaF32x8
+                    | IntrinsicOp::VecHorizontalAddF64x4
+                    | IntrinsicOp::VecHorizontalAddF64x2
+                    | IntrinsicOp::VecHorizontalAddI32x8
+                    | IntrinsicOp::VecHorizontalAddI32x4
+                    | IntrinsicOp::VecHorizontalAddF32x8
+                    | IntrinsicOp::VecHorizontalAddF32x4
+                    | IntrinsicOp::LoadF64x4
+                    | IntrinsicOp::LoadF64x2
+                    | IntrinsicOp::LoadI32x8
+                    | IntrinsicOp::LoadI32x4
+                    | IntrinsicOp::AddF64x4
+                    | IntrinsicOp::AddF64x2
+                    | IntrinsicOp::MulF64x4
+                    | IntrinsicOp::MulF64x2
+                    | IntrinsicOp::AddI32x8
+                    | IntrinsicOp::AddI32x4
+                    | IntrinsicOp::HorizontalAddF64x4
+                    | IntrinsicOp::HorizontalAddF64x2
+                    | IntrinsicOp::HorizontalAddI32x8
+                    | IntrinsicOp::HorizontalAddI32x4
+            )
         })
     });
     // The mature accumulator backend has a complete stack path for scalar FP,
@@ -208,12 +263,23 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                     matches!(
                         op,
                         O::Pblendvb128
-                            | O::Dpbusd128 | O::Dpbusds128 | O::Dpwusd128
-                            | O::Dpwusds128 | O::Dpbssd128 | O::Dpbssds128
-                            | O::Dpbsud128 | O::Dpbsuds128 | O::Dpbuud128
-                            | O::Dpbuuds128 | O::Dpwuud128 | O::Dpwuuds128
-                            | O::Dpwssd128 | O::Dpwssds128
-                            | O::F128Fabs | O::F128Neg | O::F128Copysign
+                            | O::Dpbusd128
+                            | O::Dpbusds128
+                            | O::Dpwusd128
+                            | O::Dpwusds128
+                            | O::Dpbssd128
+                            | O::Dpbssds128
+                            | O::Dpbsud128
+                            | O::Dpbsuds128
+                            | O::Dpbuud128
+                            | O::Dpbuuds128
+                            | O::Dpwuud128
+                            | O::Dpwuuds128
+                            | O::Dpwssd128
+                            | O::Dpwssds128
+                            | O::F128Fabs
+                            | O::F128Neg
+                            | O::F128Copysign
                     )
                 } else {
                     false
@@ -264,7 +330,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     };
     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
     let accumulator_policy = if caller_saved_regs.iter().any(|r| r.0 == 10)
-        || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1)) {
+        || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1))
+    {
         super::super::regalloc::AccumulatorPolicy {
             operand_order: super::super::regalloc::AccumulatorOperandOrder::LhsFirst,
             return_consumes_accumulator: crate::common::types::target_is_32bit(),
@@ -276,8 +343,13 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         }
     };
     let config = super::super::regalloc::RegAllocConfig {
-        available_regs, accumulator_policy, caller_saved_regs, call_arg_regs, indirect_target_regs,
-        allow_inline_asm_regalloc, xmm_regs,
+        available_regs,
+        accumulator_policy,
+        caller_saved_regs,
+        call_arg_regs,
+        indirect_target_regs,
+        allow_inline_asm_regalloc,
+        xmm_regs,
         never_materialized: never_materialized.unwrap_or_default(),
         folded_index_uses,
         reg_hints,
@@ -287,7 +359,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         super::super::regalloc::RegAllocResult {
             assignments: Default::default(),
             accumulator_assignments: super::super::regalloc::analyze_accumulator_assignments(
-                func, config.accumulator_policy,
+                func,
+                config.accumulator_policy,
             ),
             used_regs: Vec::new(),
             caller_save_spans: Default::default(),
@@ -313,15 +386,17 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     used_callee_saved.sort_by_key(|r| r.0);
 
     let reg_assigned: FxHashMap<u32, PhysReg> = reg_assignments.clone();
-    (reg_assigned, cached_liveness, caller_save_spans, accumulator_assignments)
+    (
+        reg_assigned,
+        cached_liveness,
+        caller_save_spans,
+        accumulator_assignments,
+    )
 }
 
 /// Filter a callee-saved register list by removing ASM-clobbered entries.
 /// Returns the filtered list suitable for passing to `run_regalloc_and_merge_clobbers`.
-pub fn filter_available_regs(
-    callee_saved: &[PhysReg],
-    asm_clobbered: &[PhysReg],
-) -> Vec<PhysReg> {
+pub fn filter_available_regs(callee_saved: &[PhysReg], asm_clobbered: &[PhysReg]) -> Vec<PhysReg> {
     let mut available = callee_saved.to_vec();
     if !asm_clobbered.is_empty() {
         let clobbered_set: FxHashSet<u8> = asm_clobbered.iter().map(|r| r.0).collect();
@@ -335,7 +410,9 @@ pub fn filter_available_regs(
 /// Find the nth alloca instruction in the entry block (used for parameter storage).
 pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value, IrType)> {
     func.blocks.first().and_then(|block| {
-        block.instructions.iter()
+        block
+            .instructions
+            .iter()
             .filter(|i| matches!(i, Instruction::Alloca { .. }))
             .nth(param_idx)
             .and_then(|inst| {

@@ -7,14 +7,9 @@
 //! - Flat initialization of struct arrays (field-by-field without braces)
 //! - String literal special cases that consume entire char array fields
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::common::types::{CType, IrType, StructLayout};
 use super::lower::Lowerer;
+use crate::common::types::{CType, IrType, StructLayout};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
 
 impl Lowerer {
     /// Compute the effective array size from an initializer list with potential designators.
@@ -33,7 +28,10 @@ impl Lowerer {
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &items[0].init {
                 return s.chars().count() + 1; // +1 for null terminator
             }
-            if let Initializer::Expr(Expr::WideStringLiteral(s, _) | Expr::Char16StringLiteral(s, _)) = &items[0].init {
+            if let Initializer::Expr(
+                Expr::WideStringLiteral(s, _) | Expr::Char16StringLiteral(s, _),
+            ) = &items[0].init
+            {
                 return s.chars().count() + 1; // wide/char16 string to char array
             }
         }
@@ -58,7 +56,9 @@ impl Lowerer {
             if let Initializer::Expr(Expr::Char16StringLiteral(s, _)) = &items[0].init {
                 return s.chars().count() + 1; // +1 for null terminator (count in char16_t elements)
             }
-            if let Initializer::Expr(Expr::WideStringLiteral(s, _) | Expr::StringLiteral(s, _)) = &items[0].init {
+            if let Initializer::Expr(Expr::WideStringLiteral(s, _) | Expr::StringLiteral(s, _)) =
+                &items[0].init
+            {
                 return s.chars().count() + 1; // string to char16_t array
             }
         }
@@ -82,7 +82,10 @@ impl Lowerer {
             // Only advance to next element if this item does NOT have a field
             // designator (e.g., [0].field = val should NOT advance the index,
             // since multiple items may target different fields of the same element)
-            let has_field_designator = item.designators.iter().any(|d| matches!(d, Designator::Field(_)));
+            let has_field_designator = item
+                .designators
+                .iter()
+                .any(|d| matches!(d, Designator::Field(_)));
             if !has_field_designator {
                 current_idx += 1;
             }
@@ -102,9 +105,7 @@ impl Lowerer {
     /// For structs/unions: sum of scalar counts of all fields (union uses max field count).
     fn flat_scalar_count(&self, ty: &CType) -> usize {
         match ty {
-            CType::Array(elem_ty, Some(size)) => {
-                *size * self.flat_scalar_count(elem_ty)
-            }
+            CType::Array(elem_ty, Some(size)) => *size * self.flat_scalar_count(elem_ty),
             CType::Array(_, None) => {
                 // Unsized array treated as 0 for counting purposes
                 0
@@ -130,13 +131,17 @@ impl Lowerer {
         }
         if layout.is_union {
             // Union: only one field is initialized, use max for sizing purposes
-            layout.fields.iter()
+            layout
+                .fields
+                .iter()
                 .map(|f| self.flat_scalar_count(&f.ty))
                 .max()
                 .unwrap_or(1)
         } else {
             // Struct: all fields are initialized sequentially
-            layout.fields.iter()
+            layout
+                .fields
+                .iter()
                 .map(|f| self.flat_scalar_count(&f.ty))
                 .sum()
         }
@@ -181,7 +186,10 @@ impl Lowerer {
 
             // Check if this item starts a new struct element (braced or designator)
             let is_braced = matches!(item.init, Initializer::List(_));
-            let has_field_designator = item.designators.iter().any(|d| matches!(d, Designator::Field(_)));
+            let has_field_designator = item
+                .designators
+                .iter()
+                .any(|d| matches!(d, Designator::Field(_)));
 
             if is_braced || has_field_designator {
                 // Each braced item or field-designated item is one struct element
@@ -238,7 +246,10 @@ impl Lowerer {
                         layout,
                     ) {
                         // String literal fills the entire current char array field
-                        self.remaining_scalars_in_current_field(fields_consumed, &field_scalar_counts)
+                        self.remaining_scalars_in_current_field(
+                            fields_consumed,
+                            &field_scalar_counts,
+                        )
                     } else {
                         1
                     };
@@ -256,10 +267,9 @@ impl Lowerer {
         }
 
         // If there are remaining fields consumed, count the partial struct element
-        if fields_consumed > 0
-            && current_idx >= max_idx {
-                max_idx = current_idx + 1;
-            }
+        if fields_consumed > 0 && current_idx >= max_idx {
+            max_idx = current_idx + 1;
+        }
 
         max_idx
     }
@@ -274,8 +284,11 @@ impl Lowerer {
     ) -> bool {
         let is_string = matches!(
             init,
-            Initializer::Expr(Expr::StringLiteral(_, _) | Expr::WideStringLiteral(_, _)
-                | Expr::Char16StringLiteral(_, _))
+            Initializer::Expr(
+                Expr::StringLiteral(_, _)
+                    | Expr::WideStringLiteral(_, _)
+                    | Expr::Char16StringLiteral(_, _)
+            )
         );
         if !is_string {
             return false;
@@ -314,8 +327,7 @@ impl Lowerer {
             CType::Array(elem, _) => {
                 matches!(
                     elem.as_ref(),
-                    CType::Char | CType::UChar
-                    | CType::Int | CType::UInt
+                    CType::Char | CType::UChar | CType::Int | CType::UInt
                 )
             }
             _ => false,

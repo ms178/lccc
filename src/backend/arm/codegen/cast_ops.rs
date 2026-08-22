@@ -1,10 +1,12 @@
 //! ArmCodegen: cast operations.
 
-use crate::ir::reexports::{Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::cast::{CastKind, classify_cast};
+use super::emit::{
+    arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
+};
+use crate::backend::cast::{classify_cast, CastKind};
 use crate::backend::traits::ArchCodegen;
-use super::emit::{ArmCodegen, arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
@@ -81,14 +83,12 @@ impl ArmCodegen {
                 }
             }
 
-            CastKind::SignedToUnsignedSameSize { to_ty } => {
-                match to_ty {
-                    IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
-                    IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
-                    IrType::U32 => self.state.emit("    mov w0, w0"),
-                    _ => {}
-                }
-            }
+            CastKind::SignedToUnsignedSameSize { to_ty } => match to_ty {
+                IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
+                IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
+                IrType::U32 => self.state.emit("    mov w0, w0"),
+                _ => {}
+            },
 
             CastKind::IntWiden { from_ty, .. } => {
                 if from_ty.is_unsigned() {
@@ -108,17 +108,15 @@ impl ArmCodegen {
                 }
             }
 
-            CastKind::IntNarrow { to_ty } => {
-                match to_ty {
-                    IrType::I8 => self.state.emit("    sxtb x0, w0"),
-                    IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
-                    IrType::I16 => self.state.emit("    sxth x0, w0"),
-                    IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
-                    IrType::I32 => self.state.emit("    sxtw x0, w0"),
-                    IrType::U32 => self.state.emit("    mov w0, w0"),
-                    _ => {}
-                }
-            }
+            CastKind::IntNarrow { to_ty } => match to_ty {
+                IrType::I8 => self.state.emit("    sxtb x0, w0"),
+                IrType::U8 => self.state.emit("    and x0, x0, #0xff"),
+                IrType::I16 => self.state.emit("    sxth x0, w0"),
+                IrType::U16 => self.state.emit("    and x0, x0, #0xffff"),
+                IrType::I32 => self.state.emit("    sxtw x0, w0"),
+                IrType::U32 => self.state.emit("    mov w0, w0"),
+                _ => {}
+            },
 
             CastKind::SignedToF128 { .. }
             | CastKind::UnsignedToF128 { .. }
@@ -131,7 +129,13 @@ impl ArmCodegen {
         }
     }
 
-    pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+    pub(super) fn emit_cast_impl(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) {
         if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }
@@ -140,19 +144,33 @@ impl ArmCodegen {
         // x0 round-trip. This is on the hot path of every indexed access.
         if let CastKind::IntWiden { .. } = classify_cast(from_ty, to_ty) {
             let src_phys = self.operand_reg(src).filter(|r| !is_arm_fp_phys(*r));
-            let dest_phys = self.get_phys_reg_for_value(dest.0).filter(|r| !is_arm_fp_phys(*r));
+            let dest_phys = self
+                .get_phys_reg_for_value(dest.0)
+                .filter(|r| !is_arm_fp_phys(*r));
             if let (Some(sp), Some(dp)) = (src_phys, dest_phys) {
                 let s32 = callee_saved_name_32(sp);
                 let d64 = callee_saved_name(dp);
                 let d32 = callee_saved_name_32(dp);
                 let signed = !from_ty.is_unsigned();
                 match (signed, from_ty) {
-                    (true, IrType::I8) => self.state.emit_fmt(format_args!("    sxtb {}, {}", d64, s32)),
-                    (true, IrType::I16) => self.state.emit_fmt(format_args!("    sxth {}, {}", d64, s32)),
-                    (true, IrType::I32) => self.state.emit_fmt(format_args!("    sxtw {}, {}", d64, s32)),
-                    (false, IrType::U8) => self.state.emit_fmt(format_args!("    and {}, {}, #0xff", d32, s32)),
-                    (false, IrType::U16) => self.state.emit_fmt(format_args!("    and {}, {}, #0xffff", d32, s32)),
-                    (false, IrType::U32) => self.state.emit_fmt(format_args!("    mov {}, {}", d32, s32)),
+                    (true, IrType::I8) => self
+                        .state
+                        .emit_fmt(format_args!("    sxtb {}, {}", d64, s32)),
+                    (true, IrType::I16) => self
+                        .state
+                        .emit_fmt(format_args!("    sxth {}, {}", d64, s32)),
+                    (true, IrType::I32) => self
+                        .state
+                        .emit_fmt(format_args!("    sxtw {}, {}", d64, s32)),
+                    (false, IrType::U8) => self
+                        .state
+                        .emit_fmt(format_args!("    and {}, {}, #0xff", d32, s32)),
+                    (false, IrType::U16) => self
+                        .state
+                        .emit_fmt(format_args!("    and {}, {}, #0xffff", d32, s32)),
+                    (false, IrType::U32) => self
+                        .state
+                        .emit_fmt(format_args!("    mov {}, {}", d32, s32)),
                     _ => {}
                 }
                 self.state.reg_cache.invalidate_acc();
@@ -165,7 +183,10 @@ impl ArmCodegen {
         if let Some(&phys) = self.reg_assignments.get(&dest.0) {
             if is_arm_fp_phys(phys) && matches!(to_ty, IrType::F32 | IrType::F64) {
                 let kind = classify_cast(from_ty, to_ty);
-                if matches!(kind, CastKind::SignedToFloat { .. } | CastKind::UnsignedToFloat { .. }) {
+                if matches!(
+                    kind,
+                    CastKind::SignedToFloat { .. } | CastKind::UnsignedToFloat { .. }
+                ) {
                     let signed = matches!(kind, CastKind::SignedToFloat { .. });
                     let mnemonic = if signed { "scvtf" } else { "ucvtf" };
                     let fp_dest = arm_fp_name(phys, to_ty);
@@ -177,22 +198,37 @@ impl ArmCodegen {
                         match from_ty.size() {
                             8 => {
                                 self.state.emit_fmt(format_args!(
-                                    "    {} {}, {}", mnemonic, fp_dest, callee_saved_name(sp)));
+                                    "    {} {}, {}",
+                                    mnemonic,
+                                    fp_dest,
+                                    callee_saved_name(sp)
+                                ));
                             }
                             4 => {
                                 self.state.emit_fmt(format_args!(
-                                    "    {} {}, {}", mnemonic, fp_dest, callee_saved_name_32(sp)));
+                                    "    {} {}, {}",
+                                    mnemonic,
+                                    fp_dest,
+                                    callee_saved_name_32(sp)
+                                ));
                             }
                             _ => {
                                 self.emit_load_operand(src);
                                 if signed {
-                                    if from_ty.size() == 1 { self.state.emit("    sxtb x0, w0"); }
-                                    else { self.state.emit("    sxth x0, w0"); }
+                                    if from_ty.size() == 1 {
+                                        self.state.emit("    sxtb x0, w0");
+                                    } else {
+                                        self.state.emit("    sxth x0, w0");
+                                    }
                                 } else {
-                                    if from_ty.size() == 1 { self.state.emit("    and x0, x0, #0xff"); }
-                                    else { self.state.emit("    and x0, x0, #0xffff"); }
+                                    if from_ty.size() == 1 {
+                                        self.state.emit("    and x0, x0, #0xff");
+                                    } else {
+                                        self.state.emit("    and x0, x0, #0xffff");
+                                    }
                                 }
-                                self.state.emit_fmt(format_args!("    {} {}, x0", mnemonic, fp_dest));
+                                self.state
+                                    .emit_fmt(format_args!("    {} {}, x0", mnemonic, fp_dest));
                             }
                         }
                         self.state.reg_cache.invalidate_acc();
@@ -214,7 +250,8 @@ impl ArmCodegen {
                             _ => {}
                         }
                     }
-                    self.state.emit_fmt(format_args!("    {} {}, x0", mnemonic, fp_dest));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, x0", mnemonic, fp_dest));
                     self.state.reg_cache.invalidate_acc();
                     return;
                 }

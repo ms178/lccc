@@ -6,28 +6,42 @@
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
-use super::elf::*;
 use super::elf::parse_object_shared;
+use super::elf::*;
+use super::types::{x86_should_replace_extra, GlobalSymbol};
 use crate::backend::linker_common;
-use super::types::{GlobalSymbol, x86_should_replace_extra};
 
 pub(super) fn load_file(
-    path: &str, objects: &mut Vec<ElfObject>, globals: &mut FxHashMap<String, GlobalSymbol>,
-    needed_sonames: &mut Vec<String>, lib_paths: &[String],
+    path: &str,
+    objects: &mut Vec<ElfObject>,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
     whole_archive: bool,
 ) -> Result<(), String> {
     // Default call sites keep GNU ld's historical behaviour for this linker
     // (as-needed); positional callers use `load_file_as_needed`.
-    load_file_as_needed(path, objects, globals, needed_sonames, lib_paths,
-                        whole_archive, true)
+    load_file_as_needed(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        whole_archive,
+        true,
+    )
 }
 
 /// As [`load_file`], but carries the positional `--as-needed` state that was
 /// in effect for this input.
 pub(super) fn load_file_as_needed(
-    path: &str, objects: &mut Vec<ElfObject>, globals: &mut FxHashMap<String, GlobalSymbol>,
-    needed_sonames: &mut Vec<String>, lib_paths: &[String],
-    whole_archive: bool, as_needed: bool,
+    path: &str,
+    objects: &mut Vec<ElfObject>,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+    as_needed: bool,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("load_file: {}", path);
@@ -51,37 +65,78 @@ pub(super) fn load_file_as_needed(
 
     // Regular archive
     if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-        return linker_common::load_archive_elf64_backed(&backing, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
+        return linker_common::load_archive_elf64_backed(
+            &backing,
+            path,
+            objects,
+            globals,
+            EM_X86_64,
+            x86_should_replace_extra,
+            whole_archive,
+        );
     }
 
     // Thin archive
     if is_thin_archive(data) {
-        return linker_common::load_thin_archive_elf64(data, path, objects, globals, EM_X86_64, x86_should_replace_extra, whole_archive);
+        return linker_common::load_thin_archive_elf64(
+            data,
+            path,
+            objects,
+            globals,
+            EM_X86_64,
+            x86_should_replace_extra,
+            whole_archive,
+        );
     }
 
     // Not ELF? Try linker script (handles GROUP and INPUT directives)
     if data.len() >= 4 && data[0..4] != ELF_MAGIC {
         if let Ok(text) = std::str::from_utf8(data) {
             if let Some(entries) = parse_linker_script_entries(text) {
-                let script_dir = Path::new(path).parent().map(|p| p.to_string_lossy().to_string());
+                let script_dir = Path::new(path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string());
                 for entry in &entries {
                     match entry {
                         LinkerScriptEntry::Path(lib_path) => {
                             if Path::new(lib_path).exists() {
-                                load_file_as_needed(lib_path, objects, globals,
-                                    needed_sonames, lib_paths, whole_archive, as_needed)?;
+                                load_file_as_needed(
+                                    lib_path,
+                                    objects,
+                                    globals,
+                                    needed_sonames,
+                                    lib_paths,
+                                    whole_archive,
+                                    as_needed,
+                                )?;
                             } else if let Some(ref dir) = script_dir {
                                 let resolved = format!("{}/{}", dir, lib_path);
                                 if Path::new(&resolved).exists() {
-                                    load_file_as_needed(&resolved, objects, globals,
-                                        needed_sonames, lib_paths, whole_archive, as_needed)?;
+                                    load_file_as_needed(
+                                        &resolved,
+                                        objects,
+                                        globals,
+                                        needed_sonames,
+                                        lib_paths,
+                                        whole_archive,
+                                        as_needed,
+                                    )?;
                                 }
                             }
                         }
                         LinkerScriptEntry::Lib(lib_name) => {
-                            if let Some(resolved_path) = linker_common::resolve_lib(lib_name, lib_paths, false) {
-                                load_file_as_needed(&resolved_path, objects, globals,
-                                    needed_sonames, lib_paths, whole_archive, as_needed)?;
+                            if let Some(resolved_path) =
+                                linker_common::resolve_lib(lib_name, lib_paths, false)
+                            {
+                                load_file_as_needed(
+                                    &resolved_path,
+                                    objects,
+                                    globals,
+                                    needed_sonames,
+                                    lib_paths,
+                                    whole_archive,
+                                    as_needed,
+                                )?;
                             }
                         }
                     }
@@ -97,13 +152,23 @@ pub(super) fn load_file_as_needed(
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type == ET_DYN {
             return linker_common::load_shared_library_elf64_as_needed(
-                path, globals, needed_sonames, lib_paths, as_needed);
+                path,
+                globals,
+                needed_sonames,
+                lib_paths,
+                as_needed,
+            );
         }
     }
 
     // Regular ELF object
     let obj = linker_common::parse_object::parse_elf64_object_backed(
-        &backing, 0, data.len(), path, EM_X86_64)?;
+        &backing,
+        0,
+        data.len(),
+        path,
+        EM_X86_64,
+    )?;
     let obj_idx = objects.len();
     linker_common::register_symbols_elf64(obj_idx, &obj, globals, x86_should_replace_extra)?;
     objects.push(obj);

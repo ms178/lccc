@@ -4,10 +4,10 @@
 //! Handles directives, labels, and instructions with AT&T operand ordering
 //! (source, destination).
 
-use std::fmt;
 use crate::backend::asm_expr;
 use crate::backend::asm_preprocess::{self, CommentStyle};
 use crate::backend::elf;
+use std::fmt;
 
 /// A parsed assembly item (one per line, roughly).
 #[derive(Debug, Clone)]
@@ -60,7 +60,8 @@ pub enum AsmItem {
     /// Symbol alias: `.set alias, target`
     Set(String, String),
     /// CFI directive (ignored for code generation, kept for .eh_frame)
-    #[allow(dead_code)] // Parsed by parser but skipped during encoding (DWARF .eh_frame not yet emitted)
+    #[allow(dead_code)]
+    // Parsed by parser but skipped during encoding (DWARF .eh_frame not yet emitted)
     Cfi(CfiDirective),
     /// Debug file directive: `.file N "filename"`
     #[allow(dead_code)] // Parsed but skipped during encoding (debug info not yet emitted)
@@ -84,7 +85,11 @@ pub enum AsmItem {
     /// counter), offset, and the fill byte (GAS defaults to 0).
     Org(String, i64, u8),
     /// `.incbin "file"[, skip[, count]]` — include binary file contents
-    Incbin { path: String, skip: u64, count: Option<u64> },
+    Incbin {
+        path: String,
+        skip: u64,
+        count: Option<u64>,
+    },
     /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`
     Symver(String, String),
     /// Code mode switch: `.code16`, `.code32`, `.code64`
@@ -214,7 +219,11 @@ impl Register {
     pub fn new(name: &str) -> Self {
         let n = name.trim();
         let n = n.strip_prefix('%').map(str::trim_start).unwrap_or(n);
-        Register { name: n.to_string(), mask: None, zeroing: false }
+        Register {
+            name: n.to_string(),
+            mask: None,
+            zeroing: false,
+        }
     }
 }
 
@@ -295,7 +304,8 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             }
             let count_str = trimmed[".rept".len()..].trim();
             let count = parse_integer_expr(count_str)
-                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))? as usize;
+                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
+                as usize;
             let mut depth = 1;
             let mut body = Vec::new();
             i += 1;
@@ -319,8 +329,11 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
-        } else if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t")
-            || trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
+        } else if trimmed.starts_with(".irp ")
+            || trimmed.starts_with(".irp\t")
+            || trimmed.starts_with(".irpc ")
+            || trimmed.starts_with(".irpc\t")
+        {
             // .irpc must be tracked exactly like .irp here: this pre-pass
             // only expands .rept, and treating .irpc's .endr as a stray
             // DELETED it, so the later .irpc expansion ran off the end of
@@ -541,8 +554,8 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".size" => parse_size_directive(args),
         ".align" | ".p2align" | ".balign" => {
             let val_str = args.split(',').next().unwrap_or("1").trim();
-            let val: u32 = parse_integer_expr(val_str)
-                .map_err(|_| format!("bad alignment: {}", args))? as u32;
+            let val: u32 =
+                parse_integer_expr(val_str).map_err(|_| format!("bad alignment: {}", args))? as u32;
             // .p2align is power-of-2, .align/.balign on x86 gas is byte count
             if directive == ".p2align" {
                 Ok(AsmItem::Align(1 << val))
@@ -644,13 +657,15 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                     let repeat = repeat as u64;
                     let size = if parts.len() > 1 {
                         parse_integer_expr(parts[1].trim())
-                            .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))? as u64
+                            .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
+                            as u64
                     } else {
                         1
                     };
                     let value = if parts.len() > 2 {
                         parse_integer_expr(parts[2].trim())
-                            .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))? as u64
+                            .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
+                            as u64
                     } else {
                         0
                     };
@@ -673,13 +688,15 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                     // Parse size and value as constants (these are always simple integers).
                     let size = if parts.len() > 1 {
                         parse_integer_expr(parts[1].trim())
-                            .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))? as u64
+                            .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
+                            as u64
                     } else {
                         1
                     };
                     let value = if parts.len() > 2 {
                         parse_integer_expr(parts[2].trim())
-                            .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))? as u8
+                            .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
+                            as u8
                     } else {
                         0
                     };
@@ -714,8 +731,8 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".cfi_endproc" => Ok(AsmItem::Cfi(CfiDirective::EndProc)),
         ".cfi_def_cfa_offset" => {
             // Accept full constant expressions (e.g. "8*2", "N*8+N").
-            let val = parse_integer_expr(args.trim())
-                .map_err(|_| format!("bad cfi offset: {}", args))?;
+            let val =
+                parse_integer_expr(args.trim()).map_err(|_| format!("bad cfi offset: {}", args))?;
             Ok(AsmItem::Cfi(CfiDirective::DefCfaOffset(val as i32)))
         }
         ".cfi_def_cfa_register" => {
@@ -746,12 +763,17 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         }
         ".loc" => {
             // .loc filenum line column
-            let nums: Vec<u32> = args.split_whitespace()
+            let nums: Vec<u32> = args
+                .split_whitespace()
                 .take(3)
                 .filter_map(|s| s.parse().ok())
                 .collect();
             if nums.len() >= 2 {
-                Ok(AsmItem::Loc(nums[0], nums[1], nums.get(2).copied().unwrap_or(0)))
+                Ok(AsmItem::Loc(
+                    nums[0],
+                    nums[1],
+                    nums.get(2).copied().unwrap_or(0),
+                ))
             } else {
                 Ok(AsmItem::Empty)
             }
@@ -780,10 +802,14 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                 .map_err(|_| ".incbin: invalid UTF-8 in path".to_string())?;
             let skip = if parts.len() > 1 {
                 parts[1].trim().parse::<u64>().unwrap_or(0)
-            } else { 0 };
+            } else {
+                0
+            };
             let count = if parts.len() > 2 {
                 Some(parts[2].trim().parse::<u64>().unwrap_or(0))
-            } else { None };
+            } else {
+                None
+            };
             Ok(AsmItem::Incbin { path, skip, count })
         }
         d if d.starts_with(".cfi_") => {
@@ -807,7 +833,8 @@ fn parse_section_directive(args: &str) -> Result<AsmItem, String> {
     // Split by comma, but handle quoted strings
     let parts = split_section_args(args);
 
-    let name = parts.first()
+    let name = parts
+        .first()
         .map(|s| s.trim().trim_matches('"').to_string())
         .unwrap_or_else(|| ".text".to_string());
 
@@ -874,7 +901,7 @@ fn split_section_args(s: &str) -> Vec<String> {
 fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
     let (name, kind_str) = if let Some(comma_pos) = args.find(',') {
         // Standard GAS format: .type name, @function
-        (args[..comma_pos].trim(), args[comma_pos+1..].trim())
+        (args[..comma_pos].trim(), args[comma_pos + 1..].trim())
     } else {
         // Linux kernel format: .type name STT_FUNC (space-separated, no comma)
         let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
@@ -889,8 +916,11 @@ fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
         "@object" | "%object" | "STT_OBJECT" => SymbolKind::Object,
         "@tls_object" | "%tls_object" | "STT_TLS" => SymbolKind::TlsObject,
         "@notype" | "%notype" | "STT_NOTYPE" => SymbolKind::NoType,
-        "@gnu_indirect_function" | "%gnu_indirect_function" | "STT_GNU_IFUNC"
-        | "@gnu_indirect_function," | "%gnu_indirect_function," => SymbolKind::GnuIndirectFunction,
+        "@gnu_indirect_function"
+        | "%gnu_indirect_function"
+        | "STT_GNU_IFUNC"
+        | "@gnu_indirect_function,"
+        | "%gnu_indirect_function," => SymbolKind::GnuIndirectFunction,
         _ => return Err(format!("unknown symbol type: {}", kind_str)),
     };
     Ok(AsmItem::SymbolType(name, kind))
@@ -912,10 +942,18 @@ fn parse_size_directive(args: &str) -> Result<AsmItem, String> {
         Ok(AsmItem::Size(name, SizeExpr::CurrentMinusSymbol(sym)))
     } else if let Ok(val) = parse_integer_expr(expr_str) {
         Ok(AsmItem::Size(name, SizeExpr::Constant(val as u64)))
-    } else if expr_str.starts_with('.') || expr_str.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') {
+    } else if expr_str.starts_with('.')
+        || expr_str
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+    {
         // Symbol reference (e.g., .L__sym_size_*) - resolve through .set aliases
         // Treat as a symbol that will be resolved during ELF writing
-        Ok(AsmItem::Size(name, SizeExpr::SymbolRef(expr_str.to_string())))
+        Ok(AsmItem::Size(
+            name,
+            SizeExpr::SymbolRef(expr_str.to_string()),
+        ))
     } else {
         Err(format!("bad size expr: {}", expr_str))
     }
@@ -928,9 +966,12 @@ fn parse_comm_directive(args: &str) -> Result<AsmItem, String> {
         return Err(format!("bad .comm directive: {}", args));
     }
     let name = parts[0].trim().to_string();
-    let size: u64 = parts[1].trim().parse()
+    let size: u64 = parts[1]
+        .trim()
+        .parse()
         .map_err(|_| format!("bad .comm size: {}", args))?;
-    let align: u32 = parts.get(2)
+    let align: u32 = parts
+        .get(2)
         .map(|s| s.trim().parse().unwrap_or(1))
         .unwrap_or(1);
     Ok(AsmItem::Comm(name, size, align))
@@ -971,8 +1012,8 @@ fn is_prefixed_instruction(rest: &str) -> bool {
     // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
     // byte that ALTERNATIVE can later patch into a different encoding.
     const PREFIXES: [&str; 13] = [
-        "lock", "rep", "repz", "repe", "repnz", "repne", "notrack",
-        "cs", "ds", "es", "ss", "fs", "gs",
+        "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs",
+        "gs",
     ];
     match rest.split_once(|c: char| c.is_whitespace()) {
         Some((head, tail)) => PREFIXES.contains(&head) && !tail.trim().is_empty(),
@@ -1022,7 +1063,8 @@ fn split_mnemonic_operands(line: &str) -> (&str, &str) {
     // instructions, which is semantically identical to the hinted form; the
     // prefixes are accepted so GCC/LLVM-generated assembly assembles cleanly.
     let trimmed = line.trim_start();
-    let trimmed = if let Some(rest) = trimmed.strip_prefix("{vex} ")
+    let trimmed = if let Some(rest) = trimmed
+        .strip_prefix("{vex} ")
         .or_else(|| trimmed.strip_prefix("{vex3} "))
         .or_else(|| trimmed.strip_prefix("{vex2} "))
         .or_else(|| trimmed.strip_prefix("{evex} "))
@@ -1150,7 +1192,10 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
             && !stem.is_empty()
             && stem.bytes().all(|c| c.is_ascii_digit())
     };
-    if s.bytes().next().is_some_and(|c| c.is_ascii_digit() || c == b'-') && !is_numeric_label
+    if s.bytes()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == b'-')
+        && !is_numeric_label
     {
         if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(s) {
             return Ok(Operand::Memory(MemoryOperand {
@@ -1288,11 +1333,32 @@ fn parse_immediate_operand(s: &str) -> Result<Operand, String> {
 /// LAST '@' (the modifier), keeping `sym@VER` as the versioned symbol name;
 /// a bare `sym@VER` (suffix not in this list) stays a plain symbol.
 fn is_known_reloc_modifier(m: &str) -> bool {
-    matches!(m.to_ascii_uppercase().as_str(),
-        "GOT" | "GOTPCREL" | "GOTPCRELX" | "GOTOFF" | "GOTTPOFF" | "GOTNTPOFF"
-        | "PLT" | "TPOFF" | "TPREL" | "NTPOFF" | "INDNTPOFF" | "TLSGD"
-        | "TLSLD" | "DTPMOD" | "DTPOFF" | "TLSDESC" | "PLTOFF"
-        | "SECREL" | "SIZE" | "CALL" | "PAGEOFF" | "PAGE" | "GOTPLT")
+    matches!(
+        m.to_ascii_uppercase().as_str(),
+        "GOT"
+            | "GOTPCREL"
+            | "GOTPCRELX"
+            | "GOTOFF"
+            | "GOTTPOFF"
+            | "GOTNTPOFF"
+            | "PLT"
+            | "TPOFF"
+            | "TPREL"
+            | "NTPOFF"
+            | "INDNTPOFF"
+            | "TLSGD"
+            | "TLSLD"
+            | "DTPMOD"
+            | "DTPOFF"
+            | "TLSDESC"
+            | "PLTOFF"
+            | "SECREL"
+            | "SIZE"
+            | "CALL"
+            | "PAGEOFF"
+            | "PAGE"
+            | "GOTPLT"
+    )
 }
 
 /// Split `sym@mod` at the LAST '@' when the suffix is a known relocation
@@ -1328,9 +1394,7 @@ fn parse_immediate_label_diff(s: &str) -> Option<ImmediateValue> {
             // startup_32)` — the inner label arrives as `(1b)`.
             let lhs = strip_sym_parens(s[..i].trim());
             let rhs = strip_sym_parens(s[i + 1..].trim());
-            if !lhs.is_empty() && !rhs.is_empty()
-                && is_label_like(lhs) && is_label_like(rhs)
-            {
+            if !lhs.is_empty() && !rhs.is_empty() && is_label_like(lhs) && is_label_like(rhs) {
                 return Some(ImmediateValue::SymbolDiff(lhs.to_string(), rhs.to_string()));
             }
         }
@@ -1389,8 +1453,8 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
                 _ => {}
             }
         }
-        let paren_start = paren_start
-            .ok_or_else(|| format!("unmatched paren in memory operand: {}", s))?;
+        let paren_start =
+            paren_start.ok_or_else(|| format!("unmatched paren in memory operand: {}", s))?;
         let disp_str = s[..paren_start].trim();
         let inner = &s[paren_start + 1..paren_end];
 
@@ -1435,9 +1499,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
                     if is_segment_name(seg) {
                         seg_override = Some(seg.to_string());
                         let seg_val = p0[colon + 1..].trim();
-                        if !seg_val.is_empty() && seg_val != "0"
-                            && seg_val.starts_with('%')
-                        {
+                        if !seg_val.is_empty() && seg_val != "0" && seg_val.starts_with('%') {
                             // `%fs:%reg` form: keep the register as base.
                             Some(Register::new(seg_val.trim_start_matches('%')))
                         } else {
@@ -1463,8 +1525,11 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
         };
 
         let scale = if parts.len() > 2 && !parts[2].is_empty() {
-            Some(parts[2].parse::<u8>()
-                .map_err(|_| format!("bad scale: {}", parts[2]))?)
+            Some(
+                parts[2]
+                    .parse::<u8>()
+                    .map_err(|_| format!("bad scale: {}", parts[2]))?,
+            )
         } else {
             None
         };
@@ -1557,7 +1622,10 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
                 continue;
             }
             if is_label_like(lhs_raw) {
-                return Ok(Displacement::SymbolDiff(lhs_raw.to_string(), rhs.to_string()));
+                return Ok(Displacement::SymbolDiff(
+                    lhs_raw.to_string(),
+                    rhs.to_string(),
+                ));
             }
             // LHS with folded constant tail: `pgtable + 0`, `sym + (1<<4) - 8`.
             if let Some(DataValue::SymbolOffset(sym, add)) = parse_symbol_expr_chain(lhs_raw) {
@@ -1584,7 +1652,9 @@ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
             }
 
             let is_valid_sym = |s: &str| -> bool {
-                !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
             };
 
             // Case 1: symbol+offset (e.g. "maxmin_avx+32")
@@ -1608,7 +1678,6 @@ fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
     None
 }
 
-
 /// Try to parse a `symbol+offset` or `symbol-offset` expression as an immediate value.
 /// This handles cases like `init_top_pgt - 0xffffffff80000000` where the expression
 /// mixes a symbol with a large integer constant.
@@ -1626,7 +1695,9 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
     }
     let is_valid_sym = |s: &str| -> bool {
         let s = strip_parens(s);
-        !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
     };
 
     // Scan for '+' or '-' that separates the symbol from the offset.
@@ -1641,7 +1712,10 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
             // Case 1: symbol+/-offset (e.g. "init_top_pgt - 0xffffffff80000000")
             if let Ok(offset) = parse_integer_expr(right_with_sign) {
                 if is_valid_sym(left) {
-                    return Some(ImmediateValue::SymbolPlusOffset(strip_parens(left).to_string(), offset));
+                    return Some(ImmediateValue::SymbolPlusOffset(
+                        strip_parens(left).to_string(),
+                        offset,
+                    ));
                 }
             }
 
@@ -1650,7 +1724,10 @@ fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
                 if let Ok(offset) = parse_integer_expr(left) {
                     let sym = right_with_sign[1..].trim();
                     if is_valid_sym(sym) {
-                        return Some(ImmediateValue::SymbolPlusOffset(strip_parens(sym).to_string(), offset));
+                        return Some(ImmediateValue::SymbolPlusOffset(
+                            strip_parens(sym).to_string(),
+                            offset,
+                        ));
                     }
                 }
             }
@@ -1675,7 +1752,11 @@ fn split_skip_args(args: &str) -> (&str, u8) {
     if let Some(pos) = last_comma {
         let expr = &args[..pos];
         let fill_str = args[pos + 1..].trim();
-        let fill = if let Ok(v) = parse_integer_expr(fill_str) { v as u8 } else { 0u8 };
+        let fill = if let Ok(v) = parse_integer_expr(fill_str) {
+            v as u8
+        } else {
+            0u8
+        };
         (expr, fill)
     } else {
         (args, 0u8)
@@ -1689,8 +1770,7 @@ fn parse_label_diff(s: &str) -> Option<DataValue> {
         if c == '-' {
             let lhs = &s[..i];
             let rhs = &s[i + 1..];
-            if !lhs.is_empty() && !rhs.is_empty()
-                && is_label_like(lhs) && is_label_like(rhs) {
+            if !lhs.is_empty() && !rhs.is_empty() && is_label_like(lhs) && is_label_like(rhs) {
                 return Some(DataValue::SymbolDiff(lhs.to_string(), rhs.to_string()));
             }
             // `label-N-.` (kernel vDSO sigreturn: `.long .LSTART_sigreturn-1-.`,
@@ -1701,7 +1781,10 @@ fn parse_label_diff(s: &str) -> Option<DataValue> {
                 let mid = &rhs[..rhs.len() - 2];
                 if let Ok(n) = parse_integer_expr(mid) {
                     return Some(DataValue::SymbolDiffAddend(
-                        lhs.to_string(), ".".to_string(), -n));
+                        lhs.to_string(),
+                        ".".to_string(),
+                        -n,
+                    ));
                 }
             }
             // `a-b+N` / `a-b-N` without spaces (same file:
@@ -1716,7 +1799,10 @@ fn parse_label_diff(s: &str) -> Option<DataValue> {
                         if is_label_like(rhs_sym) {
                             if let Ok(n) = parse_integer_expr(addend_str) {
                                 return Some(DataValue::SymbolDiffAddend(
-                                    lhs.to_string(), rhs_sym.to_string(), n));
+                                    lhs.to_string(),
+                                    rhs_sym.to_string(),
+                                    n,
+                                ));
                             }
                         }
                     }
@@ -1746,7 +1832,8 @@ fn is_label_like(s: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
         return false;
     }
-    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
 /// Strip balanced outer parentheses from an expression.
@@ -1795,7 +1882,11 @@ fn strip_sym_parens(s: &str) -> &str {
                 _ => {}
             }
         }
-        if depth == 0 { strip_sym_parens(inner) } else { s }
+        if depth == 0 {
+            strip_sym_parens(inner)
+        } else {
+            s
+        }
     } else {
         s
     }
@@ -1816,9 +1907,12 @@ fn parse_float_values(s: &str, double: bool) -> Result<Vec<DataValue>, String> {
             continue;
         }
         let t = t
-            .strip_prefix("0f").or_else(|| t.strip_prefix("0F"))
-            .or_else(|| t.strip_prefix("0d")).or_else(|| t.strip_prefix("0D"))
-            .or_else(|| t.strip_prefix("0e")).or_else(|| t.strip_prefix("0E"))
+            .strip_prefix("0f")
+            .or_else(|| t.strip_prefix("0F"))
+            .or_else(|| t.strip_prefix("0d"))
+            .or_else(|| t.strip_prefix("0D"))
+            .or_else(|| t.strip_prefix("0e"))
+            .or_else(|| t.strip_prefix("0E"))
             .unwrap_or(t);
         let v: f64 = t
             .parse::<f64>()
@@ -1896,29 +1990,35 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             // string "__tracepoint_read_msr+8 + 0" as the symbol name and the
             // link failed with "undefined reference to `sym+8 + 0 + 2'".
             // Fold the full chain first; fall back to the single-term peel.
-            let (lhs, lhs_addend) = if let Some(DataValue::SymbolOffset(sym, a)) =
-                parse_symbol_expr_chain(&lhs_raw)
-            {
-                (sym, a)
-            } else {
-                match lhs_raw.rfind(" + ") {
-                    Some(p) => {
-                        let sym = strip_sym_parens(lhs_raw[..p].trim());
-                        match (is_label_like(sym), parse_integer_expr(lhs_raw[p + 3..].trim())) {
-                            (true, Ok(a)) => (sym.to_string(), a),
-                            _ => (lhs_raw.clone(), 0),
+            let (lhs, lhs_addend) =
+                if let Some(DataValue::SymbolOffset(sym, a)) = parse_symbol_expr_chain(&lhs_raw) {
+                    (sym, a)
+                } else {
+                    match lhs_raw.rfind(" + ") {
+                        Some(p) => {
+                            let sym = strip_sym_parens(lhs_raw[..p].trim());
+                            match (
+                                is_label_like(sym),
+                                parse_integer_expr(lhs_raw[p + 3..].trim()),
+                            ) {
+                                (true, Ok(a)) => (sym.to_string(), a),
+                                _ => (lhs_raw.clone(), 0),
+                            }
                         }
+                        None => (lhs_raw.clone(), 0),
                     }
-                    None => (lhs_raw.clone(), 0),
-                }
-            };
+                };
             // Check if rhs has an addend: "sym - N" or "sym + N"
             if let Some(rhs_minus) = rhs_full.rfind(" - ") {
                 let rhs_sym = strip_sym_parens(rhs_full[..rhs_minus].trim());
                 let rhs_add = rhs_full[rhs_minus + 3..].trim();
                 if is_label_like(rhs_sym) {
                     if let Ok(addend) = parse_integer_expr(rhs_add) {
-                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), lhs_addend - addend));
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            rhs_sym.to_string(),
+                            lhs_addend - addend,
+                        ));
                         continue;
                     }
                 }
@@ -1928,16 +2028,26 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
                 let rhs_add = rhs_full[rhs_plus + 3..].trim();
                 if is_label_like(rhs_sym) {
                     if let Ok(addend) = parse_integer_expr(rhs_add) {
-                        vals.push(DataValue::SymbolDiffAddend(lhs, rhs_sym.to_string(), lhs_addend + addend));
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            rhs_sym.to_string(),
+                            lhs_addend + addend,
+                        ));
                         continue;
                     }
                 }
             }
             if lhs_addend != 0 {
                 vals.push(DataValue::SymbolDiffAddend(
-                    lhs, strip_sym_parens(rhs_full).to_string(), lhs_addend));
+                    lhs,
+                    strip_sym_parens(rhs_full).to_string(),
+                    lhs_addend,
+                ));
             } else {
-                vals.push(DataValue::SymbolDiff(lhs, strip_sym_parens(rhs_full).to_string()));
+                vals.push(DataValue::SymbolDiff(
+                    lhs,
+                    strip_sym_parens(rhs_full).to_string(),
+                ));
             }
             continue;
         }
@@ -2005,7 +2115,10 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
 /// value equals `symbol + addend`. Returns None for non-label strings.
 fn parse_sym_addend(s: &str) -> Option<(String, i64)> {
     let t = s.trim();
-    let t = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t);
+    let t = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(t);
     let t = t.trim();
     if t.is_empty() {
         return None;
@@ -2086,7 +2199,9 @@ fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
     // Division: `(a - b) / 8` (header.S NumberOfRvaAndSizes).
     if let Some(r) = rest.strip_prefix('/') {
         let (num, tail) = split_leading_int(r.trim())?;
-        if num == 0 { return None; }
+        if num == 0 {
+            return None;
+        }
         div = num;
         rest = tail.trim();
     }
@@ -2318,24 +2433,35 @@ fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
         // snapshots the target's CURRENT value, so later redefinition of
         // the target must not rewrite history — exactly what resolving
         // through the map at definition time gives us.
-        let alias_def: Option<(&str, &str)> =
-            if let Some(rest) = trimmed.strip_prefix(".set ").or_else(|| trimmed.strip_prefix(".set\t")) {
-                rest.find(',').map(|comma| (rest[..comma].trim(), rest[comma + 1..].trim()))
-            } else if let Some(eq) = trimmed.find('=') {
-                // Plain `NAME = TARGET` (not ==, and NAME must be a bare
-                // identifier — labels and expressions are not alias defs).
-                let name = trimmed[..eq].trim();
-                let target = trimmed[eq + 1..].trim();
-                let name_is_ident = !name.is_empty()
-                    && !target.starts_with('=')
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
-                if name_is_ident { Some((name, target)) } else { None }
+        let alias_def: Option<(&str, &str)> = if let Some(rest) = trimmed
+            .strip_prefix(".set ")
+            .or_else(|| trimmed.strip_prefix(".set\t"))
+        {
+            rest.find(',')
+                .map(|comma| (rest[..comma].trim(), rest[comma + 1..].trim()))
+        } else if let Some(eq) = trimmed.find('=') {
+            // Plain `NAME = TARGET` (not ==, and NAME must be a bare
+            // identifier — labels and expressions are not alias defs).
+            let name = trimmed[..eq].trim();
+            let target = trimmed[eq + 1..].trim();
+            let name_is_ident = !name.is_empty()
+                && !target.starts_with('=')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+            if name_is_ident {
+                Some((name, target))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         if let Some((name, target)) = alias_def {
             let name_ok = !name.is_empty()
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
             if name_ok {
                 if target.starts_with('%') {
                     reg_aliases.insert(name.to_string(), target.to_string());
@@ -2382,9 +2508,7 @@ fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
                 // register suffix cannot fire inside one.
                 let start = i;
                 i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 replaced.push_str(&line[start..i]);
@@ -2450,7 +2574,7 @@ fn expand_gas_macros_with_state(
             let rest = trimmed[".set".len()..].trim();
             if let Some(comma_pos) = rest.find(',') {
                 let sym_name = rest[..comma_pos].trim().to_string();
-                let expr_str = rest[comma_pos+1..].trim();
+                let expr_str = rest[comma_pos + 1..].trim();
                 // Try to evaluate expression with current symbol values
                 let resolved = resolve_set_expr(expr_str, symbols);
                 if let Ok(val) = parse_integer_expr(&resolved) {
@@ -2475,10 +2599,12 @@ fn expand_gas_macros_with_state(
         // Used by kernel code like: i = 0 / i = i + 1 inside .rept blocks
         if let Some(eq_pos) = trimmed.find('=') {
             // Make sure it's not ==, !=, <=, >= (comparison operators)
-            let not_comparison = (eq_pos + 1 >= trimmed.len() || trimmed.as_bytes()[eq_pos + 1] != b'=')
-                && (eq_pos == 0 || (trimmed.as_bytes()[eq_pos - 1] != b'!'
-                    && trimmed.as_bytes()[eq_pos - 1] != b'<'
-                    && trimmed.as_bytes()[eq_pos - 1] != b'>'));
+            let not_comparison = (eq_pos + 1 >= trimmed.len()
+                || trimmed.as_bytes()[eq_pos + 1] != b'=')
+                && (eq_pos == 0
+                    || (trimmed.as_bytes()[eq_pos - 1] != b'!'
+                        && trimmed.as_bytes()[eq_pos - 1] != b'<'
+                        && trimmed.as_bytes()[eq_pos - 1] != b'>'));
             if not_comparison {
                 let before = trimmed[..eq_pos].trim();
                 // Check if before looks like a symbol name: starts with letter or _, no spaces
@@ -2524,19 +2650,28 @@ fn expand_gas_macros_with_state(
         // into the object as a relocation symbol named "\l * 8".
         if trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
             let rest = trimmed[".irpc".len()..].trim();
-            let comma = rest.find(',').ok_or(".irpc: missing comma after variable")?;
+            let comma = rest
+                .find(',')
+                .ok_or(".irpc: missing comma after variable")?;
             let var = rest[..comma].trim().to_string();
             let chars_str = rest[comma + 1..].trim();
             // GAS allows the string to be quoted; strip one layer.
-            let chars_str = chars_str.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(chars_str);
+            let chars_str = chars_str
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(chars_str);
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
             while i < lines.len() {
                 let inner = strip_comment(&lines[i]).trim().to_string();
-                if inner.starts_with(".irp ") || inner.starts_with(".irp\t")
-                    || inner.starts_with(".irpc ") || inner.starts_with(".irpc\t")
-                    || inner.starts_with(".rept ") || inner.starts_with(".rept\t") {
+                if inner.starts_with(".irp ")
+                    || inner.starts_with(".irp\t")
+                    || inner.starts_with(".irpc ")
+                    || inner.starts_with(".irpc\t")
+                    || inner.starts_with(".rept ")
+                    || inner.starts_with(".rept\t")
+                {
                     depth += 1;
                 } else if inner == ".endr" {
                     depth -= 1;
@@ -2551,7 +2686,8 @@ fn expand_gas_macros_with_state(
             for ch in chars_str.chars() {
                 let item = ch.to_string();
                 for bline in &body {
-                    let mut expanded = asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
+                    let mut expanded =
+                        asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
                     expanded = expanded.replace("\\()", "");
                     all_expanded.push(expanded);
                 }
@@ -2571,8 +2707,11 @@ fn expand_gas_macros_with_state(
             i += 1;
             while i < lines.len() {
                 let inner = strip_comment(&lines[i]).trim().to_string();
-                if inner.starts_with(".irp ") || inner.starts_with(".irp\t")
-                    || inner.starts_with(".rept ") || inner.starts_with(".rept\t") {
+                if inner.starts_with(".irp ")
+                    || inner.starts_with(".irp\t")
+                    || inner.starts_with(".rept ")
+                    || inner.starts_with(".rept\t")
+                {
                     depth += 1;
                 } else if inner == ".endr" {
                     depth -= 1;
@@ -2587,7 +2726,8 @@ fn expand_gas_macros_with_state(
             let mut all_expanded = Vec::new();
             for item in &items {
                 for bline in &body {
-                    let mut expanded = asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), item);
+                    let mut expanded =
+                        asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), item);
                     // Strip GAS macro argument delimiters: \() resolves to empty string
                     expanded = expanded.replace("\\()", "");
                     all_expanded.push(expanded);
@@ -2600,7 +2740,10 @@ fn expand_gas_macros_with_state(
         }
 
         // .if expr / .elseif expr / .else / .endif
-        if trimmed.starts_with(".if ") || trimmed.starts_with(".if\t") || trimmed.starts_with(".if(") {
+        if trimmed.starts_with(".if ")
+            || trimmed.starts_with(".if\t")
+            || trimmed.starts_with(".if(")
+        {
             let rest = if trimmed.starts_with(".if(") {
                 &trimmed[".if".len()..]
             } else {
@@ -2623,7 +2766,9 @@ fn expand_gas_macros_with_state(
                         break;
                     }
                     branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1 && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t")) {
+                } else if depth == 1
+                    && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t"))
+                {
                     let elseif_rest = inner[".elseif".len()..].trim();
                     // All branch conditions are evaluated eagerly; harmless for pure comparisons.
                     let elseif_cond = eval_if_expr(elseif_rest, symbols);
@@ -2656,8 +2801,12 @@ fn expand_gas_macros_with_state(
         // .ifb string / .ifnb string / .endif
         // GAS tests whether the argument text is blank after macro substitution.
         // Linux/FFmpeg x86 macro code uses these heavily for optional operands.
-        if trimmed == ".ifb" || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb	")
-            || trimmed == ".ifnb" || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb	")
+        if trimmed == ".ifb"
+            || trimmed.starts_with(".ifb ")
+            || trimmed.starts_with(".ifb	")
+            || trimmed == ".ifnb"
+            || trimmed.starts_with(".ifnb ")
+            || trimmed.starts_with(".ifnb	")
         {
             let is_ifnb = trimmed.starts_with(".ifnb");
             let rest = if is_ifnb {
@@ -2665,7 +2814,11 @@ fn expand_gas_macros_with_state(
             } else {
                 trimmed[".ifb".len()..].trim()
             };
-            let cond = if is_ifnb { !eval_ifb(rest) } else { eval_ifb(rest) };
+            let cond = if is_ifnb {
+                !eval_ifb(rest)
+            } else {
+                eval_ifb(rest)
+            };
             let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
             let mut current_idx = 0;
             let mut depth = 1;
@@ -2677,9 +2830,13 @@ fn expand_gas_macros_with_state(
                     branches[current_idx].1.push(lines[i].clone());
                 } else if inner == ".endif" {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                     branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1 && (inner.starts_with(".elseif ") || inner.starts_with(".elseif	")) {
+                } else if depth == 1
+                    && (inner.starts_with(".elseif ") || inner.starts_with(".elseif	"))
+                {
                     let elseif_rest = inner[".elseif".len()..].trim();
                     let elseif_cond = eval_if_expr(elseif_rest, symbols);
                     branches.push((elseif_cond, Vec::new()));
@@ -2695,7 +2852,10 @@ fn expand_gas_macros_with_state(
             let empty: Vec<String> = Vec::new();
             let mut chosen_lines: &Vec<String> = &empty;
             for (bcond, blines) in &branches {
-                if *bcond { chosen_lines = blines; break; }
+                if *bcond {
+                    chosen_lines = blines;
+                    break;
+                }
             }
             let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
             result.extend(expanded);
@@ -2722,7 +2882,9 @@ fn expand_gas_macros_with_state(
                         break;
                     }
                     branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1 && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t")) {
+                } else if depth == 1
+                    && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t"))
+                {
                     let elseif_rest = inner[".elseif".len()..].trim();
                     // All branch conditions are evaluated eagerly; harmless for pure comparisons.
                     let elseif_cond = eval_if_expr(elseif_rest, symbols);
@@ -2752,7 +2914,10 @@ fn expand_gas_macros_with_state(
 
         // .error "message" - assembler error directive
         if trimmed.starts_with(".error ") || trimmed.starts_with(".error\t") {
-            return Err(format!("assembler error: {}", trimmed[".error".len()..].trim()));
+            return Err(format!(
+                "assembler error: {}",
+                trimmed[".error".len()..].trim()
+            ));
         }
 
         // Check if line is a macro invocation.
@@ -2781,8 +2946,10 @@ fn expand_gas_macros_with_state(
                 while pos < bytes.len() && bytes[pos] != b' ' && bytes[pos] != b'\t' {
                     pos += 1;
                 }
-                if pos > tok_start && bytes[pos - 1] == b':'
-                    && first_part[tok_start..pos - 1].chars()
+                if pos > tok_start
+                    && bytes[pos - 1] == b':'
+                    && first_part[tok_start..pos - 1]
+                        .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
                     && !first_part[tok_start..pos - 1].is_empty()
                 {
@@ -2804,7 +2971,11 @@ fn expand_gas_macros_with_state(
             macro_name_candidate
         } else if let Some(paren_pos) = macro_name_candidate.find('(') {
             let candidate = &macro_name_candidate[..paren_pos];
-            if macros.contains_key(candidate) { candidate } else { macro_name_candidate }
+            if macros.contains_key(candidate) {
+                candidate
+            } else {
+                macro_name_candidate
+            }
         } else {
             macro_name_candidate
         };
@@ -2837,20 +3008,24 @@ fn expand_gas_macros_with_state(
             let invocation = MACRO_INVOCATION_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 .to_string();
-            let mut expanded_body: Vec<String> = mac.body.iter().map(|line| {
-                let mut l = line.clone();
-                for (pname, pval) in &sorted_args {
-                    l = asm_preprocess::replace_macro_param(&l, &format!("\\{}", pname), pval);
-                }
-                if l.contains("\\@") {
-                    l = l.replace("\\@", &invocation);
-                }
-                // Strip GAS macro argument delimiters: \() resolves to empty string.
-                // Used to separate parameter names from adjacent text,
-                // e.g., \op\()_safe_regs -> rdmsr_safe_regs
-                l = l.replace("\\()", "");
-                l
-            }).collect();
+            let mut expanded_body: Vec<String> = mac
+                .body
+                .iter()
+                .map(|line| {
+                    let mut l = line.clone();
+                    for (pname, pval) in &sorted_args {
+                        l = asm_preprocess::replace_macro_param(&l, &format!("\\{}", pname), pval);
+                    }
+                    if l.contains("\\@") {
+                        l = l.replace("\\@", &invocation);
+                    }
+                    // Strip GAS macro argument delimiters: \() resolves to empty string.
+                    // Used to separate parameter names from adjacent text,
+                    // e.g., \op\()_safe_regs -> rdmsr_safe_regs
+                    l = l.replace("\\()", "");
+                    l
+                })
+                .collect();
             // Substituting a parameter can splice several statements into ONE
             // body line (a quoted ALTERNATIVE argument such as
             // "nop;ANNOTATE type=7; call 772f"). Break those apart before the
@@ -2890,8 +3065,7 @@ fn expand_gas_macros_with_state(
                 .filter(|sp| !sp.is_empty())
                 .collect();
             if !rest_parts.is_empty() {
-                let expanded_rest =
-                    expand_gas_macros_with_state(&rest_parts, macros, symbols)?;
+                let expanded_rest = expand_gas_macros_with_state(&rest_parts, macros, symbols)?;
                 result.extend(expanded_rest);
             }
             i += 1;
@@ -2933,20 +3107,35 @@ fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>)
         for c in s.chars() {
             if in_quote {
                 cur.push(c);
-                if c == '"' { in_quote = false; }
+                if c == '"' {
+                    in_quote = false;
+                }
                 continue;
             }
             match c {
-                '"' => { in_quote = true; cur.push(c); }
-                '(' => { depth += 1; cur.push(c); }
-                ')' => { depth -= 1; cur.push(c); }
+                '"' => {
+                    in_quote = true;
+                    cur.push(c);
+                }
+                '(' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
                 _ if depth == 0 && (c.is_whitespace() || c == ',') => {
-                    if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
                 }
                 _ => cur.push(c),
             }
         }
-        if !cur.is_empty() { out.push(cur); }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
         out
     }
 
@@ -2974,7 +3163,10 @@ fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>)
 }
 
 /// Parse macro invocation arguments: "param1=val1, param2=val2" or positional
-fn parse_macro_args(args_str: &str, params: &[(String, Option<String>)]) -> Result<Vec<(String, String)>, String> {
+fn parse_macro_args(
+    args_str: &str,
+    params: &[(String, Option<String>)],
+) -> Result<Vec<(String, String)>, String> {
     let mut result = Vec::new();
     if args_str.is_empty() {
         // Use defaults for all params
@@ -2992,7 +3184,7 @@ fn parse_macro_args(args_str: &str, params: &[(String, Option<String>)]) -> Resu
     let strip_quotes = |s: &str| -> String {
         let t = s.trim();
         if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-            t[1..t.len()-1].to_string()
+            t[1..t.len() - 1].to_string()
         } else {
             t.to_string()
         }
@@ -3012,7 +3204,7 @@ fn parse_macro_args(args_str: &str, params: &[(String, Option<String>)]) -> Resu
             let key = part[..eq_pos].trim();
             // Only treat as named if the key matches a known parameter name
             if params.iter().any(|(pname, _)| pname == key) {
-                let val = strip_quotes(part[eq_pos+1..].trim());
+                let val = strip_quotes(part[eq_pos + 1..].trim());
                 arg_map.insert(key.to_string(), val);
                 continue;
             }
@@ -3077,8 +3269,14 @@ fn split_macro_args(s: &str) -> Vec<String> {
                     }
                 }
             }
-            '(' if !in_quotes => { depth += 1; current.push(ch); }
-            ')' if !in_quotes => { depth -= 1; current.push(ch); }
+            '(' if !in_quotes => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_quotes => {
+                depth -= 1;
+                current.push(ch);
+            }
             ',' if depth == 0 && !in_quotes => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
@@ -3120,8 +3318,9 @@ fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
     // First find the variable name (before the first comma)
     let comma_pos = rest.find(',').ok_or(".irp: missing comma after variable")?;
     let var = rest[..comma_pos].trim().to_string();
-    let items_str = rest[comma_pos+1..].trim();
-    let items: Vec<String> = items_str.split(',')
+    let items_str = rest[comma_pos + 1..].trim();
+    let items: Vec<String> = items_str
+        .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -3132,7 +3331,9 @@ fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
 /// argument, empty string, or macro argument that expands to nothing as blank.
 fn eval_ifb(rest: &str) -> bool {
     let t = rest.trim();
-    if t.is_empty() { return true; }
+    if t.is_empty() {
+        return true;
+    }
     if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
         return t.len() <= 2;
     }
@@ -3143,7 +3344,7 @@ fn eval_ifb(rest: &str) -> bool {
 fn eval_ifc(rest: &str) -> bool {
     if let Some(comma_pos) = rest.find(',') {
         let s1 = rest[..comma_pos].trim();
-        let s2 = rest[comma_pos+1..].trim();
+        let s2 = rest[comma_pos + 1..].trim();
         s1 == s2
     } else {
         false
@@ -3153,7 +3354,10 @@ fn eval_ifc(rest: &str) -> bool {
 /// Resolve symbols in a .set expression string.
 /// Uses whole-word matching to avoid replacing substrings inside identifiers,
 /// register names, or instruction mnemonics (e.g., replacing `i` inside `rip`).
-fn resolve_set_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> String {
+fn resolve_set_expr(
+    expr: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+) -> String {
     // NEVER substitute inside the directive mnemonic.
     //
     // Substitution is whole-word and `.` counts as a word boundary, so a
@@ -3197,18 +3401,24 @@ fn resolve_set_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<Stri
         // Operand-less directives (`.text` with empty rest) ARE mnemonics
         // and stay protected: a user symbol named `text` must not turn
         // `.text` into `.3`.
-        let is_mnemonic = first_tok[1..].bytes().all(is_ident_char)
-            && !first_tok.starts_with(".L");
+        let is_mnemonic = first_tok[1..].bytes().all(is_ident_char) && !first_tok.starts_with(".L");
         if is_mnemonic {
-            return format!("{}{}{}", &expr[..lead], first_tok,
-                           substitute_set_symbols(rest, symbols));
+            return format!(
+                "{}{}{}",
+                &expr[..lead],
+                first_tok,
+                substitute_set_symbols(rest, symbols)
+            );
         }
     }
     substitute_set_symbols(expr, symbols)
 }
 
 /// Plain whole-word .set-symbol substitution, no directive-mnemonic logic.
-fn substitute_set_symbols(text: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> String {
+fn substitute_set_symbols(
+    text: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+) -> String {
     let mut result = text.to_string();
     // Sort by length (longest first) to avoid partial replacements
     let mut sym_list: Vec<_> = symbols.iter().collect();
@@ -3235,8 +3445,8 @@ fn replace_whole_word(text: &str, word: &str, replacement: &str) -> String {
             // Check left boundary: either start of string or non-identifier char
             let left_ok = i == 0 || !is_ident_char(bytes[i - 1]);
             // Check right boundary: either end of string or non-identifier char
-            let right_ok = i + word_bytes.len() >= bytes.len()
-                || !is_ident_char(bytes[i + word_bytes.len()]);
+            let right_ok =
+                i + word_bytes.len() >= bytes.len() || !is_ident_char(bytes[i + word_bytes.len()]);
             if left_ok && right_ok {
                 result.push_str(replacement);
                 i += word_bytes.len();
@@ -3261,11 +3471,19 @@ fn is_ident_char(b: u8) -> bool {
 
 /// Check if a line starts a new conditional assembly block (.if, .ifc, .ifdef, .ifndef).
 fn is_if_start(trimmed: &str) -> bool {
-    trimmed.starts_with(".if ") || trimmed.starts_with(".if\t") || trimmed.starts_with(".if(")
-        || trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t")
-        || trimmed == ".ifb" || trimmed.starts_with(".ifb ") || trimmed.starts_with(".ifb\t")
-        || trimmed == ".ifnb" || trimmed.starts_with(".ifnb ") || trimmed.starts_with(".ifnb\t")
-        || trimmed.starts_with(".ifdef ") || trimmed.starts_with(".ifndef ")
+    trimmed.starts_with(".if ")
+        || trimmed.starts_with(".if\t")
+        || trimmed.starts_with(".if(")
+        || trimmed.starts_with(".ifc ")
+        || trimmed.starts_with(".ifc\t")
+        || trimmed == ".ifb"
+        || trimmed.starts_with(".ifb ")
+        || trimmed.starts_with(".ifb\t")
+        || trimmed == ".ifnb"
+        || trimmed.starts_with(".ifnb ")
+        || trimmed.starts_with(".ifnb\t")
+        || trimmed.starts_with(".ifdef ")
+        || trimmed.starts_with(".ifndef ")
 }
 
 /// Evaluate a `.if` expression for the x86 assembler.
@@ -3299,22 +3517,38 @@ mod tests {
             "ANN".into(),
         ];
         let out = expand_gas_macros(&lines).unwrap();
-        let labels: Vec<&String> = out.iter()
+        let labels: Vec<&String> = out
+            .iter()
             .filter(|l| l.trim_end().ends_with(':') && l.contains(".Lhere_"))
             .collect();
-        assert_eq!(labels.len(), 3, "three expansions, three label defs: {:?}", out);
+        assert_eq!(
+            labels.len(),
+            3,
+            "three expansions, three label defs: {:?}",
+            out
+        );
         // All three labels must be pairwise distinct.
         assert_ne!(labels[0], labels[1]);
         assert_ne!(labels[1], labels[2]);
         assert_ne!(labels[0], labels[2]);
         // No `\@` may survive expansion.
-        assert!(out.iter().all(|l| !l.contains("\\@")), "unsubstituted \\@: {:?}", out);
+        assert!(
+            out.iter().all(|l| !l.contains("\\@")),
+            "unsubstituted \\@: {:?}",
+            out
+        );
         // Each reference must use ITS invocation's label.
-        for (def, reference) in labels.iter().zip(
-            out.iter().filter(|l| l.contains(".long .Lhere_"))) {
+        for (def, reference) in labels
+            .iter()
+            .zip(out.iter().filter(|l| l.contains(".long .Lhere_")))
+        {
             let def_name = def.trim().trim_end_matches(':');
-            assert!(reference.contains(def_name),
-                "reference {:?} does not match definition {:?}", reference, def);
+            assert!(
+                reference.contains(def_name),
+                "reference {:?} does not match definition {:?}",
+                reference,
+                def
+            );
         }
     }
 
@@ -3333,10 +3567,16 @@ mod tests {
         ];
         let out = expand_gas_macros(&lines).unwrap();
         let joined = out.join("\n");
-        assert!(joined.contains("mov $32, %rax"),
-            ":req parameter did not bind: {:?}", out);
-        assert!(joined.contains(".long (((1 << 0) << 16) | (( 3*32+21)))"),
-            "parenthesized default was shredded: {:?}", out);
+        assert!(
+            joined.contains("mov $32, %rax"),
+            ":req parameter did not bind: {:?}",
+            out
+        );
+        assert!(
+            joined.contains(".long (((1 << 0) << 16) | (( 3*32+21)))"),
+            "parenthesized default was shredded: {:?}",
+            out
+        );
     }
 
     /// A directive is never a macro invocation: a macro named `type` must
@@ -3354,10 +3594,16 @@ mod tests {
         ];
         let out = expand_gas_macros(&lines).unwrap();
         let joined = out.join("\n");
-        assert!(joined.contains(".type myfn, @function"),
-            ".type directive was rewritten: {:?}", out);
-        assert!(joined.contains(".long 7"),
-            "bare `type` invocation must still expand: {:?}", out);
+        assert!(
+            joined.contains(".type myfn, @function"),
+            ".type directive was rewritten: {:?}",
+            out
+        );
+        assert!(
+            joined.contains(".long 7"),
+            "bare `type` invocation must still expand: {:?}",
+            out
+        );
     }
 
     /// `.set alias, %reg` register aliases substitute into operands with
@@ -3376,10 +3622,16 @@ mod tests {
         ];
         let out = expand_gas_macros(&lines).unwrap();
         let joined = out.join("\n");
-        assert!(joined.contains("movdqa -32(%rcx), %xmm7"),
-            "transitive alias failed: {:?}", out);
-        assert!(joined.contains("movdqa (%rdx), %xmm2"),
-            "redefinition not honored for later uses: {:?}", out);
+        assert!(
+            joined.contains("movdqa -32(%rcx), %xmm7"),
+            "transitive alias failed: {:?}",
+            out
+        );
+        assert!(
+            joined.contains("movdqa (%rdx), %xmm2"),
+            "redefinition not honored for later uses: {:?}",
+            out
+        );
         assert!(!joined.contains("CONSTS"), "alias leaked: {:?}", out);
     }
 
@@ -3396,9 +3648,16 @@ mod tests {
         ];
         let out = expand_gas_macros(&lines).unwrap();
         let joined = out.join("\n");
-        assert!(joined.contains(".long 3"), ".set value not applied: {:?}", out);
-        assert!(joined.contains(".type f, @function"),
-            ".type directive corrupted: {:?}", out);
+        assert!(
+            joined.contains(".long 3"),
+            ".set value not applied: {:?}",
+            out
+        );
+        assert!(
+            joined.contains(".type f, @function"),
+            ".type directive corrupted: {:?}",
+            out
+        );
     }
 
     /// The directive-mnemonic guard must NOT swallow `.L` local symbols:
@@ -3417,8 +3676,11 @@ mod tests {
             ".long .Lfound".into(),
         ];
         let out = expand_gas_macros(&lines).unwrap();
-        assert!(out.join("\n").contains(".long 1"),
-            ".Lfound increment lost: {:?}", out);
+        assert!(
+            out.join("\n").contains(".long 1"),
+            ".Lfound increment lost: {:?}",
+            out
+        );
 
         // The full kernel shape: .irp register scan with .ifc counting.
         let lines2: Vec<String> = vec![
@@ -3480,7 +3742,10 @@ main:
 "#;
         let items = parse_asm(asm).unwrap();
         // Should parse without errors
-        let labels: Vec<_> = items.iter().filter(|i| matches!(i, AsmItem::Label(_))).collect();
+        let labels: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, AsmItem::Label(_)))
+            .collect();
         assert_eq!(labels.len(), 1);
     }
 

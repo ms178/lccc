@@ -46,7 +46,11 @@ pub fn inline_threshold_multiplier(caller: &str, callee: &str, p: &ProfileData) 
         // makes the base inliner over-inline helpers into hot functions —
         // restructuring them and regressing the hot path (see summary.rs).
         if ch && dh {
-            if s.has_spread() { 1.75 } else { 1.0 }
+            if s.has_spread() {
+                1.75
+            } else {
+                1.0
+            }
         } else if ch && dc {
             0.60
         } else if cc {

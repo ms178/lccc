@@ -73,13 +73,12 @@ impl VersionScript {
             return None;
         }
 
-        let version_pos = text.rfind("VERSION")
-            .filter(|&pos| {
-                let before = text[..pos].chars().next_back();
-                let after = text[pos + "VERSION".len()..].chars().next();
-                !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-            });
+        let version_pos = text.rfind("VERSION").filter(|&pos| {
+            let before = text[..pos].chars().next_back();
+            let after = text[pos + "VERSION".len()..].chars().next();
+            !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
         let mut text = version_pos.map_or(text.as_str(), |pos| &text[pos + "VERSION".len()..]);
         if version_pos.is_some() {
             // Full scripts spell `VERSION { NODE { global: ...; }; }` while a
@@ -120,11 +119,17 @@ impl VersionScript {
     /// assignment use exactly the same wildcard semantics.
     pub fn version_node_for(&self, name: &str) -> Option<usize> {
         if self.nodes.is_empty() {
-            return self.global_patterns.iter()
-                .any(|pat| wildcard_match(pat, name)).then_some(0);
+            return self
+                .global_patterns
+                .iter()
+                .any(|pat| wildcard_match(pat, name))
+                .then_some(0);
         }
-        self.nodes.iter().position(|node|
-            node.global_patterns.iter().any(|pat| wildcard_match(pat, name)))
+        self.nodes.iter().position(|node| {
+            node.global_patterns
+                .iter()
+                .any(|pat| wildcard_match(pat, name))
+        })
     }
 
     /// True when `name` is explicitly matched by some node's `local:` list.
@@ -132,13 +137,18 @@ impl VersionScript {
     /// `local: *` is reported through [`Self::local_star`]; this covers the
     /// narrower `local: internal_*;` form.
     pub fn matches_local(&self, name: &str) -> bool {
-        self.nodes.iter().any(|n| n.local_patterns.iter()
-            .any(|pat| pat != "*" && wildcard_match(pat, name)))
+        self.nodes.iter().any(|n| {
+            n.local_patterns
+                .iter()
+                .any(|pat| pat != "*" && wildcard_match(pat, name))
+        })
     }
 
     /// `local: *` in any node hides everything not explicitly exported.
     pub fn any_local_star(&self) -> bool {
-        if self.nodes.is_empty() { return self.local_star; }
+        if self.nodes.is_empty() {
+            return self.local_star;
+        }
         self.nodes.iter().any(|n| n.local_star)
     }
 }
@@ -175,7 +185,9 @@ fn parse_version_nodes(text: &str) -> Vec<VersionNode> {
 
     while i < bytes.len() {
         // Node name: everything up to the opening brace.
-        let Some(rel_open) = text[i..].find('{') else { break };
+        let Some(rel_open) = text[i..].find('{') else {
+            break;
+        };
         let open = i + rel_open;
         let name = text[i..open]
             .trim()
@@ -194,7 +206,10 @@ fn parse_version_nodes(text: &str) -> Vec<VersionNode> {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
-                    if depth == 0 { close = Some(open + k); break; }
+                    if depth == 0 {
+                        close = Some(open + k);
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -214,7 +229,9 @@ fn parse_version_nodes(text: &str) -> Vec<VersionNode> {
         nodes.push(node);
 
         i = close + 1 + suffix_end + usize::from(suffix_end < after.len());
-        if text[i..].trim().is_empty() { break; }
+        if text[i..].trim().is_empty() {
+            break;
+        }
     }
     nodes
 }
@@ -226,7 +243,9 @@ fn parse_one_node_body(body: &str) -> VersionNode {
 
     for segment in body.split(';') {
         let mut t = segment.trim();
-        if t.is_empty() { continue; }
+        if t.is_empty() {
+            continue;
+        }
 
         if let Some(pos) = t.find("global:") {
             mode = Some("global");
@@ -236,17 +255,23 @@ fn parse_one_node_body(body: &str) -> VersionNode {
             mode = Some("local");
             t = t[pos + "local:".len()..].trim();
         }
-        if t.is_empty() { continue; }
+        if t.is_empty() {
+            continue;
+        }
 
         // Version scripts normally list one pattern per semicolon, but allow
         // whitespace-separated patterns as a robustness improvement.
         for pat in t.split_whitespace() {
             let pat = pat.trim().trim_matches(';').trim();
-            if pat.is_empty() { continue; }
+            if pat.is_empty() {
+                continue;
+            }
             match mode {
                 Some("global") => node.global_patterns.push(pat.to_string()),
                 Some("local") => {
-                    if pat == "*" { node.local_star = true; }
+                    if pat == "*" {
+                        node.local_star = true;
+                    }
                     node.local_patterns.push(pat.to_string());
                 }
                 _ => {}
@@ -268,7 +293,9 @@ pub(crate) fn strip_version_script_comments(input: &str) -> String {
             }
             i = (i + 2).min(bytes.len());
         } else if bytes[i] == b'#' {
-            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
         } else {
             out.push(bytes[i] as char);
             i += 1;
@@ -283,14 +310,22 @@ pub fn wildcard_match_pattern(pattern: &str, text: &str) -> bool {
 }
 
 pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" { return true; }
-    if !pattern.contains('*') { return pattern == text; }
+    if pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
     let mut rest = text;
     let mut first = true;
     for part in pattern.split('*') {
-        if part.is_empty() { continue; }
+        if part.is_empty() {
+            continue;
+        }
         if first && !pattern.starts_with('*') {
-            if !rest.starts_with(part) { return false; }
+            if !rest.starts_with(part) {
+                return false;
+            }
             rest = &rest[part.len()..];
         } else if let Some(pos) = rest.find(part) {
             rest = &rest[pos + part.len()..];
@@ -302,16 +337,17 @@ pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
     pattern.ends_with('*') || rest.is_empty()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
     fn write_script(body: &str) -> String {
-        let dir = std::env::temp_dir()
-            .join(format!("lccc_vs_{}_{}", std::process::id(),
-                          body.len() * 2654435761usize % 100000));
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_vs_{}_{}",
+            std::process::id(),
+            body.len() * 2654435761usize % 100000
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("v.map");
         let mut f = std::fs::File::create(&p).unwrap();
@@ -360,8 +396,8 @@ mod tests {
 
     #[test]
     fn comments_are_stripped() {
-        let p = write_script(
-            "/* c comment */\n# hash comment\n{ global: keep; /* x */ local: *; };\n");
+        let p =
+            write_script("/* c comment */\n# hash comment\n{ global: keep; /* x */ local: *; };\n");
         let vs = VersionScript::parse(&p).unwrap();
         assert!(vs.matches_global("keep"));
         assert!(vs.local_star);
@@ -398,20 +434,30 @@ mod tests {
     fn multiple_version_nodes_are_all_parsed_with_parents() {
         let vs = VersionScript::parse_text(
             "LIBV_1.0 { global: old_fn; local: *; };\n\
-             LIBV_2.0 { global: new_fn; } LIBV_1.0;\n").unwrap();
+             LIBV_2.0 { global: new_fn; } LIBV_1.0;\n",
+        )
+        .unwrap();
         assert_eq!(vs.nodes.len(), 2, "both nodes must be parsed");
         assert_eq!(vs.nodes[0].name, "LIBV_1.0");
         assert_eq!(vs.nodes[1].name, "LIBV_2.0");
         assert_eq!(vs.nodes[0].parent, None);
-        assert_eq!(vs.nodes[1].parent.as_deref(), Some("LIBV_1.0"),
-                   "the inheritance edge is what lets a 2.0 provider satisfy a 1.0 dependency");
+        assert_eq!(
+            vs.nodes[1].parent.as_deref(),
+            Some("LIBV_1.0"),
+            "the inheritance edge is what lets a 2.0 provider satisfy a 1.0 dependency"
+        );
         // Export is a property of the whole script, not of its first node.
         assert!(vs.matches_global("old_fn"));
-        assert!(vs.matches_global("new_fn"),
-                "a symbol introduced by a later node is still exported");
+        assert!(
+            vs.matches_global("new_fn"),
+            "a symbol introduced by a later node is still exported"
+        );
         assert_eq!(vs.version_node_for("old_fn"), Some(0));
-        assert_eq!(vs.version_node_for("new_fn"), Some(1),
-                   "dynsym must receive the later node's version index");
+        assert_eq!(
+            vs.version_node_for("new_fn"),
+            Some(1),
+            "dynsym must receive the later node's version index"
+        );
         assert!(!vs.matches_global("internal_fn"));
         assert!(vs.any_local_star(), "local: * in any node hides the rest");
     }
@@ -428,8 +474,7 @@ mod tests {
 
     #[test]
     fn explicit_local_patterns_are_recorded() {
-        let vs = VersionScript::parse_text(
-            "V { global: pub_*; local: internal_*; };").unwrap();
+        let vs = VersionScript::parse_text("V { global: pub_*; local: internal_*; };").unwrap();
         assert!(vs.matches_global("pub_a"));
         assert!(vs.matches_local("internal_x"));
         assert!(!vs.matches_local("pub_a"));
@@ -441,11 +486,12 @@ mod tests {
         let vs = VersionScript::parse_text(
             "A_1 { global: f1; };\n\
              A_2 { global: f2; } A_1;\n\
-             A_3 { global: f3; } A_2;\n").unwrap();
+             A_3 { global: f3; } A_2;\n",
+        )
+        .unwrap();
         let names: Vec<&str> = vs.nodes.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["A_1", "A_2", "A_3"]);
-        let parents: Vec<Option<&str>> =
-            vs.nodes.iter().map(|n| n.parent.as_deref()).collect();
+        let parents: Vec<Option<&str>> = vs.nodes.iter().map(|n| n.parent.as_deref()).collect();
         assert_eq!(parents, vec![None, Some("A_1"), Some("A_2")]);
     }
 }

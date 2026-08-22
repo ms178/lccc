@@ -30,7 +30,12 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
         let is_double = rd_lower.starts_with('d') || rm_lower.starts_with('d');
         let ftype = if is_double { 0b01 } else { 0b00 };
         // 0 00 11110 ftype 1 0000 00 10000 Rn Rd
-        let word = (0b00011110 << 24) | (ftype << 22) | (0b100000 << 16) | (0b10000 << 10) | (rm << 5) | rd;
+        let word = (0b00011110 << 24)
+            | (ftype << 22)
+            | (0b100000 << 16)
+            | (0b10000 << 10)
+            | (rm << 5)
+            | rd;
         return Ok(EncodeResult::Word(word));
     }
 
@@ -62,7 +67,10 @@ pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> 
         }
     }
 
-    Err(format!("unsupported fmov operands: {} -> {}", rd_name, rm_name))
+    Err(format!(
+        "unsupported fmov operands: {} -> {}",
+        rd_name, rm_name
+    ))
 }
 
 pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
@@ -70,45 +78,67 @@ pub(crate) fn encode_fp_arith(operands: &[Operand], opcode: u32) -> Result<Encod
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
 
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01 } else { 0b00 };
 
     // 0 00 11110 ftype 1 Rm opcode 10 Rn Rd
-    let word = (0b00011110 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (opcode << 12) | (0b10 << 10) | (rn << 5) | rd;
+    let word = (0b00011110 << 24)
+        | (ftype << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | (opcode << 12)
+        | (0b10 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_fneg(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01 } else { 0b00 };
     // FNEG: 0 00 11110 ftype 1 0000 10 10000 Rn Rd
-    let word = (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b10000 << 10) | (rn << 5) | rd;
+    let word =
+        (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b10000 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_fabs(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01 } else { 0b00 };
     // FABS: 0 00 11110 ftype 1 0000 01 10000 Rn Rd
-    let word = (0b00011110 << 24) | (ftype << 22) | (0b100000 << 16) | (0b110000 << 10) | (rn << 5) | rd;
+    let word =
+        (0b00011110 << 24) | (ftype << 22) | (0b100000 << 16) | (0b110000 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01 } else { 0b00 };
     // FSQRT: 0 00 11110 ftype 1 0000 11 10000 Rn Rd
-    let word = (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b110000 << 10) | (rn << 5) | rd;
+    let word =
+        (0b00011110 << 24) | (ftype << 22) | (0b100001 << 16) | (0b110000 << 10) | (rn << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -117,65 +147,107 @@ pub(crate) fn encode_fsqrt(operands: &[Operand]) -> Result<EncodeResult, String>
 pub(crate) fn encode_fp_1src(operands: &[Operand], opcode: u32) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01u32 } else { 0b00 };
-    let word = (0b00011110u32 << 24) | (ftype << 22) | (1 << 21)
-        | (opcode << 15) | (0b10000 << 10) | (rn << 5) | rd;
+    let word = (0b00011110u32 << 24)
+        | (ftype << 22)
+        | (1 << 21)
+        | (opcode << 15)
+        | (0b10000 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode FMADD/FMSUB: Rd = Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 0 Rm o1 Ra Rn Rd
-pub(crate) fn encode_fmadd_fmsub(operands: &[Operand], is_sub: bool) -> Result<EncodeResult, String> {
+pub(crate) fn encode_fmadd_fmsub(
+    operands: &[Operand],
+    is_sub: bool,
+) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
     let (ra, _) = get_reg(operands, 3)?;
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01u32 } else { 0b00 };
     let o1 = if is_sub { 1u32 } else { 0 };
-    let word = (0b00011111u32 << 24) | (ftype << 22) | (rm << 16)
-        | (o1 << 15) | (ra << 10) | (rn << 5) | rd;
+    let word = (0b00011111u32 << 24)
+        | (ftype << 22)
+        | (rm << 16)
+        | (o1 << 15)
+        | (ra << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
 /// Encode FNMADD/FNMSUB: Rd = -Ra +/- (Rn * Rm)
 /// Format: 0 00 11111 ftype 1 Rm o1 Ra Rn Rd
-pub(crate) fn encode_fnmadd_fnmsub(operands: &[Operand], is_sub: bool) -> Result<EncodeResult, String> {
+pub(crate) fn encode_fnmadd_fnmsub(
+    operands: &[Operand],
+    is_sub: bool,
+) -> Result<EncodeResult, String> {
     let (rd, _) = get_reg(operands, 0)?;
     let (rn, _) = get_reg(operands, 1)?;
     let (rm, _) = get_reg(operands, 2)?;
     let (ra, _) = get_reg(operands, 3)?;
-    let rd_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rd_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rd_name.starts_with('d');
     let ftype = if is_double { 0b01u32 } else { 0b00 };
     let o1 = if is_sub { 1u32 } else { 0 };
-    let word = (0b00011111u32 << 24) | (ftype << 22) | (1 << 21) | (rm << 16)
-        | (o1 << 15) | (ra << 10) | (rn << 5) | rd;
+    let word = (0b00011111u32 << 24)
+        | (ftype << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | (o1 << 15)
+        | (ra << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rn, _) = get_reg(operands, 0)?;
-    let rn_name = match &operands[0] { Operand::Reg(r) => r.to_lowercase(), _ => String::new() };
+    let rn_name = match &operands[0] {
+        Operand::Reg(r) => r.to_lowercase(),
+        _ => String::new(),
+    };
     let is_double = rn_name.starts_with('d');
     let ftype = if is_double { 0b01 } else { 0b00 };
 
     // FCMP Dn, #0.0
     if operands.len() < 2 || matches!(operands.get(1), Some(Operand::Imm(0))) {
-        let word = ((0b00011110 << 24) | (ftype << 22) | (1 << 21)) | (0b001000 << 10) | (rn << 5) | 0b01000;
+        let word = ((0b00011110 << 24) | (ftype << 22) | (1 << 21))
+            | (0b001000 << 10)
+            | (rn << 5)
+            | 0b01000;
         return Ok(EncodeResult::Word(word));
     }
 
     let (rm, _) = get_reg(operands, 1)?;
     // FCMP Dn, Dm: 0 00 11110 ftype 1 Rm 00 1000 Rn 00 000
-    let word = (0b00011110 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (0b001000 << 10) | (rn << 5);
+    let word =
+        (0b00011110 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (0b001000 << 10) | (rn << 5);
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fcvt_rounding(operands: &[Operand], rmode: u32, opcode: u32) -> Result<EncodeResult, String> {
+pub(crate) fn encode_fcvt_rounding(
+    operands: &[Operand],
+    rmode: u32,
+    opcode: u32,
+) -> Result<EncodeResult, String> {
     // Float-to-integer conversion with specified rounding mode
     // Encoding: sf 00 11110 ftype 1 rmode opcode 000000 Rn Rd
     // sf: 0=W dest, 1=X dest
@@ -191,11 +263,17 @@ pub(crate) fn encode_fcvt_rounding(operands: &[Operand], rmode: u32, opcode: u32
         Operand::Reg(name) => name.to_lowercase(),
         _ => return Err("fcvt*: expected register source".to_string()),
     };
-    let ftype: u32 = if src_name.starts_with('d') { 0b01 } else { 0b00 };
+    let ftype: u32 = if src_name.starts_with('d') {
+        0b01
+    } else {
+        0b00
+    };
     let sf: u32 = if rd_is_64 { 1 } else { 0 };
 
-    let word = ((sf << 31) | (0b11110 << 24) | (ftype << 22)
-        | (1 << 21) | (rmode << 19) | (opcode << 16)) | (rn << 5) | rd;
+    let word =
+        ((sf << 31) | (0b11110 << 24) | (ftype << 22) | (1 << 21) | (rmode << 19) | (opcode << 16))
+            | (rn << 5)
+            | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -207,7 +285,10 @@ pub(crate) fn encode_scvtf(operands: &[Operand]) -> Result<EncodeResult, String>
     encode_int_to_float(operands, true)
 }
 
-pub(crate) fn encode_int_to_float(operands: &[Operand], is_signed: bool) -> Result<EncodeResult, String> {
+pub(crate) fn encode_int_to_float(
+    operands: &[Operand],
+    is_signed: bool,
+) -> Result<EncodeResult, String> {
     // SCVTF/UCVTF: integer-to-float conversion
     // Encoding: sf 00 11110 ftype 1 00 opcode 000000 Rn Rd
     // sf: 0=W source, 1=X source
@@ -223,12 +304,17 @@ pub(crate) fn encode_int_to_float(operands: &[Operand], is_signed: bool) -> Resu
         Operand::Reg(name) => name.to_lowercase(),
         _ => return Err("scvtf/ucvtf: expected register dest".to_string()),
     };
-    let ftype: u32 = if dst_name.starts_with('d') { 0b01 } else { 0b00 };
+    let ftype: u32 = if dst_name.starts_with('d') {
+        0b01
+    } else {
+        0b00
+    };
     let sf: u32 = if rn_is_64 { 1 } else { 0 };
     let opcode: u32 = if is_signed { 0b010 } else { 0b011 };
 
-    let word = (((sf << 31) | (0b11110 << 24) | (ftype << 22)
-        | (1 << 21)) | (opcode << 16)) | (rn << 5) | rd;
+    let word = (((sf << 31) | (0b11110 << 24) | (ftype << 22) | (1 << 21)) | (opcode << 16))
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }
 
@@ -265,7 +351,13 @@ pub(crate) fn encode_fcvt_precision(operands: &[Operand]) -> Result<EncodeResult
         _ => return Err(format!("fcvt: unsupported dest type: {}", dst_name)),
     };
 
-    let word = (0b00011110 << 24) | (ftype << 22) | (1 << 21) | (0b0001 << 17)
-        | (opc << 15) | (0b10000 << 10) | (rn << 5) | rd;
+    let word = (0b00011110 << 24)
+        | (ftype << 22)
+        | (1 << 21)
+        | (0b0001 << 17)
+        | (opc << 15)
+        | (0b10000 << 10)
+        | (rn << 5)
+        | rd;
     Ok(EncodeResult::Word(word))
 }

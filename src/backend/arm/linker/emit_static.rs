@@ -6,8 +6,8 @@
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
-use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE};
 use super::reloc;
+use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE};
 use crate::backend::linker_common;
 use linker_common::OutputSection;
 
@@ -23,13 +23,18 @@ pub(super) fn emit_executable(
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("output sections:");
         for (i, sec) in output_sections.iter().enumerate() {
-            eprintln!("  [{}]: {} type={} flags=0x{:x} size={} align={}", i, sec.name, sec.sh_type, sec.flags, sec.mem_size, sec.alignment);
+            eprintln!(
+                "  [{}]: {} type={} flags=0x{:x} size={} align={}",
+                i, sec.name, sec.sh_type, sec.flags, sec.mem_size, sec.alignment
+            );
         }
     }
 
     // Layout: Single RX LOAD segment from file offset 0 (ELF hdr + phdrs + text + rodata),
     // followed by a RW LOAD segment for data + bss, plus TLS and GNU_STACK phdrs.
-    let has_tls = output_sections.iter().any(|s| s.flags & SHF_TLS != 0 && s.mem_size > 0);
+    let has_tls = output_sections
+        .iter()
+        .any(|s| s.flags & SHF_TLS != 0 && s.mem_size > 0);
     let phdr_count: u64 = 2 + if has_tls { 1 } else { 0 } + 1 + 1; // 2 LOAD + optional TLS + GNU_STACK + GNU_EH_FRAME
     let phdr_total_size = phdr_count * 56;
     let debug_layout = std::env::var("LINKER_DEBUG_LAYOUT").is_ok();
@@ -50,16 +55,21 @@ pub(super) fn emit_executable(
 
     // Rodata sections (read-only, in same RX segment)
     for sec in output_sections.iter_mut() {
-        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_EXECINSTR == 0 &&
-           sec.flags & SHF_WRITE == 0 && sec.sh_type != SHT_NOBITS &&
-           sec.flags & SHF_TLS == 0 {
+        if sec.flags & SHF_ALLOC != 0
+            && sec.flags & SHF_EXECINSTR == 0
+            && sec.flags & SHF_WRITE == 0
+            && sec.sh_type != SHT_NOBITS
+            && sec.flags & SHF_TLS == 0
+        {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!("  LAYOUT RO: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
-                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags);
+                eprintln!(
+                    "  LAYOUT RO: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags
+                );
             }
             offset += sec.mem_size;
         }
@@ -83,7 +93,10 @@ pub(super) fn emit_executable(
     if eh_frame_size > 0 {
         // Count FDEs from individual input .eh_frame sections (data not merged yet)
         let mut fde_count = 0usize;
-        if let Some(ef_sec) = output_sections.iter().find(|s| s.name == ".eh_frame" && s.mem_size > 0) {
+        if let Some(ef_sec) = output_sections
+            .iter()
+            .find(|s| s.name == ".eh_frame" && s.mem_size > 0)
+        {
             for input in &ef_sec.inputs {
                 let sd = &objects[input.object_idx].section_data[input.section_idx];
                 fde_count += crate::backend::linker_common::count_eh_frame_fdes(sd);
@@ -96,8 +109,10 @@ pub(super) fn emit_executable(
         eh_frame_hdr_vaddr = BASE_ADDR + offset;
         offset += eh_frame_hdr_size;
         if debug_layout {
-            eprintln!("  LAYOUT EH_FRAME_HDR: addr=0x{:x} foff=0x{:x} sz=0x{:x} fde_count={}",
-                eh_frame_hdr_vaddr, eh_frame_hdr_offset, eh_frame_hdr_size, fde_count);
+            eprintln!(
+                "  LAYOUT EH_FRAME_HDR: addr=0x{:x} foff=0x{:x} sz=0x{:x} fde_count={}",
+                eh_frame_hdr_vaddr, eh_frame_hdr_offset, eh_frame_hdr_size, fde_count
+            );
         }
     }
 
@@ -107,7 +122,8 @@ pub(super) fn emit_executable(
     // Pre-count IFUNC symbols so we can reserve space for IPLT stubs in the RX gap.
     // Each IPLT stub is 16 bytes (ADRP + LDR + BR + NOP), placed in the gap between
     // the RX segment end and the page-aligned RW segment start.
-    let pre_iplt_count = globals.iter()
+    let pre_iplt_count = globals
+        .iter()
         .filter(|(_, gsym)| gsym.info & 0xf == STT_GNU_IFUNC && gsym.defined_in.is_some())
         .count() as u64;
     let iplt_stubs_needed = pre_iplt_count * 16;
@@ -139,12 +155,18 @@ pub(super) fn emit_executable(
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
-            if tls_addr == 0 { tls_addr = sec.addr; tls_file_offset = offset; tls_align = a; }
+            if tls_addr == 0 {
+                tls_addr = sec.addr;
+                tls_file_offset = offset;
+                tls_align = a;
+            }
             tls_file_size += sec.mem_size;
             tls_mem_size += sec.mem_size;
             if debug_layout {
-                eprintln!("  LAYOUT TLS: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} align={} flags=0x{:x}",
-                    sec.name, sec.addr, sec.file_offset, sec.mem_size, a, sec.flags);
+                eprintln!(
+                    "  LAYOUT TLS: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} align={} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, a, sec.flags
+                );
             }
             offset += sec.mem_size;
         }
@@ -167,7 +189,9 @@ pub(super) fn emit_executable(
                     sec.name, sec.addr, aligned, sec.mem_size, a, tls_mem_size);
             }
             tls_mem_size = aligned + sec.mem_size;
-            if a > tls_align { tls_align = a; }
+            if a > tls_align {
+                tls_align = a;
+            }
         }
     }
     if tls_mem_size > 0 {
@@ -205,25 +229,33 @@ pub(super) fn emit_executable(
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!("  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
-                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags);
+                eprintln!(
+                    "  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags
+                );
             }
             offset += sec.mem_size;
         }
     }
     // Remaining data sections (writable, non-BSS, non-TLS)
     for sec in output_sections.iter_mut() {
-        if sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_WRITE != 0 &&
-           sec.sh_type != SHT_NOBITS && sec.flags & SHF_TLS == 0 &&
-           sec.name != ".init_array" && sec.name != ".fini_array" &&
-           sec.name != ".data.rel.ro" {
+        if sec.flags & SHF_ALLOC != 0
+            && sec.flags & SHF_WRITE != 0
+            && sec.sh_type != SHT_NOBITS
+            && sec.flags & SHF_TLS == 0
+            && sec.name != ".init_array"
+            && sec.name != ".fini_array"
+            && sec.name != ".data.rel.ro"
+        {
             let a = sec.alignment.max(1);
             offset = (offset + a - 1) & !(a - 1);
             sec.addr = BASE_ADDR + offset;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!("  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
-                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags);
+                eprintln!(
+                    "  LAYOUT RW: {} addr=0x{:x} foff=0x{:x} sz=0x{:x} flags=0x{:x}",
+                    sec.name, sec.addr, sec.file_offset, sec.mem_size, sec.flags
+                );
             }
             offset += sec.mem_size;
         }
@@ -283,7 +315,11 @@ pub(super) fn emit_executable(
             sec.file_offset = offset;
         }
     }
-    let rw_memsz = if bss_size > 0 { (bss_addr + bss_size) - rw_page_addr } else { rw_filesz };
+    let rw_memsz = if bss_size > 0 {
+        (bss_addr + bss_size) - rw_page_addr
+    } else {
+        rw_filesz
+    };
 
     // IPLT stubs go in the RX padding between rx_filesz and rw_page_offset.
     // Each stub: 16 bytes (ADRP + LDR + BR + NOP)
@@ -291,19 +327,37 @@ pub(super) fn emit_executable(
     let iplt_stub_file_off = (rx_filesz + 15) & !15; // 16-byte aligned
     let iplt_stub_addr = BASE_ADDR + iplt_stub_file_off;
     if iplt_stub_size > 0 && iplt_stub_file_off + iplt_stub_size > rw_page_offset {
-        return Err(format!("IPLT stubs ({} bytes) don't fit in RX padding (gap={})",
-            iplt_stub_size, rw_page_offset - iplt_stub_file_off));
+        return Err(format!(
+            "IPLT stubs ({} bytes) don't fit in RX padding (gap={})",
+            iplt_stub_size,
+            rw_page_offset - iplt_stub_file_off
+        ));
     }
 
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("section layout:");
         for sec in output_sections.iter() {
-            eprintln!("  {} addr=0x{:x} foff=0x{:x} size=0x{:x}", sec.name, sec.addr, sec.file_offset, sec.mem_size);
+            eprintln!(
+                "  {} addr=0x{:x} foff=0x{:x} size=0x{:x}",
+                sec.name, sec.addr, sec.file_offset, sec.mem_size
+            );
         }
-        eprintln!("  GOT addr=0x{:x} foff=0x{:x} size=0x{:x} entries={}", got_addr, got_offset, got_size, got_entries.len());
+        eprintln!(
+            "  GOT addr=0x{:x} foff=0x{:x} size=0x{:x} entries={}",
+            got_addr,
+            got_offset,
+            got_size,
+            got_entries.len()
+        );
         if iplt_got_count > 0 {
-            eprintln!("  IPLT GOT addr=0x{:x} entries={}", iplt_got_addr, iplt_got_count);
-            eprintln!("  RELA.IPLT addr=0x{:x}..0x{:x}", rela_iplt_addr, rela_iplt_end_addr);
+            eprintln!(
+                "  IPLT GOT addr=0x{:x} entries={}",
+                iplt_got_addr, iplt_got_count
+            );
+            eprintln!(
+                "  RELA.IPLT addr=0x{:x}..0x{:x}",
+                rela_iplt_addr, rela_iplt_end_addr
+            );
             eprintln!("  IPLT stubs addr=0x{:x}", iplt_stub_addr);
         }
         eprintln!("  BSS addr=0x{:x} size=0x{:x}", bss_addr, bss_size);
@@ -311,7 +365,9 @@ pub(super) fn emit_executable(
 
     // Merge section data
     for sec in output_sections.iter_mut() {
-        if sec.sh_type == SHT_NOBITS { continue; }
+        if sec.sh_type == SHT_NOBITS {
+            continue;
+        }
         let mut data = vec![0u8; sec.mem_size as usize];
         for input in &sec.inputs {
             let sd = &objects[input.object_idx].section_data[input.section_idx];
@@ -327,7 +383,9 @@ pub(super) fn emit_executable(
     // Update global symbol addresses
     for (name, gsym) in globals.iter_mut() {
         if let Some(obj_idx) = gsym.defined_in {
-            if obj_idx == usize::MAX { continue; } // linker-defined
+            if obj_idx == usize::MAX {
+                continue;
+            } // linker-defined
             if gsym.section_idx == SHN_COMMON || gsym.section_idx == 0xffff {
                 if let Some(bss_sec) = output_sections.iter().find(|s| s.name == ".bss") {
                     gsym.value += bss_sec.addr;
@@ -349,7 +407,8 @@ pub(super) fn emit_executable(
     }
 
     // Build IFUNC resolver address map (now that addresses are resolved)
-    let ifunc_syms: Vec<(String, u64)> = ifunc_names.iter()
+    let ifunc_syms: Vec<(String, u64)> = ifunc_names
+        .iter()
         .map(|name| {
             let resolver_addr = globals.get(name).map(|g| g.value).unwrap_or(0);
             (name.clone(), resolver_addr)
@@ -368,19 +427,48 @@ pub(super) fn emit_executable(
 
     if std::env::var("LINKER_DEBUG").is_ok() && !ifunc_syms.is_empty() {
         for (i, (name, resolver)) in ifunc_syms.iter().enumerate() {
-            eprintln!("  IFUNC[{}]: {} resolver=0x{:x} plt=0x{:x} got=0x{:x}",
-                      i, name, resolver, iplt_stub_addr + i as u64 * 16,
-                      iplt_got_addr + i as u64 * 8);
+            eprintln!(
+                "  IFUNC[{}]: {} resolver=0x{:x} plt=0x{:x} got=0x{:x}",
+                i,
+                name,
+                resolver,
+                iplt_stub_addr + i as u64 * 16,
+                iplt_got_addr + i as u64 * 8
+            );
         }
     }
 
     // Compute init/fini array boundaries
-    let init_array_start = output_sections.iter().find(|s| s.name == ".init_array").map(|s| s.addr).unwrap_or(0);
-    let init_array_end = output_sections.iter().find(|s| s.name == ".init_array").map(|s| s.addr + s.mem_size).unwrap_or(0);
-    let fini_array_start = output_sections.iter().find(|s| s.name == ".fini_array").map(|s| s.addr).unwrap_or(0);
-    let fini_array_end = output_sections.iter().find(|s| s.name == ".fini_array").map(|s| s.addr + s.mem_size).unwrap_or(0);
-    let init_addr = output_sections.iter().find(|s| s.name == ".init").map(|s| s.addr).unwrap_or(0);
-    let fini_addr = output_sections.iter().find(|s| s.name == ".fini").map(|s| s.addr).unwrap_or(0);
+    let init_array_start = output_sections
+        .iter()
+        .find(|s| s.name == ".init_array")
+        .map(|s| s.addr)
+        .unwrap_or(0);
+    let init_array_end = output_sections
+        .iter()
+        .find(|s| s.name == ".init_array")
+        .map(|s| s.addr + s.mem_size)
+        .unwrap_or(0);
+    let fini_array_start = output_sections
+        .iter()
+        .find(|s| s.name == ".fini_array")
+        .map(|s| s.addr)
+        .unwrap_or(0);
+    let fini_array_end = output_sections
+        .iter()
+        .find(|s| s.name == ".fini_array")
+        .map(|s| s.addr + s.mem_size)
+        .unwrap_or(0);
+    let init_addr = output_sections
+        .iter()
+        .find(|s| s.name == ".init")
+        .map(|s| s.addr)
+        .unwrap_or(0);
+    let fini_addr = output_sections
+        .iter()
+        .find(|s| s.name == ".fini")
+        .map(|s| s.addr)
+        .unwrap_or(0);
 
     // Define linker-provided symbols using shared infrastructure (consistent
     // with x86-64/i686/RISC-V via get_standard_linker_symbols)
@@ -403,25 +491,53 @@ pub(super) fn emit_executable(
         rela_iplt_size,
     };
     for sym in &get_standard_linker_symbols(&linker_addrs) {
-        if globals.get(sym.name).map(|g| g.defined_in.is_none()).unwrap_or(true) {
-            globals.insert(sym.name.to_string(), GlobalSymbol {
-                value: sym.value, size: 0, info: (sym.binding << 4) | STT_OBJECT,
-                defined_in: Some(usize::MAX), section_idx: SHN_ABS,
-                from_lib: None, plt_idx: None, got_idx: None,
-                is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
-            });
+        if globals
+            .get(sym.name)
+            .map(|g| g.defined_in.is_none())
+            .unwrap_or(true)
+        {
+            globals.insert(
+                sym.name.to_string(),
+                GlobalSymbol {
+                    value: sym.value,
+                    size: 0,
+                    info: (sym.binding << 4) | STT_OBJECT,
+                    defined_in: Some(usize::MAX),
+                    section_idx: SHN_ABS,
+                    from_lib: None,
+                    plt_idx: None,
+                    got_idx: None,
+                    is_dynamic: false,
+                    copy_reloc: false,
+                    lib_sym_value: 0,
+                },
+            );
         }
     }
 
     // Auto-generate __start_<section> / __stop_<section> symbols (GNU ld feature)
     for (name, addr) in linker_common::resolve_start_stop_symbols(output_sections) {
-        if globals.get(&name).map(|g| g.defined_in.is_none()).unwrap_or(false) {
-            globals.insert(name, GlobalSymbol {
-                value: addr, size: 0, info: (STB_GLOBAL << 4),
-                defined_in: Some(usize::MAX), section_idx: SHN_ABS,
-                from_lib: None, plt_idx: None, got_idx: None,
-                is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
-            });
+        if globals
+            .get(&name)
+            .map(|g| g.defined_in.is_none())
+            .unwrap_or(false)
+        {
+            globals.insert(
+                name,
+                GlobalSymbol {
+                    value: addr,
+                    size: 0,
+                    info: (STB_GLOBAL << 4),
+                    defined_in: Some(usize::MAX),
+                    section_idx: SHN_ABS,
+                    from_lib: None,
+                    plt_idx: None,
+                    got_idx: None,
+                    is_dynamic: false,
+                    copy_reloc: false,
+                    lib_sym_value: 0,
+                },
+            );
         }
     }
     // ARM-specific linker symbols not in the shared list
@@ -431,22 +547,42 @@ pub(super) fn emit_executable(
         ("_fini", fini_addr),
     ];
     for (name, val) in &arm_extra_syms {
-        if globals.get(*name).map(|g| g.defined_in.is_none()).unwrap_or(true) {
-            globals.insert(name.to_string(), GlobalSymbol {
-                value: *val, size: 0, info: (STB_GLOBAL << 4) | STT_OBJECT,
-                defined_in: Some(usize::MAX), section_idx: SHN_ABS,
-                from_lib: None, plt_idx: None, got_idx: None,
-                is_dynamic: false, copy_reloc: false, lib_sym_value: 0,
-            });
+        if globals
+            .get(*name)
+            .map(|g| g.defined_in.is_none())
+            .unwrap_or(true)
+        {
+            globals.insert(
+                name.to_string(),
+                GlobalSymbol {
+                    value: *val,
+                    size: 0,
+                    info: (STB_GLOBAL << 4) | STT_OBJECT,
+                    defined_in: Some(usize::MAX),
+                    section_idx: SHN_ABS,
+                    from_lib: None,
+                    plt_idx: None,
+                    got_idx: None,
+                    is_dynamic: false,
+                    copy_reloc: false,
+                    lib_sym_value: 0,
+                },
+            );
         }
     }
 
     let entry_addr = globals.get("_start").map(|s| s.value).unwrap_or(BASE_ADDR);
 
     if std::env::var("LINKER_DEBUG").is_ok() {
-        if let Some(g) = globals.get("main") { eprintln!("  main resolved to 0x{:x}", g.value); }
-        if let Some(g) = globals.get("_start") { eprintln!("  _start resolved to 0x{:x}", g.value); }
-        if let Some(g) = globals.get("__libc_start_main") { eprintln!("  __libc_start_main resolved to 0x{:x}", g.value); }
+        if let Some(g) = globals.get("main") {
+            eprintln!("  main resolved to 0x{:x}", g.value);
+        }
+        if let Some(g) = globals.get("_start") {
+            eprintln!("  _start resolved to 0x{:x}", g.value);
+        }
+        if let Some(g) = globals.get("__libc_start_main") {
+            eprintln!("  __libc_start_main resolved to 0x{:x}", g.value);
+        }
         eprintln!("  entry_addr = 0x{:x}", entry_addr);
     }
 
@@ -456,7 +592,9 @@ pub(super) fn emit_executable(
 
     // Write section data
     for sec in output_sections.iter() {
-        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() { continue; }
+        if sec.sh_type == SHT_NOBITS || sec.data.is_empty() {
+            continue;
+        }
         write_bytes(&mut out, sec.file_offset as usize, &sec.data);
     }
 
@@ -464,8 +602,12 @@ pub(super) fn emit_executable(
     // We re-walk the relocations to resolve each symbol (including locals)
     // rather than only looking up global symbol names.
     let globals_snap = globals.clone();
-    let got_info = reloc::GotInfo { got_addr, entries: got_entries };
-    let got_kind_map: FxHashMap<String, reloc::GotEntryKind> = got_syms.iter()
+    let got_info = reloc::GotInfo {
+        got_addr,
+        entries: got_entries,
+    };
+    let got_kind_map: FxHashMap<String, reloc::GotEntryKind> = got_syms
+        .iter()
         .map(|(k, kind)| (k.clone(), *kind))
         .collect();
     // Build a resolved address map for GOT entries by walking relocations
@@ -474,16 +616,22 @@ pub(super) fn emit_executable(
         for sec_idx in 0..objects[obj_idx].sections.len() {
             for rela in &objects[obj_idx].relocations[sec_idx] {
                 match rela.rela_type {
-                    R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC |
-                    reloc::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 | reloc::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => {
+                    R_AARCH64_ADR_GOT_PAGE
+                    | R_AARCH64_LD64_GOT_LO12_NC
+                    | reloc::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21
+                    | reloc::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => {
                         let si = rela.sym_idx as usize;
                         if si < objects[obj_idx].symbols.len() {
                             let sym = &objects[obj_idx].symbols[si];
                             let key = reloc::got_key(obj_idx, sym);
                             got_resolved.entry(key).or_insert_with(|| {
-                                
-                                reloc::resolve_sym(obj_idx, sym, &globals_snap,
-                                                              section_map, output_sections)
+                                reloc::resolve_sym(
+                                    obj_idx,
+                                    sym,
+                                    &globals_snap,
+                                    section_map,
+                                    output_sections,
+                                )
                             });
                         }
                     }
@@ -530,9 +678,9 @@ pub(super) fn emit_executable(
         let rela_off = rela_iplt_offset as usize + i * 24;
         let got_slot_addr = iplt_got_addr + i as u64 * 8;
         if rela_off + 24 <= out.len() {
-            w64(&mut out, rela_off, got_slot_addr);        // r_offset: GOT slot VA
-            w64(&mut out, rela_off + 8, 0x408);            // r_info: R_AARCH64_IRELATIVE
-            w64(&mut out, rela_off + 16, *resolver_addr);  // r_addend: resolver VA
+            w64(&mut out, rela_off, got_slot_addr); // r_offset: GOT slot VA
+            w64(&mut out, rela_off + 8, 0x408); // r_info: R_AARCH64_IRELATIVE
+            w64(&mut out, rela_off + 16, *resolver_addr); // r_addend: resolver VA
         }
 
         // PLT stub: ADRP x16, got_page; LDR x17, [x16, #got_lo]; BR x17; NOP
@@ -562,9 +710,19 @@ pub(super) fn emit_executable(
     }
 
     // Apply relocations
-    let tls_info = reloc::TlsInfo { tls_addr, tls_size: tls_mem_size };
-    reloc::apply_relocations(objects, &globals_snap, output_sections, section_map,
-                             &mut out, &tls_info, &got_info)?;
+    let tls_info = reloc::TlsInfo {
+        tls_addr,
+        tls_size: tls_mem_size,
+    };
+    reloc::apply_relocations(
+        objects,
+        &globals_snap,
+        output_sections,
+        section_map,
+        &mut out,
+        &tls_info,
+        &got_info,
+    )?;
 
     // Build .eh_frame_hdr from relocated .eh_frame data and write it
     if eh_frame_hdr_size > 0 && eh_frame_size > 0 {
@@ -587,41 +745,74 @@ pub(super) fn emit_executable(
 
     // === ELF header ===
     out[0..4].copy_from_slice(&ELF_MAGIC);
-    out[4] = ELFCLASS64; out[5] = ELFDATA2LSB; out[6] = 1;
+    out[4] = ELFCLASS64;
+    out[5] = ELFDATA2LSB;
+    out[6] = 1;
     out[7] = 3; // ELFOSABI_GNU (matches ld output for static exes)
     w16(&mut out, 16, ET_EXEC);
     w16(&mut out, 18, EM_AARCH64);
     w32(&mut out, 20, 1);
     w64(&mut out, 24, entry_addr);
     w64(&mut out, 32, 64); // e_phoff
-    w64(&mut out, 40, 0);  // e_shoff
-    w32(&mut out, 48, 0);  // e_flags
+    w64(&mut out, 40, 0); // e_shoff
+    w32(&mut out, 48, 0); // e_flags
     w16(&mut out, 52, 64); // e_ehsize
     w16(&mut out, 54, 56); // e_phentsize
     w16(&mut out, 56, phdr_count as u16);
     w16(&mut out, 58, 64); // e_shentsize
-    w16(&mut out, 60, 0);  // e_shnum
-    w16(&mut out, 62, 0);  // e_shstrndx
+    w16(&mut out, 60, 0); // e_shnum
+    w16(&mut out, 62, 0); // e_shstrndx
 
     // === Program headers ===
     let mut ph = 64usize;
 
     // LOAD: RX segment starting from file offset 0 (includes ELF header + PLT stubs)
-    let rx_actual_filesz = if iplt_stub_size > 0 { iplt_stub_file_off + iplt_stub_size } else { rx_filesz };
+    let rx_actual_filesz = if iplt_stub_size > 0 {
+        iplt_stub_file_off + iplt_stub_size
+    } else {
+        rx_filesz
+    };
     let rx_actual_memsz = rx_actual_filesz;
-    wphdr(&mut out, ph, PT_LOAD, PF_R | PF_X,
-          0, BASE_ADDR, rx_actual_filesz, rx_actual_memsz, PAGE_SIZE);
+    wphdr(
+        &mut out,
+        ph,
+        PT_LOAD,
+        PF_R | PF_X,
+        0,
+        BASE_ADDR,
+        rx_actual_filesz,
+        rx_actual_memsz,
+        PAGE_SIZE,
+    );
     ph += 56;
 
     // LOAD: RW segment
-    wphdr(&mut out, ph, PT_LOAD, PF_R | PF_W,
-          rw_page_offset, rw_page_addr, rw_filesz, rw_memsz, PAGE_SIZE);
+    wphdr(
+        &mut out,
+        ph,
+        PT_LOAD,
+        PF_R | PF_W,
+        rw_page_offset,
+        rw_page_addr,
+        rw_filesz,
+        rw_memsz,
+        PAGE_SIZE,
+    );
     ph += 56;
 
     // TLS segment
     if has_tls && tls_addr != 0 {
-        wphdr(&mut out, ph, PT_TLS, PF_R,
-              tls_file_offset, tls_addr, tls_file_size, tls_mem_size, tls_align);
+        wphdr(
+            &mut out,
+            ph,
+            PT_TLS,
+            PF_R,
+            tls_file_offset,
+            tls_addr,
+            tls_file_size,
+            tls_mem_size,
+            tls_align,
+        );
         ph += 56;
     }
 
@@ -630,11 +821,21 @@ pub(super) fn emit_executable(
     ph += 56;
 
     // PT_GNU_EH_FRAME: points to .eh_frame_hdr for stack unwinding
-    wphdr(&mut out, ph, PT_GNU_EH_FRAME, PF_R,
-          eh_frame_hdr_offset, eh_frame_hdr_vaddr, eh_frame_hdr_size, eh_frame_hdr_size, 4);
+    wphdr(
+        &mut out,
+        ph,
+        PT_GNU_EH_FRAME,
+        PF_R,
+        eh_frame_hdr_offset,
+        eh_frame_hdr_vaddr,
+        eh_frame_hdr_size,
+        eh_frame_hdr_size,
+        4,
+    );
 
     // Write output
-    std::fs::write(output_path, &out).map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
+    std::fs::write(output_path, &out)
+        .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -642,4 +843,3 @@ pub(super) fn emit_executable(
     }
     Ok(())
 }
-

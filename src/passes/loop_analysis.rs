@@ -544,10 +544,7 @@ pub fn merge_loops_by_header(loops: Vec<NaturalLoop>) -> Vec<NaturalLoop> {
 
     let mut header_map: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
     for nl in loops {
-        header_map
-            .entry(nl.header)
-            .or_default()
-            .extend(nl.body);
+        header_map.entry(nl.header).or_default().extend(nl.body);
     }
 
     let mut headers: Vec<usize> = header_map.keys().copied().collect();
@@ -984,7 +981,10 @@ mod tests {
         assert_eq!(loops[0].body, [1usize, 2].into_iter().collect());
 
         assert_eq!(find_preheader(1, &loops[0].body, &preds), Some(0));
-        assert_eq!(find_dedicated_preheader(1, &loops[0].body, &preds, &succs), Some(0));
+        assert_eq!(
+            find_dedicated_preheader(1, &loops[0].body, &preds, &succs),
+            Some(0)
+        );
 
         assert_eq!(loops[0].latches(&preds), vec![2]);
         assert_eq!(loops[0].single_latch(&preds), Some(2));
@@ -1039,12 +1039,10 @@ mod tests {
     fn nested_loop_body_and_subloop() {
         // 0 -> 1(outer hdr) -> 2(inner hdr) -> 3 -> 2 (inner backedge),
         // 3 -> 4, 4 -> 1 (outer backedge), 4 -> 5 (exit)
-        let succs = FlatAdj::from_vecs_usize(&[
-            vec![1], vec![2], vec![3], vec![2, 4], vec![1, 5], vec![],
-        ]);
-        let preds = FlatAdj::from_vecs_usize(&[
-            vec![], vec![0, 4], vec![1, 3], vec![2], vec![3], vec![4],
-        ]);
+        let succs =
+            FlatAdj::from_vecs_usize(&[vec![1], vec![2], vec![3], vec![2, 4], vec![1, 5], vec![]]);
+        let preds =
+            FlatAdj::from_vecs_usize(&[vec![], vec![0, 4], vec![1, 3], vec![2], vec![3], vec![4]]);
         let idom = vec![0usize, 0, 1, 2, 3, 4];
 
         let loops = find_merged_natural_loops(6, &preds, &succs, &idom);
@@ -1061,9 +1059,18 @@ mod tests {
     #[test]
     fn loop_nest_hierarchy() {
         // Synthetic loop set: outer A {2,3,4} > inner A {3,4}; sibling B {6,7}.
-        let l_outer_a = NaturalLoop { header: 2, body: [2usize, 3, 4].into_iter().collect() };
-        let l_inner_a = NaturalLoop { header: 3, body: [3usize, 4].into_iter().collect() };
-        let l_loop_b = NaturalLoop { header: 6, body: [6usize, 7].into_iter().collect() };
+        let l_outer_a = NaturalLoop {
+            header: 2,
+            body: [2usize, 3, 4].into_iter().collect(),
+        };
+        let l_inner_a = NaturalLoop {
+            header: 3,
+            body: [3usize, 4].into_iter().collect(),
+        };
+        let l_loop_b = NaturalLoop {
+            header: 6,
+            body: [6usize, 7].into_iter().collect(),
+        };
 
         let loops = vec![l_outer_a, l_inner_a, l_loop_b];
         let nest = LoopNest::analyze(9, &loops);
@@ -1097,11 +1104,13 @@ mod tests {
     #[test]
     fn loop_rpo_traversal() {
         // Loop with internal diamond: 1 -> {2,3} -> 4 -> 1, exit 4 -> 5
-        let succs = FlatAdj::from_vecs_usize(&[
-            vec![1], vec![2, 3], vec![4], vec![4], vec![1, 5], vec![],
-        ]);
+        let succs =
+            FlatAdj::from_vecs_usize(&[vec![1], vec![2, 3], vec![4], vec![4], vec![1, 5], vec![]]);
 
-        let l = NaturalLoop { header: 1, body: [1usize, 2, 3, 4].into_iter().collect() };
+        let l = NaturalLoop {
+            header: 1,
+            body: [1usize, 2, 3, 4].into_iter().collect(),
+        };
         let rpo = l.blocks_in_rpo(&succs);
         assert_eq!(rpo.len(), 4);
         assert_eq!(rpo[0], 1, "header must come first in RPO");
@@ -1136,6 +1145,9 @@ mod tests {
         let preds = FlatAdj::from_vecs_usize(&[vec![], vec![0, 2], vec![0, 1]]);
         let idom = vec![0usize, 0, 0];
         let loops2 = find_natural_loops(3, &preds, &succs, &idom);
-        assert!(loops2.is_empty(), "irreducible cycles must not be reported as natural loops");
+        assert!(
+            loops2.is_empty(),
+            "irreducible cycles must not be reported as natural loops"
+        );
     }
 }

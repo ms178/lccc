@@ -11,12 +11,14 @@
 use super::types::*;
 
 /// Read dynamic symbol info, with library search paths for resolving linker script entries.
-pub(super) fn read_dynsyms_with_search(path: &str, lib_search_paths: &[&str]) -> Result<Vec<DynSymInfo>, String> {
+pub(super) fn read_dynsyms_with_search(
+    path: &str,
+    lib_search_paths: &[&str],
+) -> Result<Vec<DynSymInfo>, String> {
     const LOCAL_SHT_GNU_VERSYM: u32 = 0x6fffffff;
     const SHT_GNU_VERDEF: u32 = 0x6ffffffd;
 
-    let data = std::fs::read(path)
-        .map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
     if data.len() < 52 || data[0..4] != ELF_MAGIC || data[4] != ELFCLASS32 {
         // Check if this is a linker script
         if let Ok(text) = std::str::from_utf8(&data) {
@@ -42,10 +44,14 @@ pub(super) fn read_dynsyms_with_search(path: &str, lib_search_paths: &[&str]) ->
 
     for i in 0..e_shnum {
         let off = e_shoff + i * e_shentsize;
-        if off + 40 > data.len() { break; }
+        if off + 40 > data.len() {
+            break;
+        }
         let sh_type = read_u32(&data, off + 4);
         match sh_type {
-            SHT_DYNSYM => { dynsym_idx = Some(i); }
+            SHT_DYNSYM => {
+                dynsym_idx = Some(i);
+            }
             LOCAL_SHT_GNU_VERSYM => {
                 let sh_offset = read_u32(&data, off + 16) as usize;
                 let sh_size = read_u32(&data, off + 20) as usize;
@@ -71,42 +77,59 @@ pub(super) fn read_dynsyms_with_search(path: &str, lib_search_paths: &[&str]) ->
 
     // Read dynsym section
     let off = e_shoff + dynsym_i * e_shentsize;
-    if off + 40 > data.len() { return Ok(Vec::new()); }
+    if off + 40 > data.len() {
+        return Ok(Vec::new());
+    }
 
     let sh_offset = read_u32(&data, off + 16) as usize;
     let sh_size = read_u32(&data, off + 20) as usize;
     let sh_link = read_u32(&data, off + 24) as usize;
     let sh_entsize = read_u32(&data, off + 36) as usize;
-    if sh_entsize == 0 { return Ok(Vec::new()); }
+    if sh_entsize == 0 {
+        return Ok(Vec::new());
+    }
 
     // Get the string table
     let str_off = e_shoff + sh_link * e_shentsize;
-    if str_off + 40 > data.len() { return Ok(Vec::new()); }
+    if str_off + 40 > data.len() {
+        return Ok(Vec::new());
+    }
     let str_sh_offset = read_u32(&data, str_off + 16) as usize;
     let str_sh_size = read_u32(&data, str_off + 20) as usize;
-    if str_sh_offset + str_sh_size > data.len() { return Ok(Vec::new()); }
+    if str_sh_offset + str_sh_size > data.len() {
+        return Ok(Vec::new());
+    }
     let strtab = &data[str_sh_offset..str_sh_offset + str_sh_size];
 
     let count = sh_size / sh_entsize;
     let mut syms = Vec::new();
     for j in 0..count {
         let sym_off = sh_offset + j * sh_entsize;
-        if sym_off + 16 > data.len() { break; }
+        if sym_off + 16 > data.len() {
+            break;
+        }
         let st_name = read_u32(&data, sym_off) as usize;
         let st_size = read_u32(&data, sym_off + 8);
         let st_info = data[sym_off + 12];
         let st_shndx = read_u16(&data, sym_off + 14);
 
-        if st_shndx == SHN_UNDEF { continue; }
+        if st_shndx == SHN_UNDEF {
+            continue;
+        }
         let binding = st_info >> 4;
-        if binding != STB_GLOBAL && binding != STB_WEAK { continue; }
+        if binding != STB_GLOBAL && binding != STB_WEAK {
+            continue;
+        }
 
         // Look up version for this symbol
         let (version, is_default_ver) = lookup_version(j, versym_shdr, &ver_names, &data);
 
         if st_name < strtab.len() {
-            let end = strtab[st_name..].iter().position(|&b| b == 0)
-                .map(|p| st_name + p).unwrap_or(strtab.len());
+            let end = strtab[st_name..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| st_name + p)
+                .unwrap_or(strtab.len());
             let name = String::from_utf8_lossy(&strtab[st_name..end]).into_owned();
             if !name.is_empty() {
                 syms.push(DynSymInfo {
@@ -143,7 +166,11 @@ fn parse_verdef(
     let vd_strtab = if vd_str_hdr + 40 <= data.len() {
         let s_off = read_u32(data, vd_str_hdr + 16) as usize;
         let s_sz = read_u32(data, vd_str_hdr + 20) as usize;
-        if s_off + s_sz <= data.len() { &data[s_off..s_off + s_sz] } else { return ver_names; }
+        if s_off + s_sz <= data.len() {
+            &data[s_off..s_off + s_sz]
+        } else {
+            return ver_names;
+        }
     } else {
         return ver_names;
     };
@@ -167,7 +194,9 @@ fn parse_verdef(
             }
         }
 
-        if vd_next == 0 { break; }
+        if vd_next == 0 {
+            break;
+        }
         pos += vd_next;
     }
 
@@ -206,7 +235,8 @@ fn resolve_linker_script_syms(
     entries: &[LinkerScriptEntry],
     lib_search_paths: &[&str],
 ) -> Result<Vec<DynSymInfo>, String> {
-    let script_dir = std::path::Path::new(path).parent()
+    let script_dir = std::path::Path::new(path)
+        .parent()
         .map(|p| p.to_string_lossy().to_string());
     let mut all_syms = Vec::new();
     for entry in entries {
@@ -214,11 +244,10 @@ fn resolve_linker_script_syms(
             LinkerScriptEntry::Path(lib_path) => {
                 resolve_script_path(lib_path, script_dir.as_deref(), lib_search_paths)
             }
-            LinkerScriptEntry::Lib(lib_name) => {
-                lib_search_paths.iter()
-                    .map(|dir| format!("{}/lib{}.so", dir, lib_name))
-                    .find(|p| std::path::Path::new(p).exists())
-            }
+            LinkerScriptEntry::Lib(lib_name) => lib_search_paths
+                .iter()
+                .map(|dir| format!("{}/lib{}.so", dir, lib_name))
+                .find(|p| std::path::Path::new(p).exists()),
         };
         if let Some(resolved_path) = resolved {
             if let Ok(syms) = read_dynsyms_with_search(&resolved_path, lib_search_paths) {
@@ -229,7 +258,10 @@ fn resolve_linker_script_syms(
     if !all_syms.is_empty() {
         Ok(all_syms)
     } else {
-        Err(format!("{}: linker script but no resolvable libraries found", path))
+        Err(format!(
+            "{}: linker script but no resolvable libraries found",
+            path
+        ))
     }
 }
 
@@ -242,30 +274,41 @@ pub(super) fn parse_soname_elf32(path: &str) -> Option<String> {
         return None;
     }
     let e_type = read_u16(&data, 16);
-    if e_type != ET_DYN { return None; }
+    if e_type != ET_DYN {
+        return None;
+    }
 
     let e_shoff = read_u32(&data, 32) as usize;
     let e_shentsize = read_u16(&data, 46) as usize;
     let e_shnum = read_u16(&data, 48) as usize;
 
-    if e_shoff == 0 || e_shnum == 0 { return None; }
+    if e_shoff == 0 || e_shnum == 0 {
+        return None;
+    }
 
     // Find .dynamic section
     for i in 0..e_shnum {
         let off = e_shoff + i * e_shentsize;
-        if off + 40 > data.len() { break; }
+        if off + 40 > data.len() {
+            break;
+        }
         let sh_type = read_u32(&data, off + 4);
-        if sh_type == 6 { // SHT_DYNAMIC
+        if sh_type == 6 {
+            // SHT_DYNAMIC
             let dyn_off = read_u32(&data, off + 16) as usize;
             let dyn_size = read_u32(&data, off + 20) as usize;
             let link = read_u32(&data, off + 24) as usize;
 
             // Get linked string table
             let str_sec_off = e_shoff + link * e_shentsize;
-            if str_sec_off + 40 > data.len() { return None; }
+            if str_sec_off + 40 > data.len() {
+                return None;
+            }
             let str_off = read_u32(&data, str_sec_off + 16) as usize;
             let str_size = read_u32(&data, str_sec_off + 20) as usize;
-            if str_off + str_size > data.len() { return None; }
+            if str_off + str_size > data.len() {
+                return None;
+            }
             let strtab = &data[str_off..str_off + str_size];
 
             // Scan .dynamic entries for DT_SONAME (tag = 14)
@@ -273,8 +316,11 @@ pub(super) fn parse_soname_elf32(path: &str) -> Option<String> {
             while pos + 8 <= dyn_off + dyn_size && pos + 8 <= data.len() {
                 let tag = read_i32(&data, pos);
                 let val = read_u32(&data, pos + 4) as usize;
-                if tag == 0 { break; } // DT_NULL
-                if tag == 14 { // DT_SONAME
+                if tag == 0 {
+                    break;
+                } // DT_NULL
+                if tag == 14 {
+                    // DT_SONAME
                     return Some(read_cstr(strtab, val));
                 }
                 pos += 8;

@@ -5,13 +5,19 @@ use super::*;
 // c.lui rd, nzimm
 pub(crate) fn encode_c_lui(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
-    if rd == 0 || rd == 2 { return Err("c.lui: rd cannot be x0 or x2".into()); }
+    if rd == 0 || rd == 2 {
+        return Err("c.lui: rd cannot be x0 or x2".into());
+    }
     let imm = get_imm(operands, 1)?;
     let nzimm = imm as i32;
-    if nzimm == 0 { return Err("c.lui: nzimm must not be zero".into()); }
+    if nzimm == 0 {
+        return Err("c.lui: nzimm must not be zero".into());
+    }
     let bit17 = ((nzimm >> 5) & 1) as u16;
     let bits16_12 = (nzimm & 0x1F) as u16;
-    Ok(EncodeResult::Half(0b01 | ((bits16_12 & 0x1F) << 2) | ((rd as u16) << 7) | (bit17 << 12) | (0b011 << 13)))
+    Ok(EncodeResult::Half(
+        0b01 | ((bits16_12 & 0x1F) << 2) | ((rd as u16) << 7) | (bit17 << 12) | (0b011 << 13),
+    ))
 }
 
 // c.li rd, imm
@@ -20,7 +26,9 @@ pub(crate) fn encode_c_li(operands: &[Operand]) -> Result<EncodeResult, String> 
     let imm = get_imm(operands, 1)? as i32;
     let bit5 = ((imm >> 5) & 1) as u16;
     let bits4_0 = (imm & 0x1F) as u16;
-    Ok(EncodeResult::Half(0b01 | (bits4_0 << 2) | ((rd as u16) << 7) | (bit5 << 12) | (0b010 << 13)))
+    Ok(EncodeResult::Half(
+        0b01 | (bits4_0 << 2) | ((rd as u16) << 7) | (bit5 << 12) | (0b010 << 13),
+    ))
 }
 
 // c.addi rd, nzimm
@@ -29,33 +37,43 @@ pub(crate) fn encode_c_addi(operands: &[Operand]) -> Result<EncodeResult, String
     let imm = get_imm(operands, 1)? as i32;
     let bit5 = ((imm >> 5) & 1) as u16;
     let bits4_0 = (imm & 0x1F) as u16;
-    Ok(EncodeResult::Half(0b01 | (bits4_0 << 2) | ((rd as u16) << 7) | (bit5 << 12)))
+    Ok(EncodeResult::Half(
+        0b01 | (bits4_0 << 2) | ((rd as u16) << 7) | (bit5 << 12),
+    ))
 }
 
 // c.mv rd, rs2
 pub(crate) fn encode_c_mv(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Half(0b10 | ((rs2 as u16) << 2) | ((rd as u16) << 7) | (0b100 << 13)))
+    Ok(EncodeResult::Half(
+        0b10 | ((rs2 as u16) << 2) | ((rd as u16) << 7) | (0b100 << 13),
+    ))
 }
 
 // c.add rd, rs2
 pub(crate) fn encode_c_add(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs2 = get_reg(operands, 1)?;
-    Ok(EncodeResult::Half(0b10 | ((rs2 as u16) << 2) | ((rd as u16) << 7) | (1 << 12) | (0b100 << 13)))
+    Ok(EncodeResult::Half(
+        0b10 | ((rs2 as u16) << 2) | ((rd as u16) << 7) | (1 << 12) | (0b100 << 13),
+    ))
 }
 
 // c.jr rs1
 pub(crate) fn encode_c_jr(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rs1 = get_reg(operands, 0)?;
-    Ok(EncodeResult::Half(0b10 | ((rs1 as u16) << 7) | (0b100 << 13)))
+    Ok(EncodeResult::Half(
+        0b10 | ((rs1 as u16) << 7) | (0b100 << 13),
+    ))
 }
 
 // c.jalr rs1
 pub(crate) fn encode_c_jalr(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rs1 = get_reg(operands, 0)?;
-    Ok(EncodeResult::Half(0b10 | ((rs1 as u16) << 7) | (1 << 12) | (0b100 << 13)))
+    Ok(EncodeResult::Half(
+        0b10 | ((rs1 as u16) << 7) | (1 << 12) | (0b100 << 13),
+    ))
 }
 
 // ── .insn directive encoder ──
@@ -66,7 +84,9 @@ pub fn encode_insn_directive(args: &str) -> Result<EncodeResult, String> {
 
     // Parse the format: .insn <format> <opcode>, <funct3>, <rd>, <rs1>, <imm>
     // or .insn <format> <opcode>, <funct3>, <funct7>, <rd>, <rs1>, <rs2>
-    let parts: Vec<&str> = args.splitn(2, |c: char| c.is_whitespace() || c == ',').collect();
+    let parts: Vec<&str> = args
+        .splitn(2, |c: char| c.is_whitespace() || c == ',')
+        .collect();
     if parts.is_empty() {
         return Err("empty .insn directive".into());
     }
@@ -74,8 +94,16 @@ pub fn encode_insn_directive(args: &str) -> Result<EncodeResult, String> {
     let format = parts[0].trim().to_lowercase();
 
     // Get remaining args after the format keyword
-    let rest = if parts.len() > 1 { parts[1].trim_start_matches(',').trim() } else { "" };
-    let fields: Vec<&str> = rest.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let rest = if parts.len() > 1 {
+        parts[1].trim_start_matches(',').trim()
+    } else {
+        ""
+    };
+    let fields: Vec<&str> = rest
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     match format.as_str() {
         "r" => encode_insn_r(&fields),
@@ -103,7 +131,8 @@ pub(crate) fn parse_insn_int(s: &str) -> Result<i64, String> {
     } else if s.starts_with("0b") || s.starts_with("0B") {
         i64::from_str_radix(&s[2..], 2).map_err(|e| format!("invalid bin in .insn: {}: {}", s, e))
     } else {
-        s.parse::<i64>().map_err(|e| format!("invalid int in .insn: {}: {}", s, e))
+        s.parse::<i64>()
+            .map_err(|e| format!("invalid int in .insn: {}: {}", s, e))
     }
 }
 
@@ -115,7 +144,10 @@ pub(crate) fn parse_insn_reg(s: &str) -> Result<u32, String> {
 pub(crate) fn encode_insn_r(fields: &[&str]) -> Result<EncodeResult, String> {
     // .insn r opcode, funct3, funct7, rd, rs1, rs2
     if fields.len() < 6 {
-        return Err(format!(".insn r requires 6 fields (opcode, funct3, funct7, rd, rs1, rs2), got {}", fields.len()));
+        return Err(format!(
+            ".insn r requires 6 fields (opcode, funct3, funct7, rd, rs1, rs2), got {}",
+            fields.len()
+        ));
     }
     let opcode = parse_insn_int(fields[0])? as u32;
     let funct3 = parse_insn_int(fields[1])? as u32;
@@ -123,13 +155,18 @@ pub(crate) fn encode_insn_r(fields: &[&str]) -> Result<EncodeResult, String> {
     let rd = parse_insn_reg(fields[3])?;
     let rs1 = parse_insn_reg(fields[4])?;
     let rs2 = parse_insn_reg(fields[5])?;
-    Ok(EncodeResult::Word(encode_r(opcode, rd, funct3, rs1, rs2, funct7)))
+    Ok(EncodeResult::Word(encode_r(
+        opcode, rd, funct3, rs1, rs2, funct7,
+    )))
 }
 
 pub(crate) fn encode_insn_i(fields: &[&str]) -> Result<EncodeResult, String> {
     // .insn i opcode, funct3, rd, rs1, imm
     if fields.len() < 5 {
-        return Err(format!(".insn i requires 5 fields (opcode, funct3, rd, rs1, imm), got {}", fields.len()));
+        return Err(format!(
+            ".insn i requires 5 fields (opcode, funct3, rd, rs1, imm), got {}",
+            fields.len()
+        ));
     }
     let opcode = parse_insn_int(fields[0])? as u32;
     let funct3 = parse_insn_int(fields[1])? as u32;
@@ -151,7 +188,7 @@ pub(crate) fn encode_insn_s(fields: &[&str]) -> Result<EncodeResult, String> {
     let last = fields[3].trim();
     if let Some(paren_pos) = last.find('(') {
         let imm_str = &last[..paren_pos];
-        let rs1_str = last[paren_pos+1..].trim_end_matches(')');
+        let rs1_str = last[paren_pos + 1..].trim_end_matches(')');
         let imm = parse_insn_int(imm_str)? as i32;
         let rs1 = parse_insn_reg(rs1_str)?;
         Ok(EncodeResult::Word(encode_s(opcode, funct3, rs1, rs2, imm)))

@@ -1,11 +1,16 @@
 //! ArmCodegen: variadic function operations (va_arg, va_start, va_copy).
 
-use crate::ir::reexports::Value;
+use super::emit::{callee_saved_name, ArmCodegen};
 use crate::common::types::IrType;
-use super::emit::{ArmCodegen, callee_saved_name};
+use crate::ir::reexports::Value;
 
 impl ArmCodegen {
-    pub(super) fn emit_va_arg_impl(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
+    pub(super) fn emit_va_arg_impl(
+        &mut self,
+        dest: &Value,
+        va_list_ptr: &Value,
+        result_ty: IrType,
+    ) {
         let is_fp = result_ty.is_float();
         let is_f128 = result_ty.is_long_double();
 
@@ -15,7 +20,8 @@ impl ArmCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x1, {}", reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov x1, {}", reg_name));
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             self.emit_load_from_sp("x1", slot.0, "ldr");
         }
@@ -26,7 +32,8 @@ impl ArmCodegen {
             let label_done = format!(".Lva_done_{}", label_id);
 
             self.state.emit("    ldrsw x2, [x1, #28]");
-            self.state.emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
+            self.state
+                .emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
             self.state.emit("    ldr x3, [x1, #16]");
             self.state.emit("    add x3, x3, x2");
             self.state.emit("    add w2, w2, #16");
@@ -55,7 +62,8 @@ impl ArmCodegen {
             let label_done = format!(".Lva_done_{}", label_id);
 
             self.state.emit("    ldrsw x2, [x1, #28]");
-            self.state.emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
+            self.state
+                .emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
             self.state.emit("    ldr x3, [x1, #16]");
             self.state.emit("    add x3, x3, x2");
             self.state.emit("    add w2, w2, #16");
@@ -84,7 +92,8 @@ impl ArmCodegen {
             let label_done = format!(".Lva_done_{}", label_id);
 
             self.state.emit("    ldrsw x2, [x1, #24]");
-            self.state.emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
+            self.state
+                .emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
             self.state.emit("    ldr x3, [x1, #8]");
             self.state.emit("    add x3, x3, x2");
             self.state.emit("    add w2, w2, #8");
@@ -113,14 +122,16 @@ impl ArmCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov x0, {}", reg_name));
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             self.emit_load_from_sp("x0", slot.0, "ldr");
         }
 
         let stack_offset = self.current_frame_size + self.va_named_stack_bytes as i64;
         if stack_offset <= 4095 {
-            self.state.emit_fmt(format_args!("    add x1, x29, #{}", stack_offset));
+            self.state
+                .emit_fmt(format_args!("    add x1, x29, #{}", stack_offset));
         } else {
             self.load_large_imm("x1", stack_offset);
             self.state.emit("    add x1, x29, x1");
@@ -140,7 +151,8 @@ impl ArmCodegen {
         }
 
         let gr_offs: i32 = -((8 - self.va_named_gp_count as i32) * 8);
-        self.state.emit_fmt(format_args!("    mov w1, #{}", gr_offs));
+        self.state
+            .emit_fmt(format_args!("    mov w1, #{}", gr_offs));
         self.state.emit("    str w1, [x0, #24]");
 
         let vr_offs: i32 = if self.general_regs_only {
@@ -148,7 +160,8 @@ impl ArmCodegen {
         } else {
             -((8 - self.va_named_fp_count as i32) * 16)
         };
-        self.state.emit_fmt(format_args!("    mov w1, #{}", vr_offs));
+        self.state
+            .emit_fmt(format_args!("    mov w1, #{}", vr_offs));
         self.state.emit("    str w1, [x0, #28]");
     }
 
@@ -159,7 +172,8 @@ impl ArmCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&src_ptr.0) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x1, {}", reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov x1, {}", reg_name));
         } else if let Some(src_slot) = self.state.get_slot(src_ptr.0) {
             self.emit_load_from_sp("x1", src_slot.0, "ldr");
         }
@@ -169,7 +183,8 @@ impl ArmCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov x0, {}", reg_name));
         } else if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
             self.emit_load_from_sp("x0", dest_slot.0, "ldr");
         }
@@ -195,7 +210,13 @@ impl ArmCodegen {
     ///
     /// __gr_offs starts negative and advances toward 0. When it would become >= 0
     /// for the struct, we use the stack path instead.
-    pub(super) fn emit_va_arg_struct_impl(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, _align: usize) {
+    pub(super) fn emit_va_arg_struct_impl(
+        &mut self,
+        dest_ptr: &Value,
+        va_list_ptr: &Value,
+        size: usize,
+        _align: usize,
+    ) {
         let num_slots = size.div_ceil(8);
         let total_reg_bytes = num_slots * 8;
 
@@ -214,21 +235,23 @@ impl ArmCodegen {
         // We need: __gr_offs + total_reg_bytes <= 0
         // Equivalently: __gr_offs <= -total_reg_bytes
         // Or: __gr_offs + total_reg_bytes is still negative (bit 63 set after sign-extend + add)
-        self.state.emit("    ldrsw x2, [x1, #24]");  // x2 = sign-extended __gr_offs
+        self.state.emit("    ldrsw x2, [x1, #24]"); // x2 = sign-extended __gr_offs
         if total_reg_bytes <= 4095 {
-            self.state.emit_fmt(format_args!("    adds x3, x2, #{}", total_reg_bytes));
+            self.state
+                .emit_fmt(format_args!("    adds x3, x2, #{}", total_reg_bytes));
         } else {
             self.load_large_imm("x3", total_reg_bytes as i64);
             self.state.emit("    adds x3, x2, x3");
         }
         // If x3 > 0 (not enough register slots for entire struct), use stack path.
-        self.state.emit_fmt(format_args!("    b.gt {}", label_stack));
+        self.state
+            .emit_fmt(format_args!("    b.gt {}", label_stack));
 
         // ==== Register path ====
         // Read all slots from the GP register save area.
         // Base address: __gr_top + __gr_offs
-        self.state.emit("    ldr x5, [x1, #8]");     // x5 = __gr_top
-        self.state.emit("    add x5, x5, x2");        // x5 = __gr_top + __gr_offs (source addr)
+        self.state.emit("    ldr x5, [x1, #8]"); // x5 = __gr_top
+        self.state.emit("    add x5, x5, x2"); // x5 = __gr_top + __gr_offs (source addr)
 
         // Copy struct data from register save area to dest
         for i in 0..num_slots {
@@ -239,8 +262,10 @@ impl ArmCodegen {
                     self.state.emit("    ldr x6, [x5]");
                     self.state.emit("    str x6, [x4]");
                 } else {
-                    self.state.emit_fmt(format_args!("    ldr x6, [x5, #{}]", offset));
-                    self.state.emit_fmt(format_args!("    str x6, [x4, #{}]", offset));
+                    self.state
+                        .emit_fmt(format_args!("    ldr x6, [x5, #{}]", offset));
+                    self.state
+                        .emit_fmt(format_args!("    str x6, [x4, #{}]", offset));
                 }
             } else {
                 // Partial last slot: copy remaining bytes
@@ -261,7 +286,7 @@ impl ArmCodegen {
         self.state.emit("    str wzr, [x1, #24]");
 
         // Read from __stack
-        self.state.emit("    ldr x5, [x1]");          // x5 = __stack (source addr)
+        self.state.emit("    ldr x5, [x1]"); // x5 = __stack (source addr)
 
         // Align __stack to 8 bytes (structs on stack are 8-byte aligned per AAPCS64)
         self.state.emit("    add x5, x5, #7");
@@ -275,8 +300,10 @@ impl ArmCodegen {
                     self.state.emit("    ldr x6, [x5]");
                     self.state.emit("    str x6, [x4]");
                 } else {
-                    self.state.emit_fmt(format_args!("    ldr x6, [x5, #{}]", offset));
-                    self.state.emit_fmt(format_args!("    str x6, [x4, #{}]", offset));
+                    self.state
+                        .emit_fmt(format_args!("    ldr x6, [x5, #{}]", offset));
+                    self.state
+                        .emit_fmt(format_args!("    str x6, [x4, #{}]", offset));
                 }
             } else {
                 let remaining = size - i * 8;
@@ -287,7 +314,8 @@ impl ArmCodegen {
         // Advance __stack past the struct (8-byte aligned)
         let advance = num_slots * 8;
         if advance <= 4095 {
-            self.state.emit_fmt(format_args!("    add x5, x5, #{}", advance));
+            self.state
+                .emit_fmt(format_args!("    add x5, x5, #{}", advance));
         } else {
             self.load_large_imm("x6", advance as i64);
             self.state.emit("    add x5, x5, x6");
@@ -307,7 +335,8 @@ impl ArmCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov {}, {}", dest_reg, reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov {}, {}", dest_reg, reg_name));
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             self.emit_load_from_sp(dest_reg, slot.0, "ldr");
         }
@@ -321,39 +350,54 @@ impl ArmCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov {}, {}", dest_reg, reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov {}, {}", dest_reg, reg_name));
         } else if let Some(slot) = self.state.get_slot(dest_ptr.0) {
             self.emit_load_from_sp(dest_reg, slot.0, "ldr");
         }
     }
 
     /// Emit byte-by-byte copy for a partial struct slot (last slot with < 8 bytes).
-    fn emit_partial_struct_copy(&mut self, base_offset: i64, remaining: usize, src_reg: &str, dst_reg: &str) {
+    fn emit_partial_struct_copy(
+        &mut self,
+        base_offset: i64,
+        remaining: usize,
+        src_reg: &str,
+        dst_reg: &str,
+    ) {
         let mut copied = 0usize;
         // Copy 4 bytes if possible
         if remaining >= 4 {
             let off = base_offset + copied as i64;
             if off == 0 {
-                self.state.emit_fmt(format_args!("    ldr w6, [{}]", src_reg));
-                self.state.emit_fmt(format_args!("    str w6, [{}]", dst_reg));
+                self.state
+                    .emit_fmt(format_args!("    ldr w6, [{}]", src_reg));
+                self.state
+                    .emit_fmt(format_args!("    str w6, [{}]", dst_reg));
             } else {
-                self.state.emit_fmt(format_args!("    ldr w6, [{}, #{}]", src_reg, off));
-                self.state.emit_fmt(format_args!("    str w6, [{}, #{}]", dst_reg, off));
+                self.state
+                    .emit_fmt(format_args!("    ldr w6, [{}, #{}]", src_reg, off));
+                self.state
+                    .emit_fmt(format_args!("    str w6, [{}, #{}]", dst_reg, off));
             }
             copied += 4;
         }
         // Copy 2 bytes if possible
         if remaining - copied >= 2 {
             let off = base_offset + copied as i64;
-            self.state.emit_fmt(format_args!("    ldrh w6, [{}, #{}]", src_reg, off));
-            self.state.emit_fmt(format_args!("    strh w6, [{}, #{}]", dst_reg, off));
+            self.state
+                .emit_fmt(format_args!("    ldrh w6, [{}, #{}]", src_reg, off));
+            self.state
+                .emit_fmt(format_args!("    strh w6, [{}, #{}]", dst_reg, off));
             copied += 2;
         }
         // Copy 1 byte if remaining
         if remaining - copied >= 1 {
             let off = base_offset + copied as i64;
-            self.state.emit_fmt(format_args!("    ldrb w6, [{}, #{}]", src_reg, off));
-            self.state.emit_fmt(format_args!("    strb w6, [{}, #{}]", dst_reg, off));
+            self.state
+                .emit_fmt(format_args!("    ldrb w6, [{}, #{}]", src_reg, off));
+            self.state
+                .emit_fmt(format_args!("    strb w6, [{}, #{}]", dst_reg, off));
         }
     }
 }

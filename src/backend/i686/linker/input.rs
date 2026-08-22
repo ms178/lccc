@@ -6,14 +6,22 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
-use super::types::*;
-use super::parse::*;
 use super::dynsym::*;
+use super::parse::*;
+use super::types::*;
 
 // Phase 1: Argument parsing
 // ══════════════════════════════════════════════════════════════════════════════
 
-pub(super) fn parse_user_args(user_args: &[String]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<(String, String)>) {
+pub(super) fn parse_user_args(
+    user_args: &[String],
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String)>,
+) {
     let mut extra_libs = Vec::new();
     let mut extra_lib_files = Vec::new();
     let mut extra_lib_paths = Vec::new();
@@ -50,14 +58,20 @@ pub(super) fn parse_user_args(user_args: &[String]) -> (Vec<String>, Vec<String>
                     // --defsym=SYMBOL=EXPR: define a symbol alias
                     // TODO: only supports symbol-to-symbol aliasing, not arbitrary expressions
                     if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((defsym_arg[..eq_pos].to_string(), defsym_arg[eq_pos + 1..].to_string()));
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
                     }
                 } else if part == "--defsym" && j + 1 < parts.len() {
                     // Two-argument form: --defsym SYM=VAL
                     j += 1;
                     let defsym_arg = parts[j];
                     if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((defsym_arg[..eq_pos].to_string(), defsym_arg[eq_pos + 1..].to_string()));
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
                     }
                 }
                 j += 1;
@@ -67,7 +81,13 @@ pub(super) fn parse_user_args(user_args: &[String]) -> (Vec<String>, Vec<String>
         }
     }
 
-    (extra_libs, extra_lib_files, extra_lib_paths, extra_objects, defsym_defs)
+    (
+        extra_libs,
+        extra_lib_files,
+        extra_lib_paths,
+        extra_objects,
+        defsym_defs,
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -127,8 +147,12 @@ pub(super) fn load_libraries(
     extra_libs: &[String],
     extra_lib_files: &[String],
     all_lib_dirs: &[String],
-) -> (FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>, Vec<String>) {
-    let mut dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> = FxHashMap::default();
+) -> (
+    FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
+    Vec<String>,
+) {
+    let mut dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> =
+        FxHashMap::default();
     let mut static_lib_objects: Vec<String> = Vec::new();
     let all_lib_refs: Vec<&str> = all_lib_dirs.iter().map(|s| s.as_str()).collect();
 
@@ -176,7 +200,8 @@ pub(super) fn load_libraries(
                     static_lib_objects.push(path);
                 } else if !is_static {
                     let real_path = std::fs::canonicalize(&path).ok();
-                    let check_path = real_path.as_ref()
+                    let check_path = real_path
+                        .as_ref()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or(path.clone());
                     if let Ok(syms) = read_dynsyms_with_search(&check_path, &all_lib_refs) {
@@ -209,7 +234,8 @@ pub(super) fn scan_shared_lib(
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().into_owned();
-                if fname.starts_with(&so_base) && fname.len() > so_base.len()
+                if fname.starts_with(&so_base)
+                    && fname.len() > so_base.len()
                     && fname.as_bytes()[so_base.len()] == b'.'
                 {
                     candidates.push(format!("{}/{}", dir, fname));
@@ -218,17 +244,21 @@ pub(super) fn scan_shared_lib(
         }
         for cand in &candidates {
             let real_path = std::fs::canonicalize(cand).ok();
-            let check_path = real_path.as_ref()
+            let check_path = real_path
+                .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(cand.clone());
             if let Ok(syms) = read_dynsyms_with_search(&check_path, lib_refs) {
                 // Read the actual SONAME from the ELF file; fall back to hardcoded defaults
-                let lib_soname = parse_soname_elf32(&check_path)
-                    .unwrap_or_else(|| {
-                        if lib == "c" { "libc.so.6".to_string() }
-                        else if lib == "m" { "libm.so.6".to_string() }
-                        else { format!("lib{}.so", lib) }
-                    });
+                let lib_soname = parse_soname_elf32(&check_path).unwrap_or_else(|| {
+                    if lib == "c" {
+                        "libc.so.6".to_string()
+                    } else if lib == "m" {
+                        "libm.so.6".to_string()
+                    } else {
+                        format!("lib{}.so", lib)
+                    }
+                });
                 for sym in syms {
                     insert_dynsym(dynlib_syms, sym, &lib_soname);
                 }
@@ -247,11 +277,25 @@ pub(super) fn insert_dynsym(
     let entry = dynlib_syms.entry(sym.name.clone());
     match entry {
         std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert((lib_soname.to_string(), sym.sym_type, sym.size, sym.version, sym.is_default_ver, sym.binding));
+            e.insert((
+                lib_soname.to_string(),
+                sym.sym_type,
+                sym.size,
+                sym.version,
+                sym.is_default_ver,
+                sym.binding,
+            ));
         }
         std::collections::hash_map::Entry::Occupied(mut e) => {
             if sym.is_default_ver && !e.get().4 {
-                e.insert((lib_soname.to_string(), sym.sym_type, sym.size, sym.version, sym.is_default_ver, sym.binding));
+                e.insert((
+                    lib_soname.to_string(),
+                    sym.sym_type,
+                    sym.size,
+                    sym.version,
+                    sym.is_default_ver,
+                    sym.binding,
+                ));
             }
         }
     }
@@ -261,13 +305,16 @@ pub(super) fn insert_dynsym(
 // Phase 4: Parse objects with demand-driven archive extraction
 // ══════════════════════════════════════════════════════════════════════════════
 
-pub(super) fn load_and_parse_objects(all_objects: &[String], defsym_defs: &[(String, String)]) -> Result<(Vec<InputObject>, Vec<InputObject>), String> {
+pub(super) fn load_and_parse_objects(
+    all_objects: &[String],
+    defsym_defs: &[(String, String)],
+) -> Result<(Vec<InputObject>, Vec<InputObject>), String> {
     let mut inputs: Vec<InputObject> = Vec::new();
     let mut archive_pool: Vec<InputObject> = Vec::new();
 
     for obj_path in all_objects {
-        let data = std::fs::read(obj_path)
-            .map_err(|e| format!("cannot read {}: {}", obj_path, e))?;
+        let data =
+            std::fs::read(obj_path).map_err(|e| format!("cannot read {}: {}", obj_path, e))?;
         if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
             let members = parse_archive(&data, obj_path)?;
             for (name, mdata) in members {
@@ -296,7 +343,11 @@ pub(super) fn load_and_parse_objects(all_objects: &[String], defsym_defs: &[(Str
 }
 
 /// Pull in archive members that satisfy undefined symbols, iterating until stable.
-pub(super) fn resolve_archive_members(inputs: &mut Vec<InputObject>, archive_pool: &mut Vec<InputObject>, defsym_defs: &[(String, String)]) {
+pub(super) fn resolve_archive_members(
+    inputs: &mut Vec<InputObject>,
+    archive_pool: &mut Vec<InputObject>,
+    defsym_defs: &[(String, String)],
+) {
     let mut defined: FxHashSet<String> = FxHashSet::default();
     let mut undefined: FxHashSet<String> = FxHashSet::default();
 
@@ -337,7 +388,10 @@ pub(super) fn resolve_archive_members(inputs: &mut Vec<InputObject>, archive_poo
             if resolves {
                 let obj = archive_pool.remove(i);
                 for sym in &obj.symbols {
-                    if sym.name.is_empty() || sym.sym_type == STT_FILE || sym.sym_type == STT_SECTION {
+                    if sym.name.is_empty()
+                        || sym.sym_type == STT_FILE
+                        || sym.sym_type == STT_SECTION
+                    {
                         continue;
                     }
                     if sym.section_index != SHN_UNDEF {
@@ -359,4 +413,3 @@ pub(super) fn resolve_archive_members(inputs: &mut Vec<InputObject>, archive_poo
 // ══════════════════════════════════════════════════════════════════════════════
 // Phase 5: Section merging
 // ══════════════════════════════════════════════════════════════════════════════
-

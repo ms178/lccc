@@ -4,13 +4,12 @@
 //! marks PLT/GOT needs for dynamic linking, and identifies GOT entries for
 //! PC-relative GOT references.
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::{
-    GlobalSym, MergedSection,
-    R_RISCV_GOT_HI20, R_RISCV_TLS_GOT_HI20, R_RISCV_TLS_GD_HI20,
-    got_sym_key,
+    got_sym_key, GlobalSym, MergedSection, R_RISCV_GOT_HI20, R_RISCV_TLS_GD_HI20,
+    R_RISCV_TLS_GOT_HI20,
 };
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Build the global symbol table from all input objects.
 ///
@@ -32,22 +31,38 @@ pub fn build_global_symbols(
             }
 
             if sym.shndx == SHN_UNDEF {
-                global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
-                    value: 0, size: 0, binding: sym.binding(),
-                    sym_type: sym.sym_type(), visibility: sym.visibility(),
-                    defined: false, needs_plt: false, plt_idx: 0,
-                    got_offset: None, section_idx: None,
-                });
+                global_syms
+                    .entry(sym.name.to_string())
+                    .or_insert_with(|| GlobalSym {
+                        value: 0,
+                        size: 0,
+                        binding: sym.binding(),
+                        sym_type: sym.sym_type(),
+                        visibility: sym.visibility(),
+                        defined: false,
+                        needs_plt: false,
+                        plt_idx: 0,
+                        got_offset: None,
+                        section_idx: None,
+                    });
                 continue;
             }
 
             if sym.shndx == SHN_ABS {
-                let entry = global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
-                    value: sym.value, size: sym.size, binding: sym.binding(),
-                    sym_type: sym.sym_type(), visibility: sym.visibility(),
-                    defined: true, needs_plt: false, plt_idx: 0,
-                    got_offset: None, section_idx: None,
-                });
+                let entry = global_syms
+                    .entry(sym.name.to_string())
+                    .or_insert_with(|| GlobalSym {
+                        value: sym.value,
+                        size: sym.size,
+                        binding: sym.binding(),
+                        sym_type: sym.sym_type(),
+                        visibility: sym.visibility(),
+                        defined: true,
+                        needs_plt: false,
+                        plt_idx: 0,
+                        got_offset: None,
+                        section_idx: None,
+                    });
                 if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
                     entry.value = sym.value;
                     entry.size = sym.size;
@@ -59,9 +74,7 @@ pub fn build_global_symbols(
             }
 
             if sym.shndx == SHN_COMMON {
-                allocate_common_symbol(
-                    sym, &mut global_syms, merged_sections, merged_map,
-                );
+                allocate_common_symbol(sym, &mut global_syms, merged_sections, merged_map);
                 continue;
             }
 
@@ -71,12 +84,20 @@ pub fn build_global_symbols(
                 None => continue,
             };
 
-            let entry = global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
-                value: 0, size: sym.size, binding: sym.binding(),
-                sym_type: sym.sym_type(), visibility: sym.visibility(),
-                defined: false, needs_plt: false, plt_idx: 0,
-                got_offset: None, section_idx: None,
-            });
+            let entry = global_syms
+                .entry(sym.name.to_string())
+                .or_insert_with(|| GlobalSym {
+                    value: 0,
+                    size: sym.size,
+                    binding: sym.binding(),
+                    sym_type: sym.sym_type(),
+                    visibility: sym.visibility(),
+                    defined: false,
+                    needs_plt: false,
+                    plt_idx: 0,
+                    got_offset: None,
+                    section_idx: None,
+                });
 
             if entry.defined && !(entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
                 continue;
@@ -123,12 +144,20 @@ fn allocate_common_symbol(
     ms.data.resize(ms.data.len() + sym.size as usize, 0);
     ms.align = ms.align.max(align as u64);
 
-    let entry = global_syms.entry(sym.name.to_string()).or_insert_with(|| GlobalSym {
-        value: off, size: sym.size, binding: sym.binding(),
-        sym_type: STT_OBJECT, visibility: sym.visibility(),
-        defined: true, needs_plt: false, plt_idx: 0,
-        got_offset: None, section_idx: Some(bss_idx),
-    });
+    let entry = global_syms
+        .entry(sym.name.to_string())
+        .or_insert_with(|| GlobalSym {
+            value: off,
+            size: sym.size,
+            binding: sym.binding(),
+            sym_type: STT_OBJECT,
+            visibility: sym.visibility(),
+            defined: true,
+            needs_plt: false,
+            plt_idx: 0,
+            got_offset: None,
+            section_idx: Some(bss_idx),
+        });
     if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
         entry.value = off;
         entry.size = sym.size.max(entry.size);
@@ -170,7 +199,11 @@ pub fn mark_plt_and_copy_symbols(
 /// and a map of local GOT symbol info for resolving local GOT entries.
 pub fn collect_got_entries(
     input_objs: &[(String, ElfObject)],
-) -> (Vec<String>, FxHashSet<String>, FxHashMap<String, (usize, usize, i64)>) {
+) -> (
+    Vec<String>,
+    FxHashSet<String>,
+    FxHashMap<String, (usize, usize, i64)>,
+) {
     let mut got_symbols: Vec<String> = Vec::new();
     let mut tls_got_symbols: FxHashSet<String> = FxHashSet::default();
     let mut local_got_sym_info: FxHashMap<String, (usize, usize, i64)> = FxHashMap::default();
@@ -246,9 +279,12 @@ pub fn check_undefined_symbols(
     global_syms: &FxHashMap<String, GlobalSym>,
     shared_lib_syms: &FxHashMap<String, DynSymbol>,
 ) -> Result<(), String> {
-    let mut truly_undefined: Vec<&String> = global_syms.iter()
+    let mut truly_undefined: Vec<&String> = global_syms
+        .iter()
         .filter(|(name, sym)| {
-            !sym.defined && !sym.needs_plt && sym.binding != STB_WEAK
+            !sym.defined
+                && !sym.needs_plt
+                && sym.binding != STB_WEAK
                 && !crate::backend::linker_common::is_linker_defined_symbol(name)
                 && !shared_lib_syms.contains_key(name.as_str())
         })
@@ -260,7 +296,11 @@ pub fn check_undefined_symbols(
         truly_undefined.truncate(20);
         return Err(format!(
             "undefined symbols: {}",
-            truly_undefined.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            truly_undefined
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     Ok(())

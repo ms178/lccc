@@ -8,17 +8,12 @@
 //! - Sub-struct compound vs byte-level selection
 //! - Nested compound flattening and bytes+ptrs merging
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::ir::reexports::{GlobalInit, IrConst};
-use crate::common::types::{IrType, StructLayout, CType, InitFieldResolution};
-use super::lower::Lowerer;
 use super::global_init_helpers as h;
-use h::{push_zero_bytes, push_bytes_as_elements, push_string_as_elements};
+use super::lower::Lowerer;
+use crate::common::types::{CType, InitFieldResolution, IrType, StructLayout};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
+use crate::ir::reexports::{GlobalInit, IrConst};
+use h::{push_bytes_as_elements, push_string_as_elements, push_zero_bytes};
 
 impl Lowerer {
     /// Lower a struct global init that contains address expressions.
@@ -49,11 +44,18 @@ impl Lowerer {
             let item = &items[item_idx];
 
             let designator_name = h::first_field_designator(item);
-            let resolution = layout.resolve_init_field(designator_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = layout.resolve_init_field(
+                designator_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
 
             let field_idx = match &resolution {
                 Some(InitFieldResolution::Direct(idx)) => *idx,
-                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                Some(InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
                     // Designator targets a field inside an anonymous member.
                     // Create a synthetic init item with the inner designator,
                     // preserving any remaining nested designators from the original item.
@@ -71,7 +73,9 @@ impl Lowerer {
                     current_field_idx = *anon_field_idx + 1;
                     item_idx += 1;
                     let has_designator = !item.designators.is_empty();
-                    if layout.is_union && !has_designator { break; }
+                    if layout.is_union && !has_designator {
+                        break;
+                    }
                     continue;
                 }
                 None => {
@@ -91,7 +95,8 @@ impl Lowerer {
             // complete initializer for the entire array (e.g., char c[10] = "hello").
             // However, for pointer arrays (e.g., char *s[2] = {"abc", "def"}), each
             // string literal IS a flat-init element (it initializes one pointer).
-            let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
+            let is_string_literal =
+                matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
             if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
                 let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::UChar);
                 let skip_flat = is_string_literal && is_char_array;
@@ -100,7 +105,8 @@ impl Lowerer {
                     // For arrays of scalars/pointers, each element is 1 item.
                     // For arrays of structs, each element needs multiple items
                     // (one per scalar leaf field in the struct).
-                    let scalars_per_elem = h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
+                    let scalars_per_elem =
+                        h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
                     let total_scalars = *arr_size * scalars_per_elem;
                     let mut consumed = 0;
                     while consumed < total_scalars && (item_idx + consumed) < items.len() {
@@ -118,7 +124,9 @@ impl Lowerer {
                     item_idx += consumed;
                     current_field_idx = field_idx + 1;
                     let has_designator = !item.designators.is_empty();
-                    if layout.is_union && !has_designator { break; }
+                    if layout.is_union && !has_designator {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -133,7 +141,8 @@ impl Lowerer {
                 && matches!(&item.init, Initializer::Expr(_))
                 && item.designators.is_empty()
             {
-                let scalars_needed = h::count_flat_init_scalars(field_ty, &*self.types.borrow_struct_layouts());
+                let scalars_needed =
+                    h::count_flat_init_scalars(field_ty, &*self.types.borrow_struct_layouts());
                 if scalars_needed > 1 {
                     let mut consumed = 0;
                     while consumed < scalars_needed && (item_idx + consumed) < items.len() {
@@ -151,7 +160,9 @@ impl Lowerer {
                     item_idx += consumed;
                     current_field_idx = field_idx + 1;
                     let has_designator = !item.designators.is_empty();
-                    if layout.is_union && !has_designator { break; }
+                    if layout.is_union && !has_designator {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -160,7 +171,9 @@ impl Lowerer {
             current_field_idx = field_idx + 1;
             item_idx += 1;
             let has_designator = !item.designators.is_empty();
-            if layout.is_union && !has_designator { break; }
+            if layout.is_union && !has_designator {
+                break;
+            }
         }
 
         // For unions, find the one initialized field and emit only that,
@@ -186,17 +199,24 @@ impl Lowerer {
                 let inits = &field_inits[fi];
                 let field_size = self.resolve_ctype_size(&layout.fields[fi].ty);
                 if !inits.is_empty() {
-                    self.emit_field_inits_compound(&mut elements, inits, &layout.fields[fi], field_size);
+                    self.emit_field_inits_compound(
+                        &mut elements,
+                        inits,
+                        &layout.fields[fi],
+                        field_size,
+                    );
                 } else {
                     // Field has no direct inits but may have anonymous member inits
-                    let anon_items_for_fi: Vec<InitializerItem> = anon_synth_items.iter()
+                    let anon_items_for_fi: Vec<InitializerItem> = anon_synth_items
+                        .iter()
                         .filter(|(idx, _)| *idx == fi)
                         .map(|(_, item)| item.clone())
                         .collect();
                     if !anon_items_for_fi.is_empty() {
                         let anon_field_ty = &layout.fields[fi].ty;
                         if let Some(sub_layout) = self.get_struct_layout_for_ctype(anon_field_ty) {
-                            let sub_init = self.lower_struct_global_init_compound(&anon_items_for_fi, &sub_layout);
+                            let sub_init = self
+                                .lower_struct_global_init_compound(&anon_items_for_fi, &sub_layout);
                             Self::append_nested_compound(&mut elements, sub_init, field_size);
                         } else {
                             push_zero_bytes(&mut elements, field_size);
@@ -216,121 +236,137 @@ impl Lowerer {
                 current_offset = union_size;
             }
         } else {
+            let mut fi = 0;
+            while fi < layout.fields.len() {
+                let field_offset = layout.fields[fi].offset;
+                let field_size = self.resolve_ctype_size(&layout.fields[fi].ty);
 
-        let mut fi = 0;
-        while fi < layout.fields.len() {
-            let field_offset = layout.fields[fi].offset;
-            let field_size = self.resolve_ctype_size(&layout.fields[fi].ty);
+                // Check if this is a bitfield: if so, we need to pack all bitfields
+                // sharing the same storage unit into a single byte buffer.
+                if layout.fields[fi].bit_offset.is_some() {
+                    let storage_unit_offset = field_offset;
+                    let storage_unit_size = field_size; // All bitfields in this unit have the same type size
 
-            // Check if this is a bitfield: if so, we need to pack all bitfields
-            // sharing the same storage unit into a single byte buffer.
-            if layout.fields[fi].bit_offset.is_some() {
-                let storage_unit_offset = field_offset;
-                let storage_unit_size = field_size; // All bitfields in this unit have the same type size
+                    // Emit padding before this storage unit (only if unit starts after current pos)
+                    if storage_unit_offset > current_offset {
+                        let pad = storage_unit_offset - current_offset;
+                        push_zero_bytes(&mut elements, pad);
+                        current_offset = storage_unit_offset;
+                    }
 
-                // Emit padding before this storage unit (only if unit starts after current pos)
-                if storage_unit_offset > current_offset {
-                    let pad = storage_unit_offset - current_offset;
-                    push_zero_bytes(&mut elements, pad);
-                    current_offset = storage_unit_offset;
+                    // Allocate a byte buffer for the storage unit and pack all
+                    // bitfield values into it using read-modify-write.
+                    let mut unit_bytes = vec![0u8; storage_unit_size];
+
+                    // Track the highest bit used so we know exactly how many bytes
+                    // the bitfields actually occupy (the storage unit type may be
+                    // wider than the bits used, and the remaining bytes may belong
+                    // to subsequent non-bitfield fields).
+                    let mut max_bit_end: u32 = 0;
+
+                    // Process all consecutive bitfield fields sharing this storage unit offset
+                    while fi < layout.fields.len()
+                        && layout.fields[fi].offset == storage_unit_offset
+                        && layout.fields[fi].bit_offset.is_some()
+                    {
+                        let bit_offset = layout.fields[fi]
+                            .bit_offset
+                            .expect("bitfield must have bit_offset");
+                        let bit_width = layout.fields[fi]
+                            .bit_width
+                            .expect("bitfield must have bit_width");
+                        let field_ir_ty = IrType::from_ctype(&layout.fields[fi].ty);
+
+                        let inits = &field_inits[fi];
+                        let val = if !inits.is_empty() {
+                            self.eval_init_scalar(&inits[0].init)
+                        } else {
+                            IrConst::I32(0) // Zero-init for missing initializers
+                        };
+
+                        // Pack this bitfield value into the storage unit buffer
+                        self.write_bitfield_to_bytes(
+                            &mut unit_bytes,
+                            0,
+                            &val,
+                            field_ir_ty,
+                            bit_offset,
+                            bit_width,
+                        );
+                        if bit_offset + bit_width > max_bit_end {
+                            max_bit_end = bit_offset + bit_width;
+                        }
+                        fi += 1;
+                    }
+
+                    // Compute the actual number of bytes occupied by bitfield data.
+                    // The storage unit type (e.g. uint32_t = 4 bytes) may be wider
+                    // than the bits actually used. Bytes beyond the last used bit
+                    // may belong to subsequent non-bitfield fields and must not be
+                    // overwritten with zeros from the storage unit buffer.
+                    let actual_bytes_used = (max_bit_end as usize).div_ceil(8);
+                    let effective_size = actual_bytes_used.min(storage_unit_size);
+
+                    // When the storage unit overlaps with already-written data
+                    // (due to align_down placement), skip the overlapping bytes.
+                    let skip = current_offset.saturating_sub(storage_unit_offset);
+                    // Emit only the non-overlapping portion of the actually-used bytes
+                    if skip < effective_size {
+                        push_bytes_as_elements(&mut elements, &unit_bytes[skip..effective_size]);
+                    }
+                    current_offset = storage_unit_offset + effective_size;
+                    continue;
                 }
 
-                // Allocate a byte buffer for the storage unit and pack all
-                // bitfield values into it using read-modify-write.
-                let mut unit_bytes = vec![0u8; storage_unit_size];
+                // Emit padding before this field
+                if field_offset > current_offset {
+                    let pad = field_offset - current_offset;
+                    push_zero_bytes(&mut elements, pad);
+                    current_offset = field_offset;
+                }
 
-                // Track the highest bit used so we know exactly how many bytes
-                // the bitfields actually occupy (the storage unit type may be
-                // wider than the bits used, and the remaining bytes may belong
-                // to subsequent non-bitfield fields).
-                let mut max_bit_end: u32 = 0;
+                let inits = &field_inits[fi];
 
-                // Process all consecutive bitfield fields sharing this storage unit offset
-                while fi < layout.fields.len()
-                    && layout.fields[fi].offset == storage_unit_offset
-                    && layout.fields[fi].bit_offset.is_some()
-                {
-                    let bit_offset = layout.fields[fi].bit_offset.expect("bitfield must have bit_offset");
-                    let bit_width = layout.fields[fi].bit_width.expect("bitfield must have bit_width");
-                    let field_ir_ty = IrType::from_ctype(&layout.fields[fi].ty);
-
-                    let inits = &field_inits[fi];
-                    let val = if !inits.is_empty() {
-                        self.eval_init_scalar(&inits[0].init)
-                    } else {
-                        IrConst::I32(0) // Zero-init for missing initializers
-                    };
-
-                    // Pack this bitfield value into the storage unit buffer
-                    self.write_bitfield_to_bytes(&mut unit_bytes, 0, &val, field_ir_ty, bit_offset, bit_width);
-                    if bit_offset + bit_width > max_bit_end {
-                        max_bit_end = bit_offset + bit_width;
+                // Flexible array member (FAM): use fam_extra as the actual data size
+                if let CType::Array(ref elem_ty, None) = layout.fields[fi].ty {
+                    if fam_extra > 0 && !inits.is_empty() {
+                        self.emit_fam_compound(&mut elements, inits, elem_ty, fam_extra);
+                        current_offset += fam_extra;
                     }
                     fi += 1;
+                    continue;
                 }
 
-                // Compute the actual number of bytes occupied by bitfield data.
-                // The storage unit type (e.g. uint32_t = 4 bytes) may be wider
-                // than the bits actually used. Bytes beyond the last used bit
-                // may belong to subsequent non-bitfield fields and must not be
-                // overwritten with zeros from the storage unit buffer.
-                let actual_bytes_used = (max_bit_end as usize).div_ceil(8);
-                let effective_size = actual_bytes_used.min(storage_unit_size);
-
-                // When the storage unit overlaps with already-written data
-                // (due to align_down placement), skip the overlapping bytes.
-                let skip = current_offset.saturating_sub(storage_unit_offset);
-                // Emit only the non-overlapping portion of the actually-used bytes
-                if skip < effective_size {
-                    push_bytes_as_elements(&mut elements, &unit_bytes[skip..effective_size]);
-                }
-                current_offset = storage_unit_offset + effective_size;
-                continue;
-            }
-
-            // Emit padding before this field
-            if field_offset > current_offset {
-                let pad = field_offset - current_offset;
-                push_zero_bytes(&mut elements, pad);
-                current_offset = field_offset;
-            }
-
-            let inits = &field_inits[fi];
-
-            // Flexible array member (FAM): use fam_extra as the actual data size
-            if let CType::Array(ref elem_ty, None) = layout.fields[fi].ty {
-                if fam_extra > 0 && !inits.is_empty() {
-                    self.emit_fam_compound(&mut elements, inits, elem_ty, fam_extra);
-                    current_offset += fam_extra;
-                }
-                fi += 1;
-                continue;
-            }
-
-            // Check for synthetic items from anonymous member designated inits
-            if inits.is_empty() {
-                let anon_items_for_fi: Vec<InitializerItem> = anon_synth_items.iter()
-                    .filter(|(idx, _)| *idx == fi)
-                    .map(|(_, item)| item.clone())
-                    .collect();
-                if !anon_items_for_fi.is_empty() {
-                    let anon_field_ty = &layout.fields[fi].ty;
-                    if let Some(sub_layout) = self.get_struct_layout_for_ctype(anon_field_ty) {
-                        let sub_init = self.lower_struct_global_init_compound(&anon_items_for_fi, &sub_layout);
-                        Self::append_nested_compound(&mut elements, sub_init, field_size);
+                // Check for synthetic items from anonymous member designated inits
+                if inits.is_empty() {
+                    let anon_items_for_fi: Vec<InitializerItem> = anon_synth_items
+                        .iter()
+                        .filter(|(idx, _)| *idx == fi)
+                        .map(|(_, item)| item.clone())
+                        .collect();
+                    if !anon_items_for_fi.is_empty() {
+                        let anon_field_ty = &layout.fields[fi].ty;
+                        if let Some(sub_layout) = self.get_struct_layout_for_ctype(anon_field_ty) {
+                            let sub_init = self
+                                .lower_struct_global_init_compound(&anon_items_for_fi, &sub_layout);
+                            Self::append_nested_compound(&mut elements, sub_init, field_size);
+                        } else {
+                            push_zero_bytes(&mut elements, field_size);
+                        }
                     } else {
                         push_zero_bytes(&mut elements, field_size);
                     }
                 } else {
-                    push_zero_bytes(&mut elements, field_size);
+                    self.emit_field_inits_compound(
+                        &mut elements,
+                        inits,
+                        &layout.fields[fi],
+                        field_size,
+                    );
                 }
-            } else {
-                self.emit_field_inits_compound(&mut elements, inits, &layout.fields[fi], field_size);
+                current_offset += field_size;
+                fi += 1;
             }
-            current_offset += field_size;
-            fi += 1;
-        }
-
         } // end of else (non-union struct path)
 
         // Trailing padding
@@ -351,7 +387,9 @@ impl Lowerer {
         fam_data_size: usize,
     ) {
         let elem_size = self.resolve_ctype_size(elem_ty);
-        if elem_size == 0 { return; }
+        if elem_size == 0 {
+            return;
+        }
         let elem_is_pointer = matches!(elem_ty, CType::Pointer(_, _) | CType::Function(_));
 
         // The FAM init should be a single item with a List initializer containing sub-items
@@ -362,7 +400,13 @@ impl Lowerer {
             } else {
                 // Single expression init for a FAM element
                 let init_item = inits[0];
-                self.emit_compound_field_init(elements, &init_item.init, elem_ty, elem_size, elem_is_pointer);
+                self.emit_compound_field_init(
+                    elements,
+                    &init_item.init,
+                    elem_ty,
+                    elem_size,
+                    elem_is_pointer,
+                );
                 let emitted = elem_size;
                 if emitted < fam_data_size {
                     push_zero_bytes(elements, fam_data_size - emitted);
@@ -374,8 +418,16 @@ impl Lowerer {
             // but handle by emitting each as an element
             let mut emitted = 0;
             for item in inits {
-                if emitted + elem_size > fam_data_size { break; }
-                self.emit_compound_field_init(elements, &item.init, elem_ty, elem_size, elem_is_pointer);
+                if emitted + elem_size > fam_data_size {
+                    break;
+                }
+                self.emit_compound_field_init(
+                    elements,
+                    &item.init,
+                    elem_ty,
+                    elem_size,
+                    elem_is_pointer,
+                );
                 emitted += elem_size;
             }
             if emitted < fam_data_size {
@@ -388,20 +440,39 @@ impl Lowerer {
         let num_elems = fam_data_size / elem_size;
         let mut emitted = 0;
         for (i, sub_item) in sub_items.iter().enumerate() {
-            if i >= num_elems { break; }
+            if i >= num_elems {
+                break;
+            }
             // Each sub_item is an initializer for one FAM element (e.g., one struct upid)
             if let Some(sub_layout) = self.get_struct_layout_for_ctype(elem_ty) {
                 // Struct element - use sub-struct compound emission
                 match &sub_item.init {
                     Initializer::List(nested_items) => {
-                        self.emit_sub_struct_to_compound(elements, nested_items, &sub_layout, elem_size);
+                        self.emit_sub_struct_to_compound(
+                            elements,
+                            nested_items,
+                            &sub_layout,
+                            elem_size,
+                        );
                     }
                     _ => {
-                        self.emit_compound_field_init(elements, &sub_item.init, elem_ty, elem_size, elem_is_pointer);
+                        self.emit_compound_field_init(
+                            elements,
+                            &sub_item.init,
+                            elem_ty,
+                            elem_size,
+                            elem_is_pointer,
+                        );
                     }
                 }
             } else {
-                self.emit_compound_field_init(elements, &sub_item.init, elem_ty, elem_size, elem_is_pointer);
+                self.emit_compound_field_init(
+                    elements,
+                    &sub_item.init,
+                    elem_ty,
+                    elem_size,
+                    elem_is_pointer,
+                );
             }
             emitted += elem_size;
         }
@@ -433,11 +504,17 @@ impl Lowerer {
 
     /// Append the elements from a nested GlobalInit::Compound into `elements`,
     /// padding/truncating to exactly `target_size` bytes.
-    fn append_nested_compound(elements: &mut Vec<GlobalInit>, nested: GlobalInit, target_size: usize) {
+    fn append_nested_compound(
+        elements: &mut Vec<GlobalInit>,
+        nested: GlobalInit,
+        target_size: usize,
+    ) {
         if let GlobalInit::Compound(nested_elems) = nested {
             let mut emitted = 0;
             for elem in nested_elems {
-                if emitted >= target_size { break; }
+                if emitted >= target_size {
+                    break;
+                }
                 emitted += elem.byte_size();
                 elements.push(elem);
             }
@@ -527,7 +604,8 @@ impl Lowerer {
                         push_string_as_elements(elements, s, field_size);
                     }
                 } else if let Expr::AddressOf(inner, _) = expr {
-                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref()
+                    {
                         // &(compound_literal) at file scope: create anonymous global
                         let addr_init = self.create_compound_literal_global(cl_type_spec, cl_init);
                         elements.push(addr_init);
@@ -546,7 +624,13 @@ impl Lowerer {
                         elements.push(addr_init);
                     } else {
                         // Non-pointer compound literal: unwrap and use inner initializer
-                        self.emit_compound_field_init(elements, cl_init, field_ty, field_size, field_is_pointer);
+                        self.emit_compound_field_init(
+                            elements,
+                            cl_init,
+                            field_ty,
+                            field_size,
+                            field_is_pointer,
+                        );
                     }
                 } else {
                     // Scalar constant, string literal addr, global addr, or zero fallback
@@ -560,13 +644,22 @@ impl Lowerer {
                         // Distinguish: direct pointer array vs struct-with-pointer-fields array
                         if matches!(elem_ty.as_ref(), CType::Pointer(_, _) | CType::Function(_)) {
                             // Array of direct pointers: emit each element as a GlobalAddr or zero
-                            self.emit_compound_ptr_array_init(elements, nested_items, elem_ty, *arr_size);
+                            self.emit_compound_ptr_array_init(
+                                elements,
+                                nested_items,
+                                elem_ty,
+                                *arr_size,
+                            );
                             return;
                         }
                         // Array of structs/unions containing pointer fields:
                         // use the struct-array-with-ptrs path (byte buffer + ptr_ranges)
                         if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
-                            let nested = self.lower_struct_array_with_ptrs(nested_items, &elem_layout, *arr_size);
+                            let nested = self.lower_struct_array_with_ptrs(
+                                nested_items,
+                                &elem_layout,
+                                *arr_size,
+                            );
                             if let GlobalInit::Compound(nested_elems) = nested {
                                 elements.extend(nested_elems);
                             } else {
@@ -580,7 +673,12 @@ impl Lowerer {
                         if let CType::Array(_, _) = elem_ty.as_ref() {
                             let outer_elem_size = self.resolve_ctype_size(elem_ty);
                             self.emit_multidim_array_compound(
-                                elements, nested_items, elem_ty, *arr_size, outer_elem_size);
+                                elements,
+                                nested_items,
+                                elem_ty,
+                                *arr_size,
+                                outer_elem_size,
+                            );
                             return;
                         }
                     }
@@ -590,7 +688,12 @@ impl Lowerer {
                 // which handles compound-vs-bytes selection automatically.
                 let field_ty_clone = field_ty.clone();
                 if let Some(nested_layout) = self.get_struct_layout_for_ctype(&field_ty_clone) {
-                    self.emit_sub_struct_to_compound(elements, nested_items, &nested_layout, field_size);
+                    self.emit_sub_struct_to_compound(
+                        elements,
+                        nested_items,
+                        &nested_layout,
+                        field_size,
+                    );
                     return;
                 }
 
@@ -599,22 +702,55 @@ impl Lowerer {
                 if let CType::Array(ref inner_ty, Some(arr_size)) = field_ty_clone {
                     if inner_ty.is_complex() {
                         let elem_size = self.resolve_ctype_size(inner_ty);
-                        self.fill_array_of_complex(nested_items, inner_ty, arr_size, elem_size, &mut bytes, 0);
+                        self.fill_array_of_complex(
+                            nested_items,
+                            inner_ty,
+                            arr_size,
+                            elem_size,
+                            &mut bytes,
+                            0,
+                        );
                     } else if matches!(inner_ty.as_ref(), CType::Struct(_) | CType::Union(_)) {
                         // Array of structs/unions without pointer fields: use composite
                         // array filler which handles Initializer::List sub-items correctly.
                         let elem_size = self.resolve_ctype_size(inner_ty);
-                        self.fill_array_of_composites(nested_items, inner_ty, arr_size, elem_size, &mut bytes, 0);
-                    } else if let CType::Array(ref inner_elem, Some(inner_size)) = inner_ty.as_ref() {
+                        self.fill_array_of_composites(
+                            nested_items,
+                            inner_ty,
+                            arr_size,
+                            elem_size,
+                            &mut bytes,
+                            0,
+                        );
+                    } else if let CType::Array(ref inner_elem, Some(inner_size)) = inner_ty.as_ref()
+                    {
                         // Multi-dimensional array (e.g., unsigned char hash[2][24]):
                         // each sub-item is a braced list for one element of the outer dimension.
                         let elem_size = self.resolve_ctype_size(inner_ty);
-                        self.fill_multidim_array_field(nested_items, inner_elem, *inner_size, arr_size, elem_size, &mut bytes, 0);
+                        self.fill_multidim_array_field(
+                            nested_items,
+                            inner_elem,
+                            *inner_size,
+                            arr_size,
+                            elem_size,
+                            &mut bytes,
+                            0,
+                        );
                     } else {
-                        self.fill_scalar_list_to_bytes(nested_items, inner_ty, field_size, &mut bytes);
+                        self.fill_scalar_list_to_bytes(
+                            nested_items,
+                            inner_ty,
+                            field_size,
+                            &mut bytes,
+                        );
                     }
                 } else {
-                    self.fill_scalar_list_to_bytes(nested_items, &field_ty_clone, field_size, &mut bytes);
+                    self.fill_scalar_list_to_bytes(
+                        nested_items,
+                        &field_ty_clone,
+                        field_size,
+                        &mut bytes,
+                    );
                 }
                 push_bytes_as_elements(elements, &bytes);
             }
@@ -679,78 +815,99 @@ impl Lowerer {
         } else if inits.len() == 1 {
             let item = inits[0];
             let desig_name = h::first_field_designator(item);
-            let is_anon = h::is_anon_member_designator(
-                desig_name, &field.name, &field.ty);
+            let is_anon = h::is_anon_member_designator(desig_name, &field.name, &field.ty);
 
             if is_anon {
                 let sub_item = InitializerItem {
                     designators: item.designators.clone(),
                     init: item.init.clone(),
                 };
-                let sub_layout = self.get_struct_layout_for_ctype(&field.ty)
+                let sub_layout = self
+                    .get_struct_layout_for_ctype(&field.ty)
                     .unwrap_or_else(StructLayout::empty_rc);
                 self.emit_sub_struct_to_compound(elements, &[sub_item], &sub_layout, field_size);
             } else if h::has_nested_field_designator(item) {
-                self.emit_compound_nested_designator_field(
-                    elements, item, &field.ty, field_size);
+                self.emit_compound_nested_designator_field(elements, item, &field.ty, field_size);
             } else {
-                let has_array_idx_designator = item.designators.iter().any(|d| matches!(d, Designator::Index(_)));
+                let has_array_idx_designator = item
+                    .designators
+                    .iter()
+                    .any(|d| matches!(d, Designator::Index(_)));
                 if has_array_idx_designator {
                     if let CType::Array(elem_ty, Some(arr_size)) = &field.ty {
                         // Only use pointer-array designated init for direct pointer arrays.
                         // For arrays of structs/sub-arrays containing pointers, fall through
                         // to emit_compound_field_init which handles nested List initializers.
-                        let is_direct_ptr = matches!(elem_ty.as_ref(), CType::Pointer(_, _) | CType::Function(_));
+                        let is_direct_ptr =
+                            matches!(elem_ty.as_ref(), CType::Pointer(_, _) | CType::Function(_));
                         if is_direct_ptr {
                             self.emit_compound_ptr_array_designated_init(
-                                elements, &[item], elem_ty, *arr_size);
+                                elements,
+                                &[item],
+                                elem_ty,
+                                *arr_size,
+                            );
                             return;
                         }
                     }
                 }
-                self.emit_compound_field_init(elements, &item.init, &field.ty, field_size, field_is_pointer);
+                self.emit_compound_field_init(
+                    elements,
+                    &item.init,
+                    &field.ty,
+                    field_size,
+                    field_is_pointer,
+                );
             }
         } else {
             // Multiple items targeting the same outer struct field.
             // Check if they all have nested field designators (e.g., .mmu.f1, .mmu.f2, .mmu.f3)
             // targeting sub-fields of a struct/union field.
-            let all_have_nested_desig = inits.iter().all(|item| h::has_nested_field_designator(item));
+            let all_have_nested_desig = inits
+                .iter()
+                .all(|item| h::has_nested_field_designator(item));
             let field_is_struct = matches!(&field.ty, CType::Struct(_) | CType::Union(_));
 
             let is_anon_multi = field.name.is_empty() && field_is_struct;
             if all_have_nested_desig && field_is_struct {
                 // Strip the outer field designator from each item and delegate
                 // to sub-struct compound init with the inner designators.
-                let sub_items: Vec<InitializerItem> = inits.iter().map(|item| {
-                    InitializerItem {
+                let sub_items: Vec<InitializerItem> = inits
+                    .iter()
+                    .map(|item| InitializerItem {
                         designators: item.designators[1..].to_vec(),
                         init: item.init.clone(),
-                    }
-                }).collect();
-                let sub_layout = self.get_struct_layout_for_ctype(&field.ty)
+                    })
+                    .collect();
+                let sub_layout = self
+                    .get_struct_layout_for_ctype(&field.ty)
                     .unwrap_or_else(StructLayout::empty_rc);
                 self.emit_sub_struct_to_compound(elements, &sub_items, &sub_layout, field_size);
             } else if is_anon_multi {
-                let sub_items: Vec<InitializerItem> = inits.iter().map(|item| {
-                    InitializerItem {
+                let sub_items: Vec<InitializerItem> = inits
+                    .iter()
+                    .map(|item| InitializerItem {
                         designators: item.designators.clone(),
                         init: item.init.clone(),
-                    }
-                }).collect();
-                let sub_layout = self.get_struct_layout_for_ctype(&field.ty)
+                    })
+                    .collect();
+                let sub_layout = self
+                    .get_struct_layout_for_ctype(&field.ty)
                     .unwrap_or_else(StructLayout::empty_rc);
                 self.emit_sub_struct_to_compound(elements, &sub_items, &sub_layout, field_size);
             } else if field_is_struct && inits.iter().all(|item| item.designators.is_empty()) {
                 // Brace-elided sub-struct initialization: multiple flat items
                 // (no designators) targeting a struct field. Convert them into
                 // positional initializer items for the sub-struct.
-                let sub_items: Vec<InitializerItem> = inits.iter().map(|item| {
-                    InitializerItem {
+                let sub_items: Vec<InitializerItem> = inits
+                    .iter()
+                    .map(|item| InitializerItem {
                         designators: vec![],
                         init: item.init.clone(),
-                    }
-                }).collect();
-                let sub_layout = self.get_struct_layout_for_ctype(&field.ty)
+                    })
+                    .collect();
+                let sub_layout = self
+                    .get_struct_layout_for_ctype(&field.ty)
                     .unwrap_or_else(StructLayout::empty_rc);
                 self.emit_sub_struct_to_compound(elements, &sub_items, &sub_layout, field_size);
             } else {

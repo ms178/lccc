@@ -63,7 +63,10 @@ pub(super) fn color_stack_slots(
 ) {
     let mut segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for segment in &liveness.segments {
-        segments.entry(segment.value_id).or_default().push((segment.start, segment.end));
+        segments
+            .entry(segment.value_id)
+            .or_default()
+            .push((segment.start, segment.end));
     }
     // Liveness can omit a zero-length definition or retain only use-driven
     // pieces. Emission still writes the value's home at every definition,
@@ -99,8 +102,14 @@ pub(super) fn color_stack_slots(
         values.sort_unstable_by(|a, b| {
             let ap = &segments[a];
             let bp = &segments[b];
-            let aspan: u64 = ap.iter().map(|&(s, e)| e.saturating_sub(s) as u64 + 1).sum();
-            let bspan: u64 = bp.iter().map(|&(s, e)| e.saturating_sub(s) as u64 + 1).sum();
+            let aspan: u64 = ap
+                .iter()
+                .map(|&(s, e)| e.saturating_sub(s) as u64 + 1)
+                .sum();
+            let bspan: u64 = bp
+                .iter()
+                .map(|&(s, e)| e.saturating_sub(s) as u64 + 1)
+                .sum();
             bspan
                 .cmp(&aspan)
                 .then(bp.len().cmp(&ap.len()))

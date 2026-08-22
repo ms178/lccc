@@ -81,7 +81,9 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
             if let LineKind::Other { .. } = infos[i].kind {
                 let line = store.get(i);
                 let trimmed = infos[i].trimmed(line);
-                if (trimmed.starts_with("leaq ") || trimmed.starts_with("leal ") || trimmed.starts_with("lea "))
+                if (trimmed.starts_with("leaq ")
+                    || trimmed.starts_with("leal ")
+                    || trimmed.starts_with("lea "))
                     && (trimmed.contains("(%rbp)") || trimmed.contains("(%rsp)"))
                 {
                     func_suppress_tailcall = true;
@@ -117,8 +119,12 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
                 mark_nop(&mut infos[i]);
 
                 // Replace the `ret` with `jmp TARGET`
-                replace_line(store, &mut infos[ret_idx], ret_idx,
-                    format!("    {}", jmp_text));
+                replace_line(
+                    store,
+                    &mut infos[ret_idx],
+                    ret_idx,
+                    format!("    {}", jmp_text),
+                );
 
                 changed = true;
             }
@@ -216,7 +222,8 @@ fn is_tail_call_candidate(
             }
             LineKind::Pop { reg } => {
                 // popq %rbp is part of the epilogue
-                if reg == 5 { // rbp = register family 5
+                if reg == 5 {
+                    // rbp = register family 5
                     found_pop_rbp = true;
                     j += 1;
                     continue;
@@ -288,11 +295,25 @@ mod tests {
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jmp foo"), "should convert call to jmp: {}", result);
-        assert!(!result.contains("call foo"), "should not have call: {}", result);
-        assert!(!result.contains("ret"), "should not have ret (replaced by jmp): {}", result);
+        assert!(
+            result.contains("jmp foo"),
+            "should convert call to jmp: {}",
+            result
+        );
+        assert!(
+            !result.contains("call foo"),
+            "should not have call: {}",
+            result
+        );
+        assert!(
+            !result.contains("ret"),
+            "should not have ret (replaced by jmp): {}",
+            result
+        );
     }
 
     #[test]
@@ -321,10 +342,20 @@ mod tests {
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jmp *%r10"), "should convert call *%r10 to jmp *%r10: {}", result);
-        assert!(!result.contains("call *%r10"), "should not have call: {}", result);
+        assert!(
+            result.contains("jmp *%r10"),
+            "should convert call *%r10 to jmp *%r10: {}",
+            result
+        );
+        assert!(
+            !result.contains("call *%r10"),
+            "should not have call: {}",
+            result
+        );
         assert!(!result.contains("ret"), "should not have ret: {}", result);
     }
 
@@ -337,15 +368,21 @@ mod tests {
             "    movq %rsp, %rbp",
             "    subq $16, %rsp",
             "    call foo",
-            "    movq %rax, %r12",  // uses %rax result - but stores to r12
-            "    movl $42, %eax",   // overwrites %rax!
+            "    movq %rax, %r12", // uses %rax result - but stores to r12
+            "    movl $42, %eax",  // overwrites %rax!
             "    movq %rbp, %rsp",
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("call foo"), "should NOT convert when %rax is modified: {}", result);
+        assert!(
+            result.contains("call foo"),
+            "should NOT convert when %rax is modified: {}",
+            result
+        );
         assert!(result.contains("ret"), "should keep ret: {}", result);
     }
 
@@ -361,11 +398,21 @@ mod tests {
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
         // Only the LAST call should be converted
-        assert!(result.contains("call foo"), "first call should remain: {}", result);
-        assert!(result.contains("jmp bar"), "second call should be tail-optimized: {}", result);
+        assert!(
+            result.contains("call foo"),
+            "first call should remain: {}",
+            result
+        );
+        assert!(
+            result.contains("jmp bar"),
+            "second call should be tail-optimized: {}",
+            result
+        );
     }
 
     #[test]
@@ -380,9 +427,15 @@ mod tests {
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("jmp foo@PLT"), "should convert PLT call to jmp: {}", result);
+        assert!(
+            result.contains("jmp foo@PLT"),
+            "should convert PLT call to jmp: {}",
+            result
+        );
     }
 
     #[test]
@@ -401,7 +454,7 @@ mod tests {
             "    movq %r12, -24(%rbp)",
             "    addq $15, %rax",
             "    andq $-16, %rax",
-            "    subq %rax, %rsp",        // dynamic alloca!
+            "    subq %rax, %rsp", // dynamic alloca!
             "    movq %rsp, %rax",
             "    movq %rax, -16(%rbp)",
             "    call memset",
@@ -412,10 +465,20 @@ mod tests {
             "    popq %rbp",
             "    ret",
             ".size test_alloca, .-test_alloca",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("call printf"), "should NOT convert when alloca exists: {}", result);
-        assert!(result.contains("ret"), "should keep ret when alloca exists: {}", result);
+        assert!(
+            result.contains("call printf"),
+            "should NOT convert when alloca exists: {}",
+            result
+        );
+        assert!(
+            result.contains("ret"),
+            "should keep ret when alloca exists: {}",
+            result
+        );
     }
 
     #[test]
@@ -431,17 +494,27 @@ mod tests {
             "    .cfi_def_cfa_register %rbp",
             "    subq $32, %rsp",
             "    movq %rbx, -32(%rbp)",
-            "    leaq -16(%rbp), %rsi",  // takes address of local!
+            "    leaq -16(%rbp), %rsi", // takes address of local!
             "    movq %rdi, %rbx",
-            "    call bar",              // bar receives pointer to our local
+            "    call bar", // bar receives pointer to our local
             "    movq -32(%rbp), %rbx",
             "    movq %rbp, %rsp",
             "    popq %rbp",
             "    ret",
             ".size func, .-func",
-        ].join("\n") + "\n";
+        ]
+        .join("\n")
+            + "\n";
         let result = peephole_optimize(asm);
-        assert!(result.contains("call bar"), "should NOT convert when lea of local exists: {}", result);
-        assert!(result.contains("ret"), "should keep ret when lea of local exists: {}", result);
+        assert!(
+            result.contains("call bar"),
+            "should NOT convert when lea of local exists: {}",
+            result
+        );
+        assert!(
+            result.contains("ret"),
+            "should keep ret when lea of local exists: {}",
+            result
+        );
     }
 }

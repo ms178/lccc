@@ -1,9 +1,9 @@
 //! X86Codegen: i128 arithmetic and comparison operations.
 
-use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::StackSlot;
 use super::emit::X86Codegen;
+use crate::backend::state::StackSlot;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
 
 impl X86Codegen {
     pub(super) fn emit_i128_prep_binop_impl(&mut self, lhs: &Operand, rhs: &Operand) {
@@ -51,7 +51,9 @@ impl X86Codegen {
                         } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
                             self.state.out.emit_instr_imm_reg("    movq", high, "rsi");
                         } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", high, "rsi");
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", high, "rsi");
                         }
                     }
                     IrConst::Zero => {
@@ -72,7 +74,9 @@ impl X86Codegen {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
-                    self.state.out.emit_instr_rbp_reg("    movq", slot.0 + 8, "rsi");
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg("    movq", slot.0 + 8, "rsi");
                 } else {
                     // No slot (should not happen for i128 values): fall back
                     // to the accumulator pair, then copy into rcx:rsi.
@@ -167,12 +171,17 @@ impl X86Codegen {
             self.state.emit("    movq %rax, %rdx");
             self.state.emit("    xorl %eax, %eax");
         } else if amount > 64 {
-            self.state.out.emit_instr_imm_reg("    shlq", (amount - 64) as i64, "rax");
+            self.state
+                .out
+                .emit_instr_imm_reg("    shlq", (amount - 64) as i64, "rax");
             self.state.emit("    movq %rax, %rdx");
             self.state.emit("    xorl %eax, %eax");
         } else {
-            self.state.emit_fmt(format_args!("    shldq ${}, %rax, %rdx", amount));
-            self.state.out.emit_instr_imm_reg("    shlq", amount as i64, "rax");
+            self.state
+                .emit_fmt(format_args!("    shldq ${}, %rax, %rdx", amount));
+            self.state
+                .out
+                .emit_instr_imm_reg("    shlq", amount as i64, "rax");
         }
     }
 
@@ -184,12 +193,17 @@ impl X86Codegen {
             self.state.emit("    movq %rdx, %rax");
             self.state.emit("    xorl %edx, %edx");
         } else if amount > 64 {
-            self.state.out.emit_instr_imm_reg("    shrq", (amount - 64) as i64, "rdx");
+            self.state
+                .out
+                .emit_instr_imm_reg("    shrq", (amount - 64) as i64, "rdx");
             self.state.emit("    movq %rdx, %rax");
             self.state.emit("    xorl %edx, %edx");
         } else {
-            self.state.emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
-            self.state.out.emit_instr_imm_reg("    shrq", amount as i64, "rdx");
+            self.state
+                .emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
+            self.state
+                .out
+                .emit_instr_imm_reg("    shrq", amount as i64, "rdx");
         }
     }
 
@@ -201,16 +215,26 @@ impl X86Codegen {
             self.state.emit("    movq %rdx, %rax");
             self.state.emit("    sarq $63, %rdx");
         } else if amount > 64 {
-            self.state.out.emit_instr_imm_reg("    sarq", (amount - 64) as i64, "rdx");
+            self.state
+                .out
+                .emit_instr_imm_reg("    sarq", (amount - 64) as i64, "rdx");
             self.state.emit("    movq %rdx, %rax");
             self.state.emit("    sarq $63, %rdx");
         } else {
-            self.state.emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
-            self.state.out.emit_instr_imm_reg("    sarq", amount as i64, "rdx");
+            self.state
+                .emit_fmt(format_args!("    shrdq ${}, %rdx, %rax", amount));
+            self.state
+                .out
+                .emit_instr_imm_reg("    sarq", amount as i64, "rdx");
         }
     }
 
-    pub(super) fn emit_i128_divrem_call_impl(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
+    pub(super) fn emit_i128_divrem_call_impl(
+        &mut self,
+        func_name: &str,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
         self.operand_to_rax_rdx(rhs);
         self.state.emit("    pushq %rdx");
         self.state.emit("    pushq %rax");
@@ -219,27 +243,34 @@ impl X86Codegen {
         self.state.emit("    movq %rdx, %rsi");
         self.state.emit("    popq %rdx");
         self.state.emit("    popq %rcx");
-        self.state.emit_fmt(format_args!("    call {}@PLT", func_name));
+        self.state
+            .emit_fmt(format_args!("    call {}@PLT", func_name));
     }
 
     pub(super) fn emit_i128_store_result_impl(&mut self, dest: &Value) {
         self.store_rax_rdx_to(dest);
     }
 
-    pub(super) fn emit_i128_to_float_call_impl(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) {
+    pub(super) fn emit_i128_to_float_call_impl(
+        &mut self,
+        src: &Operand,
+        from_signed: bool,
+        to_ty: IrType,
+    ) {
         self.operand_to_rax_rdx(src);
         self.state.emit("    movq %rax, %rdi");
         self.state.emit("    movq %rdx, %rsi");
         let func_name = match (from_signed, to_ty) {
-            (true, IrType::F64)  => "__floattidf",
-            (true, IrType::F32)  => "__floattisf",
+            (true, IrType::F64) => "__floattidf",
+            (true, IrType::F32) => "__floattisf",
             (true, IrType::F128) => "__floattitf",
             (false, IrType::F64) => "__floatuntidf",
             (false, IrType::F32) => "__floatuntisf",
             (false, IrType::F128) => "__floatuntitf",
             _ => panic!("unsupported i128-to-float conversion: {:?}", to_ty),
         };
-        self.state.emit_fmt(format_args!("    call {}@PLT", func_name));
+        self.state
+            .emit_fmt(format_args!("    call {}@PLT", func_name));
         self.state.reg_cache.invalidate_all();
         if to_ty == IrType::F128 {
             // _Float128 result stays in %xmm0 (single-XMM SysV ABI).
@@ -252,7 +283,12 @@ impl X86Codegen {
         }
     }
 
-    pub(super) fn emit_float_to_i128_call_impl(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) {
+    pub(super) fn emit_float_to_i128_call_impl(
+        &mut self,
+        src: &Operand,
+        to_signed: bool,
+        from_ty: IrType,
+    ) {
         if from_ty == IrType::F128 {
             // _Float128 (binary128): ONE XMM register per SysV psABI. Load the
             // 16-byte value into %xmm0, then call libgcc's __fixtfti /
@@ -260,7 +296,9 @@ impl X86Codegen {
             match src {
                 Operand::Value(v) => {
                     if let Some(slot) = self.state.get_slot(v.0) {
-                        self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
                     } else if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
                         if held != "xmm0" {
                             self.state
@@ -276,8 +314,13 @@ impl X86Codegen {
                     self.state.emit("    movdqu (%rax), %xmm0");
                 }
             }
-            let func_name = if to_signed { "__fixtfti" } else { "__fixunstfti" };
-            self.state.emit_fmt(format_args!("    call {}@PLT", func_name));
+            let func_name = if to_signed {
+                "__fixtfti"
+            } else {
+                "__fixunstfti"
+            };
+            self.state
+                .emit_fmt(format_args!("    call {}@PLT", func_name));
             self.state.reg_cache.invalidate_all();
             return;
         }
@@ -288,13 +331,14 @@ impl X86Codegen {
             self.state.emit("    movq %rax, %xmm0");
         }
         let func_name = match (to_signed, from_ty) {
-            (true, IrType::F64)  => "__fixdfti",
-            (true, IrType::F32)  => "__fixsfti",
+            (true, IrType::F64) => "__fixdfti",
+            (true, IrType::F32) => "__fixsfti",
             (false, IrType::F64) => "__fixunsdfti",
             (false, IrType::F32) => "__fixunssfti",
             _ => panic!("unsupported float-to-i128 conversion: {:?}", from_ty),
         };
-        self.state.emit_fmt(format_args!("    call {}@PLT", func_name));
+        self.state
+            .emit_fmt(format_args!("    call {}@PLT", func_name));
         self.state.reg_cache.invalidate_all();
     }
 
@@ -360,12 +404,16 @@ impl X86Codegen {
 
     pub(super) fn emit_store_pair_to_slot_impl(&mut self, slot: StackSlot) {
         self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
-        self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
+        self.state
+            .out
+            .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
     }
 
     pub(super) fn emit_load_pair_from_slot_impl(&mut self, slot: StackSlot) {
         self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
-        self.state.out.emit_instr_rbp_reg("    movq", slot.0 + 8, "rdx");
+        self.state
+            .out
+            .emit_instr_rbp_reg("    movq", slot.0 + 8, "rdx");
     }
 
     pub(super) fn emit_save_acc_pair_impl(&mut self) {

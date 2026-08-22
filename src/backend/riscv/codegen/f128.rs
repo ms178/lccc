@@ -8,13 +8,13 @@
 //! mnemonics, S0-relative addressing). The shared orchestration logic lives
 //! in `backend/f128_softfloat.rs`.
 
-use crate::ir::reexports::{Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::{StackSlot, SlotAddr};
-use crate::backend::regalloc::PhysReg;
-use crate::backend::traits::ArchCodegen;
+use super::emit::{callee_saved_name, RiscvCodegen};
 use crate::backend::f128_softfloat::F128SoftFloat;
-use super::emit::{RiscvCodegen, callee_saved_name};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::{SlotAddr, StackSlot};
+use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::ir::reexports::{Operand, Value};
 
 impl F128SoftFloat for RiscvCodegen {
     fn state(&mut self) -> &mut crate::backend::state::CodegenState {
@@ -34,8 +34,10 @@ impl F128SoftFloat for RiscvCodegen {
     }
 
     fn f128_load_const_to_arg1(&mut self, lo: u64, hi: u64) {
-        self.state.emit_fmt(format_args!("    li a0, {}", lo as i64));
-        self.state.emit_fmt(format_args!("    li a1, {}", hi as i64));
+        self.state
+            .emit_fmt(format_args!("    li a0, {}", lo as i64));
+        self.state
+            .emit_fmt(format_args!("    li a1, {}", hi as i64));
     }
 
     fn f128_load_16b_from_addr_reg_to_arg1(&mut self) {
@@ -105,9 +107,11 @@ impl F128SoftFloat for RiscvCodegen {
     }
 
     fn f128_store_const_halves_to_slot(&mut self, lo: u64, hi: u64, slot: StackSlot) {
-        self.state.emit_fmt(format_args!("    li t0, {}", lo as i64));
+        self.state
+            .emit_fmt(format_args!("    li t0, {}", lo as i64));
         self.emit_store_to_s0("t0", slot.0, "sd");
-        self.state.emit_fmt(format_args!("    li t0, {}", hi as i64));
+        self.state
+            .emit_fmt(format_args!("    li t0, {}", hi as i64));
         self.emit_store_to_s0("t0", slot.0 + 8, "sd");
     }
 
@@ -135,9 +139,11 @@ impl F128SoftFloat for RiscvCodegen {
 
     fn f128_store_const_halves_to_addr(&mut self, lo: u64, hi: u64) {
         // t5 holds dest address
-        self.state.emit_fmt(format_args!("    li t0, {}", lo as i64));
+        self.state
+            .emit_fmt(format_args!("    li t0, {}", lo as i64));
         self.state.emit("    sd t0, 0(t5)");
-        self.state.emit_fmt(format_args!("    li t0, {}", hi as i64));
+        self.state
+            .emit_fmt(format_args!("    li t0, {}", hi as i64));
         self.state.emit("    sd t0, 8(t5)");
     }
 
@@ -226,7 +232,10 @@ impl F128SoftFloat for RiscvCodegen {
         }
     }
 
-    fn f128_move_phys_to_addr_reg(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mv t5, {}", callee_saved_name(reg))); }
+    fn f128_move_phys_to_addr_reg(&mut self, reg: PhysReg) {
+        self.state
+            .emit_fmt(format_args!("    mv t5, {}", callee_saved_name(reg)));
+    }
 
     // f128_move_aligned_to_addr_reg: RISC-V uses t5 for both alloca-aligned
     // addr and F128 addr register, so the default no-op is correct.
@@ -354,5 +363,4 @@ impl RiscvCodegen {
     pub(super) fn emit_f128_neg_full(&mut self, dest: &Value, src: &Operand) {
         crate::backend::f128_softfloat::f128_neg(self, dest, src);
     }
-
 }

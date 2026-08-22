@@ -20,7 +20,7 @@
 //! 3. **Post-global cleanup + loop trampolines + tail calls + never-read stores
 //!    + callee-save elimination + frame compaction**: see `passes/mod.rs`.
 
-mod types;
 mod passes;
+mod types;
 
 pub(crate) use passes::peephole_optimize;

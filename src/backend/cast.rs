@@ -70,7 +70,8 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
         return CastKind::Noop;
     }
     // Void (and any zero-size type) has no meaningful conversion.
-    if from_ty == IrType::Void || to_ty == IrType::Void || from_ty.size() == 0 || to_ty.size() == 0 {
+    if from_ty == IrType::Void || to_ty == IrType::Void || from_ty.size() == 0 || to_ty.size() == 0
+    {
         return CastKind::Noop;
     }
 
@@ -82,8 +83,16 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
         }
         // x86: F128 (x87 80-bit) is computed as F64. Treat F128 <-> F64 as noop,
         // and F128 <-> other as F64 <-> other.
-        let effective_from = if from_ty == IrType::F128 { IrType::F64 } else { from_ty };
-        let effective_to = if to_ty == IrType::F128 { IrType::F64 } else { to_ty };
+        let effective_from = if from_ty == IrType::F128 {
+            IrType::F64
+        } else {
+            from_ty
+        };
+        let effective_to = if to_ty == IrType::F128 {
+            IrType::F64
+        } else {
+            to_ty
+        };
         if effective_from == effective_to {
             return CastKind::Noop;
         }
@@ -93,12 +102,27 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
     // Ptr is equivalent to U64 on LP64 targets, U32 on ILP32 targets. This block
     // handles Ptr <-> integer casts (both sides non-float). Ptr <-> float is
     // handled in the float paths below, where Ptr must also be unsigned.
-    if (from_ty == IrType::Ptr || to_ty == IrType::Ptr) && !from_ty.is_float() && !to_ty.is_float() {
-        let ptr_int_ty = if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 };
-        let effective_from = if from_ty == IrType::Ptr { ptr_int_ty } else { from_ty };
-        let effective_to = if to_ty == IrType::Ptr { ptr_int_ty } else { to_ty };
+    if (from_ty == IrType::Ptr || to_ty == IrType::Ptr) && !from_ty.is_float() && !to_ty.is_float()
+    {
+        let ptr_int_ty = if crate::common::types::target_is_32bit() {
+            IrType::U32
+        } else {
+            IrType::U64
+        };
+        let effective_from = if from_ty == IrType::Ptr {
+            ptr_int_ty
+        } else {
+            from_ty
+        };
+        let effective_to = if to_ty == IrType::Ptr {
+            ptr_int_ty
+        } else {
+            to_ty
+        };
         let ptr_sz = crate::common::types::target_ptr_size();
-        if effective_from == effective_to || (effective_from.size() == ptr_sz && effective_to.size() == ptr_sz) {
+        if effective_from == effective_to
+            || (effective_from.size() == ptr_sz && effective_to.size() == ptr_sz)
+        {
             return CastKind::Noop;
         }
         return classify_cast(effective_from, effective_to);
@@ -129,11 +153,18 @@ pub fn classify_cast_with_f128(from_ty: IrType, to_ty: IrType, f128_is_native: b
             // backend's U64 path (with the >= 2^63 adjustment) is taken for
             // high-bit kernel addresses instead of the signed convert.
             let from_n = if from_ty == IrType::Ptr {
-                if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 }
+                if crate::common::types::target_is_32bit() {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
             } else {
                 from_ty
             };
-            return CastKind::UnsignedToFloat { to_f64, from_ty: from_n };
+            return CastKind::UnsignedToFloat {
+                to_f64,
+                from_ty: from_n,
+            };
         } else {
             return CastKind::SignedToFloat { to_f64, from_ty };
         }
@@ -195,7 +226,11 @@ fn classify_f128_cast_native(from_ty: IrType, to_ty: IrType) -> CastKind {
             // signedness fix as the plain int->float path: a high-bit kernel
             // address must be converted as unsigned).
             let from_n = if from_ty == IrType::Ptr {
-                if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 }
+                if crate::common::types::target_is_32bit() {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
             } else {
                 from_ty
             };
@@ -217,7 +252,11 @@ fn classify_f128_cast_native(from_ty: IrType, to_ty: IrType) -> CastKind {
     }
     if to_ty.is_unsigned() || to_ty == IrType::Ptr {
         let to_n = if to_ty == IrType::Ptr {
-            if crate::common::types::target_is_32bit() { IrType::U32 } else { IrType::U64 }
+            if crate::common::types::target_is_32bit() {
+                IrType::U32
+            } else {
+                IrType::U64
+            }
         } else {
             to_ty
         };

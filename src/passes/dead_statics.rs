@@ -165,7 +165,11 @@ fn push_named_refs(name: &str, name_to_ids: &FxHashMap<&str, Vec<usize>>, refs: 
     refs.extend_from_slice(ids_for_name(name_to_ids, name));
 }
 
-fn mark_address_taken(name: &str, name_to_ids: &FxHashMap<&str, Vec<usize>>, address_taken: &mut [bool]) {
+fn mark_address_taken(
+    name: &str,
+    name_to_ids: &FxHashMap<&str, Vec<usize>>,
+    address_taken: &mut [bool],
+) {
     for &id in ids_for_name(name_to_ids, name) {
         if let Some(slot) = address_taken.get_mut(id) {
             *slot = true;
@@ -296,7 +300,12 @@ fn compute_reachability(
     }
 
     for (alias_name, target, _) in &module.aliases {
-        mark_named(alias_name.as_ref(), name_to_ids, &mut reachable, &mut worklist);
+        mark_named(
+            alias_name.as_ref(),
+            name_to_ids,
+            &mut reachable,
+            &mut worklist,
+        );
         mark_named(target.as_ref(), name_to_ids, &mut reachable, &mut worklist);
     }
 

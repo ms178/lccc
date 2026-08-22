@@ -11,10 +11,10 @@
 //!   preheader:  %c4 = copy 4.0
 //!   loop:       ... cmp %x, %c4        (no per-iteration constant load)
 
+use super::loop_analysis;
 use crate::common::fx_hash::FxHashSet;
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
-use super::loop_analysis;
 
 /// Run FP-constant hoisting on a function. Returns the number of constants hoisted.
 pub(crate) fn run(func: &mut IrFunction) -> usize {
@@ -22,7 +22,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         return 0;
     }
     let cfg = analysis::CfgAnalysis::build(func);
-    let mut loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+    let mut loops =
+        loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     if loops.is_empty() {
         return 0;
     }
@@ -80,7 +81,12 @@ fn for_each_fp_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
             f(rhs);
         }
         Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => f(src),
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             f(cond);
             f(true_val);
             f(false_val);
@@ -89,7 +95,11 @@ fn for_each_fp_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
     }
 }
 
-fn hoist_in_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, preheader: usize) -> usize {
+fn hoist_in_loop(
+    func: &mut IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+    preheader: usize,
+) -> usize {
     // Collect distinct non-zero FP constants used as operands in the loop body.
     let mut consts: Vec<FpConst> = Vec::new();
     let mut seen: FxHashSet<FpConst> = FxHashSet::default();
@@ -144,7 +154,12 @@ fn rewrite_fp_operands(inst: &mut Instruction, c: FpConst, new_val: u32) {
             sub(rhs);
         }
         Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => sub(src),
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             sub(cond);
             sub(true_val);
             sub(false_val);

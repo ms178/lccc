@@ -5,10 +5,10 @@
 //! template parsing logic. This module provides shared free functions to
 //! avoid duplicating these across both backends.
 
-use std::borrow::Cow;
-use std::fmt::Write;
 use crate::common::types::IrType;
 use crate::ir::reexports::BlockId;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 /// Resolve GCC inline asm dialect alternatives in a template string.
 ///
@@ -62,26 +62,26 @@ fn resolve_dialect_alternatives(line: &str) -> Cow<'_, str> {
 /// This mapping is identical for both x86-64 and i686.
 pub(crate) fn gcc_cc_to_x86(cond: &str) -> &'static str {
     match cond {
-        "e" | "z" => "e",       // equal / zero
-        "ne" | "nz" => "ne",    // not equal / not zero
-        "s" => "s",             // sign (negative)
-        "ns" => "ns",           // not sign (non-negative)
-        "o" => "o",             // overflow
-        "no" => "no",           // no overflow
-        "c" => "c",             // carry
-        "nc" => "nc",           // no carry
-        "a" | "nbe" => "a",     // above (unsigned >)
-        "ae" | "nb" => "ae",    // above or equal (unsigned >=)
-        "b" | "nae" => "b",     // below (unsigned <)
-        "be" | "na" => "be",    // below or equal (unsigned <=)
-        "g" | "nle" => "g",     // greater (signed >)
-        "ge" | "nl" => "ge",    // greater or equal (signed >=)
-        "l" | "nge" => "l",     // less (signed <)
-        "le" | "ng" => "le",    // less or equal (signed <=)
-        "p" | "pe" => "p",      // parity even
-        "np" | "po" => "np",    // parity odd / no parity
+        "e" | "z" => "e",    // equal / zero
+        "ne" | "nz" => "ne", // not equal / not zero
+        "s" => "s",          // sign (negative)
+        "ns" => "ns",        // not sign (non-negative)
+        "o" => "o",          // overflow
+        "no" => "no",        // no overflow
+        "c" => "c",          // carry
+        "nc" => "nc",        // no carry
+        "a" | "nbe" => "a",  // above (unsigned >)
+        "ae" | "nb" => "ae", // above or equal (unsigned >=)
+        "b" | "nae" => "b",  // below (unsigned <)
+        "be" | "na" => "be", // below or equal (unsigned <=)
+        "g" | "nle" => "g",  // greater (signed >)
+        "ge" | "nl" => "ge", // greater or equal (signed >=)
+        "l" | "nge" => "l",  // less (signed <)
+        "le" | "ng" => "le", // less or equal (signed <=)
+        "p" | "pe" => "p",   // parity even
+        "np" | "po" => "np", // parity odd / no parity
         // TODO: emit a warning/diagnostic for unrecognized condition code suffixes
-        _ => "e",               // fallback to equal
+        _ => "e", // fallback to equal
     }
 }
 
@@ -210,16 +210,24 @@ pub(crate) fn substitute_x86_asm_operands(
             //   c (raw constant), P (raw symbol), a (address)
             // But 'l' followed by '[' may be a goto label reference %l[name]
             let mut modifier = None;
-            if chars[i] == 'l' && i + 1 < chars.len() && chars[i + 1] == '[' && !goto_labels.is_empty() {
+            if chars[i] == 'l'
+                && i + 1 < chars.len()
+                && chars[i + 1] == '['
+                && !goto_labels.is_empty()
+            {
                 // This could be %l[name] goto label reference
                 // Parse the name and check if it's a goto label first
                 let saved_i = i;
                 i += 1; // skip 'l'
                 i += 1; // skip '['
                 let name_start = i;
-                while i < chars.len() && chars[i] != ']' { i += 1; }
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
                 let name: String = chars[name_start..i].iter().collect();
-                if i < chars.len() { i += 1; } // skip ']'
+                if i < chars.len() {
+                    i += 1;
+                } // skip ']'
 
                 if let Some((_, block_id)) = goto_labels.iter().find(|(n, _)| n == &name) {
                     // It's a goto label — emit the assembly label
@@ -230,7 +238,11 @@ pub(crate) fn substitute_x86_asm_operands(
                 i = saved_i;
                 modifier = Some('l');
                 i += 1; // skip 'l', will parse [name] below
-            } else if chars[i] == 'l' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() && !goto_labels.is_empty() {
+            } else if chars[i] == 'l'
+                && i + 1 < chars.len()
+                && chars[i + 1].is_ascii_digit()
+                && !goto_labels.is_empty()
+            {
                 // %l<N> could be a goto label positional reference
                 let saved_i = i;
                 i += 1; // skip 'l'
@@ -256,11 +268,15 @@ pub(crate) fn substitute_x86_asm_operands(
                     modifier = Some('P');
                     i += 1;
                 }
-            } else if matches!(chars[i], 'k' | 'w' | 'b' | 'h' | 'q' | 'l' | 'c' | 'a' | 'n' | 'd')
-                && i + 1 < chars.len() && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '[') {
-                    modifier = Some(chars[i]);
-                    i += 1;
-                }
+            } else if matches!(
+                chars[i],
+                'k' | 'w' | 'b' | 'h' | 'q' | 'l' | 'c' | 'a' | 'n' | 'd'
+            ) && i + 1 < chars.len()
+                && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '[')
+            {
+                modifier = Some(chars[i]);
+                i += 1;
+            }
 
             if chars[i] == '[' {
                 // Named operand: %[name] or %k[name]
@@ -270,15 +286,25 @@ pub(crate) fn substitute_x86_asm_operands(
                     i += 1;
                 }
                 let name: String = chars[name_start..i].iter().collect();
-                if i < chars.len() { i += 1; } // skip ]
+                if i < chars.len() {
+                    i += 1;
+                } // skip ]
 
                 let mut found = false;
                 for (idx, op_name) in op_names.iter().enumerate() {
                     if let Some(ref n) = op_name {
                         if n == &name {
-                            emit_operand(&mut result, idx, modifier,
-                                op_regs, op_is_memory, op_mem_addrs, op_types,
-                                op_imm_values, op_imm_symbols);
+                            emit_operand(
+                                &mut result,
+                                idx,
+                                modifier,
+                                op_regs,
+                                op_is_memory,
+                                op_mem_addrs,
+                                op_types,
+                                op_imm_values,
+                                op_imm_symbols,
+                            );
                             found = true;
                             break;
                         }
@@ -286,7 +312,9 @@ pub(crate) fn substitute_x86_asm_operands(
                 }
                 if !found {
                     result.push('%');
-                    if let Some(m) = modifier { result.push(m); }
+                    if let Some(m) = modifier {
+                        result.push(m);
+                    }
                     result.push('[');
                     result.push_str(&name);
                     result.push(']');
@@ -305,18 +333,30 @@ pub(crate) fn substitute_x86_asm_operands(
                     num // fallback: direct mapping
                 };
                 if internal_idx < op_regs.len() {
-                    emit_operand(&mut result, internal_idx, modifier,
-                        op_regs, op_is_memory, op_mem_addrs, op_types,
-                        op_imm_values, op_imm_symbols);
+                    emit_operand(
+                        &mut result,
+                        internal_idx,
+                        modifier,
+                        op_regs,
+                        op_is_memory,
+                        op_mem_addrs,
+                        op_types,
+                        op_imm_values,
+                        op_imm_symbols,
+                    );
                 } else {
                     result.push('%');
-                    if let Some(m) = modifier { result.push(m); }
+                    if let Some(m) = modifier {
+                        result.push(m);
+                    }
                     result.push_str(&num.to_string());
                 }
             } else {
                 // Not a recognized pattern, emit as-is (e.g. %rax, %eax, etc.)
                 result.push('%');
-                if let Some(m) = modifier { result.push(m); }
+                if let Some(m) = modifier {
+                    result.push(m);
+                }
                 result.push(chars[i]);
                 i += 1;
             }
@@ -348,7 +388,11 @@ pub(crate) fn emit_operand_common(
     // GCC's 'd' modifier duplicates the operand (glibc math-inline-asm.h uses
     // VARGPREFIX "%d" -> `%vdivss %1, %d0` with a "+x" operand): emit the
     // operand in its plain register form.
-    let modifier = if modifier == Some('d') { None } else { modifier };
+    let modifier = if modifier == Some('d') {
+        None
+    } else {
+        modifier
+    };
     let is_raw = matches!(modifier, Some('c') | Some('P'));
     let is_neg = modifier == Some('n');
     let has_symbol = op_imm_symbols.get(idx).and_then(|s| s.as_ref());

@@ -5,10 +5,10 @@
 //! can be used as a fallback. The `gcc_m16` feature enables GCC passthrough
 //! for -m16 mode (16-bit real-mode boot code).
 
-#[cfg(feature = "gcc_assembler")]
-use std::sync::Once;
 use super::Driver;
 use crate::backend::Target;
+#[cfg(feature = "gcc_assembler")]
+use std::sync::Once;
 
 /// Print a one-time warning when using a GCC-backed assembler for
 /// source .s/.S files.
@@ -65,7 +65,10 @@ impl Driver {
                 continue;
             }
             match arg.as_str() {
-                "-o" => { skip_next = true; continue; }
+                "-o" => {
+                    skip_next = true;
+                    continue;
+                }
                 "-c" | "-S" => continue,
                 _ => {}
             }
@@ -80,25 +83,34 @@ impl Driver {
                 cmd.arg("-S");
                 cmd.arg("-o").arg(output_path);
                 cmd.arg(input_file);
-                let result = cmd.output()
+                let result = cmd
+                    .output()
                     .map_err(|e| format!("Failed to run GCC for -m16: {}", e))?;
                 if !result.status.success() {
                     let stderr = String::from_utf8_lossy(&result.stderr);
-                    return Err(format!("GCC -m16 compilation of {} failed: {}", input_file, stderr));
+                    return Err(format!(
+                        "GCC -m16 compilation of {} failed: {}",
+                        input_file, stderr
+                    ));
                 }
-                let asm = std::fs::read_to_string(output_path)
-                    .map_err(|e| format!("Cannot read GCC assembly output {}: {}", output_path, e))?;
+                let asm = std::fs::read_to_string(output_path).map_err(|e| {
+                    format!("Cannot read GCC assembly output {}: {}", output_path, e)
+                })?;
                 Ok(Some(asm))
             }
             GccM16Mode::Object => {
                 cmd.arg("-c");
                 cmd.arg("-o").arg(output_path);
                 cmd.arg(input_file);
-                let result = cmd.output()
+                let result = cmd
+                    .output()
                     .map_err(|e| format!("Failed to run GCC for -m16: {}", e))?;
                 if !result.status.success() {
                     let stderr = String::from_utf8_lossy(&result.stderr);
-                    return Err(format!("GCC -m16 compilation of {} failed: {}", input_file, stderr));
+                    return Err(format!(
+                        "GCC -m16 compilation of {} failed: {}",
+                        input_file, stderr
+                    ));
                 }
                 Ok(None)
             }
@@ -110,7 +122,11 @@ impl Driver {
     /// When the `gcc_assembler` Cargo feature is enabled, uses GCC for
     /// assembling (with a warning). When disabled (default), uses the
     /// built-in assembler with built-in C preprocessor for .S files.
-    pub(super) fn assemble_source_file(&self, input_file: &str, output_path: &str) -> Result<(), String> {
+    pub(super) fn assemble_source_file(
+        &self,
+        input_file: &str,
+        output_path: &str,
+    ) -> Result<(), String> {
         // When gcc_assembler feature is enabled, use GCC for assembling
         #[cfg(feature = "gcc_assembler")]
         {
@@ -133,7 +149,12 @@ impl Driver {
     ///
     /// Only compiled when the `gcc_assembler` feature is enabled.
     #[cfg(feature = "gcc_assembler")]
-    fn assemble_source_file_gcc(&self, input_file: &str, output_path: &str, custom_command: Option<&str>) -> Result<(), String> {
+    fn assemble_source_file_gcc(
+        &self,
+        input_file: &str,
+        output_path: &str,
+        custom_command: Option<&str>,
+    ) -> Result<(), String> {
         let config = self.target.assembler_config();
         let asm_command = custom_command.unwrap_or(config.command);
 
@@ -192,7 +213,8 @@ impl Driver {
             cmd.stdout(std::process::Stdio::inherit());
         }
 
-        let result = cmd.output()
+        let result = cmd
+            .output()
             .map_err(|e| format!("Failed to run assembler for {}: {}", input_file, e))?;
 
         if !result.status.success() {
@@ -212,7 +234,11 @@ impl Driver {
     /// For .s files (pure assembly), reads the file directly and passes it
     /// to the builtin assembler.
     #[cfg_attr(feature = "gcc_assembler", allow(dead_code))] // Only called in standalone (non-gcc) assembler mode
-    fn assemble_source_file_builtin(&self, input_file: &str, output_path: &str) -> Result<(), String> {
+    fn assemble_source_file_builtin(
+        &self,
+        input_file: &str,
+        output_path: &str,
+    ) -> Result<(), String> {
         let needs_cpp = input_file.ends_with(".S")
             || self.explicit_language.as_deref() == Some("assembler-with-cpp");
         let asm_text = if needs_cpp {
@@ -272,12 +298,15 @@ impl Driver {
         // Debug: dump preprocessed assembly to /tmp/asm_debug_<basename>.s
         if std::env::var("CCC_ASM_DEBUG").is_ok() {
             let basename = std::path::Path::new(input_file)
-                .file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
             let _ = std::fs::write(format!("/tmp/asm_debug_{}.s", basename), &asm_text);
         }
 
         let extra = self.build_asm_extra_args();
-        self.target.assemble_with_extra(&asm_text, output_path, &extra)
+        self.target
+            .assemble_with_extra(&asm_text, output_path, &extra)
     }
 
     /// Build extra assembler arguments for RISC-V ABI/arch overrides.

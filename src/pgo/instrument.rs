@@ -25,9 +25,9 @@
 //! `h1` is the post-pass fingerprint used to detect CFG drift from
 //! profile-guided transforms; drift degrades edge-based layout gracefully
 //! instead of dropping the whole function.
+use crate::backend::Target;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::backend::Target;
 use crate::ir::constants::IrConst;
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, Instruction, IrFunction, IrGlobal, IrModule,
@@ -211,7 +211,14 @@ fn scc_ids(nodes: &[u32], edges: &[Edge]) -> FxHashMap<u32, u32> {
     for v in 0..n {
         if index[v] == usize::MAX {
             dfs(
-                v, &adj, &mut index, &mut low, &mut on, &mut stack, &mut comp, &mut next_index,
+                v,
+                &adj,
+                &mut index,
+                &mut low,
+                &mut on,
+                &mut stack,
+                &mut comp,
+                &mut next_index,
                 &mut next_comp,
             );
         }
@@ -230,10 +237,7 @@ fn choose_instrumented_edges(nodes: &[u32], edges: &[Edge], entry: u32) -> Vec<E
     let comp = scc_ids(nodes, edges);
     let dom = dominators(nodes, edges, entry);
     let weight = |e: &Edge| -> i64 {
-        let backed = dom
-            .get(&e.src)
-            .map(|d| d.contains(&e.dst))
-            .unwrap_or(false);
+        let backed = dom.get(&e.src).map(|d| d.contains(&e.dst)).unwrap_or(false);
         let loopish = e.src == e.dst
             || comp
                 .get(&e.src)
@@ -516,12 +520,17 @@ pub fn instrument_module(
                 let Terminator::CondBranch { cond, .. } = &b.terminator else {
                     continue;
                 };
-                let Operand::Value(condv) = cond else { continue };
+                let Operand::Value(condv) = cond else {
+                    continue;
+                };
                 let mut cur = condv.0;
                 let mut ok = false;
                 for inst in b.instructions.iter().rev() {
                     match inst {
-                        Instruction::Copy { dest, src: Operand::Value(v) } if dest.0 == cur => {
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(v),
+                        } if dest.0 == cur => {
                             cur = v.0;
                         }
                         Instruction::Cmp { dest, .. } if dest.0 == cur => {
@@ -604,7 +613,11 @@ pub fn instrument_module(
             is_static: true,
             is_extern: false,
             is_common: false,
-            section: if std::env::var("LCCC_PGO_BSS_ARRAYS").is_ok() { None } else { Some(SEC.into()) },
+            section: if std::env::var("LCCC_PGO_BSS_ARRAYS").is_ok() {
+                None
+            } else {
+                Some(SEC.into())
+            },
             is_weak: false,
             visibility: Some("hidden".into()),
             has_explicit_align: true,
@@ -624,66 +637,70 @@ pub fn instrument_module(
             // Debug: emit arrays + dump helpers but ZERO counter instructions.
             f.next_label = next_split_label + 1;
         } else {
-        for (i, e) in instr_edges.iter().enumerate() {
-            if entry_only && e.src != VENTRY {
-                continue;
-            }
-            let place_in = if e.src == VENTRY {
-                entry
-            } else if std::env::var("LCCC_PGO_START_ONLY").is_ok() {
-                // Debug: place ALL counters at the destination start.
-                if let Some(&s) = split_of.get(e) { s } else { e.dst }
-            } else if outdeg.get(&e.src).copied().unwrap_or(0) == 1
-                && !ends_with_fused_cmp.contains(&e.src)
-            {
-                e.src
-            } else if let Some(&s) = split_of.get(e) {
-                s
-            } else if indeg.get(&e.dst).copied().unwrap_or(0) == 1 {
-                e.dst
-            } else {
-                // create a split block for this edge
-                next_split_label += 1;
-                let s = next_split_label;
-                split_of.insert(*e, s);
-                for b in &mut f.blocks {
-                    if b.label.0 != e.src {
-                        continue;
-                    }
-                    let mut rw = |l: &mut BlockId| {
-                        if l.0 == e.dst {
-                            l.0 = s;
-                        }
-                    };
-                    match &mut b.terminator {
-                        Terminator::Branch(x) => rw(x),
-                        Terminator::CondBranch {
-                            true_label,
-                            false_label,
-                            ..
-                        } => {
-                            rw(true_label);
-                            rw(false_label);
-                        }
-                        Terminator::Switch { cases, default, .. } => {
-                            for (_, x) in cases.iter_mut() {
-                                rw(x);
-                            }
-                            rw(default);
-                        }
-                        _ => {}
-                    }
+            for (i, e) in instr_edges.iter().enumerate() {
+                if entry_only && e.src != VENTRY {
+                    continue;
                 }
-                f.blocks.push(BasicBlock {
-                    label: BlockId(s),
-                    instructions: vec![],
-                    terminator: Terminator::Branch(BlockId(e.dst)),
-                    source_spans: vec![],
-                });
-                s
-            };
-            per_block.entry(place_in).or_default().push(i);
-        }
+                let place_in = if e.src == VENTRY {
+                    entry
+                } else if std::env::var("LCCC_PGO_START_ONLY").is_ok() {
+                    // Debug: place ALL counters at the destination start.
+                    if let Some(&s) = split_of.get(e) {
+                        s
+                    } else {
+                        e.dst
+                    }
+                } else if outdeg.get(&e.src).copied().unwrap_or(0) == 1
+                    && !ends_with_fused_cmp.contains(&e.src)
+                {
+                    e.src
+                } else if let Some(&s) = split_of.get(e) {
+                    s
+                } else if indeg.get(&e.dst).copied().unwrap_or(0) == 1 {
+                    e.dst
+                } else {
+                    // create a split block for this edge
+                    next_split_label += 1;
+                    let s = next_split_label;
+                    split_of.insert(*e, s);
+                    for b in &mut f.blocks {
+                        if b.label.0 != e.src {
+                            continue;
+                        }
+                        let mut rw = |l: &mut BlockId| {
+                            if l.0 == e.dst {
+                                l.0 = s;
+                            }
+                        };
+                        match &mut b.terminator {
+                            Terminator::Branch(x) => rw(x),
+                            Terminator::CondBranch {
+                                true_label,
+                                false_label,
+                                ..
+                            } => {
+                                rw(true_label);
+                                rw(false_label);
+                            }
+                            Terminator::Switch { cases, default, .. } => {
+                                for (_, x) in cases.iter_mut() {
+                                    rw(x);
+                                }
+                                rw(default);
+                            }
+                            _ => {}
+                        }
+                    }
+                    f.blocks.push(BasicBlock {
+                        label: BlockId(s),
+                        instructions: vec![],
+                        terminator: Terminator::Branch(BlockId(e.dst)),
+                        source_spans: vec![],
+                    });
+                    s
+                };
+                per_block.entry(place_in).or_default().push(i);
+            }
         } // !no_insert
         f.next_label = next_split_label + 1;
         for b in &mut f.blocks {
@@ -742,10 +759,7 @@ pub fn instrument_module(
                     if ind {
                         let (fp, sig) = match &b.instructions[k] {
                             Instruction::CallIndirect { func_ptr, info } => match func_ptr {
-                                Operand::Value(v) => (
-                                    *v,
-                                    site_signature(info),
-                                ),
+                                Operand::Value(v) => (*v, site_signature(info)),
                                 _ => {
                                     ordinal += 1;
                                     k += 1;
@@ -754,8 +768,7 @@ pub fn instrument_module(
                             },
                             _ => unreachable!(),
                         };
-                        let site =
-                            format!("__lccc_pgo_vp_{:016x}_{:016x}_{}", uid, h0, ordinal);
+                        let site = format!("__lccc_pgo_vp_{:016x}_{:016x}_{}", uid, h0, ordinal);
                         let sa = Value(next_val);
                         next_val += 1;
                         let g = IrGlobal {
@@ -805,11 +818,7 @@ pub fn instrument_module(
                                 .insert(k + 1, crate::common::source::Span::dummy());
                         }
                         k += 2;
-                        site_recs.push(SiteRec {
-                            ordinal,
-                            site,
-                            sig,
-                        });
+                        site_recs.push(SiteRec { ordinal, site, sig });
                         ordinal += 1;
                     }
                     k += 1;
@@ -884,7 +893,8 @@ fn dump_helper(
     let hdr2 = format!("__lccc_pgo_hdr2_{}", m.functions.len());
     m.string_literals
         .push((hdr2.clone(), "%u %llu\nfunc %s\n".into()));
-    m.string_literals.push((pair.clone(), "e %u %u %llu\n".into()));
+    m.string_literals
+        .push((pair.clone(), "e %u %u %llu\n".into()));
     m.string_literals.push((fpair.clone(), "f %llu\n".into()));
     m.string_literals
         .push((vp_fmt.clone(), "v %u %llu %s\n".into()));
@@ -1160,7 +1170,8 @@ fn dump_helper(
             offset: Operand::Const(IrConst::I64((*entry_slot * 8) as i64)),
             ty: IrType::I64,
         });
-        is.push(Instruction::Load { volatile: false,
+        is.push(Instruction::Load {
+            volatile: false,
             dest: fcnt,
             ptr: fg,
             ty: IrType::I64,
@@ -1195,7 +1206,8 @@ fn dump_helper(
                 offset: Operand::Const(IrConst::I64((*slot * 8) as i64)),
                 ty: IrType::I64,
             });
-            is.push(Instruction::Load { volatile: false,
+            is.push(Instruction::Load {
+                volatile: false,
                 dest: fmt,
                 ptr: lp,
                 ty: IrType::I64,
@@ -1218,7 +1230,13 @@ fn dump_helper(
                         Operand::Const(IrConst::I32(*dst as i32)),
                         Operand::Value(fmt),
                     ],
-                    vec![IrType::Ptr, IrType::Ptr, IrType::I32, IrType::I32, IrType::I64],
+                    vec![
+                        IrType::Ptr,
+                        IrType::Ptr,
+                        IrType::I32,
+                        IrType::I32,
+                        IrType::I64,
+                    ],
                     IrType::I32,
                     true,
                 ),
@@ -1244,17 +1262,14 @@ fn dump_helper(
                     offset: Operand::Const(IrConst::I64(64)),
                     ty: IrType::I64,
                 });
-                is.push(Instruction::Load { volatile: false,
+                is.push(Instruction::Load {
+                    volatile: false,
                     dest: tot,
                     ptr: totp,
                     ty: IrType::I64,
                     seg_override: crate::common::types::AddressSpace::Default,
                 });
-                let sig_sym = format!(
-                    "__lccc_pgo_sig_{}_{}",
-                    sanitize(fkey),
-                    m.functions.len()
-                );
+                let sig_sym = format!("__lccc_pgo_sig_{}_{}", sanitize(fkey), m.functions.len());
                 m.string_literals.push((sig_sym.clone(), sr.sig.clone()));
                 for slot in 0..4usize {
                     let ap = Value(next);
@@ -1281,7 +1296,8 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64((slot * 8) as i64)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load { volatile: false,
+                    is.push(Instruction::Load {
+                        volatile: false,
                         dest: av,
                         ptr: ap,
                         ty: IrType::I64,
@@ -1293,7 +1309,8 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64((32 + slot * 8) as i64)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load { volatile: false,
+                    is.push(Instruction::Load {
+                        volatile: false,
                         dest: cv,
                         ptr: cp,
                         ty: IrType::I64,
@@ -1317,7 +1334,8 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64(8)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load { volatile: false,
+                    is.push(Instruction::Load {
+                        volatile: false,
                         dest: nm2,
                         ptr: nm2,
                         ty: IrType::I64,
@@ -1329,7 +1347,8 @@ fn dump_helper(
                         offset: Operand::Const(IrConst::I64(16)),
                         ty: IrType::I64,
                     });
-                    is.push(Instruction::Load { volatile: false,
+                    is.push(Instruction::Load {
+                        volatile: false,
                         dest: fl,
                         ptr: fl2,
                         ty: IrType::I64,
@@ -1535,7 +1554,6 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-
 /// Build a tiny standalone helper function (IR-built runtime for PGO value
 /// profiling). Params follow the frontend's exact lowering pattern — Alloca +
 /// ParamRef + Store in the entry block — because the backend's prologue
@@ -1556,7 +1574,8 @@ fn push_helper_fn(
         .iter()
         .map(|&ty| crate::ir::reexports::IrParam {
             ty,
-            noalias: false, struct_size: None,
+            noalias: false,
+            struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,
@@ -1586,13 +1605,15 @@ fn push_helper_fn(
             param_idx: i,
             ty,
         });
-        entry_is.push(Instruction::Store { volatile: false,
+        entry_is.push(Instruction::Store {
+            volatile: false,
             val: Operand::Value(Value(i as u32)),
             ptr: a,
             ty,
             seg_override: crate::common::types::AddressSpace::Default,
         });
-        entry_is.push(Instruction::Load { volatile: false,
+        entry_is.push(Instruction::Load {
+            volatile: false,
             dest: l,
             ptr: a,
             ty,
@@ -1621,7 +1642,11 @@ fn push_helper_fn(
             for inst in b.instructions.iter_mut() {
                 match inst {
                     Instruction::Store {
-                        val, ptr, ty, seg_override, ..
+                        val,
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
                     } => {
                         let _ = ty;
                         let _ = seg_override;
@@ -1632,14 +1657,14 @@ fn push_helper_fn(
                         remap_dest(dest);
                         remap_dest(ptr);
                     }
-                    Instruction::GetElementPtr { dest, base, offset, .. } => {
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => {
                         remap_dest(dest);
                         remap_dest(base);
                         remap_op(offset);
                     }
-                    Instruction::BinOp {
-                        dest, lhs, rhs, ..
-                    } => {
+                    Instruction::BinOp { dest, lhs, rhs, .. } => {
                         remap_dest(dest);
                         remap_op(lhs);
                         remap_op(rhs);
@@ -1805,7 +1830,8 @@ impl VpBuilder {
     }
     fn load(&mut self, ptr: Value) -> Value {
         let d = self.v();
-        self.push(Instruction::Load { volatile: false,
+        self.push(Instruction::Load {
+            volatile: false,
             dest: d,
             ptr,
             ty: IrType::I64,
@@ -1814,7 +1840,8 @@ impl VpBuilder {
         d
     }
     fn store(&mut self, ptr: Value, val: Operand) {
-        self.push(Instruction::Store { volatile: false,
+        self.push(Instruction::Store {
+            volatile: false,
             val,
             ptr,
             ty: IrType::I64,
@@ -2026,11 +2053,11 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             name: pool.clone(),
         });
         let tmp = b.gep(poolv, 0);
-            b.store(tmp, Operand::Value(old));
+        b.store(tmp, Operand::Value(old));
         let tmp = b.gep(poolv, 8);
-            b.store(tmp, Operand::Value(Value(0)));
+        b.store(tmp, Operand::Value(Value(0)));
         let tmp = b.gep(poolv, 16);
-            b.store(tmp, Operand::Value(Value(1)));
+        b.store(tmp, Operand::Value(Value(1)));
         b.store(headp, Operand::Value(poolv));
         label_base += 1;
         push_helper_fn(
@@ -2123,29 +2150,85 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             let tmp = e.gep(site, (i * 8) as i64);
             let tv = e.load(tmp);
             t.push(tv);
-            let q = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(tv), Operand::Value(fp));
+            let q = e.cmp(
+                crate::ir::ops::IrCmpOp::Eq,
+                Operand::Value(tv),
+                Operand::Value(fp),
+            );
             eqs.push(q);
         }
         // empty-slot zero compares (reuse t values)
-        let z0 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(t[0]), Operand::Const(IrConst::I64(0)));
-        let z1 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(t[1]), Operand::Const(IrConst::I64(0)));
-        let z2 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(t[2]), Operand::Const(IrConst::I64(0)));
-        let z3 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(t[3]), Operand::Const(IrConst::I64(0)));
+        let z0 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(t[0]),
+            Operand::Const(IrConst::I64(0)),
+        );
+        let z1 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(t[1]),
+            Operand::Const(IrConst::I64(0)),
+        );
+        let z2 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(t[2]),
+            Operand::Const(IrConst::I64(0)),
+        );
+        let z3 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(t[3]),
+            Operand::Const(IrConst::I64(0)),
+        );
         // load counts for the eviction min
         let mut c: Vec<Value> = Vec::new();
         for i in 0..4 {
             let tmp = e.gep(site, (32 + i * 8) as i64);
             c.push(e.load(tmp));
         }
-        let u01 = e.cmp(crate::ir::ops::IrCmpOp::Ule, Operand::Value(c[0]), Operand::Value(c[1]));
-        let m01 = e.sel(Operand::Value(u01), Operand::Value(c[0]), Operand::Value(c[1]));
-        let u012 = e.cmp(crate::ir::ops::IrCmpOp::Ule, Operand::Value(m01), Operand::Value(c[2]));
-        let m012 = e.sel(Operand::Value(u012), Operand::Value(m01), Operand::Value(c[2]));
-        let u0123 = e.cmp(crate::ir::ops::IrCmpOp::Ule, Operand::Value(m012), Operand::Value(c[3]));
-        let min = e.sel(Operand::Value(u0123), Operand::Value(m012), Operand::Value(c[3]));
-        let q0 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(min), Operand::Value(c[0]));
-        let q1 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(min), Operand::Value(c[1]));
-        let q2 = e.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(min), Operand::Value(c[2]));
+        let u01 = e.cmp(
+            crate::ir::ops::IrCmpOp::Ule,
+            Operand::Value(c[0]),
+            Operand::Value(c[1]),
+        );
+        let m01 = e.sel(
+            Operand::Value(u01),
+            Operand::Value(c[0]),
+            Operand::Value(c[1]),
+        );
+        let u012 = e.cmp(
+            crate::ir::ops::IrCmpOp::Ule,
+            Operand::Value(m01),
+            Operand::Value(c[2]),
+        );
+        let m012 = e.sel(
+            Operand::Value(u012),
+            Operand::Value(m01),
+            Operand::Value(c[2]),
+        );
+        let u0123 = e.cmp(
+            crate::ir::ops::IrCmpOp::Ule,
+            Operand::Value(m012),
+            Operand::Value(c[3]),
+        );
+        let min = e.sel(
+            Operand::Value(u0123),
+            Operand::Value(m012),
+            Operand::Value(c[3]),
+        );
+        let q0 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(min),
+            Operand::Value(c[0]),
+        );
+        let q1 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(min),
+            Operand::Value(c[1]),
+        );
+        let q2 = e.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(min),
+            Operand::Value(c[2]),
+        );
         let entry = BasicBlock {
             label: l0,
             instructions: e.is,
@@ -2281,7 +2364,14 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
                 source_spans: vec![],
             },
         ];
-        push_helper_fn(m, vp_recorder, vec![IrType::Ptr, IrType::I64], blocks, n8, label_base);
+        push_helper_fn(
+            m,
+            vp_recorder,
+            vec![IrType::Ptr, IrType::I64],
+            blocks,
+            n8,
+            label_base,
+        );
         label_base += 20;
     }
 
@@ -2291,8 +2381,16 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
     // advances — a fresh value per iteration never updates the comparison.
     {
         let (l0, lcond, lbody, lpc, lpb, lpn, lnn, ldone, lfound, lret) = (
-            BlockId(0), BlockId(1), BlockId(2), BlockId(3), BlockId(4),
-            BlockId(5), BlockId(6), BlockId(7), BlockId(8), BlockId(9),
+            BlockId(0),
+            BlockId(1),
+            BlockId(2),
+            BlockId(3),
+            BlockId(4),
+            BlockId(5),
+            BlockId(6),
+            BlockId(7),
+            BlockId(8),
+            BlockId(9),
         );
         // Shared loop-carried value ids (allocated once, redefined by copies).
         let mut e = VpBuilder::new(1);
@@ -2319,7 +2417,11 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         };
         // lcond: if node0 != 0 -> body else done (node0 redefined in lnn)
         let mut c = VpBuilder::new(e.next);
-        let nz = c.cmp(crate::ir::ops::IrCmpOp::Ne, Operand::Value(node0), Operand::Const(IrConst::I64(0)));
+        let nz = c.cmp(
+            crate::ir::ops::IrCmpOp::Ne,
+            Operand::Value(node0),
+            Operand::Const(IrConst::I64(0)),
+        );
         let blk_cond = BasicBlock {
             label: lcond,
             instructions: c.is,
@@ -2343,7 +2445,11 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         };
         // lpc: icur < count -> pb else nn
         let mut p = VpBuilder::new(b.next);
-        let ic = p.cmp(crate::ir::ops::IrCmpOp::Ult, Operand::Value(icur), Operand::Value(count));
+        let ic = p.cmp(
+            crate::ir::ops::IrCmpOp::Ult,
+            Operand::Value(icur),
+            Operand::Value(count),
+        );
         let blk_pc = BasicBlock {
             label: lpc,
             instructions: p.is,
@@ -2355,7 +2461,11 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         let off = q.mul(Operand::Value(icur), Operand::Const(IrConst::I64(24)));
         let ep = q.add(Operand::Value(table_v), Operand::Value(off));
         let av = q.load(ep);
-        let ae = q.cmp(crate::ir::ops::IrCmpOp::Eq, Operand::Value(av), Operand::Value(addr));
+        let ae = q.cmp(
+            crate::ir::ops::IrCmpOp::Eq,
+            Operand::Value(av),
+            Operand::Value(addr),
+        );
         let blk_pb = BasicBlock {
             label: lpb,
             instructions: q.is,
@@ -2420,8 +2530,8 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             &lookup,
             vec![IrType::I64],
             vec![
-                entry, blk_cond, blk_body, blk_pc, blk_pb, blk_pn, blk_nn, blk_done,
-                blk_found, blk_ret,
+                entry, blk_cond, blk_body, blk_pc, blk_pb, blk_pn, blk_nn, blk_done, blk_found,
+                blk_ret,
             ],
             x.next,
             label_base,
@@ -2451,8 +2561,14 @@ mod tests {
         let has = |s: u32, d: u32| instr.iter().any(|e| e.src == s && e.dst == d);
         // The forward edge into the latch (1->2) is a TREE edge: it must NOT
         // be instrumented. The backedge (2->1) must be instrumented.
-        assert!(!has(1, 2), "forward edge 1->2 must be a tree edge, not instrumented");
-        assert!(has(2, 1), "backedge 2->1 must be instrumented (off the arborescence)");
+        assert!(
+            !has(1, 2),
+            "forward edge 1->2 must be a tree edge, not instrumented"
+        );
+        assert!(
+            has(2, 1),
+            "backedge 2->1 must be instrumented (off the arborescence)"
+        );
         // Every node except entry must have exactly one incoming TREE edge.
         let tree: FxHashSet<Edge> = edges
             .iter()
@@ -2477,7 +2593,11 @@ mod tests {
             }
         }
         for &v in &[1u32, 2, 3, VEXIT] {
-            assert!(reachable.contains(&v), "node {} must be tree-reachable from entry", v);
+            assert!(
+                reachable.contains(&v),
+                "node {} must be tree-reachable from entry",
+                v
+            );
         }
     }
 }

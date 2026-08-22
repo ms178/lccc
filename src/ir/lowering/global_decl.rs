@@ -6,18 +6,13 @@
 //!   computing type properties, array/pointer info, struct layout, etc.
 //! - `fixup_unsized_array`: resolves unsized array declarations from initializer size.
 
+use super::definitions::{DeclAnalysis, GlobalInfo};
+use super::lower::Lowerer;
+use crate::common::types::{CType, IrType};
 use crate::frontend::parser::ast::{
-    Declaration,
-    DerivedDeclarator,
-    Expr,
-    InitDeclarator,
-    Initializer,
-    TypeSpecifier,
+    Declaration, DerivedDeclarator, Expr, InitDeclarator, Initializer, TypeSpecifier,
 };
 use crate::ir::reexports::{GlobalInit, IrGlobal};
-use crate::common::types::{IrType, CType};
-use super::lower::Lowerer;
-use super::definitions::{GlobalInfo, DeclAnalysis};
 
 enum RedeclResult {
     Skip,
@@ -79,8 +74,16 @@ impl Lowerer {
                 continue;
             }
 
-            self.emit_ir_global(decl, declarator, &da, init, align, has_explicit_align,
-                                is_extern_decl, prior_was_weak);
+            self.emit_ir_global(
+                decl,
+                declarator,
+                &da,
+                init,
+                align,
+                has_explicit_align,
+                is_extern_decl,
+                prior_was_weak,
+            );
         }
     }
 
@@ -114,16 +117,21 @@ impl Lowerer {
                         CType::Struct(k) | CType::Union(k) => k.to_string(),
                         _ => unreachable!(),
                     };
-                    let layout_copy = self.types.borrow_struct_layouts()
+                    let layout_copy = self
+                        .types
+                        .borrow_struct_layouts()
                         .get(&new_key)
                         .map(|l| l.as_ref().clone());
                     if let Some(layout) = layout_copy {
-                        self.types.insert_struct_layout_scoped_from_ref(&old_key, layout);
+                        self.types
+                            .insert_struct_layout_scoped_from_ref(&old_key, layout);
                     }
                     resolved_ctype = existing.clone();
                 }
             }
-            self.types.typedefs.insert(declarator.name.clone(), resolved_ctype);
+            self.types
+                .typedefs
+                .insert(declarator.name.clone(), resolved_ctype);
             if is_enum_type && declarator.derived.is_empty() {
                 self.types.enum_typedefs.insert(declarator.name.clone());
             }
@@ -133,12 +141,12 @@ impl Lowerer {
                     let real_sizeof = self.sizeof_type(sizeof_ts);
                     align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
                 }
-                align.or_else(|| {
-                    decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts))
-                })
+                align.or_else(|| decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)))
             };
             if let Some(align) = effective_alignment {
-                self.types.typedef_alignments.insert(declarator.name.clone(), align);
+                self.types
+                    .typedef_alignments
+                    .insert(declarator.name.clone(), align);
             }
         }
         if decl.is_transparent_union() {
@@ -148,10 +156,20 @@ impl Lowerer {
 
     /// Returns true if this declarator should be skipped (function prototypes,
     /// function typedefs, typeof-declared functions).
-    fn should_skip_global_declarator(&self, decl: &Declaration, declarator: &InitDeclarator) -> bool {
+    fn should_skip_global_declarator(
+        &self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> bool {
         // Skip function declarations (prototypes), but NOT function pointer variables.
-        if declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
-            && !declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+        if declarator
+            .derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
+            && !declarator
+                .derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
             && declarator.init.is_none()
         {
             return true;
@@ -163,8 +181,10 @@ impl Lowerer {
                     return true;
                 }
             }
-            if matches!(&decl.type_spec, TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_))
-                && self.known_functions.contains(&declarator.name)
+            if matches!(
+                &decl.type_spec,
+                TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_)
+            ) && self.known_functions.contains(&declarator.name)
             {
                 return true;
             }
@@ -173,8 +193,14 @@ impl Lowerer {
     }
 
     /// Handle global register variable. Returns true if handled (caller should continue).
-    fn try_lower_register_global(&mut self, decl: &Declaration, declarator: &InitDeclarator) -> bool {
-        let Some(ref reg_name) = declarator.attrs.asm_register else { return false };
+    fn try_lower_register_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> bool {
+        let Some(ref reg_name) = declarator.attrs.asm_register else {
+            return false;
+        };
         if !crate::ir::lowering::lower::is_x86_register_name(reg_name) {
             return false;
         }
@@ -236,17 +262,29 @@ impl Lowerer {
 
     /// Handle tentative definitions and re-declarations. Returns whether to skip
     /// or proceed (with prior weak flag preserved).
-    fn handle_global_redeclaration(&mut self, decl: &Declaration, declarator: &InitDeclarator) -> RedeclResult {
+    fn handle_global_redeclaration(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> RedeclResult {
         if !self.globals.contains_key(&declarator.name) {
-            return RedeclResult::Proceed { prior_was_weak: false };
+            return RedeclResult::Proceed {
+                prior_was_weak: false,
+            };
         }
         if declarator.init.is_none() {
             if self.emitted_global_names.contains(&declarator.name) {
-                let prior_is_extern = self.module.globals.iter()
+                let prior_is_extern = self
+                    .module
+                    .globals
+                    .iter()
                     .any(|g| g.name == declarator.name && g.is_extern);
                 if prior_is_extern && !decl.is_extern() {
                     // Remove old extern entry and re-emit as defined
-                    let prior_was_weak = self.module.globals.iter()
+                    let prior_was_weak = self
+                        .module
+                        .globals
+                        .iter()
                         .find(|g| g.name == declarator.name)
                         .is_some_and(|g| g.is_weak);
                     self.module.globals.retain(|g| g.name != declarator.name);
@@ -265,19 +303,28 @@ impl Lowerer {
                 return RedeclResult::Skip;
             }
         } else {
-            let prior_was_weak = self.module.globals.iter()
+            let prior_was_weak = self
+                .module
+                .globals
+                .iter()
                 .find(|g| g.name == declarator.name)
                 .is_some_and(|g| g.is_weak);
             self.module.globals.retain(|g| g.name != declarator.name);
             self.emitted_global_names.remove(&declarator.name);
             return RedeclResult::Proceed { prior_was_weak };
         }
-        RedeclResult::Proceed { prior_was_weak: false }
+        RedeclResult::Proceed {
+            prior_was_weak: false,
+        }
     }
 
     /// Run declaration analysis with vector_size, array-of-pointers fixup, unsized
     /// array fixup, and scalar size adjustment.
-    fn prepare_global_analysis(&self, decl: &Declaration, declarator: &InitDeclarator) -> DeclAnalysis {
+    fn prepare_global_analysis(
+        &self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> DeclAnalysis {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
         da.base_type_volatile = decl.is_volatile();
         let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
@@ -288,7 +335,12 @@ impl Lowerer {
             da.struct_layout = None;
             da.is_struct = false;
         }
-        self.fixup_unsized_array(&mut da, &decl.type_spec, &declarator.derived, &declarator.init);
+        self.fixup_unsized_array(
+            &mut da,
+            &decl.type_spec,
+            &declarator.derived,
+            &declarator.init,
+        );
         if !da.is_array && !da.is_pointer && da.struct_layout.is_none() {
             let c_size = self.sizeof_type(&decl.type_spec);
             da.actual_alloc_size = c_size.max(da.var_ty.size());
@@ -296,7 +348,12 @@ impl Lowerer {
         da
     }
 
-    fn lower_declarator_init(&mut self, decl: &Declaration, declarator: &InitDeclarator, da: &DeclAnalysis) -> GlobalInit {
+    fn lower_declarator_init(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        da: &DeclAnalysis,
+    ) -> GlobalInit {
         if let Some(ref initializer) = declarator.init {
             let init_base_ty = if da.is_pointer && !da.is_array {
                 da.var_ty
@@ -305,7 +362,16 @@ impl Lowerer {
             } else {
                 da.base_ty
             };
-            self.lower_global_init(initializer, &decl.type_spec, init_base_ty, da.is_array, da.elem_size, da.actual_alloc_size, &da.struct_layout, &da.array_dim_strides)
+            self.lower_global_init(
+                initializer,
+                &decl.type_spec,
+                init_base_ty,
+                da.is_array,
+                da.elem_size,
+                da.actual_alloc_size,
+                &da.struct_layout,
+                &da.array_dim_strides,
+            )
         } else {
             GlobalInit::Zero
         }
@@ -313,7 +379,11 @@ impl Lowerer {
 
     fn compute_global_alignment(&self, decl: &Declaration, da: &DeclAnalysis) -> (usize, bool) {
         let c_align = self.alignof_type(&decl.type_spec);
-        let natural = if c_align > 0 { c_align.max(da.var_ty.align()) } else { da.var_ty.align() };
+        let natural = if c_align > 0 {
+            c_align.max(da.var_ty.align())
+        } else {
+            da.var_ty.align()
+        };
         let mut explicit = if let Some(ref alignas_ts) = decl.alignas_type {
             Some(self.alignof_type(alignas_ts))
         } else {
@@ -334,13 +404,21 @@ impl Lowerer {
     }
 
     fn emit_ir_global(
-        &mut self, decl: &Declaration, declarator: &InitDeclarator,
-        da: &DeclAnalysis, init: GlobalInit, align: usize, has_explicit_align: bool,
-        is_extern_decl: bool, prior_was_weak: bool,
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        da: &DeclAnalysis,
+        init: GlobalInit,
+        align: usize,
+        has_explicit_align: bool,
+        is_extern_decl: bool,
+        prior_was_weak: bool,
     ) {
         let global_ty = da.resolve_global_ty(&init);
         let final_size = match &init {
-            GlobalInit::Array(vals) if da.is_struct && vals.len() > da.actual_alloc_size => vals.len(),
+            GlobalInit::Array(vals) if da.is_struct && vals.len() > da.actual_alloc_size => {
+                vals.len()
+            }
             GlobalInit::Compound(_) if da.is_struct => {
                 let emitted = init.emitted_byte_size();
                 emitted.max(da.actual_alloc_size)
@@ -348,8 +426,10 @@ impl Lowerer {
             _ => da.actual_alloc_size,
         };
         // For pointer variables, decl.is_const refers to the pointee type, not the pointer.
-        let var_is_const = decl.is_const() && !da.is_pointer
-            && !da.is_array_of_pointers && !da.is_array_of_func_ptrs;
+        let var_is_const = decl.is_const()
+            && !da.is_pointer
+            && !da.is_array_of_pointers
+            && !da.is_array_of_func_ptrs;
 
         self.emitted_global_names.insert(declarator.name.clone());
         // Honour the declaration's asm label (`extern int x __asm("abccb"); int x = 1;`
@@ -361,7 +441,8 @@ impl Lowerer {
         // declaration of the same symbol (collected in asm_label_map), or
         // directly on this declarator; real register names pin globals and
         // are never used as rename targets.
-        let emit_name = self.asm_label_map
+        let emit_name = self
+            .asm_label_map
             .get(&declarator.name)
             .cloned()
             .or_else(|| declarator.attrs.asm_register.clone())
@@ -392,7 +473,11 @@ impl Lowerer {
     ///
     /// Computes all type-related properties (base type, array info, pointer info, struct layout,
     /// pointee type, etc.) that both `lower_local_decl` and `lower_global_decl` need.
-    pub(super) fn analyze_declaration(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> DeclAnalysis {
+    pub(super) fn analyze_declaration(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> DeclAnalysis {
         let mut base_ty = self.type_spec_to_ir(type_spec);
         let (alloc_size, elem_size, is_array, is_pointer, array_dim_strides) =
             self.compute_decl_info(type_spec, derived);
@@ -429,15 +514,25 @@ impl Lowerer {
         //      matching the logic in compute_decl_info which checks `last_is_array`.
         //   2. Typedef'd pointer with array dimensions.
         let is_array_of_pointers = is_array && {
-            let ptr_pos = derived.iter().position(|d| matches!(d, DerivedDeclarator::Pointer));
-            let last_arr_pos = derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
-            let has_derived_ptr_before_last_arr = matches!((ptr_pos, last_arr_pos), (Some(pp), Some(ap)) if pp < ap);
-            let typedef_ptr_array = ptr_pos.is_none() && last_arr_pos.is_some() &&
-                self.is_type_pointer(type_spec);
+            let ptr_pos = derived
+                .iter()
+                .position(|d| matches!(d, DerivedDeclarator::Pointer));
+            let last_arr_pos = derived
+                .iter()
+                .rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
+            let has_derived_ptr_before_last_arr =
+                matches!((ptr_pos, last_arr_pos), (Some(pp), Some(ap)) if pp < ap);
+            let typedef_ptr_array =
+                ptr_pos.is_none() && last_arr_pos.is_some() && self.is_type_pointer(type_spec);
             has_derived_ptr_before_last_arr || typedef_ptr_array
         };
-        let is_array_of_func_ptrs = is_array && derived.iter().any(|d|
-            matches!(d, DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
+        let is_array_of_func_ptrs = is_array
+            && derived.iter().any(|d| {
+                matches!(
+                    d,
+                    DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)
+                )
+            });
         let var_ty = if is_pointer || is_array_of_pointers || is_array_of_func_ptrs {
             IrType::Ptr
         } else {
@@ -456,31 +551,36 @@ impl Lowerer {
             base_ty
         };
 
-        let has_derived_ptr = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
+        let has_derived_ptr = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer));
         let is_bool = self.is_type_bool(type_spec) && !has_derived_ptr && !is_array;
 
-        let struct_layout = self.get_struct_layout_for_type(type_spec)
-            .or_else(|| {
-                let ctype = self.type_spec_to_ctype(type_spec);
-                match &ctype {
-                    CType::Pointer(inner, _) => self.struct_layout_from_ctype(inner),
-                    CType::Array(_, _) => {
-                        // Unwrap all Array levels to find the innermost element type.
-                        // This handles multi-dimensional typedef'd arrays like:
-                        // typedef struct s tyst[2][2]; -> CType::Array(Array(Struct, 2), 2)
-                        let mut ct = &ctype;
-                        while let CType::Array(inner, _) = ct {
-                            ct = inner.as_ref();
-                        }
-                        self.struct_layout_from_ctype(ct)
+        let struct_layout = self.get_struct_layout_for_type(type_spec).or_else(|| {
+            let ctype = self.type_spec_to_ctype(type_spec);
+            match &ctype {
+                CType::Pointer(inner, _) => self.struct_layout_from_ctype(inner),
+                CType::Array(_, _) => {
+                    // Unwrap all Array levels to find the innermost element type.
+                    // This handles multi-dimensional typedef'd arrays like:
+                    // typedef struct s tyst[2][2]; -> CType::Array(Array(Struct, 2), 2)
+                    let mut ct = &ctype;
+                    while let CType::Array(inner, _) = ct {
+                        ct = inner.as_ref();
                     }
-                    _ => None,
+                    self.struct_layout_from_ctype(ct)
                 }
-            });
+                _ => None,
+            }
+        });
         let is_struct = struct_layout.is_some() && !is_pointer && !is_array;
 
         let actual_alloc_size = if let Some(ref layout) = struct_layout {
-            if is_array || is_pointer { alloc_size } else { layout.size }
+            if is_array || is_pointer {
+                alloc_size
+            } else {
+                layout.size
+            }
         } else {
             alloc_size
         };
@@ -507,14 +607,23 @@ impl Lowerer {
             // indirection. The syntax-marker Pointer is always immediately before FunctionPointer.
             //
             // So the correct check is: has any Pointer entries AFTER the FunctionPointer entry.
-            let fptr_count = derived.iter().filter(|d|
-                matches!(d, DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _))).count();
+            let fptr_count = derived
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d,
+                        DerivedDeclarator::FunctionPointer(_, _)
+                            | DerivedDeclarator::Function(_, _)
+                    )
+                })
+                .count();
             if fptr_count == 1 {
                 let mut found_fptr = false;
                 let mut ptrs_after_fptr = 0usize;
                 for d in derived {
                     match d {
-                        DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _) => {
+                        DerivedDeclarator::FunctionPointer(_, _)
+                        | DerivedDeclarator::Function(_, _) => {
                             found_fptr = true;
                         }
                         DerivedDeclarator::Pointer if found_fptr => {
@@ -530,10 +639,23 @@ impl Lowerer {
         };
 
         DeclAnalysis {
-            base_ty, var_ty, alloc_size, elem_size, is_array, is_pointer,
-            array_dim_strides, is_array_of_pointers, is_array_of_func_ptrs,
-            struct_layout, is_struct, actual_alloc_size, pointee_type, c_type,
-            is_bool, elem_ir_ty, is_ptr_to_func_ptr,
+            base_ty,
+            var_ty,
+            alloc_size,
+            elem_size,
+            is_array,
+            is_pointer,
+            array_dim_strides,
+            is_array_of_pointers,
+            is_array_of_func_ptrs,
+            struct_layout,
+            is_struct,
+            actual_alloc_size,
+            pointee_type,
+            c_type,
+            is_bool,
+            elem_ir_ty,
+            is_ptr_to_func_ptr,
             base_type_volatile: false,
         }
     }
@@ -548,10 +670,11 @@ impl Lowerer {
         derived: &[DerivedDeclarator],
         init: &Option<Initializer>,
     ) {
-        let is_unsized = da.is_array && (
-            derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(None)))
-            || matches!(self.type_spec_to_ctype(type_spec), CType::Array(_, None))
-        );
+        let is_unsized = da.is_array
+            && (derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Array(None)))
+                || matches!(self.type_spec_to_ctype(type_spec), CType::Array(_, None)));
         if !is_unsized {
             return;
         }
@@ -563,7 +686,9 @@ impl Lowerer {
                             da.alloc_size = s.chars().count() + 1;
                             da.actual_alloc_size = da.alloc_size;
                         }
-                        if let Expr::WideStringLiteral(s, _) | Expr::Char16StringLiteral(s, _) = expr {
+                        if let Expr::WideStringLiteral(s, _) | Expr::Char16StringLiteral(s, _) =
+                            expr
+                        {
                             da.alloc_size = s.chars().count() + 1;
                             da.actual_alloc_size = da.alloc_size;
                         }
@@ -582,8 +707,9 @@ impl Lowerer {
                     }
                     if da.base_ty == IrType::I16 || da.base_ty == IrType::U16 {
                         if let Expr::Char16StringLiteral(s, _)
-                            | Expr::StringLiteral(s, _)
-                            | Expr::WideStringLiteral(s, _) = expr {
+                        | Expr::StringLiteral(s, _)
+                        | Expr::WideStringLiteral(s, _) = expr
+                        {
                             let char_count = s.chars().count() + 1;
                             da.alloc_size = char_count * 2;
                             da.actual_alloc_size = da.alloc_size;
@@ -612,9 +738,9 @@ impl Lowerer {
                         // top-level item spans the outermost stride.
                         // For flat init (e.g., {&x,0,0,&y,0,0}), each item
                         // is one element.
-                        let has_nested_lists = items.iter().any(|item| {
-                            matches!(&item.init, Initializer::List(_))
-                        });
+                        let has_nested_lists = items
+                            .iter()
+                            .any(|item| matches!(&item.init, Initializer::List(_)));
                         let item_size = if da.array_dim_strides.len() > 1 && has_nested_lists {
                             da.array_dim_strides[0]
                         } else {

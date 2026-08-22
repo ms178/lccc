@@ -14,8 +14,8 @@
 //! - **Utility functions**: `build_gnu_hash`, `find_versioned_soname`,
 //!   `resolve_archive_members`, `output_section_name`, `section_order`.
 
-use crate::common::fx_hash::FxHashMap;
 use super::elf_read::*;
+use crate::common::fx_hash::FxHashMap;
 
 // ── RISC-V relocation type constants ─────────────────────────────────────
 // Values from the RISC-V ELF psABI specification.
@@ -107,11 +107,8 @@ pub fn patch_b_type(data: &mut [u8], off: usize, value: u32) {
     let bits10_5 = (imm >> 5) & 0x3F;
     let bits4_1 = (imm >> 1) & 0xF;
     let bit11 = (imm >> 11) & 1;
-    let insn = (insn & 0x01FFF07F)
-        | (bit12 << 31)
-        | (bits10_5 << 25)
-        | (bits4_1 << 8)
-        | (bit11 << 7);
+    let insn =
+        (insn & 0x01FFF07F) | (bit12 << 31) | (bits10_5 << 25) | (bits4_1 << 8) | (bit11 << 7);
     data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
 }
 
@@ -126,11 +123,8 @@ pub fn patch_j_type(data: &mut [u8], off: usize, value: u32) {
     let bits10_1 = (imm >> 1) & 0x3FF;
     let bit11 = (imm >> 11) & 1;
     let bits19_12 = (imm >> 12) & 0xFF;
-    let insn = (insn & 0xFFF)
-        | (bit20 << 31)
-        | (bits10_1 << 21)
-        | (bit11 << 20)
-        | (bits19_12 << 12);
+    let insn =
+        (insn & 0xFFF) | (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
     data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
 }
 
@@ -206,9 +200,13 @@ pub fn resolve_symbol_value(
         }
         0
     } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-        global_syms.get(sym.name.as_str()).map(|gs| gs.value).unwrap_or(0)
+        global_syms
+            .get(sym.name.as_str())
+            .map(|gs| gs.value)
+            .unwrap_or(0)
     } else {
-        local_sym_vaddrs.get(obj_idx)
+        local_sym_vaddrs
+            .get(obj_idx)
             .and_then(|v| v.get(sym_idx))
             .copied()
             .unwrap_or(0)
@@ -225,7 +223,10 @@ pub fn resolve_symbol_value(
 /// Returns (key, is_local) where is_local indicates the symbol won't be in global_syms.
 pub fn got_sym_key(obj_idx: usize, sym: &Symbol, addend: i64) -> (String, bool) {
     if sym.sym_type() == STT_SECTION {
-        (format!("__local_sec_{}_{}_{}", obj_idx, sym.shndx, addend), true)
+        (
+            format!("__local_sec_{}_{}_{}", obj_idx, sym.shndx, addend),
+            true,
+        )
     } else if sym.binding() == STB_LOCAL {
         (format!("__local_{}_{}_{}", obj_idx, sym.name, addend), true)
     } else {
@@ -262,9 +263,18 @@ pub fn find_hi20_value(
     }
 
     find_hi20_value_core(
-        obj, obj_idx, sec_idx, sec_mapping, section_vaddrs,
-        local_sym_vaddrs, global_syms, auipc_vaddr, sec_offset,
-        got_vaddr, got_symbols, Some(got_plt_vaddr),
+        obj,
+        obj_idx,
+        sec_idx,
+        sec_mapping,
+        section_vaddrs,
+        local_sym_vaddrs,
+        global_syms,
+        auipc_vaddr,
+        sec_offset,
+        got_vaddr,
+        got_symbols,
+        Some(got_plt_vaddr),
     )
 }
 
@@ -286,9 +296,18 @@ pub fn find_hi20_value_shared(
     got_symbols: &[String],
 ) -> i64 {
     find_hi20_value_core(
-        obj, obj_idx, sec_idx, sec_mapping, section_vaddrs,
-        local_sym_vaddrs, global_syms, auipc_vaddr, sec_offset,
-        got_vaddr, got_symbols, None,
+        obj,
+        obj_idx,
+        sec_idx,
+        sec_mapping,
+        section_vaddrs,
+        local_sym_vaddrs,
+        global_syms,
+        auipc_vaddr,
+        sec_offset,
+        got_vaddr,
+        got_symbols,
+        None,
     )
 }
 
@@ -318,14 +337,24 @@ fn find_hi20_value_core(
             None => continue,
         };
         let this_vaddr = section_vaddrs[mi] + reloc_vaddr;
-        if this_vaddr != auipc_vaddr { continue; }
+        if this_vaddr != auipc_vaddr {
+            continue;
+        }
 
         match reloc.rela_type {
             R_RISCV_PCREL_HI20 => {
                 let hi_sym_idx = reloc.sym_idx as usize;
                 let sym = &obj.symbols[hi_sym_idx];
-                let s = resolve_symbol_value(sym, hi_sym_idx, obj, obj_idx, sec_mapping,
-                                             section_vaddrs, local_sym_vaddrs, global_syms);
+                let s = resolve_symbol_value(
+                    sym,
+                    hi_sym_idx,
+                    obj,
+                    obj_idx,
+                    sec_mapping,
+                    section_vaddrs,
+                    local_sym_vaddrs,
+                    global_syms,
+                );
                 let target = s as i64 + reloc.addend;
                 return (target - auipc_vaddr as i64) & 0xFFF;
             }
@@ -348,7 +377,9 @@ fn find_hi20_value_core(
                         }
                     } else if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
                         got_vaddr + idx as u64 * 8
-                    } else { 0 }
+                    } else {
+                        0
+                    }
                 } else {
                     // Shared lib path: got_symbols first, then global_syms
                     if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
@@ -356,8 +387,12 @@ fn find_hi20_value_core(
                     } else if let Some(gs) = global_syms.get(sym.name.as_str()) {
                         if let Some(got_off) = gs.got_offset {
                             got_vaddr + got_off
-                        } else { 0 }
-                    } else { 0 }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
                 };
 
                 return (got_entry_vaddr as i64 + reloc.addend - auipc_vaddr as i64) & 0xFFF;
@@ -457,11 +492,11 @@ pub fn output_section_name(name: &str, sh_type: u32, sh_flags: u64) -> Option<St
 // ── ELF writing helpers ──────────────────────────────────────────────────
 // Re-exported from linker_common for backward compatibility with link.rs imports.
 
-pub use crate::backend::linker_common::write_elf64_shdr as write_shdr;
-pub use crate::backend::linker_common::write_elf64_phdr as write_phdr;
-pub use crate::backend::linker_common::write_elf64_phdr_at as write_phdr_at;
 pub use crate::backend::linker_common::align_up_64 as align_up;
 pub use crate::backend::linker_common::pad_to;
+pub use crate::backend::linker_common::write_elf64_phdr as write_phdr;
+pub use crate::backend::linker_common::write_elf64_phdr_at as write_phdr_at;
+pub use crate::backend::linker_common::write_elf64_shdr as write_shdr;
 
 /// Build a proper `.gnu.hash` section for the given dynamic symbol names.
 ///
@@ -485,7 +520,8 @@ pub fn build_gnu_hash(sym_names: &[String]) -> (Vec<u8>, Vec<usize>) {
     }
 
     // Compute hashes for all symbols
-    let hashes: Vec<u32> = sym_names.iter()
+    let hashes: Vec<u32> = sym_names
+        .iter()
         .map(|n| crate::backend::linker_common::gnu_hash(n.as_bytes()))
         .collect();
 
@@ -604,16 +640,20 @@ pub fn resolve_archive_members(
             });
             if needed {
                 for sym in &obj.symbols {
-                    if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty() {
+                    if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty()
+                    {
                         defined_syms.insert(sym.name.to_string());
                         undefined_syms.remove(sym.name.as_str());
                     }
                 }
                 for sym in &obj.symbols {
-                    if sym.shndx == SHN_UNDEF && !sym.name.is_empty() && sym.binding() != STB_LOCAL
-                        && !defined_syms.contains(sym.name.as_str()) {
-                            undefined_syms.insert(sym.name.to_string());
-                        }
+                    if sym.shndx == SHN_UNDEF
+                        && !sym.name.is_empty()
+                        && sym.binding() != STB_LOCAL
+                        && !defined_syms.contains(sym.name.as_str())
+                    {
+                        undefined_syms.insert(sym.name.to_string());
+                    }
                 }
                 input_objs.push((name, obj));
                 added_any = true;

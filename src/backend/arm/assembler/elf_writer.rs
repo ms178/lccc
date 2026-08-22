@@ -11,14 +11,11 @@
 // ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
-use super::parser::{AsmStatement, AsmDirective, SymbolKind, SizeExpr, DataValue, Operand};
 use super::encoder::{encode_instruction, EncodeResult, RelocType};
+use super::parser::{AsmDirective, AsmStatement, DataValue, Operand, SizeExpr, SymbolKind};
 use crate::backend::elf::{
-    self,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
-    STV_HIDDEN, STV_PROTECTED, STV_INTERNAL,
-    ELFCLASS64, EM_AARCH64,
-    ElfWriterBase, ObjReloc,
+    self, ElfWriterBase, ObjReloc, ELFCLASS64, EM_AARCH64, STT_FUNC, STT_NOTYPE, STT_OBJECT,
+    STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
 };
 
 /// AArch64 NOP instruction: `d503201f` in little-endian
@@ -55,11 +52,12 @@ struct PendingReloc {
 /// Returns true if the given ELF relocation type is a branch/jump relocation
 /// that should be deferred for intra-section resolution at assembly time.
 fn is_branch_reloc_type(elf_type: u32) -> bool {
-    matches!(elf_type,
+    matches!(
+        elf_type,
         279 |  // R_AARCH64_TSTBR14
         280 |  // R_AARCH64_CONDBR19
         282 |  // R_AARCH64_JUMP26
-        283    // R_AARCH64_CALL26
+        283 // R_AARCH64_CALL26
     )
 }
 
@@ -127,14 +125,16 @@ impl ElfWriter {
                             if diff.size == 1 && off < section.data.len() {
                                 section.data[off] = value as u8;
                             } else if diff.size == 4 && off + 4 <= section.data.len() {
-                                section.data[off..off + 4].copy_from_slice(&(value as i32).to_le_bytes());
+                                section.data[off..off + 4]
+                                    .copy_from_slice(&(value as i32).to_le_bytes());
                             } else if diff.size == 8 && off + 8 <= section.data.len() {
                                 section.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
                             }
                         }
                     } else {
                         // Cross-section: emit R_AARCH64_PREL32 or PREL64 based on size
-                        let addend = off_a as i64 + diff.offset as i64 - off_b as i64 + diff.extra_addend;
+                        let addend =
+                            off_a as i64 + diff.offset as i64 - off_b as i64 + diff.extra_addend;
                         let reloc_type = if diff.size == 8 {
                             RelocType::Prel64.elf_type()
                         } else {
@@ -203,10 +203,12 @@ impl ElfWriter {
                                 section.data[off] = val as u8;
                             }
                             2 if off + 2 <= section.data.len() => {
-                                section.data[off..off + 2].copy_from_slice(&(val as i16).to_le_bytes());
+                                section.data[off..off + 2]
+                                    .copy_from_slice(&(val as i16).to_le_bytes());
                             }
                             4 if off + 4 <= section.data.len() => {
-                                section.data[off..off + 4].copy_from_slice(&(val as i32).to_le_bytes());
+                                section.data[off..off + 4]
+                                    .copy_from_slice(&(val as i32).to_le_bytes());
                             }
                             8 if off + 8 <= section.data.len() => {
                                 section.data[off..off + 8].copy_from_slice(&val.to_le_bytes());
@@ -247,14 +249,26 @@ impl ElfWriter {
         let pending = std::mem::take(&mut self.pending_instructions);
         for pinstr in &pending {
             // Resolve each operand that has a deferred expression
-            let resolved_operands: Vec<Operand> = pinstr.operands.iter().map(|op| {
-                match op {
-                    Operand::MemExpr { base, expr, writeback } => {
+            let resolved_operands: Vec<Operand> = pinstr
+                .operands
+                .iter()
+                .map(|op| match op {
+                    Operand::MemExpr {
+                        base,
+                        expr,
+                        writeback,
+                    } => {
                         if let Some(val) = self.resolve_label_expr(expr) {
                             if *writeback {
-                                Operand::MemPreIndex { base: base.clone(), offset: val }
+                                Operand::MemPreIndex {
+                                    base: base.clone(),
+                                    offset: val,
+                                }
                             } else {
-                                Operand::Mem { base: base.clone(), offset: val }
+                                Operand::Mem {
+                                    base: base.clone(),
+                                    offset: val,
+                                }
                             }
                         } else {
                             op.clone()
@@ -268,8 +282,8 @@ impl ElfWriter {
                         }
                     }
                     _ => op.clone(),
-                }
-            }).collect();
+                })
+                .collect();
 
             // Re-encode the instruction with resolved operands
             match encode_instruction(&pinstr.mnemonic, &resolved_operands, &pinstr.raw_operands) {
@@ -288,7 +302,9 @@ impl ElfWriter {
                         if off + 4 <= section.data.len() {
                             section.data[off..off + 4].copy_from_slice(&word.to_le_bytes());
                         }
-                        let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l") || reloc.symbol == ".";
+                        let is_local = reloc.symbol.starts_with(".L")
+                            || reloc.symbol.starts_with(".l")
+                            || reloc.symbol == ".";
                         if is_local || is_branch_reloc_type(elf_type) {
                             self.pending_branch_relocs.push(PendingReloc {
                                 section: pinstr.section.clone(),
@@ -321,7 +337,10 @@ impl ElfWriter {
                 Ok(EncodeResult::Skip) => {}
                 Err(e) => {
                     // Log error but don't fail the whole assembly
-                    eprintln!("warning: failed to resolve deferred instruction '{}': {}", pinstr.mnemonic, e);
+                    eprintln!(
+                        "warning: failed to resolve deferred instruction '{}': {}",
+                        pinstr.mnemonic, e
+                    );
                 }
             }
         }
@@ -402,13 +421,13 @@ impl ElfWriter {
                 Ok(())
             }
 
-            AsmStatement::Directive(dir) => {
-                self.process_directive(dir)
-            }
+            AsmStatement::Directive(dir) => self.process_directive(dir),
 
-            AsmStatement::Instruction { mnemonic, operands, raw_operands } => {
-                self.process_instruction(mnemonic, operands, raw_operands)
-            }
+            AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } => self.process_instruction(mnemonic, operands, raw_operands),
 
             AsmStatement::LdrLiteralPool { .. } => {
                 // Should have been expanded by expand_literal_pools() before reaching here
@@ -463,10 +482,22 @@ impl ElfWriter {
                 }
                 Ok(())
             }
-            AsmDirective::Weak(sym) => { self.base.set_weak(sym); Ok(()) }
-            AsmDirective::Hidden(sym) => { self.base.set_visibility(sym, STV_HIDDEN); Ok(()) }
-            AsmDirective::Protected(sym) => { self.base.set_visibility(sym, STV_PROTECTED); Ok(()) }
-            AsmDirective::Internal(sym) => { self.base.set_visibility(sym, STV_INTERNAL); Ok(()) }
+            AsmDirective::Weak(sym) => {
+                self.base.set_weak(sym);
+                Ok(())
+            }
+            AsmDirective::Hidden(sym) => {
+                self.base.set_visibility(sym, STV_HIDDEN);
+                Ok(())
+            }
+            AsmDirective::Protected(sym) => {
+                self.base.set_visibility(sym, STV_PROTECTED);
+                Ok(())
+            }
+            AsmDirective::Internal(sym) => {
+                self.base.set_visibility(sym, STV_INTERNAL);
+                Ok(())
+            }
 
             AsmDirective::SymbolType(sym, kind) => {
                 let st = match kind {
@@ -508,9 +539,18 @@ impl ElfWriter {
             AsmDirective::Long(vals) => self.emit_data_values(vals, 4),
             AsmDirective::Quad(vals) => self.emit_data_values(vals, 8),
 
-            AsmDirective::Zero(size, fill) => { self.base.emit_bytes(&vec![*fill; *size]); Ok(()) }
-            AsmDirective::Asciz(bytes) => { self.base.emit_bytes(bytes); Ok(()) }
-            AsmDirective::Ascii(bytes) => { self.base.emit_bytes(bytes); Ok(()) }
+            AsmDirective::Zero(size, fill) => {
+                self.base.emit_bytes(&vec![*fill; *size]);
+                Ok(())
+            }
+            AsmDirective::Asciz(bytes) => {
+                self.base.emit_bytes(bytes);
+                Ok(())
+            }
+            AsmDirective::Ascii(bytes) => {
+                self.base.emit_bytes(bytes);
+                Ok(())
+            }
 
             AsmDirective::Comm(sym, size, align) => {
                 self.base.emit_comm(sym, *size, *align);
@@ -528,11 +568,19 @@ impl ElfWriter {
                 let data = std::fs::read(path)
                     .map_err(|e| format!(".incbin: failed to read '{}': {}", path, e))?;
                 let skip = *skip as usize;
-                let data = if skip < data.len() { &data[skip..] } else { &[] };
+                let data = if skip < data.len() {
+                    &data[skip..]
+                } else {
+                    &[]
+                };
                 let data = match count {
                     Some(c) => {
                         let c = *c as usize;
-                        if c < data.len() { &data[..c] } else { data }
+                        if c < data.len() {
+                            &data[..c]
+                        } else {
+                            data
+                        }
                     }
                     None => data,
                 };
@@ -540,7 +588,10 @@ impl ElfWriter {
                 Ok(())
             }
 
-            AsmDirective::RawBytes(bytes) => { self.base.emit_bytes(bytes); Ok(()) }
+            AsmDirective::RawBytes(bytes) => {
+                self.base.emit_bytes(bytes);
+                Ok(())
+            }
 
             AsmDirective::Cfi | AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
         }
@@ -567,7 +618,8 @@ impl ElfWriter {
                     } else {
                         RelocType::Abs64.elf_type()
                     };
-                    self.base.emit_data_symbol_ref(sym, *addend, size, reloc_type);
+                    self.base
+                        .emit_data_symbol_ref(sym, *addend, size, reloc_type);
                 }
                 DataValue::SymbolDiff(sym_a, sym_b) => {
                     self.record_sym_diff(sym_a, sym_b, 0, size);
@@ -608,10 +660,17 @@ impl ElfWriter {
 
     /// Check if any operand contains a deferred symbolic expression.
     fn has_deferred_expr(operands: &[Operand]) -> bool {
-        operands.iter().any(|op| matches!(op, Operand::MemExpr { .. } | Operand::Expr(_)))
+        operands
+            .iter()
+            .any(|op| matches!(op, Operand::MemExpr { .. } | Operand::Expr(_)))
     }
 
-    fn process_instruction(&mut self, mnemonic: &str, operands: &[Operand], raw_operands: &str) -> Result<(), String> {
+    fn process_instruction(
+        &mut self,
+        mnemonic: &str,
+        operands: &[Operand],
+        raw_operands: &str,
+    ) -> Result<(), String> {
         self.base.ensure_text_section();
 
         // If any operand has a symbolic expression that needs deferred resolution,
@@ -638,7 +697,9 @@ impl ElfWriter {
             }
             Ok(EncodeResult::WordWithReloc { word, reloc }) => {
                 let elf_type = reloc.reloc_type.elf_type();
-                let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l") || reloc.symbol == ".";
+                let is_local = reloc.symbol.starts_with(".L")
+                    || reloc.symbol.starts_with(".l")
+                    || reloc.symbol == ".";
 
                 if is_local || is_branch_reloc_type(elf_type) {
                     let offset = self.base.current_offset();

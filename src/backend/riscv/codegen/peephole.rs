@@ -91,7 +91,7 @@ const REG_T3: u8 = 3;
 const REG_T4: u8 = 4;
 const REG_T5: u8 = 5;
 const REG_T6: u8 = 6;
-const REG_S0: u8 = 10;  // frame pointer
+const REG_S0: u8 = 10; // frame pointer
 const REG_S1: u8 = 11;
 const REG_S2: u8 = 12;
 const REG_S3: u8 = 13;
@@ -119,28 +119,70 @@ const NUM_REGS: usize = 42;
 /// Parse a register name to our internal ID.
 fn parse_reg(name: &str) -> u8 {
     match name {
-        "t0" => REG_T0, "t1" => REG_T1, "t2" => REG_T2, "t3" => REG_T3,
-        "t4" => REG_T4, "t5" => REG_T5, "t6" => REG_T6,
-        "s0" => REG_S0, "s1" => REG_S1, "s2" => REG_S2, "s3" => REG_S3,
-        "s4" => REG_S4, "s5" => REG_S5, "s6" => REG_S6, "s7" => REG_S7,
-        "s8" => REG_S8, "s9" => REG_S9, "s10" => REG_S10, "s11" => REG_S11,
-        "a0" => REG_A0, "a1" => REG_A1, "a2" => REG_A2, "a3" => REG_A3,
-        "a4" => REG_A4, "a5" => REG_A5, "a6" => REG_A6, "a7" => REG_A7,
-        "ra" => REG_RA, "sp" => REG_SP,
+        "t0" => REG_T0,
+        "t1" => REG_T1,
+        "t2" => REG_T2,
+        "t3" => REG_T3,
+        "t4" => REG_T4,
+        "t5" => REG_T5,
+        "t6" => REG_T6,
+        "s0" => REG_S0,
+        "s1" => REG_S1,
+        "s2" => REG_S2,
+        "s3" => REG_S3,
+        "s4" => REG_S4,
+        "s5" => REG_S5,
+        "s6" => REG_S6,
+        "s7" => REG_S7,
+        "s8" => REG_S8,
+        "s9" => REG_S9,
+        "s10" => REG_S10,
+        "s11" => REG_S11,
+        "a0" => REG_A0,
+        "a1" => REG_A1,
+        "a2" => REG_A2,
+        "a3" => REG_A3,
+        "a4" => REG_A4,
+        "a5" => REG_A5,
+        "a6" => REG_A6,
+        "a7" => REG_A7,
+        "ra" => REG_RA,
+        "sp" => REG_SP,
         _ => REG_NONE,
     }
 }
 
 fn reg_name(id: u8) -> &'static str {
     match id {
-        REG_T0 => "t0", REG_T1 => "t1", REG_T2 => "t2", REG_T3 => "t3",
-        REG_T4 => "t4", REG_T5 => "t5", REG_T6 => "t6",
-        REG_S0 => "s0", REG_S1 => "s1", REG_S2 => "s2", REG_S3 => "s3",
-        REG_S4 => "s4", REG_S5 => "s5", REG_S6 => "s6", REG_S7 => "s7",
-        REG_S8 => "s8", REG_S9 => "s9", REG_S10 => "s10", REG_S11 => "s11",
-        REG_A0 => "a0", REG_A1 => "a1", REG_A2 => "a2", REG_A3 => "a3",
-        REG_A4 => "a4", REG_A5 => "a5", REG_A6 => "a6", REG_A7 => "a7",
-        REG_RA => "ra", REG_SP => "sp",
+        REG_T0 => "t0",
+        REG_T1 => "t1",
+        REG_T2 => "t2",
+        REG_T3 => "t3",
+        REG_T4 => "t4",
+        REG_T5 => "t5",
+        REG_T6 => "t6",
+        REG_S0 => "s0",
+        REG_S1 => "s1",
+        REG_S2 => "s2",
+        REG_S3 => "s3",
+        REG_S4 => "s4",
+        REG_S5 => "s5",
+        REG_S6 => "s6",
+        REG_S7 => "s7",
+        REG_S8 => "s8",
+        REG_S9 => "s9",
+        REG_S10 => "s10",
+        REG_S11 => "s11",
+        REG_A0 => "a0",
+        REG_A1 => "a1",
+        REG_A2 => "a2",
+        REG_A3 => "a3",
+        REG_A4 => "a4",
+        REG_A5 => "a5",
+        REG_A6 => "a6",
+        REG_A7 => "a7",
+        REG_RA => "ra",
+        REG_SP => "sp",
         _ => "??",
     }
 }
@@ -170,26 +212,40 @@ fn classify_line(line: &str) -> LineKind {
 
     // Instructions (indented lines)
     // Store: sd/sw reg, offset(s0)
-    if let Some(rest) = trimmed.strip_prefix("sd ").or_else(|| trimmed.strip_prefix("sw ")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("sd ")
+        .or_else(|| trimmed.strip_prefix("sw "))
+    {
         let is_word = trimmed.starts_with("sw");
         if let Some((reg_str, addr)) = rest.split_once(", ") {
             let reg = parse_reg(reg_str.trim());
             if reg != REG_NONE {
                 if let Some(offset) = parse_s0_offset(addr.trim()) {
-                    return LineKind::StoreS0 { reg, offset, is_word };
+                    return LineKind::StoreS0 {
+                        reg,
+                        offset,
+                        is_word,
+                    };
                 }
             }
         }
     }
 
     // Load: ld/lw reg, offset(s0)
-    if let Some(rest) = trimmed.strip_prefix("ld ").or_else(|| trimmed.strip_prefix("lw ")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("ld ")
+        .or_else(|| trimmed.strip_prefix("lw "))
+    {
         let is_word = trimmed.starts_with("lw");
         if let Some((reg_str, addr)) = rest.split_once(", ") {
             let reg = parse_reg(reg_str.trim());
             if reg != REG_NONE {
                 if let Some(offset) = parse_s0_offset(addr.trim()) {
-                    return LineKind::LoadS0 { reg, offset, is_word };
+                    return LineKind::LoadS0 {
+                        reg,
+                        offset,
+                        is_word,
+                    };
                 }
             }
         }
@@ -236,10 +292,15 @@ fn classify_line(line: &str) -> LineKind {
     }
 
     // Branch instructions
-    if trimmed.starts_with("beq ") || trimmed.starts_with("bne ") ||
-       trimmed.starts_with("bge ") || trimmed.starts_with("blt ") ||
-       trimmed.starts_with("bgeu ") || trimmed.starts_with("bltu ") ||
-       trimmed.starts_with("bnez ") || trimmed.starts_with("beqz ") {
+    if trimmed.starts_with("beq ")
+        || trimmed.starts_with("bne ")
+        || trimmed.starts_with("bge ")
+        || trimmed.starts_with("blt ")
+        || trimmed.starts_with("bgeu ")
+        || trimmed.starts_with("bltu ")
+        || trimmed.starts_with("bnez ")
+        || trimmed.starts_with("beqz ")
+    {
         return LineKind::Branch;
     }
 
@@ -254,35 +315,61 @@ fn classify_line(line: &str) -> LineKind {
     }
 
     // ALU instructions
-    if trimmed.starts_with("add ") || trimmed.starts_with("addi ") ||
-       trimmed.starts_with("addw ") || trimmed.starts_with("addiw ") ||
-       trimmed.starts_with("sub ") || trimmed.starts_with("subw ") ||
-       trimmed.starts_with("and ") || trimmed.starts_with("andi ") ||
-       trimmed.starts_with("or ") || trimmed.starts_with("ori ") ||
-       trimmed.starts_with("xor ") || trimmed.starts_with("xori ") ||
-       trimmed.starts_with("sll ") || trimmed.starts_with("slli ") ||
-       trimmed.starts_with("srl ") || trimmed.starts_with("srli ") ||
-       trimmed.starts_with("sra ") || trimmed.starts_with("srai ") ||
-       trimmed.starts_with("sllw ") || trimmed.starts_with("slliw ") ||
-       trimmed.starts_with("srlw ") || trimmed.starts_with("srliw ") ||
-       trimmed.starts_with("sraw ") || trimmed.starts_with("sraiw ") ||
-       trimmed.starts_with("mul ") || trimmed.starts_with("mulw ") ||
-       trimmed.starts_with("div ") || trimmed.starts_with("divu ") ||
-       trimmed.starts_with("divw ") || trimmed.starts_with("divuw ") ||
-       trimmed.starts_with("rem ") || trimmed.starts_with("remu ") ||
-       trimmed.starts_with("remw ") || trimmed.starts_with("remuw ") ||
-       trimmed.starts_with("slt ") || trimmed.starts_with("sltu ") ||
-       trimmed.starts_with("slti ") || trimmed.starts_with("sltiu ") ||
-       trimmed.starts_with("neg ") || trimmed.starts_with("negw ") ||
-       trimmed.starts_with("not ") || trimmed.starts_with("snez ") ||
-       trimmed.starts_with("seqz ") || trimmed.starts_with("lui ") {
+    if trimmed.starts_with("add ")
+        || trimmed.starts_with("addi ")
+        || trimmed.starts_with("addw ")
+        || trimmed.starts_with("addiw ")
+        || trimmed.starts_with("sub ")
+        || trimmed.starts_with("subw ")
+        || trimmed.starts_with("and ")
+        || trimmed.starts_with("andi ")
+        || trimmed.starts_with("or ")
+        || trimmed.starts_with("ori ")
+        || trimmed.starts_with("xor ")
+        || trimmed.starts_with("xori ")
+        || trimmed.starts_with("sll ")
+        || trimmed.starts_with("slli ")
+        || trimmed.starts_with("srl ")
+        || trimmed.starts_with("srli ")
+        || trimmed.starts_with("sra ")
+        || trimmed.starts_with("srai ")
+        || trimmed.starts_with("sllw ")
+        || trimmed.starts_with("slliw ")
+        || trimmed.starts_with("srlw ")
+        || trimmed.starts_with("srliw ")
+        || trimmed.starts_with("sraw ")
+        || trimmed.starts_with("sraiw ")
+        || trimmed.starts_with("mul ")
+        || trimmed.starts_with("mulw ")
+        || trimmed.starts_with("div ")
+        || trimmed.starts_with("divu ")
+        || trimmed.starts_with("divw ")
+        || trimmed.starts_with("divuw ")
+        || trimmed.starts_with("rem ")
+        || trimmed.starts_with("remu ")
+        || trimmed.starts_with("remw ")
+        || trimmed.starts_with("remuw ")
+        || trimmed.starts_with("slt ")
+        || trimmed.starts_with("sltu ")
+        || trimmed.starts_with("slti ")
+        || trimmed.starts_with("sltiu ")
+        || trimmed.starts_with("neg ")
+        || trimmed.starts_with("negw ")
+        || trimmed.starts_with("not ")
+        || trimmed.starts_with("snez ")
+        || trimmed.starts_with("seqz ")
+        || trimmed.starts_with("lui ")
+    {
         return LineKind::Alu;
     }
 
     // Load address: lla/la reg, symbol
     // These must not have their symbol operands modified by copy propagation,
     // since symbol names can contain register-like substrings (e.g. `main.s1.0`).
-    if let Some(rest) = trimmed.strip_prefix("lla ").or_else(|| trimmed.strip_prefix("la ")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("lla ")
+        .or_else(|| trimmed.strip_prefix("la "))
+    {
         if let Some((reg_str, _)) = rest.split_once(", ") {
             let dst = parse_reg(reg_str.trim());
             if dst != REG_NONE {
@@ -338,7 +425,11 @@ fn parse_alu_dest(line: &str) -> Option<u8> {
         args.trim()
     };
     let reg = parse_reg(first_arg);
-    if reg != REG_NONE { Some(reg) } else { None }
+    if reg != REG_NONE {
+        Some(reg)
+    } else {
+        None
+    }
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
@@ -417,14 +508,24 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
     let mut changed = false;
     let mut i = 0;
     while i + 1 < n {
-        if let LineKind::StoreS0 { reg: store_reg, offset: store_off, is_word: store_word } = kinds[i] {
+        if let LineKind::StoreS0 {
+            reg: store_reg,
+            offset: store_off,
+            is_word: store_word,
+        } = kinds[i]
+        {
             // Look ahead for the matching load (skip Nops)
             let mut j = i + 1;
             while j < n && kinds[j] == LineKind::Nop {
                 j += 1;
             }
             if j < n {
-                if let LineKind::LoadS0 { reg: load_reg, offset: load_off, is_word: load_word } = kinds[j] {
+                if let LineKind::LoadS0 {
+                    reg: load_reg,
+                    offset: load_off,
+                    is_word: load_word,
+                } = kinds[j]
+                {
                     if store_off == load_off && store_word == load_word {
                         if store_reg == load_reg {
                             // Same register: eliminate the load
@@ -432,8 +533,12 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                             changed = true;
                         } else {
                             // Different register: replace load with mv
-                            lines[j] = format!("    mv {}, {}", reg_name(load_reg), reg_name(store_reg));
-                            kinds[j] = LineKind::Move { dst: load_reg, src: store_reg };
+                            lines[j] =
+                                format!("    mv {}, {}", reg_name(load_reg), reg_name(store_reg));
+                            kinds[j] = LineKind::Move {
+                                dst: load_reg,
+                                src: store_reg,
+                            };
                             changed = true;
                         }
                     }
@@ -504,20 +609,31 @@ fn eliminate_redundant_mv_chain(lines: &mut [String], kinds: &mut [LineKind], n:
     let mut changed = false;
     let mut i = 0;
     while i + 1 < n {
-        if let LineKind::Move { dst: dst1, src: src1 } = kinds[i] {
+        if let LineKind::Move {
+            dst: dst1,
+            src: src1,
+        } = kinds[i]
+        {
             // Find next non-Nop instruction
             let mut j = i + 1;
             while j < n && kinds[j] == LineKind::Nop {
                 j += 1;
             }
             if j < n {
-                if let LineKind::Move { dst: dst2, src: src2 } = kinds[j] {
+                if let LineKind::Move {
+                    dst: dst2,
+                    src: src2,
+                } = kinds[j]
+                {
                     // Pattern: mv dst1, src1 ; mv dst2, dst1
                     // → redirect second: mv dst2, src1
                     // Keep the first mv (dst1 might be used later).
                     if src2 == dst1 && dst2 != src1 {
                         lines[j] = format!("    mv {}, {}", reg_name(dst2), reg_name(src1));
-                        kinds[j] = LineKind::Move { dst: dst2, src: src1 };
+                        kinds[j] = LineKind::Move {
+                            dst: dst2,
+                            src: src1,
+                        };
                         changed = true;
                         // The first mv may become dead. The self-move elimination or
                         // unused callee-save passes may clean it up later.
@@ -543,9 +659,15 @@ fn eliminate_li_mv_chain(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             // Only optimize when the immediate dest is a temp register (t0-t6)
             if imm_dst <= REG_T6 {
                 let mut j = i + 1;
-                while j < n && kinds[j] == LineKind::Nop { j += 1; }
+                while j < n && kinds[j] == LineKind::Nop {
+                    j += 1;
+                }
                 if j < n {
-                    if let LineKind::Move { dst: mv_dst, src: mv_src } = kinds[j] {
+                    if let LineKind::Move {
+                        dst: mv_dst,
+                        src: mv_src,
+                    } = kinds[j]
+                    {
                         if mv_src == imm_dst {
                             // Retarget the li to the move destination
                             let trimmed = lines[i].trim();
@@ -616,13 +738,24 @@ fn global_store_forwarding(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                 gsf_invalidate_all(&mut slots, &mut reg_slots);
             }
 
-            LineKind::StoreS0 { reg, offset, is_word } => {
+            LineKind::StoreS0 {
+                reg,
+                offset,
+                is_word,
+            } => {
                 // Invalidate any existing mapping that overlaps this store
                 let store_size: i32 = if is_word { 4 } else { 8 };
                 gsf_invalidate_overlapping(&mut slots, &mut reg_slots, offset, store_size);
                 // Record new mapping
                 if (reg as usize) < NUM_REGS {
-                    slots.push((offset, SlotMapping { reg, is_word, active: true }));
+                    slots.push((
+                        offset,
+                        SlotMapping {
+                            reg,
+                            is_word,
+                            active: true,
+                        },
+                    ));
                     reg_slots[reg as usize].push(offset);
                 }
                 if slots.len() > MAX_SLOT_ENTRIES {
@@ -630,9 +763,15 @@ fn global_store_forwarding(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                 }
             }
 
-            LineKind::LoadS0 { reg: load_reg, offset: load_off, is_word: load_word } => {
+            LineKind::LoadS0 {
+                reg: load_reg,
+                offset: load_off,
+                is_word: load_word,
+            } => {
                 // Try to forward from a stored value
-                let mapping = slots.iter().rev()
+                let mapping = slots
+                    .iter()
+                    .rev()
                     .find(|(off, m)| m.active && *off == load_off && m.is_word == load_word)
                     .map(|(_, m)| *m);
 
@@ -643,8 +782,12 @@ fn global_store_forwarding(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                         changed = true;
                     } else {
                         // Different register: replace load with mv
-                        lines[i] = format!("    mv {}, {}", reg_name(load_reg), reg_name(mapping.reg));
-                        kinds[i] = LineKind::Move { dst: load_reg, src: mapping.reg };
+                        lines[i] =
+                            format!("    mv {}, {}", reg_name(load_reg), reg_name(mapping.reg));
+                        kinds[i] = LineKind::Move {
+                            dst: load_reg,
+                            src: mapping.reg,
+                        };
                         changed = true;
                     }
                 }
@@ -670,7 +813,8 @@ fn global_store_forwarding(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                 }
             }
 
-            LineKind::LoadImm { dst } | LineKind::SextW { dst, .. }
+            LineKind::LoadImm { dst }
+            | LineKind::SextW { dst, .. }
             | LineKind::LoadAddr { dst } => {
                 if (dst as usize) < NUM_REGS {
                     gsf_invalidate_reg(&mut slots, &mut reg_slots, dst);
@@ -785,8 +929,12 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
         // with symbol names (LoadAddr) that could be corrupted by register
         // name replacement (e.g. `lla t0, main.s1.0` contains "s1").
         match kinds[j] {
-            LineKind::Label | LineKind::Jump | LineKind::Ret | LineKind::Directive
-            | LineKind::Call | LineKind::LoadAddr { .. } => continue,
+            LineKind::Label
+            | LineKind::Jump
+            | LineKind::Ret
+            | LineKind::Directive
+            | LineKind::Call
+            | LineKind::LoadAddr { .. } => continue,
             _ => {}
         }
 
@@ -799,7 +947,10 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 
         // For move instructions, replace the source operand
         match kinds[j] {
-            LineKind::Move { dst: dst2, src: src2 } if src2 == dst => {
+            LineKind::Move {
+                dst: dst2,
+                src: src2,
+            } if src2 == dst => {
                 // mv X, dst → mv X, src
                 if dst2 != src {
                     lines[j] = format!("    mv {}, {}", reg_name(dst2), src_name);
@@ -809,7 +960,9 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             }
             _ => {
                 // General case: try to replace the register in source positions
-                if let Some(new_line) = replace_source_reg_in_instruction(&lines[j], dst_name, src_name) {
+                if let Some(new_line) =
+                    replace_source_reg_in_instruction(&lines[j], dst_name, src_name)
+                {
                     lines[j] = new_line;
                     kinds[j] = classify_line(&lines[j]);
                     changed = true;
@@ -860,8 +1013,12 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 
             // Stop at control flow boundaries and any unclassified instruction
             match kinds[j] {
-                LineKind::Label | LineKind::Jump | LineKind::Branch |
-                LineKind::Ret | LineKind::Call | LineKind::Directive => break,
+                LineKind::Label
+                | LineKind::Jump
+                | LineKind::Branch
+                | LineKind::Ret
+                | LineKind::Call
+                | LineKind::Directive => break,
                 LineKind::Other => {
                     // Conservatively assume Other instructions may read the register
                     break;
@@ -925,9 +1082,9 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 }
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
-use crate::backend::peephole_common::{has_whole_word, replace_source_reg_in_instruction};
 #[cfg(test)]
 use crate::backend::peephole_common::replace_whole_word;
+use crate::backend::peephole_common::{has_whole_word, replace_source_reg_in_instruction};
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //
@@ -975,7 +1132,9 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
     for i in 0..n {
         match kinds[i] {
-            LineKind::LoadS0 { offset, is_word, .. } => {
+            LineKind::LoadS0 {
+                offset, is_word, ..
+            } => {
                 let size = if is_word { 4 } else { 8 };
                 loaded_ranges.push((offset, size));
             }
@@ -1007,7 +1166,10 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     // Phase 2: Remove stores whose byte range does not overlap any load range
     let mut changed = false;
     for i in 0..n {
-        if let LineKind::StoreS0 { offset, is_word, .. } = kinds[i] {
+        if let LineKind::StoreS0 {
+            offset, is_word, ..
+        } = kinds[i]
+        {
             let store_size = if is_word { 4 } else { 8 };
             let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
                 // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
@@ -1028,9 +1190,7 @@ fn extract_s0_offset_from_line(line: &str) -> Option<i32> {
         // Walk backwards from paren_pos to find the start of the offset number
         let before = &line[..paren_pos];
         // Find the last comma or space before the offset
-        let start = before.rfind([',', ' '])
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let start = before.rfind([',', ' ']).map(|p| p + 1).unwrap_or(0);
         let offset_str = before[start..].trim();
         return offset_str.parse::<i32>().ok();
     }
@@ -1045,11 +1205,19 @@ mod tests {
     fn test_classify_store() {
         assert!(matches!(
             classify_line("    sd t0, -24(s0)"),
-            LineKind::StoreS0 { reg: REG_T0, offset: -24, is_word: false }
+            LineKind::StoreS0 {
+                reg: REG_T0,
+                offset: -24,
+                is_word: false
+            }
         ));
         assert!(matches!(
             classify_line("    sw a0, -32(s0)"),
-            LineKind::StoreS0 { reg: REG_A0, offset: -32, is_word: true }
+            LineKind::StoreS0 {
+                reg: REG_A0,
+                offset: -32,
+                is_word: true
+            }
         ));
     }
 
@@ -1057,7 +1225,11 @@ mod tests {
     fn test_classify_load() {
         assert!(matches!(
             classify_line("    ld t0, -24(s0)"),
-            LineKind::LoadS0 { reg: REG_T0, offset: -24, is_word: false }
+            LineKind::LoadS0 {
+                reg: REG_T0,
+                offset: -24,
+                is_word: false
+            }
         ));
     }
 
@@ -1065,7 +1237,10 @@ mod tests {
     fn test_classify_move() {
         assert!(matches!(
             classify_line("    mv t1, t0"),
-            LineKind::Move { dst: REG_T1, src: REG_T0 }
+            LineKind::Move {
+                dst: REG_T1,
+                src: REG_T0
+            }
         ));
     }
 
@@ -1085,7 +1260,10 @@ mod tests {
     fn test_classify_sext_w() {
         assert!(matches!(
             classify_line("    sext.w t0, t0"),
-            LineKind::SextW { dst: REG_T0, src: REG_T0 }
+            LineKind::SextW {
+                dst: REG_T0,
+                src: REG_T0
+            }
         ));
     }
 
@@ -1227,31 +1405,19 @@ mod tests {
 
     #[test]
     fn test_copy_prop_word_boundary() {
-        assert_eq!(
-            replace_whole_word("t10, t1", "t1", "s1"),
-            "t10, s1"
-        );
+        assert_eq!(replace_whole_word("t10, t1", "t1", "s1"), "t10, s1");
     }
 
     #[test]
     fn test_copy_prop_no_false_match() {
-        assert_eq!(
-            replace_whole_word("s10", "s1", "s5"),
-            "s10"
-        );
+        assert_eq!(replace_whole_word("s10", "s1", "s5"), "s10");
     }
 
     #[test]
     fn test_copy_prop_no_symbol_corruption() {
         // Register name inside symbol names must not be replaced
-        assert_eq!(
-            replace_whole_word(" main.s1.0", "s1", "t0"),
-            " main.s1.0"
-        );
-        assert_eq!(
-            replace_whole_word(" _s1_var", "s1", "t0"),
-            " _s1_var"
-        );
+        assert_eq!(replace_whole_word(" main.s1.0", "s1", "t0"), " main.s1.0");
+        assert_eq!(replace_whole_word(" _s1_var", "s1", "t0"), " _s1_var");
     }
 
     #[test]
@@ -1262,8 +1428,15 @@ mod tests {
     lla t0, main.s1.0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("main.s1.0"), "Symbol name corrupted, got:\n{}", result);
-        assert!(!result.contains("main.t0.0"), "Symbol name corrupted to main.t0.0");
+        assert!(
+            result.contains("main.s1.0"),
+            "Symbol name corrupted, got:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("main.t0.0"),
+            "Symbol name corrupted to main.t0.0"
+        );
     }
 
     #[test]
@@ -1286,7 +1459,11 @@ mod tests {
     mv a0, t1\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("mv t1, t0"), "Expected dead move eliminated, got:\n{}", result);
+        assert!(
+            !result.contains("mv t1, t0"),
+            "Expected dead move eliminated, got:\n{}",
+            result
+        );
         assert!(result.contains("li t1, 42"));
     }
 
@@ -1303,7 +1480,15 @@ mod tests {
     add t2, t1, t0\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("mv t1, s1"), "Expected t1 = s1 via chain, got:\n{}", result);
-        assert!(result.contains("add t2, s1,"), "Expected t1 propagated in add, got:\n{}", result);
+        assert!(
+            result.contains("mv t1, s1"),
+            "Expected t1 = s1 via chain, got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("add t2, s1,"),
+            "Expected t1 propagated in add, got:\n{}",
+            result
+        );
     }
 }

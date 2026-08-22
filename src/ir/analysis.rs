@@ -126,7 +126,11 @@ pub fn build_cfg(
                     preds[target].push(i32);
                 }
             }
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 if let Some(&t) = label_to_idx.get(true_label) {
                     succs[i].push(t as u32);
                     preds[t].push(i32);
@@ -139,7 +143,9 @@ pub fn build_cfg(
                     preds[f].push(i32);
                 }
             }
-            Terminator::IndirectBranch { possible_targets, .. } => {
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => {
                 for label in possible_targets {
                     if let Some(&t) = label_to_idx.get(label) {
                         let t32 = t as u32;
@@ -235,11 +241,7 @@ fn intersect(
 /// Compute immediate dominators using the Cooper-Harvey-Kennedy algorithm.
 /// Returns idom[i] = immediate dominator of block i (idom[0] = 0 for entry).
 /// Uses usize::MAX as sentinel for undefined/unreachable blocks.
-pub fn compute_dominators(
-    num_blocks: usize,
-    preds: &FlatAdj,
-    succs: &FlatAdj,
-) -> Vec<usize> {
+pub fn compute_dominators(num_blocks: usize, preds: &FlatAdj, succs: &FlatAdj) -> Vec<usize> {
     const UNDEF: usize = usize::MAX;
 
     let rpo = compute_reverse_postorder(num_blocks, succs);

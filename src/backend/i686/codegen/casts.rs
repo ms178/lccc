@@ -10,18 +10,24 @@
 //! All F64/F128 conversions go through the x87 FPU, bypassing the default
 //! emit_load_operand path that assumes values fit in a single register.
 
+use super::emit::I686Codegen;
 use crate::backend::traits::ArchCodegen;
-use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::emit;
-use super::emit::I686Codegen;
+use crate::ir::reexports::{Operand, Value};
 
 impl I686Codegen {
     /// Override emit_cast to handle F64 source/destination specially on i686.
     /// F64 values are 8 bytes but the accumulator is only 32 bits, so we use
     /// x87 FPU for all F64 conversions, bypassing the default emit_load_operand path.
-    pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
-        use crate::backend::cast::{CastKind, classify_cast_with_f128};
+    pub(super) fn emit_cast_impl(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) {
+        use crate::backend::cast::{classify_cast_with_f128, CastKind};
 
         // Register-preserving no-op: when dest and src share a register and the
         // cast does not change the 32-bit register contents, emit nothing.
@@ -39,8 +45,10 @@ impl I686Codegen {
                 if dp == sp {
                     let noop = matches!(
                         (from_ty, to_ty),
-                        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, IrType::I32 | IrType::U32)
-                            | (IrType::I32, IrType::U32)
+                        (
+                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16,
+                            IrType::I32 | IrType::U32
+                        ) | (IrType::I32, IrType::U32)
                             | (IrType::U32, IrType::I32)
                             | (IrType::I32, IrType::I32)
                             | (IrType::U32, IrType::U32)
@@ -53,7 +61,9 @@ impl I686Codegen {
         }
 
         // Let the default handle i128 conversions
-        if crate::backend::generation::is_i128_type(from_ty) || crate::backend::generation::is_i128_type(to_ty) {
+        if crate::backend::generation::is_i128_type(from_ty)
+            || crate::backend::generation::is_i128_type(to_ty)
+        {
             crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
             return;
         }
@@ -65,10 +75,16 @@ impl I686Codegen {
         // use fstpl (8-byte store) which would corrupt F128 values.
         match classify_cast_with_f128(from_ty, to_ty, true) {
             // --- Casts where F64 is the destination (result needs 8-byte slot) ---
-            CastKind::SignedToFloat { to_f64: true, from_ty: src_ty } => {
+            CastKind::SignedToFloat {
+                to_f64: true,
+                from_ty: src_ty,
+            } => {
                 self.emit_signed_to_f64(src, src_ty, dest);
             }
-            CastKind::UnsignedToFloat { to_f64: true, from_ty } => {
+            CastKind::UnsignedToFloat {
+                to_f64: true,
+                from_ty,
+            } => {
                 self.emit_unsigned_to_f64(src, from_ty, dest);
             }
             CastKind::FloatToFloat { widen: true } => {
@@ -86,7 +102,10 @@ impl I686Codegen {
             CastKind::FloatToSigned { from_f64: true } => {
                 self.emit_f64_to_signed(src, to_ty, dest);
             }
-            CastKind::FloatToUnsigned { from_f64: true, to_u64 } => {
+            CastKind::FloatToUnsigned {
+                from_f64: true,
+                to_u64,
+            } => {
                 self.emit_f64_to_unsigned(src, to_u64, to_ty, dest);
             }
             CastKind::FloatToFloat { widen: false } => {
@@ -123,7 +142,10 @@ impl I686Codegen {
             }
 
             // --- I64 -> F32: use x87 fildq for full 64-bit precision ---
-            CastKind::SignedToFloat { to_f64: false, from_ty: IrType::I64 } => {
+            CastKind::SignedToFloat {
+                to_f64: false,
+                from_ty: IrType::I64,
+            } => {
                 self.emit_load_acc_pair(src);
                 self.state.emit("    pushl %edx");
                 self.state.emit("    pushl %eax");
@@ -135,7 +157,10 @@ impl I686Codegen {
                 self.store_eax_to(dest);
             }
             // --- U64 -> F32: use x87 with unsigned handling ---
-            CastKind::UnsignedToFloat { to_f64: false, from_ty: IrType::U64 } => {
+            CastKind::UnsignedToFloat {
+                to_f64: false,
+                from_ty: IrType::U64,
+            } => {
                 self.emit_u64_to_f32(src, dest);
             }
             // --- F32 -> I64: use x87 fisttpq ---
@@ -143,14 +168,25 @@ impl I686Codegen {
                 self.emit_f32_to_i64(src, dest);
             }
             // --- F32 -> U64: use x87 fisttpq ---
-            CastKind::FloatToUnsigned { from_f64: false, to_u64: true } => {
+            CastKind::FloatToUnsigned {
+                from_f64: false,
+                to_u64: true,
+            } => {
                 self.emit_f32_to_i64(src, dest); // same implementation as F32->I64
             }
 
             // --- Same-size cast between I64 and U64: copy all 8 bytes ---
             CastKind::SignedToUnsignedSameSize { to_ty: IrType::U64 }
             | CastKind::UnsignedToSignedSameSize { to_ty: IrType::I64 }
-            | CastKind::Noop if matches!((from_ty, to_ty), (IrType::I64, IrType::U64) | (IrType::U64, IrType::I64) | (IrType::I64, IrType::I64) | (IrType::U64, IrType::U64)) => {
+            | CastKind::Noop
+                if matches!(
+                    (from_ty, to_ty),
+                    (IrType::I64, IrType::U64)
+                        | (IrType::U64, IrType::I64)
+                        | (IrType::I64, IrType::I64)
+                        | (IrType::U64, IrType::U64)
+                ) =>
+            {
                 self.emit_load_acc_pair(src);
                 self.emit_store_acc_pair(dest);
                 self.state.reg_cache.invalidate_all();
@@ -509,7 +545,7 @@ impl I686Codegen {
     /// Emit scalar cast instructions (non-F64/F128, non-64-bit integer).
     /// Operates on value already in eax, result left in eax.
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
-        use crate::backend::cast::{CastKind, classify_cast};
+        use crate::backend::cast::{classify_cast, CastKind};
 
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {}
@@ -599,7 +635,10 @@ impl I686Codegen {
                 }
             }
 
-            CastKind::FloatToUnsigned { from_f64: false, to_u64 } => {
+            CastKind::FloatToUnsigned {
+                from_f64: false,
+                to_u64,
+            } => {
                 if to_u64 {
                     // F32 -> U64: use x87
                     self.state.emit("    pushl %eax");

@@ -1,11 +1,11 @@
 //! I686Codegen: comparison operations (float, int, fused branches, select).
 
-use crate::ir::reexports::{IrCmpOp, Operand, Value};
-use crate::common::types::IrType;
+use super::emit::{phys_reg_name, I686Codegen};
 use crate::backend::state::SlotAddr;
-use crate::emit;
 use crate::backend::traits::ArchCodegen;
-use super::emit::{I686Codegen, phys_reg_name};
+use crate::common::types::IrType;
+use crate::emit;
+use crate::ir::reexports::{IrCmpOp, Operand, Value};
 
 impl I686Codegen {
     /// Register name for a scalar value safe to compare in place (not an
@@ -32,7 +32,9 @@ impl I686Codegen {
     /// %eax stays untouched). `%ecx` is the slot-operand scratch, so a LHS in
     /// %ecx never takes the direct path against a slot-resident RHS.
     fn emit_int_cmp_flags_direct(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) -> bool {
-        let Some(lreg) = self.cmp_operand_reg(lhs) else { return false };
+        let Some(lreg) = self.cmp_operand_reg(lhs) else {
+            return false;
+        };
         if let Some(imm) = Self::const_as_imm32(rhs) {
             let imm = Self::normalize_cmp_imm(imm, ty);
             if imm == 0 {
@@ -52,9 +54,19 @@ impl I686Codegen {
         true
     }
 
-    pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_float_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         if ty == IrType::F64 {
-            let swap = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
+            let swap = matches!(
+                op,
+                IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+            );
             let (first, second) = if swap { (lhs, rhs) } else { (rhs, lhs) };
             self.emit_f64_load_to_x87(first);
             self.emit_f64_load_to_x87(second);
@@ -85,8 +97,15 @@ impl I686Codegen {
             return;
         }
         // F32: Use SSE for float comparisons
-        let swap_operands = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
-        let (first, second) = if swap_operands { (rhs, lhs) } else { (lhs, rhs) };
+        let swap_operands = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
+        let (first, second) = if swap_operands {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
 
         self.operand_to_eax(first);
         self.state.emit("    movd %eax, %xmm0");
@@ -117,8 +136,17 @@ impl I686Codegen {
         self.store_eax_to(dest);
     }
 
-    pub(super) fn emit_f128_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {
-        let swap = matches!(op, IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule);
+    pub(super) fn emit_f128_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        let swap = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
         let (first, second) = if swap { (lhs, rhs) } else { (rhs, lhs) };
         self.emit_f128_load_to_x87(first);
         self.emit_f128_load_to_x87(second);
@@ -179,7 +207,9 @@ impl I686Codegen {
             IrType::I32 | IrType::U32 | IrType::Ptr => "cmpl",
             _ => return false,
         };
-        let Some(addr) = self.state.resolve_slot_addr(ptr) else { return false };
+        let Some(addr) = self.state.resolve_slot_addr(ptr) else {
+            return false;
+        };
         match addr {
             SlotAddr::Direct(slot) => {
                 let sr = self.slot_ref(slot);
@@ -189,8 +219,17 @@ impl I686Codegen {
                 self.emit_load_ptr_from_slot(slot, ptr);
                 emit!(self.state, "    {} ${}, (%ecx)", mnemonic, imm);
             }
-            SlotAddr::OverAligned(slot,id) => { self.emit_alloca_aligned_addr(slot,id); emit!(self.state,"    {} ${}, (%ecx)",mnemonic,imm); }
-            SlotAddr::Reg(reg) => emit!(self.state,"    {} ${}, (%{})",mnemonic,imm,phys_reg_name(reg)),
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr(slot, id);
+                emit!(self.state, "    {} ${}, (%ecx)", mnemonic, imm);
+            }
+            SlotAddr::Reg(reg) => emit!(
+                self.state,
+                "    {} ${}, (%{})",
+                mnemonic,
+                imm,
+                phys_reg_name(reg)
+            ),
         }
         true
     }
@@ -201,8 +240,12 @@ impl I686Codegen {
     /// `cmp{b,w,l} $imm,(mem)` and report success so the caller skips the
     /// register-resident compare.
     fn take_load_cmp_fold(&mut self, lhs: &Operand, rhs: &Operand, op: IrCmpOp) -> bool {
-        let Operand::Value(lv) = lhs else { return false };
-        let Some((ptr, lty, imm)) = self.state.pending_load_cmp.remove(&lv.0) else { return false };
+        let Operand::Value(lv) = lhs else {
+            return false;
+        };
+        let Some((ptr, lty, imm)) = self.state.pending_load_cmp.remove(&lv.0) else {
+            return false;
+        };
         if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
             || crate::backend::generation::cmp_fold_imm(rhs, lty) != Some(imm)
         {
@@ -220,7 +263,14 @@ impl I686Codegen {
         true
     }
 
-    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_int_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         // Load→memory-compare fold: `movsbl (mem),%r; testl %r,%r` collapses
         // to `cmpb $0,(mem)`, freeing the register and the push/pop pair.
         let folded = self.take_load_cmp_fold(lhs, rhs, op);
@@ -382,8 +432,8 @@ impl I686Codegen {
         }
 
         let jcc = match op {
-            IrCmpOp::Eq  => "je",
-            IrCmpOp::Ne  => "jne",
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
             IrCmpOp::Slt => "jl",
             IrCmpOp::Sle => "jle",
             IrCmpOp::Sgt => "jg",
@@ -398,7 +448,14 @@ impl I686Codegen {
         self.state.reg_cache.invalidate_all();
     }
 
-    pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) {
+    pub(super) fn emit_select_impl(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) {
         use crate::ir::reexports::IrConst;
         // Constant-fold wide conditions at compile time
         match cond {

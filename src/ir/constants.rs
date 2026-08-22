@@ -154,7 +154,11 @@ impl IrConst {
     /// Returns true if this constant is zero (integer or float).
     pub fn is_zero(&self) -> bool {
         match self {
-            IrConst::I8(0) | IrConst::I16(0) | IrConst::I32(0) | IrConst::I64(0) | IrConst::I128(0) => true,
+            IrConst::I8(0)
+            | IrConst::I16(0)
+            | IrConst::I32(0)
+            | IrConst::I64(0)
+            | IrConst::I128(0) => true,
             IrConst::F32(v) => *v == 0.0,
             IrConst::F64(v) => *v == 0.0,
             IrConst::LongDouble(v, _) => *v == 0.0,
@@ -238,8 +242,10 @@ impl IrConst {
     /// exception/rounding observability. Floating identities need their own
     /// opt-in legality gate instead of silently sharing integer algebra.
     pub fn is_one(&self) -> bool {
-        matches!(self, IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1)
-            | IrConst::I64(1) | IrConst::I128(1))
+        matches!(
+            self,
+            IrConst::I8(1) | IrConst::I16(1) | IrConst::I32(1) | IrConst::I64(1) | IrConst::I128(1)
+        )
     }
 
     /// Returns true if this constant is nonzero (for truthiness checks in const eval).
@@ -302,8 +308,14 @@ impl IrConst {
 
     /// Cast a long double (with f128 bytes) to the target IR type.
     /// Uses full precision for integer conversions.
-    pub fn cast_long_double_to_target(fv: f64, bytes: &[u8; 16], target: IrType) -> Option<IrConst> {
-        use crate::common::long_double::{f128_bytes_to_i64, f128_bytes_to_u64, f128_bytes_to_i128, f128_bytes_to_u128};
+    pub fn cast_long_double_to_target(
+        fv: f64,
+        bytes: &[u8; 16],
+        target: IrType,
+    ) -> Option<IrConst> {
+        use crate::common::long_double::{
+            f128_bytes_to_i128, f128_bytes_to_i64, f128_bytes_to_u128, f128_bytes_to_u64,
+        };
         Some(match target {
             IrType::F64 => IrConst::F64(fv),
             IrType::F128 => IrConst::long_double_with_bytes(fv, *bytes),

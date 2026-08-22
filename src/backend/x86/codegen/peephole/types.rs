@@ -56,33 +56,49 @@ pub(super) struct LineInfo {
 /// patterns we care about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LineKind {
-    Nop,                // Deleted line (marked via LineInfo only)
-    Empty,              // Blank line
+    Nop,   // Deleted line (marked via LineInfo only)
+    Empty, // Blank line
 
     /// `movX %reg, offset(%rbp)` – store register to stack slot
-    StoreRbp { reg: RegId, offset: i32, size: MoveSize },
+    StoreRbp {
+        reg: RegId,
+        offset: i32,
+        size: MoveSize,
+    },
     /// `movX offset(%rbp), %reg` or `movslq offset(%rbp), %reg` – load from stack slot
-    LoadRbp  { reg: RegId, offset: i32, size: MoveSize },
+    LoadRbp {
+        reg: RegId,
+        offset: i32,
+        size: MoveSize,
+    },
 
     /// `movq %reg, %reg` – self-move (pre-classified to avoid string ops in hot loop)
     SelfMove,
 
-    Label,              // `name:`
-    Jmp,                // `jmp label`
-    JmpIndirect,        // `jmpq *%rax` or `jmp __x86_indirect_thunk_rax`
-    CondJmp,            // `je`/`jne`/`jl`/... label
-    Call,               // `call ...`
-    Ret,                // `ret`
-    Push { reg: RegId },  // `pushq %reg`
-    Pop { reg: RegId },   // `popq %reg`
-    SetCC { reg: RegId },  // `setCC %reg` (byte register; reg is family ID)
-    Cmp,                // `cmpX`/`testX`/`ucomis*`
-    Directive,          // Lines starting with `.`
+    Label,       // `name:`
+    Jmp,         // `jmp label`
+    JmpIndirect, // `jmpq *%rax` or `jmp __x86_indirect_thunk_rax`
+    CondJmp,     // `je`/`jne`/`jl`/... label
+    Call,        // `call ...`
+    Ret,         // `ret`
+    Push {
+        reg: RegId,
+    }, // `pushq %reg`
+    Pop {
+        reg: RegId,
+    }, // `popq %reg`
+    SetCC {
+        reg: RegId,
+    }, // `setCC %reg` (byte register; reg is family ID)
+    Cmp,         // `cmpX`/`testX`/`ucomis*`
+    Directive,   // Lines starting with `.`
 
     /// Everything else (regular instructions).
     /// `dest_reg` is the pre-parsed destination register family (REG_NONE if unknown).
     /// This allows fast register-modification checks without re-parsing.
-    Other { dest_reg: RegId },
+    Other {
+        dest_reg: RegId,
+    },
 
     /// A line inside a `#APP`/`#NO_APP` inline-asm region. User-authored
     /// assembly is OPAQUE: it may be a deliberate length template (kernel
@@ -171,10 +187,13 @@ impl MoveSize {
 
 impl LineInfo {
     #[inline]
-    pub(super) fn is_nop(self) -> bool { self.kind == LineKind::Nop }
+    pub(super) fn is_nop(self) -> bool {
+        self.kind == LineKind::Nop
+    }
     #[inline]
     pub(super) fn is_barrier(self) -> bool {
-        matches!(self.kind,
+        matches!(
+            self.kind,
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
             LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
             // ms178: push/pop (incl. pushfq/popfq with REG_NONE) read/write the
@@ -183,10 +202,13 @@ impl LineInfo {
             // logical slot offsets consistent across pushfq/popfq, but the
             // barrier only costs a little optimization locality, never
             // correctness.
-            LineKind::Push { .. } | LineKind::Pop { .. })
+            LineKind::Push { .. } | LineKind::Pop { .. }
+        )
     }
     #[inline]
-    pub(super) fn is_push(self) -> bool { matches!(self.kind, LineKind::Push { .. }) }
+    pub(super) fn is_push(self) -> bool {
+        matches!(self.kind, LineKind::Push { .. })
+    }
 
     /// Get the trimmed content of a line using the cached trim offset.
     /// This avoids re-scanning leading whitespace on every access.
@@ -207,7 +229,15 @@ impl LineInfo {
 /// Helper to construct a LineInfo with default ext_kind and has_indirect_mem.
 #[inline]
 pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
+    LineInfo {
+        kind,
+        ext_kind: ExtKind::None,
+        trim_start: ts,
+        has_indirect_mem: false,
+        rbp_offset: RBP_OFFSET_NONE,
+        reg_refs: 0,
+        pinned: false,
+    }
 }
 
 /// Build a `LineInfo` for a `Cmp`/`test`/`ucomis` line, populating the
@@ -218,7 +248,11 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
 #[inline]
 pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
     let has_indirect = has_indirect_memory_access(s);
-    let rbp_off = if has_indirect { RBP_OFFSET_NONE } else { parse_rbp_offset(s) };
+    let rbp_off = if has_indirect {
+        RBP_OFFSET_NONE
+    } else {
+        parse_rbp_offset(s)
+    };
     let reg_refs = scan_register_refs(sb);
     LineInfo {
         kind: LineKind::Cmp,
@@ -234,13 +268,29 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
 /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
 #[inline]
 pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ExtKind::None, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs, pinned: false }
+    LineInfo {
+        kind,
+        ext_kind: ExtKind::None,
+        trim_start: ts,
+        has_indirect_mem: false,
+        rbp_offset: RBP_OFFSET_NONE,
+        reg_refs,
+        pinned: false,
+    }
 }
 
 /// Helper to construct a LineInfo with a specific ext_kind.
 #[inline]
 pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
-    LineInfo { kind, ext_kind: ext, trim_start: ts, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false }
+    LineInfo {
+        kind,
+        ext_kind: ext,
+        trim_start: ts,
+        has_indirect_mem: false,
+        rbp_offset: RBP_OFFSET_NONE,
+        reg_refs: 0,
+        pinned: false,
+    }
 }
 
 /// Parse one assembly line into a `LineInfo`.
@@ -249,7 +299,10 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
 
     // Compute trim offset once and cache it
     let trim_start = compute_trim_offset(b);
-    debug_assert!(trim_start <= u16::MAX as usize, "assembly line with >65535 leading spaces");
+    debug_assert!(
+        trim_start <= u16::MAX as usize,
+        "assembly line with >65535 leading spaces"
+    );
     let s = &raw[trim_start..];
     let sb = s.as_bytes();
 
@@ -306,16 +359,19 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             }
         }
         // Check for self-move: movq %reg, %reg (same src and dst)
-        if sb[3] == b'q' && sb.len() >= 6 && sb[4] == b' '
-            && is_self_move_fast(sb) {
-                return line_info(LineKind::SelfMove, ts);
-            }
+        if sb[3] == b'q' && sb.len() >= 6 && sb[4] == b' ' && is_self_move_fast(sb) {
+            return line_info(LineKind::SelfMove, ts);
+        }
         // Pre-classify extension-related instructions
         let ext = classify_mov_ext(s, sb);
         if ext != ExtKind::None {
             let dest_reg = parse_dest_reg_fast(s);
             let has_indirect = has_indirect_memory_access(s);
-            let rbp_off = if has_indirect { RBP_OFFSET_NONE } else { parse_rbp_offset(s) };
+            let rbp_off = if has_indirect {
+                RBP_OFFSET_NONE
+            } else {
+                parse_rbp_offset(s)
+            };
             let reg_refs = scan_register_refs(sb);
             return LineInfo {
                 kind: LineKind::Other { dest_reg },
@@ -388,12 +444,20 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         if let Some(rest) = s.strip_prefix("pushq ") {
             let reg = register_family_fast(rest.trim());
             // Only use reg for bitmask if it's a GP register; otherwise use full scan
-            let rr = if reg <= REG_GP_MAX { 1u16 << reg } else { scan_register_refs(sb) };
+            let rr = if reg <= REG_GP_MAX {
+                1u16 << reg
+            } else {
+                scan_register_refs(sb)
+            };
             return line_info_with_regs(LineKind::Push { reg }, ts, rr);
         }
         if let Some(rest) = s.strip_prefix("popq ") {
             let reg = register_family_fast(rest.trim());
-            let rr = if reg <= REG_GP_MAX { 1u16 << reg } else { scan_register_refs(sb) };
+            let rr = if reg <= REG_GP_MAX {
+                1u16 << reg
+            } else {
+                scan_register_refs(sb)
+            };
             return line_info_with_regs(LineKind::Pop { reg }, ts, rr);
         }
         // ms178: pushfq/popfq (and 32-bit pushfl/popfl) are classified with
@@ -416,14 +480,19 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
 
     // SetCC: extract the actual destination register (not always %al).
     // Inline asm can emit setCC to any byte register (e.g., sete %cl, seta %dl).
-    if first == b's' && sb.len() >= 4 && sb[1] == b'e' && sb[2] == b't' && parse_setcc(s).is_some() {
+    if first == b's' && sb.len() >= 4 && sb[1] == b'e' && sb[2] == b't' && parse_setcc(s).is_some()
+    {
         let setcc_reg = if let Some(space_pos) = s.rfind(' ') {
             let operand = s[space_pos + 1..].trim();
             register_family_fast(operand)
         } else {
             0 // default to rax family if can't parse
         };
-        return line_info_with_regs(LineKind::SetCC { reg: setcc_reg }, ts, scan_register_refs(sb));
+        return line_info_with_regs(
+            LineKind::SetCC { reg: setcc_reg },
+            ts,
+            scan_register_refs(sb),
+        );
     }
 
     // Pre-classify 32-bit arithmetic producers for extension elimination
@@ -433,10 +502,22 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     let dest_reg = parse_dest_reg_fast(s);
     // Cache has_indirect_memory_access for Other lines
     let has_indirect = has_indirect_memory_access(s);
-    let rbp_off = if has_indirect { RBP_OFFSET_NONE } else { parse_rbp_offset(s) };
+    let rbp_off = if has_indirect {
+        RBP_OFFSET_NONE
+    } else {
+        parse_rbp_offset(s)
+    };
     // Pre-scan register references for O(1) checks in eliminate_unused_callee_saves
     let reg_refs = scan_register_refs(sb);
-    LineInfo { kind: LineKind::Other { dest_reg }, ext_kind: ext, trim_start: ts, has_indirect_mem: has_indirect, rbp_offset: rbp_off, reg_refs, pinned: false }
+    LineInfo {
+        kind: LineKind::Other { dest_reg },
+        ext_kind: ext,
+        trim_start: ts,
+        has_indirect_mem: has_indirect,
+        rbp_offset: rbp_off,
+        reg_refs,
+        pinned: false,
+    }
 }
 
 /// Fast check for self-move: `movq %REG, %REG` where both register names match.
@@ -447,14 +528,20 @@ pub(super) fn is_self_move_fast(sb: &[u8]) -> bool {
     // sb = "movq %REG, %REG" - find the comma
     let len = sb.len();
     // The source starts at byte 5 (after "movq ")
-    if len < 10 || sb[5] != b'%' { return false; }
+    if len < 10 || sb[5] != b'%' {
+        return false;
+    }
     // Find comma
     let mut comma = 6;
     while comma < len {
-        if sb[comma] == b',' { break; }
+        if sb[comma] == b',' {
+            break;
+        }
         comma += 1;
     }
-    if comma >= len { return false; }
+    if comma >= len {
+        return false;
+    }
     // Source = sb[5..comma], skip whitespace after comma
     let src = &sb[5..comma];
     let mut dst_start = comma + 1;
@@ -481,11 +568,21 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
     // after another movslq to %rax) and is also a producer for cltq elimination.
     // We classify it as ProducerMovslqToRax so cltq elimination works, and add
     // MovslqEaxRax to the consumer matching so it can also be eliminated.
-    if s == "movzbq %al, %rax" { return ExtKind::MovzbqAlRax; }
-    if s == "movzwq %ax, %rax" { return ExtKind::MovzwqAxRax; }
-    if s == "movsbq %al, %rax" { return ExtKind::MovsbqAlRax; }
-    if s == "movslq %eax, %rax" { return ExtKind::MovslqEaxRax; }
-    if s == "movl %eax, %eax" { return ExtKind::MovlEaxEax; }
+    if s == "movzbq %al, %rax" {
+        return ExtKind::MovzbqAlRax;
+    }
+    if s == "movzwq %ax, %rax" {
+        return ExtKind::MovzwqAxRax;
+    }
+    if s == "movsbq %al, %rax" {
+        return ExtKind::MovsbqAlRax;
+    }
+    if s == "movslq %eax, %rax" {
+        return ExtKind::MovslqEaxRax;
+    }
+    if s == "movl %eax, %eax" {
+        return ExtKind::MovlEaxEax;
+    }
 
     // Producers: movslq ... %rax
     if len >= 7 && sb[3] == b's' && sb[4] == b'l' && sb[5] == b'q' && sb[6] == b' ' {
@@ -496,21 +593,19 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
     }
 
     // Producers: movq $const, %rax
-    if len >= 6 && sb[3] == b'q' && sb[4] == b' ' && sb[5] == b'$'
-        && s.ends_with("%rax") {
-            return ExtKind::ProducerMovqConstRax;
-        }
+    if len >= 6 && sb[3] == b'q' && sb[4] == b' ' && sb[5] == b'$' && s.ends_with("%rax") {
+        return ExtKind::ProducerMovqConstRax;
+    }
 
     // Producers: movq %REG, %rax (register-to-rax copy, REG != rax)
     // Used for fusion: `movq %REG, %rax; movl %eax, %eax` -> `movl %REGd, %eax`
-    if len >= 6 && sb[3] == b'q' && sb[4] == b' ' && sb[5] == b'%'
-        && s.ends_with(", %rax") {
-            // Extract source register and verify it's not %rax itself
-            let src = &s[5..s.len() - 6]; // between "movq " and ", %rax"
-            if src.starts_with('%') && src != "%rax" && !src.contains('(') {
-                return ExtKind::ProducerMovqRegToRax;
-            }
+    if len >= 6 && sb[3] == b'q' && sb[4] == b' ' && sb[5] == b'%' && s.ends_with(", %rax") {
+        // Extract source register and verify it's not %rax itself
+        let src = &s[5..s.len() - 6]; // between "movq " and ", %rax"
+        if src.starts_with('%') && src != "%rax" && !src.contains('(') {
+            return ExtKind::ProducerMovqRegToRax;
         }
+    }
 
     // Producers: movzbq ... %rax
     if s.starts_with("movzbq ") && s.ends_with("%rax") {
@@ -524,10 +619,9 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
     }
 
     // Producers: movl ... %eax
-    if len >= 6 && sb[3] == b'l' && sb[4] == b' '
-        && s.ends_with("%eax") {
-            return ExtKind::ProducerMovlToEax;
-        }
+    if len >= 6 && sb[3] == b'l' && sb[4] == b' ' && s.ends_with("%eax") {
+        return ExtKind::ProducerMovlToEax;
+    }
 
     // Producers: movzbl ... %eax
     if s.starts_with("movzbl ") && s.ends_with("%eax") {
@@ -550,29 +644,48 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
 pub(super) fn classify_arith_ext(s: &str, _sb: &[u8], first: u8) -> ExtKind {
     match first {
         b'a' => {
-            if s.starts_with("addl ") || s.starts_with("andl ") { ExtKind::ProducerArith32 }
-            else { ExtKind::None }
+            if s.starts_with("addl ") || s.starts_with("andl ") {
+                ExtKind::ProducerArith32
+            } else {
+                ExtKind::None
+            }
         }
         b's' => {
-            if s.starts_with("subl ") || s.starts_with("shll ") || s.starts_with("shrl ") { ExtKind::ProducerArith32 }
-            else { ExtKind::None }
+            if s.starts_with("subl ") || s.starts_with("shll ") || s.starts_with("shrl ") {
+                ExtKind::ProducerArith32
+            } else {
+                ExtKind::None
+            }
         }
         b'i' => {
-            if s.starts_with("imull ") { ExtKind::ProducerArith32 }
-            else if s == "idivl %ecx" { ExtKind::ProducerDiv32 }
-            else { ExtKind::None }
+            if s.starts_with("imull ") {
+                ExtKind::ProducerArith32
+            } else if s == "idivl %ecx" {
+                ExtKind::ProducerDiv32
+            } else {
+                ExtKind::None
+            }
         }
         b'o' => {
-            if s.starts_with("orl ") { ExtKind::ProducerArith32 }
-            else { ExtKind::None }
+            if s.starts_with("orl ") {
+                ExtKind::ProducerArith32
+            } else {
+                ExtKind::None
+            }
         }
         b'x' => {
-            if s.starts_with("xorl ") { ExtKind::ProducerArith32 }
-            else { ExtKind::None }
+            if s.starts_with("xorl ") {
+                ExtKind::ProducerArith32
+            } else {
+                ExtKind::None
+            }
         }
         b'd' => {
-            if s == "divl %ecx" { ExtKind::ProducerDiv32 }
-            else { ExtKind::None }
+            if s == "divl %ecx" {
+                ExtKind::ProducerDiv32
+            } else {
+                ExtKind::None
+            }
         }
         _ => ExtKind::None,
     }
@@ -595,18 +708,19 @@ pub(super) fn compute_trim_offset(b: &[u8]) -> usize {
 pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
     let b = s.as_bytes();
     // Implicit rax writers
-    if b.len() >= 4
-        && b[0] == b'c' && (s == "cltq" || s == "cqto" || s == "cdq" || s == "cqo") {
-            return 0; // rax family
-        }
+    if b.len() >= 4 && b[0] == b'c' && (s == "cltq" || s == "cqto" || s == "cdq" || s == "cqo") {
+        return 0; // rax family
+    }
     // Single-operand div/idiv/mul implicitly write rax:rdx.
     // Note: imul is not listed because the codegen only emits two/three-operand
     // forms (imulq %rcx, %rax / imulq $imm, %rax, %rax) which write to the
     // explicit destination, handled by the comma-based dest extraction below.
-    if b.len() >= 3 && (b[0] == b'd' || b[0] == b'i' || b[0] == b'm')
-        && (s.starts_with("div") || s.starts_with("idiv") || s.starts_with("mul")) {
-            return 0; // rax family (also rdx, but we track rax as primary)
-        }
+    if b.len() >= 3
+        && (b[0] == b'd' || b[0] == b'i' || b[0] == b'm')
+        && (s.starts_with("div") || s.starts_with("idiv") || s.starts_with("mul"))
+    {
+        return 0; // rax family (also rdx, but we track rax as primary)
+    }
     // For AT&T syntax the final *top-level* operand is the destination.  A
     // raw last-comma search is unsound for SIB memory operands such as
     // `movb $0, (%rdx,%r8)`: it mistakes `%r8)` for a destination register.
@@ -626,12 +740,19 @@ pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
     //   shr, shl, sar, ror, rol (shift/rotate by 1 with no immediate)
     //   popcntl, popcntq      (popcount, though these usually have 2 operands with comma)
     if b.len() >= 4 {
-        let is_single_op_modifier =
-            (b[0] == b'i' || b[0] == b'd' || b[0] == b'n') &&
-            (s.starts_with("inc") || s.starts_with("dec") || s.starts_with("not") || s.starts_with("neg"))
+        let is_single_op_modifier = (b[0] == b'i' || b[0] == b'd' || b[0] == b'n')
+            && (s.starts_with("inc")
+                || s.starts_with("dec")
+                || s.starts_with("not")
+                || s.starts_with("neg"))
             || b[0] == b'b' && (s.starts_with("bswapl") || s.starts_with("bswapq"))
-            || b[0] == b's' && (s.starts_with("shr") || s.starts_with("shl") || s.starts_with("sar"))
-            || b[0] == b'r' && (s.starts_with("ror") || s.starts_with("rol") || s.starts_with("rcr") || s.starts_with("rcl"));
+            || b[0] == b's'
+                && (s.starts_with("shr") || s.starts_with("shl") || s.starts_with("sar"))
+            || b[0] == b'r'
+                && (s.starts_with("ror")
+                    || s.starts_with("rol")
+                    || s.starts_with("rcr")
+                    || s.starts_with("rcl"));
         if is_single_op_modifier {
             if let Some(space_pos) = s.find(' ') {
                 let operand = s[space_pos + 1..].trim();
@@ -691,7 +812,11 @@ pub(super) fn fast_parse_i32(s: &str) -> i32 {
             break;
         }
     }
-    if neg { -v } else { v }
+    if neg {
+        -v
+    } else {
+        v
+    }
 }
 
 // ── Existing string-level parsers (used once during classify and for mutations) ──
@@ -773,13 +898,28 @@ pub(super) use crate::backend::peephole_common::LineStore;
 
 #[inline]
 pub(super) fn mark_nop(info: &mut LineInfo) {
-    if info.pinned { return; } // Never remove pinned instructions
-    *info = LineInfo { kind: LineKind::Nop, ext_kind: ExtKind::None, trim_start: 0, has_indirect_mem: false, rbp_offset: RBP_OFFSET_NONE, reg_refs: 0, pinned: false };
+    if info.pinned {
+        return;
+    } // Never remove pinned instructions
+    *info = LineInfo {
+        kind: LineKind::Nop,
+        ext_kind: ExtKind::None,
+        trim_start: 0,
+        has_indirect_mem: false,
+        rbp_offset: RBP_OFFSET_NONE,
+        reg_refs: 0,
+        pinned: false,
+    };
 }
 
 /// Replace a line's text and re-classify it.
 #[inline]
-pub(super) fn replace_line(store: &mut LineStore, info: &mut LineInfo, idx: usize, new_text: String) {
+pub(super) fn replace_line(
+    store: &mut LineStore,
+    info: &mut LineInfo,
+    idx: usize,
+    new_text: String,
+) {
     store.replace(idx, new_text);
     *info = classify_line(store.get(idx));
 }
@@ -858,11 +998,15 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     //   iret    -> restores rip, cs, rflags, rsp, ss from stack
     // Treat these as barriers for store forwarding since parse_dest_reg_fast
     // cannot detect their implicit register writes.
-    if trimmed.starts_with("rdmsr") || trimmed.starts_with("wrmsr")
-        || trimmed.starts_with("cpuid") || trimmed.starts_with("rdtsc")
+    if trimmed.starts_with("rdmsr")
+        || trimmed.starts_with("wrmsr")
+        || trimmed.starts_with("cpuid")
+        || trimmed.starts_with("rdtsc")
         || trimmed.starts_with("xgetbv")
-        || trimmed.starts_with("syscall") || trimmed.starts_with("sysenter")
-        || trimmed.starts_with("int ") || trimmed.starts_with("int\t")
+        || trimmed.starts_with("syscall")
+        || trimmed.starts_with("sysenter")
+        || trimmed.starts_with("int ")
+        || trimmed.starts_with("int\t")
         || trimmed.starts_with("iret")
     {
         return true;
@@ -919,9 +1063,11 @@ pub(super) fn parse_rbp_offset(s: &str) -> i32 {
     let mut found_offset = RBP_OFFSET_NONE;
     let mut i = 0;
     while i + 5 < len {
-        if bytes[i] == b'(' && bytes[i + 1] == b'%'
+        if bytes[i] == b'('
+            && bytes[i + 1] == b'%'
             && bytes[i + 2] == b'r'
-            && ((bytes[i + 3] == b'b' && bytes[i + 4] == b'p') || (bytes[i + 3] == b's' && bytes[i + 4] == b'p'))
+            && ((bytes[i + 3] == b'b' && bytes[i + 4] == b'p')
+                || (bytes[i + 3] == b's' && bytes[i + 4] == b'p'))
             && bytes[i + 5] == b')'
         {
             // Found "(%rbp)" at position i. Parse the offset before '('.
@@ -964,15 +1110,15 @@ pub(super) fn is_conditional_jump(s: &str) -> bool {
     }
     // Dispatch on second byte to narrow candidates quickly
     match b[1] {
-        b'e' => b[2] == b' ',                                         // je
-        b'l' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '),  // jl, jle
-        b'g' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '),  // jg, jge
-        b'b' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '),  // jb, jbe
-        b'a' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '),  // ja, jae
-        b's' => b[2] == b' ',                                         // js
-        b'o' => b[2] == b' ',                                         // jo
-        b'p' => b[2] == b' ',                                         // jp
-        b'z' => b[2] == b' ',                                         // jz
+        b'e' => b[2] == b' ',                                                   // je
+        b'l' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // jl, jle
+        b'g' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // jg, jge
+        b'b' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // jb, jbe
+        b'a' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // ja, jae
+        b's' => b[2] == b' ',                                                   // js
+        b'o' => b[2] == b' ',                                                   // jo
+        b'p' => b[2] == b' ',                                                   // jp
+        b'z' => b[2] == b' ',                                                   // jz
         b'n' => {
             // jne, jns, jno, jnp, jnz
             if b.len() >= 4 {
@@ -1052,18 +1198,42 @@ pub(super) fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) ->
             if src == dst {
                 // Map old_reg (64-bit) to its 32-bit name to check if it matches
                 let old_32 = match old_reg {
-                    "%rax" => "%eax", "%rbx" => "%ebx", "%rcx" => "%ecx", "%rdx" => "%edx",
-                    "%rsi" => "%esi", "%rdi" => "%edi", "%rsp" => "%esp", "%rbp" => "%ebp",
-                    "%r8" => "%r8d", "%r9" => "%r9d", "%r10" => "%r10d", "%r11" => "%r11d",
-                    "%r12" => "%r12d", "%r13" => "%r13d", "%r14" => "%r14d", "%r15" => "%r15d",
+                    "%rax" => "%eax",
+                    "%rbx" => "%ebx",
+                    "%rcx" => "%ecx",
+                    "%rdx" => "%edx",
+                    "%rsi" => "%esi",
+                    "%rdi" => "%edi",
+                    "%rsp" => "%esp",
+                    "%rbp" => "%ebp",
+                    "%r8" => "%r8d",
+                    "%r9" => "%r9d",
+                    "%r10" => "%r10d",
+                    "%r11" => "%r11d",
+                    "%r12" => "%r12d",
+                    "%r13" => "%r13d",
+                    "%r14" => "%r14d",
+                    "%r15" => "%r15d",
                     _ => "",
                 };
                 if src == old_32 {
                     let new_32 = match new_reg {
-                        "%rax" => "%eax", "%rbx" => "%ebx", "%rcx" => "%ecx", "%rdx" => "%edx",
-                        "%rsi" => "%esi", "%rdi" => "%edi", "%rsp" => "%esp", "%rbp" => "%ebp",
-                        "%r8" => "%r8d", "%r9" => "%r9d", "%r10" => "%r10d", "%r11" => "%r11d",
-                        "%r12" => "%r12d", "%r13" => "%r13d", "%r14" => "%r14d", "%r15" => "%r15d",
+                        "%rax" => "%eax",
+                        "%rbx" => "%ebx",
+                        "%rcx" => "%ecx",
+                        "%rdx" => "%edx",
+                        "%rsi" => "%esi",
+                        "%rdi" => "%edi",
+                        "%rsp" => "%esp",
+                        "%rbp" => "%ebp",
+                        "%r8" => "%r8d",
+                        "%r9" => "%r9d",
+                        "%r10" => "%r10d",
+                        "%r11" => "%r11d",
+                        "%r12" => "%r12d",
+                        "%r13" => "%r13d",
+                        "%r14" => "%r14d",
+                        "%r15" => "%r15d",
                         _ => new_reg,
                     };
                     return Some(format!("xorl {}, {}", new_32, new_32));
@@ -1077,17 +1247,15 @@ pub(super) fn replace_dest_register(inst: &str, old_reg: &str, new_reg: &str) ->
             if let Some((src, dst)) = rest.rsplit_once(',') {
                 let src = src.trim();
                 let dst = dst.trim();
-                if dst == old_reg
-                    && !src.contains(old_reg) {
-                        return Some(format!("{}{}, {}", prefix, src, new_reg));
-                    }
+                if dst == old_reg && !src.contains(old_reg) {
+                    return Some(format!("{}{}, {}", prefix, src, new_reg));
+                }
             }
         }
     }
 
     None
 }
-
 
 /// Parse a setCC instruction and return the condition code string.
 pub(super) fn parse_setcc(s: &str) -> Option<&str> {
@@ -1098,8 +1266,8 @@ pub(super) fn parse_setcc(s: &str) -> Option<&str> {
     let space_idx = rest.find(' ')?;
     let cc = &rest[..space_idx];
     match cc {
-        "e" | "ne" | "l" | "le" | "g" | "ge" | "b" | "be" | "a" | "ae"
-        | "c" | "nc" | "s" | "ns" | "o" | "no" | "p" | "np" | "z" | "nz" => Some(cc),
+        "e" | "ne" | "l" | "le" | "g" | "ge" | "b" | "be" | "a" | "ae" | "c" | "nc" | "s"
+        | "ns" | "o" | "no" | "p" | "np" | "z" | "nz" => Some(cc),
         _ => None,
     }
 }
@@ -1140,7 +1308,11 @@ pub(super) fn register_overlaps(a: &str, b: &str) -> bool {
 /// Get the register family (0-15) for an x86 register name.
 pub(super) fn register_family(reg: &str) -> Option<u8> {
     let id = register_family_fast(reg);
-    if id == REG_NONE { None } else { Some(id) }
+    if id == REG_NONE {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 /// Fast register family lookup using byte-level dispatch.
@@ -1167,42 +1339,72 @@ pub(super) fn register_family_fast(reg: &str) -> RegId {
         b'r' | b'e' => {
             if len < 4 {
                 // len==3: only %r8, %r9 are valid
-                return if b[1] == b'r' { reg_digit_to_id(b[2]) } else { REG_NONE };
+                return if b[1] == b'r' {
+                    reg_digit_to_id(b[2])
+                } else {
+                    REG_NONE
+                };
             }
             // For len>=4, map (b[2], b[3]) to family id.
             // This covers %rax/%eax, %rcx/%ecx, etc. and %r10..%r15.
             match (b[2], b[3]) {
-                (b'a', b'x') => 0,  // %rax / %eax
-                (b'c', b'x') => 1,  // %rcx / %ecx
-                (b'd', b'x') => 2,  // %rdx / %edx
-                (b'd', b'i') => 7,  // %rdi / %edi
-                (b'b', b'x') => 3,  // %rbx / %ebx
-                (b'b', b'p') => 5,  // %rbp / %ebp
-                (b's', b'p') => 4,  // %rsp / %esp
-                (b's', b'i') => 6,  // %rsi / %esi
-                (b'8', _)    => 8,  // %r8d / %r8w / %r8b
-                (b'9', _)    => 9,  // %r9d / %r9w / %r9b
-                (b'1', b'0') => 10, (b'1', b'1') => 11, (b'1', b'2') => 12,
-                (b'1', b'3') => 13, (b'1', b'4') => 14, (b'1', b'5') => 15,
+                (b'a', b'x') => 0, // %rax / %eax
+                (b'c', b'x') => 1, // %rcx / %ecx
+                (b'd', b'x') => 2, // %rdx / %edx
+                (b'd', b'i') => 7, // %rdi / %edi
+                (b'b', b'x') => 3, // %rbx / %ebx
+                (b'b', b'p') => 5, // %rbp / %ebp
+                (b's', b'p') => 4, // %rsp / %esp
+                (b's', b'i') => 6, // %rsi / %esi
+                (b'8', _) => 8,    // %r8d / %r8w / %r8b
+                (b'9', _) => 9,    // %r9d / %r9w / %r9b
+                (b'1', b'0') => 10,
+                (b'1', b'1') => 11,
+                (b'1', b'2') => 12,
+                (b'1', b'3') => 13,
+                (b'1', b'4') => 14,
+                (b'1', b'5') => 15,
                 _ => REG_NONE,
             }
         }
         // 16-bit / 8-bit short forms: %ax, %al, %ah, %cx, %cl, etc.
-        b'a' => if matches!(b[2], b'x' | b'l' | b'h') { 0 } else { REG_NONE },
-        b'c' => if matches!(b[2], b'x' | b'l' | b'h') { 1 } else { REG_NONE },
-        b'd' => match b[2] { b'i' => 7, b'x' | b'l' | b'h' => 2, _ => REG_NONE },
-        b'b' => match b[2] { b'p' => 5, b'x' | b'l' | b'h' => 3, _ => REG_NONE },
-        b's' => match b[2] { b'p' => 4, b'i' => 6, _ => REG_NONE },
-        // MMX registers: %mm0..%mm7 → families 16..23
-        b'm' if len == 4 && b[2] == b'm' && b[3] >= b'0' && b[3] <= b'7' => {
-            16 + (b[3] - b'0')
+        b'a' => {
+            if matches!(b[2], b'x' | b'l' | b'h') {
+                0
+            } else {
+                REG_NONE
+            }
         }
+        b'c' => {
+            if matches!(b[2], b'x' | b'l' | b'h') {
+                1
+            } else {
+                REG_NONE
+            }
+        }
+        b'd' => match b[2] {
+            b'i' => 7,
+            b'x' | b'l' | b'h' => 2,
+            _ => REG_NONE,
+        },
+        b'b' => match b[2] {
+            b'p' => 5,
+            b'x' | b'l' | b'h' => 3,
+            _ => REG_NONE,
+        },
+        b's' => match b[2] {
+            b'p' => 4,
+            b'i' => 6,
+            _ => REG_NONE,
+        },
+        // MMX registers: %mm0..%mm7 → families 16..23
+        b'm' if len == 4 && b[2] == b'm' && b[3] >= b'0' && b[3] <= b'7' => 16 + (b[3] - b'0'),
         // XMM registers: %xmm0..%xmm15 → families 24..39
         b'x' if len >= 5 && b[2] == b'm' && b[3] == b'm' => {
             if len == 5 && b[4] >= b'0' && b[4] <= b'9' {
                 24 + (b[4] - b'0')
             } else if len == 6 && b[4] == b'1' && b[5] >= b'0' && b[5] <= b'5' {
-                34 + (b[5] - b'0')  // xmm10..xmm15
+                34 + (b[5] - b'0') // xmm10..xmm15
             } else {
                 REG_NONE
             }
@@ -1214,24 +1416,36 @@ pub(super) fn register_family_fast(reg: &str) -> RegId {
 /// Map a single ASCII digit byte to a register family id (8 or 9), or REG_NONE.
 #[inline]
 pub(super) fn reg_digit_to_id(digit: u8) -> RegId {
-    match digit { b'8' => 8, b'9' => 9, _ => REG_NONE }
+    match digit {
+        b'8' => 8,
+        b'9' => 9,
+        _ => REG_NONE,
+    }
 }
 
 /// Register name table indexed by [size][family_id].
 /// Sizes: 0=Q/SLQ(64-bit), 1=L(32-bit), 2=W(16-bit), 3=B(8-bit).
 pub(super) const REG_NAMES: [[&str; 16]; 4] = [
     // Q / SLQ (64-bit)
-    ["%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi",
-     "%r8",  "%r9",  "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"],
+    [
+        "%rax", "%rcx", "%rdx", "%rbx", "%rsp", "%rbp", "%rsi", "%rdi", "%r8", "%r9", "%r10",
+        "%r11", "%r12", "%r13", "%r14", "%r15",
+    ],
     // L (32-bit)
-    ["%eax",  "%ecx",  "%edx",  "%ebx",  "%esp",  "%ebp",  "%esi",  "%edi",
-     "%r8d",  "%r9d",  "%r10d", "%r11d", "%r12d", "%r13d", "%r14d", "%r15d"],
+    [
+        "%eax", "%ecx", "%edx", "%ebx", "%esp", "%ebp", "%esi", "%edi", "%r8d", "%r9d", "%r10d",
+        "%r11d", "%r12d", "%r13d", "%r14d", "%r15d",
+    ],
     // W (16-bit)
-    ["%ax",   "%cx",   "%dx",   "%bx",   "%sp",   "%bp",   "%si",   "%di",
-     "%r8w",  "%r9w",  "%r10w", "%r11w", "%r12w", "%r13w", "%r14w", "%r15w"],
+    [
+        "%ax", "%cx", "%dx", "%bx", "%sp", "%bp", "%si", "%di", "%r8w", "%r9w", "%r10w", "%r11w",
+        "%r12w", "%r13w", "%r14w", "%r15w",
+    ],
     // B (8-bit)
-    ["%al",  "%cl",  "%dl",  "%bl",  "%spl", "%bpl", "%sil", "%dil",
-     "%r8b", "%r9b", "%r10b","%r11b","%r12b","%r13b","%r14b","%r15b"],
+    [
+        "%al", "%cl", "%dl", "%bl", "%spl", "%bpl", "%sil", "%dil", "%r8b", "%r9b", "%r10b",
+        "%r11b", "%r12b", "%r13b", "%r14b", "%r15b",
+    ],
 ];
 
 /// Scan assembly line bytes for register references and return a bitmask.
@@ -1299,14 +1513,26 @@ pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
                 b'a' => Some(0),
                 b'c' => Some(1),
                 b'd' => {
-                    if i + 2 < len && b[i + 2] == b'i' { Some(7) } else { Some(2) }
+                    if i + 2 < len && b[i + 2] == b'i' {
+                        Some(7)
+                    } else {
+                        Some(2)
+                    }
                 }
                 b'b' => {
-                    if i + 2 < len && b[i + 2] == b'p' { Some(5) } else { Some(3) }
+                    if i + 2 < len && b[i + 2] == b'p' {
+                        Some(5)
+                    } else {
+                        Some(3)
+                    }
                 }
                 b's' => {
                     if i + 2 < len {
-                        match b[i + 2] { b'p' => Some(4), b'i' => Some(6), _ => None }
+                        match b[i + 2] {
+                            b'p' => Some(4),
+                            b'i' => Some(6),
+                            _ => None,
+                        }
                     } else {
                         None
                     }

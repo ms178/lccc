@@ -9,7 +9,7 @@
 //
 // All types are re-exported here so `use crate::ir::reexports::*` imports work.
 pub use super::constants::*;
-pub use super::ops::*;
-pub use super::intrinsics::*;
 pub use super::instruction::*;
+pub use super::intrinsics::*;
 pub use super::module::*;
+pub use super::ops::*;

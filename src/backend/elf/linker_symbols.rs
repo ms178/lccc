@@ -74,33 +74,117 @@ pub fn get_standard_linker_symbols(addrs: &LinkerSymbolAddresses) -> Vec<LinkerD
     let end_addr = addrs.bss_addr + addrs.bss_size;
     vec![
         // GOT / dynamic
-        LinkerDefinedSym { name: "_GLOBAL_OFFSET_TABLE_", value: addrs.got_addr, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "_DYNAMIC", value: addrs.dynamic_addr, binding: STB_GLOBAL },
+        LinkerDefinedSym {
+            name: "_GLOBAL_OFFSET_TABLE_",
+            value: addrs.got_addr,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "_DYNAMIC",
+            value: addrs.dynamic_addr,
+            binding: STB_GLOBAL,
+        },
         // BSS / data boundaries
-        LinkerDefinedSym { name: "__bss_start", value: addrs.bss_addr, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "_edata", value: addrs.bss_addr, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "_end", value: end_addr, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__end", value: end_addr, binding: STB_GLOBAL },
+        LinkerDefinedSym {
+            name: "__bss_start",
+            value: addrs.bss_addr,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "_edata",
+            value: addrs.bss_addr,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "_end",
+            value: end_addr,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__end",
+            value: end_addr,
+            binding: STB_GLOBAL,
+        },
         // Text boundaries
-        LinkerDefinedSym { name: "_etext", value: addrs.text_end, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "etext", value: addrs.text_end, binding: STB_GLOBAL },
+        LinkerDefinedSym {
+            name: "_etext",
+            value: addrs.text_end,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "etext",
+            value: addrs.text_end,
+            binding: STB_GLOBAL,
+        },
         // ELF header / executable start
-        LinkerDefinedSym { name: "__ehdr_start", value: addrs.base_addr, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__executable_start", value: addrs.base_addr, binding: STB_GLOBAL },
+        LinkerDefinedSym {
+            name: "__ehdr_start",
+            value: addrs.base_addr,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__executable_start",
+            value: addrs.base_addr,
+            binding: STB_GLOBAL,
+        },
         // Data segment
-        LinkerDefinedSym { name: "__dso_handle", value: addrs.data_start, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__data_start", value: addrs.data_start, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "data_start", value: addrs.data_start, binding: STB_WEAK },
+        LinkerDefinedSym {
+            name: "__dso_handle",
+            value: addrs.data_start,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__data_start",
+            value: addrs.data_start,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "data_start",
+            value: addrs.data_start,
+            binding: STB_WEAK,
+        },
         // Init/fini/preinit arrays
-        LinkerDefinedSym { name: "__init_array_start", value: addrs.init_array_start, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__init_array_end", value: addrs.init_array_start + addrs.init_array_size, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__fini_array_start", value: addrs.fini_array_start, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__fini_array_end", value: addrs.fini_array_start + addrs.fini_array_size, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__preinit_array_start", value: addrs.preinit_array_start, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__preinit_array_end", value: addrs.preinit_array_start + addrs.preinit_array_size, binding: STB_GLOBAL },
+        LinkerDefinedSym {
+            name: "__init_array_start",
+            value: addrs.init_array_start,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__init_array_end",
+            value: addrs.init_array_start + addrs.init_array_size,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__fini_array_start",
+            value: addrs.fini_array_start,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__fini_array_end",
+            value: addrs.fini_array_start + addrs.fini_array_size,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__preinit_array_start",
+            value: addrs.preinit_array_start,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__preinit_array_end",
+            value: addrs.preinit_array_start + addrs.preinit_array_size,
+            binding: STB_GLOBAL,
+        },
         // IPLT relocation boundaries
-        LinkerDefinedSym { name: "__rela_iplt_start", value: addrs.rela_iplt_start, binding: STB_GLOBAL },
-        LinkerDefinedSym { name: "__rela_iplt_end", value: addrs.rela_iplt_start + addrs.rela_iplt_size, binding: STB_GLOBAL },
+        LinkerDefinedSym {
+            name: "__rela_iplt_start",
+            value: addrs.rela_iplt_start,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "__rela_iplt_end",
+            value: addrs.rela_iplt_start + addrs.rela_iplt_size,
+            binding: STB_GLOBAL,
+        },
     ]
 }
 
@@ -123,7 +207,9 @@ pub fn section_index(section_name: &str, content_sections: &[String], shndx_offs
     } else if section_name == "*UND*" || section_name.is_empty() {
         SHN_UNDEF
     } else {
-        content_sections.iter().position(|s| s == section_name)
+        content_sections
+            .iter()
+            .position(|s| s == section_name)
             .map(|i| (i as u16) + shndx_offset)
             .unwrap_or(SHN_UNDEF)
     }
@@ -136,8 +222,11 @@ pub fn section_index(section_name: &str, content_sections: &[String], shndx_offs
 pub fn default_section_flags(name: &str) -> u64 {
     if name == ".text" || name.starts_with(".text.") {
         SHF_ALLOC | SHF_EXECINSTR
-    } else if name == ".data" || name.starts_with(".data.")
-        || name == ".bss" || name.starts_with(".bss.") {
+    } else if name == ".data"
+        || name.starts_with(".data.")
+        || name == ".bss"
+        || name.starts_with(".bss.")
+    {
         SHF_ALLOC | SHF_WRITE
     } else if name == ".rodata" || name.starts_with(".rodata.") {
         SHF_ALLOC

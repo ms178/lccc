@@ -11,11 +11,12 @@
 //! - Os: O2 with code-size-increasing transforms disabled
 //! - Oz: Os with inlining disabled
 
-pub(crate) mod aggregate_sroa;
-pub(crate) mod cfg_simplify;
-pub(crate) mod bit_idioms;
 pub(crate) mod aggregate_copy_forward;
+pub(crate) mod aggregate_sroa;
+pub(crate) mod alias;
+pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
+pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
@@ -23,27 +24,26 @@ mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod fp_const_hoist;
 pub(crate) mod global_addr_cse;
-pub(crate) mod int_const_hoist;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
+pub(crate) mod int_const_hoist;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_memory_promote;
-pub(crate) mod alias;
-pub(crate) mod redundant_loads;
-pub(crate) mod quadratic_sr;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
+pub(crate) mod quadratic_sr;
 pub(crate) mod range_check;
-pub(crate) mod set_membership;
 pub(crate) mod reassoc_accum;
 pub(crate) mod recursion_to_iter;
+pub(crate) mod redundant_loads;
 mod resolve_asm;
+pub(crate) mod set_membership;
 pub(crate) mod simplify;
 pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
@@ -51,8 +51,8 @@ pub(crate) mod univsr;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 
-use crate::ir::analysis::CfgAnalysis;
 use crate::common::fx_hash::FxHashSet;
+use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{Instruction, IrFunction, IrModule};
 
 /// Debug hook: dump only functions whose name contains one of the comma-
@@ -73,15 +73,17 @@ fn dump_ir_filtered(module: &IrModule, tag: &str) {
         if func.is_declaration {
             continue;
         }
-        let matched = filters.is_empty()
-            || filters.iter().any(|f| func.name.contains(f.as_str()));
+        let matched = filters.is_empty() || filters.iter().any(|f| func.name.contains(f.as_str()));
         if matched {
             let _ = writeln!(
                 out,
                 "--- function {} ({} blocks, {} instrs) ---",
                 func.name,
                 func.blocks.len(),
-                func.blocks.iter().map(|b| b.instructions.len()).sum::<usize>()
+                func.blocks
+                    .iter()
+                    .map(|b| b.instructions.len())
+                    .sum::<usize>()
             );
             for (bi, block) in func.blocks.iter().enumerate() {
                 let _ = writeln!(out, "block {} ({}):", bi, block.label);
@@ -95,7 +97,6 @@ fn dump_ir_filtered(module: &IrModule, tag: &str) {
     let _ = writeln!(out, "==== END IR {} ====", tag);
     eprintln!("{}", out);
 }
-
 
 /// Run a per-function pass only on functions in the visit set.
 ///
@@ -250,7 +251,9 @@ fn run_gvn_licm_ivsr_shared(
             for _ in 0..4 {
                 let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
                 n += round;
-                if round == 0 { break; }
+                if round == 0 {
+                    break;
+                }
             }
             if n > 0 {
                 ivsr_total += n;
@@ -426,15 +429,21 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
         crate::ir::mem2reg::promote_allocas_with_params(module);
     }
     iphase_dump!("cleanup-mem2reg-params");
-    if !std::env::var("CCC_NO_CLEANUP_FOLD1").is_ok() { constant_fold::run(module); }
+    if !std::env::var("CCC_NO_CLEANUP_FOLD1").is_ok() {
+        constant_fold::run(module);
+    }
     iphase_dump!("cleanup-fold1");
-    if !std::env::var("CCC_NO_CLEANUP_CP1").is_ok() { copy_prop::run(module); }
+    if !std::env::var("CCC_NO_CLEANUP_CP1").is_ok() {
+        copy_prop::run(module);
+    }
     iphase_dump!("cleanup-copyprop1");
     // Copy forwarding can expose another temporary in a copy chain
     // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
         for _ in 0..8 {
-            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+            if module.for_each_function(aggregate_copy_forward::run) == 0 {
+                break;
+            }
         }
     }
     iphase_dump!("cleanup-agg-copy-forward");
@@ -451,14 +460,22 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
             let n = module.for_each_function(cfg_simplify::run_function);
             constant_fold::run(module);
             copy_prop::run(module);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
         }
     }
     iphase_dump!("cleanup-cfg-simplify");
-    if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() { simplify::run(module); }
+    if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() {
+        simplify::run(module);
+    }
     iphase_dump!("cleanup-simplify");
-    if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() { constant_fold::run(module); }
-    if !std::env::var("CCC_NO_CLEANUP_CP2").is_ok() { copy_prop::run(module); }
+    if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() {
+        constant_fold::run(module);
+    }
+    if !std::env::var("CCC_NO_CLEANUP_CP2").is_ok() {
+        copy_prop::run(module);
+    }
     iphase_dump!("cleanup-fold2-copyprop2");
     resolve_asm::resolve_inline_asm_symbols(module);
     iphase_dump!("post-inline cleanup");
@@ -533,13 +550,13 @@ pub(crate) fn run_passes(
     // repeated cold medium-body expansion stays out. -O1/-O2/-O3 keep full
     // inlining.
 
-macro_rules! preloop_dump {
-    ($name:expr) => {
-        if dump_each_pass {
-            dump_ir_filtered(module, &format!("pre-loop {}", $name));
-        }
-    };
-}
+    macro_rules! preloop_dump {
+        ($name:expr) => {
+            if dump_each_pass {
+                dump_ir_filtered(module, &format!("pre-loop {}", $name));
+            }
+        };
+    }
     let allow_inline = opt_level != 4 && opt_level != 5;
     preloop_dump!("lowering(pre-O2)");
     run_inline_phase(module, &disabled, allow_inline, optimize_for_size);
@@ -794,8 +811,12 @@ macro_rules! preloop_dump {
         // Vectorize: x86-64 gets the full SSE/AVX-shaped pass; AArch64 gets
         // the 128-bit (2-wide F64 / 4-wide I32) NEON variant. -Os/-Oz skip
         // vectorization entirely (code size).
-        if iter == 0 && !optimize_for_size
-            && matches!(target, crate::backend::Target::X86_64 | crate::backend::Target::Aarch64)
+        if iter == 0
+            && !optimize_for_size
+            && matches!(
+                target,
+                crate::backend::Target::X86_64 | crate::backend::Target::Aarch64
+            )
             && !disabled.contains("vectorize")
         {
             let vectorize_fn = match (target, fp_reassoc, fp_contract_fast, x86_avx) {
@@ -806,13 +827,9 @@ macro_rules! preloop_dump {
                     vectorize::vectorize_function_two_wide
                 }
                 (_, true, true, true) => vectorize::vectorize_function_fast_math,
-                (_, true, true, false) => {
-                    vectorize::vectorize_function_fast_math_without_fixed_slp
-                }
+                (_, true, true, false) => vectorize::vectorize_function_fast_math_without_fixed_slp,
                 (_, true, false, true) => vectorize::vectorize_function_reassoc,
-                (_, true, false, false) => {
-                    vectorize::vectorize_function_reassoc_without_fixed_slp
-                }
+                (_, true, false, false) => vectorize::vectorize_function_reassoc_without_fixed_slp,
                 (_, false, _, _) => vectorize::vectorize_function,
             };
             let n = timed_pass!(
@@ -870,8 +887,12 @@ macro_rules! preloop_dump {
             total_changes_excl_dce += n;
 
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
-            let n = timed_pass!("bit_idioms", run_on_visited(module, &dirty, &mut changed,
-                |func| bit_idioms::recognize_function(func, enable_bit_reverse)));
+            let n = timed_pass!(
+                "bit_idioms",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    bit_idioms::recognize_function(func, enable_bit_reverse)
+                })
+            );
             cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
@@ -917,9 +938,8 @@ macro_rules! preloop_dump {
             let gvn_enabled = true;
             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
-            let run_ivsr = iter == 0
-                && std::env::var("CCC_NO_IVSR").is_err()
-                && !disabled.contains("ivsr");
+            let run_ivsr =
+                iter == 0 && std::env::var("CCC_NO_IVSR").is_err() && !disabled.contains("ivsr");
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -1133,7 +1153,9 @@ macro_rules! preloop_dump {
     // silences one of two callsites is a debugging trap, not a gate).
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
         for _ in 0..8 {
-            if module.for_each_function(aggregate_copy_forward::run) == 0 { break; }
+            if module.for_each_function(aggregate_copy_forward::run) == 0 {
+                break;
+            }
         }
     }
     // Forward alloca-field stores to later loads of the same constant-offset
@@ -1143,13 +1165,17 @@ macro_rules! preloop_dump {
     // Iterate: each round can expose new dead stores for the next.
     if !disabled.contains("slforward") {
         for _ in 0..4 {
-            if module.for_each_function(store_load_forward::run) == 0 { break; }
+            if module.for_each_function(store_load_forward::run) == 0 {
+                break;
+            }
         }
     }
     module.for_each_function(dce::eliminate_dead_code);
     if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
         for func in &module.functions {
-            if func.is_declaration { continue; }
+            if func.is_declaration {
+                continue;
+            }
             eprintln!("=== IR(pre-promote) {} ===", func.name);
             for (bi, b) in func.blocks.iter().enumerate() {
                 eprintln!("  block {} (label {}):", bi, b.label.0);

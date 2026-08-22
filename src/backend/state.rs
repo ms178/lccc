@@ -842,7 +842,10 @@ pub enum SlotAddr {
 impl CodegenState {
     #[inline]
     pub fn is_accumulator_location(&self, val_id: u32) -> bool {
-        matches!(self.explicit_locations.get(&val_id), Some(ExplicitLocation::Accumulator))
+        matches!(
+            self.explicit_locations.get(&val_id),
+            Some(ExplicitLocation::Accumulator)
+        )
     }
 
     /// Classify how to access a value's effective address.
@@ -890,10 +893,17 @@ mod slot_addr_tests {
     #[test]
     fn register_home_is_explicit_and_exact() {
         let mut state = CodegenState::new();
-        state.explicit_locations.insert(17, ExplicitLocation::Reg(PhysReg(14)));
-        assert!(matches!(state.resolve_slot_addr(17), Some(SlotAddr::Reg(PhysReg(14)))));
+        state
+            .explicit_locations
+            .insert(17, ExplicitLocation::Reg(PhysReg(14)));
+        assert!(matches!(
+            state.resolve_slot_addr(17),
+            Some(SlotAddr::Reg(PhysReg(14)))
+        ));
         assert!(state.get_slot(17).is_none());
-        state.explicit_locations.insert(18, ExplicitLocation::Accumulator);
+        state
+            .explicit_locations
+            .insert(18, ExplicitLocation::Accumulator);
         assert!(state.is_accumulator_location(18));
         assert!(state.resolve_slot_addr(18).is_none());
     }

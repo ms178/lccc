@@ -1,19 +1,19 @@
 //! I686Codegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::{Instruction, IrFunction, Value};
-use crate::common::types::IrType;
-use crate::backend::generation::{
-    is_i128_type, calculate_stack_space_common, run_regalloc_and_merge_clobbers,
-    filter_available_regs, find_param_alloca,
-};
-use crate::backend::call_abi::{ParamClass, classify_params};
-use crate::emit;
 use super::emit::{
-    I686Codegen, phys_reg_name, i686_constraint_to_phys, i686_clobber_to_phys,
-    I686_CALLEE_SAVED, I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED,
+    i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name, I686Codegen, I686_CALLEE_SAVED,
+    I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED,
+};
+use crate::backend::call_abi::{classify_params, ParamClass};
+use crate::backend::generation::{
+    calculate_stack_space_common, filter_available_regs, find_param_alloca, is_i128_type,
+    run_regalloc_and_merge_clobbers,
 };
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::emit;
+use crate::ir::reexports::{Instruction, IrFunction, Value};
 
 impl I686Codegen {
     /// Does this function need the PIC GOT base in %ebx?
@@ -59,9 +59,7 @@ impl I686Codegen {
                     // PIC-relevant construct is an external call (verified:
                     // gcc -m32 -fPIC on `return helper(x)+1;` emits
                     // get_pc_thunk.bx + call helper@PLT).
-                    Instruction::Call { func: callee, .. }
-                        if self.state.needs_plt(callee) =>
-                    {
+                    Instruction::Call { func: callee, .. } if self.state.needs_plt(callee) => {
                         return true;
                     }
                     // 64-bit div/mod lowers to __{u}divdi3/__{u}moddi3 calls
@@ -130,7 +128,8 @@ impl I686Codegen {
         // needed. Falls back to the conservative marking when any block's
         // demand exceeds the caller-saved prefix.
         crate::backend::stack_layout::collect_inline_asm_callee_saved_i686(
-            func, &mut asm_clobbered_regs,
+            func,
+            &mut asm_clobbered_regs,
             i686_constraint_to_phys,
             i686_clobber_to_phys,
             callee_saved_set,
@@ -165,8 +164,11 @@ impl I686Codegen {
         // non-PIC, non-TLS, non-wide type, default address space.
         let mut never_materialized = if !self.state.pic_mode {
             let gmap = crate::backend::generation::build_global_addr_map_for(
-                func, &self.state.tls_symbols);
-            let mut set = crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+                func,
+                &self.state.tls_symbols,
+            );
+            let mut set =
+                crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
             // Loads folded into `cmp{b,w,l} $imm,(mem)` and fused
             // compare-and-branch booleans emit no code and write no value, so
             // they must not grab a caller-saved register that the live loop
@@ -227,8 +229,7 @@ impl I686Codegen {
             let mut cond_values: crate::common::fx_hash::FxHashSet<u32> =
                 crate::common::fx_hash::FxHashSet::default();
             for block in &func.blocks {
-                if let crate::ir::reexports::Terminator::CondBranch { cond, .. } =
-                    &block.terminator
+                if let crate::ir::reexports::Terminator::CondBranch { cond, .. } = &block.terminator
                 {
                     if let crate::ir::reexports::Operand::Value(v) = cond {
                         cond_values.insert(v.0);
@@ -239,10 +240,14 @@ impl I686Codegen {
             let skip = crate::backend::regalloc::analyze_accumulator_assignments(
                 func,
                 crate::backend::regalloc::AccumulatorPolicy {
-                    operand_order: crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
+                    operand_order:
+                        crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
                     return_consumes_accumulator: true,
                 },
-            ).into_iter().map(|a| a.value_id).collect::<crate::common::fx_hash::FxHashSet<_>>();
+            )
+            .into_iter()
+            .map(|a| a.value_id)
+            .collect::<crate::common::fx_hash::FxHashSet<_>>();
             let extra: Vec<u32> = skip
                 .iter()
                 .copied()
@@ -260,19 +265,26 @@ impl I686Codegen {
 
         let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
             crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
-            func, available_regs, caller_saved_regs, &asm_clobbered_regs,
-            &mut self.reg_assignments, &mut self.used_callee_saved,
-            false, never_materialized, Vec::new(), Vec::new(),
-            // i686 emits SIB indexed addressing directly at the Load/Store
-            // (session 27) AND folds constant-offset GEPs with register
-            // bases (const_offset_fold_reg_base_ok): BOTH forms consume
-            // address registers RA-invisibly at the access position.
-            // collect_folded_gep_links_all extends the base intervals of
-            // const-offset folds plus base AND index intervals of indexed
-            // folds to their consumers, so the address registers survive
-            // intervening calls and accumulator staging.
-            crate::backend::generation::collect_folded_gep_links_all(func),
-        );
+                func,
+                available_regs,
+                caller_saved_regs,
+                &asm_clobbered_regs,
+                &mut self.reg_assignments,
+                &mut self.used_callee_saved,
+                false,
+                never_materialized,
+                Vec::new(),
+                Vec::new(),
+                // i686 emits SIB indexed addressing directly at the Load/Store
+                // (session 27) AND folds constant-offset GEPs with register
+                // bases (const_offset_fold_reg_base_ok): BOTH forms consume
+                // address registers RA-invisibly at the access position.
+                // collect_folded_gep_links_all extends the base intervals of
+                // const-offset folds plus base AND index intervals of indexed
+                // folds to their consumers, so the address registers survive
+                // intervening calls and accumulator staging.
+                crate::backend::generation::collect_folded_gep_links_all(func),
+            );
 
         // %ebx must be saved/restored only when it really holds the GOT base.
         if needs_got && !self.used_callee_saved.contains(&PhysReg(0)) {
@@ -294,22 +306,35 @@ impl I686Codegen {
         let omit_fp = self.omit_frame_pointer;
         let alignment_bias: i64 = if omit_fp { 12 } else { 8 };
 
-        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
-        calculate_stack_space_common(&mut self.state, func, callee_saved_bytes, |space, alloc_size, align| {
-            let effective_align = if align > 0 { align.max(4) } else { 4 };
-            let alloc = (alloc_size + 3) & !3;
-            let required = space + alloc;
-            let new_space = if effective_align >= 16 {
-                let bias = alignment_bias;
-                let a = effective_align;
-                let rem = ((required % a) + a) % a;
-                let needed = if rem <= bias { bias - rem } else { a - rem + bias };
-                required + needed
-            } else {
-                ((required + effective_align - 1) / effective_align) * effective_align
-            };
-            (-new_space, new_space)
-        }, &reg_assigned, callee_saved_set, cached_liveness)
+        self.state.ra_accumulator_values =
+            accumulator_assignments.iter().map(|a| a.value_id).collect();
+        calculate_stack_space_common(
+            &mut self.state,
+            func,
+            callee_saved_bytes,
+            |space, alloc_size, align| {
+                let effective_align = if align > 0 { align.max(4) } else { 4 };
+                let alloc = (alloc_size + 3) & !3;
+                let required = space + alloc;
+                let new_space = if effective_align >= 16 {
+                    let bias = alignment_bias;
+                    let a = effective_align;
+                    let rem = ((required % a) + a) % a;
+                    let needed = if rem <= bias {
+                        bias - rem
+                    } else {
+                        a - rem + bias
+                    };
+                    required + needed
+                } else {
+                    ((required + effective_align - 1) / effective_align) * effective_align
+                };
+                (-new_space, new_space)
+            },
+            &reg_assigned,
+            callee_saved_set,
+            cached_liveness,
+        )
     }
 
     // ---- aligned_frame_size ----
@@ -337,9 +362,7 @@ impl I686Codegen {
         // peephole.  Without the return type it must conservatively keep EDX
         // live at every ret for the i64 ABI, which preserves hundreds of dead
         // `mov ..., %edx` relays in ordinary 32-bit-returning functions.
-        if matches!(func.return_type, IrType::I64 | IrType::U64)
-            || is_i128_type(func.return_type)
-        {
+        if matches!(func.return_type, IrType::I64 | IrType::U64) || is_i128_type(func.return_type) {
             self.state.emit("# lccc-i686-return-uses-edx");
         }
         if self.omit_frame_pointer {
@@ -369,8 +392,10 @@ impl I686Codegen {
         }
 
         if self.pic_got_live {
-            debug_assert!(self.used_callee_saved.contains(&PhysReg(0)),
-                "GOT-using function requires ebx in used_callee_saved");
+            debug_assert!(
+                self.used_callee_saved.contains(&PhysReg(0)),
+                "GOT-using function requires ebx in used_callee_saved"
+            );
             self.state.emit("    call __x86.get_pc_thunk.bx");
             self.state.emit("    addl $_GLOBAL_OFFSET_TABLE_, %ebx");
             self.needs_pc_thunk_bx = true;
@@ -424,11 +449,12 @@ impl I686Codegen {
         self.state.num_params = func.params.len();
         self.state.func_is_variadic = func.is_variadic;
 
-        self.state.param_alloca_slots = (0..func.params.len()).map(|i| {
-            find_param_alloca(func, i).and_then(|(dest, ty)| {
-                self.state.get_slot(dest.0).map(|slot| (slot, ty))
+        self.state.param_alloca_slots = (0..func.params.len())
+            .map(|i| {
+                find_param_alloca(func, i)
+                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
             })
-        }).collect();
+            .collect();
 
         let fastcall_reg_count = if self.is_fastcall {
             self.count_fastcall_reg_params(func)
@@ -440,7 +466,9 @@ impl I686Codegen {
         if self.is_fastcall {
             let mut total_stack_bytes: usize = 0;
             for (i, _p) in func.params.iter().enumerate() {
-                if i < fastcall_reg_count { continue; }
+                if i < fastcall_reg_count {
+                    continue;
+                }
                 let ty = func.params[i].ty;
                 let size = match ty {
                     IrType::I64 | IrType::U64 | IrType::F64 => 8,
@@ -462,7 +490,10 @@ impl I686Codegen {
         if self.is_fastcall || self.regparm > 0 {
             for block in &func.blocks {
                 for inst in &block.instructions {
-                    if let Instruction::ParamRef { dest, param_idx, .. } = inst {
+                    if let Instruction::ParamRef {
+                        dest, param_idx, ..
+                    } = inst
+                    {
                         if *param_idx < paramref_dests.len() {
                             paramref_dests[*param_idx] = Some(*dest);
                         }
@@ -496,7 +527,8 @@ impl I686Codegen {
             // MUST cover register params with live allocas too: the main
             // loop's stack-param copies stage through %eax (and wide copies
             // through %edx), which would destroy unsaved register args.
-            let mut reg_moves: Vec<(usize, &'static str, crate::backend::regalloc::PhysReg)> = Vec::new(); // (param_idx, src, dst)
+            let mut reg_moves: Vec<(usize, &'static str, crate::backend::regalloc::PhysReg)> =
+                Vec::new(); // (param_idx, src, dst)
             for (i, class) in param_classes.iter().enumerate() {
                 let alloca_slot = find_param_alloca(func, i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0).map(|s| (dest, s)));
@@ -514,19 +546,39 @@ impl I686Codegen {
                             let slot_ref = self.slot_ref(slot);
                             match ty {
                                 IrType::I8 => {
-                                    emit!(self.state, "    movsbl {}, {}", regparm_regs_byte[reg_idx], src_full);
+                                    emit!(
+                                        self.state,
+                                        "    movsbl {}, {}",
+                                        regparm_regs_byte[reg_idx],
+                                        src_full
+                                    );
                                     emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 IrType::U8 => {
-                                    emit!(self.state, "    movzbl {}, {}", regparm_regs_byte[reg_idx], src_full);
+                                    emit!(
+                                        self.state,
+                                        "    movzbl {}, {}",
+                                        regparm_regs_byte[reg_idx],
+                                        src_full
+                                    );
                                     emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 IrType::I16 => {
-                                    emit!(self.state, "    movswl {}, {}", regparm_regs_word[reg_idx], src_full);
+                                    emit!(
+                                        self.state,
+                                        "    movswl {}, {}",
+                                        regparm_regs_word[reg_idx],
+                                        src_full
+                                    );
                                     emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 IrType::U16 => {
-                                    emit!(self.state, "    movzwl {}, {}", regparm_regs_word[reg_idx], src_full);
+                                    emit!(
+                                        self.state,
+                                        "    movzwl {}, {}",
+                                        regparm_regs_word[reg_idx],
+                                        src_full
+                                    );
                                     emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 _ => {
@@ -546,28 +598,43 @@ impl I686Codegen {
                     }
                     ParamClass::I64RegPair { base_reg_idx } => {
                         // Wide values always live in 8-byte slots on i686.
-                        let slot = alloca_slot.map(|(_, s)| s).or_else(|| {
-                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
-                        });
+                        let slot = alloca_slot
+                            .map(|(_, s)| s)
+                            .or_else(|| paramref_dests[i].and_then(|d| self.state.get_slot(d.0)));
                         if let Some(slot) = slot {
                             let sr0 = self.slot_ref(slot);
                             let sr4 = self.slot_ref_offset(slot, 4);
-                            emit!(self.state, "    movl {}, {}", regparm_srcs[base_reg_idx], sr0);
-                            emit!(self.state, "    movl {}, {}", regparm_srcs[base_reg_idx + 1], sr4);
+                            emit!(
+                                self.state,
+                                "    movl {}, {}",
+                                regparm_srcs[base_reg_idx],
+                                sr0
+                            );
+                            emit!(
+                                self.state,
+                                "    movl {}, {}",
+                                regparm_srcs[base_reg_idx + 1],
+                                sr4
+                            );
                             if alloca_slot.is_none() {
                                 self.state.param_pre_stored.insert(i);
                             }
                         }
                     }
                     ParamClass::StructByValReg { base_reg_idx, size } => {
-                        let slot = alloca_slot.map(|(_, s)| s).or_else(|| {
-                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
-                        });
+                        let slot = alloca_slot
+                            .map(|(_, s)| s)
+                            .or_else(|| paramref_dests[i].and_then(|d| self.state.get_slot(d.0)));
                         if let Some(slot) = slot {
                             let words = size.div_ceil(4);
                             for k in 0..words {
                                 let sr = self.slot_ref_offset(slot, (k * 4) as i64);
-                                emit!(self.state, "    movl {}, {}", regparm_srcs[base_reg_idx + k], sr);
+                                emit!(
+                                    self.state,
+                                    "    movl {}, {}",
+                                    regparm_srcs[base_reg_idx + k],
+                                    sr
+                                );
                             }
                             if alloca_slot.is_none() {
                                 self.state.param_pre_stored.insert(i);
@@ -610,7 +677,8 @@ impl I686Codegen {
 
         // Build a map from physical register -> list of param indices that use it,
         // so we can detect when two params share the same callee-saved register.
-        let mut reg_to_params: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> = crate::common::fx_hash::FxHashMap::default();
+        let mut reg_to_params: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
+            crate::common::fx_hash::FxHashMap::default();
         if self.is_fastcall {
             for (i, _) in func.params.iter().enumerate() {
                 if let Some(paramref_dest) = paramref_dests[i] {
@@ -653,10 +721,18 @@ impl I686Codegen {
                         if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
                             let dest_reg = phys_reg_name(phys_reg);
                             match ty {
-                                IrType::I8 => emit!(self.state, "    movsbl {}, %{}", byte, dest_reg),
-                                IrType::U8 => emit!(self.state, "    movzbl {}, %{}", byte, dest_reg),
-                                IrType::I16 => emit!(self.state, "    movswl {}, %{}", word, dest_reg),
-                                IrType::U16 => emit!(self.state, "    movzwl {}, %{}", word, dest_reg),
+                                IrType::I8 => {
+                                    emit!(self.state, "    movsbl {}, %{}", byte, dest_reg)
+                                }
+                                IrType::U8 => {
+                                    emit!(self.state, "    movzbl {}, %{}", byte, dest_reg)
+                                }
+                                IrType::I16 => {
+                                    emit!(self.state, "    movswl {}, %{}", word, dest_reg)
+                                }
+                                IrType::U16 => {
+                                    emit!(self.state, "    movzwl {}, %{}", word, dest_reg)
+                                }
                                 _ => emit!(self.state, "    movl {}, %{}", full, dest_reg),
                             }
                             self.state.param_pre_stored.insert(i);
@@ -693,12 +769,17 @@ impl I686Codegen {
                         .and_then(|(dest, _)| self.state.get_slot(dest.0))
                         .is_some();
                     if !has_alloca_slot {
-                        let src_reg = if fastcall_reg_idx == 0 { "%ecx" } else { "%edx" };
+                        let src_reg = if fastcall_reg_idx == 0 {
+                            "%ecx"
+                        } else {
+                            "%edx"
+                        };
                         if let Some(paramref_dest) = paramref_dests[i] {
                             if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
                                 // Safety check: if another param's dest is also assigned
                                 // to this register, skip pre-store to avoid conflicts.
-                                let shared = reg_to_params.get(&phys_reg.0)
+                                let shared = reg_to_params
+                                    .get(&phys_reg.0)
                                     .is_some_and(|users| users.len() > 1);
                                 if !shared {
                                     // Store directly to the callee-saved register
@@ -723,14 +804,20 @@ impl I686Codegen {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     (slot, ty, dest.0)
                 } else {
-                    if self.is_fastcall && fastcall_reg_idx < fastcall_reg_count && i < func.params.len()
-                        && self.is_fastcall_reg_eligible(ty) {
-                            fastcall_reg_idx += 1;
-                        }
+                    if self.is_fastcall
+                        && fastcall_reg_idx < fastcall_reg_count
+                        && i < func.params.len()
+                        && self.is_fastcall_reg_eligible(ty)
+                    {
+                        fastcall_reg_idx += 1;
+                    }
                     continue;
                 }
             } else {
-                if self.is_fastcall && fastcall_reg_idx < fastcall_reg_count && i < func.params.len() {
+                if self.is_fastcall
+                    && fastcall_reg_idx < fastcall_reg_count
+                    && i < func.params.len()
+                {
                     let param_ty = func.params[i].ty;
                     if self.is_fastcall_reg_eligible(param_ty) {
                         fastcall_reg_idx += 1;
@@ -739,8 +826,15 @@ impl I686Codegen {
                 continue;
             };
 
-            if self.is_fastcall && fastcall_reg_idx < fastcall_reg_count && self.is_fastcall_reg_eligible(ty) {
-                let src_reg_full = if fastcall_reg_idx == 0 { "%ecx" } else { "%edx" };
+            if self.is_fastcall
+                && fastcall_reg_idx < fastcall_reg_count
+                && self.is_fastcall_reg_eligible(ty)
+            {
+                let src_reg_full = if fastcall_reg_idx == 0 {
+                    "%ecx"
+                } else {
+                    "%edx"
+                };
                 let slot_ref = self.slot_ref(slot);
                 // For sub-int types, sign/zero-extend to full 32-bit before
                 // storing to the 4-byte SSA slot (avoids partial-write issues).
@@ -773,7 +867,11 @@ impl I686Codegen {
                 continue;
             }
 
-            let stack_offset_adjust = if self.is_fastcall { fastcall_reg_count as i64 * 4 } else { 0 };
+            let stack_offset_adjust = if self.is_fastcall {
+                fastcall_reg_count as i64 * 4
+            } else {
+                0
+            };
 
             match class {
                 ParamClass::StackScalar { offset } => {
@@ -970,16 +1068,22 @@ impl I686Codegen {
         }
 
         let stack_base: i64 = 8;
-        let stack_offset_adjust = if self.is_fastcall { self.fastcall_reg_param_count as i64 * 4 } else { 0 };
+        let stack_offset_adjust = if self.is_fastcall {
+            self.fastcall_reg_param_count as i64 * 4
+        } else {
+            0
+        };
         let param_offset = if param_idx < self.state.param_classes.len() {
             match self.state.param_classes[param_idx] {
-                ParamClass::StackScalar { offset } |
-                ParamClass::StructStack { offset, .. } |
-                ParamClass::LargeStructStack { offset, .. } |
-                ParamClass::F128AlwaysStack { offset } |
-                ParamClass::I128Stack { offset } |
-                ParamClass::F128Stack { offset } |
-                ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset - stack_offset_adjust,
+                ParamClass::StackScalar { offset }
+                | ParamClass::StructStack { offset, .. }
+                | ParamClass::LargeStructStack { offset, .. }
+                | ParamClass::F128AlwaysStack { offset }
+                | ParamClass::I128Stack { offset }
+                | ParamClass::F128Stack { offset }
+                | ParamClass::LargeStructByRefStack { offset, .. } => {
+                    stack_base + offset - stack_offset_adjust
+                }
                 ParamClass::IntReg { .. }
                 | ParamClass::I64RegPair { .. }
                 | ParamClass::StructByValReg { .. } => {
@@ -987,8 +1091,11 @@ impl I686Codegen {
                     // captured in the prologue (param_pre_stored) or is dead.
                     // There IS no stack home to read; falling through to a
                     // stack load would read the caller's frame garbage.
-                    debug_assert!(false,
-                        "emit_param_ref: register param {} not pre-stored", param_idx);
+                    debug_assert!(
+                        false,
+                        "emit_param_ref: register param {} not pre-stored",
+                        param_idx
+                    );
                     return;
                 }
                 _ => stack_base + (param_idx as i64) * 4,

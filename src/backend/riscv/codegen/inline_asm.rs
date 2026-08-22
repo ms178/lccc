@@ -4,20 +4,20 @@
 //! RISC-V inline assembly, as well as the operand formatting and template
 //! substitution logic used by `emit_inline_asm` in the main codegen module.
 
-use std::fmt::Write;
 use super::emit::RiscvCodegen;
+use std::fmt::Write;
 
 /// Constraint classification for RISC-V inline asm operands.
 #[derive(Clone, PartialEq)]
 pub(super) enum RvConstraintKind {
-    GpReg,           // "r" - general purpose register
-    FpReg,           // "f" - floating point register
-    Memory,          // "m" - memory (offset(s0))
-    Address,         // "A" - address for AMO instructions (produces (reg) format)
-    Immediate,       // "I", "i" - immediate value
-    ZeroOrReg,       // "J" in "rJ" - zero register or GP reg
-    Specific(String),// specific register name
-    Tied(usize),     // tied to output operand N
+    GpReg,            // "r" - general purpose register
+    FpReg,            // "f" - floating point register
+    Memory,           // "m" - memory (offset(s0))
+    Address,          // "A" - address for AMO instructions (produces (reg) format)
+    Immediate,        // "I", "i" - immediate value
+    ZeroOrReg,        // "J" in "rJ" - zero register or GP reg
+    Specific(String), // specific register name
+    Tied(usize),      // tied to output operand N
 }
 
 /// Classify a RISC-V inline asm constraint string into its kind.
@@ -38,8 +38,9 @@ pub(super) fn classify_rv_constraint(constraint: &str) -> RvConstraintKind {
         "I" | "i" | "n" => RvConstraintKind::Immediate,
         "J" => RvConstraintKind::ZeroOrReg,
         "rJ" => RvConstraintKind::ZeroOrReg,
-        "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7"
-        | "ra" | "t0" | "t1" | "t2" => RvConstraintKind::Specific(c.to_string()),
+        "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7" | "ra" | "t0" | "t1" | "t2" => {
+            RvConstraintKind::Specific(c.to_string())
+        }
         _ if c.starts_with("ft") || c.starts_with("fa") || c.starts_with("fs") => {
             RvConstraintKind::Specific(c.to_string())
         }
@@ -91,9 +92,7 @@ impl RiscvCodegen {
                     "0".to_string()
                 }
             }
-            _ => {
-                op_regs[idx].clone()
-            }
+            _ => op_regs[idx].clone(),
         }
     }
 
@@ -134,7 +133,9 @@ impl RiscvCodegen {
                             i += 1;
                         }
                         let name: String = chars[name_start..i].iter().collect();
-                        if i < chars.len() { i += 1; }
+                        if i < chars.len() {
+                            i += 1;
+                        }
                         let mut found = false;
                         for (idx, op_name) in op_names.iter().enumerate() {
                             if let Some(ref n) = op_name {
@@ -175,7 +176,9 @@ impl RiscvCodegen {
                             // Check if the operand is a constant zero (rJ constraint with zero value)
                             if op_regs[internal_idx] == "zero" {
                                 result.push_str("zero");
-                            } else if let Some(imm) = op_imm_values.get(internal_idx).and_then(|v| *v) {
+                            } else if let Some(imm) =
+                                op_imm_values.get(internal_idx).and_then(|v| *v)
+                            {
                                 if imm == 0 {
                                     result.push_str("zero");
                                 } else {
@@ -215,13 +218,24 @@ impl RiscvCodegen {
                         i += 1;
                     }
                     let name: String = chars[name_start..i].iter().collect();
-                    if i < chars.len() { i += 1; }
+                    if i < chars.len() {
+                        i += 1;
+                    }
 
                     let mut found = false;
                     for (idx, op_name) in op_names.iter().enumerate() {
                         if let Some(ref n) = op_name {
                             if n == &name {
-                                result.push_str(&Self::format_operand(idx, op_regs, op_kinds, op_mem_offsets, op_mem_addrs, op_imm_values, op_imm_symbols, true));
+                                result.push_str(&Self::format_operand(
+                                    idx,
+                                    op_regs,
+                                    op_kinds,
+                                    op_mem_offsets,
+                                    op_mem_addrs,
+                                    op_imm_values,
+                                    op_imm_symbols,
+                                    true,
+                                ));
                                 found = true;
                                 break;
                             }
@@ -246,7 +260,16 @@ impl RiscvCodegen {
                         num
                     };
                     if internal_idx < op_regs.len() {
-                        result.push_str(&Self::format_operand(internal_idx, op_regs, op_kinds, op_mem_offsets, op_mem_addrs, op_imm_values, op_imm_symbols, true));
+                        result.push_str(&Self::format_operand(
+                            internal_idx,
+                            op_regs,
+                            op_kinds,
+                            op_mem_offsets,
+                            op_mem_addrs,
+                            op_imm_values,
+                            op_imm_symbols,
+                            true,
+                        ));
                     } else {
                         let _ = write!(result, "%{}", num);
                     }

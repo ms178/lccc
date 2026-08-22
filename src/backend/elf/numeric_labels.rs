@@ -12,10 +12,10 @@
 //! ARM and RISC-V use different parser types and don't have this pattern
 //! (ARM has no numeric labels; RISC-V has its own pre-pass).
 
-use crate::common::fx_hash::FxHashMap;
 use crate::backend::x86::assembler::parser::{
-    AsmItem, Instruction, Operand, MemoryOperand, Displacement, DataValue, ImmediateValue,
+    AsmItem, DataValue, Displacement, ImmediateValue, Instruction, MemoryOperand, Operand,
 };
+use crate::common::fx_hash::FxHashMap;
 
 /// Check if a string is a numeric local label (just digits, e.g., "1", "42").
 pub fn is_numeric_label(name: &str) -> bool {
@@ -82,9 +82,11 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                 result.push(item.clone());
             }
             AsmItem::Instruction(instr) => {
-                let new_ops: Vec<Operand> = instr.operands.iter().map(|op| {
-                    resolve_numeric_operand(op, i, &defs)
-                }).collect();
+                let new_ops: Vec<Operand> = instr
+                    .operands
+                    .iter()
+                    .map(|op| resolve_numeric_operand(op, i, &defs))
+                    .collect();
                 result.push(AsmItem::Instruction(Instruction {
                     prefix: instr.prefix.clone(),
                     mnemonic: instr.mnemonic.clone(),
@@ -104,10 +106,14 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                 result.push(AsmItem::Byte(resolve_numeric_data_values(vals, i, &defs)));
             }
             AsmItem::Uleb128(vals) => {
-                result.push(AsmItem::Uleb128(resolve_numeric_data_values(vals, i, &defs)));
+                result.push(AsmItem::Uleb128(resolve_numeric_data_values(
+                    vals, i, &defs,
+                )));
             }
             AsmItem::Sleb128(vals) => {
-                result.push(AsmItem::Sleb128(resolve_numeric_data_values(vals, i, &defs)));
+                result.push(AsmItem::Sleb128(resolve_numeric_data_values(
+                    vals, i, &defs,
+                )));
             }
             AsmItem::SkipExpr(expr, fill) => {
                 let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
@@ -142,7 +148,9 @@ fn resolve_numeric_operand(
             }
         }
         Operand::Memory(mem) => {
-            if let Some(new_disp) = resolve_numeric_displacement(&mem.displacement, current_idx, defs) {
+            if let Some(new_disp) =
+                resolve_numeric_displacement(&mem.displacement, current_idx, defs)
+            {
                 Operand::Memory(MemoryOperand {
                     segment: mem.segment.clone(),
                     displacement: new_disp,
@@ -157,8 +165,10 @@ fn resolve_numeric_operand(
             }
         }
         Operand::Immediate(ImmediateValue::SymbolDiff(lhs, rhs)) => {
-            let new_lhs = resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
-            let new_rhs = resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+            let new_lhs =
+                resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+            let new_rhs =
+                resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
             Operand::Immediate(ImmediateValue::SymbolDiff(new_lhs, new_rhs))
         }
         Operand::Immediate(ImmediateValue::Symbol(name)) => {
@@ -182,57 +192,61 @@ fn resolve_numeric_data_values(
     current_idx: usize,
     defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Vec<DataValue> {
-    vals.iter().map(|val| {
-        match val {
-            DataValue::Symbol(name) => {
-                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
-                    DataValue::Symbol(resolved)
-                } else {
-                    val.clone()
+    vals.iter()
+        .map(|val| {
+            match val {
+                DataValue::Symbol(name) => {
+                    if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                        DataValue::Symbol(resolved)
+                    } else {
+                        val.clone()
+                    }
                 }
-            }
-            DataValue::SymbolDiff(lhs, rhs) => {
-                let new_lhs = resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
-                let new_rhs = resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
-                DataValue::SymbolDiff(new_lhs, new_rhs)
-            }
-            DataValue::SymbolOffset(name, offset) => {
-                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
-                    DataValue::SymbolOffset(resolved, *offset)
-                } else {
-                    val.clone()
+                DataValue::SymbolDiff(lhs, rhs) => {
+                    let new_lhs =
+                        resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                    let new_rhs =
+                        resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                    DataValue::SymbolDiff(new_lhs, new_rhs)
                 }
+                DataValue::SymbolOffset(name, offset) => {
+                    if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                        DataValue::SymbolOffset(resolved, *offset)
+                    } else {
+                        val.clone()
+                    }
+                }
+                // A numeric label reference is equally valid in the ADDEND and
+                // SCALED forms. Leaving them in the catch-all below meant a
+                // difference such as
+                //     .long 770b + 1 - 760b        (SymbolDiffAddend)
+                //     .long (770b - 760b) * 4      (SymbolDiffScaled)
+                // kept the raw names `770b`/`760b`, while the DEFINITIONS had
+                // already been renamed to `.Lnum_770_0`/`.Lnum_760_0`. Nothing
+                // downstream could ever match them, so the assembler aborted with
+                // "undefined label in .byte diff: 770b". The plain `SymbolDiff`
+                // form worked only because it is listed above -- which is exactly
+                // why this must be an exhaustive match rather than a catch-all.
+                DataValue::SymbolDiffAddend(lhs, rhs, addend) => {
+                    let new_lhs =
+                        resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                    let new_rhs =
+                        resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                    DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
+                }
+                DataValue::SymbolDiffScaled(lhs, rhs, scale, div, addend) => {
+                    let new_lhs =
+                        resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                    let new_rhs =
+                        resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                    DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *div, *addend)
+                }
+                // Exhaustive on purpose: every future DataValue variant that can
+                // carry a symbol name must be considered here explicitly.
+                DataValue::Integer(_) => val.clone(),
             }
-            // A numeric label reference is equally valid in the ADDEND and
-            // SCALED forms. Leaving them in the catch-all below meant a
-            // difference such as
-            //     .long 770b + 1 - 760b        (SymbolDiffAddend)
-            //     .long (770b - 760b) * 4      (SymbolDiffScaled)
-            // kept the raw names `770b`/`760b`, while the DEFINITIONS had
-            // already been renamed to `.Lnum_770_0`/`.Lnum_760_0`. Nothing
-            // downstream could ever match them, so the assembler aborted with
-            // "undefined label in .byte diff: 770b". The plain `SymbolDiff`
-            // form worked only because it is listed above -- which is exactly
-            // why this must be an exhaustive match rather than a catch-all.
-            DataValue::SymbolDiffAddend(lhs, rhs, addend) => {
-                let new_lhs = resolve_numeric_name(lhs, current_idx, defs)
-                    .unwrap_or_else(|| lhs.clone());
-                let new_rhs = resolve_numeric_name(rhs, current_idx, defs)
-                    .unwrap_or_else(|| rhs.clone());
-                DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
-            }
-            DataValue::SymbolDiffScaled(lhs, rhs, scale, div, addend) => {
-                let new_lhs = resolve_numeric_name(lhs, current_idx, defs)
-                    .unwrap_or_else(|| lhs.clone());
-                let new_rhs = resolve_numeric_name(rhs, current_idx, defs)
-                    .unwrap_or_else(|| rhs.clone());
-                DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *div, *addend)
-            }
-            // Exhaustive on purpose: every future DataValue variant that can
-            // carry a symbol name must be considered here explicitly.
-            DataValue::Integer(_) => val.clone(),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Resolve a numeric label reference name (e.g., "1f" -> ".Lnum_1_0").
@@ -245,11 +259,13 @@ pub fn resolve_numeric_name(
     let def_list = defs.get(num)?;
 
     if is_forward {
-        def_list.iter()
+        def_list
+            .iter()
             .find(|(idx, _)| *idx > current_idx)
             .map(|(_, name)| name.clone())
     } else {
-        def_list.iter()
+        def_list
+            .iter()
             .rev()
             .find(|(idx, _)| *idx < current_idx)
             .map(|(_, name)| name.clone())
@@ -264,17 +280,12 @@ fn resolve_numeric_displacement(
 ) -> Option<Displacement> {
     match disp {
         Displacement::Symbol(name) => {
-            resolve_numeric_name(name, current_idx, defs)
-                .map(Displacement::Symbol)
+            resolve_numeric_name(name, current_idx, defs).map(Displacement::Symbol)
         }
-        Displacement::SymbolAddend(name, addend) => {
-            resolve_numeric_name(name, current_idx, defs)
-                .map(|n| Displacement::SymbolAddend(n, *addend))
-        }
-        Displacement::SymbolMod(name, modifier) => {
-            resolve_numeric_name(name, current_idx, defs)
-                .map(|n| Displacement::SymbolMod(n, modifier.clone()))
-        }
+        Displacement::SymbolAddend(name, addend) => resolve_numeric_name(name, current_idx, defs)
+            .map(|n| Displacement::SymbolAddend(n, *addend)),
+        Displacement::SymbolMod(name, modifier) => resolve_numeric_name(name, current_idx, defs)
+            .map(|n| Displacement::SymbolMod(n, modifier.clone())),
         Displacement::SymbolPlusOffset(name, offset) => {
             resolve_numeric_name(name, current_idx, defs)
                 .map(|n| Displacement::SymbolPlusOffset(n, *offset))

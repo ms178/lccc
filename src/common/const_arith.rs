@@ -8,8 +8,8 @@
 //! lowering) are responsible for determining width/signedness from their own
 //! type systems (CType vs IrType) before calling these shared functions.
 
-use crate::ir::reexports::IrConst;
 use crate::frontend::parser::ast::BinOp;
+use crate::ir::reexports::IrConst;
 
 // === Low-level arithmetic primitives ===
 
@@ -17,7 +17,11 @@ use crate::frontend::parser::ast::BinOp;
 /// This handles the C semantics of truncating arithmetic results to `int` width.
 #[inline]
 fn wrap_result(v: i64, is_32bit: bool) -> i64 {
-    if is_32bit { v as i32 as i64 } else { v }
+    if is_32bit {
+        v as i32 as i64
+    } else {
+        v
+    }
 }
 
 /// Perform an unsigned binary operation, handling 32-bit vs 64-bit width.
@@ -35,7 +39,11 @@ fn unsigned_op(l: i64, r: i64, is_32bit: bool, op: fn(u64, u64) -> u64) -> i64 {
 /// Convert a boolean to i64 (1 for true, 0 for false).
 #[inline]
 fn bool_to_i64(b: bool) -> i64 {
-    if b { 1 } else { 0 }
+    if b {
+        1
+    } else {
+        0
+    }
 }
 
 // === Shared constant binary operation evaluators ===
@@ -51,13 +59,21 @@ fn bool_to_i64(b: bool) -> i64 {
 /// - lowering uses IrType: `(ir_type.size() <= 4, ir_type.is_unsigned())`
 ///
 /// Returns `Some(IrConst::I64(result))` or `None` for division by zero.
-fn eval_const_binop_int(op: &BinOp, l: i64, r: i64, is_32bit: bool, is_unsigned: bool) -> Option<IrConst> {
+fn eval_const_binop_int(
+    op: &BinOp,
+    l: i64,
+    r: i64,
+    is_32bit: bool,
+    is_unsigned: bool,
+) -> Option<IrConst> {
     let result = match op {
         BinOp::Add => wrap_result(l.wrapping_add(r), is_32bit),
         BinOp::Sub => wrap_result(l.wrapping_sub(r), is_32bit),
         BinOp::Mul => wrap_result(l.wrapping_mul(r), is_32bit),
         BinOp::Div => {
-            if r == 0 { return None; }
+            if r == 0 {
+                return None;
+            }
             if is_unsigned {
                 unsigned_op(l, r, is_32bit, u64::wrapping_div)
             } else {
@@ -65,7 +81,9 @@ fn eval_const_binop_int(op: &BinOp, l: i64, r: i64, is_32bit: bool, is_unsigned:
             }
         }
         BinOp::Mod => {
-            if r == 0 { return None; }
+            if r == 0 {
+                return None;
+            }
             if is_unsigned {
                 unsigned_op(l, r, is_32bit, u64::wrapping_rem)
             } else {
@@ -86,34 +104,74 @@ fn eval_const_binop_int(op: &BinOp, l: i64, r: i64, is_32bit: bool, is_unsigned:
             }
         }
         BinOp::Eq => {
-            if is_32bit { bool_to_i64(l as u32 == r as u32) }
-            else if is_unsigned { bool_to_i64(l as u64 == r as u64) }
-            else { bool_to_i64(l == r) }
+            if is_32bit {
+                bool_to_i64(l as u32 == r as u32)
+            } else if is_unsigned {
+                bool_to_i64(l as u64 == r as u64)
+            } else {
+                bool_to_i64(l == r)
+            }
         }
         BinOp::Ne => {
-            if is_32bit { bool_to_i64(l as u32 != r as u32) }
-            else if is_unsigned { bool_to_i64(l as u64 != r as u64) }
-            else { bool_to_i64(l != r) }
+            if is_32bit {
+                bool_to_i64(l as u32 != r as u32)
+            } else if is_unsigned {
+                bool_to_i64(l as u64 != r as u64)
+            } else {
+                bool_to_i64(l != r)
+            }
         }
         BinOp::Lt => {
-            if is_32bit { if is_unsigned { bool_to_i64((l as u32) < (r as u32)) } else { bool_to_i64((l as i32) < (r as i32)) } }
-            else if is_unsigned { bool_to_i64((l as u64) < (r as u64)) }
-            else { bool_to_i64(l < r) }
+            if is_32bit {
+                if is_unsigned {
+                    bool_to_i64((l as u32) < (r as u32))
+                } else {
+                    bool_to_i64((l as i32) < (r as i32))
+                }
+            } else if is_unsigned {
+                bool_to_i64((l as u64) < (r as u64))
+            } else {
+                bool_to_i64(l < r)
+            }
         }
         BinOp::Gt => {
-            if is_32bit { if is_unsigned { bool_to_i64((l as u32) > (r as u32)) } else { bool_to_i64((l as i32) > (r as i32)) } }
-            else if is_unsigned { bool_to_i64((l as u64) > (r as u64)) }
-            else { bool_to_i64(l > r) }
+            if is_32bit {
+                if is_unsigned {
+                    bool_to_i64((l as u32) > (r as u32))
+                } else {
+                    bool_to_i64((l as i32) > (r as i32))
+                }
+            } else if is_unsigned {
+                bool_to_i64((l as u64) > (r as u64))
+            } else {
+                bool_to_i64(l > r)
+            }
         }
         BinOp::Le => {
-            if is_32bit { if is_unsigned { bool_to_i64((l as u32) <= (r as u32)) } else { bool_to_i64((l as i32) <= (r as i32)) } }
-            else if is_unsigned { bool_to_i64((l as u64) <= (r as u64)) }
-            else { bool_to_i64(l <= r) }
+            if is_32bit {
+                if is_unsigned {
+                    bool_to_i64((l as u32) <= (r as u32))
+                } else {
+                    bool_to_i64((l as i32) <= (r as i32))
+                }
+            } else if is_unsigned {
+                bool_to_i64((l as u64) <= (r as u64))
+            } else {
+                bool_to_i64(l <= r)
+            }
         }
         BinOp::Ge => {
-            if is_32bit { if is_unsigned { bool_to_i64((l as u32) >= (r as u32)) } else { bool_to_i64((l as i32) >= (r as i32)) } }
-            else if is_unsigned { bool_to_i64((l as u64) >= (r as u64)) }
-            else { bool_to_i64(l >= r) }
+            if is_32bit {
+                if is_unsigned {
+                    bool_to_i64((l as u32) >= (r as u32))
+                } else {
+                    bool_to_i64((l as i32) >= (r as i32))
+                }
+            } else if is_unsigned {
+                bool_to_i64((l as u64) >= (r as u64))
+            } else {
+                bool_to_i64(l >= r)
+            }
         }
         BinOp::LogicalAnd => bool_to_i64(l != 0 && r != 0),
         BinOp::LogicalOr => bool_to_i64(l != 0 || r != 0),
@@ -150,7 +208,8 @@ fn eval_const_binop_int(op: &BinOp, l: i64, r: i64, is_32bit: bool, is_unsigned:
 pub fn eval_const_binop_float(op: &BinOp, lhs: &IrConst, rhs: &IrConst) -> Option<IrConst> {
     use crate::common::long_double;
 
-    let use_long_double = matches!(lhs, IrConst::LongDouble(..)) || matches!(rhs, IrConst::LongDouble(..));
+    let use_long_double =
+        matches!(lhs, IrConst::LongDouble(..)) || matches!(rhs, IrConst::LongDouble(..));
     let use_f32 = matches!(lhs, IrConst::F32(_)) && matches!(rhs, IrConst::F32(_));
 
     // For long double arithmetic, use precision matching the target:
@@ -307,7 +366,14 @@ pub fn eval_const_binop_float(op: &BinOp, lhs: &IrConst, rhs: &IrConst) -> Optio
 /// C type, used to correctly zero-extend or sign-extend when widening to i128.
 /// Per C11 6.3.1.3, converting unsigned long long to __int128 preserves the value
 /// (zero-extends), while converting signed long long sign-extends.
-fn eval_const_binop_i128(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_unsigned: bool, lhs_unsigned: bool, rhs_unsigned: bool) -> Option<IrConst> {
+fn eval_const_binop_i128(
+    op: &BinOp,
+    lhs: &IrConst,
+    rhs: &IrConst,
+    is_unsigned: bool,
+    lhs_unsigned: bool,
+    rhs_unsigned: bool,
+) -> Option<IrConst> {
     // When widening a non-I128 operand to 128-bit, use the operand's own signedness
     // to decide zero-extend vs sign-extend. This is critical for cases like:
     //   (i128)x << 64 | 0xFEDCBA9876543210ULL
@@ -325,16 +391,16 @@ fn eval_const_binop_i128(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_unsigned: 
         rhs.to_i128()?
     };
 
-    let bool_result = |b: bool| -> Option<IrConst> {
-        Some(IrConst::I64(if b { 1 } else { 0 }))
-    };
+    let bool_result = |b: bool| -> Option<IrConst> { Some(IrConst::I64(if b { 1 } else { 0 })) };
 
     match op {
         BinOp::Add => Some(IrConst::I128(l.wrapping_add(r))),
         BinOp::Sub => Some(IrConst::I128(l.wrapping_sub(r))),
         BinOp::Mul => Some(IrConst::I128(l.wrapping_mul(r))),
         BinOp::Div => {
-            if r == 0 { return None; }
+            if r == 0 {
+                return None;
+            }
             if is_unsigned {
                 Some(IrConst::I128((l as u128).wrapping_div(r as u128) as i128))
             } else {
@@ -342,7 +408,9 @@ fn eval_const_binop_i128(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_unsigned: 
             }
         }
         BinOp::Mod => {
-            if r == 0 { return None; }
+            if r == 0 {
+                return None;
+            }
             if is_unsigned {
                 Some(IrConst::I128((l as u128).wrapping_rem(r as u128) as i128))
             } else {
@@ -363,20 +431,32 @@ fn eval_const_binop_i128(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_unsigned: 
         BinOp::Eq => bool_result(l == r),
         BinOp::Ne => bool_result(l != r),
         BinOp::Lt => {
-            if is_unsigned { bool_result((l as u128) < (r as u128)) }
-            else { bool_result(l < r) }
+            if is_unsigned {
+                bool_result((l as u128) < (r as u128))
+            } else {
+                bool_result(l < r)
+            }
         }
         BinOp::Gt => {
-            if is_unsigned { bool_result((l as u128) > (r as u128)) }
-            else { bool_result(l > r) }
+            if is_unsigned {
+                bool_result((l as u128) > (r as u128))
+            } else {
+                bool_result(l > r)
+            }
         }
         BinOp::Le => {
-            if is_unsigned { bool_result((l as u128) <= (r as u128)) }
-            else { bool_result(l <= r) }
+            if is_unsigned {
+                bool_result((l as u128) <= (r as u128))
+            } else {
+                bool_result(l <= r)
+            }
         }
         BinOp::Ge => {
-            if is_unsigned { bool_result((l as u128) >= (r as u128)) }
-            else { bool_result(l >= r) }
+            if is_unsigned {
+                bool_result((l as u128) >= (r as u128))
+            } else {
+                bool_result(l >= r)
+            }
         }
         BinOp::LogicalAnd => bool_result(l != 0 && r != 0),
         BinOp::LogicalOr => bool_result(l != 0 || r != 0),
@@ -389,9 +469,23 @@ fn eval_const_binop_i128(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_unsigned: 
 /// The caller provides `is_32bit` and `is_unsigned` for the integer path.
 /// `lhs_unsigned` and `rhs_unsigned` indicate the signedness of each operand's
 /// original C type, used for correct widening to i128.
-pub fn eval_const_binop(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_32bit: bool, is_unsigned: bool, lhs_unsigned: bool, rhs_unsigned: bool) -> Option<IrConst> {
-    let lhs_is_float = matches!(lhs, IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..));
-    let rhs_is_float = matches!(rhs, IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..));
+pub fn eval_const_binop(
+    op: &BinOp,
+    lhs: &IrConst,
+    rhs: &IrConst,
+    is_32bit: bool,
+    is_unsigned: bool,
+    lhs_unsigned: bool,
+    rhs_unsigned: bool,
+) -> Option<IrConst> {
+    let lhs_is_float = matches!(
+        lhs,
+        IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..)
+    );
+    let rhs_is_float = matches!(
+        rhs,
+        IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..)
+    );
 
     if lhs_is_float || rhs_is_float {
         return eval_const_binop_float(op, lhs, rhs);
@@ -448,9 +542,12 @@ pub fn bitnot_const(val: IrConst) -> Option<IrConst> {
 pub fn is_zero_expr(expr: &crate::frontend::parser::ast::Expr) -> bool {
     use crate::frontend::parser::ast::Expr;
     match expr {
-        Expr::IntLiteral(0, _) | Expr::UIntLiteral(0, _)
-        | Expr::LongLiteral(0, _) | Expr::ULongLiteral(0, _)
-        | Expr::LongLongLiteral(0, _) | Expr::ULongLongLiteral(0, _) => true,
+        Expr::IntLiteral(0, _)
+        | Expr::UIntLiteral(0, _)
+        | Expr::LongLiteral(0, _)
+        | Expr::ULongLiteral(0, _)
+        | Expr::LongLongLiteral(0, _)
+        | Expr::ULongLongLiteral(0, _) => true,
         Expr::Cast(_, inner, _) => is_zero_expr(inner),
         _ => false,
     }
@@ -469,9 +566,12 @@ pub fn is_null_pointer_constant(expr: &crate::frontend::parser::ast::Expr) -> bo
     use crate::frontend::parser::ast::TypeSpecifier;
     match expr {
         // Integer literal 0 is an NPC
-        Expr::IntLiteral(0, _) | Expr::UIntLiteral(0, _)
-        | Expr::LongLiteral(0, _) | Expr::ULongLiteral(0, _)
-        | Expr::LongLongLiteral(0, _) | Expr::ULongLongLiteral(0, _) => true,
+        Expr::IntLiteral(0, _)
+        | Expr::UIntLiteral(0, _)
+        | Expr::LongLiteral(0, _)
+        | Expr::ULongLiteral(0, _)
+        | Expr::LongLongLiteral(0, _)
+        | Expr::ULongLongLiteral(0, _) => true,
         // (void*)ICE_zero is an NPC
         Expr::Cast(ts, inner, _) => {
             if let TypeSpecifier::Pointer(p, _) = ts {
@@ -507,15 +607,22 @@ fn is_syntactically_constant(expr: &crate::frontend::parser::ast::Expr) -> bool 
     use crate::frontend::parser::ast::Expr;
     match expr {
         // Literals are constant
-        Expr::IntLiteral(_, _) | Expr::UIntLiteral(_, _)
-        | Expr::LongLiteral(_, _) | Expr::ULongLiteral(_, _)
-        | Expr::LongLongLiteral(_, _) | Expr::ULongLongLiteral(_, _)
-        | Expr::CharLiteral(_, _) | Expr::FloatLiteral(_, _)
-        | Expr::FloatLiteralF32(_, _) | Expr::FloatLiteralLongDouble(_, _, _) => true,
+        Expr::IntLiteral(_, _)
+        | Expr::UIntLiteral(_, _)
+        | Expr::LongLiteral(_, _)
+        | Expr::ULongLiteral(_, _)
+        | Expr::LongLongLiteral(_, _)
+        | Expr::ULongLongLiteral(_, _)
+        | Expr::CharLiteral(_, _)
+        | Expr::FloatLiteral(_, _)
+        | Expr::FloatLiteralF32(_, _)
+        | Expr::FloatLiteralLongDouble(_, _, _) => true,
 
         // sizeof and alignof are constant (even when applied to expressions)
-        Expr::Sizeof(_, _) | Expr::Alignof(_, _)
-        | Expr::AlignofExpr(_, _) | Expr::GnuAlignof(_, _)
+        Expr::Sizeof(_, _)
+        | Expr::Alignof(_, _)
+        | Expr::AlignofExpr(_, _)
+        | Expr::GnuAlignof(_, _)
         | Expr::GnuAlignofExpr(_, _) => true,
 
         // Casts of constant expressions are constant
@@ -533,9 +640,9 @@ fn is_syntactically_constant(expr: &crate::frontend::parser::ast::Expr) -> bool 
 
         // Conditional on constant expressions is constant
         Expr::Conditional(cond, then_e, else_e, _) => {
-            is_syntactically_constant(cond) &&
-            is_syntactically_constant(then_e) &&
-            is_syntactically_constant(else_e)
+            is_syntactically_constant(cond)
+                && is_syntactically_constant(then_e)
+                && is_syntactically_constant(else_e)
         }
 
         // Variable references, function calls, etc. are NOT constant
@@ -578,7 +685,11 @@ fn is_zero_valued_constant(expr: &crate::frontend::parser::ast::Expr) -> bool {
 /// and optionally sign-extends back to 64 bits. Returns `(result_bits, target_signed)`.
 ///
 /// The caller determines `target_width` and `target_signed` from their type system.
-pub fn truncate_and_extend_bits(bits: u64, target_width: usize, target_signed: bool) -> (u64, bool) {
+pub fn truncate_and_extend_bits(
+    bits: u64,
+    target_width: usize,
+    target_signed: bool,
+) -> (u64, bool) {
     // Truncate to target width
     let truncated = if target_width >= 64 || target_width == 0 {
         bits

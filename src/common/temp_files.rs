@@ -74,7 +74,9 @@ impl TempFile {
 
     /// Get the path as a string slice (panics if not valid UTF-8).
     pub fn to_str(&self) -> &str {
-        self.path.to_str().expect("temp file path is not valid UTF-8")
+        self.path
+            .to_str()
+            .expect("temp file path is not valid UTF-8")
     }
 }
 
