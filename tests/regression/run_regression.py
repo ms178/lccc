@@ -22,6 +22,8 @@ Conventions (per test ``NAME.c``):
   gaps, ABI-peculiar tests).  The lccc self-check still must pass.
 * A test passes when its binary exits 0.  Compared tests additionally
   require byte-identical stdout between the LCCC and GCC binaries.
+* A successfully linked ``-m32`` test is reported as ``SKIP-RUN`` when the
+  host image has no i386 ELF interpreter; this is not a compiler failure.
 
 Usage::
 
@@ -78,11 +80,30 @@ class TestCase:
 @dataclass
 class Result:
     name: str
-    status: str  # pass | fail | skip-compare
+    status: str  # pass | fail | skip-compare | skip-run
     detail: str = ""
     lccc_time: float = 0.0
     gcc_time: float = 0.0
     phases: list[str] = field(default_factory=list)
+
+
+def unavailable_i386_interpreter(binary: Path, flags: str) -> bool:
+    """Whether a successful -m32 link cannot run only due to the host image."""
+    if "-m32" not in flags.split():
+        return False
+    loaders = (
+        Path("/lib/ld-linux.so.2"),
+        Path("/lib32/ld-linux.so.2"),
+        Path("/usr/lib32/ld-linux.so.2"),
+    )
+    if any(path.is_file() and os.access(path, os.X_OK) for path in loaders):
+        return False
+    if shutil.which("readelf") is None:
+        return False
+    probe = subprocess.run(
+        ["readelf", "-l", str(binary)], capture_output=True, text=True
+    )
+    return probe.returncode == 0 and "Requesting program interpreter" in probe.stdout
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -198,6 +219,15 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
         return Result(test.name, "fail",
                       f"internal: compile rc=0 but no binary at {out}; cwd={workdir}; stderr={se[-1500:]}",
                       time.monotonic() - start, 0.0, phases + ["run:missing"])
+    if unavailable_i386_interpreter(out, test.flags):
+        return Result(
+            test.name,
+            "skip-run",
+            "compiled successfully; host image has no i386 ELF interpreter",
+            time.monotonic() - start,
+            0.0,
+            phases + ["run:host-skip"],
+        )
     rc, so, se = run_checked([str(out)], env=env, cwd=workdir)
     lccc_elapsed = time.monotonic() - start
     if rc != 0:
@@ -284,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
             "pass": color(GRN, "PASS"),
             "fail": color(RED, "FAIL"),
             "skip-compare": color(YLW, "SKIP-COMPARE"),
+            "skip-run": color(YLW, "SKIP-RUN"),
         }[res.status]
         tag = " ".join(res.phases)
         line = f"{mark} {res.name}  ({tag})  {res.lccc_time:5.1f}s"
@@ -314,15 +345,19 @@ def main(argv: list[str] | None = None) -> int:
                     skips.append(res)
 
     elapsed = time.monotonic() - t0
+    skipped_compare = sum(result.status == "skip-compare" for result in skips)
+    skipped_run = sum(result.status == "skip-run" for result in skips)
     print()
     print(f"== {passed} passed, {len(failures)} failed, "
-          f"{len(skips)} skipped-compare, {len(tests)} total, {elapsed:.0f}s")
+          f"{skipped_compare} skipped-compare, {skipped_run} skipped-run, "
+          f"{len(tests)} total, {elapsed:.0f}s")
 
     if args.json:
         payload: dict[str, Any] = {
             "passed": passed,
             "failed": len(failures),
-            "skipped_compare": len(skips),
+            "skipped_compare": skipped_compare,
+            "skipped_run": skipped_run,
             "total": len(tests),
             "elapsed_s": round(elapsed, 1),
             "lccc": str(args.lccc),

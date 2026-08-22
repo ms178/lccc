@@ -10,8 +10,8 @@
 
 use super::live_range::{self, LinearScanAllocator};
 use super::liveness::{
-    compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
-    for_each_value_use_in_instruction, LiveInterval, LivenessResult,
+    LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction,
+    for_each_operand_in_terminator, for_each_value_use_in_instruction,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -2310,8 +2310,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .count();
             eprintln!(
                 "[RA-STATS] fn={} eligible={} scan={} assigned={} spilled={} segments={} holes={} callee-homes={} caller-homes={}",
-                func.name, eligible.len(), scan_values.len(), assigned_scan, spilled,
-                liveness.segments.len(), holes, callee_homes, caller_homes
+                func.name,
+                eligible.len(),
+                scan_values.len(),
+                assigned_scan,
+                spilled,
+                liveness.segments.len(),
+                holes,
+                callee_homes,
+                caller_homes
             );
         }
     }
@@ -2530,107 +2537,149 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
         }
     }
 
-    // Compute producers: dest_ptr is a 16-byte slot, args are vector slots
-    // loaded via sse_load_arg. Mem-loads write a slot but their args are
-    // *addresses* — using a vecreg alloca as a load address is not a
-    // cache-aware vector read.
-    let is_128_compute = |op: &IntrinsicOp| -> bool {
+    // Compute producers: dest_ptr is a 16-byte slot and the first N args
+    // are vector slots loaded via sse_load_arg.  Return the exact VECTOR
+    // prefix length rather than an op-level bool: several instructions carry
+    // trailing scalar/immediate operands.  Treating every Value operand as a
+    // vector pointer can admit an alloca used as an immediate/scalar and make
+    // codegen reinterpret its XMM contents as an address.
+    //
+    // Keep this fail-closed and tied to lowering shapes.  New intrinsics get
+    // no vecreg allocation until their sse_load_arg/sse_store_dest contract is
+    // audited here.
+    let compute_vec_arg_count = |op: &IntrinsicOp| -> Option<usize> {
         use IntrinsicOp as O;
-        matches!(
-            op,
+        match op {
+            // Full-width constants do not read a vector operand.
+            O::Setzero128 => Some(0),
+
+            // Unary vector input followed, for some ops, by scalar/immediate
+            // operands. Inserts preserve the other lanes of args[0].
+            O::Pabsb128
+            | O::Pabsw128
+            | O::Pabsd128
+            | O::Pmovzxbw128
+            | O::Pmovzxwd128
+            | O::Aesimc128
+            | O::Aeskeygenassist128
+            | O::Psllwi128
+            | O::Psrlwi128
+            | O::Psrawi128
+            | O::Psradi128
+            | O::Pslldi128
+            | O::Psrldi128
+            | O::Pslldqi128
+            | O::Psrldqi128
+            | O::Psllqi128
+            | O::Psrlqi128
+            | O::Pshufd128
+            | O::Pshuflw128
+            | O::Pshufhw128
+            | O::Pinsrw128
+            | O::Pinsrd128
+            | O::Pinsrb128
+            | O::Pinsrq128 => Some(1),
+
+            // Three genuine vector inputs (no scalar operand in the prefix).
+            O::Pblendvb128
+            | O::Dpbusd128
+            | O::Dpbusds128
+            | O::Dpwusd128
+            | O::Dpwusds128
+            | O::Dpbssd128
+            | O::Dpbssds128
+            | O::Dpbsud128
+            | O::Dpbsuds128
+            | O::Dpbuud128
+            | O::Dpbuuds128
+            | O::Dpwuud128
+            | O::Dpwuuds128
+            | O::Dpwssd128
+            | O::Dpwssds128 => Some(3),
+
+            // Binary vector inputs.  Palignr/Pblendw/Pclmul/GFNI append an
+            // immediate after this two-vector prefix; variable shifts really
+            // do consume their count operand as a 128-bit vector.
             O::Pcmpeqb128
-                | O::Pcmpeqd128
-                | O::Psubusb128
-                | O::Psubsb128
-                | O::Por128
-                | O::Pand128
-                | O::Pxor128
-                | O::AddPs128
-                | O::SubPs128
-                | O::MulPs128
-                | O::AddPd128
-                | O::SubPd128
-                | O::MulPd128
-                | O::Paddw128
-                | O::Psubw128
-                | O::Pmulhw128
-                | O::Pmullw128
-                | O::Pmuludq128
-                | O::Pmuldq128
-                | O::Pmulld128
-                | O::Pmaddwd128
-                | O::Pmaddubsw128
-                | O::Pcmpgtw128
-                | O::Pcmpgtb128
-                | O::Paddd128
-                | O::Psubd128
-                | O::Paddb128
-                | O::Psubb128
-                | O::Psubusw128
-                | O::Psadbw128
-                | O::Pshufb128
-                | O::Pabsb128
-                | O::Pabsw128
-                | O::Pabsd128
-                | O::Pmaxub128
-                | O::Pminub128
-                | O::Pmovzxbw128
-                | O::Pmovzxwd128
-                | O::Packssdw128
-                | O::Packsswb128
-                | O::Packuswb128
-                | O::Punpcklbw128
-                | O::Punpckhbw128
-                | O::Punpcklwd128
-                | O::Punpckhwd128
-                | O::Phaddw128
-                | O::Phaddd128
-                | O::Palignr128
-                | O::Psllw128
-                | O::Psrlw128
-                | O::Pblendvb128
-                | O::Pblendw128
-                | O::Aesenc128
-                | O::Aesenclast128
-                | O::Aesdec128
-                | O::Aesdeclast128
-                | O::Aesimc128
-                | O::Aeskeygenassist128
-                | O::Pclmulqdq128
-                | O::Gf2p8mulb128
-                | O::Gf2p8affineqb128
-                | O::Gf2p8affineinvqb128
-                | O::Psllwi128
-                | O::Psrlwi128
-                | O::Psrawi128
-                | O::Psradi128
-                | O::Pslldi128
-                | O::Psrldi128
-                | O::Pslldqi128
-                | O::Psrldqi128
-                | O::Psllqi128
-                | O::Psrlqi128
-                | O::Pshufd128
-                | O::Pshuflw128
-                | O::Pshufhw128
-                | O::AddF64x2
-                | O::MulF64x2
-                | O::AddI32x4
-                | O::Dpbusd128
-                | O::Dpbusds128
-                | O::Dpwusd128
-                | O::Dpwusds128
-                | O::Dpbssd128
-                | O::Dpbssds128
-                | O::Dpbsud128
-                | O::Dpbsuds128
-                | O::Dpbuud128
-                | O::Dpbuuds128
-                | O::Dpwuud128
-                | O::Dpwuuds128
-                | O::Dpwssd128
-                | O::Dpwssds128
-        )
+            | O::Pcmpeqd128
+            | O::Psubusb128
+            | O::Psubsb128
+            | O::Por128
+            | O::Pand128
+            | O::Pxor128
+            | O::AddPs128
+            | O::SubPs128
+            | O::MulPs128
+            | O::AddPd128
+            | O::SubPd128
+            | O::MulPd128
+            | O::Paddw128
+            | O::Psubw128
+            | O::Pmulhw128
+            | O::Pmullw128
+            | O::Pmuludq128
+            | O::Pmuldq128
+            | O::Pmulld128
+            | O::Pmaddwd128
+            | O::Pmaddubsw128
+            | O::Pcmpgtw128
+            | O::Pcmpgtb128
+            | O::Paddd128
+            | O::Psubd128
+            | O::Paddb128
+            | O::Psubb128
+            | O::Psubusw128
+            | O::Psadbw128
+            | O::Pshufb128
+            | O::Pmaxub128
+            | O::Pminub128
+            | O::Packssdw128
+            | O::Packsswb128
+            | O::Packuswb128
+            | O::Punpcklbw128
+            | O::Punpckhbw128
+            | O::Punpcklwd128
+            | O::Punpckhwd128
+            | O::Phaddw128
+            | O::Phaddd128
+            | O::Palignr128
+            | O::Psllw128
+            | O::Psrlw128
+            | O::Pblendw128
+            | O::Aesenc128
+            | O::Aesenclast128
+            | O::Aesdec128
+            | O::Aesdeclast128
+            | O::Pclmulqdq128
+            | O::Gf2p8mulb128
+            | O::Gf2p8affineqb128
+            | O::Gf2p8affineinvqb128
+            | O::AddF64x2
+            | O::MulF64x2
+            | O::AddI32x4
+            // SSE2 operations wired after the original whitelist.  Their
+            // lowerings all route through emit_sse_binary_128.
+            | O::Paddusb128
+            | O::Paddsb128
+            | O::Paddusw128
+            | O::Paddsw128
+            | O::Psubsw128
+            | O::Pandn128
+            | O::Pcmpeqw128
+            | O::Pcmpgtd128
+            | O::Pavgb128
+            | O::Pavgw128
+            | O::Pminsw128
+            | O::Pmaxsw128
+            | O::Pmulhuw128
+            | O::Paddq128
+            | O::Psubq128
+            | O::Punpckldq128
+            | O::Punpckhdq128
+            | O::Punpcklqdq128
+            | O::Punpckhqdq128 => Some(2),
+            _ => None,
+        }
     };
     let is_128_mem_load = |op: &IntrinsicOp| -> bool {
         use IntrinsicOp as O;
@@ -2717,7 +2766,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                     args,
                     ..
                 } => {
-                    if is_128_compute(op) || is_128_mem_load(op) {
+                    if compute_vec_arg_count(op).is_some() || is_128_mem_load(op) {
                         produced.insert(d.0);
                     }
                     if is_store_target(op) {
@@ -2726,10 +2775,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                     // Fail-closed: only compute-producer ARGs are cache-aware
                     // vector reads. Everything else (store payload, mem-load
                     // address, raw FMA/horiz, unknown op) poisons the value.
-                    let args_are_vec = is_128_compute(op);
-                    for arg in args {
+                    let vec_arg_count = compute_vec_arg_count(op).unwrap_or(0);
+                    for (index, arg) in args.iter().enumerate() {
                         if let Operand::Value(v) = arg {
-                            if args_are_vec {
+                            if index < vec_arg_count {
                                 *arg_uses.entry(v.0).or_insert(0) += 1;
                                 if v.0 == d.0 {
                                     rmw.insert(v.0);
@@ -2755,10 +2804,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 } => {
                     // No dest_ptr: still poison args unless this is a known
                     // compute op (should not happen for the 128 family).
-                    let args_are_vec = is_128_compute(op);
-                    for arg in args {
+                    let vec_arg_count = compute_vec_arg_count(op).unwrap_or(0);
+                    for (index, arg) in args.iter().enumerate() {
                         if let Operand::Value(v) = arg {
-                            if args_are_vec {
+                            if index < vec_arg_count {
                                 *arg_uses.entry(v.0).or_insert(0) += 1;
                             } else {
                                 bad_use.insert(v.0);
