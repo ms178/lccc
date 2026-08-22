@@ -330,18 +330,54 @@ impl Parser {
                     _ => {}
                 }
             }
-            // Apply pre-Function derivations
-            for d in &derived[..fpos] {
-                match d {
+            // Apply pre-Function derivations.
+            //
+            // A (Pointer, FunctionPointer) pair — or a standalone FunctionPointer —
+            // in the prefix is the "returns a function pointer" core produced by
+            // `combine_declarator_parts` for declarators like
+            // `int (*f(int))(const void*, int)`. It must become a
+            // TypeSpecifier::FunctionPointer wrapping the return type built so
+            // far (TypeSpecifier::FunctionPointer already denotes
+            // Pointer(Function(...))). Silently skipping it (the old `_ => {}`)
+            // truncated such return types to `int *`.
+            let prefix = &derived[..fpos];
+            let mut i = 0;
+            while i < prefix.len() {
+                match &prefix[i] {
                     DerivedDeclarator::Pointer => {
-                        return_type =
-                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                        if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
+                            prefix.get(i + 1)
+                        {
+                            return_type = TypeSpecifier::FunctionPointer(
+                                Box::new(return_type),
+                                params.clone(),
+                                *variadic,
+                            );
+                            i += 2;
+                        } else {
+                            return_type = TypeSpecifier::Pointer(
+                                Box::new(return_type),
+                                AddressSpace::Default,
+                            );
+                            i += 1;
+                        }
+                    }
+                    DerivedDeclarator::FunctionPointer(params, variadic) => {
+                        return_type = TypeSpecifier::FunctionPointer(
+                            Box::new(return_type),
+                            params.clone(),
+                            *variadic,
+                        );
+                        i += 1;
                     }
                     DerivedDeclarator::Array(size_expr) => {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
+                        i += 1;
                     }
-                    _ => {}
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
         } else {

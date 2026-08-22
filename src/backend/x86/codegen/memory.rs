@@ -1845,7 +1845,18 @@ impl X86Codegen {
         shift: u8,
         ty: IrType,
     ) -> bool {
-        if self.state.needs_got_for_addr(sym) {
+        // `sym` may carry a composed constant displacement ("gh+2"). The GOT
+        // verdict must be computed on the base symbol, exactly like
+        // `rip_rel_blocked` does on the deciding side (`can_indexed_addr_fold`).
+        // Passing the composed string made `needs_got_for_addr` miss
+        // `local_symbols` under -fPIC, so the emitter refused a fold the
+        // allocator had already committed to: the skipped GEP was then
+        // rematerialised at the access site, clobbering %rax while it held the
+        // acc-resident store value (speedtest1 HashFinal ICE).
+        // C symbol names cannot contain '+'; '-' only occurs in the map's
+        // displacement suffix.
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
             return false;
         }
         let Some(&x) = self.reg_assignments.get(&index.0) else {
@@ -1878,7 +1889,11 @@ impl X86Codegen {
         shift: u8,
         ty: IrType,
     ) -> bool {
-        if self.state.needs_got_for_addr(sym) {
+        // Same basename rule as emit_load_indexed_sym_impl (see comment there):
+        // the GOT check must match the deciding side or the fold is refused
+        // after the allocator committed to it.
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
             return false;
         }
         let Some(&x) = self.reg_assignments.get(&index.0) else {

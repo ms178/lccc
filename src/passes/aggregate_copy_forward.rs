@@ -261,6 +261,31 @@ struct CopyCandidate {
     source_root: u32,
 }
 
+/// Instructions that can write memory the pass cannot attribute to a tracked
+/// pointer path: calls (including libc `memset`/`memcpy` lowered as plain
+/// `Call`s), inline asm, atomics, va-machinery, and impure intrinsics. A
+/// snapshot window that spans one of these may only survive when the source
+/// is a provably unclobberable local (non-escaping alloca).
+fn is_opaque_memory_write(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::StackRestore { .. } => true,
+        Instruction::Intrinsic { op, .. } => !op.is_pure(),
+        _ => false,
+    }
+}
+
 /// Return the alloca root and GEP path for pointer values derived from allocas.
 fn pointer_paths(
     func: &IrFunction,
@@ -916,9 +941,71 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // The source must also remain unchanged after the copy.  Otherwise replacing
     // a temporary read with a source read changes snapshot semantics (TinyCC's
     // `tmp = *vtop; *vtop = ...; use(tmp)` exposed this).
+    //
+    // Writes come in two shapes:
+    //  * attributable — Store/Memcpy through a tracked pointer path; and
+    //  * opaque — calls, inline asm, atomics, impure intrinsics.  libc
+    //    `memset`/`memcpy` lower to plain `Call`s, so they land here.
+    //
+    // An opaque write can touch the source whenever the source's address has
+    // escaped (passed to a call, stored as data, or used outside the tracked
+    // load/store/GEP shapes).  SQLite memjrnlCreateFile miscompiled exactly
+    // so: `copy = *p; memset(p, 0, sizeof *p); use copy.pVfs` — the memset
+    // Call was invisible to the old Store/Memcpy-only scan, the copy was
+    // elided, and the forwarded reads observed the zeroed struct (speedtest1
+    // --testset json SIGSEGV via a NULL xOpen function pointer).
+    let mut escaped_roots: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let mut used = Vec::with_capacity(16);
+            inst.for_each_used_value(|v| used.push(v));
+            for value in used {
+                let Some((root, _)) = paths.get(&value) else {
+                    continue;
+                };
+                let non_escaping_shape = match inst {
+                    Instruction::GetElementPtr { base, .. } => base.0 == value,
+                    Instruction::Load { ptr, .. } => ptr.0 == value,
+                    Instruction::Store { ptr, val, .. } => {
+                        // Address position is fine; storing the POINTER as a
+                        // value escapes it.
+                        ptr.0 == value && !matches!(val, Operand::Value(v) if v.0 == value)
+                    }
+                    Instruction::Memcpy { dest, src, .. } => {
+                        dest.0 == value || src.0 == value
+                    }
+                    Instruction::Copy {
+                        src: Operand::Value(v),
+                        ..
+                    } => v.0 == value,
+                    Instruction::Phi { incoming, .. } => incoming
+                        .iter()
+                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)),
+                    _ => false,
+                };
+                if !non_escaping_shape {
+                    escaped_roots.insert(*root);
+                }
+            }
+        }
+    }
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
+            if is_opaque_memory_write(inst) {
+                for (&dest_root, candidate) in &candidates {
+                    let after_copy = bi == candidate.block && ii > candidate.inst;
+                    // A non-escaping alloca cannot be written by an opaque
+                    // instruction; anything else must be assumed clobbered.
+                    let source_provably_private = alloca_roots
+                        .contains(&candidate.source_root)
+                        && !escaped_roots.contains(&candidate.source_root);
+                    if after_copy && !source_provably_private {
+                        invalid.insert(dest_root);
+                    }
+                }
+                continue;
+            }
             let written_root = match inst {
                 Instruction::Store { ptr, .. } => paths.get(&ptr.0).map(|p| p.0),
                 Instruction::Memcpy { dest, .. } => paths.get(&dest.0).map(|p| p.0),

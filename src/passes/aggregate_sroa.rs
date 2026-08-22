@@ -46,6 +46,29 @@ fn ty_size(ty: IrType) -> i64 {
     }
 }
 
+/// Instructions that can write memory the pass cannot attribute to a tracked
+/// pointer: calls (including libc `memset`/`memcpy` lowered as plain `Call`s),
+/// inline asm, atomics, va-machinery, and impure intrinsics.
+fn is_opaque_memory_write(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::StackRestore { .. } => true,
+        Instruction::Intrinsic { op, .. } => !op.is_pure(),
+        _ => false,
+    }
+}
+
 fn const_i64(op: &Operand) -> Option<i64> {
     match op {
         Operand::Const(c) => match c {
@@ -424,6 +447,15 @@ fn run_function(func: &mut IrFunction) -> usize {
                         // The source must not be written between the copy and
                         // the load (aliasing safety).
                         let (sr, _so) = resolve(&s.gep, src);
+                        // A non-escaping alloca cannot be written by a call or
+                        // other opaque instruction; any other source (param,
+                        // global, escaped alloca) must be assumed clobbered by
+                        // one. libc memset/memcpy lower to plain Calls: SQLite
+                        // memjrnlCreateFile's `copy = *p; memset(p,0,..)` was
+                        // forwarded across the memset by the old Store/Memcpy-
+                        // only scan (speedtest1 --testset json SIGSEGV).
+                        let src_call_private = s.alloca_size.contains_key(&sr)
+                            && !any_escape(&s.escapes, &s.gep, sr);
                         let mut src_dirty = false;
                         for k in (mi + 1)..ii {
                             if let Some(inst_k) = block.instructions.get(k) {
@@ -442,7 +474,12 @@ fn run_function(func: &mut IrFunction) -> usize {
                                             break;
                                         }
                                     }
-                                    _ => {}
+                                    other => {
+                                        if !src_call_private && is_opaque_memory_write(other) {
+                                            src_dirty = true;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -562,10 +599,10 @@ fn run_function(func: &mut IrFunction) -> usize {
                                         break;
                                     }
                                 }
-                                // A call may write through either pointer.
-                                Some(Instruction::Call { .. })
-                                | Some(Instruction::CallIndirect { .. })
-                                | Some(Instruction::InlineAsm { .. }) => {
+                                // Anything that can write memory opaquely may
+                                // touch either pointer (calls, inline asm,
+                                // atomics, impure intrinsics, va machinery).
+                                Some(other) if is_opaque_memory_write(other) => {
                                     dirty = true;
                                     break;
                                 }

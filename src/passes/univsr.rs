@@ -219,11 +219,22 @@ fn extract_base_from_init(func: &IrFunction, init_op: &Operand) -> Option<(Value
                     } = inst
                     {
                         if dest.0 == v.0 {
-                            let init_offset = match offset {
-                                Operand::Const(c) => c.to_i64().unwrap_or(0),
-                                _ => 0,
+                            return match offset {
+                                Operand::Const(c) => Some((*base, c.to_i64()?)),
+                                // Variable displacement: peeling to the GEP's
+                                // base would silently DROP the runtime offset.
+                                // SQLite 3.53.4 pragmaVtabConnect miscompiled
+                                // exactly so: the pointer IV init was
+                                // GEP(pragCName, j0*8) with j0 loaded from
+                                // pPragma->iPragCName, and the old `_ => 0`
+                                // arm rewrote every walk to pragCName[i] —
+                                // every pragma_* eponymous vtab got
+                                // foreign_key_list's column names
+                                // (speedtest1 --testset app: "no such column:
+                                // name"). The init pointer VALUE is itself a
+                                // legal SIB base: use it and keep disp 0.
+                                _ => Some((*v, 0)),
                             };
-                            return Some((*base, init_offset));
                         }
                     }
                 }
