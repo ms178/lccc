@@ -81,11 +81,24 @@ fn canon_name<'a>(name: &'a str, aliases: &'a FxHashMap<String, String>) -> &'a 
 
 pub(crate) fn run_module(module: &mut IrModule) -> usize {
     let aliases = alias_canon_map(module);
-    module.for_each_function(|f| run_with_aliases(f, &aliases))
+    // TLS symbols: their GlobalAddr costs TWO instructions on x86-64
+    // (movq %fs:0,%r + leaq sym@TPOFF(%r)), and unlike RIP-addressable
+    // globals there is no `sym(,%idx,scale)` absolute form to protect —
+    // the indexed form works from the materialized base register either
+    // way. So TLS addresses are ALWAYS CSE/hoist candidates, even when
+    // they feed variable-index GEPs (glibc __thread arrays re-derived the
+    // base per element access: 2 extra instructions per loop iteration).
+    let tls: FxHashSet<String> = module
+        .globals
+        .iter()
+        .filter(|g| g.is_thread_local)
+        .map(|g| g.name.clone())
+        .collect();
+    module.for_each_function(|f| run_with_aliases_tls(f, &aliases, &tls))
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    run_with_aliases(func, &FxHashMap::default())
+    run_with_aliases_tls(func, &FxHashMap::default(), &FxHashSet::default())
 }
 
 /// GlobalAddr values feeding variable-index GEPs stay at their original sites.
@@ -246,6 +259,14 @@ pub(crate) fn run_with_aliases(
     func: &mut IrFunction,
     aliases: &FxHashMap<String, String>,
 ) -> usize {
+    run_with_aliases_tls(func, aliases, &FxHashSet::default())
+}
+
+pub(crate) fn run_with_aliases_tls(
+    func: &mut IrFunction,
+    aliases: &FxHashMap<String, String>,
+    tls_symbols: &FxHashSet<String>,
+) -> usize {
     if func.blocks.is_empty() {
         debug_merged(&func.name, 0);
         return 0;
@@ -263,7 +284,7 @@ pub(crate) fn run_with_aliases(
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GlobalAddr { dest, name } = inst {
-                if site_local.contains(&dest.0) {
+                if site_local.contains(&dest.0) && !tls_symbols.contains(name) {
                     continue;
                 }
                 groups

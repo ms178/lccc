@@ -666,7 +666,42 @@ pub(super) fn emit_shared_library(
             };
             let mut idx: u16 = match ver {
                 Some(v) => 2 + version_set.iter().position(|x| x == v).unwrap_or(0) as u16,
-                None => 1,
+                // Plain (un-@-suffixed) DEFINED name: GNU ld assigns the
+                // version of the FIRST version-script node whose `global:`
+                // patterns match — that is how the vast majority of glibc's
+                // exports (e.g. __progname@GLIBC_2.2.5) are versioned; only
+                // compat symbols carry explicit .symver suffixes. Leaving
+                // these at versym 1 (*global*) made every versioned
+                // reference from an external binary fail check_match
+                // ("undefined symbol __progname, version GLIBC_2.2.5").
+                // Undefined symbols stay 1: imports are versioned via
+                // verneed, not verdef.
+                None => {
+                    let defined = globals
+                        .get(name)
+                        .is_some_and(|g| g.defined_in.is_some() && g.section_idx != SHN_UNDEF);
+                    let from_script = if defined {
+                        version_script.as_ref().and_then(|vs| {
+                            vs.nodes.iter().find_map(|node| {
+                                node.global_patterns
+                                    .iter()
+                                    .any(|pat| {
+                                        linker_common::wildcard_match_pattern(pat, name)
+                                    })
+                                    .then(|| {
+                                        version_set
+                                            .iter()
+                                            .position(|x| x == &node.name)
+                                            .map(|p| (2 + p) as u16)
+                                    })
+                                    .flatten()
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    from_script.unwrap_or(1)
+                }
             };
             // "name@VER" (single @): non-default version — hidden bit set.
             if hidden {

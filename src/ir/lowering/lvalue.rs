@@ -94,9 +94,23 @@ impl Lowerer {
                 }
             }
             Expr::ArraySubscript(base, index, _) => {
-                // base[index] -> compute address of element
+                // base[index] -> compute address of element.
+                //
+                // The address space must be derived exactly like the LOAD
+                // path (lower_array_subscript) does: `p[i]` through a
+                // __seg_fs pointer, and `((S __seg_fs *)0)->arr[i]` through
+                // a segment-qualified member array, both store into the
+                // segment. Hardcoding Default here dropped the %fs prefix
+                // on every pointer-typed THREAD_SETMEM in glibc
+                // (__tls_init_tp: `((struct pthread __seg_fs *)0)
+                // ->specific[0] = ...` stored to the NULL page, killing
+                // every external binary at TLS-init time — LK-26).
+                let addr_space = match self.get_addr_space_of_ptr_expr(base) {
+                    AddressSpace::Default => self.get_addr_space_of_struct_expr(base),
+                    s => s,
+                };
                 let addr = self.compute_array_element_addr(base, index);
-                Some(LValue::address(addr, AddressSpace::Default, vol))
+                Some(LValue::address(addr, addr_space, vol))
             }
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // s.field as lvalue -> compute address of the field

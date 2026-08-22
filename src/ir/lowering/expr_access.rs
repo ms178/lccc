@@ -1094,7 +1094,13 @@ impl Lowerer {
                 return Operand::Value(addr);
             }
         }
-        let addr_space = self.get_addr_space_of_ptr_expr(base);
+        let addr_space = match self.get_addr_space_of_ptr_expr(base) {
+            // Member arrays of segment-qualified structs have Array CType;
+            // fall back to the struct-expression walk (mirrors the lvalue
+            // path — LK-26).
+            AddressSpace::Default => self.get_addr_space_of_struct_expr(base),
+            s => s,
+        };
         let elem_ty = self.get_expr_type(expr);
         let addr = self.compute_array_element_addr(base, index);
         let dest = self.fresh_value();

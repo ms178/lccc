@@ -1029,6 +1029,8 @@ fn hint_from_instruction(inst: &Instruction) -> Option<(u32, u32)> {
                 | IntrinsicOp::SqrtF32
                 | IntrinsicOp::FabsF64
                 | IntrinsicOp::FabsF32
+                | IntrinsicOp::RoundScalarF64(_)
+                | IntrinsicOp::RoundScalarF32(_)
         ) =>
         {
             match args.as_slice() {

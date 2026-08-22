@@ -611,10 +611,29 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     }
 
     // ── 9. Rename paramref values to phi values in all existing blocks ──────
+    // AND retarget phi predecessor labels: the entry block's original
+    // terminator has just moved into the loop header (step 7), so every
+    // control-flow edge that used to leave `entry` now leaves `loop_header`.
+    // A phi in a former entry-successor that still names `entry` as the
+    // predecessor is doubly wrong after the value rename below: the incoming
+    // value becomes the header phi (defined only in the loop header, which
+    // does NOT dominate entry), and phi elimination then places the edge
+    // copy in the entry block, reading the header phi's home before its
+    // first definition. glibc's _dl_lookup_symbol_x hashed a stale register
+    // for every ld.so lookup exactly this way (LK-27). The loop below only
+    // visits pre-existing blocks — the loop header (pushed in step 10) keeps
+    // its deliberate `entry` incomings.
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
             if matches!(inst, Instruction::ParamRef { .. }) {
                 continue; // definition, not a use
+            }
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, pred) in incoming.iter_mut() {
+                    if *pred == entry_label {
+                        *pred = loop_header_label;
+                    }
+                }
             }
             replace_values_in_inst(inst, &replace_map);
         }
