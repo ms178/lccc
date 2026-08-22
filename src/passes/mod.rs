@@ -53,7 +53,7 @@ pub(crate) mod vectorize;
 
 use crate::common::fx_hash::FxHashSet;
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{Instruction, IrFunction, IrModule};
+use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand};
 
 /// CCC_VALIDATE_SSA=1 debug validator: every Value id must have exactly one
 /// defining instruction, InlineAsm outputs and Phi dests included, and every
@@ -113,6 +113,125 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
                  'fresh' ids",
                 tag, func.name, max_def, func.next_value_id
             );
+        }
+
+        // PHI-INCOMING DOMINANCE: an incoming (v, pred) is evaluated at the
+        // END OF pred, so v must be defined in a block dominating pred. The
+        // case passes actually get wrong: substituting a SIBLING phi's dest
+        // as an incoming on a FORWARD edge (value equality reasoning that is
+        // only true under sequential-copy semantics). On a backedge the phi
+        // block dominates the latch and sibling-dest incomings are the
+        // classic legal swap-loop shape. glibc _dl_lookup_symbol_x: v445's
+        // entry-edge incoming was rewritten v8 -> v454 (sibling phi),
+        // eliminate_phis then emitted `v445 = Copy(v454)` before v454's own
+        // edge copy — every ld.so symbol lookup hashed a stale register
+        // (LK-27).
+        if strict {
+            let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+            let dominates = |a: usize, b: usize| -> bool {
+                let mut x = b;
+                loop {
+                    if x == a {
+                        return true;
+                    }
+                    let n = cfg.idom[x];
+                    if n == x {
+                        return x == a;
+                    }
+                    x = n;
+                }
+            };
+            let mut label_of: crate::common::fx_hash::FxHashMap<u32, usize> =
+                crate::common::fx_hash::FxHashMap::default();
+            for (bi, block) in func.blocks.iter().enumerate() {
+                label_of.insert(block.label.0, bi);
+            }
+            let mut def_block: crate::common::fx_hash::FxHashMap<u32, usize> =
+                crate::common::fx_hash::FxHashMap::default();
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Some(d) = inst.dest() {
+                        def_block.insert(d.0, bi);
+                    }
+                }
+            }
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        for (op, pred) in incoming {
+                            if let Operand::Value(v) = op {
+                                if let (Some(&db), Some(&pb)) =
+                                    (def_block.get(&v.0), label_of.get(&pred.0))
+                                {
+                                    if !dominates(db, pb) {
+                                        panic!(
+                                            "SSA PHI-DOMINANCE VIOLATION after phase '{}': \
+                                             function '{}' block {} phi v{} incoming v{} \
+                                             from pred block {} is not dominated by the \
+                                             defining block {}",
+                                            tag, func.name, bi, dest.0, v.0, pb, db
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SAME-BLOCK ORDER: a use of v inside the block that defines v must
+        // come AFTER the definition. Uniqueness alone does not catch a pass
+        // that swaps two instructions (glibc _dl_lookup_symbol_x: the
+        // `s = undef_name` copy was emitted before undef_name's own home
+        // copy, so the inlined _dl_new_hash hashed a stale register and
+        // every symbol lookup against ld.so's map failed — LK-27). Cross-
+        // block dominance is deliberately not modelled here; the same-block
+        // case is the one instruction-motion bugs actually produce, and it
+        // needs no CFG analysis. Skipped in the conventional-SSA backend
+        // phases where phi-home Copies legitimately repeat.
+        // In conventional-SSA backend phases, cross-block flow can make a
+        // same-block late def legal (loop-rotated phi homes) — but the ENTRY
+        // block has no predecessors: use-before-def there is a bug in every
+        // phase. Check all blocks in strict phases, entry-only afterwards.
+        let order_blocks = if strict { usize::MAX } else { 1 };
+        {
+            for (bi, block) in func.blocks.iter().enumerate().take(order_blocks) {
+                let mut defined_here: crate::common::fx_hash::FxHashMap<u32, usize> =
+                    crate::common::fx_hash::FxHashMap::default();
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    if let Some(d) = inst.dest() {
+                        defined_here.entry(d.0).or_insert(ii);
+                    }
+                }
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    // Phi incoming values are PARALLEL COPIES on predecessor
+                    // EDGES: a loop-carried value is legally defined later in
+                    // the same (header) block, arriving via the backedge.
+                    // Order only constrains straight-line uses.
+                    if matches!(inst, Instruction::Phi { .. }) {
+                        continue;
+                    }
+                    let mut bad: Option<u32> = None;
+                    inst.for_each_used_value(|v| {
+                        if bad.is_none() {
+                            if let Some(&di) = defined_here.get(&v) {
+                                if di > ii {
+                                    bad = Some(v);
+                                }
+                            }
+                        }
+                    });
+                    if let Some(v) = bad {
+                        panic!(
+                            "SSA ORDER VIOLATION after phase '{}': function '{}' \
+                             block {} instruction {} uses v{} which is only \
+                             defined later in the same block (index {}):\n  use: {:?}",
+                            tag, func.name, bi, ii, v, defined_here[&v], inst
+                        );
+                    }
+                }
+            }
         }
     }
 }

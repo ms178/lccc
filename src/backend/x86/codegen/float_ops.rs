@@ -309,6 +309,25 @@ impl X86Codegen {
             if let Some(&reg) = self.reg_assignments.get(&d.0) {
                 if is_xmm_reg(reg) {
                     let dname = phys_reg_name(reg);
+                    // Source-direct 3-operand form: when the argument already
+                    // lives in an XMM register, read it in place —
+                    // `vroundsd $9, %src, %src, %dst` — instead of copying
+                    // it into the destination first. Eliminates one movsd
+                    // per rounding op; the glibc round-family kernel emits
+                    // six of these per iteration (GCC parity).
+                    if let Operand::Value(sv) = arg {
+                        if let Some(&sreg) = self.reg_assignments.get(&sv.0) {
+                            if is_xmm_reg(sreg) && sreg != reg {
+                                let sname = phys_reg_name(sreg);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} ${}, %{}, %{}, %{}",
+                                    inst, imm, sname, sname, dname
+                                ));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                    }
                     self.load_fp_to_reg(arg, ty, dname);
                     self.state.emit_fmt(format_args!(
                         "    {} ${}, %{}, %{}, %{}",
@@ -354,25 +373,61 @@ impl X86Codegen {
                 0x8000_0000_0000_0000u64,
             )
         };
-        // y's sign into xmm1, |x| into xmm0, OR them.
-        self.load_fp_to_reg(y, ty, "xmm1");
-        self.load_fp_to_xmm0(x, ty);
         let abs_label = self.state.get_fp_const_label(abs_mask);
         let sign_label = self.state.get_fp_const_label(sign_mask);
-        self.state.emit_fmt(format_args!(
-            "    {} {}(%rip), %xmm1, %xmm1",
-            andp, sign_label
-        ));
-        self.state.emit_fmt(format_args!(
-            "    {} {}(%rip), %xmm0, %xmm0",
-            andp, abs_label
-        ));
+        // Source-direct: masks are non-destructive 3-operand VEX ops, so
+        // XMM-homed operands are read in place (no movsd staging copies) —
+        // sign bits land in scratch xmm1, magnitude in scratch xmm0.
+        let xh = self.fp_arg_xmm_home(x);
+        let yh = self.fp_arg_xmm_home(y);
+        match yh {
+            Some(yname) => self.state.emit_fmt(format_args!(
+                "    {} {}(%rip), %{}, %xmm1",
+                andp, sign_label, yname
+            )),
+            None => {
+                self.load_fp_to_reg(y, ty, "xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} {}(%rip), %xmm1, %xmm1",
+                    andp, sign_label
+                ));
+            }
+        }
+        match xh {
+            Some(xname) => self.state.emit_fmt(format_args!(
+                "    {} {}(%rip), %{}, %xmm0",
+                andp, abs_label, xname
+            )),
+            None => {
+                self.load_fp_to_xmm0(x, ty);
+                self.state.emit_fmt(format_args!(
+                    "    {} {}(%rip), %xmm0, %xmm0",
+                    andp, abs_label
+                ));
+            }
+        }
         self.state
             .emit_fmt(format_args!("    {} %xmm1, %xmm0, %xmm0", orp));
         if let Some(d) = dest {
             self.store_xmm0_fp_dest(d, ty);
         }
         self.state.reg_cache.invalidate_acc();
+    }
+
+    /// XMM register home of an FP operand, if it has one (excluding the
+    /// xmm0/xmm1 scratch pair which the copysign sequence overwrites).
+    fn fp_arg_xmm_home(&self, arg: &Operand) -> Option<&'static str> {
+        if let Operand::Value(v) = arg {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    if name != "xmm0" && name != "xmm1" {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn emit_float_binop_impl(
@@ -852,6 +907,45 @@ impl X86Codegen {
                             }
                         }
                         _ => {}
+                    }
+                }
+            }
+            // General XMM-homed destination: preload the accumulator into
+            // the destination register (one movsd — or zero when the
+            // accumulator is slot-resident) and run the destructive
+            // 231-form in place. Replaces the acc->xmm0 / lhs->xmm1 /
+            // FMA / xmm0->dest scratch dance (4 insns -> <=2). Aliasing
+            // guards: both multiply sources must be readable from homes or
+            // slots DISTINCT from the destination, and the accumulator
+            // preload must not clobber a source (dest_name is excluded as
+            // either source's home below).
+            if xmm_home(acc) != Some(dest_name) {
+                if let Some(lhs_name) = xmm_home(mul_lhs).filter(|name| *name != dest_name) {
+                    let rhs_src: Option<String> = match mul_rhs {
+                        Operand::Value(v) => match xmm_home(mul_rhs) {
+                            Some(n) if n != dest_name => Some(format!("%{}", n)),
+                            Some(_) => None,
+                            None => self
+                                .state
+                                .get_slot(v.0)
+                                .map(|slot| self.slot_ref(slot.0)),
+                        },
+                        // FP constant: RIP-relative memory operand, exactly
+                        // what GCC feeds vfmadd231sd for literal multipliers.
+                        Operand::Const(IrConst::F64(c)) => {
+                            let label = self.state.get_fp_const_label(c.to_bits());
+                            Some(format!("{}(%rip)", label))
+                        }
+                        _ => None,
+                    };
+                    if let Some(rhs) = rhs_src {
+                        self.load_fp_to_reg(acc, ty, dest_name);
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, %{}, %{}",
+                            fma, rhs, lhs_name, dest_name
+                        ));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
                     }
                 }
             }

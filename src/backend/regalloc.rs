@@ -3144,6 +3144,12 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             | IntrinsicOp::SqrtF32
                             | IntrinsicOp::FabsF64
                             | IntrinsicOp::FabsF32
+                            | IntrinsicOp::FmaScalarF64
+                            | IntrinsicOp::FmaScalarF32
+                            | IntrinsicOp::RoundScalarF64(_)
+                            | IntrinsicOp::RoundScalarF32(_)
+                            | IntrinsicOp::CopysignF64
+                            | IntrinsicOp::CopysignF32
                             | IntrinsicOp::FixedDistanceF32x8
                             | IntrinsicOp::FixedDistanceF64x4
                     ) || op.produces_vector_value()
@@ -3540,7 +3546,19 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
                 }
                 Instruction::Intrinsic {
                     dest: Some(d), op, ..
-                } if matches!(op, O::SqrtF64 | O::FabsF64 | O::SqrtF32 | O::FabsF32) => {
+                } if matches!(
+                    op,
+                    O::SqrtF64
+                        | O::FabsF64
+                        | O::SqrtF32
+                        | O::FabsF32
+                        | O::FmaScalarF64
+                        | O::FmaScalarF32
+                        | O::RoundScalarF64(_)
+                        | O::RoundScalarF32(_)
+                        | O::CopysignF64
+                        | O::CopysignF32
+                ) => {
                     f64_values.insert(d.0);
                 }
                 _ => {}

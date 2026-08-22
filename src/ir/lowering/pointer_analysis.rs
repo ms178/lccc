@@ -507,6 +507,11 @@ impl Lowerer {
             }
             // Nested member access: s.inner.field — propagate from outermost base
             Expr::MemberAccess(base, _, _) => self.get_addr_space_of_struct_expr(base),
+            // p->field where p is a segment-qualified pointer: the member
+            // (including member ARRAYS, whose CType is Array not Pointer and
+            // therefore invisible to get_addr_space_of_ptr_expr) lives in
+            // the segment p points into.
+            Expr::PointerMemberAccess(base, _, _) => self.get_addr_space_of_ptr_expr(base),
             // Dereference of a __seg_gs pointer: (*p).field
             Expr::Deref(inner, _) => self.get_addr_space_of_ptr_expr(inner),
             // Cast expression: check if the cast target has an address space
