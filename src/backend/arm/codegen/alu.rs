@@ -1,7 +1,7 @@
 //! ArmCodegen: ALU operations (integer arithmetic, bitwise, unary).
 
 use super::emit::{
-    arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
+    ArmCodegen, arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
 };
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrBinOp, Operand, Value};
@@ -24,7 +24,10 @@ impl ArmCodegen {
         debug_assert!(amount < width);
 
         let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
-            if let Some(reg) = this.operand_reg(op) {
+            // FP-homed integer values must stage through the scratch GPR:
+            // callee_saved_name panics on FP register indices (the session-29
+            // ICE class). operand_to_x0 handles the fmov correctly.
+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
                 if use_32bit {
                     callee_saved_name_32(reg).to_string()
                 } else {
@@ -106,7 +109,7 @@ impl ArmCodegen {
         let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
         let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
         let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
-        if let Some(dest_phys) = self.dest_reg(dest) {
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
             let output = if use_32bit {
                 callee_saved_name_32(dest_phys)
             } else {
@@ -122,6 +125,70 @@ impl ArmCodegen {
         let output = if use_32bit { "w0" } else { "x0" };
         self.state.emit_fmt(format_args!(
             "    madd {}, {}, {}, {}",
+            output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_x0_to(dest);
+    }
+
+    /// Integer fused multiply-subtract: dest = acc - lhs*rhs (msub).
+    /// Same staging discipline as emit_int_fused_mul_add_impl; msub reads
+    /// all three sources before writing, so output aliasing is safe.
+    pub(super) fn emit_int_fused_mul_sub_impl(
+        &mut self,
+        lhs: &Operand,
+        rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+    ) {
+        let use_32bit = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
+            // FP-homed integer values stage through the scratch GPR
+            // (callee_saved_name panics on FP indices; session-29 class).
+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
+                if use_32bit {
+                    callee_saved_name_32(reg).to_string()
+                } else {
+                    callee_saved_name(reg).to_string()
+                }
+            } else {
+                if let Operand::Value(v) = op {
+                    if !this.state.is_alloca(v.0) {
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.emit_load_from_sp(scratch, slot.0, "ldr");
+                            return scratch.to_string();
+                        }
+                    }
+                }
+                this.operand_to_x0(op);
+                let acc_name = if use_32bit { "w0" } else { "x0" };
+                this.state
+                    .emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
+                scratch.to_string()
+            }
+        };
+        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
+        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
+        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+            let output = if use_32bit {
+                callee_saved_name_32(dest_phys)
+            } else {
+                callee_saved_name(dest_phys)
+            };
+            self.state.emit_fmt(format_args!(
+                "    msub {}, {}, {}, {}",
+                output, lhs_reg, rhs_reg, acc_reg
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let output = if use_32bit { "w0" } else { "x0" };
+        self.state.emit_fmt(format_args!(
+            "    msub {}, {}, {}, {}",
             output, lhs_reg, rhs_reg, acc_reg
         ));
         self.store_x0_to(dest);
