@@ -1,0 +1,189 @@
+{
+  "gcc_revision": "ad82e41f1b997dedd2cf227cb410afd8763d89c8",
+  "scope": "first 500 sorted top-level gcc.c-torture/execute C files",
+  "counts": {
+    "PASS": 457,
+    "FAIL": 43
+  },
+  "tools": {
+    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+    "assembler": "GNU assembler (GNU Binutils) 2.47.20260726",
+    "gcc": "aarch64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0",
+    "clang": null,
+    "qemu": "qemu-aarch64 version 10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)"
+  },
+  "failures": [
+    {
+      "source": "20000822-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20010209-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20010605-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20020411-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20020412-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20020413-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20020720-1.c",
+      "stage": "lccc-link"
+    },
+    {
+      "source": "20021127-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20030125-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20030216-1.c",
+      "stage": "lccc-link"
+    },
+    {
+      "source": "20030501-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20031003-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20040411-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20040423-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20040520-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20040709-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20040709-2.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20040709-3.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20041019-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20041114-1.c",
+      "stage": "lccc-link"
+    },
+    {
+      "source": "20041214-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20041218-2.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20050121-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20051215-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20060929-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20061220-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20070212-2.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20070614-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20070919-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20071210-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20071220-1.c",
+      "stage": "lccc-link"
+    },
+    {
+      "source": "20071220-2.c",
+      "stage": "lccc-link"
+    },
+    {
+      "source": "20080604-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20090219-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "20120919-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20171008-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20230630-2.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "20230630-4.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "920302-1.c",
+      "stage": "execute-vs-gcc"
+    },
+    {
+      "source": "920415-1.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "920428-2.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "920501-7.c",
+      "stage": "lccc-compile"
+    },
+    {
+      "source": "920612-2.c",
+      "stage": "lccc-compile"
+    }
+  ]
+}

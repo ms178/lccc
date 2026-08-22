@@ -760,6 +760,17 @@ fn try_complete_unroll_two_block(
     let _ = (body_entry, exit_cond_positive);
 
     let final_map: FxHashMap<u32, u32> = final_carried.iter().copied().collect();
+    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
+    for (block_index, block) in func.blocks.iter_mut().enumerate() {
+        if lp.body.contains(&block_index) {
+            continue;
+        }
+        for instruction in &mut block.instructions {
+            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
+        }
+        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
+    }
+
     func.blocks.extend(new_blocks);
 
     for (phi_id, final_id) in final_map.iter() {
@@ -780,70 +791,26 @@ fn try_complete_unroll_two_block(
 }
 
 fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
-    let rep = |op: &mut Operand| {
-        if let Operand::Value(v) = op {
-            if v.0 == old_id {
-                *op = new_op.clone();
+    inst.for_each_operand_mut(|operand| {
+        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
+            *operand = new_op.clone();
+        }
+    });
+    if let Operand::Value(replacement) = new_op {
+        inst.for_each_value_use_mut(|value| {
+            if value.0 == old_id {
+                *value = *replacement;
             }
-        }
-    };
-    match inst {
-        Instruction::BinOp { lhs, rhs, .. } => {
-            rep(lhs);
-            rep(rhs);
-        }
-        Instruction::UnaryOp { src, .. }
-        | Instruction::Cast { src, .. }
-        | Instruction::Copy { src, .. } => rep(src),
-        Instruction::Store { val, .. } => rep(val),
-        Instruction::GetElementPtr { offset, .. } => rep(offset),
-        Instruction::Cmp { lhs, rhs, .. } => {
-            rep(lhs);
-            rep(rhs);
-        }
-        Instruction::Select {
-            cond,
-            true_val,
-            false_val,
-            ..
-        } => {
-            rep(cond);
-            rep(true_val);
-            rep(false_val);
-        }
-        Instruction::Intrinsic { args, .. } => {
-            for a in args.iter_mut() {
-                rep(a);
-            }
-        }
-        _ => {}
+        });
     }
-    match inst {
-        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
-            if ptr.0 == old_id {
-                if let Operand::Value(v) = new_op {
-                    *ptr = *v;
-                }
-            }
+}
+
+fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32, new_op: &Operand) {
+    terminator.for_each_operand_mut(|operand| {
+        if matches!(operand, Operand::Value(value) if value.0 == old_id) {
+            *operand = new_op.clone();
         }
-        Instruction::GetElementPtr { base, .. } => {
-            if base.0 == old_id {
-                if let Operand::Value(v) = new_op {
-                    *base = *v;
-                }
-            }
-        }
-        Instruction::Intrinsic {
-            dest_ptr: Some(dp), ..
-        } => {
-            if dp.0 == old_id {
-                if let Operand::Value(v) = new_op {
-                    *dp = *v;
-                }
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 fn find_iv_in_loop(
@@ -1421,161 +1388,12 @@ fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
 }
 
 fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
-    match inst {
-        Instruction::PgoCounterInc { .. } => {}
-        // Definitions with no operands to replace.
-        Instruction::ParamRef { .. }
-        | Instruction::Alloca { .. }
-        | Instruction::GlobalAddr { .. }
-        | Instruction::LabelAddr { .. }
-        | Instruction::Fence { .. }
-        | Instruction::StackSave { .. }
-        | Instruction::GetReturnF64Second { .. }
-        | Instruction::GetReturnF32Second { .. }
-        | Instruction::GetReturnF128Second { .. } => {}
-
-        // Memory.
-        Instruction::Store { val, ptr, .. } => {
-            replace_op(val, map);
-            replace_val(ptr, map);
-        }
-        Instruction::Load { ptr, .. } => replace_val(ptr, map),
-        Instruction::Memcpy { dest, src, .. } => {
-            replace_val(dest, map);
-            replace_val(src, map);
-        }
-
-        // Arithmetic / logic.
-        Instruction::BinOp { lhs, rhs, .. } => {
-            replace_op(lhs, map);
-            replace_op(rhs, map);
-        }
-        Instruction::UnaryOp { src, .. } => replace_op(src, map),
-        Instruction::Cmp { lhs, rhs, .. } => {
-            replace_op(lhs, map);
-            replace_op(rhs, map);
-        }
-
-        // Pointer / address.
-        Instruction::GetElementPtr { base, offset, .. } => {
-            replace_val(base, map);
-            replace_op(offset, map);
-        }
-        Instruction::DynAlloca { size, .. } => replace_op(size, map),
-        Instruction::StackRestore { ptr } => replace_val(ptr, map),
-
-        // Conversions.
-        Instruction::Cast { src, .. } => replace_op(src, map),
-        Instruction::Copy { src, .. } => replace_op(src, map),
-
-        // Calls.
-        Instruction::Call { info, .. } => {
-            for arg in &mut info.args {
-                replace_op(arg, map);
-            }
-        }
-        Instruction::CallIndirect { func_ptr, info } => {
-            replace_op(func_ptr, map);
-            for arg in &mut info.args {
-                replace_op(arg, map);
-            }
-        }
-
-        // Phi.
-        Instruction::Phi { incoming, .. } => {
-            for (op, _) in incoming {
-                replace_op(op, map);
-            }
-        }
-
-        // Select.
-        Instruction::Select {
-            cond,
-            true_val,
-            false_val,
-            ..
-        } => {
-            replace_op(cond, map);
-            replace_op(true_val, map);
-            replace_op(false_val, map);
-        }
-
-        // Atomics.
-        Instruction::AtomicRmw { ptr, val, .. } => {
-            replace_op(ptr, map);
-            replace_op(val, map);
-        }
-        Instruction::AtomicInc { ptr, .. } => replace_op(ptr, map),
-        Instruction::AtomicCmpxchg {
-            ptr,
-            expected,
-            desired,
-            ..
-        } => {
-            replace_op(ptr, map);
-            replace_op(expected, map);
-            replace_op(desired, map);
-        }
-        Instruction::AtomicLoad { ptr, .. } => replace_op(ptr, map),
-        Instruction::AtomicStore { ptr, val, .. } => {
-            replace_op(ptr, map);
-            replace_op(val, map);
-        }
-
-        // Varargs.
-        Instruction::VaArg { va_list_ptr, .. } => replace_val(va_list_ptr, map),
-        Instruction::VaArgStruct {
-            dest_ptr,
-            va_list_ptr,
-            ..
-        } => {
-            replace_val(dest_ptr, map);
-            replace_val(va_list_ptr, map);
-        }
-        Instruction::VaStart { va_list_ptr } => replace_val(va_list_ptr, map),
-        Instruction::VaEnd { va_list_ptr } => replace_val(va_list_ptr, map),
-        Instruction::VaCopy { dest_ptr, src_ptr } => {
-            replace_val(dest_ptr, map);
-            replace_val(src_ptr, map);
-        }
-
-        // Inline assembly.
-        Instruction::InlineAsm {
-            outputs, inputs, ..
-        } => {
-            for (_, ptr, _) in outputs {
-                replace_val(ptr, map);
-            }
-            for (_, op, _) in inputs {
-                replace_op(op, map);
-            }
-        }
-
-        // Intrinsics.
-        Instruction::Intrinsic { dest_ptr, args, .. } => {
-            if let Some(ptr) = dest_ptr {
-                replace_val(ptr, map);
-            }
-            for arg in args {
-                replace_op(arg, map);
-            }
-        }
-
-        // Complex-return helpers.
-        Instruction::SetReturnF64Second { src } => replace_op(src, map),
-        Instruction::SetReturnF32Second { src } => replace_op(src, map),
-        Instruction::SetReturnF128Second { src } => replace_op(src, map),
-    }
+    inst.for_each_operand_mut(|operand| replace_op(operand, map));
+    inst.for_each_value_use_mut(|value| replace_val(value, map));
 }
 
 fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
-    match term {
-        Terminator::Return(Some(op)) => replace_op(op, map),
-        Terminator::CondBranch { cond, .. } => replace_op(cond, map),
-        Terminator::IndirectBranch { target, .. } => replace_op(target, map),
-        Terminator::Switch { val, .. } => replace_op(val, map),
-        Terminator::Return(None) | Terminator::Branch(_) | Terminator::Unreachable => {}
-    }
+    term.for_each_operand_mut(|operand| replace_op(operand, map));
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1584,7 +1402,7 @@ fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>
 mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Value};
+    use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, BasicBlock, BlockId, IrConst, Value};
 
     /// Build a simple counting loop:
     ///   preheader → header → body → latch → (back to header) / exit
@@ -1994,6 +1812,116 @@ mod tests {
 
         // Inner loop (body_work = {B2b} with 1 instruction) should be unrolled.
         assert_eq!(n, 1, "only the inner loop should be unrolled");
+    }
+
+    #[test]
+    fn substitution_covers_twenty_five_non_algebraic_use_positions() {
+        let mut instructions = vec![
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(2),
+                size: 8,
+            },
+            Instruction::AtomicCmpxchg {
+                dest: Value(100),
+                ptr: Operand::Value(Value(3)),
+                expected: Operand::Value(Value(4)),
+                desired: Operand::Value(Value(5)),
+                ty: IrType::I32,
+                success_ordering: AtomicOrdering::SeqCst,
+                failure_ordering: AtomicOrdering::SeqCst,
+                returns_bool: true,
+            },
+            Instruction::VaArgStruct {
+                dest_ptr: Value(6),
+                va_list_ptr: Value(7),
+                size: 8,
+                align: 8,
+                eightbyte_classes: vec![],
+            },
+            Instruction::VaCopy {
+                dest_ptr: Value(8),
+                src_ptr: Value(9),
+            },
+            Instruction::AtomicRmw {
+                dest: Value(101),
+                op: AtomicRmwOp::Add,
+                ptr: Operand::Value(Value(10)),
+                val: Operand::Value(Value(11)),
+                ty: IrType::I32,
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::AtomicStore {
+                ptr: Operand::Value(Value(12)),
+                val: Operand::Value(Value(13)),
+                ty: IrType::I32,
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::Phi {
+                dest: Value(102),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(14)), BlockId(1)),
+                    (Operand::Value(Value(15)), BlockId(2)),
+                ],
+            },
+            Instruction::VaArg {
+                dest: Value(103),
+                va_list_ptr: Value(16),
+                result_ty: IrType::I32,
+            },
+            Instruction::VaStart {
+                va_list_ptr: Value(17),
+            },
+            Instruction::VaEnd {
+                va_list_ptr: Value(18),
+            },
+            Instruction::SetReturnF64Second {
+                src: Operand::Value(Value(19)),
+            },
+            Instruction::SetReturnF32Second {
+                src: Operand::Value(Value(20)),
+            },
+            Instruction::SetReturnF128Second {
+                src: Operand::Value(Value(21)),
+            },
+            Instruction::AtomicInc {
+                ptr: Operand::Value(Value(22)),
+                offset: 0,
+                ty: IrType::I32,
+                ordering: AtomicOrdering::SeqCst,
+            },
+            Instruction::AtomicLoad {
+                dest: Value(104),
+                ptr: Operand::Value(Value(23)),
+                ty: IrType::I32,
+                ordering: AtomicOrdering::SeqCst,
+            },
+        ];
+        for instruction in &mut instructions {
+            for old in 1..=23 {
+                subst_value_with_operand(instruction, old, &Operand::Value(Value(old + 1000)));
+            }
+        }
+        let mut uses: Vec<u32> = instructions
+            .iter()
+            .flat_map(Instruction::used_values)
+            .collect();
+        uses.sort_unstable();
+        assert_eq!(uses, (1001..=1023).collect::<Vec<_>>());
+
+        let mut terminators = [
+            Terminator::Return(Some(Operand::Value(Value(24)))),
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(25)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ];
+        subst_value_in_terminator(&mut terminators[0], 24, &Operand::Value(Value(1024)));
+        subst_value_in_terminator(&mut terminators[1], 25, &Operand::Value(Value(1025)));
+        assert_eq!(terminators[0].used_values(), vec![1024]);
+        assert_eq!(terminators[1].used_values(), vec![1025]);
     }
 
     #[test]
