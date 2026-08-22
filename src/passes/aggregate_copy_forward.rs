@@ -454,6 +454,30 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
         copies.remove(&root);
     }
 
+    // A candidate must have at least one write that this analysis can
+    // attribute to its root. Loop pointer promotion can replace a precise GEP
+    // with a marching phi that `pointer_paths` intentionally cannot prove;
+    // treating the then apparently write-free temporary as dead deletes the
+    // memcpy while leaving the real stores in the old object (GCC torture
+    // 20001026-1). Unknown writes therefore fail closed instead of proving an
+    // empty construction.
+    copies.retain(|root, _| {
+        func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|instruction| match instruction {
+                    Instruction::Store { ptr, .. } => {
+                        paths.get(&ptr.0).is_some_and(|path| path.0 == *root)
+                    }
+                    Instruction::Memcpy { dest, .. } => {
+                        paths.get(&dest.0).is_some_and(|path| path.0 == *root)
+                    }
+                    _ => false,
+                })
+        })
+    });
+
     // Byte offset of a tracked pointer when its whole GEP path is constant.
     let const_offset = |value: u32| -> Option<i64> {
         let (_, path) = paths.get(&value)?;
@@ -971,9 +995,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         // value escapes it.
                         ptr.0 == value && !matches!(val, Operand::Value(v) if v.0 == value)
                     }
-                    Instruction::Memcpy { dest, src, .. } => {
-                        dest.0 == value || src.0 == value
-                    }
+                    Instruction::Memcpy { dest, src, .. } => dest.0 == value || src.0 == value,
                     Instruction::Copy {
                         src: Operand::Value(v),
                         ..
@@ -997,8 +1019,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     let after_copy = bi == candidate.block && ii > candidate.inst;
                     // A non-escaping alloca cannot be written by an opaque
                     // instruction; anything else must be assumed clobbered.
-                    let source_provably_private = alloca_roots
-                        .contains(&candidate.source_root)
+                    let source_provably_private = alloca_roots.contains(&candidate.source_root)
                         && !escaped_roots.contains(&candidate.source_root);
                     if after_copy && !source_provably_private {
                         invalid.insert(dest_root);
@@ -1114,6 +1135,69 @@ mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+
+    #[test]
+    fn preserves_copy_when_source_write_uses_untracked_pointer_arithmetic() {
+        let mut func = IrFunction::new("untracked_store".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func), 0);
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Memcpy { .. }))
+        );
+    }
 
     #[test]
     fn preserves_snapshot_when_copy_source_is_overwritten() {

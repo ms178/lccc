@@ -89,14 +89,19 @@ mv -f "$ART/lccc.bundle.tmp.$$" "$ART/lccc.bundle" 2>/dev/null || true
 # ---- 5. ledger --------------------------------------------------------------
 files=$(git diff --stat "$BASE" HEAD | tail -1 | sed 's/^ *//')
 if [[ ! -f "$LEDGER" ]]; then
+  echo "# LCCC Snapshot Ledger" > "$LEDGER"
+fi
+# A merged session starts from a new upstream base while retaining historical
+# artifacts. Start a fresh ledger section instead of silently appending rows
+# under the previous base's heading.
+if ! grep -Fq "Base (upstream): \`$BASE\`" "$LEDGER"; then
   {
-    echo "# LCCC Snapshot Ledger"
     echo
-    echo "Base (upstream): \`$BASE\`"
+    echo "## Base (upstream): \`$BASE\`"
     echo
     echo "| # | UTC | Tag | Description | Cumulative diffstat |"
     echo "|---|-----|-----|-------------|---------------------|"
-  } > "$LEDGER"
+  } >> "$LEDGER"
 fi
 printf '| %d | %s | `%s` | %s | %s |\n' "$seq" "$stamp" "$tag" "$desc" "${files:-none}" >> "$LEDGER"
 

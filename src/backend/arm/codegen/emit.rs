@@ -684,42 +684,59 @@ impl ArmCodegen {
         }
     }
 
-    /// Check if an IrConst is a small unsigned immediate that fits in AArch64
-    /// `cmp Xn, #imm12` instruction (0..=4095).
-    fn const_as_cmp_imm12(c: &IrConst) -> Option<u64> {
-        let v = match c {
-            IrConst::I8(v) => *v as i64,
-            IrConst::I16(v) => *v as i64,
-            IrConst::I32(v) => *v as i64,
-            IrConst::I64(v) => *v,
-            IrConst::Zero => 0,
-            _ => return None,
-        };
-        // AArch64 cmp (alias of subs) accepts unsigned 12-bit immediate (0..4095),
-        // optionally shifted left by 12. We only use the unshifted form.
-        if (0..=4095).contains(&v) {
-            Some(v as u64)
+    /// Normalize an integer constant to the exact bit pattern compared by the
+    /// AArch64 instruction. Narrow compares execute in W registers, so signed
+    /// values are sign-extended and unsigned values are zero-extended to 32
+    /// bits. This distinction is essential for `(unsigned short)-2`: its
+    /// compare value is 0x0000fffe, not the 32-bit -2 pattern 0xfffffffe.
+    fn normalized_cmp_const(c: &IrConst, ty: IrType) -> Option<u64> {
+        if !ty.is_integer() && ty != IrType::Ptr {
+            return None;
+        }
+        let bits = (ty.size() * 8) as u32;
+        if bits == 0 || bits > 64 {
+            return None;
+        }
+        let mask = if bits == 64 {
+            u128::from(u64::MAX)
         } else {
-            None
+            (1u128 << bits) - 1
+        };
+        let truncated = (c.to_i128()? as u128) & mask;
+        if ty.is_signed() {
+            let sign_bit = 1u128 << (bits - 1);
+            let signed = if truncated & sign_bit != 0 {
+                (truncated | !mask) as i128
+            } else {
+                truncated as i128
+            };
+            if bits <= 32 {
+                Some((signed as i32 as u32) as u64)
+            } else {
+                Some(signed as i64 as u64)
+            }
+        } else {
+            Some(truncated as u64)
         }
     }
 
-    /// Check if an IrConst is a small negative value that can use `cmn Xn, #imm12`
-    /// (i.e., the negated value fits in 0..=4095).
-    fn const_as_cmn_imm12(c: &IrConst) -> Option<u64> {
-        let v = match c {
-            IrConst::I8(v) => *v as i64,
-            IrConst::I16(v) => *v as i64,
-            IrConst::I32(v) => *v as i64,
-            IrConst::I64(v) => *v,
-            _ => return None,
-        };
-        let neg = v.checked_neg()?;
-        if (1..=4095).contains(&neg) {
-            Some(neg as u64)
+    /// Check for the unshifted immediate form of CMP (0..=4095).
+    fn const_as_cmp_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
+        let value = Self::normalized_cmp_const(c, ty)?;
+        (value <= 4095).then_some(value)
+    }
+
+    /// Check whether CMN with an imm12 is bit-exact at the actual machine
+    /// compare width. Testing the full-width two's-complement relation avoids
+    /// treating a narrow unsigned 0xfffe as 32-bit -2.
+    fn const_as_cmn_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
+        let value = Self::normalized_cmp_const(c, ty)?;
+        let negated = if ty.size() <= 4 {
+            (value as u32).wrapping_neg() as u64
         } else {
-            None
-        }
+            value.wrapping_neg()
+        };
+        (1..=4095).contains(&negated).then_some(negated)
     }
 
     /// Get the register name for a Value if it has a register assignment.
@@ -752,13 +769,13 @@ impl ArmCodegen {
 
                 // cmp reg, #imm12
                 if let Operand::Const(c) = rhs {
-                    if let Some(imm) = Self::const_as_cmp_imm12(c) {
+                    if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
                         self.state
                             .emit_fmt(format_args!("    cmp {}, #{}", lhs_reg, imm));
                         return;
                     }
                     // cmn reg, #imm12 (for negative constants)
-                    if let Some(imm) = Self::const_as_cmn_imm12(c) {
+                    if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
                         self.state
                             .emit_fmt(format_args!("    cmn {}, #{}", lhs_reg, imm));
                         return;
@@ -775,8 +792,16 @@ impl ArmCodegen {
                     }
                 }
 
-                // lhs in register, rhs needs loading into x0
-                self.operand_to_x0(rhs);
+                // lhs in register, rhs needs loading into x0. Constants must
+                // use comparison-type normalization rather than their storage
+                // variant's signed interpretation.
+                if let Operand::Const(c) = rhs {
+                    let value = Self::normalized_cmp_const(c, ty)
+                        .expect("integer comparison constant must normalize");
+                    self.emit_load_imm64("x0", value as i64);
+                } else {
+                    self.operand_to_x0(rhs);
+                }
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    cmp {}, w0", lhs_reg));
                 } else {
@@ -802,7 +827,7 @@ impl ArmCodegen {
 
         // Try: lhs in x0 (accumulator), rhs is immediate
         if let Operand::Const(c) = rhs {
-            if let Some(imm) = Self::const_as_cmp_imm12(c) {
+            if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
                 self.operand_to_x0(lhs);
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    cmp w0, #{}", imm));
@@ -811,7 +836,7 @@ impl ArmCodegen {
                 }
                 return;
             }
-            if let Some(imm) = Self::const_as_cmn_imm12(c) {
+            if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
                 self.operand_to_x0(lhs);
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    cmn w0, #{}", imm));
@@ -825,7 +850,13 @@ impl ArmCodegen {
         // Fallback: load both into x0/x1
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
-        self.operand_to_x0(rhs);
+        if let Operand::Const(c) = rhs {
+            let value = Self::normalized_cmp_const(c, ty)
+                .expect("integer comparison constant must normalize");
+            self.emit_load_imm64("x0", value as i64);
+        } else {
+            self.operand_to_x0(rhs);
+        }
         if use_32bit {
             self.state.emit("    cmp w1, w0");
         } else {
@@ -2981,5 +3012,50 @@ impl ArchCodegen for ArmCodegen {
 impl Default for ArmCodegen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod compare_immediate_tests {
+    use super::*;
+
+    #[test]
+    fn narrow_unsigned_constants_zero_extend_to_machine_width() {
+        assert_eq!(
+            ArmCodegen::normalized_cmp_const(&IrConst::I16(-2), IrType::U16),
+            Some(65_534)
+        );
+        assert_eq!(
+            ArmCodegen::normalized_cmp_const(&IrConst::I8(-2), IrType::U8),
+            Some(254)
+        );
+        assert_eq!(
+            ArmCodegen::const_as_cmn_imm12(&IrConst::I16(-2), IrType::U16),
+            None
+        );
+        assert_eq!(
+            ArmCodegen::const_as_cmp_imm12(&IrConst::I8(-2), IrType::U8),
+            Some(254)
+        );
+    }
+
+    #[test]
+    fn signed_and_full_width_negative_constants_use_cmn() {
+        assert_eq!(
+            ArmCodegen::normalized_cmp_const(&IrConst::I16(-2), IrType::I16),
+            Some(u32::MAX as u64 - 1)
+        );
+        assert_eq!(
+            ArmCodegen::const_as_cmn_imm12(&IrConst::I16(-2), IrType::I16),
+            Some(2)
+        );
+        assert_eq!(
+            ArmCodegen::const_as_cmn_imm12(&IrConst::I32(-2), IrType::U32),
+            Some(2)
+        );
+        assert_eq!(
+            ArmCodegen::const_as_cmn_imm12(&IrConst::I64(-2), IrType::U64),
+            Some(2)
+        );
     }
 }

@@ -43,7 +43,7 @@
 //! - The call result flows directly to a `Return` with no intervening uses
 //! - The tail call is not in the entry block (would create duplicate predecessors)
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
 };
@@ -342,6 +342,76 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     let func_name = func.name.clone();
     let num_params = func.params.len();
 
+    // Reusing one frame is not semantics-preserving when a recursive argument
+    // points into the current frame: each source-level call owns a distinct
+    // automatic object. Track stack-derived pointers through the pure pointer
+    // forms that can reach call arguments. The actual call-site check below is
+    // deliberately per argument, so ordinary scalar locals do not disable TCE.
+    let mut local_pointers = FxHashSet::default();
+    for block in &func.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Alloca { dest, .. } | Instruction::DynAlloca { dest, .. } =
+                instruction
+            {
+                local_pointers.insert(dest.0);
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for instruction in &block.instructions {
+                let derived = match instruction {
+                    Instruction::GetElementPtr { dest, base, .. }
+                        if local_pointers.contains(&base.0) =>
+                    {
+                        Some(*dest)
+                    }
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(source),
+                    }
+                    | Instruction::Cast {
+                        dest,
+                        src: Operand::Value(source),
+                        ..
+                    } if local_pointers.contains(&source.0) => Some(*dest),
+                    Instruction::Phi { dest, incoming, .. }
+                        if incoming.iter().any(|(operand, _)| {
+                            matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
+                        }) =>
+                    {
+                        Some(*dest)
+                    }
+                    Instruction::Select {
+                        dest,
+                        true_val,
+                        false_val,
+                        ..
+                    } if [true_val, false_val].iter().any(|operand| {
+                        matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
+                    }) => Some(*dest),
+                    Instruction::BinOp {
+                        dest,
+                        lhs,
+                        rhs,
+                        ty: crate::common::types::IrType::Ptr,
+                        ..
+                    } if [lhs, rhs].iter().any(|operand| {
+                        matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
+                    }) => Some(*dest),
+                    _ => None,
+                };
+                if let Some(dest) = derived {
+                    changed |= local_pointers.insert(dest.0);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     // ── 1. Collect ParamRef instructions from the entry block ──────────────
     // After mem2reg, each parameter has exactly one ParamRef in the entry block.
     // param_refs[i] = (SSA Value, IrType) for parameter i.
@@ -406,6 +476,11 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
 
         let call_dest = info.dest;
         let args: Vec<Operand> = info.args[..num_params].to_vec();
+        if args.iter().any(|argument| {
+            matches!(argument, Operand::Value(value) if local_pointers.contains(&value.0))
+        }) {
+            continue;
+        }
 
         // Verify no instruction after the call uses the call result.
         if let Some(result_val) = call_dest {
@@ -922,6 +997,46 @@ mod tests {
         let mut func = make_sum_func();
         let n = tail_calls_to_loops(&mut func);
         assert_eq!(n, 1, "should have eliminated 1 tail call");
+    }
+
+    #[test]
+    fn test_tce_rejects_pointer_into_current_stack_frame() {
+        let mut func = make_sum_func();
+        func.blocks[0].instructions.insert(
+            0,
+            Instruction::Alloca {
+                dest: Value(7),
+                ty: IrType::I32,
+                size: 4,
+                align: 4,
+                volatile: false,
+                semantic_volatile: false,
+            },
+        );
+        func.blocks[2].instructions.insert(
+            3,
+            Instruction::GetElementPtr {
+                dest: Value(8),
+                base: Value(7),
+                offset: Operand::Const(IrConst::I64(0)),
+                ty: IrType::Ptr,
+            },
+        );
+        let call = func.blocks[2]
+            .instructions
+            .iter_mut()
+            .find(|instruction| matches!(instruction, Instruction::Call { .. }))
+            .unwrap();
+        if let Instruction::Call { info, .. } = call {
+            info.args[1] = Operand::Value(Value(8));
+            info.arg_types[1] = IrType::Ptr;
+        }
+        func.next_value_id = 9;
+
+        assert_eq!(tail_calls_to_loops(&mut func), 0);
+        assert!(func.blocks[2].instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::Call { func, .. } if func == "sum")
+        ));
     }
 
     #[test]

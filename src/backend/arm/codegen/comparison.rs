@@ -1,8 +1,8 @@
 //! ArmCodegen: comparison operations.
 
 use super::emit::{
-    arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
-    is_arm_fp_phys, ArmCodegen,
+    ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
+    is_arm_fp_phys,
 };
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrCmpOp, Operand, Value};
@@ -163,8 +163,11 @@ impl ArmCodegen {
             self.state
                 .emit_fmt(format_args!("    csel {}, {}, {}, ne", d, t_name, f_name));
         } else {
-            self.state
-                .emit_fmt(format_args!("    csel x0, {}, {}, ne", t_name, f_name));
+            let accumulator = if use_32bit { "w0" } else { "x0" };
+            self.state.emit_fmt(format_args!(
+                "    csel {}, {}, {}, ne",
+                accumulator, t_name, f_name
+            ));
             self.store_x0_to(dest);
         }
         self.state.reg_cache.invalidate_acc();
@@ -206,8 +209,11 @@ impl ArmCodegen {
                 d, t_name, f_name, cc
             ));
         } else {
-            self.state
-                .emit_fmt(format_args!("    csel x0, {}, {}, {}", t_name, f_name, cc));
+            let accumulator = if use_32bit { "w0" } else { "x0" };
+            self.state.emit_fmt(format_args!(
+                "    csel {}, {}, {}, {}",
+                accumulator, t_name, f_name, cc
+            ));
             self.store_x0_to(dest);
         }
         self.state.reg_cache.invalidate_acc();

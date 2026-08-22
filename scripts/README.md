@@ -16,7 +16,8 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
 | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
 | `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
-| `codegen_oracle.py` | Batch local/Compiler-Explorer comparison with deterministic artifacts and architecture-aware x86 or AArch64 instruction/load/store/stack-traffic statistics. |
+| `codegen_oracle.py` | Batch local/Compiler-Explorer comparison with deterministic artifacts and architecture-aware x86 or AArch64 instruction/load/store/stack-traffic statistics; AArch64 defaults to GCC 16.1, GCC trunk, and Clang 22.1. |
+| `aarch64_execute_suite.py` | GCC `gcc.c-torture/execute` differential runner: LCCC assembly is validated by a mandatory GAS 2.47, linked for AArch64, and executed against GCC/optional Clang under QEMU. |
 | `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commit, squashed `ms178-1.patch`, series, tarball, bundle, ledger. |
 | `benchmark_fp_memfold_ab.py` | Builds the stencil5 scalar-FP memory-fold treatment/control and retains randomized CPU-pinned paired samples plus a bootstrap interval. Results are explicitly VM screening, not PMU evidence. |
 | `benchmark_reduction_vecreg_ab.py` | Builds register- and stack-accumulator variants of the F32 sum+dot workload and retains randomized CPU-pinned paired samples with a bootstrap interval. |
@@ -102,6 +103,14 @@ scripts/godbolt.py compare kernel.c --flags "-O3 -march=x86-64-v3" \
 # AArch64 structural comparison (ARM64 GCC 16.1 on Compiler Explorer):
 python3 scripts/codegen_oracle.py test.c --function hot_loop \
     --arch aarch64 --local target/fastbuild/lccc-arm \
-    --local-flags '-O2' --flags '-O2' --oracles carm64g1610 \
+    --local-flags '-O2' --flags '-O2' \
     --artifact-dir /tmp/aarch64-oracle
+
+# Differential execution of GCC's C torture suite. The harness rejects every
+# assembler whose --version is not 2.47.
+python3 scripts/aarch64_execute_suite.py \
+    /path/to/gcc/gcc/testsuite/gcc.c-torture/execute \
+    --lccc target/fastbuild/lccc-arm \
+    --assembler /path/to/binutils-2.47/aarch64-linux-gnu-as \
+    --jobs 2 --flags=-O2 --json /tmp/aarch64-torture.json
 ```
