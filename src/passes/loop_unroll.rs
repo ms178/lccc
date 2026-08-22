@@ -583,11 +583,23 @@ fn try_complete_unroll_two_block(
         }
         _ => return false,
     };
-    // Powers of two only: residual vectorization remainders (trip 3/5/6/7)
-    // interact badly with the F32 map path. 2/4/8 are the common complete-
-    // unroll targets (struct_copy trip-4, CRC-safe via bit-iteration guard).
-    if !(2..=8).contains(&trip) {
+    // Trip bound 16 with a 512-expanded-instruction budget (levkropp
+    // 1b4bac8b's full-unroll limits, grafted onto our two-block complete
+    // unroller): trips 9..16 are profitable for the same struct-return
+    // temp-forwarding reasons as 4/8 once the expansion stays cache-tight.
+    // The pow2 restriction below still applies to trips with F32-only
+    // bodies (residual map-vectorizer interaction).
+    if !(2..=16).contains(&trip) {
         return false;
+    }
+    {
+        let body_insts: usize = work_blocks
+            .iter()
+            .map(|&wbi| func.blocks[wbi].instructions.len())
+            .sum();
+        if body_insts.saturating_mul(trip as usize) > 512 {
+            return false;
+        }
     }
     // Reject F32-only residual map loops (vectorizer remainder expects a loop).
     // F64 (nbody) and integer (struct_copy) non-pow2 trips are allowed.

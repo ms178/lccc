@@ -1975,6 +1975,78 @@ fn detect_mul_add_fusions(
     fusion_map
 }
 
+/// Gap-fused multiply-add candidates (levkropp 2e57bcf2, audited port):
+/// `fmul` at idx, one or two Load/GEP instructions between (nbody's j-side
+/// address computation and velocity load), then `fadd` consuming the mul
+/// result. The fmadd is emitted AT the Add so the gap instructions execute
+/// first, in order. Returns (mul_idx, add_idx); the driver recomputes the
+/// gap indices and validates register aliasing before committing (the multiply operands are
+/// read LATER than liveness recorded, so no gap destination register may
+/// alias them). Windows are disjoint from detect_mul_add_fusions by
+/// construction: that scan breaks at Load/GEP, this one breaks at Copy/Cast,
+/// so an Add is claimed by at most one detector. CCC_NO_GAP_FMA disables.
+fn detect_gap_fma_fusions(
+    block: &BasicBlock,
+    use_counts: &[u32],
+    fuse_float: bool,
+    accumulator_dests: &FxHashSet<u32>,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if !fuse_float || env_flag_set("CCC_NO_GAP_FMA") {
+        return out;
+    }
+    for (idx, inst) in block.instructions.iter().enumerate() {
+        let (mul_dest, mul_ty) = match inst {
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Mul,
+                ty,
+                ..
+            } => (dest, ty),
+            _ => continue,
+        };
+        if !mul_ty.is_float() || matches!(mul_ty, IrType::F128) {
+            continue;
+        }
+        // Exactly one (global) use: the Add. Skipping the standalone Mul
+        // emission is then safe -- nothing else ever reads mul_dest.
+        if use_counts.get(mul_dest.0 as usize).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let mut gap_len = 0usize;
+        let mut found = None;
+        for j in (idx + 1)..block.instructions.len() {
+            match &block.instructions[j] {
+                Instruction::Load { .. } | Instruction::GetElementPtr { .. } if gap_len < 2 => {
+                    gap_len += 1;
+                }
+                Instruction::BinOp {
+                    dest: add_dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty: add_ty,
+                } if gap_len > 0 => {
+                    let mul_used = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
+                        || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    // Accumulator gate mirrors the fmsub/fmadd policy: fusing
+                    // into a loop-carried accumulator lengthens the serial
+                    // dependency chain.
+                    if mul_used && add_ty == mul_ty && !accumulator_dests.contains(&add_dest.0) {
+                        found = Some(j);
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if let Some(add_idx) = found {
+            out.push((idx, add_idx));
+        }
+    }
+    out
+}
+
 /// Adjacent `shift-imm; logical` that AArch64 encodes as one instruction.
 fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
     let mut logical_indices = FxHashSet::default();
@@ -2909,6 +2981,64 @@ fn generate_function(
                 None
             },
         );
+        // Gap-fused fmadd (levkropp 2e57bcf2, audited port): Mul, [Load/GEP
+        // x1-2], Add. The fmadd is emitted at the Add, so the multiply
+        // operands are read LATER than their IR liveness recorded. Two alias
+        // hazards must be rejected, not one: (a) a gap destination's PHYSICAL
+        // register aliasing a mul operand's register (levkropp's check), and
+        // (b) a gap destination's STACK SLOT aliasing a slot-homed mul
+        // operand -- Tier-2 slot coloring can legally pack a value born in
+        // the gap into the slot of a value whose IR liveness ended at the
+        // Mul (his check missed this class entirely).
+        let mut gap_mul_skips: FxHashSet<usize> = FxHashSet::default();
+        let mut gap_add_fusions: FxHashMap<usize, usize> = FxHashMap::default();
+        for &(mul_idx, add_idx) in &detect_gap_fma_fusions(
+            block,
+            &value_use_counts,
+            cg.supports_fused_float_mul_add(),
+            &accumulator_dests,
+        ) {
+            let Instruction::BinOp {
+                lhs: mul_lhs,
+                rhs: mul_rhs,
+                ..
+            } = &block.instructions[mul_idx]
+            else {
+                continue;
+            };
+            let mut clash = false;
+            for g in (mul_idx + 1)..add_idx {
+                let gap_dest = match &block.instructions[g] {
+                    Instruction::Load { dest, .. } => Some(*dest),
+                    Instruction::GetElementPtr { dest, .. } => Some(*dest),
+                    _ => None,
+                };
+                let Some(gd) = gap_dest else { continue };
+                let gap_phys = cg.get_phys_reg_for_value(gd.0);
+                let gap_slot = cg.state_ref().get_slot(gd.0);
+                for op in [mul_lhs, mul_rhs] {
+                    if let Operand::Value(v) = op {
+                        let op_phys = cg.get_phys_reg_for_value(v.0);
+                        if gap_phys.is_some() && op_phys == gap_phys {
+                            clash = true;
+                        }
+                        // Slot aliasing only matters when the operand will be
+                        // RELOADED from its slot at the Add (no register home).
+                        if op_phys.is_none() {
+                            if let (Some(gs), Some(os)) = (gap_slot, cg.state_ref().get_slot(v.0)) {
+                                if gs.0 == os.0 {
+                                    clash = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !clash {
+                gap_mul_skips.insert(mul_idx);
+                gap_add_fusions.insert(add_idx, mul_idx);
+            }
+        }
         let cmp_select_fusions =
             if cg.supports_fused_cmp_select() && !env_flag_set("CCC_NO_FUSED_CSEL") {
                 detect_cmp_select_fusion(block, &value_use_counts)
@@ -2982,6 +3112,37 @@ fn generate_function(
             if fused_add_skip.contains(&idx) {
                 cg.state().current_program_point += 1;
                 continue;
+            }
+            // Gap-fused fmadd: the Mul is computed by the fmadd emitted at
+            // the Add (below), after the gap Load/GEP ran in program order.
+            if gap_mul_skips.contains(&idx) {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if let Some(&mul_idx) = gap_add_fusions.get(&idx) {
+                if let (
+                    Instruction::BinOp {
+                        dest: mul_dest,
+                        lhs: mul_lhs,
+                        rhs: mul_rhs,
+                        ty: mul_ty,
+                        ..
+                    },
+                    Instruction::BinOp {
+                        dest: add_dest,
+                        lhs: add_lhs,
+                        rhs: add_rhs,
+                        ..
+                    },
+                ) = (&block.instructions[mul_idx], inst)
+                {
+                    let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                    cg.flush_machinst();
+                    cg.emit_fused_mul_add(mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
             }
             if skip_fused_logical {
                 skip_fused_logical = false;
