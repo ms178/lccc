@@ -11,7 +11,7 @@
 //! - Frame/return address intrinsics
 //! - SSE scalar float math (sqrt, fabs) for F32/F64
 
-use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_256, X86Codegen};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_256};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
@@ -1380,8 +1380,6 @@ impl X86Codegen {
             | IntrinsicOp::Pshufb128
             | IntrinsicOp::Pmaxub128
             | IntrinsicOp::Pminub128
-            | IntrinsicOp::Pmovzxbw128
-            | IntrinsicOp::Pmovzxwd128
             | IntrinsicOp::Packssdw128
             | IntrinsicOp::Packsswb128
             | IntrinsicOp::Packuswb128
@@ -1411,8 +1409,6 @@ impl X86Codegen {
                         IntrinsicOp::Pshufb128 => "pshufb",
                         IntrinsicOp::Pmaxub128 => "pmaxub",
                         IntrinsicOp::Pminub128 => "pminub",
-                        IntrinsicOp::Pmovzxbw128 => "pmovzxbw",
-                        IntrinsicOp::Pmovzxwd128 => "pmovzxwd",
                         IntrinsicOp::Packssdw128 => "packssdw",
                         IntrinsicOp::Packsswb128 => "packsswb",
                         IntrinsicOp::Packuswb128 => "packuswb",
@@ -1425,6 +1421,24 @@ impl X86Codegen {
                     self.emit_sse_binary_128(dptr, args, inst);
                 }
             }
+            // SSE4.1 widening conversions are unary.  They were historically
+            // routed through emit_sse_binary_128, which asserted args.len() >= 2
+            // and turned valid _mm_cvtepu8_epi16/_mm_cvtepu16_epi32 programs
+            // into a compiler panic.
+            IntrinsicOp::Pmovzxbw128 | IntrinsicOp::Pmovzxwd128 => {
+                if let Some(dptr) = dest_ptr {
+                    let inst = if matches!(op, IntrinsicOp::Pmovzxbw128) {
+                        "pmovzxbw"
+                    } else {
+                        "pmovzxwd"
+                    };
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+                    self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+
             // SSSE3 horizontal add and alignr (imm arg in args[2] for alignr)
             IntrinsicOp::Phaddw128 | IntrinsicOp::Phaddd128 | IntrinsicOp::Palignr128 => {
                 if let Some(dptr) = dest_ptr {

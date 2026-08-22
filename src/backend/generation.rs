@@ -1524,7 +1524,7 @@ fn detect_cmp_branch_fusion(
         scan -= 1;
         match &block.instructions[scan] {
             Instruction::Cmp { dest, .. } if dest.0 == wanted => {
-                break (scan, FusedBranchKind::Cmp)
+                break (scan, FusedBranchKind::Cmp);
             }
             Instruction::BinOp {
                 dest,
@@ -2864,32 +2864,13 @@ fn generate_function(
                     *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
                 }
             });
-            match inst {
-                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
-                    *cg.state().block_use_counts.entry(ptr.0).or_insert(0) += 1;
-                }
-                Instruction::GetElementPtr { base, .. } => {
-                    *cg.state().block_use_counts.entry(base.0).or_insert(0) += 1;
-                }
-                Instruction::Memcpy { dest, src, .. } => {
-                    *cg.state().block_use_counts.entry(dest.0).or_insert(0) += 1;
-                    *cg.state().block_use_counts.entry(src.0).or_insert(0) += 1;
-                }
-                Instruction::AtomicLoad { ptr, .. }
-                | Instruction::AtomicStore { ptr, .. }
-                | Instruction::AtomicRmw { ptr, .. }
-                | Instruction::AtomicCmpxchg { ptr, .. } => {
-                    if let Operand::Value(v) = ptr {
-                        *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
-                    }
-                }
-                Instruction::AtomicInc { ptr, .. } => {
-                    if let Operand::Value(v) = ptr {
-                        *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
-                    }
-                }
-                _ => {}
-            }
+            // Mirror count_value_uses exactly.  The former hand-written
+            // match omitted Intrinsic::dest_ptr (so every local vecreg looked
+            // live-out and was needlessly spilled) and double-counted atomic
+            // pointer operands (which could hide a genuine later-block use).
+            for_each_value_use_in_instruction(inst, |v| {
+                *cg.state().block_use_counts.entry(v.0).or_insert(0) += 1;
+            });
         }
 
         for (idx, inst) in block.instructions.iter().enumerate() {
