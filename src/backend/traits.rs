@@ -1892,6 +1892,46 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether the backend can combine
+    /// `select(cmp, base + 1, base)` (or swapped arms) into one conditional
+    /// increment after the comparison.
+    fn supports_conditional_increment_select(&self) -> bool {
+        false
+    }
+
+    /// Emit the SSA-proven conditional-increment select. Called only when the
+    /// Add result has one use and the opposite Select arm is exactly its base.
+    fn emit_conditional_increment_select(
+        &mut self,
+        _dest: &Value,
+        _cond: &Operand,
+        _base: &Operand,
+        _increment_on_true: bool,
+        _ty: IrType,
+    ) {
+        unreachable!(
+            "backend advertised conditional-increment select without implementing the hook"
+        );
+    }
+
+    /// As above, but consume an adjacent integer comparison directly instead
+    /// of materializing its boolean result.
+    fn emit_fused_cmp_conditional_increment_select(
+        &mut self,
+        _op: IrCmpOp,
+        _lhs: &Operand,
+        _rhs: &Operand,
+        _cmp_ty: IrType,
+        _base: &Operand,
+        _increment_on_true: bool,
+        _dest: &Value,
+        _sel_ty: IrType,
+    ) {
+        unreachable!(
+            "backend advertised conditional-increment select without implementing the fused hook"
+        );
+    }
+
     /// Emit a fused compare-and-select: `dest = (lhs <op> rhs) ? tv : fv`
     /// without materializing the comparison's boolean value. Only called for
     /// integer comparisons whose Cmp result is used solely by this select
