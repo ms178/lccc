@@ -269,6 +269,30 @@ pub trait ArchCodegen {
     /// Emit a load with a segment override prefix (e.g., %gs: or %fs:).
     /// Used for GCC named address space extensions (__seg_gs, __seg_fs) on x86.
     /// Default: panics (only x86 supports segment overrides).
+    /// Segment-relative access at a LINK-TIME-CONSTANT offset
+    /// (`movq %fs:16, %rax` — glibc THREAD_SELF/THREAD_GETMEM/SETMEM,
+    /// errno, stack guard). Returns false when the backend has no direct
+    /// form; the caller falls back to the register-indirect pair. One
+    /// instruction instead of const-materialize + reg bounce + indirect
+    /// access — the difference is 3.1x on the TLS benchmark kernel.
+    fn emit_seg_load_const_addr(
+        &mut self,
+        _dest: &Value,
+        _addr: i64,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+    fn emit_seg_store_const_addr(
+        &mut self,
+        _val: &Operand,
+        _addr: i64,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
     fn emit_seg_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType, _seg: AddressSpace) {
         panic!("segment override loads only supported on x86");
     }

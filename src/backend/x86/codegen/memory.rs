@@ -2573,6 +2573,107 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
+    /// Direct segment-relative access at constant offset: the GCC/Clang
+    /// form for every glibc TLS macro. `movq %fs:16, %rax` (2 uops, no
+    /// address materialization) replaces movq $16,%r; movq %r,%rcx;
+    /// movq %fs:(%rcx),... The offset is printed signed decimal exactly
+    /// like GAS 2.47 disassembles it.
+    /// Direct segment-relative access at constant offset: the GCC/Clang
+    /// form for every glibc TLS macro. `movq %fs:16, %rax` (no address
+    /// materialization) replaces movq $16,%r; movq %r,%rcx;
+    /// movq %fs:(%rcx),... The offset prints signed decimal, exactly the
+    /// operand GAS 2.47 accepts and objdump prints.
+    pub(super) fn emit_seg_load_const_addr_impl(
+        &mut self,
+        dest: &Value,
+        addr: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
+        {
+            return false;
+        }
+        // 64-bit loads straight into a GPR home skip the rax round-trip.
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    self.state.emit_fmt(format_args!(
+                        "    movq {}{}, %{}",
+                        seg_prefix, addr, phys_reg_name(reg)
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let dest_reg = Self::load_dest_reg(ty);
+        self.state.emit_fmt(format_args!(
+            "    {} {}{}, {}",
+            load_instr, seg_prefix, addr, dest_reg
+        ));
+        self.store_rax_to(dest);
+        true
+    }
+
+    pub(super) fn emit_seg_store_const_addr_impl(
+        &mut self,
+        val: &Operand,
+        addr: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
+        {
+            return false;
+        }
+        let store_instr = Self::mov_store_for_type(ty);
+        // Immediate store: mov $imm, %fs:OFF — zero register pressure.
+        if let Operand::Const(c) = val {
+            let is_32 = !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+            if let Some(imm) = Self::const_as_imm32_typed(&Operand::Const(c.clone()), is_32) {
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, {}{}",
+                    store_instr, imm, seg_prefix, addr
+                ));
+                return true;
+            }
+        }
+        // Register-homed value: store straight from its home.
+        if let Operand::Value(v) = val {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if !is_xmm_reg(reg) {
+                    let rname = Self::reg_for_type(phys_reg_name(reg), ty);
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, {}{}",
+                        store_instr, rname, seg_prefix, addr
+                    ));
+                    return true;
+                }
+            }
+        }
+        self.operand_to_rax(val);
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}{}",
+            store_instr, Self::reg_for_type("rax", ty), seg_prefix, addr
+        ));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
     pub(super) fn emit_seg_store_impl(
         &mut self,
         val: &Operand,
