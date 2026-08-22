@@ -387,7 +387,39 @@ struct ReductionPattern {
     exit_cmp_dest: Value,
     /// All block indices in the loop body
     loop_blocks: FxHashSet<usize>,
+    /// Optional second, fully independent accumulator in the same loop body
+    /// (multi-reduction: `a += x[i]*y[i]; b += x[i]*z[i]`).  Same kind,
+    /// element type, accumulator type and body block as the primary; the two
+    /// chains share only loads and the induction variable, never state.
+    second: Option<SecondaryAccumulator>,
 }
+
+/// A second, independent reduction accumulator sharing the primary's loop.
+///
+/// The two accumulators are required to be *independent*: each add must read
+/// only its own phi and pure loads (a load may be shared with the other
+/// accumulator; a phi or any accumulator-derived value may not).  A dependent
+/// chain like Adler-32's `sum2 += sum1` is deliberately rejected — it needs a
+/// sequential prefix-sum transform, not an independent multi-reduction.
+#[derive(Debug)]
+struct SecondaryAccumulator {
+    /// Scalar accumulator phi in the header (distinct from the primary's).
+    accumulator_phi: Value,
+    /// Destination of the add that updates this accumulator.
+    add_result: Value,
+    /// Index of that add in the (shared) body block.
+    accumulator_add_idx: usize,
+    /// GEP for first array (arr for sum, a for dot product).
+    array_a_gep: Value,
+    /// GEP for second array (only for dot product).
+    array_b_gep: Option<Value>,
+    /// Cast/copy closure of this accumulator, for soundness checks.
+    accumulator_derived: FxHashSet<Value>,
+    /// Load destinations feeding this accumulator's add (1 for Sum, 2 for
+    /// DotProduct), for the union soundness check.
+    loads: Vec<Value>,
+}
+
 
 /// Analyze a loop to detect the vectorizable matmul pattern.
 fn analyze_loop_pattern(
@@ -901,15 +933,17 @@ fn reduction_pattern_is_sound(
     loop_blocks: &FxHashSet<usize>,
     header_idx: usize,
     body_idx: usize,
-    accumulator_add_idx: usize,
-    add_result: Value,
-    accumulator_phi: Value,
+    adds: &[(usize, Value)],
+    accumulator_phis: &[Value],
     accumulator_derived: &FxHashSet<Value>,
     allowed_loads: &[Value],
 ) -> bool {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let is_add = |block_idx: usize, inst_idx: usize, dest: Value| {
-        block_idx == body_idx && inst_idx == accumulator_add_idx && dest == add_result
+        block_idx == body_idx
+            && adds
+                .iter()
+                .any(|&(add_idx, add_result)| add_idx == inst_idx && add_result == dest)
     };
 
     // (4) terminators: only the header may branch (its exit condition);
@@ -936,9 +970,12 @@ fn reduction_pattern_is_sound(
                     // The header's own IV phi (and any other non-accumulator
                     // phi) is fine; only phis writing an accumulator-derived
                     // value are forbidden (the vector transform rewires the
-                    // accumulator phi to a vector value).
+                    // accumulator phi to a vector value).  With multiple
+                    // accumulators, each accumulator's own header phi is
+                    // allowed; any other accumulator-derived phi is not.
                     if accumulator_derived.contains(dest)
-                        && (block_idx != header_idx || *dest != accumulator_phi)
+                        && (block_idx != header_idx
+                            || !accumulator_phis.iter().any(|phi| *phi == *dest))
                     {
                         if debug {
                             eprintln!(
@@ -1025,12 +1062,16 @@ fn reduction_pattern_is_sound(
         }
     }
 
-    // (2) no instruction other than the identified Add and copy/cast/phi
+    // (2) no instruction other than the identified Adds and copy/cast/phi
     //     relays may READ an accumulator-derived value.
     for &block_idx in loop_blocks {
         let block = &func.blocks[block_idx];
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            if is_add(block_idx, inst_idx, add_result)
+            let is_any_add = block_idx == body_idx
+                && adds
+                    .iter()
+                    .any(|&(add_idx, _)| add_idx == inst_idx);
+            if is_any_add
                 || matches!(
                     inst,
                     Instruction::Copy { .. }
@@ -1322,34 +1363,39 @@ fn analyze_reduction_pattern(
     }
     let accumulator_phi = accumulator_phi?;
 
-    // Reject loops with multiple reduction phis (e.g., `vBv += ... ; vv += ...`).
-    // The vectorizer only handles one reduction; transforming the loop structure
-    // (splitting into vector + remainder) corrupts any additional reductions.
-    let other_zero_phis = header
+    // Collect any additional zero-init phis in the header.  Zero or one extra
+    // phi is acceptable: a single extra phi may be a second, independent
+    // reduction (analyzed after the primary); two or more exceed what the
+    // transform supports and are rejected as before.  A dependent reduction
+    // (`sum2 += sum1`) is also rejected, by the independence check, because
+    // the vector transform cannot split it into two standalone accumulators.
+    let other_zero_phis: Vec<Value> = header
         .instructions
         .iter()
-        .filter(|inst| {
+        .filter_map(|inst| {
             if let Instruction::Phi { dest, incoming, .. } = inst {
                 if *dest != iv && *dest != accumulator_phi && incoming.len() == 2 {
-                    return incoming.iter().any(|(val, _)| {
+                    let zero_init = incoming.iter().any(|(val, _)| {
                         if let Operand::Const(c) = val {
                             c.to_i64() == Some(0) || c.to_f64().map(|f| f == 0.0).unwrap_or(false)
                         } else {
                             false
                         }
                     });
+                    return zero_init.then_some(*dest);
                 }
             }
-            false
+            None
         })
-        .count();
-    if other_zero_phis > 0 {
+        .collect();
+    if other_zero_phis.len() > 1 {
         if debug {
             eprintln!(
-                "[VEC-RED]   Rejecting: {} other zero-init phis in header (multi-reduction)",
-                other_zero_phis
+                "[VEC-RED]   Rejecting: {} extra zero-init phis in header (>1 unsupported)",
+                other_zero_phis.len()
             );
         }
+        set_reject("more than two reduction accumulators");
         return None;
     }
 
@@ -1506,7 +1552,8 @@ fn analyze_reduction_pattern(
         );
     }
 
-    match added_inst {
+    let mut primary_loads: Vec<Value> = Vec::new();
+    let mut pattern = match added_inst {
         // Simple sum pattern: sum += arr[i]
         Instruction::Load { ptr, .. } => {
             let array_gep = *ptr;
@@ -1526,28 +1573,9 @@ fn analyze_reduction_pattern(
                 );
             }
 
-            if !reduction_pattern_is_sound(
-                func,
-                cfg,
-                &loop_info.body,
-                header_idx,
-                body_idx,
-                accumulator_add_idx,
-                add_result,
-                accumulator_phi,
-                &accumulator_derived,
-                &[added_value],
-            ) {
-                if debug {
-                    eprintln!("[VEC-RED]   Rejecting unsound reduction (Sum)");
-                }
-                set_reject(
-                    "reduction rejected: side effects / control flow / foreign memory in loop",
-                );
-                return None;
-            }
+            primary_loads = vec![added_value];
 
-            Some(ReductionPattern {
+            ReductionPattern {
                 kind: ReductionKind::Sum,
                 element_type,
                 accumulator_type: element_type,
@@ -1565,7 +1593,8 @@ fn analyze_reduction_pattern(
                 exit_cmp_inst_idx,
                 exit_cmp_dest,
                 loop_blocks: loop_info.body.clone(),
-            })
+                second: None,
+            }
         }
 
         // Handle cast followed by load (e.g., long sum += (long)arr[i] where arr is int[])
@@ -1644,28 +1673,9 @@ fn analyze_reduction_pattern(
                     return None;
                 }
 
-                if !reduction_pattern_is_sound(
-                    func,
-                    cfg,
-                    &loop_info.body,
-                    header_idx,
-                    body_idx,
-                    accumulator_add_idx,
-                    add_result,
-                    accumulator_phi,
-                    &accumulator_derived,
-                    &[cast_src_val],
-                ) {
-                    if debug {
-                        eprintln!("[VEC-RED]   Rejecting unsound reduction (Cast-Sum)");
-                    }
-                    set_reject(
-                        "reduction rejected: side effects / control flow / foreign memory in loop",
-                    );
-                    return None;
-                }
+                primary_loads = vec![cast_src_val];
 
-                Some(ReductionPattern {
+                ReductionPattern {
                     kind: ReductionKind::Sum,
                     element_type: *from_ty, // Use the actual array element type
                     accumulator_type: element_type,
@@ -1683,12 +1693,13 @@ fn analyze_reduction_pattern(
                     exit_cmp_inst_idx,
                     exit_cmp_dest,
                     loop_blocks: loop_info.body.clone(),
-                })
+                    second: None,
+                }
             } else {
                 if debug {
                     eprintln!("[VEC-RED]   Cast source is not a load: {:?}", cast_src_inst);
                 }
-                None
+                return None;
             }
         }
 
@@ -1782,28 +1793,9 @@ fn analyze_reduction_pattern(
                 );
             }
 
-            if !reduction_pattern_is_sound(
-                func,
-                cfg,
-                &loop_info.body,
-                header_idx,
-                body_idx,
-                accumulator_add_idx,
-                add_result,
-                accumulator_phi,
-                &accumulator_derived,
-                &[mul_lhs_val, mul_rhs_val],
-            ) {
-                if debug {
-                    eprintln!("[VEC-RED]   Rejecting unsound reduction (DotProduct)");
-                }
-                set_reject(
-                    "reduction rejected: side effects / control flow / foreign memory in loop",
-                );
-                return None;
-            }
+            primary_loads = vec![mul_lhs_val, mul_rhs_val];
 
-            Some(ReductionPattern {
+            ReductionPattern {
                 kind: ReductionKind::DotProduct,
                 element_type,
                 accumulator_type,
@@ -1821,7 +1813,8 @@ fn analyze_reduction_pattern(
                 exit_cmp_inst_idx,
                 exit_cmp_dest,
                 loop_blocks: loop_info.body.clone(),
-            })
+                second: None,
+            }
         }
 
         _ => {
@@ -1829,9 +1822,593 @@ fn analyze_reduction_pattern(
                 eprintln!("[VEC-RED]   Unsupported accumulator update pattern");
             }
             set_reject("accumulator update is not sum += x[i] or sum += x[i]*y[i]");
-            None
+            return None;
+        }
+    };
+
+    // Multi-reduction: analyze the single extra zero-init phi (if any) as a
+    // second, fully independent accumulator.  It must match the primary's
+    // kind/type/body block, or the whole loop stays scalar (same as the
+    // historical single-reduction behavior).
+    if let Some(&secondary_phi) = other_zero_phis.first() {
+        pattern.second = Some(analyze_secondary_accumulator(
+            func,
+            loop_info,
+            cfg,
+            &pattern,
+            &accumulator_derived,
+            secondary_phi,
+        )?);
+        if debug {
+            eprintln!(
+                "[VEC-RED]   Multi-reduction: second accumulator phi {} (add @{} in body {})",
+                pattern.second.as_ref().unwrap().accumulator_phi.0,
+                pattern.second.as_ref().unwrap().accumulator_add_idx,
+                body_idx,
+            );
         }
     }
+
+    // One soundness check over the union of accumulators.  With a single
+    // accumulator this is exactly the historical per-kind check (same add,
+    // phi, derived set and loads); with two it additionally permits the
+    // second accumulator's loads and add.
+    {
+        let mut adds = vec![(pattern.accumulator_add_idx, add_result)];
+        let mut phis = vec![pattern.accumulator_phi];
+        let mut derived = accumulator_derived.clone();
+        let mut loads = primary_loads.clone();
+        if let Some(sec) = &pattern.second {
+            adds.push((sec.accumulator_add_idx, sec.add_result));
+            phis.push(sec.accumulator_phi);
+            derived.extend(sec.accumulator_derived.iter().copied());
+            loads.extend(sec.loads.iter().copied());
+        }
+        if !reduction_pattern_is_sound(
+            func,
+            cfg,
+            &loop_info.body,
+            header_idx,
+            body_idx,
+            &adds,
+            &phis,
+            &derived,
+            &loads,
+        ) {
+            if debug {
+                eprintln!("[VEC-RED]   Rejecting unsound reduction");
+            }
+            set_reject(
+                "reduction rejected: side effects / control flow / foreign memory in loop",
+            );
+            return None;
+        }
+    }
+
+    Some(pattern)
+}
+
+/// Analyze a second, independent reduction accumulator sharing the primary's
+/// loop.  Returns None (fail-closed) unless the accumulator is a standalone
+/// `sum += x[i]` / `sum += x[i] * y[i]` chain of the same kind and type in the
+/// same body block, whose add reads neither the primary accumulator chain nor
+/// any state the primary writes, and the union of both chains is sound.
+///
+/// Independence is the key constraint: the two accumulators may share loads
+/// (`b += v[i]*w[i]` reuses the `v[i]` load of `a += u[i]*v[i]` — a load is
+/// pure), but must not share any accumulator-derived SSA value.  A dependent
+/// chain like Adler-32's `sum2 += sum1` is rejected here and stays scalar.
+fn analyze_secondary_accumulator(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+    primary: &ReductionPattern,
+    primary_derived: &FxHashSet<Value>,
+    secondary_phi: Value,
+) -> Option<SecondaryAccumulator> {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+
+    // Widening multi-reductions are not supported: they would need two
+    // widening load+add chains and the x86 paths have no such form.  The
+    // historical behavior (reject the whole loop) is preserved.
+    if primary.element_type != primary.accumulator_type {
+        if debug {
+            eprintln!(
+                "[VEC-RED]   Rejecting multi-reduction: widening accumulator not supported"
+            );
+        }
+        set_reject("multi-reduction widening accumulator not supported");
+        return None;
+    }
+
+    // Cast/copy closure of the secondary accumulator (mirrors the primary).
+    let mut acc_derived: FxHashSet<Value> = FxHashSet::default();
+    acc_derived.insert(secondary_phi);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block_idx in &loop_info.body {
+            for inst in &func.blocks[block_idx].instructions {
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst
+                {
+                    if let Operand::Value(src_val) = src {
+                        if acc_derived.contains(src_val) && !acc_derived.contains(dest) {
+                            acc_derived.insert(*dest);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Independence: the two chains must not share any accumulator-derived
+    // value.  A dependent reduction (`sum2 += sum1`) shares the primary phi
+    // and is rejected here, keeping the loop scalar.
+    if acc_derived.iter().any(|v| primary_derived.contains(v)) {
+        if debug {
+            eprintln!(
+                "[VEC-RED]   Rejecting multi-reduction: dependent accumulator (sum2 += sum1)"
+            );
+        }
+        set_reject("dependent reduction accumulator");
+        return None;
+    }
+
+    let body = &func.blocks[primary.body_idx];
+
+    // Locate the add that updates the secondary accumulator in the same body.
+    let mut acc_add_idx = None;
+    let mut add_result = None;
+    for (idx, inst) in body.instructions.iter().enumerate() {
+        if let Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } = inst
+        {
+            let lhs_is = matches!(lhs, Operand::Value(v) if acc_derived.contains(v));
+            let rhs_is = matches!(rhs, Operand::Value(v) if acc_derived.contains(v));
+            if !lhs_is && !rhs_is {
+                continue;
+            }
+            if *ty != primary.accumulator_type {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Rejecting multi-reduction: second accumulator type {:?} != {:?}",
+                        ty, primary.accumulator_type
+                    );
+                }
+                set_reject("second accumulator type mismatch");
+                return None;
+            }
+            acc_add_idx = Some(idx);
+            add_result = Some(*dest);
+            break;
+        }
+    }
+    let (acc_add_idx, add_result) = (acc_add_idx?, add_result?);
+
+    // The non-accumulator operand is the added value; it must not be the
+    // primary accumulator chain (another dependent-reduction check).
+    let add_inst = &body.instructions[acc_add_idx];
+    let (lhs_val, rhs_val) = match add_inst {
+        Instruction::BinOp { lhs, rhs, .. } => (
+            match lhs {
+                Operand::Value(v) => Some(*v),
+                _ => None,
+            },
+            match rhs {
+                Operand::Value(v) => Some(*v),
+                _ => None,
+            },
+        ),
+        _ => return None,
+    };
+    let added_value = if lhs_val.is_some_and(|v| acc_derived.contains(&v)) {
+        rhs_val?
+    } else if rhs_val.is_some_and(|v| acc_derived.contains(&v)) {
+        lhs_val?
+    } else {
+        return None;
+    };
+    if primary_derived.contains(&added_value) {
+        set_reject("dependent reduction accumulator");
+        return None;
+    }
+    let added_inst = find_inst_by_dest(body, added_value)?;
+
+    // IV-derived closure (recomputed; same shape as the primary analyzer).
+    let mut iv_derived: FxHashSet<Value> = FxHashSet::default();
+    iv_derived.insert(primary.iv);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block_idx in &loop_info.body {
+            for inst in &func.blocks[block_idx].instructions {
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst
+                {
+                    if let Operand::Value(src_val) = src {
+                        if iv_derived.contains(src_val) && iv_derived.insert(*dest) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Match the secondary shape to the primary kind.
+    let (array_a_gep, array_b_gep, loads): (Value, Option<Value>, Vec<Value>) =
+        match (primary.kind, added_inst) {
+            (
+                ReductionKind::Sum,
+                Instruction::Load { ptr, ty, .. },
+            ) => {
+                if *ty != primary.element_type {
+                    set_reject("second accumulator element type mismatch");
+                    return None;
+                }
+                if !gep_uses_iv(func, &loop_info.body, *ptr, primary.iv, &iv_derived) {
+                    set_reject("second accumulator array index not based on IV");
+                    return None;
+                }
+                (*ptr, None, vec![added_value])
+            }
+            (
+                ReductionKind::DotProduct,
+                Instruction::BinOp {
+                    op: IrBinOp::Mul,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                },
+            ) => {
+                if *ty != primary.accumulator_type {
+                    set_reject("second accumulator element type mismatch");
+                    return None;
+                }
+                let (Operand::Value(lv), Operand::Value(rv)) = (lhs, rhs) else {
+                    return None;
+                };
+                let li = find_inst_by_dest(body, *lv)?;
+                let ri = find_inst_by_dest(body, *rv)?;
+                let (Instruction::Load { ptr: ap, .. }, Instruction::Load { ptr: bp, .. }) =
+                    (li, ri)
+                else {
+                    set_reject("second dot product operands not loads");
+                    return None;
+                };
+                if !gep_uses_iv(func, &loop_info.body, *ap, primary.iv, &iv_derived)
+                    || !gep_uses_iv(func, &loop_info.body, *bp, primary.iv, &iv_derived)
+                {
+                    set_reject("second dot product array index not based on IV");
+                    return None;
+                }
+                (*ap, Some(*bp), vec![*lv, *rv])
+            }
+            _ => {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Rejecting multi-reduction: second accumulator kind mismatch"
+                    );
+                }
+                set_reject("second accumulator kind mismatch");
+                return None;
+            }
+        };
+
+    // The union soundness check (both adds, both phis, both derived sets,
+    // both load sets) runs in the caller once the whole pattern is known.
+    Some(SecondaryAccumulator {
+        accumulator_phi: secondary_phi,
+        add_result,
+        accumulator_add_idx: acc_add_idx,
+        array_a_gep,
+        array_b_gep,
+        accumulator_derived: acc_derived,
+        loads,
+    })
+}
+
+/// All (array_a_gep, array_b_gep) pairs of a reduction pattern, including the
+/// optional second accumulator.  Every transform-wide sweep over "the arrays
+/// of this loop" (contiguity precondition, byte-IV strength reduction, and
+/// element-index GEP scaling) must cover both accumulators or the second one
+/// would read at the wrong stride.
+fn reduction_array_geps(pattern: &ReductionPattern) -> Vec<(Value, Option<Value>)> {
+    let mut geps = vec![(pattern.array_a_gep, pattern.array_b_gep)];
+    if let Some(sec) = &pattern.second {
+        geps.push((sec.array_a_gep, sec.array_b_gep));
+    }
+    geps
+}
+
+/// Rewrite one reduction accumulator's body (scalar `+=` → register vector
+/// chain) and rewire its header phi to the vector accumulator.  Shared by the
+/// AVX2 and SSE2 transforms; the single-accumulator fast path is intentionally
+/// NOT routed through here so its emitted IR stays bit-identical.
+///
+/// Returns `(init_zero_value, vec_sum_value, change_count)`.  The caller must
+/// process accumulators in DESCENDING `add_idx` order: inserting/removing
+/// instructions at a higher index never shifts a lower one still to patch.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_reduction_body(
+    func: &mut IrFunction,
+    header_idx: usize,
+    body_idx: usize,
+    latch_idx: usize,
+    kind: ReductionKind,
+    use_byte_iv: bool,
+    vec_load_op: IntrinsicOp,
+    vec_add_op: IntrinsicOp,
+    vec_zero_op: IntrinsicOp,
+    vec_mul_op: Option<IntrinsicOp>,
+    use_fma: bool,
+    vec_fma_op: Option<IntrinsicOp>,
+    phi: Value,
+    add_idx: usize,
+    array_a_gep: Value,
+    array_b_gep: Option<Value>,
+    byte_iv_a: Option<(Value, Value)>,
+    byte_iv_b: Option<(Value, Value)>,
+    next_val_id: &mut u32,
+) -> (Value, Value, usize) {
+    // SSA ids in the same order the single-accumulator paths allocate them:
+    // init_zero first (it lands in the entry block), then loads, then the sum.
+    let init_zero_value = Value(*next_val_id);
+    *next_val_id += 1;
+    let vec_load_a = Value(*next_val_id);
+    *next_val_id += 1;
+    let vec_load_b = Value(*next_val_id);
+    *next_val_id += 1;
+    let vec_mul = Value(*next_val_id);
+    *next_val_id += 1;
+    let vec_sum_value = Value(*next_val_id);
+    *next_val_id += 1;
+
+    let mut changes = 0usize;
+
+    // Initialize the vector accumulator to zero in the entry block.
+    {
+        let entry_block = &mut func.blocks[0];
+        let zero_inst = Instruction::Intrinsic {
+            dest: Some(init_zero_value),
+            op: vec_zero_op,
+            dest_ptr: None,
+            args: vec![],
+        };
+        entry_block.instructions.push(zero_inst);
+    }
+    changes += 1;
+
+    // Rewire this accumulator's phi: the zero-constant entry edge becomes the
+    // vector zero; the backedge becomes the new vector sum.
+    let latch_label = func.blocks[latch_idx].label;
+    {
+        let header_block = &mut func.blocks[header_idx];
+        for inst in header_block.instructions.iter_mut() {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest != phi {
+                    continue;
+                }
+                for (val, label) in incoming.iter_mut() {
+                    if matches!(
+                        val,
+                        Operand::Const(IrConst::F32(_))
+                            | Operand::Const(IrConst::F64(_))
+                            | Operand::Const(IrConst::I32(0))
+                            | Operand::Const(IrConst::I64(0))
+                            | Operand::Const(IrConst::Zero)
+                    ) {
+                        *val = Operand::Value(init_zero_value);
+                    }
+                    if *label == latch_label {
+                        *val = Operand::Value(vec_sum_value);
+                    }
+                }
+            }
+        }
+    }
+
+    let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
+        (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
+        _ => (
+            Operand::Value(array_a_gep),
+            Operand::Const(IrConst::I64(0)),
+        ),
+    };
+    let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
+        (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
+        _ => (
+            Operand::Value(array_b_gep.unwrap_or(array_a_gep)),
+            Operand::Const(IrConst::I64(0)),
+        ),
+    };
+
+    let body_block = &mut func.blocks[body_idx];
+    match kind {
+        ReductionKind::Sum => {
+            let load_inst = Instruction::Intrinsic {
+                dest: Some(vec_load_a),
+                op: vec_load_op,
+                dest_ptr: None,
+                args: vec![a_base, a_off],
+            };
+            let add_inst = Instruction::Intrinsic {
+                dest: Some(vec_sum_value),
+                op: vec_add_op,
+                dest_ptr: None,
+                args: vec![Operand::Value(phi), Operand::Value(vec_load_a)],
+            };
+            body_block.instructions.insert(add_idx, load_inst);
+            body_block.instructions.insert(add_idx + 1, add_inst);
+            body_block.instructions.remove(add_idx + 2);
+            changes += 2;
+        }
+        ReductionKind::DotProduct => {
+            if use_fma {
+                let fma_inst = Instruction::Intrinsic {
+                    dest: Some(vec_sum_value),
+                    op: vec_fma_op.expect("dot product FMA requires a vector FMA op"),
+                    dest_ptr: None,
+                    args: vec![Operand::Value(phi), a_base, a_off, b_base, b_off],
+                };
+                body_block.instructions.insert(add_idx, fma_inst);
+                body_block.instructions.remove(add_idx + 1);
+                changes += 1;
+            } else {
+                let load_a_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load_a),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: vec![a_base, a_off],
+                };
+                let load_b_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load_b),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: vec![b_base, b_off],
+                };
+                let mul_inst = Instruction::Intrinsic {
+                    dest: Some(vec_mul),
+                    op: vec_mul_op.expect("dot product requires a vector multiply op"),
+                    dest_ptr: None,
+                    args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
+                };
+                let add_inst = Instruction::Intrinsic {
+                    dest: Some(vec_sum_value),
+                    op: vec_add_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(phi), Operand::Value(vec_mul)],
+                };
+                body_block.instructions.insert(add_idx, load_a_inst);
+                body_block.instructions.insert(add_idx + 1, load_b_inst);
+                body_block.instructions.insert(add_idx + 2, mul_inst);
+                body_block.instructions.insert(add_idx + 3, add_inst);
+                body_block.instructions.remove(add_idx + 4);
+                changes += 4;
+            }
+        }
+    }
+
+    (init_zero_value, vec_sum_value, changes)
+}
+
+/// Rewrite every use of `acc_id` OUTSIDE the reduction's loop blocks to
+/// `replacement` (the scalar remainder result).  The vector accumulator only
+/// lives inside the loop; every outside reader must see the reduced scalar.
+/// Returns the number of rewritten uses (diagnostic only).
+fn rewrite_accumulator_uses_outside_loop(
+    func: &mut IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    acc_id: u32,
+    replacement: Value,
+) -> usize {
+    let mut updates = 0usize;
+    let mut replace_in_operand = |op: &mut Operand| -> bool {
+        if let Operand::Value(v) = op {
+            if v.0 == acc_id {
+                *v = replacement;
+                return true;
+            }
+        }
+        false
+    };
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue; // the vector accumulator lives and is consumed here
+        }
+        for inst in &mut block.instructions {
+            match inst {
+                Instruction::Copy { src, .. } => {
+                    if replace_in_operand(src) {
+                        updates += 1;
+                    }
+                }
+                Instruction::Store { val, .. } => {
+                    if replace_in_operand(val) {
+                        updates += 1;
+                    }
+                }
+                Instruction::BinOp { lhs, rhs, .. } => {
+                    if replace_in_operand(lhs) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(rhs) {
+                        updates += 1;
+                    }
+                }
+                Instruction::Cmp { lhs, rhs, .. } => {
+                    if replace_in_operand(lhs) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(rhs) {
+                        updates += 1;
+                    }
+                }
+                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+                    if replace_in_operand(src) {
+                        updates += 1;
+                    }
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for a in &mut info.args {
+                        if replace_in_operand(a) {
+                            updates += 1;
+                        }
+                    }
+                }
+                Instruction::Phi { incoming, .. } => {
+                    for (op, _) in incoming {
+                        if replace_in_operand(op) {
+                            updates += 1;
+                        }
+                    }
+                }
+                Instruction::Select {
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    if replace_in_operand(cond) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(true_val) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(false_val) {
+                        updates += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match &mut block.terminator {
+            Terminator::Return(Some(op)) => {
+                if replace_in_operand(op) {
+                    updates += 1;
+                }
+            }
+            Terminator::CondBranch { cond, .. } => {
+                if replace_in_operand(cond) {
+                    updates += 1;
+                }
+            }
+            Terminator::Switch { val, .. } => {
+                if replace_in_operand(val) {
+                    updates += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    updates
 }
 
 /// Identity of a pointer's statically-known base object.
@@ -4286,6 +4863,7 @@ fn insert_reduction_remainder_loop(
     vec_sum_value: Value, // Accumulated vector SSA value
     byte_offset_iv: bool,
     second_acc: Option<Value>, // Second vector accumulator phi (NEON smlal2 half)
+    second: Option<&SecondaryAccumulator>, // Second INDEPENDENT accumulator (multi-reduction)
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
@@ -4332,6 +4910,32 @@ fn insert_reduction_remainder_loop(
             }
         }
         Some(gep)
+    });
+
+    // Same lookup for the second accumulator's arrays (multi-reduction).
+    let second_array_a_base = second.map(|sec| {
+        let body_block = &func.blocks[pattern.body_idx];
+        for inst in &body_block.instructions {
+            if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                if *dest == sec.array_a_gep {
+                    return *base;
+                }
+            }
+        }
+        sec.array_a_gep
+    });
+    let second_array_b_base = second.and_then(|sec| {
+        sec.array_b_gep.map(|gep| {
+            let body_block = &func.blocks[pattern.body_idx];
+            for inst in &body_block.instructions {
+                if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                    if *dest == gep {
+                        return *base;
+                    }
+                }
+            }
+            gep
+        })
     });
 
     // Allocate new block IDs
@@ -4384,6 +4988,34 @@ fn insert_reduction_remainder_loop(
         (Value(0), Value(0), Value(0), Value(0))
     };
     let load_rem_b_acc = Value(*next_val_id);
+    *next_val_id += 1;
+
+    // Second independent accumulator's scalar remainder chain (multi-reduction).
+    // Allocated unconditionally; the ids are simply unused when `second` is None.
+    let scalar_sum2 = Value(*next_val_id);
+    *next_val_id += 1;
+    let offset_a2 = Value(*next_val_id);
+    *next_val_id += 1;
+    let gep_rem_a2 = Value(*next_val_id);
+    *next_val_id += 1;
+    let load_rem_a2 = Value(*next_val_id);
+    *next_val_id += 1;
+    let (offset_b2, gep_rem_b2, load_rem_b2, mul_rem2) =
+        if pattern.kind == ReductionKind::DotProduct {
+            let vals = (
+                Value(*next_val_id),
+                Value(*next_val_id + 1),
+                Value(*next_val_id + 2),
+                Value(*next_val_id + 3),
+            );
+            *next_val_id += 4;
+            vals
+        } else {
+            (Value(0), Value(0), Value(0), Value(0))
+        };
+    let sum_rem_phi2 = Value(*next_val_id);
+    *next_val_id += 1;
+    let sum_rem_next2 = Value(*next_val_id);
     *next_val_id += 1;
 
     if debug {
@@ -4450,42 +5082,51 @@ fn insert_reduction_remainder_loop(
         };
         let mut instructions = Vec::with_capacity(16);
         instructions.append(&mut prefix);
-        instructions.extend_from_slice(&[
-            // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
-            // Use the accumulator PHI (not vec_sum_value) so that when the
-            // vectorized loop has 0 iterations, we reduce the initial zero
-            // vector instead of an uninitialized temporary.
-            Instruction::Intrinsic {
-                dest: Some(scalar_sum),
+        // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
+        // Use the accumulator PHI (not vec_sum_value) so that when the
+        // vectorized loop has 0 iterations, we reduce the initial zero
+        // vector instead of an uninitialized temporary.
+        instructions.push(Instruction::Intrinsic {
+            dest: Some(scalar_sum),
+            op: vec_horizontal_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(horiz_src)],
+        });
+        // Second independent accumulator reduces to its own scalar
+        // (multi-reduction); its vector phi is rewired the same way as the
+        // primary's and is only live inside the loop.
+        if let Some(sec) = second {
+            instructions.push(Instruction::Intrinsic {
+                dest: Some(scalar_sum2),
                 op: vec_horizontal_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(horiz_src)],
-            },
-            // Compute starting index for the scalar remainder loop.
-            //   byte-offset IV: start = byte_iv_final >> log2(element_size)
-            //   element-index IV: start = iv_final * vec_width
-            // Vector byte IVs are normalized at zero, increase by a positive
-            // power-of-two stride, and only reach this block from the loop's
-            // non-negative exit.  Use that proof directly rather than leaving
-            // a late signed divide for x86 codegen.
-            if byte_offset_iv {
-                Instruction::BinOp {
-                    dest: i_rem_start,
-                    op: IrBinOp::LShr,
-                    lhs: Operand::Value(pattern.iv),
-                    rhs: Operand::Const(IrConst::I32(element_size.trailing_zeros() as i32)),
-                    ty: IrType::I32,
-                }
-            } else {
-                Instruction::BinOp {
-                    dest: i_rem_start,
-                    op: IrBinOp::Mul,
-                    lhs: Operand::Value(pattern.iv),
-                    rhs: Operand::Const(IrConst::I32(vec_width as i32)),
-                    ty: IrType::I32,
-                }
-            },
-        ]);
+                args: vec![Operand::Value(sec.accumulator_phi)],
+            });
+        }
+        // Compute starting index for the scalar remainder loop.
+        //   byte-offset IV: start = byte_iv_final >> log2(element_size)
+        //   element-index IV: start = iv_final * vec_width
+        // Vector byte IVs are normalized at zero, increase by a positive
+        // power-of-two stride, and only reach this block from the loop's
+        // non-negative exit.  Use that proof directly rather than leaving
+        // a late signed divide for x86 codegen.
+        instructions.push(if byte_offset_iv {
+            Instruction::BinOp {
+                dest: i_rem_start,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(pattern.iv),
+                rhs: Operand::Const(IrConst::I32(element_size.trailing_zeros() as i32)),
+                ty: IrType::I32,
+            }
+        } else {
+            Instruction::BinOp {
+                dest: i_rem_start,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(pattern.iv),
+                rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+                ty: IrType::I32,
+            }
+        });
         BasicBlock {
             label: vec_exit_label,
             instructions,
@@ -4495,36 +5136,49 @@ fn insert_reduction_remainder_loop(
     };
 
     // Step 3: Create remainder_header block
+    let mut remainder_header_instructions = vec![
+        // IV phi
+        Instruction::Phi {
+            dest: i_rem_iv,
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(i_rem_start), vec_exit_label),
+                (Operand::Value(i_rem_iv_next), remainder_latch_label),
+            ],
+        },
+        // Accumulator phi (receives scalar_sum from horizontal reduction!)
+        Instruction::Phi {
+            dest: sum_rem_phi,
+            ty: pattern.accumulator_type,
+            incoming: vec![
+                (Operand::Value(scalar_sum), vec_exit_label),
+                (Operand::Value(sum_rem_next), remainder_latch_label),
+            ],
+        },
+    ];
+    // Second accumulator phi (multi-reduction): same shape, own result.
+    if let Some(sec) = second {
+        remainder_header_instructions.push(Instruction::Phi {
+            dest: sum_rem_phi2,
+            ty: pattern.accumulator_type,
+            incoming: vec![
+                (Operand::Value(scalar_sum2), vec_exit_label),
+                (Operand::Value(sum_rem_next2), remainder_latch_label),
+            ],
+        });
+    }
+    // Comparison
+    remainder_header_instructions.push(Instruction::Cmp {
+        dest: i_rem_cmp,
+        op: IrCmpOp::Slt,
+        lhs: Operand::Value(i_rem_iv),
+        rhs: pattern.limit.clone(), // ORIGINAL limit (not divided)
+        ty: IrType::I32,
+    });
+
     let remainder_header_block = BasicBlock {
         label: remainder_header_label,
-        instructions: vec![
-            // IV phi
-            Instruction::Phi {
-                dest: i_rem_iv,
-                ty: IrType::I32,
-                incoming: vec![
-                    (Operand::Value(i_rem_start), vec_exit_label),
-                    (Operand::Value(i_rem_iv_next), remainder_latch_label),
-                ],
-            },
-            // Accumulator phi (receives scalar_sum from horizontal reduction!)
-            Instruction::Phi {
-                dest: sum_rem_phi,
-                ty: pattern.accumulator_type,
-                incoming: vec![
-                    (Operand::Value(scalar_sum), vec_exit_label),
-                    (Operand::Value(sum_rem_next), remainder_latch_label),
-                ],
-            },
-            // Comparison
-            Instruction::Cmp {
-                dest: i_rem_cmp,
-                op: IrCmpOp::Slt,
-                lhs: Operand::Value(i_rem_iv),
-                rhs: pattern.limit.clone(), // ORIGINAL limit (not divided)
-                ty: IrType::I32,
-            },
-        ],
+        instructions: remainder_header_instructions,
         terminator: Terminator::CondBranch {
             cond: Operand::Value(i_rem_cmp),
             true_label: remainder_body_label,
@@ -4650,6 +5304,86 @@ fn insert_reduction_remainder_loop(
         }
     }
 
+    // Second accumulator's scalar chain (multi-reduction).  Same shape as the
+    // primary; the analyzer guarantees element_type == accumulator_type here,
+    // so no per-element casts are needed.
+    if let Some(sec) = second {
+        let base2 = second_array_a_base.unwrap_or(sec.array_a_gep);
+        remainder_body_instructions.extend_from_slice(&[
+            Instruction::BinOp {
+                dest: offset_a2,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(i_rem_cast),
+                rhs: Operand::Const(IrConst::I64(element_size)),
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: gep_rem_a2,
+                base: base2,
+                offset: Operand::Value(offset_a2),
+                ty: pattern.element_type,
+            },
+            Instruction::Load {
+                volatile: false,
+                dest: load_rem_a2,
+                ptr: gep_rem_a2,
+                ty: pattern.element_type,
+                seg_override: AddressSpace::Default,
+            },
+        ]);
+        match pattern.kind {
+            ReductionKind::Sum => {
+                remainder_body_instructions.push(Instruction::BinOp {
+                    dest: sum_rem_next2,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(sum_rem_phi2),
+                    rhs: Operand::Value(load_rem_a2),
+                    ty: pattern.accumulator_type,
+                });
+            }
+            ReductionKind::DotProduct => {
+                let base_b2 = second_array_b_base
+                    .unwrap_or_else(|| sec.array_b_gep.unwrap_or(sec.array_a_gep));
+                remainder_body_instructions.extend_from_slice(&[
+                    Instruction::BinOp {
+                        dest: offset_b2,
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(i_rem_cast),
+                        rhs: Operand::Const(IrConst::I64(element_size)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::GetElementPtr {
+                        dest: gep_rem_b2,
+                        base: base_b2,
+                        offset: Operand::Value(offset_b2),
+                        ty: pattern.element_type,
+                    },
+                    Instruction::Load {
+                        volatile: false,
+                        dest: load_rem_b2,
+                        ptr: gep_rem_b2,
+                        ty: pattern.element_type,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::BinOp {
+                        dest: mul_rem2,
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(load_rem_a2),
+                        rhs: Operand::Value(load_rem_b2),
+                        ty: pattern.accumulator_type,
+                    },
+                    Instruction::BinOp {
+                        dest: sum_rem_next2,
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(sum_rem_phi2),
+                        rhs: Operand::Value(mul_rem2),
+                        ty: pattern.accumulator_type,
+                    },
+                ]);
+            }
+        }
+    }
+
     let remainder_body_block = BasicBlock {
         label: remainder_body_label,
         instructions: remainder_body_instructions,
@@ -4678,135 +5412,30 @@ fn insert_reduction_remainder_loop(
     func.blocks.push(remainder_body_block);
     func.blocks.push(remainder_latch_block);
 
-    // Step 7: Replace uses of original scalar accumulator with remainder accumulator
-    // After vectorization, pattern.accumulator_phi in the header now holds a VECTOR
-    // value. EVERY use outside this loop must read the scalar remainder result
-    // sum_rem_phi instead. The former code only rewired the exit block: with
-    // several inlined reductions in one function the consumer (e.g. a printf
-    // argument) lives in a later block and kept reading the vector accumulator —
-    // emitted as LEA (vectors are addressed, not loaded), printing a stack
-    // address (lea_sib_fold -O2 wrong sum; --compare-gcc output mismatch).
+    // Step 7: Replace uses of the original scalar accumulator(s) with the
+    // scalar remainder results.  After vectorization each accumulator phi in
+    // the header holds a VECTOR value; EVERY use outside this loop must read
+    // the reduced scalar instead (otherwise the consumer prints the vector's
+    // stack address — lea_sib_fold / reduction_two_sums regressions).
     {
-        let acc_id = pattern.accumulator_phi.0;
-        let mut updates = 0;
-        if debug {
-            eprintln!(
-                "[VEC-RED]   Rewiring uses of SSA {} (vector accumulator) outside the loop",
-                acc_id
+        let primary_updates = rewrite_accumulator_uses_outside_loop(
+            func,
+            &pattern.loop_blocks,
+            pattern.accumulator_phi.0,
+            sum_rem_phi,
+        );
+        if let Some(sec) = second {
+            rewrite_accumulator_uses_outside_loop(
+                func,
+                &pattern.loop_blocks,
+                sec.accumulator_phi.0,
+                sum_rem_phi2,
             );
         }
-
-        // Helper to replace SSA values in operands
-        let mut replace_in_operand = |op: &mut Operand, from: u32, to: Value| -> bool {
-            if let Operand::Value(v) = op {
-                if v.0 == from {
-                    *v = to;
-                    return true;
-                }
-            }
-            false
-        };
-
-        for (bi, block) in func.blocks.iter_mut().enumerate() {
-            if pattern.loop_blocks.contains(&bi) {
-                continue; // the vector accumulator lives and is consumed here
-            }
-            for inst in &mut block.instructions {
-                match inst {
-                    Instruction::Copy { src, .. } => {
-                        if replace_in_operand(src, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                    }
-                    Instruction::Store { val, .. } => {
-                        if replace_in_operand(val, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                    }
-                    Instruction::BinOp { lhs, rhs, .. } => {
-                        if replace_in_operand(lhs, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                        if replace_in_operand(rhs, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                    }
-                    Instruction::Cmp { lhs, rhs, .. } => {
-                        // Comparisons consuming the accumulator (e.g.
-                        // `if (s != 45)`) were missed by the exit-block-only
-                        // rewiring: a surviving Cmp operand kept the vector
-                        // accumulator, emitted as leaq (vectors are
-                        // addressed) — comparing a stack address instead of
-                        // the sum (the reduction_two_sums regression).
-                        if replace_in_operand(lhs, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                        if replace_in_operand(rhs, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                    }
-                    Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-                        if replace_in_operand(src, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                    }
-                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                        for a in &mut info.args {
-                            if replace_in_operand(a, acc_id, sum_rem_phi) {
-                                updates += 1;
-                            }
-                        }
-                    }
-                    Instruction::Phi { incoming, .. } => {
-                        for (op, _) in incoming {
-                            if replace_in_operand(op, acc_id, sum_rem_phi) {
-                                updates += 1;
-                            }
-                        }
-                    }
-                    Instruction::Select {
-                        cond,
-                        true_val,
-                        false_val,
-                        ..
-                    } => {
-                        if replace_in_operand(cond, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                        if replace_in_operand(true_val, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                        if replace_in_operand(false_val, acc_id, sum_rem_phi) {
-                            updates += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            match &mut block.terminator {
-                Terminator::Return(Some(op)) => {
-                    if replace_in_operand(op, acc_id, sum_rem_phi) {
-                        updates += 1;
-                    }
-                }
-                Terminator::CondBranch { cond, .. } => {
-                    if replace_in_operand(cond, acc_id, sum_rem_phi) {
-                        updates += 1;
-                    }
-                }
-                Terminator::Switch { val, .. } => {
-                    if replace_in_operand(val, acc_id, sum_rem_phi) {
-                        updates += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
         if debug {
             eprintln!(
                 "[VEC-RED]   Rewired {} uses of accumulator outside the loop",
-                updates
+                primary_updates
             );
         }
     }
@@ -4838,10 +5467,14 @@ fn transform_reduction_avx2(
     // either outcome.
     {
         let elem_size = reduction_element_size(pattern.element_type).unwrap_or(0) as u32;
+        let all_geps = reduction_array_geps(pattern);
         for &block_idx in &pattern.loop_blocks {
             for inst in &func.blocks[block_idx].instructions {
                 if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                    if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                    let is_reduction_gep = all_geps
+                        .iter()
+                        .any(|&(a, b)| *dest == a || Some(*dest) == b);
+                    if is_reduction_gep {
                         if let Operand::Value(offset_val) = offset {
                             if !offset_is_index_times(
                                 func,
@@ -4985,7 +5618,24 @@ fn transform_reduction_avx2(
     let byte_iv_b = pattern
         .array_b_gep
         .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
-    let use_byte_iv = byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+    let mut use_byte_iv =
+        byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+    // A second accumulator must have the byte-IV shape on every one of its
+    // arrays too; otherwise the whole loop uses the element-index scheme
+    // (scaled GEP offsets), which is correct but one LEA per access heavier.
+    if let Some(sec) = &pattern.second {
+        let sec_byte_iv_a = find_reduction_byte_iv(
+            func,
+            &pattern.loop_blocks,
+            sec.array_a_gep,
+            elem_sz as u32,
+        );
+        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+        });
+        use_byte_iv &= sec_byte_iv_a.is_some()
+            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+    }
 
     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
     let divided_limit = match &pattern.limit {
@@ -5151,11 +5801,15 @@ fn transform_reduction_avx2(
         // left array B at scalar stride, loading the wrong elements (miscompile:
         // dot(x,y,n) returned garbage for both n=255 and n=256).
         let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
+        let all_geps = reduction_array_geps(pattern);
         for &block_idx in &pattern.loop_blocks {
             let block = &func.blocks[block_idx];
             for (inst_idx, inst) in block.instructions.iter().enumerate() {
                 if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                    if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                    let is_reduction_gep = all_geps
+                        .iter()
+                        .any(|&(a, b)| *dest == a || Some(*dest) == b);
+                    if is_reduction_gep {
                         if let Operand::Value(offset_val) = offset {
                             geps_to_scale.push((block_idx, inst_idx, *offset_val));
                         }
@@ -5197,145 +5851,337 @@ fn transform_reduction_avx2(
     // Vector values are SSA values that live in stack slots (backend keeps in registers when possible)
     let vec_sum_value: Value; // The accumulated vector value
 
-    match pattern.kind {
-        ReductionKind::Sum => {
-            // Simple sum: sum += arr[i]
-            // Register-based flow: vec_zero → vec_load → vec_add → horizontal_add
+    if pattern.second.is_none() {
+        match pattern.kind {
+            ReductionKind::Sum => {
+                // Simple sum: sum += arr[i]
+                // Register-based flow: vec_zero → vec_load → vec_add → horizontal_add
 
-            // Map to register-based intrinsics based on element type
-            let (vec_load_op, vec_add_op, vec_zero_op) = match pattern.element_type {
-                IrType::F64 => (
-                    IntrinsicOp::VecLoadF64x4,
-                    IntrinsicOp::VecAddF64x4,
-                    IntrinsicOp::VecZeroF64x4,
-                ),
-                IrType::I32 => (
-                    IntrinsicOp::VecLoadI32x8,
-                    IntrinsicOp::VecAddI32x8,
-                    IntrinsicOp::VecZeroI32x8,
-                ),
-                IrType::F32 => (
-                    IntrinsicOp::VecLoadF32x8,
-                    IntrinsicOp::VecAddF32x8,
-                    IntrinsicOp::VecZeroF32x8,
-                ),
-                _ => panic!("Unsupported AVX2 element type: {:?}", pattern.element_type),
-            };
+                // Map to register-based intrinsics based on element type
+                let (vec_load_op, vec_add_op, vec_zero_op) = match pattern.element_type {
+                    IrType::F64 => (
+                        IntrinsicOp::VecLoadF64x4,
+                        IntrinsicOp::VecAddF64x4,
+                        IntrinsicOp::VecZeroF64x4,
+                    ),
+                    IrType::I32 => (
+                        IntrinsicOp::VecLoadI32x8,
+                        IntrinsicOp::VecAddI32x8,
+                        IntrinsicOp::VecZeroI32x8,
+                    ),
+                    IrType::F32 => (
+                        IntrinsicOp::VecLoadF32x8,
+                        IntrinsicOp::VecAddF32x8,
+                        IntrinsicOp::VecZeroF32x8,
+                    ),
+                    _ => panic!("Unsupported AVX2 element type: {:?}", pattern.element_type),
+                };
 
-            if debug {
-                eprintln!(
-                    "[VEC-RED]   Using register-based intrinsics: {:?}, {:?}",
-                    vec_load_op, vec_add_op
-                );
-            }
+                if debug {
+                    eprintln!(
+                        "[VEC-RED]   Using register-based intrinsics: {:?}, {:?}",
+                        vec_load_op, vec_add_op
+                    );
+                }
 
-            // Value IDs for vector operations (SSA values)
-            // IMPORTANT: Create init_zero_value FIRST because it's inserted in entry block (block 0)
-            // which comes before the loop body. This ensures SSA IDs are in program order.
-            let init_zero_value = Value(next_val_id);
-            next_val_id += 1;
-            let vec_load = Value(next_val_id);
-            next_val_id += 1;
-            vec_sum_value = Value(next_val_id);
-            next_val_id += 1;
+                // Value IDs for vector operations (SSA values)
+                // IMPORTANT: Create init_zero_value FIRST because it's inserted in entry block (block 0)
+                // which comes before the loop body. This ensures SSA IDs are in program order.
+                let init_zero_value = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = Value(next_val_id);
+                next_val_id += 1;
 
-            // Initialize vector accumulator to zero in entry block
-            let entry_block = &mut func.blocks[0];
-            let zero_inst = Instruction::Intrinsic {
-                dest: Some(init_zero_value),
-                op: vec_zero_op,
-                dest_ptr: None,
-                args: vec![],
-            };
-            entry_block.instructions.push(zero_inst);
-            changes += 1;
+                // Initialize vector accumulator to zero in entry block
+                let entry_block = &mut func.blocks[0];
+                let zero_inst = Instruction::Intrinsic {
+                    dest: Some(init_zero_value),
+                    op: vec_zero_op,
+                    dest_ptr: None,
+                    args: vec![],
+                };
+                entry_block.instructions.push(zero_inst);
+                changes += 1;
 
-            // Update the accumulator PHI to use init_zero_value as the entry predecessor
-            let header_block = &mut func.blocks[pattern.header_idx];
-            for inst in header_block.instructions.iter_mut() {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    if *dest == pattern.accumulator_phi {
-                        for (val, _) in incoming.iter_mut() {
-                            if matches!(
-                                val,
-                                Operand::Const(IrConst::F32(_))
-                                    | Operand::Const(IrConst::F64(_))
-                                    | Operand::Const(IrConst::I32(0))
-                                    | Operand::Const(IrConst::I64(0))
-                                    | Operand::Const(IrConst::Zero)
-                            ) {
-                                *val = Operand::Value(init_zero_value);
+                // Update the accumulator PHI to use init_zero_value as the entry predecessor
+                let header_block = &mut func.blocks[pattern.header_idx];
+                for inst in header_block.instructions.iter_mut() {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        if *dest == pattern.accumulator_phi {
+                            for (val, _) in incoming.iter_mut() {
+                                if matches!(
+                                    val,
+                                    Operand::Const(IrConst::F32(_))
+                                        | Operand::Const(IrConst::F64(_))
+                                        | Operand::Const(IrConst::I32(0))
+                                        | Operand::Const(IrConst::I64(0))
+                                        | Operand::Const(IrConst::Zero)
+                                ) {
+                                    *val = Operand::Value(init_zero_value);
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Get latch label before taking mutable references
-            let latch_label = func.blocks[pattern.latch_idx].label;
+                // Get latch label before taking mutable references
+                let latch_label = func.blocks[pattern.latch_idx].label;
 
-            // Transform loop body with register-based operations
-            {
-                let body_block = &mut func.blocks[pattern.body_idx];
+                // Transform loop body with register-based operations
+                {
+                    let body_block = &mut func.blocks[pattern.body_idx];
 
-                // Vector load from array → SSA value
-                let load_inst = Instruction::Intrinsic {
-                    dest: Some(vec_load),
-                    op: vec_load_op,
-                    dest_ptr: None,
-                    args: {
-                        let (base, off) = match (use_byte_iv, &byte_iv_a) {
-                            (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                            _ => (
-                                Operand::Value(pattern.array_a_gep),
-                                Operand::Const(IrConst::I64(0)),
-                            ),
-                        };
-                        vec![base, off]
-                    },
-                };
+                    // Vector load from array → SSA value
+                    let load_inst = Instruction::Intrinsic {
+                        dest: Some(vec_load),
+                        op: vec_load_op,
+                        dest_ptr: None,
+                        args: {
+                            let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                                (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                                _ => (
+                                    Operand::Value(pattern.array_a_gep),
+                                    Operand::Const(IrConst::I64(0)),
+                                ),
+                            };
+                            vec![base, off]
+                        },
+                    };
 
-                // Vector add: accumulator + loaded vector → new accumulator
-                let add_inst = Instruction::Intrinsic {
-                    dest: Some(vec_sum_value),
-                    op: vec_add_op,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.accumulator_phi), // Current accumulator (PHI)
-                        Operand::Value(vec_load),                // Loaded vector
-                    ],
-                };
+                    // Vector add: accumulator + loaded vector → new accumulator
+                    let add_inst = Instruction::Intrinsic {
+                        dest: Some(vec_sum_value),
+                        op: vec_add_op,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(pattern.accumulator_phi), // Current accumulator (PHI)
+                            Operand::Value(vec_load),                // Loaded vector
+                        ],
+                    };
 
-                // Insert vector instructions and remove old scalar add
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx, load_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 1, add_inst);
-                body_block
-                    .instructions
-                    .remove(pattern.accumulator_add_idx + 2);
-                changes += 2;
+                    // Insert vector instructions and remove old scalar add
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx, load_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 1, add_inst);
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 2);
+                    changes += 2;
 
-                // Debug: Log vector accumulator flow
+                    // Debug: Log vector accumulator flow
+                    if debug {
+                        eprintln!("[VEC-RED-DEBUG] Vec load SSA value: {}", vec_load.0);
+                        eprintln!(
+                            "[VEC-RED-DEBUG] Vector accumulator SSA value: {}",
+                            vec_sum_value.0
+                        );
+                        eprintln!(
+                            "[VEC-RED-DEBUG] Accumulator PHI: {}",
+                            pattern.accumulator_phi.0
+                        );
+                        eprintln!("[VEC-RED-DEBUG] Entry init value: {}", init_zero_value.0);
+                        eprintln!("[VEC-RED-DEBUG] Vector add op: {:?}", vec_add_op);
+                    }
+                }
+
+                // Update the PHI's backedge to use vec_sum_value
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    for inst in header_block.instructions.iter_mut() {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming.iter_mut() {
+                                    if *label == latch_label {
+                                        *val = Operand::Value(vec_sum_value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if debug {
-                    eprintln!("[VEC-RED-DEBUG] Vec load SSA value: {}", vec_load.0);
-                    eprintln!(
-                        "[VEC-RED-DEBUG] Vector accumulator SSA value: {}",
-                        vec_sum_value.0
-                    );
-                    eprintln!(
-                        "[VEC-RED-DEBUG] Accumulator PHI: {}",
-                        pattern.accumulator_phi.0
-                    );
-                    eprintln!("[VEC-RED-DEBUG] Entry init value: {}", init_zero_value.0);
-                    eprintln!("[VEC-RED-DEBUG] Vector add op: {:?}", vec_add_op);
+                    eprintln!("[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)");
                 }
             }
+            ReductionKind::DotProduct => {
+                // Dot product: sum += a[i] * b[i]
+                // Register-based: vec_load_a, vec_load_b, vec_mul, vec_add (all SSA)
 
-            // Update the PHI's backedge to use vec_sum_value
-            {
+                // Value IDs for vector operations
+                let vec_load_a = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load_b = Value(next_val_id);
+                next_val_id += 1;
+                let vec_mul = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = Value(next_val_id);
+                next_val_id += 1;
+
+                // Map to register-based intrinsics based on element type
+                let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op) =
+                    match pattern.element_type {
+                        IrType::F64 => (
+                            IntrinsicOp::VecLoadF64x4,
+                            IntrinsicOp::VecMulF64x4,
+                            IntrinsicOp::VecAddF64x4,
+                            IntrinsicOp::VecZeroF64x4,
+                            IntrinsicOp::VecFmaF64x4,
+                        ),
+                        IrType::F32 => (
+                            IntrinsicOp::VecLoadF32x8,
+                            IntrinsicOp::VecMulF32x8,
+                            IntrinsicOp::VecAddF32x8,
+                            IntrinsicOp::VecZeroF32x8,
+                            IntrinsicOp::VecFmaF32x8,
+                        ),
+                        IrType::I32 => (
+                            IntrinsicOp::VecLoadI32x8,
+                            IntrinsicOp::VecMulI32x8,
+                            IntrinsicOp::VecAddI32x8,
+                            IntrinsicOp::VecZeroI32x8,
+                            IntrinsicOp::VecMulI32x8,
+                        ),
+                        _ => {
+                            if debug {
+                                eprintln!(
+                                    "[VEC-RED] Unsupported AVX2 dot product type: {:?}",
+                                    pattern.element_type
+                                );
+                            }
+                            return changes;
+                        }
+                    };
+
+                if debug {
+                    eprintln!("[VEC-RED]   Using register-based dot product intrinsics");
+                }
+
+                // Initialize vector accumulator to zero in entry block
+                let entry_block = &mut func.blocks[0];
+                let init_zero_value = Value(next_val_id);
+                next_val_id += 1;
+                let zero_inst = Instruction::Intrinsic {
+                    dest: Some(init_zero_value),
+                    op: vec_zero_op,
+                    dest_ptr: None,
+                    args: vec![],
+                };
+                entry_block.instructions.push(zero_inst);
+                changes += 1;
+
+                // Update the accumulator PHI to use init_zero_value as the entry predecessor
+                let header_block = &mut func.blocks[pattern.header_idx];
+                for inst in header_block.instructions.iter_mut() {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        if *dest == pattern.accumulator_phi {
+                            for (val, _) in incoming.iter_mut() {
+                                if matches!(
+                                    val,
+                                    Operand::Const(IrConst::F32(_))
+                                        | Operand::Const(IrConst::F64(_))
+                                        | Operand::Const(IrConst::I32(0))
+                                        | Operand::Const(IrConst::I64(0))
+                                        | Operand::Const(IrConst::Zero)
+                                ) {
+                                    *val = Operand::Value(init_zero_value);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
+                    (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
+                    _ => (
+                        Operand::Value(pattern.array_a_gep),
+                        Operand::Const(IrConst::I64(0)),
+                    ),
+                };
+                let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
+                    (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
+                    _ => (
+                        Operand::Value(pattern.array_b_gep.unwrap()),
+                        Operand::Const(IrConst::I64(0)),
+                    ),
+                };
+                let body_block = &mut func.blocks[pattern.body_idx];
+
+                if fp_contract_fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
+                    let fma_inst = Instruction::Intrinsic {
+                        dest: Some(vec_sum_value),
+                        op: vec_fma_op,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(pattern.accumulator_phi),
+                            a_base,
+                            a_off,
+                            b_base,
+                            b_off,
+                        ],
+                    };
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx, fma_inst);
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 1);
+                    changes += 1;
+                } else {
+                    let load_a_inst = Instruction::Intrinsic {
+                        dest: Some(vec_load_a),
+                        op: vec_load_op,
+                        dest_ptr: None,
+                        args: vec![a_base, a_off],
+                    };
+                    let load_b_inst = Instruction::Intrinsic {
+                        dest: Some(vec_load_b),
+                        op: vec_load_op,
+                        dest_ptr: None,
+                        args: vec![b_base, b_off],
+                    };
+                    let mul_inst = Instruction::Intrinsic {
+                        dest: Some(vec_mul),
+                        op: vec_mul_op,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
+                    };
+                    let add_inst = Instruction::Intrinsic {
+                        dest: Some(vec_sum_value),
+                        op: vec_add_op,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(pattern.accumulator_phi),
+                            Operand::Value(vec_mul),
+                        ],
+                    };
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx, load_a_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 1, load_b_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 2, mul_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 3, add_inst);
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 4);
+                    changes += 4;
+                }
+
+                // Get latch label before taking a mutable reference to header
+                let latch_label = func.blocks[pattern.latch_idx].label;
+
+                // Update the PHI's backedge to use vec_sum_value
                 let header_block = &mut func.blocks[pattern.header_idx];
                 for inst in header_block.instructions.iter_mut() {
                     if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -5348,202 +6194,105 @@ fn transform_reduction_avx2(
                         }
                     }
                 }
-            }
 
-            if debug {
-                eprintln!("[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)");
-            }
-        }
-        ReductionKind::DotProduct => {
-            // Dot product: sum += a[i] * b[i]
-            // Register-based: vec_load_a, vec_load_b, vec_mul, vec_add (all SSA)
-
-            // Value IDs for vector operations
-            let vec_load_a = Value(next_val_id);
-            next_val_id += 1;
-            let vec_load_b = Value(next_val_id);
-            next_val_id += 1;
-            let vec_mul = Value(next_val_id);
-            next_val_id += 1;
-            vec_sum_value = Value(next_val_id);
-            next_val_id += 1;
-
-            // Map to register-based intrinsics based on element type
-            let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op) =
-                match pattern.element_type {
-                    IrType::F64 => (
-                        IntrinsicOp::VecLoadF64x4,
-                        IntrinsicOp::VecMulF64x4,
-                        IntrinsicOp::VecAddF64x4,
-                        IntrinsicOp::VecZeroF64x4,
-                        IntrinsicOp::VecFmaF64x4,
-                    ),
-                    IrType::F32 => (
-                        IntrinsicOp::VecLoadF32x8,
-                        IntrinsicOp::VecMulF32x8,
-                        IntrinsicOp::VecAddF32x8,
-                        IntrinsicOp::VecZeroF32x8,
-                        IntrinsicOp::VecFmaF32x8,
-                    ),
-                    IrType::I32 => (
-                        IntrinsicOp::VecLoadI32x8,
-                        IntrinsicOp::VecMulI32x8,
-                        IntrinsicOp::VecAddI32x8,
-                        IntrinsicOp::VecZeroI32x8,
-                        IntrinsicOp::VecMulI32x8,
-                    ),
-                    _ => {
-                        if debug {
-                            eprintln!(
-                                "[VEC-RED] Unsupported AVX2 dot product type: {:?}",
-                                pattern.element_type
-                            );
-                        }
-                        return changes;
-                    }
-                };
-
-            if debug {
-                eprintln!("[VEC-RED]   Using register-based dot product intrinsics");
-            }
-
-            // Initialize vector accumulator to zero in entry block
-            let entry_block = &mut func.blocks[0];
-            let init_zero_value = Value(next_val_id);
-            next_val_id += 1;
-            let zero_inst = Instruction::Intrinsic {
-                dest: Some(init_zero_value),
-                op: vec_zero_op,
-                dest_ptr: None,
-                args: vec![],
-            };
-            entry_block.instructions.push(zero_inst);
-            changes += 1;
-
-            // Update the accumulator PHI to use init_zero_value as the entry predecessor
-            let header_block = &mut func.blocks[pattern.header_idx];
-            for inst in header_block.instructions.iter_mut() {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    if *dest == pattern.accumulator_phi {
-                        for (val, _) in incoming.iter_mut() {
-                            if matches!(
-                                val,
-                                Operand::Const(IrConst::F32(_))
-                                    | Operand::Const(IrConst::F64(_))
-                                    | Operand::Const(IrConst::I32(0))
-                                    | Operand::Const(IrConst::I64(0))
-                                    | Operand::Const(IrConst::Zero)
-                            ) {
-                                *val = Operand::Value(init_zero_value);
-                            }
-                        }
-                    }
+                if debug {
+                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add");
                 }
             }
-
-            let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
-                (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
-                _ => (
-                    Operand::Value(pattern.array_a_gep),
-                    Operand::Const(IrConst::I64(0)),
-                ),
+        }
+    } else {
+        // Multi-reduction: two independent accumulators.  Rewrite each body in
+        // DESCENDING add-index order so the higher-index insertions/removals
+        // never shift a lower index still to be patched.
+        let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op, use_fma) =
+            match (pattern.kind, pattern.element_type) {
+                (ReductionKind::Sum, IrType::F64) => (
+                    IntrinsicOp::VecLoadF64x4, None, IntrinsicOp::VecAddF64x4,
+                    IntrinsicOp::VecZeroF64x4, None, false),
+                (ReductionKind::Sum, IrType::I32) => (
+                    IntrinsicOp::VecLoadI32x8, None, IntrinsicOp::VecAddI32x8,
+                    IntrinsicOp::VecZeroI32x8, None, false),
+                (ReductionKind::Sum, IrType::F32) => (
+                    IntrinsicOp::VecLoadF32x8, None, IntrinsicOp::VecAddF32x8,
+                    IntrinsicOp::VecZeroF32x8, None, false),
+                (ReductionKind::DotProduct, IrType::F64) => (
+                    IntrinsicOp::VecLoadF64x4, Some(IntrinsicOp::VecMulF64x4),
+                    IntrinsicOp::VecAddF64x4, IntrinsicOp::VecZeroF64x4,
+                    Some(IntrinsicOp::VecFmaF64x4), fp_contract_fast),
+                (ReductionKind::DotProduct, IrType::F32) => (
+                    IntrinsicOp::VecLoadF32x8, Some(IntrinsicOp::VecMulF32x8),
+                    IntrinsicOp::VecAddF32x8, IntrinsicOp::VecZeroF32x8,
+                    Some(IntrinsicOp::VecFmaF32x8), fp_contract_fast),
+                (ReductionKind::DotProduct, IrType::I32) => (
+                    IntrinsicOp::VecLoadI32x8, Some(IntrinsicOp::VecMulI32x8),
+                    IntrinsicOp::VecAddI32x8, IntrinsicOp::VecZeroI32x8,
+                    None, false),
+                _ => return 0,
             };
-            let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
-                (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
-                _ => (
-                    Operand::Value(pattern.array_b_gep.unwrap()),
-                    Operand::Const(IrConst::I64(0)),
-                ),
-            };
-            let body_block = &mut func.blocks[pattern.body_idx];
 
-            if fp_contract_fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
-                let fma_inst = Instruction::Intrinsic {
-                    dest: Some(vec_sum_value),
-                    op: vec_fma_op,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.accumulator_phi),
-                        a_base,
-                        a_off,
-                        b_base,
-                        b_off,
-                    ],
-                };
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx, fma_inst);
-                body_block
-                    .instructions
-                    .remove(pattern.accumulator_add_idx + 1);
-                changes += 1;
-            } else {
-                let load_a_inst = Instruction::Intrinsic {
-                    dest: Some(vec_load_a),
-                    op: vec_load_op,
-                    dest_ptr: None,
-                    args: vec![a_base, a_off],
-                };
-                let load_b_inst = Instruction::Intrinsic {
-                    dest: Some(vec_load_b),
-                    op: vec_load_op,
-                    dest_ptr: None,
-                    args: vec![b_base, b_off],
-                };
-                let mul_inst = Instruction::Intrinsic {
-                    dest: Some(vec_mul),
-                    op: vec_mul_op,
-                    dest_ptr: None,
-                    args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
-                };
-                let add_inst = Instruction::Intrinsic {
-                    dest: Some(vec_sum_value),
-                    op: vec_add_op,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.accumulator_phi),
-                        Operand::Value(vec_mul),
-                    ],
-                };
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx, load_a_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 1, load_b_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 2, mul_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 3, add_inst);
-                body_block
-                    .instructions
-                    .remove(pattern.accumulator_add_idx + 4);
-                changes += 4;
-            }
+        let sec = pattern.second.as_ref().unwrap();
+        let sec_byte_iv_a = find_reduction_byte_iv(
+            func,
+            &pattern.loop_blocks,
+            sec.array_a_gep,
+            elem_sz as u32,
+        );
+        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+        });
 
-            // Get latch label before taking a mutable reference to header
-            let latch_label = func.blocks[pattern.latch_idx].label;
+        let mut order = [
+            (
+                pattern.accumulator_phi,
+                pattern.accumulator_add_idx,
+                pattern.array_a_gep,
+                pattern.array_b_gep,
+                byte_iv_a,
+                byte_iv_b,
+                true,
+            ),
+            (
+                sec.accumulator_phi,
+                sec.accumulator_add_idx,
+                sec.array_a_gep,
+                sec.array_b_gep,
+                sec_byte_iv_a,
+                sec_byte_iv_b,
+                false,
+            ),
+        ];
+        order.sort_by_key(|&(_, add_idx, ..)| std::cmp::Reverse(add_idx));
 
-            // Update the PHI's backedge to use vec_sum_value
-            let header_block = &mut func.blocks[pattern.header_idx];
-            for inst in header_block.instructions.iter_mut() {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    if *dest == pattern.accumulator_phi {
-                        for (val, label) in incoming.iter_mut() {
-                            if *label == latch_label {
-                                *val = Operand::Value(vec_sum_value);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if debug {
-                eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add");
+        let mut primary_sum = Value(u32::MAX);
+        for (phi, add_idx, a_gep, b_gep, ba, bb, is_primary) in order {
+            let (_init, sum, n) = rewrite_reduction_body(
+                func,
+                pattern.header_idx,
+                pattern.body_idx,
+                pattern.latch_idx,
+                pattern.kind,
+                use_byte_iv,
+                vec_load_op,
+                vec_add_op,
+                vec_zero_op,
+                vec_mul_op,
+                use_fma,
+                vec_fma_op,
+                phi,
+                add_idx,
+                a_gep,
+                b_gep,
+                ba,
+                bb,
+                &mut next_val_id,
+            );
+            changes += n;
+            if is_primary {
+                primary_sum = sum;
             }
         }
+        debug_assert!(primary_sum.0 != u32::MAX, "primary accumulator not rewritten");
+        vec_sum_value = primary_sum;
     }
 
     // Step 4: Create remainder loop
@@ -5554,7 +6303,8 @@ fn transform_reduction_avx2(
         horizontal_intrinsic,
         vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        None, // AVX2 path uses a single accumulator
+        None, // AVX2 path uses a single NEON accumulator
+        pattern.second.as_ref(), // Second independent accumulator, if any
         &mut next_val_id,
         &mut next_label,
     );
@@ -5701,7 +6451,24 @@ fn transform_reduction_sse2(
     let byte_iv_b = pattern
         .array_b_gep
         .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
-    let use_byte_iv = byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+    let mut use_byte_iv =
+        byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+    // A second accumulator must have the byte-IV shape on every one of its
+    // arrays too; otherwise the whole loop uses the element-index scheme
+    // (scaled GEP offsets), which is correct but one LEA per access heavier.
+    if let Some(sec) = &pattern.second {
+        let sec_byte_iv_a = find_reduction_byte_iv(
+            func,
+            &pattern.loop_blocks,
+            sec.array_a_gep,
+            elem_sz as u32,
+        );
+        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+        });
+        use_byte_iv &= sec_byte_iv_a.is_some()
+            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+    }
 
     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
     let divided_limit = match &pattern.limit {
@@ -5866,11 +6633,15 @@ fn transform_reduction_sse2(
         // array B) in the same block, and the old `break` after the first match
         // left array B at scalar stride, loading the wrong elements.
         let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
+        let all_geps = reduction_array_geps(pattern);
         for &block_idx in &pattern.loop_blocks {
             let block = &func.blocks[block_idx];
             for (inst_idx, inst) in block.instructions.iter().enumerate() {
                 if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                    if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                    let is_reduction_gep = all_geps
+                        .iter()
+                        .any(|&(a, b)| *dest == a || Some(*dest) == b);
+                    if is_reduction_gep {
                         if let Operand::Value(offset_val) = offset {
                             geps_to_scale.push((block_idx, inst_idx, *offset_val));
                         }
@@ -5915,533 +6686,633 @@ fn transform_reduction_sse2(
     // this carries the second accumulator's header phi to the epilogue.
     let mut second_acc: Option<Value> = None;
 
-    match pattern.kind {
-        ReductionKind::Sum => {
-            // Simple sum: sum += arr[i]
-            // Map old intrinsics to new register-based intrinsics
-            let (vec_load_op, vec_add_op, vec_zero_op) = match load_intrinsic {
-                IntrinsicOp::LoadF64x2 => (
-                    IntrinsicOp::VecLoadF64x2,
-                    IntrinsicOp::VecAddF64x2,
-                    IntrinsicOp::VecZeroF64x2,
-                ),
-                IntrinsicOp::LoadI32x4 => (
-                    IntrinsicOp::VecLoadI32x4,
-                    IntrinsicOp::VecAddI32x4,
-                    IntrinsicOp::VecZeroI32x4,
-                ),
-                IntrinsicOp::VecLoadF32x4 => (
-                    IntrinsicOp::VecLoadF32x4,
-                    IntrinsicOp::VecAddF32x4,
-                    IntrinsicOp::VecZeroF32x4,
-                ),
-                IntrinsicOp::VecLoadWidenI32ToI64x2 => (
-                    IntrinsicOp::VecLoadWidenI32ToI64x2,
-                    IntrinsicOp::VecAddI64x2,
-                    IntrinsicOp::VecZeroI64x2,
-                ),
-                IntrinsicOp::VecLoadI64x2 => (
-                    IntrinsicOp::VecLoadI64x2,
-                    IntrinsicOp::VecAddI64x2,
-                    IntrinsicOp::VecZeroI64x2,
-                ),
-                // NEON 4-wide i32→i64 sum: load 4×I32, accumulate pairs (sadalp).
-                IntrinsicOp::VecLoadI32x4 => (
-                    IntrinsicOp::VecLoadI32x4,
-                    IntrinsicOp::VecSadalpI32x4,
-                    IntrinsicOp::VecZeroI64x2,
-                ),
-                _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
-            };
+    if pattern.second.is_none() {
+        match pattern.kind {
+            ReductionKind::Sum => {
+                // Simple sum: sum += arr[i]
+                // Map old intrinsics to new register-based intrinsics
+                let (vec_load_op, vec_add_op, vec_zero_op) = match load_intrinsic {
+                    IntrinsicOp::LoadF64x2 => (
+                        IntrinsicOp::VecLoadF64x2,
+                        IntrinsicOp::VecAddF64x2,
+                        IntrinsicOp::VecZeroF64x2,
+                    ),
+                    IntrinsicOp::LoadI32x4 => (
+                        IntrinsicOp::VecLoadI32x4,
+                        IntrinsicOp::VecAddI32x4,
+                        IntrinsicOp::VecZeroI32x4,
+                    ),
+                    IntrinsicOp::VecLoadF32x4 => (
+                        IntrinsicOp::VecLoadF32x4,
+                        IntrinsicOp::VecAddF32x4,
+                        IntrinsicOp::VecZeroF32x4,
+                    ),
+                    IntrinsicOp::VecLoadWidenI32ToI64x2 => (
+                        IntrinsicOp::VecLoadWidenI32ToI64x2,
+                        IntrinsicOp::VecAddI64x2,
+                        IntrinsicOp::VecZeroI64x2,
+                    ),
+                    IntrinsicOp::VecLoadI64x2 => (
+                        IntrinsicOp::VecLoadI64x2,
+                        IntrinsicOp::VecAddI64x2,
+                        IntrinsicOp::VecZeroI64x2,
+                    ),
+                    // NEON 4-wide i32→i64 sum: load 4×I32, accumulate pairs (sadalp).
+                    IntrinsicOp::VecLoadI32x4 => (
+                        IntrinsicOp::VecLoadI32x4,
+                        IntrinsicOp::VecSadalpI32x4,
+                        IntrinsicOp::VecZeroI64x2,
+                    ),
+                    _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
+                };
 
-            // Create SSA values for vector operations
-            // IMPORTANT: Create init_zero_value FIRST (appears in entry block)
-            let init_zero_value = Value(next_val_id);
-            next_val_id += 1;
-            let vec_load = Value(next_val_id);
-            next_val_id += 1;
-            vec_sum_value = Value(next_val_id);
-            next_val_id += 1;
+                // Create SSA values for vector operations
+                // IMPORTANT: Create init_zero_value FIRST (appears in entry block)
+                let init_zero_value = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = Value(next_val_id);
+                next_val_id += 1;
 
-            // Initialize vector accumulator to zero in entry block
-            let entry_block = &mut func.blocks[0];
-            let zero_inst = Instruction::Intrinsic {
-                dest: Some(init_zero_value),
-                op: vec_zero_op,
-                dest_ptr: None,
-                args: vec![],
-            };
-            entry_block.instructions.push(zero_inst);
-            changes += 1;
+                // Initialize vector accumulator to zero in entry block
+                let entry_block = &mut func.blocks[0];
+                let zero_inst = Instruction::Intrinsic {
+                    dest: Some(init_zero_value),
+                    op: vec_zero_op,
+                    dest_ptr: None,
+                    args: vec![],
+                };
+                entry_block.instructions.push(zero_inst);
+                changes += 1;
 
-            if debug {
-                eprintln!(
-                    "[VEC-RED]   Created SSA values: vec_load={}, vec_sum={}",
-                    vec_load.0, vec_sum_value.0
-                );
-            }
-
-            // Update the accumulator PHI to use init_zero_value as the entry predecessor
-            let header_block = &mut func.blocks[pattern.header_idx];
-            for inst in header_block.instructions.iter_mut() {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    if *dest == pattern.accumulator_phi {
-                        for (val, _) in incoming.iter_mut() {
-                            if matches!(
-                                val,
-                                Operand::Const(IrConst::F32(_))
-                                    | Operand::Const(IrConst::F64(_))
-                                    | Operand::Const(IrConst::I32(0))
-                                    | Operand::Const(IrConst::I64(0))
-                                    | Operand::Const(IrConst::Zero)
-                            ) {
-                                *val = Operand::Value(init_zero_value);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Get latch label before taking mutable references
-            let latch_label = func.blocks[pattern.latch_idx].label;
-
-            // Create vector load (returns SSA value)
-            let load_inst = Instruction::Intrinsic {
-                dest: Some(vec_load),
-                op: vec_load_op,
-                dest_ptr: None,
-                args: {
-                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
-                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (
-                            Operand::Value(pattern.array_a_gep),
-                            Operand::Const(IrConst::I64(0)),
-                        ),
-                    };
-                    vec![base, off]
-                },
-            };
-
-            // Create vector add (accumulate) - reads from PHI, produces new value
-            let add_inst = Instruction::Intrinsic {
-                dest: Some(vec_sum_value),
-                op: vec_add_op,
-                dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.accumulator_phi),
-                    Operand::Value(vec_load),
-                ],
-            };
-
-            // Insert instructions and remove old scalar add
-            {
-                let body_block = &mut func.blocks[pattern.body_idx];
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx, load_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 1, add_inst);
-                body_block
-                    .instructions
-                    .remove(pattern.accumulator_add_idx + 2);
-                changes += 2;
-
-                // Debug: Log vector accumulator flow
                 if debug {
                     eprintln!(
-                        "[VEC-RED-DEBUG-SSE2] Vector accumulator SSA value: {}",
-                        vec_sum_value.0
+                        "[VEC-RED]   Created SSA values: vec_load={}, vec_sum={}",
+                        vec_load.0, vec_sum_value.0
                     );
-                    eprintln!(
-                        "[VEC-RED-DEBUG-SSE2] Accumulator PHI: {}",
-                        pattern.accumulator_phi.0
-                    );
-                    eprintln!(
-                        "[VEC-RED-DEBUG-SSE2] Entry init value: {}",
-                        init_zero_value.0
-                    );
-                    eprintln!("[VEC-RED-DEBUG-SSE2] Vector add op: {:?}", vec_add_op);
                 }
-            }
 
-            // Update the PHI's backedge to use vec_sum_value
-            {
+                // Update the accumulator PHI to use init_zero_value as the entry predecessor
                 let header_block = &mut func.blocks[pattern.header_idx];
                 for inst in header_block.instructions.iter_mut() {
                     if let Instruction::Phi { dest, incoming, .. } = inst {
                         if *dest == pattern.accumulator_phi {
-                            for (val, label) in incoming.iter_mut() {
-                                if *label == latch_label {
-                                    *val = Operand::Value(vec_sum_value);
+                            for (val, _) in incoming.iter_mut() {
+                                if matches!(
+                                    val,
+                                    Operand::Const(IrConst::F32(_))
+                                        | Operand::Const(IrConst::F64(_))
+                                        | Operand::Const(IrConst::I32(0))
+                                        | Operand::Const(IrConst::I64(0))
+                                        | Operand::Const(IrConst::Zero)
+                                ) {
+                                    *val = Operand::Value(init_zero_value);
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            if debug {
-                eprintln!("[VEC-RED]   Transformed sum body: load + add (register-based)");
-            }
-        }
-        // NEON 4-wide i32→i64 dot product: load both arrays 4×I32, then
-        // smlal (lanes 0-1) + smlal2 (lanes 2-3) into two independent 2×I64
-        // accumulators to break the loop-carried dependency chain.
-        ReductionKind::DotProduct
-            if pattern.element_type == IrType::I32
-                && pattern.accumulator_type == IrType::I64
-                && load_intrinsic == IntrinsicOp::VecLoadI32x4 =>
-        {
-            let vec_load_a = Value(next_val_id);
-            next_val_id += 1;
-            let vec_load_b = Value(next_val_id);
-            next_val_id += 1;
-            let acc0_next = Value(next_val_id);
-            next_val_id += 1;
-            let acc1_next = Value(next_val_id);
-            next_val_id += 1;
-            let init_zero0 = Value(next_val_id);
-            next_val_id += 1;
-            let init_zero1 = Value(next_val_id);
-            next_val_id += 1;
-            let acc1_phi = Value(next_val_id);
-            next_val_id += 1;
-            vec_sum_value = acc0_next;
-            second_acc = Some(acc1_phi);
+                // Get latch label before taking mutable references
+                let latch_label = func.blocks[pattern.latch_idx].label;
 
-            // Zero both vector accumulators in the entry block.
-            {
-                let entry_block = &mut func.blocks[0];
-                for init in [init_zero0, init_zero1] {
-                    entry_block.instructions.push(Instruction::Intrinsic {
-                        dest: Some(init),
-                        op: IntrinsicOp::VecZeroI64x2,
-                        dest_ptr: None,
-                        args: vec![],
-                    });
+                // Create vector load (returns SSA value)
+                let load_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: {
+                        let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                            (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                            _ => (
+                                Operand::Value(pattern.array_a_gep),
+                                Operand::Const(IrConst::I64(0)),
+                            ),
+                        };
+                        vec![base, off]
+                    },
+                };
+
+                // Create vector add (accumulate) - reads from PHI, produces new value
+                let add_inst = Instruction::Intrinsic {
+                    dest: Some(vec_sum_value),
+                    op: vec_add_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.accumulator_phi),
+                        Operand::Value(vec_load),
+                    ],
+                };
+
+                // Insert instructions and remove old scalar add
+                {
+                    let body_block = &mut func.blocks[pattern.body_idx];
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx, load_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 1, add_inst);
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 2);
+                    changes += 2;
+
+                    // Debug: Log vector accumulator flow
+                    if debug {
+                        eprintln!(
+                            "[VEC-RED-DEBUG-SSE2] Vector accumulator SSA value: {}",
+                            vec_sum_value.0
+                        );
+                        eprintln!(
+                            "[VEC-RED-DEBUG-SSE2] Accumulator PHI: {}",
+                            pattern.accumulator_phi.0
+                        );
+                        eprintln!(
+                            "[VEC-RED-DEBUG-SSE2] Entry init value: {}",
+                            init_zero_value.0
+                        );
+                        eprintln!("[VEC-RED-DEBUG-SSE2] Vector add op: {:?}", vec_add_op);
+                    }
                 }
-                changes += 2;
-            }
 
-            let latch_label = func.blocks[pattern.latch_idx].label;
-
-            // Rewire the original accumulator phi (acc0): entry → zero vector,
-            // backedge → smlal result. Remember the preheader label for acc1.
-            let mut preheader_label = None;
-            {
-                let header_block = &mut func.blocks[pattern.header_idx];
-                for inst in header_block.instructions.iter_mut() {
-                    if let Instruction::Phi { dest, incoming, .. } = inst {
-                        if *dest == pattern.accumulator_phi {
-                            for (val, label) in incoming.iter_mut() {
-                                if *label == latch_label {
-                                    *val = Operand::Value(acc0_next);
-                                } else {
-                                    preheader_label = Some(*label);
-                                    if matches!(val, Operand::Const(_)) {
-                                        *val = Operand::Value(init_zero0);
+                // Update the PHI's backedge to use vec_sum_value
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    for inst in header_block.instructions.iter_mut() {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming.iter_mut() {
+                                    if *label == latch_label {
+                                        *val = Operand::Value(vec_sum_value);
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
-            let Some(preheader_label) = preheader_label else {
+
                 if debug {
-                    eprintln!("[VEC-RED]   NEON dot: no preheader edge on accumulator phi");
+                    eprintln!("[VEC-RED]   Transformed sum body: load + add (register-based)");
                 }
-                return changes;
-            };
-
-            // Insert the second accumulator phi after the existing header phis.
+            }
+            // NEON 4-wide i32→i64 dot product: load both arrays 4×I32, then
+            // smlal (lanes 0-1) + smlal2 (lanes 2-3) into two independent 2×I64
+            // accumulators to break the loop-carried dependency chain.
+            ReductionKind::DotProduct
+                if pattern.element_type == IrType::I32
+                    && pattern.accumulator_type == IrType::I64
+                    && load_intrinsic == IntrinsicOp::VecLoadI32x4 =>
             {
-                let header_block = &mut func.blocks[pattern.header_idx];
-                let insert_pos = header_block
-                    .instructions
-                    .iter()
-                    .rposition(|inst| matches!(inst, Instruction::Phi { .. }))
-                    .map(|p| p + 1)
-                    .unwrap_or(0);
-                header_block.instructions.insert(
-                    insert_pos,
-                    Instruction::Phi {
-                        dest: acc1_phi,
-                        ty: IrType::I64,
-                        incoming: vec![
-                            (Operand::Value(init_zero1), preheader_label),
-                            (Operand::Value(acc1_next), latch_label),
-                        ],
-                    },
-                );
-                changes += 1;
-            }
+                let vec_load_a = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load_b = Value(next_val_id);
+                next_val_id += 1;
+                let acc0_next = Value(next_val_id);
+                next_val_id += 1;
+                let acc1_next = Value(next_val_id);
+                next_val_id += 1;
+                let init_zero0 = Value(next_val_id);
+                next_val_id += 1;
+                let init_zero1 = Value(next_val_id);
+                next_val_id += 1;
+                let acc1_phi = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = acc0_next;
+                second_acc = Some(acc1_phi);
 
-            // Body: two 4-wide loads + smlal/smlal2, replacing the scalar add.
-            {
-                let body_block = &mut func.blocks[pattern.body_idx];
-                body_block.instructions.insert(
-                    pattern.accumulator_add_idx,
-                    Instruction::Intrinsic {
-                        dest: Some(vec_load_a),
-                        op: IntrinsicOp::VecLoadI32x4,
-                        dest_ptr: None,
-                        args: vec![
-                            Operand::Value(pattern.array_a_gep),
-                            Operand::Const(IrConst::I64(0)),
-                        ],
-                    },
-                );
-                body_block.instructions.insert(
-                    pattern.accumulator_add_idx + 1,
-                    Instruction::Intrinsic {
-                        dest: Some(vec_load_b),
-                        op: IntrinsicOp::VecLoadI32x4,
-                        dest_ptr: None,
-                        args: vec![
-                            Operand::Value(pattern.array_b_gep.unwrap()),
-                            Operand::Const(IrConst::I64(0)),
-                        ],
-                    },
-                );
-                body_block.instructions.insert(
-                    pattern.accumulator_add_idx + 2,
-                    Instruction::Intrinsic {
-                        dest: Some(acc0_next),
-                        op: IntrinsicOp::VecSmlalLoI32x4,
-                        dest_ptr: None,
-                        args: vec![
-                            Operand::Value(pattern.accumulator_phi),
-                            Operand::Value(vec_load_a),
-                            Operand::Value(vec_load_b),
-                        ],
-                    },
-                );
-                body_block.instructions.insert(
-                    pattern.accumulator_add_idx + 3,
-                    Instruction::Intrinsic {
-                        dest: Some(acc1_next),
-                        op: IntrinsicOp::VecSmlalHiI32x4,
-                        dest_ptr: None,
-                        args: vec![
-                            Operand::Value(acc1_phi),
-                            Operand::Value(vec_load_a),
-                            Operand::Value(vec_load_b),
-                        ],
-                    },
-                );
-                // Remove the old scalar add; the scalar mul/casts/loads are now
-                // dead and cleaned up by DCE.
-                body_block
-                    .instructions
-                    .remove(pattern.accumulator_add_idx + 4);
-                changes += 4;
-            }
-
-            if debug {
-                eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)");
-            }
-        }
-        ReductionKind::DotProduct => {
-            // Dot product: sum += a[i] * b[i]
-            // Note: Only F64 dot products are supported (no integer multiply intrinsic yet)
-            // Create SSA values for vector operations
-            let vec_load_a = Value(next_val_id);
-            next_val_id += 1;
-            let vec_load_b = Value(next_val_id);
-            next_val_id += 1;
-            let vec_mul = Value(next_val_id);
-            next_val_id += 1;
-            vec_sum_value = Value(next_val_id);
-            next_val_id += 1;
-
-            // Map old intrinsics to new register-based intrinsics (F64 and F32)
-            let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op) = match load_intrinsic {
-                IntrinsicOp::LoadF64x2 => (
-                    IntrinsicOp::VecLoadF64x2,
-                    IntrinsicOp::VecMulF64x2,
-                    IntrinsicOp::VecAddF64x2,
-                    IntrinsicOp::VecZeroF64x2,
-                ),
-                IntrinsicOp::VecLoadF32x4 => (
-                    IntrinsicOp::VecLoadF32x4,
-                    IntrinsicOp::VecMulF32x4,
-                    IntrinsicOp::VecAddF32x4,
-                    IntrinsicOp::VecZeroF32x4,
-                ),
-                IntrinsicOp::VecLoadWidenI32ToI64x2 => (
-                    IntrinsicOp::VecLoadWidenI32ToI64x2,
-                    IntrinsicOp::VecMulI64x2,
-                    IntrinsicOp::VecAddI64x2,
-                    IntrinsicOp::VecZeroI64x2,
-                ),
-                IntrinsicOp::LoadI32x4 => (
-                    IntrinsicOp::VecLoadI32x4,
-                    IntrinsicOp::VecMulI32x4,
-                    IntrinsicOp::VecAddI32x4,
-                    IntrinsicOp::VecZeroI32x4,
-                ),
-                IntrinsicOp::VecLoadI64x2 => (
-                    IntrinsicOp::VecLoadI64x2,
-                    IntrinsicOp::VecMulI64x2,
-                    IntrinsicOp::VecAddI64x2,
-                    IntrinsicOp::VecZeroI64x2,
-                ),
-                _ => {
-                    if debug {
-                        eprintln!(
-                            "[VEC-RED] Unsupported SSE2 dot product type: {:?}",
-                            load_intrinsic
-                        );
+                // Zero both vector accumulators in the entry block.
+                {
+                    let entry_block = &mut func.blocks[0];
+                    for init in [init_zero0, init_zero1] {
+                        entry_block.instructions.push(Instruction::Intrinsic {
+                            dest: Some(init),
+                            op: IntrinsicOp::VecZeroI64x2,
+                            dest_ptr: None,
+                            args: vec![],
+                        });
                     }
-                    return changes;
+                    changes += 2;
                 }
-            };
 
-            // Initialize vector accumulator to zero in entry block
-            let entry_block = &mut func.blocks[0];
-            let init_zero_value = Value(next_val_id);
-            next_val_id += 1;
-            let zero_inst = Instruction::Intrinsic {
-                dest: Some(init_zero_value),
-                op: vec_zero_op,
-                dest_ptr: None,
-                args: vec![],
-            };
-            entry_block.instructions.push(zero_inst);
-            changes += 1;
+                let latch_label = func.blocks[pattern.latch_idx].label;
 
-            if debug {
-                eprintln!("[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
-                    vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0);
-            }
-
-            // Update the accumulator PHI to use init_zero_value as the entry predecessor
-            let header_block = &mut func.blocks[pattern.header_idx];
-            for inst in header_block.instructions.iter_mut() {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    if *dest == pattern.accumulator_phi {
-                        for (val, _) in incoming.iter_mut() {
-                            if matches!(
-                                val,
-                                Operand::Const(IrConst::F32(_))
-                                    | Operand::Const(IrConst::F64(_))
-                                    | Operand::Const(IrConst::I32(0))
-                                    | Operand::Const(IrConst::I64(0))
-                                    | Operand::Const(IrConst::Zero)
-                            ) {
-                                *val = Operand::Value(init_zero_value);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Get latch label before taking mutable references
-            let latch_label = func.blocks[pattern.latch_idx].label;
-
-            // Create vector loads (return SSA values)
-            let load_a_inst = Instruction::Intrinsic {
-                dest: Some(vec_load_a),
-                op: vec_load_op,
-                dest_ptr: None,
-                args: {
-                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
-                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (
-                            Operand::Value(pattern.array_a_gep),
-                            Operand::Const(IrConst::I64(0)),
-                        ),
-                    };
-                    vec![base, off]
-                },
-            };
-
-            let load_b_inst = Instruction::Intrinsic {
-                dest: Some(vec_load_b),
-                op: vec_load_op,
-                dest_ptr: None,
-                args: {
-                    let (base, off) = match (use_byte_iv, &byte_iv_b) {
-                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (
-                            Operand::Value(pattern.array_b_gep.unwrap()),
-                            Operand::Const(IrConst::I64(0)),
-                        ),
-                    };
-                    vec![base, off]
-                },
-            };
-
-            // Create vector multiply (element-wise)
-            let mul_inst = Instruction::Intrinsic {
-                dest: Some(vec_mul),
-                op: vec_mul_op,
-                dest_ptr: None,
-                args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
-            };
-
-            // Create vector add (accumulate)
-            let add_inst = Instruction::Intrinsic {
-                dest: Some(vec_sum_value),
-                op: vec_add_op,
-                dest_ptr: None,
-                args: vec![
-                    Operand::Value(pattern.accumulator_phi),
-                    Operand::Value(vec_mul),
-                ],
-            };
-
-            // Insert all instructions and remove old scalar operations
-            {
-                let body_block = &mut func.blocks[pattern.body_idx];
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx, load_a_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 1, load_b_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 2, mul_inst);
-                body_block
-                    .instructions
-                    .insert(pattern.accumulator_add_idx + 3, add_inst);
-
-                // Remove the dead scalar add (now after the 4 inserted vector
-                // ops). The dead scalar multiply that fed it becomes unreachable
-                // and is cleaned up by DCE. The old code removed TWO
-                // instructions at accumulator_add_idx + 4, which accidentally
-                // deleted the latch's induction-variable increment once the
-                // byte-offset IV stopped inserting per-GEP multiplies
-                // (infinite loop / undefined IV on dot products).
-                body_block
-                    .instructions
-                    .remove(pattern.accumulator_add_idx + 4);
-                changes += 4;
-            }
-
-            // Update the PHI's backedge to use vec_sum_value
-            {
-                let header_block = &mut func.blocks[pattern.header_idx];
-                for inst in header_block.instructions.iter_mut() {
-                    if let Instruction::Phi { dest, incoming, .. } = inst {
-                        if *dest == pattern.accumulator_phi {
-                            for (val, label) in incoming.iter_mut() {
-                                if *label == latch_label {
-                                    *val = Operand::Value(vec_sum_value);
+                // Rewire the original accumulator phi (acc0): entry → zero vector,
+                // backedge → smlal result. Remember the preheader label for acc1.
+                let mut preheader_label = None;
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    for inst in header_block.instructions.iter_mut() {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming.iter_mut() {
+                                    if *label == latch_label {
+                                        *val = Operand::Value(acc0_next);
+                                    } else {
+                                        preheader_label = Some(*label);
+                                        if matches!(val, Operand::Const(_)) {
+                                            *val = Operand::Value(init_zero0);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
+                let Some(preheader_label) = preheader_label else {
+                    if debug {
+                        eprintln!("[VEC-RED]   NEON dot: no preheader edge on accumulator phi");
+                    }
+                    return changes;
+                };
 
-            if debug {
-                eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)");
+                // Insert the second accumulator phi after the existing header phis.
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    let insert_pos = header_block
+                        .instructions
+                        .iter()
+                        .rposition(|inst| matches!(inst, Instruction::Phi { .. }))
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    header_block.instructions.insert(
+                        insert_pos,
+                        Instruction::Phi {
+                            dest: acc1_phi,
+                            ty: IrType::I64,
+                            incoming: vec![
+                                (Operand::Value(init_zero1), preheader_label),
+                                (Operand::Value(acc1_next), latch_label),
+                            ],
+                        },
+                    );
+                    changes += 1;
+                }
+
+                // Body: two 4-wide loads + smlal/smlal2, replacing the scalar add.
+                {
+                    let body_block = &mut func.blocks[pattern.body_idx];
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx,
+                        Instruction::Intrinsic {
+                            dest: Some(vec_load_a),
+                            op: IntrinsicOp::VecLoadI32x4,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.array_a_gep),
+                                Operand::Const(IrConst::I64(0)),
+                            ],
+                        },
+                    );
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx + 1,
+                        Instruction::Intrinsic {
+                            dest: Some(vec_load_b),
+                            op: IntrinsicOp::VecLoadI32x4,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.array_b_gep.unwrap()),
+                                Operand::Const(IrConst::I64(0)),
+                            ],
+                        },
+                    );
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx + 2,
+                        Instruction::Intrinsic {
+                            dest: Some(acc0_next),
+                            op: IntrinsicOp::VecSmlalLoI32x4,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi),
+                                Operand::Value(vec_load_a),
+                                Operand::Value(vec_load_b),
+                            ],
+                        },
+                    );
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx + 3,
+                        Instruction::Intrinsic {
+                            dest: Some(acc1_next),
+                            op: IntrinsicOp::VecSmlalHiI32x4,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(acc1_phi),
+                                Operand::Value(vec_load_a),
+                                Operand::Value(vec_load_b),
+                            ],
+                        },
+                    );
+                    // Remove the old scalar add; the scalar mul/casts/loads are now
+                    // dead and cleaned up by DCE.
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 4);
+                    changes += 4;
+                }
+
+                if debug {
+                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)");
+                }
+            }
+            ReductionKind::DotProduct => {
+                // Dot product: sum += a[i] * b[i]
+                // Note: Only F64 dot products are supported (no integer multiply intrinsic yet)
+                // Create SSA values for vector operations
+                let vec_load_a = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load_b = Value(next_val_id);
+                next_val_id += 1;
+                let vec_mul = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = Value(next_val_id);
+                next_val_id += 1;
+
+                // Map old intrinsics to new register-based intrinsics (F64 and F32)
+                let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op) = match load_intrinsic {
+                    IntrinsicOp::LoadF64x2 => (
+                        IntrinsicOp::VecLoadF64x2,
+                        IntrinsicOp::VecMulF64x2,
+                        IntrinsicOp::VecAddF64x2,
+                        IntrinsicOp::VecZeroF64x2,
+                    ),
+                    IntrinsicOp::VecLoadF32x4 => (
+                        IntrinsicOp::VecLoadF32x4,
+                        IntrinsicOp::VecMulF32x4,
+                        IntrinsicOp::VecAddF32x4,
+                        IntrinsicOp::VecZeroF32x4,
+                    ),
+                    IntrinsicOp::VecLoadWidenI32ToI64x2 => (
+                        IntrinsicOp::VecLoadWidenI32ToI64x2,
+                        IntrinsicOp::VecMulI64x2,
+                        IntrinsicOp::VecAddI64x2,
+                        IntrinsicOp::VecZeroI64x2,
+                    ),
+                    IntrinsicOp::LoadI32x4 => (
+                        IntrinsicOp::VecLoadI32x4,
+                        IntrinsicOp::VecMulI32x4,
+                        IntrinsicOp::VecAddI32x4,
+                        IntrinsicOp::VecZeroI32x4,
+                    ),
+                    IntrinsicOp::VecLoadI64x2 => (
+                        IntrinsicOp::VecLoadI64x2,
+                        IntrinsicOp::VecMulI64x2,
+                        IntrinsicOp::VecAddI64x2,
+                        IntrinsicOp::VecZeroI64x2,
+                    ),
+                    _ => {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED] Unsupported SSE2 dot product type: {:?}",
+                                load_intrinsic
+                            );
+                        }
+                        return changes;
+                    }
+                };
+
+                // Initialize vector accumulator to zero in entry block
+                let entry_block = &mut func.blocks[0];
+                let init_zero_value = Value(next_val_id);
+                next_val_id += 1;
+                let zero_inst = Instruction::Intrinsic {
+                    dest: Some(init_zero_value),
+                    op: vec_zero_op,
+                    dest_ptr: None,
+                    args: vec![],
+                };
+                entry_block.instructions.push(zero_inst);
+                changes += 1;
+
+                if debug {
+                    eprintln!("[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
+                        vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0);
+                }
+
+                // Update the accumulator PHI to use init_zero_value as the entry predecessor
+                let header_block = &mut func.blocks[pattern.header_idx];
+                for inst in header_block.instructions.iter_mut() {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        if *dest == pattern.accumulator_phi {
+                            for (val, _) in incoming.iter_mut() {
+                                if matches!(
+                                    val,
+                                    Operand::Const(IrConst::F32(_))
+                                        | Operand::Const(IrConst::F64(_))
+                                        | Operand::Const(IrConst::I32(0))
+                                        | Operand::Const(IrConst::I64(0))
+                                        | Operand::Const(IrConst::Zero)
+                                ) {
+                                    *val = Operand::Value(init_zero_value);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Get latch label before taking mutable references
+                let latch_label = func.blocks[pattern.latch_idx].label;
+
+                // Create vector loads (return SSA values)
+                let load_a_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load_a),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: {
+                        let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                            (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                            _ => (
+                                Operand::Value(pattern.array_a_gep),
+                                Operand::Const(IrConst::I64(0)),
+                            ),
+                        };
+                        vec![base, off]
+                    },
+                };
+
+                let load_b_inst = Instruction::Intrinsic {
+                    dest: Some(vec_load_b),
+                    op: vec_load_op,
+                    dest_ptr: None,
+                    args: {
+                        let (base, off) = match (use_byte_iv, &byte_iv_b) {
+                            (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                            _ => (
+                                Operand::Value(pattern.array_b_gep.unwrap()),
+                                Operand::Const(IrConst::I64(0)),
+                            ),
+                        };
+                        vec![base, off]
+                    },
+                };
+
+                // Create vector multiply (element-wise)
+                let mul_inst = Instruction::Intrinsic {
+                    dest: Some(vec_mul),
+                    op: vec_mul_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
+                };
+
+                // Create vector add (accumulate)
+                let add_inst = Instruction::Intrinsic {
+                    dest: Some(vec_sum_value),
+                    op: vec_add_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(pattern.accumulator_phi),
+                        Operand::Value(vec_mul),
+                    ],
+                };
+
+                // Insert all instructions and remove old scalar operations
+                {
+                    let body_block = &mut func.blocks[pattern.body_idx];
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx, load_a_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 1, load_b_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 2, mul_inst);
+                    body_block
+                        .instructions
+                        .insert(pattern.accumulator_add_idx + 3, add_inst);
+
+                    // Remove the dead scalar add (now after the 4 inserted vector
+                    // ops). The dead scalar multiply that fed it becomes unreachable
+                    // and is cleaned up by DCE. The old code removed TWO
+                    // instructions at accumulator_add_idx + 4, which accidentally
+                    // deleted the latch's induction-variable increment once the
+                    // byte-offset IV stopped inserting per-GEP multiplies
+                    // (infinite loop / undefined IV on dot products).
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 4);
+                    changes += 4;
+                }
+
+                // Update the PHI's backedge to use vec_sum_value
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    for inst in header_block.instructions.iter_mut() {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming.iter_mut() {
+                                    if *label == latch_label {
+                                        *val = Operand::Value(vec_sum_value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if debug {
+                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)");
+                }
             }
         }
+
+    } else {
+        // Multi-reduction (SSE2/NEON 2-wide): mirror the AVX2 path, deriving
+        // the vector ops from `load_intrinsic` exactly like the single
+        // accumulator arms do.  Process in descending add-index order.
+        let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op) = match load_intrinsic {
+            IntrinsicOp::LoadF64x2 => (
+                IntrinsicOp::VecLoadF64x2,
+                Some(IntrinsicOp::VecMulF64x2),
+                IntrinsicOp::VecAddF64x2,
+                IntrinsicOp::VecZeroF64x2,
+            ),
+            IntrinsicOp::VecLoadF32x4 => (
+                IntrinsicOp::VecLoadF32x4,
+                Some(IntrinsicOp::VecMulF32x4),
+                IntrinsicOp::VecAddF32x4,
+                IntrinsicOp::VecZeroF32x4,
+            ),
+            IntrinsicOp::LoadI32x4 => (
+                IntrinsicOp::VecLoadI32x4,
+                Some(IntrinsicOp::VecMulI32x4),
+                IntrinsicOp::VecAddI32x4,
+                IntrinsicOp::VecZeroI32x4,
+            ),
+            IntrinsicOp::VecLoadI64x2 => (
+                IntrinsicOp::VecLoadI64x2,
+                Some(IntrinsicOp::VecMulI64x2),
+                IntrinsicOp::VecAddI64x2,
+                IntrinsicOp::VecZeroI64x2,
+            ),
+            // Widening/NEON-only forms never reach the multi path: the
+            // analyzer rejects widening multi-reductions up front.
+            _ => return 0,
+        };
+
+        let sec = pattern.second.as_ref().unwrap();
+        let sec_byte_iv_a = find_reduction_byte_iv(
+            func,
+            &pattern.loop_blocks,
+            sec.array_a_gep,
+            elem_sz as u32,
+        );
+        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
+            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
+        });
+
+        let mut order = [
+            (
+                pattern.accumulator_phi,
+                pattern.accumulator_add_idx,
+                pattern.array_a_gep,
+                pattern.array_b_gep,
+                byte_iv_a,
+                byte_iv_b,
+                true,
+            ),
+            (
+                sec.accumulator_phi,
+                sec.accumulator_add_idx,
+                sec.array_a_gep,
+                sec.array_b_gep,
+                sec_byte_iv_a,
+                sec_byte_iv_b,
+                false,
+            ),
+        ];
+        order.sort_by_key(|&(_, add_idx, ..)| std::cmp::Reverse(add_idx));
+
+        let mut primary_sum = Value(u32::MAX);
+        for (phi, add_idx, a_gep, b_gep, ba, bb, is_primary) in order {
+            let (_init, sum, n) = rewrite_reduction_body(
+                func,
+                pattern.header_idx,
+                pattern.body_idx,
+                pattern.latch_idx,
+                pattern.kind,
+                use_byte_iv,
+                vec_load_op,
+                vec_add_op,
+                vec_zero_op,
+                vec_mul_op,
+                false,
+                None,
+                phi,
+                add_idx,
+                a_gep,
+                b_gep,
+                ba,
+                bb,
+                &mut next_val_id,
+            );
+            changes += n;
+            if is_primary {
+                primary_sum = sum;
+            }
+        }
+        debug_assert!(primary_sum.0 != u32::MAX, "primary accumulator not rewritten");
+        vec_sum_value = primary_sum;
     }
 
     // Step 4: Create remainder loop
@@ -6453,6 +7324,7 @@ fn transform_reduction_sse2(
         vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
         second_acc, // Second NEON accumulator phi (smlal2 half), if any
+        pattern.second.as_ref(), // Second independent accumulator, if any
         &mut next_val_id,
         &mut next_label,
     );

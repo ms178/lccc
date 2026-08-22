@@ -104,6 +104,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("constant_recursion.c",), ("synthetic", "recursion", "specialization")),
     Benchmark("bitops", "bit manipulation / integer selection",
               ("bitops.c",), ("synthetic", "bit", "integer")),
+    Benchmark("double_reduction", "two independent accumulators per loop (multi-reduction)",
+              ("double_reduction.c",), ("synthetic", "vectorize", "integer", "loop")),
     Benchmark("ascii_case_fold", "ASCII parser case-fold byte loop / branch selection",
               ("ascii_case_fold.c",), ("synthetic", "parser", "branch", "memory")),
     Benchmark("binary_search", "sorted-table binary search / branch-heavy lookup",
