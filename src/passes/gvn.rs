@@ -97,6 +97,54 @@ struct MemoryVersion {
     base: u64,
 }
 
+/// A provably-distinct memory object a pointer may be rooted at.  Load-CSE and
+/// store-to-load-forwarding entries keyed on such an object only need to be
+/// invalidated by stores through pointers rooted at the SAME object.
+///
+/// Soundness of the per-object epochs (established in the session-42/45 alias
+/// work and re-derived here):
+///
+/// * two `Alloca`s are distinct frame objects;
+/// * an `Alloca` and a `Global` are frame vs static storage;
+/// * an `Alloca` and any parameter are distinct — a parameter's value is fixed
+///   at function entry, before the callee's frame exists;
+/// * a `NoAliasParam` (`restrict` pointer) is distinct from every other object
+///   by the C restrict contract (the pointee is accessed only through that
+///   parameter and pointers derived from it);
+/// * distinct `Global`s are disjoint (the pre-existing GVN assumption; GNU
+///   symbol aliases are canonicalized through `GvnContext::canonical`).
+///
+/// `NoAliasParam`s never alias anything, and `Alloca`s only alias themselves
+/// PROVIDED their address cannot be recovered by untracked code.  An alloca is
+/// therefore only admitted when `find_nonescaping_allocas` proves its address
+/// never escapes (never stored, passed to a call/asm, or used in a
+/// terminator): with no escape, every pointer that can reach it is derived
+/// in-function from the alloca itself and is tracked here.  Any pointer GVN
+/// cannot classify stays `Unknown` (no entry), and stores through it bump the
+/// global generation, which invalidates every cached load.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PtrBase {
+    Global(String),
+    Alloca(u32),
+    NoAliasParam(usize),
+}
+
+/// Epoch-map key for a `PtrBase`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ObjKey {
+    Sym(String),
+    Alloca(u32),
+    Param(usize),
+}
+
+fn obj_key(base: &PtrBase) -> ObjKey {
+    match base {
+        PtrBase::Global(s) => ObjKey::Sym(s.clone()),
+        PtrBase::Alloca(id) => ObjKey::Alloca(*id),
+        PtrBase::NoAliasParam(i) => ObjKey::Param(*i),
+    }
+}
+
 /// Module facts needed to canonicalize GNU symbol aliases during GVN.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GvnContext {
@@ -156,19 +204,26 @@ struct GvnState {
     load_generation: u32,
     /// Store-to-load forwarding map with the version recorded after the store.
     store_fwd_map: FxHashMap<StoreFwdKey, (Operand, MemoryVersion)>,
-    /// Pointer value number -> global symbol name, for pointers that resolve to
-    /// a named global (GlobalAddr, or GEP rooted at one). Two distinct globals
-    /// are disjoint objects and never alias, so a store to one cannot affect
-    /// loads of the other; per-symbol store epochs exploit this.
-    ptr_global_base: FxHashMap<u32, String>,
-    /// Global symbol -> epoch of its most recent store. Load CSE and store-to-
-    /// load forwarding entries are valid only if they predate the last store to
-    /// the SAME symbol (GEPs within a symbol may overlap, so any store in the
-    /// symbol invalidates all loads in it; stores to other symbols do not).
-    base_store_epoch: FxHashMap<String, u64>,
+    /// Pointer value number -> provably-distinct base object, for pointers
+    /// rooted at a named global, a non-escaping alloca, or a `restrict`
+    /// parameter.  Two pointers with different roots never alias, so a store
+    /// through one only invalidates cached loads through the same object;
+    /// per-object store epochs exploit this (see `PtrBase`).
+    ptr_base: FxHashMap<u32, PtrBase>,
+    /// Base object -> epoch of its most recent store.  Load CSE and store-to-
+    /// load forwarding entries are valid only if they predate the last store
+    /// to the SAME object (GEPs within an object may overlap, so any store in
+    /// the object invalidates all loads in it; stores to other objects do not).
+    base_store_epoch: FxHashMap<ObjKey, u64>,
     next_base_epoch: u64,
-    /// Rollback log for per-symbol epochs.
-    base_epoch_log: Vec<(String, Option<u64>)>,
+    /// Rollback log for per-object epochs.
+    base_epoch_log: Vec<(ObjKey, Option<u64>)>,
+    /// Non-escaping allocas (computed once per function): only these get
+    /// `PtrBase::Alloca` epochs.
+    nonescaping_allocas: FxHashSet<u32>,
+    /// `restrict` pointer parameter indices: only these get
+    /// `PtrBase::NoAliasParam` epochs.
+    noalias_params: FxHashSet<usize>,
     context: GvnContext,
     /// Rollback log for `expr_to_value`: (key, previous_value).
     rollback_log: Vec<(ExprKey, Option<Value>)>,
@@ -215,6 +270,8 @@ impl GvnState {
         context: &GvnContext,
         must_mat_gaddrs: FxHashSet<u32>,
         site_local_gaddrs: FxHashSet<u32>,
+        nonescaping_allocas: FxHashSet<u32>,
+        noalias_params: FxHashSet<usize>,
     ) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
@@ -224,10 +281,12 @@ impl GvnState {
             gep_value_numbers: FxHashMap::default(),
             load_generation: 0,
             store_fwd_map: FxHashMap::default(),
-            ptr_global_base: FxHashMap::default(),
+            ptr_base: FxHashMap::default(),
             base_store_epoch: FxHashMap::default(),
             next_base_epoch: 0,
             base_epoch_log: Vec::new(),
+            nonescaping_allocas,
+            noalias_params,
             context: context.clone(),
             rollback_log: Vec::new(),
             load_rollback_log: Vec::new(),
@@ -297,9 +356,9 @@ impl GvnState {
     fn memory_version(&self, ptr_vn: &VNOperand) -> MemoryVersion {
         let base = match ptr_vn {
             VNOperand::ValueNum(v) => self
-                .ptr_global_base
+                .ptr_base
                 .get(v)
-                .and_then(|name| self.base_store_epoch.get(name))
+                .and_then(|base| self.base_store_epoch.get(&obj_key(base)))
                 .copied()
                 .unwrap_or(0),
             VNOperand::Const(_) => 0,
@@ -314,33 +373,131 @@ impl GvnState {
         version == self.memory_version(ptr_vn)
     }
 
-    /// Record that `inst`'s destination pointer resolves to a named global, so
-    /// later stores can invalidate only that symbol's cached loads.
-    fn track_global_ptr_base(&mut self, inst: &Instruction) {
+    /// Resolve an operand's base object, or `None` when it is unclassified.
+    /// Only consults already-assigned value numbers (fail closed on
+    /// un-numbered values — those get no epoch and stay conservative).
+    fn base_of(&self, op: &Operand) -> Option<PtrBase> {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        let idx = v.0 as usize;
+        if idx >= self.value_numbers.len() || self.value_numbers[idx] == u32::MAX {
+            return None;
+        }
+        self.ptr_base.get(&self.value_numbers[idx]).cloned()
+    }
+
+    /// Propagate `src`'s base object to `dest`'s value number, if any.
+    fn propagate_ptr_base(&mut self, src: Value, dest: Value) {
+        let src_vn = match self.operand_to_vn(&Operand::Value(src)) {
+            VNOperand::ValueNum(vn) => vn,
+            VNOperand::Const(_) => return,
+        };
+        let d_idx = dest.0 as usize;
+        if d_idx >= self.value_numbers.len() || self.value_numbers[d_idx] == u32::MAX {
+            return;
+        }
+        if let Some(base) = self.ptr_base.get(&src_vn).cloned() {
+            self.ptr_base.insert(self.value_numbers[d_idx], base);
+        }
+    }
+
+    /// Record `inst`'s destination pointer's base object so later stores can
+    /// invalidate only that object's cached loads.  Roots are `GlobalAddr`,
+    /// non-escaping `Alloca`, and `restrict` `ParamRef`; the base propagates
+    /// through single-source address-preserving operations (`GetElementPtr`,
+    /// pointer-to-pointer `Cast`, `Copy`) and through integer-width pointer
+    /// arithmetic (`Add` with exactly one rooted operand, `Sub` with a rooted
+    /// left operand).  Every other shape — phis/selects with mixed bases,
+    /// loads of pointers, non-pointer casts, two-pointer arithmetic — stays
+    /// `Unknown` and falls back to the global generation.
+    fn track_ptr_base(&mut self, inst: &Instruction) {
         match inst {
             Instruction::GlobalAddr { dest, name } => {
                 let idx = dest.0 as usize;
                 if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
-                    self.ptr_global_base.insert(
+                    self.ptr_base.insert(
                         self.value_numbers[idx],
-                        self.context.canonical(name).to_string(),
+                        PtrBase::Global(self.context.canonical(name).to_string()),
                     );
                 }
             }
+            Instruction::Alloca { dest, .. } => {
+                if self.nonescaping_allocas.contains(&dest.0) {
+                    let idx = dest.0 as usize;
+                    if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
+                        self.ptr_base
+                            .insert(self.value_numbers[idx], PtrBase::Alloca(dest.0));
+                    }
+                }
+            }
+            Instruction::ParamRef {
+                dest, param_idx, ty, ..
+            } => {
+                if *ty == IrType::Ptr && self.noalias_params.contains(param_idx) {
+                    let idx = dest.0 as usize;
+                    if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
+                        self.ptr_base.insert(
+                            self.value_numbers[idx],
+                            PtrBase::NoAliasParam(*param_idx),
+                        );
+                    }
+                }
+            }
             Instruction::GetElementPtr { dest, base, .. } => {
-                let b_idx = base.0 as usize;
-                let d_idx = dest.0 as usize;
-                if b_idx < self.value_numbers.len()
-                    && d_idx < self.value_numbers.len()
-                    && self.value_numbers[b_idx] != u32::MAX
-                    && self.value_numbers[d_idx] != u32::MAX
-                {
-                    if let Some(sym) = self
-                        .ptr_global_base
-                        .get(&self.value_numbers[b_idx])
-                        .cloned()
+                self.propagate_ptr_base(*base, *dest);
+            }
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+            } => {
+                self.propagate_ptr_base(*src, *dest);
+            }
+            Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } if *from_ty == IrType::Ptr && *to_ty == IrType::Ptr => {
+                if let Operand::Value(src) = src {
+                    self.propagate_ptr_base(*src, *dest);
+                }
+            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let base = match (self.base_of(lhs), self.base_of(rhs)) {
+                    (Some(b), None) | (None, Some(b)) => Some(b),
+                    _ => None,
+                };
+                if let Some(base) = base {
+                    let d_idx = dest.0 as usize;
+                    if d_idx < self.value_numbers.len()
+                        && self.value_numbers[d_idx] != u32::MAX
                     {
-                        self.ptr_global_base.insert(self.value_numbers[d_idx], sym);
+                        self.ptr_base.insert(self.value_numbers[d_idx], base);
+                    }
+                }
+            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Sub,
+                lhs,
+                rhs,
+                ..
+            } => {
+                // `ptr - offset` preserves the base; `ptr - ptr` (a distance)
+                // and `offset - ptr` (invalid C) do not.
+                if let (Some(base), None) = (self.base_of(lhs), self.base_of(rhs)) {
+                    let d_idx = dest.0 as usize;
+                    if d_idx < self.value_numbers.len()
+                        && self.value_numbers[d_idx] != u32::MAX
+                    {
+                        self.ptr_base.insert(self.value_numbers[d_idx], base);
                     }
                 }
             }
@@ -745,6 +902,134 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     run_gvn_function_with_context(func, &GvnContext::default())
 }
 
+/// Allocas whose address provably never escapes the function.
+///
+/// The owner-set fixpoint propagates every alloca's address through
+/// address-preserving operations (GEP, Copy, Cast, BinOp/UnaryOp integer
+/// folding, Phi, Select); an alloca ESCAPES as soon as any value carrying its
+/// address is stored as data, passed to a call/asm, used in a terminator, or
+/// written by an atomic.  Only non-escaping allocas are safe for
+/// `PtrBase::Alloca` epochs: if the address cannot leave the function, every
+/// pointer that can reach the alloca is tracked by GVN and carries its epoch.
+///
+/// The fixpoint deliberately over-approximates address carriers (an int-folded
+/// address still counts), so a root is never falsely reported non-escaping.
+fn find_nonescaping_allocas(func: &IrFunction) -> FxHashSet<u32> {
+    let mut roots: FxHashSet<u32> = FxHashSet::default();
+    let mut owners: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                roots.insert(dest.0);
+                let mut s = FxHashSet::default();
+                s.insert(dest.0);
+                owners.insert(dest.0, s);
+            }
+        }
+    }
+    if owners.is_empty() {
+        return roots;
+    }
+
+    // Propagate owner sets through address-preserving operations to a fixpoint.
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Some(dest) = inst.dest() else { continue };
+                if !matches!(
+                    inst,
+                    Instruction::GetElementPtr { .. }
+                        | Instruction::Copy { .. }
+                        | Instruction::Cast { .. }
+                        | Instruction::BinOp { .. }
+                        | Instruction::UnaryOp { .. }
+                        | Instruction::Phi { .. }
+                        | Instruction::Select { .. }
+                ) {
+                    continue;
+                }
+                let mut incoming: FxHashSet<u32> = FxHashSet::default();
+                inst.for_each_used_value(|v| {
+                    if let Some(o) = owners.get(&v) {
+                        incoming.extend(o.iter().copied());
+                    }
+                });
+                if incoming.is_empty() {
+                    continue;
+                }
+                let entry = owners.entry(dest.0).or_default();
+                for o in incoming {
+                    if entry.insert(o) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut escaped: FxHashSet<u32> = FxHashSet::default();
+    fn mark_value(
+        v: u32,
+        owners: &FxHashMap<u32, FxHashSet<u32>>,
+        escaped: &mut FxHashSet<u32>,
+    ) {
+        if let Some(o) = owners.get(&v) {
+            escaped.extend(o.iter().copied());
+        }
+    }
+    fn mark_operand(
+        op: &Operand,
+        owners: &FxHashMap<u32, FxHashSet<u32>>,
+        escaped: &mut FxHashSet<u32>,
+    ) {
+        if let Operand::Value(v) = op {
+            mark_value(v.0, owners, escaped);
+        }
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Store { val, .. } => mark_operand(val, &owners, &mut escaped),
+                Instruction::AtomicStore { val, .. }
+                | Instruction::AtomicRmw { val, .. } => mark_operand(val, &owners, &mut escaped),
+                Instruction::AtomicCmpxchg {
+                    expected, desired, ..
+                } => {
+                    mark_operand(expected, &owners, &mut escaped);
+                    mark_operand(desired, &owners, &mut escaped);
+                }
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::InlineAsm { .. }
+                | Instruction::StackRestore { .. } => {
+                    inst.for_each_used_value(|v| mark_value(v, &owners, &mut escaped));
+                }
+                _ => {}
+            }
+        }
+        block
+            .terminator
+            .for_each_used_value(|v| mark_value(v, &owners, &mut escaped));
+    }
+
+    roots.retain(|r| !escaped.contains(r));
+    roots
+}
+
+/// `restrict` pointer parameter indices (their `IrParam.noalias` flag).
+fn find_noalias_params(func: &IrFunction) -> FxHashSet<usize> {
+    func.params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.noalias)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
@@ -752,6 +1037,8 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
     }
     let escaped = find_escaped_param_allocas(func);
     let volatile = find_volatile_allocas(func);
+    let nonescaping = find_nonescaping_allocas(func);
+    let noalias = find_noalias_params(func);
     if num_blocks == 1 {
         let mut state = GvnState::new(
             func.max_value_id() as usize,
@@ -761,6 +1048,8 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
             context,
             super::global_addr_cse::classify_must_materialize(func),
             super::global_addr_cse::classify_site_local_indexed(func),
+            nonescaping,
+            noalias,
         );
         return process_block(0, func, &mut state);
     }
@@ -786,6 +1075,8 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     let volatile = find_volatile_allocas(func);
     let must_mat = super::global_addr_cse::classify_must_materialize(func);
     let site_local = super::global_addr_cse::classify_site_local_indexed(func);
+    let nonescaping = find_nonescaping_allocas(func);
+    let noalias = find_noalias_params(func);
     if num_blocks == 1 {
         let mut state = GvnState::new(
             func.max_value_id() as usize,
@@ -795,6 +1086,8 @@ pub(crate) fn run_gvn_with_analysis_and_context(
             context,
             must_mat,
             site_local,
+            nonescaping,
+            noalias,
         );
         return process_block(0, func, &mut state);
     }
@@ -806,6 +1099,8 @@ pub(crate) fn run_gvn_with_analysis_and_context(
         context,
         must_mat,
         site_local,
+        nonescaping,
+        noalias,
     );
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
     state.total_eliminated
@@ -932,17 +1227,17 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
             } else {
                 let pv = state.operand_to_vn(&Operand::Value(*ptr));
                 if let VNOperand::ValueNum(pvn) = pv {
-                    match state.ptr_global_base.get(&pvn) {
-                        Some(sym) => {
+                    match state.ptr_base.get(&pvn) {
+                        Some(base) => {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                eprintln!("[GVNDBG] store bumps epoch of {}", sym);
+                                eprintln!("[GVNDBG] store bumps epoch of {:?}", base);
                             }
-                            let sym = sym.clone();
+                            let key = obj_key(base);
                             state.next_base_epoch = state.next_base_epoch.saturating_add(1);
                             let old = state
                                 .base_store_epoch
-                                .insert(sym.clone(), state.next_base_epoch);
-                            state.base_epoch_log.push((sym, old));
+                                .insert(key.clone(), state.next_base_epoch);
+                            state.base_epoch_log.push((key, old));
                         }
                         None => {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
@@ -1136,7 +1431,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         let old_val = state.expr_to_value.insert(expr_key, dest);
                         state.rollback_log.push((key_for_log, old_val));
                     }
-                    state.track_global_ptr_base(&inst);
+                    state.track_ptr_base(&inst);
                     new_instructions.push(inst);
                     block_defs.insert(dest.0);
                 }
@@ -1174,7 +1469,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 if let Some(dest) = inst.dest() {
                     block_defs.insert(dest.0);
                 }
-                state.track_global_ptr_base(&inst);
+                state.track_ptr_base(&inst);
                 new_instructions.push(inst);
             }
         }
