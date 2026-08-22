@@ -526,6 +526,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+        changed |= fold_zero_stores(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
         // After the folds: dead staging movs (their patterns must win first).
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
@@ -574,6 +575,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+            changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
@@ -2568,12 +2570,38 @@ use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace
 // Keeping the conservative bail-on-address-of-sp version: sound by
 // construction, and the loop-variant-base hazard his rewrite fixes cannot
 // arise here because we never resolve loads through derived bases at all.
+//
+// ADOPTED from levkropp 1a432a1a (audited): function-scoped analysis. The
+// peephole runs on the WHOLE MODULE text (backend/mod.rs), so the old
+// whole-buffer scan had two inter-function bugs:
+// (a) one address-of-sp anywhere disabled the pass for EVERY function in
+//     the module (missed optimization, module-size dependent), and
+// (b) the load scan collected slot ranges across all functions, so a load
+//     at [sp, #16] in function A kept a dead store to [sp, #16] alive in
+//     function B (different frames — pure missed optimization, but also a
+//     latent soundness trap should ranges ever be used for forwarding).
+// Split at .cfi_endproc boundaries; each frame is analyzed independently.
 fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut start = 0usize;
+    for i in 0..n {
+        if lines[i].trim().starts_with(".cfi_endproc") {
+            changed |= gdse_one_function(lines, kinds, start, i + 1);
+            start = i + 1;
+        }
+    }
+    if start < n {
+        changed |= gdse_one_function(lines, kinds, start, n);
+    }
+    changed
+}
+
+fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
     // stack slots could be accessed through pointers, so we must not eliminate any stores.
     // This is conservative but sound — it prevents miscompilation when arrays or structs
     // are allocated on the stack and passed by pointer to callees.
-    for i in 0..n {
+    for i in start..end {
         if kinds[i] == LineKind::Nop {
             continue;
         }
@@ -2603,7 +2631,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     // store (e.g. `str x` at offset 16, 8 bytes) can be partially read by a
     // narrower load at a different offset (e.g. `ldr w` at offset 20, 4 bytes).
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
-    for i in 0..n {
+    for i in start..end {
         match kinds[i] {
             LineKind::LoadSp {
                 offset, is_word, ..
@@ -2648,7 +2676,7 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
 
     // Phase 2: Remove stores whose byte range does not overlap any load range
     let mut changed = false;
-    for i in 0..n {
+    for i in start..end {
         if let LineKind::StoreSp {
             offset, is_word, ..
         } = kinds[i]
@@ -2968,6 +2996,84 @@ fn reg_operand_num(op: &str) -> Option<u8> {
 /// Does this instruction write a register with the given number?
 /// Conservative: the first operand (and the second for `ldp`) counts as a
 /// destination for everything that is not a store, compare, or branch.
+// ── Zero-store via wzr/xzr (levkropp 86b34508, audited port) ────────────────
+//
+// Storing a literal zero goes through a materialization: `mov x0, #0` then
+// `strb w0, [x9]`. The zero register does it for free: `strb wzr, [x9]`.
+// The mov is left for dead-move elimination (it may have other readers).
+// Audit deltas vs his version: dst < 29 (his `<= 30` admitted the frame
+// pointer and link register as tracked zero sources — sound but absurd,
+// and x29-relative rewrites deserve no code path); everything else
+// verified line-by-line (store-operand-only rewrite keeps a zr_reg BASE
+// untouched, movn excluded as -1, multi-line slots skipped, scan stops at
+// the first barrier/clobber/load).
+fn fold_zero_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let zr_reg = match kinds[i] {
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } if dst < 29 => {
+                let t = lines[i].trim();
+                // movn #0 is -1, not zero; symbol operands fail the parse.
+                if t.starts_with("movn") || lines[i].contains('\n') {
+                    continue;
+                }
+                let zero = t
+                    .rsplit_once(", ")
+                    .and_then(|(_, imm)| imm.trim().strip_prefix('#'))
+                    .is_some_and(|v| v.parse::<i64>() == Ok(0));
+                if zero {
+                    dst
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let (xname, wname) = (xreg_name(zr_reg), wreg_name(zr_reg));
+        // Rewrite the value operand of the next store that reads R, stopping
+        // at the first barrier, rewrite of R, or other memory op.
+        for j in (i + 1)..n {
+            match kinds[j] {
+                LineKind::Nop => continue,
+                LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Alu
+                | LineKind::Compare => {
+                    if instr_clobbers_reg(lines[j].trim_start(), zr_reg) {
+                        break;
+                    }
+                    continue;
+                }
+                LineKind::StoreSp { .. } | LineKind::MemOther | LineKind::StorePairSp => {
+                    let t = lines[j].trim_start().to_string();
+                    if !(t.starts_with("str") || t.starts_with("stp")) {
+                        break; // a load under MemOther: stop
+                    }
+                    if let Some((mnem, rest)) = t.split_once(' ') {
+                        if let Some((first, suffix)) = rest.split_once(',') {
+                            let first = first.trim();
+                            let zr = if first == xname {
+                                "xzr"
+                            } else if first == wname {
+                                "wzr"
+                            } else {
+                                break;
+                            };
+                            lines[j] = format!("    {} {},{}", mnem, zr, suffix);
+                            kinds[j] = classify_line(&lines[j]);
+                            changed = true;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    changed
+}
+
 fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
     let mut it = trimmed.splitn(2, char::is_whitespace);
     let mnem = it.next().unwrap_or("");

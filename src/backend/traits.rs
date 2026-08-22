@@ -610,6 +610,23 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether integer Mul;Add should fuse even when the mul temp has a
+    /// register home. On AArch64 madd has the same latency as mul, so the
+    /// fusion is one fewer instruction and a freed register, never a longer
+    /// chain (levkropp 9f064faa). On x86 there is no integer madd — the
+    /// fused path stages through the accumulator, so register-direct
+    /// mul+add stays better and this remains false.
+    fn supports_fused_int_madd_reg(&self) -> bool {
+        false
+    }
+
+    /// Whether the target has a single-instruction integer multiply-subtract
+    /// for `acc - a*b` (AArch64 msub). Only that operand order: `a*b - acc`
+    /// has no msub form and must stay split.
+    fn supports_fused_int_mul_sub(&self) -> bool {
+        false
+    }
+
     /// Emit a fused multiply-subtract.
     /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [fmsub]
     /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [fnmsub]

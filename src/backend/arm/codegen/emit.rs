@@ -2370,6 +2370,18 @@ impl ArchCodegen for ArmCodegen {
             self.emit_int_fused_mul_add_impl(mul_lhs, mul_rhs, acc, add_dest, ty);
         }
     }
+    fn supports_fused_int_madd_reg(&self) -> bool {
+        // madd latency == mul latency on every shipping AArch64 core; the
+        // fusion is strictly one fewer instruction. CCC_NO_INT_MADD restores
+        // the slot-homed-only behavior for bisection.
+        std::env::var_os("CCC_NO_INT_MADD").is_none()
+    }
+
+    fn supports_fused_int_mul_sub(&self) -> bool {
+        // msub w0, w1, w2, w3 = w3 - w1*w2 (acc - product only).
+        std::env::var_os("CCC_NO_MSUB").is_none()
+    }
+
     fn supports_fused_float_mul_sub(&self) -> bool {
         // Same single-rounding contract as fmadd fusion; the detector is
         // additionally gated on CCC_NO_FMSUB and the accumulator-dest set.
@@ -2385,8 +2397,15 @@ impl ArchCodegen for ArmCodegen {
         ty: IrType,
         mul_is_lhs: bool,
     ) {
-        debug_assert!(ty == IrType::F32 || ty == IrType::F64);
-        self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
+        if ty == IrType::F32 || ty == IrType::F64 {
+            self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
+        } else {
+            // Integer msub: sub_dest = acc - mul_lhs*mul_rhs. The detector
+            // only records integer Subs with the mul on the RHS (levkropp
+            // 9f064faa; `a*b - acc` has no msub form).
+            debug_assert!(!mul_is_lhs, "integer msub requires acc - product");
+            self.emit_int_fused_mul_sub_impl(mul_lhs, mul_rhs, acc, sub_dest, ty);
+        }
     }
     fn state(&mut self) -> &mut CodegenState {
         &mut self.state

@@ -1865,6 +1865,8 @@ fn detect_mul_add_fusions(
     block: &BasicBlock,
     use_counts: &[u32],
     fuse_float: bool,
+    // Integer `acc - a*b` -> msub (AArch64; see supports_fused_int_mul_sub).
+    fuse_int_sub: bool,
     // Float Mul;Sub -> fmsub/fnmsub (levkropp e3b21b8f, audited port).
     // None disables Sub fusion entirely (backend lacks the instruction or
     // CCC_NO_FMSUB is set); Some(accs) enables it except for destinations
@@ -1928,11 +1930,10 @@ fn detect_mul_add_fusions(
                     add_ty_r = Some(ty);
                     break;
                 }
-                // Float-only Sub fusion: `a - b*c` -> fmsub, `b*c - a` ->
-                // fnmsub (both single-rounding, matching GCC -ffp-contract=
-                // fast). Integer mul-temp fusion stays Add-only, and Subs
-                // whose dest is a loop-carried accumulator stay split (see
-                // fuse_float_sub above).
+                // Float Sub fusion: `a - b*c` -> fmsub, `b*c - a` -> fnmsub
+                // (both single-rounding, matching GCC -ffp-contract=fast).
+                // Subs whose dest is a loop-carried accumulator stay split
+                // (see fuse_float_sub above).
                 Instruction::BinOp {
                     dest: sub_dest,
                     op: IrBinOp::Sub,
@@ -1942,6 +1943,28 @@ fn detect_mul_add_fusions(
                     ..
                 } if mul_ty.is_float()
                     && fuse_float_sub.is_some_and(|accs| !accs.contains(&sub_dest.0)) =>
+                {
+                    add_idx = Some(scan);
+                    add_lhs_r = Some(lhs);
+                    add_rhs_r = Some(rhs);
+                    add_ty_r = Some(ty);
+                    break;
+                }
+                // Integer Sub fusion: `acc - a*b` -> msub (levkropp 9f064faa,
+                // audited port). ONLY when the mul is the Sub's RHS — `a*b -
+                // acc` has no msub form. Used by magic-number division
+                // (strlen/itoa: q = n/10; r = n - q*10). No accumulator gate:
+                // integer msub has the same latency as mul on shipping
+                // AArch64 cores, so the chain never lengthens.
+                Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } if !mul_ty.is_float()
+                    && fuse_int_sub
+                    && matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0) =>
                 {
                     add_idx = Some(scan);
                     add_lhs_r = Some(lhs);
@@ -2975,6 +2998,7 @@ fn generate_function(
             block,
             &value_use_counts,
             cg.supports_fused_float_mul_add(),
+            cg.supports_fused_int_mul_sub(),
             if cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB") {
                 Some(&accumulator_dests)
             } else {
@@ -3286,7 +3310,14 @@ fn generate_function(
             } = inst
             {
                 if let Some(&add_i) = mul_add_fusions.get(&idx) {
-                    if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
+                    // Float always fuses (native fmadd/fmsub). Integer fuses
+                    // when the temp is slot-homed, or unconditionally on
+                    // targets where madd/msub cost the same as the mul
+                    // (levkropp 9f064faa: one fewer instruction, freed reg).
+                    if cg.get_phys_reg_for_value(dest.0).is_none()
+                        || ty.is_float()
+                        || cg.supports_fused_int_madd_reg()
+                    {
                         if let Some(Instruction::BinOp {
                             dest: add_dest,
                             op: partner_op,
