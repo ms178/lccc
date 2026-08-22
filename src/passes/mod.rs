@@ -477,6 +477,14 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
         copy_prop::run(module);
     }
     iphase_dump!("cleanup-fold2-copyprop2");
+    // Inlining + GEP+0 folding can turn `&local` stores back into stores
+    // through the alloca itself. Re-run mem2reg so those scalars become SSA
+    // before the main loop (otherwise they stay slotted across the callee
+    // body that was just pasted in).
+    if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+    }
+    iphase_dump!("cleanup-mem2reg-after-gep0");
     resolve_asm::resolve_inline_asm_symbols(module);
     iphase_dump!("post-inline cleanup");
 }

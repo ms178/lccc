@@ -3780,8 +3780,11 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             size,
         } = infos[i].kind
         {
-            // Only fold scratch registers (eax, ecx, edx)
-            if !is_caller_saved(load_reg) && load_reg != REG_EAX {
+            // Any GPR whose value dies after the consumer may fold. The
+            // caller-saved-only filter left ebx/esi/edi reloads that the
+            // deadness scan already proves unused (i686 -Os size). Never
+            // fold through the stack/frame pointer.
+            if load_reg > REG_GP_MAX || load_reg == REG_ESP || load_reg == REG_EBP {
                 i += 1;
                 continue;
             }
