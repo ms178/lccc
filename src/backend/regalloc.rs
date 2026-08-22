@@ -897,7 +897,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let arm_fp_pool =
         config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !env_on("CCC_NO_VECREG");
-    let x86_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 20);
+    // XMM2 is deliberately removed when an intrinsic uses it as implicit
+    // scratch, so the safe x86 pool may start at PhysReg(21) (XMM3). Do not
+    // mistake that quarantine for a non-x86 pool and disable SIMD allocation.
+    let x86_fp_pool = config
+        .xmm_regs
+        .first()
+        .is_some_and(|r| (20..=33).contains(&r.0));
     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
     // Values consumed as call arguments: their last read happens in the call's
     // argument staging, which writes the ABI arg registers in order. A home in
@@ -3170,6 +3176,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecFmaF64x4 => Some(2),
             O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4 => Some(3),
             O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2 => Some(4),
+            O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8 => Some(5),
+            O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4 => Some(6),
+            O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
             _ => None,
         }
     };
@@ -3191,6 +3200,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2
             ),
+            5 => matches!(
+                op,
+                O::VecAddI32x8 | O::VecMulI32x8 | O::VecHorizontalAddI32x8
+            ),
+            6 => matches!(
+                op,
+                O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+            ),
+            7 => matches!(
+                op,
+                O::VecAddI64x2 | O::VecMulI64x2 | O::VecHorizontalAddI64x2
+            ),
             _ => false,
         }
     };
@@ -3209,6 +3230,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecHorizontalAddF64x4
                                 | O::VecHorizontalAddF32x4
                                 | O::VecHorizontalAddF64x2
+                                | O::VecHorizontalAddI32x8
+                                | O::VecHorizontalAddI32x4
+                                | O::VecHorizontalAddI64x2
                         ) =>
                 {
                     return FxHashSet::default();

@@ -28,6 +28,11 @@ def arguments() -> argparse.Namespace:
         "--source", default="tests/benchmark/programs/reduction_vecreg.c"
     )
     parser.add_argument("--output", default="reduction-vecreg-timing.json")
+    parser.add_argument("--expected", default="187392")
+    parser.add_argument(
+        "--kernel-description",
+        default="65536-element F32 sum plus dot, {repetitions} calls each/sample",
+    )
     parser.add_argument("--pairs", type=int, default=24)
     parser.add_argument("--repetitions", type=int, default=5000)
     parser.add_argument("--bootstrap", type=int, default=20000)
@@ -66,13 +71,13 @@ def command(binary: Path, cpu: int, repetitions: int) -> list[str]:
     return ["taskset", "-c", str(cpu), str(binary), str(repetitions)]
 
 
-def run_checked(binary: Path, cpu: int, repetitions: int) -> int:
+def run_checked(binary: Path, cpu: int, repetitions: int, expected: str) -> int:
     start = time.perf_counter_ns()
     result = subprocess.run(
         command(binary, cpu, repetitions), capture_output=True, text=True
     )
     elapsed = time.perf_counter_ns() - start
-    if result.returncode != 0 or result.stdout.strip() != "187392":
+    if result.returncode != 0 or result.stdout.strip() != expected:
         raise SystemExit(
             f"bad result from {binary}: exit={result.returncode}, "
             f"stdout={result.stdout!r}, stderr={result.stderr!r}"
@@ -110,7 +115,7 @@ def main() -> None:
             compiler, source, binaries["stack-accumulator"], stack_accumulator=True
         )
         for binary in binaries.values():
-            run_checked(binary, args.cpu, 10)
+            run_checked(binary, args.cpu, 10, args.expected)
 
         raw = []
         for pair in range(args.pairs):
@@ -120,7 +125,9 @@ def main() -> None:
             times = record["times_ns"]
             assert isinstance(times, dict)
             for name in order:
-                times[name] = run_checked(binaries[name], args.cpu, args.repetitions)
+                times[name] = run_checked(
+                    binaries[name], args.cpu, args.repetitions, args.expected
+                )
             raw.append(record)
 
     log_ratios = [
@@ -144,9 +151,7 @@ def main() -> None:
     ratio = math.exp(statistics.mean(log_ratios))
     summary = {
         "evidence_scope": "CPU-pinned wall-time screening; no PMU or bare-metal claim",
-        "kernel": (
-            f"65536-element F32 sum plus dot, {args.repetitions} calls each/sample"
-        ),
+        "kernel": args.kernel_description.format(repetitions=args.repetitions),
         "compiler": str(compiler),
         "control": "same compiler with CCC_NO_REDUCTION_VECREG=1",
         "cpu": args.cpu,
