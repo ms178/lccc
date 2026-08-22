@@ -188,6 +188,12 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                     | IntrinsicOp::VecAddF64x2
                     | IntrinsicOp::VecAddI32x8
                     | IntrinsicOp::VecAddI32x4
+                    | IntrinsicOp::VecMulI32x8
+                    | IntrinsicOp::VecMulI32x4
+                    | IntrinsicOp::VecZeroI64x2
+                    | IntrinsicOp::VecLoadI64x2
+                    | IntrinsicOp::VecAddI64x2
+                    | IntrinsicOp::VecMulI64x2
                     | IntrinsicOp::VecAddF32x8
                     | IntrinsicOp::VecAddF32x4
                     | IntrinsicOp::VecMulF64x4
@@ -280,6 +286,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                             | O::F128Fabs
                             | O::F128Neg
                             | O::F128Copysign
+                            | O::VecMulI64x2
                     )
                 } else {
                     false

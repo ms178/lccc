@@ -2375,9 +2375,12 @@ impl X86Codegen {
                         self.value_to_reg(c_ptr, "rax");
                         "rax"
                     };
-                    self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
-                    self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
-                    self.state.emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
+                    self.state
+                        .emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
+                    self.state
+                        .emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
+                    self.state
+                        .emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
                     self.state.reg_cache.invalidate_all();
                 }
             }
@@ -2766,16 +2769,8 @@ impl X86Codegen {
             IntrinsicOp::VecMulI64x2 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
-                }
-                if let Some(slot) = self.get_slot_for_operand(&args[1]) {
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm1");
-                }
+                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[1], "xmm1");
                 self.state.emit("    movq %xmm0, %rax");
                 self.state.emit("    movq %xmm1, %rcx");
                 self.state.emit("    imulq %rcx, %rax");
@@ -3174,14 +3169,7 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // 2×I64 → I64 horizontal sum
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
-                } else {
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movdqu (%rax), %xmm0");
-                }
+                self.sse_load_arg(&args[0], "xmm0");
                 self.state.emit("    pshufd $0xEE, %xmm0, %xmm1"); // xmm1 = {hi, hi}
                 self.state.emit("    paddq %xmm1, %xmm0");
                 self.state.emit("    movq %xmm0, %rax");
@@ -3192,17 +3180,10 @@ impl X86Codegen {
             IntrinsicOp::VecHorizontalAddI32x8 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                // %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    // Direct load from slot
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    vmovdqu", slot.0 as i64, "ymm0");
-                } else {
-                    // Fallback: load pointer then dereference
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    vmovdqu (%rax), %ymm0");
-                }
+                // %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32.
+                // The generic loader handles both a protected stack home and
+                // a width-aware register assignment.
+                self.avx_load_arg(&args[0]);
                 self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vpsrldq $8, %xmm0, %xmm1");
@@ -3218,16 +3199,7 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
-                if let Some(slot) = self.get_slot_for_operand(&args[0]) {
-                    // Direct load from slot
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movdqu", slot.0 as i64, "xmm0");
-                } else {
-                    // Fallback: load pointer then dereference
-                    self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movdqu (%rax), %xmm0");
-                }
+                self.sse_load_arg(&args[0], "xmm0");
                 self.state.emit("    movdqa %xmm0, %xmm1");
                 self.state.emit("    psrldq $8, %xmm1"); // xmm1 = {0,0,a,b}
                 self.state.emit("    paddd %xmm1, %xmm0");
@@ -3422,13 +3394,16 @@ impl X86Codegen {
             IntrinsicOp::VecZeroI64x2 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                self.state.emit("    pxor %xmm0, %xmm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if let Some(slot) = self.state.get_slot(d.0) {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name(reg);
                         self.state
-                            .out
-                            .emit_instr_reg_rbp("    movdqu", "xmm0", slot.0 as i64);
+                            .emit_fmt(format_args!("    pxor %{}, %{}", name, name));
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else {
+                        self.state.emit("    pxor %xmm0, %xmm0");
+                        self.sse_store_dest(d, "xmm0");
                     }
                 }
             }
@@ -3436,14 +3411,16 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %dest_vec = {0, 0, 0, 0, 0, 0, 0, 0} - AVX2 8×I32
-                self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if let Some(slot) = self.state.get_slot(d.0) {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name_256(reg);
                         self.state
-                            .out
-                            .emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
-                        self.state.emit("    vmovdqu %ymm0, (%rdx)");
+                            .emit_fmt(format_args!("    vpxor %{}, %{}, %{}", name, name, name));
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else {
+                        self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                        self.avx_store_dest(d);
                     }
                 }
             }
@@ -3451,14 +3428,16 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
-                self.state.emit("    pxor %xmm0, %xmm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if let Some(slot) = self.state.get_slot(d.0) {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name(reg);
                         self.state
-                            .out
-                            .emit_instr_rbp_reg("    leaq", slot.0 as i64, "rdx");
-                        self.state.emit("    movdqu %xmm0, (%rdx)");
+                            .emit_fmt(format_args!("    pxor %{}, %{}", name, name));
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else {
+                        self.state.emit("    pxor %xmm0, %xmm0");
+                        self.sse_store_dest(d, "xmm0");
                     }
                 }
             }

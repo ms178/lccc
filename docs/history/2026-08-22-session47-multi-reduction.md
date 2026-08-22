@@ -78,11 +78,12 @@ transform.
 
 ## Follow-up
 
-1. **Vector accumulators still live in stack slots.** `single_sum` emits
-   `vmovdqu %ymm0, slot; vpaddd slot, %ymm0, %ymm0` per iteration; GCC keeps
-   accumulators in XMM/YMM with memory-operand folding. This is the RA-21
-   vecreg / loop-carried vector-home gap and the reason multi-reduction is
-   1.08× rather than ~0.5× of GCC. Highest-ROI next item.
+1. ~~**Vector accumulators still live in stack slots.**~~ **DONE in session 48.**
+   Width-aware reduction homes now include I32x8/I32x4 and I64x2 sum/dot
+   webs; integer zero/horizontal/multiply emitters honor assignments and the
+   XMM2 scratch quarantine no longer disables a pool beginning at XMM3.
+   `double_reduction` is 0.7251× its stack-home control (95% CI
+   0.6007..0.8807) and 0.895× GCC in the current VM screen.
 2. **Shared-load dedup.** `b += v[i]*w[i]` after `a += u[i]*v[i]` emits the
    `v[i]` vector load twice; CSE the per-accumulator VecLoads by GEP.
 3. **>2 accumulators.** The analyzer rejects three-plus accumulators; a
