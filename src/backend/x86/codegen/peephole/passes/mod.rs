@@ -1355,6 +1355,37 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_branch_does_not_fuse_setcc_in_other_reg_with_rax_test() {
+        // zlib-ng zng_deflateSetParams: `size < 4` setb was movzbl'd into
+        // %r12d, then a later `testq %rax, %rax` tested a *different*
+        // value (slotted new_strategy). Fusing those produced `jae` on the
+        // size compare and reported Z_BUF_ERROR for a valid 4-byte buffer.
+        let asm = [
+            "    cmpq $4, %r8",
+            "    setb %al",
+            "    movzbl %al, %r12d",
+            "    movq 64(%rsp), %rax",
+            "    testq %rax, %rax",
+            "    je .Lelse",
+            "    jmp .Lthen",
+            ".Lelse:",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("setb %al"),
+            "must keep setb when the boolean is not in %rax: {result}"
+        );
+        assert!(
+            !result.contains("jae ") && !result.contains("jb "),
+            "must not fuse size-cmp flags with a later rax test: {result}"
+        );
+        assert!(result.contains("testq %rax, %rax"), "{result}");
+    }
+
+    #[test]
     fn test_compare_branch_fusion_short() {
         let asm = [
             "    cmpq %rcx, %rax",

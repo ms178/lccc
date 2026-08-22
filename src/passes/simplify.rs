@@ -332,6 +332,52 @@ fn try_simplify_with_types(
             rhs,
             ty,
         } => simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, cast_defs, is_boolean),
+        Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            seg_override,
+            volatile,
+        } => {
+            // Load through GEP+0 is a load of the base. Complements the
+            // address-of lowering that no longer emits GEP+0, and also
+            // catches offset-0 field / helper-inlined stores that still
+            // produce a zero GEP.
+            let ptr_idx = ptr.0 as usize;
+            if let Some(Some(gep)) = gep_defs.get(ptr_idx) {
+                if is_zero(&gep.offset) {
+                    return Some(Instruction::Load {
+                        dest: *dest,
+                        ptr: gep.base,
+                        ty: *ty,
+                        seg_override: *seg_override,
+                        volatile: *volatile,
+                    });
+                }
+            }
+            None
+        }
+        Instruction::Store {
+            val,
+            ptr,
+            ty,
+            seg_override,
+            volatile,
+        } => {
+            let ptr_idx = ptr.0 as usize;
+            if let Some(Some(gep)) = gep_defs.get(ptr_idx) {
+                if is_zero(&gep.offset) {
+                    return Some(Instruction::Store {
+                        val: *val,
+                        ptr: gep.base,
+                        ty: *ty,
+                        seg_override: *seg_override,
+                        volatile: *volatile,
+                    });
+                }
+            }
+            None
+        }
         Instruction::Select {
             dest,
             cond,
@@ -2372,6 +2418,55 @@ mod tests {
             ty: IrType::Ptr,
         };
         assert!(simplify_default(&inst).is_none());
+    }
+
+    #[test]
+    fn test_load_through_gep_zero() {
+        let mut gep_defs: Vec<Option<GepDef>> = vec![None; 3];
+        gep_defs[1] = Some(GepDef {
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(0)),
+        });
+        let inst = Instruction::Load {
+            dest: Value(2),
+            ptr: Value(1),
+            ty: IrType::I32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[]).unwrap();
+        match result {
+            Instruction::Load { ptr, dest, ty, .. } => {
+                assert_eq!(ptr.0, 0);
+                assert_eq!(dest.0, 2);
+                assert_eq!(ty, IrType::I32);
+            }
+            other => panic!("expected Load of GEP base, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_store_through_gep_zero() {
+        let mut gep_defs: Vec<Option<GepDef>> = vec![None; 3];
+        gep_defs[1] = Some(GepDef {
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(0)),
+        });
+        let inst = Instruction::Store {
+            val: Operand::Value(Value(3)),
+            ptr: Value(1),
+            ty: IrType::I32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        };
+        let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[]).unwrap();
+        match result {
+            Instruction::Store { ptr, val, .. } => {
+                assert_eq!(ptr.0, 0);
+                assert!(matches!(val, Operand::Value(Value(3))));
+            }
+            other => panic!("expected Store of GEP base, got {other:?}"),
+        }
     }
 
     #[test]

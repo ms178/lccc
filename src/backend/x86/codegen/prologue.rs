@@ -871,9 +871,30 @@ impl X86Codegen {
                         }
                     }
                 }
+                // A Cmp dest consumed by an integer Cast/Copy is classified
+                // as "cast"/"copy" and would otherwise lose its home. The
+                // Cmp emitter then skips setcc (nothing to write) and the
+                // Cast reads the compare's *operand* register — typically
+                // the size/level being tested — instead of 0/1.
+                // zlib-ng `zng_deflateSetParams`: `int32_t buf_error =
+                // param->size < min_size` became `buf_error = size`, so a
+                // 4-byte buffer was reported as Z_BUF_ERROR.
+                // Flag fusion (`fused_cmp_dests`) is the only legal way to
+                // skip materializing a Cmp; nohome must not take that
+                // decision for a compare result.
+                let mut cmp_dests = crate::common::fx_hash::FxHashSet::default();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Cmp { dest, .. } = inst {
+                            cmp_dests.insert(dest.0);
+                        }
+                    }
+                }
                 let mut set = never_materialized;
                 set.extend(skip.into_iter().filter(|v| {
-                    !narrowing_cast_values.contains(v) && cls_of.get(v).is_some_and(|c| has(c))
+                    !cmp_dests.contains(v)
+                        && !narrowing_cast_values.contains(v)
+                        && cls_of.get(v).is_some_and(|c| has(c))
                 }));
                 set
             }

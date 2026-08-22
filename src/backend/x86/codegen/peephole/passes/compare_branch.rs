@@ -79,8 +79,13 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             let si = seq_indices[scan];
             let line = infos[si].trimmed(store.get(si));
 
-            // Skip zero-extend of setcc result
-            if line.starts_with("movzbq %al,") || line.starts_with("movzbl %al,") {
+            // Skip zero-extend of setcc result ONLY when it lands in %rax/%eax.
+            // `movzbl %al, %r12d` leaves the boolean in r12; a later
+            // `testq %rax, %rax` is then a DIFFERENT value (zlib-ng
+            // zng_deflateSetParams: size<4's setb was fused with the
+            // test of a slotted `new_strategy`, so a 4-byte buffer
+            // became Z_BUF_ERROR).
+            if line == "movzbq %al, %rax" || line == "movzbl %al, %eax" {
                 scan += 1;
                 continue;
             }
