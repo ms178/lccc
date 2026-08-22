@@ -1146,6 +1146,36 @@ pub(crate) fn run_passes(
         std::mem::swap(&mut dirty, &mut changed);
     }
 
+    // Late AArch64 vectorization (levkropp 8ef1978f concept, audited): max
+    // and other Select-shaped reductions only exist after the main loop's
+    // if_convert phase, so the early vectorizer never sees them. Re-running
+    // the two-wide NEON pass here catches the converted form; already-
+    // vectorized loops contain Vec* intrinsics and fail the scalar-shape
+    // analyzers, so this is idempotent. -Os/-Oz skip it like the early pass.
+    // CCC_DISABLE_PASSES=latevec disables.
+    if matches!(target, crate::backend::Target::Aarch64)
+        && !optimize_for_size
+        && !disabled.contains("latevec")
+        && !disabled.contains("vectorize")
+    {
+        let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
+        if n > 0 {
+            // The vectorizer's block surgery does not maintain source_spans;
+            // drop any that no longer align with their block's instructions
+            // (debug-info line table would otherwise attribute wrong lines).
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    if !block.source_spans.is_empty()
+                        && block.source_spans.len() != block.instructions.len()
+                    {
+                        block.source_spans.clear();
+                    }
+                }
+            }
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+    }
+
     // DCE can remove aggregate-copy consumers that previously made forwarding
     // unsafe (for example a full returned struct whose only surviving use is
     // one field load). Re-run forwarding before final loop promotion.

@@ -822,8 +822,10 @@ fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
                 Some(s) => s,
                 None => {
                     if debug_inline && caller_too_large {
-                        eprintln!("[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
-                            module.functions[func_idx].name, caller_inst_count);
+                        eprintln!(
+                            "[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
+                            module.functions[func_idx].name, caller_inst_count
+                        );
                     }
                     break;
                 }
@@ -1199,7 +1201,12 @@ fn resolve_inline_asm_symbols(func: &mut IrFunction) {
                     let sym_idx = num_outputs_in_sym + i;
                     if sym_idx >= input_symbols.len() {
                         if debug_resolve {
-                            eprintln!("[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip", i, sym_idx, input_symbols.len());
+                            eprintln!(
+                                "[RESOLVE_ASM]   input[{}]: sym_idx {} >= input_symbols.len() {}, skip",
+                                i,
+                                sym_idx,
+                                input_symbols.len()
+                            );
                         }
                         continue;
                     }
@@ -2389,8 +2396,15 @@ fn inline_call_site(
 
     let debug_inline_detail = std::env::var("CCC_INLINE_DEBUG_DETAIL").is_ok();
     if debug_inline_detail {
-        eprintln!("[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, block_offset={}, callee.next_value_id={}, caller.next_value_id={}",
-            site.callee_name, caller.name, value_offset, block_offset, callee.next_value_id, caller.next_value_id);
+        eprintln!(
+            "[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, block_offset={}, callee.next_value_id={}, caller.next_value_id={}",
+            site.callee_name,
+            caller.name,
+            value_offset,
+            block_offset,
+            callee.next_value_id,
+            caller.next_value_id
+        );
         eprintln!(
             "[INLINE_DETAIL]   site.block_idx={}, site.inst_idx={}",
             site.block_idx, site.inst_idx
@@ -2534,7 +2548,7 @@ fn inline_call_site(
         if substitutable[i] {
             if let Operand::Const(c) = &site.args[i] {
                 if let Some(at) = const_ir_type(c) {
-                    home_subst.insert(param_alloca_info[i].0 .0, (site.args[i], at));
+                    home_subst.insert(param_alloca_info[i].0.0, (site.args[i], at));
                 }
             }
         }
@@ -2567,7 +2581,7 @@ fn inline_call_site(
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut inserted_arg_count = 0usize;
         for i in (0..num_args_to_store).rev() {
-            if home_subst.contains_key(&param_alloca_info[i].0 .0) {
+            if home_subst.contains_key(&param_alloca_info[i].0.0) {
                 continue; // value flows via the older pure-home substitution
             }
             let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();

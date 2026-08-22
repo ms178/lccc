@@ -924,8 +924,15 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
         }
     }
     if std::env::var("CCC_DEBUG_PHICLEANUP").is_ok() {
-        eprintln!("[PHICLEANUP] fn={} copies={} removed={} kept_other_block={} kept_use_before={} kept_src_multidef={}",
-            func.name, copies.len(), to_remove.len(), dbg_kept[0], dbg_kept[1], dbg_kept[2]);
+        eprintln!(
+            "[PHICLEANUP] fn={} copies={} removed={} kept_other_block={} kept_use_before={} kept_src_multidef={}",
+            func.name,
+            copies.len(),
+            to_remove.len(),
+            dbg_kept[0],
+            dbg_kept[1],
+            dbg_kept[2]
+        );
     }
 
     if to_remove.is_empty() {

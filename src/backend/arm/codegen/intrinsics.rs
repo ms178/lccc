@@ -3,7 +3,7 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use super::emit::{arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys, ArmCodegen};
+use super::emit::{ArmCodegen, arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys};
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 
@@ -597,6 +597,18 @@ impl ArmCodegen {
                 }
             }
 
+            // NEON smaxv: horizontal signed max of 4 I32 lanes into a scalar.
+            // The result is a full-width I32 (smaxv writes s0's low 32 bits);
+            // fmov w0 zero-extends into x0, matching the I32 store contract.
+            IntrinsicOp::VecHorizontalMaxI32x4 => {
+                let a = self.load_vector_value_128(&args[0], "q0");
+                self.state.emit_fmt(format_args!("    smaxv s0, {}.4s", a));
+                self.state.emit("    fmov w0, s0");
+                if let Some(d) = dest {
+                    self.store_x0_to(d);
+                }
+            }
+
             // NEON sadalp: accumulate sign-extended adjacent pairs of a 4×I32
             // vector into a 2×I64 accumulator (one instruction per 4 elements).
             IntrinsicOp::VecSadalpI32x4 => {
@@ -695,6 +707,7 @@ impl ArmCodegen {
             | IntrinsicOp::VecAddF32x4
             | IntrinsicOp::VecMulF32x4
             | IntrinsicOp::VecAddI32x4
+            | IntrinsicOp::VecSmaxI32x4
             | IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
@@ -705,6 +718,7 @@ impl ArmCodegen {
                         IntrinsicOp::VecAddF32x4 => ("fadd", "4s"),
                         IntrinsicOp::VecMulF32x4 => ("fmul", "4s"),
                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
+                        IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
                         _ => ("mul", "4s"),
                     };
                     if let Some(name) = self.assigned_vector_reg(d.0) {

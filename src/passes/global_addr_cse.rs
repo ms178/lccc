@@ -364,7 +364,7 @@ pub(crate) fn run_with_aliases(
         if add.is_empty() && !has_delete {
             continue;
         }
-        add.sort_by(|a, b| (a.0.as_str(), a.1, a.2 .0).cmp(&(b.0.as_str(), b.1, b.2 .0)));
+        add.sort_by(|a, b| (a.0.as_str(), a.1, a.2.0).cmp(&(b.0.as_str(), b.1, b.2.0)));
         let insert_at = block
             .instructions
             .iter()
