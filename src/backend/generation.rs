@@ -1865,6 +1865,14 @@ fn detect_mul_add_fusions(
     block: &BasicBlock,
     use_counts: &[u32],
     fuse_float: bool,
+    // Float Mul;Sub -> fmsub/fnmsub (levkropp e3b21b8f, audited port).
+    // None disables Sub fusion entirely (backend lacks the instruction or
+    // CCC_NO_FMSUB is set); Some(accs) enables it except for destinations
+    // in `accs`: fusing `acc -= a*b` puts the multiply on the loop-carried
+    // serial dependency chain (fmsub latency > fsub latency), a measured
+    // 13% regression on nbody. Such Subs stay split so the multiply issues
+    // independently of the chain.
+    fuse_float_sub: Option<&FxHashSet<u32>>,
 ) -> FxHashMap<usize, usize> {
     let mut fusion_map: FxHashMap<usize, usize> = FxHashMap::default();
     // `a*b + c*d` must not fuse the first mul with an add whose other
@@ -1914,6 +1922,27 @@ fn detect_mul_add_fusions(
                     ty,
                     ..
                 } => {
+                    add_idx = Some(scan);
+                    add_lhs_r = Some(lhs);
+                    add_rhs_r = Some(rhs);
+                    add_ty_r = Some(ty);
+                    break;
+                }
+                // Float-only Sub fusion: `a - b*c` -> fmsub, `b*c - a` ->
+                // fnmsub (both single-rounding, matching GCC -ffp-contract=
+                // fast). Integer mul-temp fusion stays Add-only, and Subs
+                // whose dest is a loop-carried accumulator stay split (see
+                // fuse_float_sub above).
+                Instruction::BinOp {
+                    dest: sub_dest,
+                    op: IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } if mul_ty.is_float()
+                    && fuse_float_sub.is_some_and(|accs| !accs.contains(&sub_dest.0)) =>
+                {
                     add_idx = Some(scan);
                     add_lhs_r = Some(lhs);
                     add_rhs_r = Some(rhs);
@@ -2665,6 +2694,56 @@ fn generate_function(
     let value_use_counts = count_value_uses(func);
     cg.state().value_use_counts = value_use_counts.clone();
 
+    // Loop-carried accumulator destinations for the fmsub gate (levkropp
+    // e3b21b8f, audited). Fusing `acc -= a*b` into fmsub puts the multiply
+    // on the accumulator's serial dependency chain (fmsub latency > fsub),
+    // measured 13% regression on nbody. Recognized accumulators: memory-
+    // promoted loop F64 phis, surviving Phi dests, multi-Copy dests (the
+    // phi-web shape after phi elimination), and — transitively — values
+    // COPIED INTO any accumulator (the backedge source sits on the same
+    // serial chain). The reverse closure is a fixpoint over Copy edges;
+    // it terminates because each round strictly grows a set bounded by
+    // the number of distinct value ids in the function.
+    let accumulator_dests: FxHashSet<u32> = {
+        let mut accs: FxHashSet<u32> = func.loop_promoted_f64_values.iter().map(|v| v.0).collect();
+        let mut copy_edges: Vec<(u32, u32)> = Vec::new(); // (dest, src)
+        let mut copy_def_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                match inst {
+                    Instruction::Phi { dest, .. } => {
+                        accs.insert(dest.0);
+                    }
+                    Instruction::Copy { dest, src } => {
+                        if let Operand::Value(sv) = src {
+                            copy_edges.push((dest.0, sv.0));
+                        }
+                        let c = copy_def_count.entry(dest.0).or_insert(0);
+                        *c += 1;
+                        if *c == 2 {
+                            accs.insert(dest.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Reverse closure over the (small) copy-edge list instead of
+        // re-walking every instruction per round: O(rounds * edges).
+        loop {
+            let mut grew = false;
+            for &(d, src) in &copy_edges {
+                if accs.contains(&d) && accs.insert(src) {
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        accs
+    };
+
     let stab = analyze_base_stability(func);
     let gep_fold_map = build_gep_fold_map(func, &value_use_counts, &stab);
     let indexed_gep_map = if cg.supports_indexed_addr() {
@@ -2820,8 +2899,16 @@ fn generate_function(
             cg.supports_fused_fp_cmp_branch(),
             cg.supports_fused_bit_test_branch(),
         );
-        let mul_add_fusions =
-            detect_mul_add_fusions(block, &value_use_counts, cg.supports_fused_float_mul_add());
+        let mul_add_fusions = detect_mul_add_fusions(
+            block,
+            &value_use_counts,
+            cg.supports_fused_float_mul_add(),
+            if cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB") {
+                Some(&accumulator_dests)
+            } else {
+                None
+            },
+        );
         let cmp_select_fusions =
             if cg.supports_fused_cmp_select() && !env_flag_set("CCC_NO_FUSED_CSEL") {
                 detect_cmp_select_fusion(block, &value_use_counts)
@@ -3041,16 +3128,32 @@ fn generate_function(
                     if cg.get_phys_reg_for_value(dest.0).is_none() || ty.is_float() {
                         if let Some(Instruction::BinOp {
                             dest: add_dest,
+                            op: partner_op,
                             lhs: add_lhs,
                             rhs: add_rhs,
                             ty: add_ty,
-                            ..
                         }) = block.instructions.get(add_i)
                         {
                             let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
                             let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
                             cg.flush_machinst();
-                            cg.emit_fused_mul_add(dest, lhs, rhs, acc_op, add_dest, *add_ty);
+                            match partner_op {
+                                IrBinOp::Add => {
+                                    cg.emit_fused_mul_add(
+                                        dest, lhs, rhs, acc_op, add_dest, *add_ty,
+                                    );
+                                }
+                                IrBinOp::Sub => {
+                                    // Detector only records float Subs when the
+                                    // backend advertised supports_fused_float_mul_sub.
+                                    // mul_is_lhs selects fnmsub (product - acc)
+                                    // vs fmsub (acc - product).
+                                    cg.emit_fused_mul_sub(
+                                        dest, lhs, rhs, acc_op, add_dest, *add_ty, mul_is_lhs,
+                                    );
+                                }
+                                _ => unreachable!("mul fusion partner must be Add or Sub"),
+                            }
                             fused_add_skip.insert(add_i);
                             cg.state().current_program_point += 1;
                             continue;

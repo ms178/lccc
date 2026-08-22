@@ -697,7 +697,41 @@ impl X86Codegen {
         } else {
             "vfmadd231ss"
         };
+        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, add_dest, ty);
+    }
 
+    /// Fused multiply-subtract via FMA3 (levkropp e3b21b8f, audited port).
+    /// FMA3 231-form semantics: dest = (src2 * src1) OP dest, dest preloaded
+    /// with `acc`:
+    ///   mul_is_lhs == true  (product - acc): vfmsub231  = z*y - x
+    ///   mul_is_lhs == false (acc - product): vfnmadd231 = -(z*y) + x
+    pub(super) fn emit_scalar_fms231(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        sub_dest: &Value,
+        ty: IrType,
+        mul_is_lhs: bool,
+    ) {
+        let fma = match (mul_is_lhs, matches!(ty, IrType::F64)) {
+            (true, true) => "vfmsub231sd",
+            (true, false) => "vfmsub231ss",
+            (false, true) => "vfnmadd231sd",
+            (false, false) => "vfnmadd231ss",
+        };
+        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, sub_dest, ty);
+    }
+
+    fn emit_scalar_fma231_with(
+        &mut self,
+        fma: &str,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        add_dest: &Value,
+        ty: IrType,
+    ) {
         // Destructive-FMA coalescing: when linear scan assigned the result to
         // the accumulator's existing XMM home, compute there directly instead
         // of acc->xmm0, lhs->xmm1, FMA, xmm0->dest. This is the dominant shape
@@ -773,13 +807,30 @@ impl X86Codegen {
                     let label = self.state.get_fp_const_label(bits);
                     self.state
                         .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                } else {
+                    // +0.0 multiplier: the FMA must still execute. Skipping
+                    // it silently returned `acc` unchanged, which is wrong
+                    // for x*0.0 with x = +/-Inf or NaN (product is NaN, so
+                    // acc+NaN = NaN) and for the -0.0 sum rules
+                    // (-0.0 + 0.0 = +0.0, not -0.0). Materialise +0.0 in
+                    // xmm2 (VEX xor keeps the unified AVX domain) and fuse.
+                    self.state.emit("    vxorpd %xmm2, %xmm2, %xmm2");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
-                let label = self.state.get_fp_const_label(bits);
-                self.state
-                    .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                if bits != 0 {
+                    let label = self.state.get_fp_const_label(bits);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                } else {
+                    // Same +0.0 rule as the F64 arm above.
+                    self.state.emit("    vxorps %xmm2, %xmm2, %xmm2");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                }
             }
             _ => {
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");

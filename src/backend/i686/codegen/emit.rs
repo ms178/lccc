@@ -1884,11 +1884,7 @@ impl ArchCodegen for I686Codegen {
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
-        if is_sret && self.regparm == 0 {
-            4
-        } else {
-            0
-        }
+        if is_sret && self.regparm == 0 { 4 } else { 0 }
     }
 
     // ---- Control flow ----
@@ -1937,6 +1933,20 @@ impl ArchCodegen for I686Codegen {
                 self.state.reg_cache.invalidate_acc();
                 let true_label = true_block.as_label();
                 self.emit_branch_nonzero(&true_label);
+                self.emit_branch_to_block(false_block);
+                return;
+            }
+            // Register-homed condition: test it in place. The accumulator
+            // relay (`movl %reg,%eax; testl %eax,%eax`) added a copy on
+            // every register-allocated loop condition (find_c byte-load
+            // shape: the load coalesced into %ebp but the branch still
+            // bounced through %eax). testl is read-only, so no cache
+            // invalidation is needed and %eax keeps whatever it held.
+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                let reg = phys_reg_name(phys);
+                emit!(self.state, "    testl %{}, %{}", reg, reg);
+                let true_label = true_block.as_label();
+                emit!(self.state, "    jne {}", true_label);
                 self.emit_branch_to_block(false_block);
                 return;
             }
@@ -2582,7 +2592,7 @@ impl I686Codegen {
         s.emit("    shrl %eax");
         s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
         s.emit("    movl %eax, %edi"); // edi = q
-                                       // Verify: compute a - q*b, adjust if negative
+        // Verify: compute a - q*b, adjust if negative
         s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
         s.emit("    movl 12(%esp), %ebx");
         s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
@@ -2709,7 +2719,7 @@ impl I686Codegen {
         s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
         s.emit("    movl 16(%esp), %eax"); // A_lo
         s.emit("    movl 24(%esp), %ebx"); // B_lo
-                                           // Negate A if negative
+        // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Ldiv_a_pos");
         s.emit("    negl %eax");
@@ -2762,7 +2772,7 @@ impl I686Codegen {
         s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
         s.emit("    movl 16(%esp), %eax"); // A_lo
         s.emit("    movl 24(%esp), %ebx"); // B_lo
-                                           // Negate A if negative
+        // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Lmod_a_pos");
         s.emit("    negl %eax");

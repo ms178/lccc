@@ -2374,7 +2374,10 @@ impl X86Codegen {
                 .out
                 .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
         } else if std::env::var("CCC_TRACE_I128").is_ok() {
-            eprintln!("[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)", dest.0);
+            eprintln!(
+                "[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)",
+                dest.0
+            );
         }
         // rax holds only the low 64 bits of an i128, not a valid scalar IR value.
         self.state.reg_cache.invalidate_all();
@@ -2473,7 +2476,7 @@ impl X86Codegen {
     pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
         // Save val to rdi (using rdi instead of r8 to free r8 for register allocation)
         self.state.emit("    movq %rax, %rdi"); // rdi = val
-                                                // Load old value
+        // Load old value
         let load_instr = Self::mov_load_for_type(ty);
         let load_dest = Self::load_dest_reg(ty);
         self.state
@@ -3425,6 +3428,27 @@ impl ArchCodegen for X86Codegen {
         // the explicit contract; integer mul+add fusion is unaffected (the
         // generation-side detector calls this only for float types).
         self.fp_contract_fast
+    }
+
+    fn supports_fused_float_mul_sub(&self) -> bool {
+        // vfmsub231/vfnmadd231 need the same contraction contract as
+        // vfmadd231. Baseline codegen already emits VEX FMA3 unconditionally
+        // for fused mul-add, so no separate ISA gate is needed here.
+        self.fp_contract_fast
+    }
+
+    fn emit_fused_mul_sub(
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        sub_dest: &Value,
+        ty: IrType,
+        mul_is_lhs: bool,
+    ) {
+        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
+        self.emit_scalar_fms231(mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
     }
 
     fn supports_and_not(&self) -> bool {

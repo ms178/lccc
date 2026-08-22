@@ -2345,7 +2345,41 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::FmaF64x2Hoisted => {
-                // Emitted only by the AArch64 two-wide vectorizer.
+                // Two-wide hoisted FMA group: C[0..4] += broadcast * B[0..4].
+                // Primarily emitted by the AArch64 two-wide vectorizer (two
+                // NEON fmla per group); reachable on x86 via LCCC_FORCE_SSE2.
+                // This was a silent no-op stub here — the program only stayed
+                // correct because the (then-buggy) remainder computation
+                // restarted at element 0 and redid ALL the work scalar. With
+                // the remainder start fixed (IV*4 for the group scheme) a
+                // no-op body would silently drop the whole accumulation, so
+                // emit the real thing: one 4-lane FMA via ymm, semantically
+                // identical to the AArch64 pair of fmla v.2d.
+                // args[0] = B pointer, dest_ptr = C pointer; the broadcast
+                // factor is already in ymm1 (BroadcastLoadF64).
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                if let Some(c_ptr) = dest_ptr {
+                    // Prefer the register allocator's assignments (same
+                    // value-cache conflation hazard as FmaF64x2 above: B and
+                    // C GEPs share the offset value but not the base).
+                    let b_name = if let Some(r) = self.operand_reg(&args[0]) {
+                        super::emit::phys_reg_name(r)
+                    } else {
+                        self.operand_to_reg(&args[0], "rdx");
+                        "rdx"
+                    };
+                    let c_name = if let Some(r) = self.dest_reg(c_ptr) {
+                        super::emit::phys_reg_name(r)
+                    } else {
+                        self.value_to_reg(c_ptr, "rax");
+                        "rax"
+                    };
+                    self.state.emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
+                    self.state.emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
+                    self.state.emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
+                    self.state.reg_cache.invalidate_all();
+                }
             }
             IntrinsicOp::FmaF64x4 => {
                 self.flush_pending_vec_store_impl();

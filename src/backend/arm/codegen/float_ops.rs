@@ -1,6 +1,6 @@
 //! ArmCodegen: floating-point binary operations.
 
-use super::emit::{arm_fp_name, is_arm_fp_phys, ArmCodegen};
+use super::emit::{ArmCodegen, arm_fp_name, is_arm_fp_phys};
 use crate::backend::cast::FloatOp;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
@@ -132,6 +132,46 @@ impl ArmCodegen {
             output, lhs_reg, rhs_reg, acc_reg
         ));
         self.store_float_reg(add_dest, ty, &output);
+    }
+
+    /// Fused multiply-subtract (levkropp e3b21b8f, audited port).
+    /// `mul_is_lhs == false`: sub_dest = acc - lhs*rhs   -> fmsub  (Rd = Ra - Rn*Rm)
+    /// `mul_is_lhs == true` : sub_dest = lhs*rhs - acc   -> fnmsub (Rd = Rn*Rm - Ra)
+    /// All three sources are read before the destination is written (single
+    /// instruction), so `output` aliasing any source register is safe.
+    /// Load order matches emit_fused_mul_add_impl (acc, lhs, rhs) so the
+    /// accumulator-flow staging behaviour is identical to the shipped fmadd.
+    pub(super) fn emit_fused_mul_sub_impl(
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        sub_dest: &Value,
+        ty: IrType,
+        mul_is_lhs: bool,
+    ) {
+        let (r0, r1, r2) = if ty == IrType::F32 {
+            ("s0", "s1", "s2")
+        } else {
+            ("d0", "d1", "d2")
+        };
+        let acc_reg = self.float_operand_reg(acc, ty, r2);
+        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
+        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
+        let output = self
+            .reg_assignments
+            .get(&sub_dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| r0.to_string());
+        let mnemonic = if mul_is_lhs { "fnmsub" } else { "fmsub" };
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}, {}",
+            mnemonic, output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_float_reg(sub_dest, ty, &output);
     }
 
     pub(super) fn emit_float_binop_impl(

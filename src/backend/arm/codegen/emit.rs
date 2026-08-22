@@ -2370,6 +2370,24 @@ impl ArchCodegen for ArmCodegen {
             self.emit_int_fused_mul_add_impl(mul_lhs, mul_rhs, acc, add_dest, ty);
         }
     }
+    fn supports_fused_float_mul_sub(&self) -> bool {
+        // Same single-rounding contract as fmadd fusion; the detector is
+        // additionally gated on CCC_NO_FMSUB and the accumulator-dest set.
+        self.fp_contract_fast
+    }
+    fn emit_fused_mul_sub(
+        &mut self,
+        mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        sub_dest: &Value,
+        ty: IrType,
+        mul_is_lhs: bool,
+    ) {
+        debug_assert!(ty == IrType::F32 || ty == IrType::F64);
+        self.emit_fused_mul_sub_impl(mul_dest, mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
+    }
     fn state(&mut self) -> &mut CodegenState {
         &mut self.state
     }

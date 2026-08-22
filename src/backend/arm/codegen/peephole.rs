@@ -33,6 +33,22 @@
 
 // ── Line classification types ────────────────────────────────────────────────
 
+// AUDITED ADOPTION of levkropp ARM peephole passes (session 30, commits
+// aadab341/e20cdf6e/de451e57/b712c79c/89111a1f/8a052b9a/339cdb8b/69bbce24):
+// forward_fp_slot_loads, fuse_fp_adjacent_pairs, eliminate_repeated_slot_loads,
+// eliminate_overwritten_moves, fold_zext_move_chains, eliminate_redundant_sxtb,
+// eliminate_overwritten_stores, sink_loop_carried_stores, and the GDSE rewrite
+// (escape analysis for sp-derived bases + loop-variant base -> whole-frame
+// reads, which also fixes the e03da2f iteration-0-offset unsoundness class).
+// Every pass individually audited: movk excluded from MoveWide overwrites,
+// store/branch/compare excluded from register-write helpers, gap hazards in
+// ldp/stp fusion checked (partner-reg mention, dest write, base write), and
+// store sinking requires call-free single-exit label-free regions with the
+// stored register surviving to the backedge. Per-pass env gates retained for
+// bisection: CCC_NO_FP_PAIR, CCC_NO_SLOT_LOAD_DEDUP, CCC_NO_FP_SLOT_FWD,
+// CCC_NO_STORE_DSE, CCC_NO_STORE_SINK, CCC_NO_GDSE, CCC_NO_REUSE_STACK_LOADS.
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
 /// Compact classification of an assembly line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LineKind {
@@ -501,11 +517,19 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+        changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
+        changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
+        changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
+        changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+        // After the folds: dead staging movs (their patterns must win first).
+        changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
+        changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
         if rotate {
             changed |= rotate_simple_loops(&mut lines, &mut kinds, n);
         }
@@ -524,7 +548,12 @@ pub fn peephole_optimize(asm: String) -> String {
     reuse_stack_loads_within_blocks(&mut lines, &mut kinds, n);
     propagate_register_copies(&mut lines, &mut kinds, n);
     eliminate_dead_call_staging_moves(&lines, &mut kinds, n);
-    global_dead_store_elimination(&lines, &mut kinds, n);
+    if std::env::var("CCC_NO_GDSE").is_err() {
+        global_dead_store_elimination(&lines, &mut kinds, n);
+    }
+    // After rotation (phase 1) and dead-store cleanup: sink loop-carried
+    // slot-home stores out of bottom-tested loops.
+    sink_loop_carried_stores(&mut lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     {
@@ -536,10 +565,17 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
+            changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
+            changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -558,17 +594,17 @@ pub fn peephole_optimize(asm: String) -> String {
 /// Propagate a register copy used only as a memory-address alias within one
 /// basic block. This handles vector intrinsics where an SSA Copy gives the C
 /// pointer a short-lived register solely for `[xN]` loads/stores.
-/// Propagate a register copy used only as a memory-address alias.
 ///
-/// AUDITED ADOPTION of levkropp ed36c44: the previous version deleted the
-/// defining `mov` after scanning only to the first block boundary — a
-/// cross-block use of the alias then read a stale/clobbered register
-/// (hash_table SIGSEGV at -O2, reproduced HERE the moment LICM hoisted
-/// GlobalAddrs to the entry block and made address values multi-use).
-/// The rewrite scans the full function text and deletes the mov only on
-/// proven death of the alias (overwrite without read, or function end),
-/// tracking src liveness so rewritten address uses never read a clobbered
-/// source.
+/// Soundness: the defining `mov` may only be deleted when the copy's value is
+/// provably dead after the rewritten window — every mention of `dst` from here
+/// to the end of the function's text must be accounted for. An earlier version
+/// stopped the scan at the first block boundary and deleted the mov anyway,
+/// which silently dropped the initializer of any alias used in a later block
+/// (exposed when global-address CSE made such aliases multi-use). We therefore
+/// scan to the end of the function and commit only on proof of death:
+/// overwrite of `dst` by an instruction that does not read it, or the end of
+/// the function's text. Anything unrecognized (other memory ops, unknown
+/// instruction kinds, calls) blocks the transform.
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -690,6 +726,7 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
     }
     changed
 }
+
 /// Fold an SSA pointer update that is copied back to its loop-carried register:
 /// `mov x0,xS; add x0,xS,#K; mov xT,x0; ...; mov xS,xT` → `add xS,xS,#K`.
 /// The scan proves neither xS nor xT is referenced in the intervening region.
@@ -805,6 +842,9 @@ fn fold_destructive_pointer_updates(
 /// either it or the slot is overwritten.  Keep this deliberately local and
 /// clear state for instruction classes whose register effects are ambiguous.
 fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_REUSE_STACK_LOADS").is_ok() {
+        return false;
+    }
     let mut cached: Vec<(i32, bool, u8, bool)> = Vec::new();
     let mut changed = false;
     let mut i = 0;
@@ -905,9 +945,8 @@ fn reuse_stack_loads_within_blocks(lines: &mut [String], kinds: &mut [LineKind],
                                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                                 .any(|tok| tok == xn || tok == wn);
                             if mentions {
-                                // A pure single-register overwrite ends the
-                                // hazard; anything else (reads, multi-dest
-                                // loads like ldp) keeps the load alive.
+                                // A pure overwrite ends the hazard; anything
+                                // else reads the (soon deleted) register.
                                 load_dead_after = match kinds[k] {
                                     LineKind::Move { dst, src, .. } => {
                                         dst == load_reg && src != load_reg
@@ -1076,6 +1115,654 @@ fn eliminate_dead_call_staging_moves(lines: &[String], kinds: &mut [LineKind], n
 // The load is redundant since the value is already in the register.
 // Also: str xN, [sp, #off]  →  ldr xM, [sp, #off]  → replace load with mov xM, xN
 // Also handles: str wN, [sp, #off]  →  ldrsw xN, [sp, #off]
+
+// ── FP spill slot load forwarding ────────────────────────────────────────────
+//
+// Pattern: `str dS, [sp, #off]` (or via a materialized `sp`-derived base
+// register) followed by `ldr dD, [sp, #off]` in the same block. The slot-home
+// emission produces these store/reload round-trips for unallocated FP
+// temporaries; the load is replaceable with `fmov dD, dS` (or deleted when
+// dD == dS) as long as neither the slot nor dS is clobbered in between.
+//
+// Tracking is deliberately conservative: any store through an unknown base,
+// any call, and any control-flow boundary drops all state, and any write of
+// a source register drops the entries that forward from it.
+
+/// Parse an FP register name token (`d7`, `s3`, `q16`, `v2`, `v2.2d`) to its
+/// register number.
+fn fp_token_reg(tok: &str) -> Option<u8> {
+    let tok = tok.trim();
+    let digits = match tok.as_bytes().first() {
+        Some(b'd') | Some(b's') | Some(b'q') | Some(b'v') => {
+            let mut end = 1;
+            while end < tok.len() && tok.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == 1 {
+                return None;
+            }
+            &tok[1..end]
+        }
+        _ => return None,
+    };
+    digits.parse::<u8>().ok().filter(|&r| r <= 31)
+}
+
+/// An FP memory operand location: direct `[sp, #off]` slot, or a register
+/// base with a byte offset (`[xN]` / `[xN, #k]`).
+#[derive(Clone, Copy)]
+enum FpAddr {
+    Sp(i32),
+    Base(u8, i32),
+}
+
+/// Parse `str dS, ...` / `ldr dD, ...` (d/s/q widths) into (reg, FpAddr).
+fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
+    let t = line.trim();
+    let (is_store, rest) = if let Some(r) = t.strip_prefix("str ") {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix("ldr ") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let (reg_str, addr) = rest.split_once(", ")?;
+    let reg_str = reg_str.trim();
+    let width = reg_str.as_bytes().first().copied()?;
+    if !matches!(width, b'd' | b's' | b'q') {
+        return None;
+    }
+    let reg = fp_token_reg(reg_str)?;
+    let addr = addr.trim();
+    if let Some(off) = parse_sp_offset(addr) {
+        return Some((is_store, reg, FpAddr::Sp(off), width));
+    }
+    if addr.starts_with("[x") && addr.ends_with(']') && !addr.contains('!') {
+        let inner = &addr[1..addr.len() - 1];
+        let (base, off) = match inner.split_once(", ") {
+            Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
+            None => (inner.trim(), 0),
+        };
+        let base_reg = parse_reg(base);
+        if base_reg < 29 {
+            return Some((is_store, reg, FpAddr::Base(base_reg, off), width));
+        }
+    }
+    None
+}
+
+/// Width in bytes of an FP spill slot access kind.
+fn fp_access_width(width: u8) -> i32 {
+    match width {
+        b's' => 4,
+        b'q' => 16,
+        _ => 8, // d
+    }
+}
+
+/// Does this line write FP register `num` (any d/s/q/v name form) as its
+/// destination? Store/branch/compare mnemonics never write a register.
+fn fp_reg_written(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else {
+        return false;
+    };
+    if matches!(
+        mnem,
+        "str"
+            | "stp"
+            | "strb"
+            | "strh"
+            | "stur"
+            | "sturb"
+            | "sturh"
+            | "stlr"
+            | "stlrb"
+            | "stlrh"
+            | "fcmp"
+            | "fcmpe"
+            | "b"
+            | "bl"
+            | "ret"
+            | "cbz"
+            | "cbnz"
+            | "tbz"
+            | "tbnz"
+            | "cmp"
+            | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    rest.split(',')
+        .next()
+        .is_some_and(|first| fp_token_reg(first) == Some(num))
+}
+
+/// Does this line write GP register `num` (x or w form)? Checks the first two
+/// operand positions (pair loads write the second). False positives are fine
+/// (callers only use this to drop tracking state, never to enable a rewrite);
+/// false negatives are not, so store/branch/compare mnemonics are excluded and
+/// anything unrecognized counts as a write when the register appears early.
+fn gp_reg_written_broad(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else {
+        return false;
+    };
+    if matches!(
+        mnem,
+        "str"
+            | "stp"
+            | "strb"
+            | "strh"
+            | "stur"
+            | "sturb"
+            | "sturh"
+            | "stlr"
+            | "stlrb"
+            | "stlrh"
+            | "fcmp"
+            | "fcmpe"
+            | "b"
+            | "bl"
+            | "ret"
+            | "cbz"
+            | "cbnz"
+            | "tbz"
+            | "tbnz"
+            | "cmp"
+            | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    rest.split(',').take(2).any(|op| {
+        let op = op.trim();
+        op == xreg_name(num) || op == wreg_name(num)
+    })
+}
+
+// ── Adjacent FP field pair fusion (ldp/stp) ─────────────────────────────────
+//
+// `ldr dA, [xB]` + `ldr dC, [xB, #8]` (within a small window) → `ldp dA, dC,
+// [xB]`, and likewise `str` pairs → `stp`. Struct-of-double loops (nbody,
+// spectral_norm, struct_copy) load/store adjacent fields in pairs; fusing
+// halves the memory-op issue slots. Bit-identical: ldp/stp move the same
+// bytes as the two scalar accesses. CCC_NO_FP_PAIR disables.
+//
+// Soundness: the second access moves up to the first's position, so nothing
+// in the gap may write memory (for loads), touch memory at all (for stores),
+// or mention either destination register or the base.
+fn fuse_fp_adjacent_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_PAIR").is_ok() {
+        return false;
+    }
+    let mention = |line: &str, reg: u8, is_fp: bool| {
+        let (a, b) = if is_fp {
+            (format!("d{}", reg), format!("q{}", reg))
+        } else {
+            (xreg_name(reg).to_string(), wreg_name(reg).to_string())
+        };
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == a || tok == b)
+    };
+    let mut changed = false;
+    for i in 0..n {
+        // Skip lines already Nop'd by earlier fusions/passes: their text is
+        // stale and must not be re-paired.
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((is_store, ra, addra, b'd')) = parse_fp_mem(&lines[i]) else {
+            continue;
+        };
+        let base_reg = match addra {
+            FpAddr::Sp(_) => u8::MAX, // sp is never rewritten mid-body
+            FpAddr::Base(b, _) => b,
+        };
+        // Find a mergeable partner within a 4-instruction window.
+        let mut partner = None;
+        let mut j = i + 1;
+        while j < n && j <= i + 4 {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            match kinds[j] {
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let tj = lines[j].trim();
+            // A valid merge partner is not a hazard to itself — check for it
+            // before the generic memory-hazard break.
+            if let Some((is_store2, rc, addrc, b'd')) = parse_fp_mem(&lines[j]) {
+                if is_store2 == is_store && rc != ra {
+                    let same_base = match (addra, addrc) {
+                        (FpAddr::Sp(a), FpAddr::Sp(b)) => Some((a, b)),
+                        (FpAddr::Base(x, a), FpAddr::Base(y, b)) if x == y => Some((a, b)),
+                        _ => None,
+                    };
+                    if let Some((oa, ob)) = same_base {
+                        if (oa - ob).abs() == 8 {
+                            // The partner's load/store moves up to position i:
+                            // no gap line may mention rc (its physical register
+                            // could carry a live older value), write ra, or
+                            // write the base.
+                            let mut ok = true;
+                            for k in (i + 1)..j {
+                                if kinds[k] == LineKind::Nop {
+                                    continue;
+                                }
+                                if mention(&lines[k], rc, true)
+                                    || fp_reg_written(&lines[k], ra)
+                                    || (base_reg != u8::MAX
+                                        && gp_reg_written_broad(&lines[k], base_reg))
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                partner = Some((j, rc, ob));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let is_mem = parse_fp_mem(&lines[j]).is_some()
+                || matches!(
+                    kinds[j],
+                    LineKind::StoreSp { .. }
+                        | LineKind::LoadSp { .. }
+                        | LineKind::LoadswSp { .. }
+                        | LineKind::MemOther
+                        | LineKind::StorePairSp
+                        | LineKind::LoadPairSp
+                        | LineKind::LoadsbReg
+                );
+            // A store in the gap could alias the pending load; for store
+            // fusion any memory access is a hazard.
+            if is_mem && (is_store || tj.starts_with("st")) {
+                break;
+            }
+            j += 1;
+        }
+        let Some((pj, rc, ob)) = partner else {
+            continue;
+        };
+        let oa = match addra {
+            FpAddr::Sp(o) => o,
+            FpAddr::Base(_, o) => o,
+        };
+        let (lo_reg, hi_reg, lo) = if oa <= ob { (ra, rc, oa) } else { (rc, ra, ob) };
+        let base_str = match addra {
+            FpAddr::Sp(_) => "sp".to_string(),
+            FpAddr::Base(b, _) => xreg_name(b).to_string(),
+        };
+        let mnem = if is_store { "stp" } else { "ldp" };
+        lines[i] = if lo == 0 {
+            format!("    {} d{}, d{}, [{}]", mnem, lo_reg, hi_reg, base_str)
+        } else {
+            format!(
+                "    {} d{}, d{}, [{}, #{}]",
+                mnem, lo_reg, hi_reg, base_str, lo
+            )
+        };
+        kinds[i] = classify_line(&lines[i]);
+        kinds[pj] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Repeated GP slot load elimination ───────────────────────────────────────
+//
+// `ldr x9, [sp, #off]` ... `ldr x9, [sp, #off]` (same slot, no clobber):
+// spill-heavy code reloads slot-homed pointers once per field access. The
+// second load is redundant (or becomes a `mov` when the destination differs).
+// Same tracking discipline as forward_fp_slot_loads: stores through unknown
+// bases, calls, and control-flow boundaries drop all state; a write of the
+// cached register drops the entry.
+fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SLOT_LOAD_DEDUP").is_ok() {
+        return false;
+    }
+    // (offset, is_word) -> register holding the slot's content
+    let mut cached: FxHashMap<(i32, bool), u8> = FxHashMap::default();
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret => {
+                cached.clear();
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => continue,
+            LineKind::StoreSp {
+                offset, is_word, ..
+            } => {
+                // Invalidate entries overlapping the stored range.
+                let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+                cached.retain(|&(off, word), _| {
+                    let (l2, h2) = (off, off + if word { 4 } else { 8 });
+                    h2 <= lo || l2 >= hi
+                });
+                continue;
+            }
+            LineKind::LoadSp {
+                reg,
+                offset,
+                is_word,
+            } => {
+                if let Some(&prev) = cached.get(&(offset, is_word)) {
+                    if prev == reg {
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        continue;
+                    }
+                    lines[i] = format!(
+                        "    mov {}, {}",
+                        if is_word {
+                            wreg_name(reg)
+                        } else {
+                            xreg_name(reg)
+                        },
+                        if is_word {
+                            wreg_name(prev)
+                        } else {
+                            xreg_name(prev)
+                        }
+                    );
+                    kinds[i] = LineKind::Move {
+                        dst: reg,
+                        src: prev,
+                        is_32bit: is_word,
+                    };
+                    changed = true;
+                }
+                // The load (or its mov replacement) writes `reg`: any entry
+                // cached under it is stale. Then record the new mapping.
+                cached.retain(|_, &mut r| r != reg);
+                cached.insert((offset, is_word), reg);
+                continue;
+            }
+            _ => {}
+        }
+        let t = lines[i].trim();
+        // Stores through untracked bases may hit the frame: drop everything.
+        if t.starts_with("st") {
+            cached.clear();
+            continue;
+        }
+        // Loads and other instructions only invalidate via their destination.
+        if let Some(w) = written_gp_register(&lines[i], kinds[i]) {
+            cached.retain(|_, &mut r| r != w);
+        } else {
+            // Unrecognized kinds: check destination-position mentions broadly.
+            let mut dead = Vec::new();
+            for &r in cached.values() {
+                if gp_reg_written_broad(&lines[i], r) {
+                    dead.push(r);
+                }
+            }
+            for r in dead {
+                cached.retain(|_, &mut v| v != r);
+            }
+        }
+    }
+    changed
+}
+
+/// Strict single-destination form: only the first operand position, and only
+/// when it is the line's sole mention of the register (a read-write like
+/// `add x0, x0, #1` is NOT a pure overwrite).
+fn gp_reg_write_only(line: &str, num: u8) -> bool {
+    let t = line.trim();
+    let Some((mnem, rest)) = t.split_once(' ') else {
+        return false;
+    };
+    if matches!(
+        mnem,
+        "str"
+            | "stp"
+            | "strb"
+            | "strh"
+            | "stur"
+            | "sturb"
+            | "sturh"
+            | "stlr"
+            | "stlrb"
+            | "stlrh"
+            | "fcmp"
+            | "fcmpe"
+            | "b"
+            | "bl"
+            | "ret"
+            | "cbz"
+            | "cbnz"
+            | "tbz"
+            | "tbnz"
+            | "cmp"
+            | "cmn"
+    ) || mnem.starts_with("b.")
+    {
+        return false;
+    }
+    let (xa, wa) = (xreg_name(num), wreg_name(num));
+    let first = rest.split(',').next().map(str::trim);
+    if first != Some(xa) && first != Some(wa) {
+        return false;
+    }
+    t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|tok| *tok == xa || *tok == wa)
+        .count()
+        == 1
+}
+
+fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_FP_SLOT_FWD").is_ok() {
+        return false;
+    }
+    // slot (offset, width) -> source FP register number
+    let mut slot_src: FxHashMap<(i32, u8), u8> = FxHashMap::default();
+    // sp-derived base register -> sp offset (`add xN, sp, #off` / `mov xN, sp`)
+    let mut base_off: FxHashMap<u8, i32> = FxHashMap::default();
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < n {
+        match kinds[i] {
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret => {
+                slot_src.clear();
+                base_off.clear();
+                i += 1;
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let t = lines[i].trim().to_string();
+
+        // Track sp-derived base registers: `add xN, sp, #off`, `mov xN, sp`.
+        if let Some(rest) = t.strip_prefix("add ") {
+            if let Some((dst_s, srcs)) = rest.split_once(", ") {
+                if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                    if src_s.trim() == "sp" {
+                        let dst = parse_reg(dst_s.trim());
+                        if dst < 29 {
+                            if let Some(imm) = imm_s
+                                .trim()
+                                .strip_prefix('#')
+                                .and_then(|v| v.parse::<i32>().ok())
+                            {
+                                base_off.insert(dst, imm);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("mov ") {
+            if let Some((dst_s, src_s)) = rest.split_once(", ") {
+                if src_s.trim() == "sp" {
+                    let dst = parse_reg(dst_s.trim());
+                    if dst < 29 {
+                        base_off.insert(dst, 0);
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Any write of a tracked base register invalidates its mapping.
+        // (Broad check: loads through untracked bases and pair loads can also
+        // rewrite the register; over-dropping only loses optimization.)
+        {
+            let mut dead_bases = Vec::new();
+            for &b in base_off.keys() {
+                if written_gp_register(&lines[i], kinds[i]) == Some(b)
+                    || gp_reg_written_broad(&lines[i], b)
+                {
+                    dead_bases.push(b);
+                }
+            }
+            for b in dead_bases {
+                base_off.remove(&b);
+            }
+        }
+
+        if let Some((is_store, reg, addr, width)) = parse_fp_mem(&lines[i]) {
+            let slot_off = match addr {
+                FpAddr::Sp(off) => Some(off),
+                FpAddr::Base(b, k) => base_off.get(&b).map(|&base| base + k),
+            };
+            let Some(slot_off) = slot_off else {
+                // Unknown base: a store through it may alias anything tracked.
+                if is_store {
+                    slot_src.clear();
+                    base_off.clear();
+                } else {
+                    // Unknown-base load still clobbers its destination.
+                    let mut to_drop = Vec::new();
+                    for (&key, &s) in slot_src.iter() {
+                        if s == reg {
+                            to_drop.push(key);
+                        }
+                    }
+                    for key in to_drop {
+                        slot_src.remove(&key);
+                    }
+                }
+                i += 1;
+                continue;
+            };
+            if is_store {
+                let (lo, hi) = (slot_off, slot_off + fp_access_width(width));
+                slot_src.retain(|&(off, w), _| {
+                    let (l2, h2) = (off, off + fp_access_width(w));
+                    h2 <= lo || l2 >= hi
+                });
+                slot_src.insert((slot_off, width), reg);
+            } else {
+                if let Some(&src) = slot_src.get(&(slot_off, width)) {
+                    if src == reg {
+                        // Loading a slot into the register that already holds
+                        // its content: redundant.
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    lines[i] = if width == b'q' {
+                        format!("    mov v{}.16b, v{}.16b", reg, src)
+                    } else {
+                        format!(
+                            "    fmov {}{}, {}{}",
+                            width as char, reg, width as char, src
+                        )
+                    };
+                    kinds[i] = classify_line(&lines[i]);
+                    changed = true;
+                }
+                // The load writes its destination register, whether or not a
+                // forward happened: entries forwarding FROM that register are
+                // now stale. (Missing this clobbered a still-tracked entry
+                // whose source was silently reloaded between store and use.)
+                slot_src.retain(|_, &mut s| s != reg);
+            }
+            i += 1;
+            continue;
+        }
+
+        // GP stack stores invalidate overlapping FP entries.
+        if let LineKind::StoreSp {
+            offset, is_word, ..
+        } = kinds[i]
+        {
+            let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+            slot_src.retain(|&(off, w), _| {
+                let (l2, h2) = (off, off + fp_access_width(w));
+                h2 <= lo || l2 >= hi
+            });
+            i += 1;
+            continue;
+        }
+
+        match kinds[i] {
+            // Untracked store forms may write anywhere: drop all state.
+            LineKind::MemOther | LineKind::StorePairSp if t.starts_with("st") => {
+                slot_src.clear();
+                base_off.clear();
+            }
+            // Pair loads write two registers: drop entries sourcing either.
+            LineKind::LoadPairSp => {
+                let mut ops = t
+                    .trim_start_matches("ldp ")
+                    .split(',')
+                    .take(2)
+                    .filter_map(|tok| fp_token_reg(tok));
+                let (a, b) = (ops.next(), ops.next());
+                slot_src.retain(|_, &mut s| Some(s) != a && Some(s) != b);
+            }
+            // Other instructions: drop entries whose source register they write.
+            _ => {
+                let mut to_drop = Vec::new();
+                for (&key, &s) in slot_src.iter() {
+                    if fp_reg_written(&lines[i], s) {
+                        to_drop.push(key);
+                    }
+                }
+                for key in to_drop {
+                    slot_src.remove(&key);
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
 
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
@@ -1283,6 +1970,88 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
     changed
 }
 
+// ── Pass 3b: Redundant byte sign-extension elimination ──────────────────────
+//
+// Mirror of eliminate_redundant_sxtw for byte-level extensions: `ldrsb`
+// produces a value whose bits 7..63 are uniform (a sign-extended byte), so a
+// later `sxtb xD, wS` on it is redundant. Fires on char-byte loops like
+// sieve's count loop (`ldrsb x0, [p]` then `sxtb` before the zero test).
+
+fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut extb = [false; 33];
+    extb[32] = true; // the zero register is "byte-extended"
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret => {
+                extb = [false; 33];
+                extb[32] = true;
+            }
+            LineKind::Move { dst, src, is_32bit } => {
+                if is_32bit {
+                    // w-mov zeroes bits 32-63, breaking byte-extension of negatives.
+                    if dst < 32 {
+                        extb[dst as usize] = false;
+                    }
+                } else if dst < 32 {
+                    extb[dst as usize] = extb[src as usize];
+                }
+            }
+            _ => {
+                let t = lines[i].trim().to_string();
+                // sxtb xD, wS
+                if let Some(rest) = t.strip_prefix("sxtb ") {
+                    if let Some((d, s)) = rest.split_once(", ") {
+                        let dst = parse_reg(d.trim());
+                        let src = parse_reg(s.trim());
+                        if dst != REG_NONE && src != REG_NONE && dst < 32 && src < 32 {
+                            if extb[src as usize] {
+                                if dst == src {
+                                    kinds[i] = LineKind::Nop;
+                                } else {
+                                    lines[i] =
+                                        format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                                    kinds[i] = LineKind::Move {
+                                        dst,
+                                        src,
+                                        is_32bit: false,
+                                    };
+                                }
+                                changed = true;
+                            }
+                            // The sxtb result is byte-extended either way.
+                            extb[dst as usize] = true;
+                            continue;
+                        }
+                    }
+                }
+                // ldrsb xD/wD, [...] creates a byte-sign-extended value.
+                if let Some(rest) = t.strip_prefix("ldrsb ") {
+                    if let Some((d, _)) = rest.split_once(',') {
+                        let dst = parse_reg(d.trim());
+                        if dst != REG_NONE && dst < 32 {
+                            extb[dst as usize] = true;
+                        }
+                        continue;
+                    }
+                }
+                // Any other write clobbers the tracking.
+                if let Some(dst) = written_gp_register(&t, kinds[i]) {
+                    if dst < 32 {
+                        extb[dst as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
 // ── Pass 4: Move chain optimization ──────────────────────────────────────────
 //
 // Pattern: mov A, B  ;  mov C, A → mov C, B
@@ -1357,6 +2126,195 @@ fn eliminate_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             _ => {}
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Overwritten-move elimination ─────────────────────────────────────────────
+//
+// The accumulator-staging emission leaves dead moves like `mov x0, x22` right
+// before `add x0, x1, x22` (the add overwrites x0 without reading it). Delete
+// any mov/MoveImm whose destination register is provably overwritten before it
+// is read. Same-block, forward scan; any control flow or non-pure-write
+// mention keeps the move.
+fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let dst = match kinds[i] {
+            LineKind::Move { dst, .. } => dst,
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => dst,
+            _ => continue,
+        };
+        if dst >= 29 {
+            continue; // never touch sp/fp-adjacent registers
+        }
+        let xn = xreg_name(dst);
+        let wn = wreg_name(dst);
+        let mut dead = false;
+        let mut j = i + 1;
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            match kinds[j] {
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::Directive => break,
+                _ => {}
+            }
+            let t = &lines[j];
+            let mentions = t
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == xn || tok == wn);
+            if !mentions {
+                j += 1;
+                continue;
+            }
+            // First mention decides: a pure overwrite (dest written, not read)
+            // makes the earlier move dead; anything else reads it.
+            dead = match kinds[j] {
+                LineKind::Move {
+                    dst: d2, src: s2, ..
+                } => d2 == dst && s2 != dst,
+                LineKind::MoveImm { dst: d2 } | LineKind::MoveWide { dst: d2 } => d2 == dst,
+                LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } => reg == dst,
+                LineKind::Alu => {
+                    // Three-operand ALU: first operand is the destination.
+                    // Dead only if dst is that dest and not among the sources.
+                    let t2 = t.trim();
+                    let ops = t2.split_once(' ').map(|x| x.1).unwrap_or("");
+                    let mut parts = ops.splitn(2, ',');
+                    let first = parts.next().unwrap_or("").trim();
+                    let rest = parts.next().unwrap_or("");
+                    let first_is_dst = first == xn || first == wn;
+                    let rest_reads = rest
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|tok| tok == xn || tok == wn);
+                    first_is_dst && !rest_reads
+                }
+                _ => false,
+            };
+            break;
+        }
+        if dead {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+// ── Zero-extend move-chain folding ───────────────────────────────────────────
+//
+// `mov xA, xS ; mov wA, wA ; mov xD, xA` — the accumulator-path zero-extension
+// idiom (the 32-bit self-move clears the top half; it is NOT a no-op, so
+// eliminate_self_moves correctly keeps it). The chain computes xD = zext32(wS),
+// exactly `mov wD, wS`. Sound only if A is not read later in the block.
+fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n.saturating_sub(2) {
+        let LineKind::Move {
+            dst: a,
+            src: s,
+            is_32bit: false,
+        } = kinds[i]
+        else {
+            continue;
+        };
+        let LineKind::Move {
+            dst: a2,
+            src: s2,
+            is_32bit: true,
+        } = kinds[i + 1]
+        else {
+            continue;
+        };
+        if a2 != a || s2 != a {
+            continue; // middle must be mov wA, wA
+        }
+        let LineKind::Move {
+            dst: d,
+            src: s3,
+            is_32bit: false,
+        } = kinds[i + 2]
+        else {
+            continue;
+        };
+        if s3 != a || d == a || s == a {
+            continue;
+        }
+        // A must be dead after the chain: no later READ before a boundary.
+        // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
+        let (xa, wa) = (xreg_name(a), wreg_name(a));
+        let mut a_live = false;
+        for j in (i + 3)..n {
+            match kinds[j] {
+                // Control-flow boundaries are NOT "value is dead" proofs.
+                // levkropp's break-as-dead default folded d2hi()'s return-
+                // value chain (`mov x0,x22; mov w0,w0; mov x23,x0` right
+                // before the epilogue) into a dead callee-saved register and
+                // returned garbage: aarch64_fuzz seeds 0/2/5 at -O1, 40/100
+                // mismatches. ABI-precise handling instead:
+                // - ret implicitly reads the return-value registers x0/x1
+                //   (and x8 for sret); other registers are dead there.
+                LineKind::Ret => {
+                    a_live = a == 0 || a == 1 || a == 8;
+                    break;
+                }
+                // - calls read argument registers x0-x8; caller-saved temps
+                //   x9-x18 are clobbered unread (dead); callee-saved x19+
+                //   survive the call, so the scan must CONTINUE looking for
+                //   readers after the call rather than assume death.
+                LineKind::Call => {
+                    if a <= 8 {
+                        a_live = true;
+                        break;
+                    }
+                    if a >= 19 {
+                        continue;
+                    }
+                    break; // x9-x18: clobbered by the call without a read
+                }
+                // - labels and branches: the value may be read in the
+                //   target/fall-through block; this single-block scan cannot
+                //   see it, so it must be treated as live.
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
+                    a_live = true;
+                    break;
+                }
+                LineKind::Nop => continue,
+                _ => {}
+            }
+            let mentions = lines[j]
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|tok| *tok == xa || *tok == wa)
+                .count();
+            if mentions == 0 {
+                continue;
+            }
+            if gp_reg_write_only(&lines[j], a) {
+                break; // write-only: the chain's value in A is dead here
+            }
+            a_live = true;
+            break;
+        }
+        if a_live {
+            continue;
+        }
+        lines[i] = format!("    mov {}, {}", wreg_name(d), wreg_name(s));
+        kinds[i] = LineKind::Move {
+            dst: d,
+            src: s,
+            is_32bit: true,
+        };
+        kinds[i + 1] = LineKind::Nop;
+        kinds[i + 2] = LineKind::Nop;
+        changed = true;
     }
     changed
 }
@@ -1602,6 +2560,14 @@ use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace
 // This runs after global store forwarding, which may have converted many loads
 // to register moves, leaving the original stores dead.
 
+// REJECTED ADOPTION: levkropp's GDSE escape-analysis rewrite (e03da2f1 /
+// e20cdf6e) caused 9 regressions on our tree (volatile_loop, fp_cmp_inf,
+// unroll_const4_*, gvn_param_alloca_load, hash_narrow_chain,
+// reduction_two_sums, glibc_ld_builtins — all bisected to CCC_NO_GDSE).
+// Our codegen emits sp-derived access patterns his tracker misclassifies.
+// Keeping the conservative bail-on-address-of-sp version: sound by
+// construction, and the loop-variant-base hazard his rewrite fixes cannot
+// arise here because we never resolve loads through derived bases at all.
 fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
     // stack slots could be accessed through pointers, so we must not eliminate any stores.
@@ -1699,6 +2665,85 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
         }
     }
     changed
+}
+
+/// Parse `[xN]`, `[xN, #k]` (no writeback) into (base register, offset).
+fn parse_base_addr(inner_bracketed: &str) -> Option<(u8, i32)> {
+    let inner = inner_bracketed.strip_prefix('[')?;
+    let inner = inner.split_once(']').map(|(h, _)| h).unwrap_or(inner);
+    let (base, off) = match inner.split_once(", ") {
+        Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
+        None => (inner.trim(), 0),
+    };
+    let b = parse_reg(base);
+    (b < 29).then_some((b, off))
+}
+
+/// Maintain the sp-derived base-register map for one line of text:
+/// `add/sub xN, sp, #k` creates, `mov` copies or ends a lineage, `add/sub`
+/// on a base adjusts or derives, calls end caller-saved lineages, and any
+/// other write of a tracked register ends its lineage.
+fn track_sp_bases(line: &str, kind: LineKind, base_off: &mut FxHashMap<u8, i32>) {
+    let t = line.trim();
+    if let Some(rest) = t.strip_prefix("add ").or_else(|| t.strip_prefix("sub ")) {
+        let neg = t.starts_with("sub ");
+        if let Some((dst_s, srcs)) = rest.split_once(", ") {
+            if let Some((src_s, imm_s)) = srcs.split_once(", ") {
+                let dst = parse_reg(dst_s.trim());
+                let src = parse_reg(src_s.trim());
+                let imm = imm_s
+                    .trim()
+                    .strip_prefix('#')
+                    .and_then(|v| v.parse::<i32>().ok());
+                if let Some(imm) = imm {
+                    let signed = if neg { -imm } else { imm };
+                    if src_s.trim() == "sp" && dst < 29 {
+                        base_off.insert(dst, signed);
+                        return;
+                    }
+                    if let Some(&off) = base_off.get(&src) {
+                        if dst < 29 {
+                            base_off.insert(dst, off + signed);
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(rest) = t.strip_prefix("mov ") {
+        if let Some((dst_s, src_s)) = rest.split_once(", ") {
+            let (dst_s, src_s) = (dst_s.trim(), src_s.trim());
+            let dst = parse_reg(dst_s);
+            if src_s == "sp" {
+                if dst < 29 {
+                    base_off.insert(dst, 0);
+                }
+                return;
+            }
+            let src = parse_reg(src_s);
+            if let Some(&off) = base_off.get(&src) {
+                if dst < 29 {
+                    base_off.insert(dst, off);
+                }
+            } else if dst < 29 {
+                // mov xN, <non-base>: clobbered, lineage ends.
+                base_off.remove(&dst);
+            }
+        }
+    }
+    // Calls clobber caller-saved registers: end those lineages.
+    if kind == LineKind::Call {
+        base_off.retain(|&r, _| r >= 19);
+        return;
+    }
+    let mut dead = Vec::new();
+    for &b in base_off.keys() {
+        if gp_reg_written_broad(line, b) || written_gp_register(line, kind) == Some(b) {
+            dead.push(b);
+        }
+    }
+    for b in dead {
+        base_off.remove(&b);
+    }
 }
 
 /// Extract the numeric offset from an instruction containing `[sp, #N]` or `[sp]`.
@@ -1884,6 +2929,441 @@ fn rotate_simple_loops(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         changed = true;
     }
     changed
+}
+
+// ── Loop-carried store sinking ───────────────────────────────────────────────
+//
+// The slot-home discipline gives every SSA value a mandatory stack slot, so a
+// loop-carried value is stored to its slot once per iteration even when
+// nothing in the loop ever loads the slot back (the value stays live in a
+// register; the slot is only read after the loop).  Sink such a store to the
+// loop's fall-through exit:
+//
+//     .Lbody:                       .Lbody:
+//       ...                           ...
+//       str x0, [sp, #24]   -->       ...            (store removed)
+//       ...                           ...
+//       b.le .Lbody                   b.le .Lbody
+//       b .Lexit                      str x0, [sp, #24]  (stored once)
+//                                     b .Lexit
+//
+// Soundness conditions (all checked below): the slot is not otherwise
+// referenced inside the loop, this is the only store to it, every path from
+// the loop head to the fall-through exit executes the store (no labels or
+// exiting branches between the head and the store, no labels between the
+// store and the backedge), the only exit is the fall-through past the
+// backedge, and the stored register is not rewritten between the store and
+// the backedge.  Then the register holds the last-stored value at the exit,
+// so storing it there once produces the same slot contents as the original.
+
+/// Register number of a scalar register operand (`w0`/`x19`/`d24`/`s3` →
+/// 0/19/24/3).  The class is ignored: a match on the number alone is a
+/// conservative clobber indication.
+fn reg_operand_num(op: &str) -> Option<u8> {
+    let op = op.trim();
+    let rest = op.strip_prefix(|c| matches!(c, 'w' | 'x' | 'd' | 's' | 'q' | 'b' | 'h'))?;
+    rest.parse::<u8>().ok().filter(|&n| n <= 30)
+}
+
+/// Does this instruction write a register with the given number?
+/// Conservative: the first operand (and the second for `ldp`) counts as a
+/// destination for everything that is not a store, compare, or branch.
+fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
+    let mut it = trimmed.splitn(2, char::is_whitespace);
+    let mnem = it.next().unwrap_or("");
+    let ops = it.next().unwrap_or("");
+    if ops.is_empty() {
+        return false; // labels, directives, ret, bare branches
+    }
+    // Stores and comparisons have no register destination.
+    if mnem.starts_with("st")
+        || mnem.starts_with("cmp")
+        || mnem.starts_with("cmn")
+        || mnem.starts_with("tst")
+        || mnem.starts_with("fcmp")
+    {
+        return false;
+    }
+    // Branches.
+    if mnem == "b"
+        || mnem.starts_with("b.")
+        || mnem == "bl"
+        || mnem == "blr"
+        || mnem == "br"
+        || mnem == "cbz"
+        || mnem == "cbnz"
+        || mnem == "tbz"
+        || mnem == "tbnz"
+    {
+        return false;
+    }
+    let mut operands = ops.split(", ");
+    if let Some(first) = operands.next() {
+        if reg_operand_num(first) == Some(num) {
+            return true;
+        }
+    }
+    if mnem == "ldp" {
+        if let Some(second) = operands.next() {
+            if reg_operand_num(second) == Some(num) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse `str <reg>, [sp, #off]` for scalar regs (w/x/s/d) → (reg_num, offset).
+fn parse_sp_store_any(trimmed: &str) -> Option<(u8, i32)> {
+    let rest = trimmed.strip_prefix("str ")?;
+    let (reg_str, addr) = rest.split_once(", ")?;
+    let num = reg_operand_num(reg_str)?;
+    let off = parse_sp_offset(addr.trim())?;
+    Some((num, off))
+}
+
+/// Byte size of a scalar `str` register operand (w/s=4, x/d=8).
+fn store_reg_size(trimmed: &str) -> Option<u32> {
+    let rest = trimmed.strip_prefix("str ")?;
+    let (reg_str, _) = rest.split_once(", ")?;
+    let r = reg_str.trim();
+    if r.starts_with('w') || r.starts_with('s') {
+        Some(4)
+    } else if r.starts_with('x') || r.starts_with('d') {
+        Some(8)
+    } else {
+        None
+    }
+}
+
+// ── Overwritten store elimination ────────────────────────────────────────────
+//
+// Local dead-store peephole: `str R, [sp, #off]` followed by another store to
+// the same slot with no intervening read (and no label, branch, call, or
+// unknown memory op between). The first store is dead. This is the store
+// analog of eliminate_overwritten_moves and catches cases the global DSE
+// misses when it bails on a whole function due to one escaped frame pointer.
+fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_STORE_DSE").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::StoreSp {
+            offset: off_i,
+            is_word: word_i,
+            ..
+        } = kinds[i]
+        else {
+            continue;
+        };
+        let size_i = if word_i { 4u32 } else { 8 };
+        let mut j = i + 1;
+        let mut steps = 0;
+        while j < n && steps < 40 {
+            steps += 1;
+            if lines[j].contains('\n') {
+                break; // multi-line slot may hide memory ops
+            }
+            match kinds[j] {
+                LineKind::Nop => {
+                    j += 1;
+                    continue;
+                }
+                LineKind::StoreSp {
+                    offset: off_j,
+                    is_word: word_j,
+                    ..
+                } => {
+                    let size_j = if word_j { 4u32 } else { 8 };
+                    if off_j == off_i && size_j >= size_i {
+                        // Fully overwritten with no intervening read.
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                    }
+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                        break; // overlapping store: stop either way
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadSp {
+                    offset: off_j,
+                    is_word: word_j,
+                    ..
+                } => {
+                    let size_j = if word_j { 4u32 } else { 8 };
+                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                        break; // reads our slot (or overlaps it)
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::LoadswSp { offset: off_j, .. } => {
+                    if off_j < off_i + size_i as i32 && off_i < off_j + 4 {
+                        break;
+                    }
+                    j += 1;
+                    continue;
+                }
+                // Straight-line, non-memory instructions are transparent.
+                LineKind::Move { .. }
+                | LineKind::MoveImm { .. }
+                | LineKind::MoveWide { .. }
+                | LineKind::Sxtw { .. }
+                | LineKind::Compare
+                | LineKind::Alu => {
+                    j += 1;
+                    continue;
+                }
+                // Labels, branches, calls, pair/unknown memory ops, anything
+                // else: stop. `Other` covers unknown instructions that might
+                // touch memory, so it stops the scan too.
+                _ => break,
+            }
+        }
+    }
+    changed
+}
+
+/// Branch target label of a (sub-)line, for plain/conditional/compare branches.
+fn any_branch_target(trimmed: &str) -> Option<&str> {
+    if let Some(rest) = trimmed.strip_prefix("b ") {
+        let t = rest.trim();
+        if t.starts_with('.') {
+            return Some(t);
+        }
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("b.") {
+        if let Some((_, t)) = rest.split_once(' ') {
+            let t = t.trim();
+            if t.starts_with('.') {
+                return Some(t);
+            }
+        }
+        return None;
+    }
+    for p in ["cbz ", "cbnz ", "tbz ", "tbnz "] {
+        if trimmed.starts_with(p) {
+            if let Some((_, t)) = trimmed.rsplit_once(", ") {
+                let t = t.trim();
+                if t.starts_with('.') {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_STORE_SINK").is_ok() {
+        return false;
+    }
+    // Flatten to virtual sub-lines: rotation leaves multi-line slots whose
+    // embedded latch branches this pass must still see.
+    let mut v: Vec<(usize, usize, String)> = Vec::new(); // (slot, sub_idx, text)
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        for (si, sub) in lines[i].split('\n').enumerate() {
+            let t = sub.trim();
+            if !t.is_empty() {
+                v.push((i, si, t.to_string()));
+            }
+        }
+    }
+    let nv = v.len();
+    // Label name -> virtual index.
+    let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (vi, (_, _, t)) in v.iter().enumerate() {
+        if let Some(name) = t.strip_suffix(':') {
+            labels.insert(name, vi);
+        }
+    }
+    // Find loop regions: a conditional backward branch ends a bottom-tested
+    // loop whose exit is the fall-through past the branch.
+    let mut regions: Vec<(usize, usize)> = Vec::new(); // (head vi, backedge vi)
+    for vj in 0..nv {
+        let t = &v[vj].2;
+        let conditional = t.starts_with("b.")
+            || t.starts_with("cbz ")
+            || t.starts_with("cbnz ")
+            || t.starts_with("tbz ")
+            || t.starts_with("tbnz ");
+        if !conditional {
+            continue;
+        }
+        let Some(target) = any_branch_target(t) else {
+            continue;
+        };
+        let Some(&vi) = labels.get(target) else {
+            continue;
+        };
+        if vi < vj {
+            regions.push((vi, vj));
+        }
+    }
+    // Largest regions first: sink each store as far out as possible.
+    regions.sort_by_key(|&(h, j)| std::cmp::Reverse(j - h));
+
+    let mut sunk_slot: Vec<bool> = vec![false; n];
+    // (store slot, store text, backedge slot, backedge sub_idx)
+    let mut edits: Vec<(usize, String, usize, usize)> = Vec::new();
+
+    for &(h, j) in &regions {
+        // Region-level hazards: calls, returns, or branches to unknown labels.
+        let mut region_bad = false;
+        for p in h..=j {
+            let t = &v[p].2;
+            if t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
+                region_bad = true;
+                break;
+            }
+            if let Some(tgt) = any_branch_target(t) {
+                if !labels.contains_key(tgt) {
+                    region_bad = true;
+                    break;
+                }
+            }
+        }
+        if region_bad {
+            continue;
+        }
+        // The backedge slot must contain no other backward branch: splicing
+        // would shift the second branch's sub-index.
+        let bslot = v[j].0;
+        let mut other_backedge = false;
+        for p in h..j {
+            if v[p].0 != bslot {
+                continue;
+            }
+            if let Some(tgt) = any_branch_target(&v[p].2) {
+                if let Some(&tp) = labels.get(tgt) {
+                    if tp < p {
+                        other_backedge = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if other_backedge {
+            continue;
+        }
+        // Exit branches: any branch in the region targeting outside it.
+        // (The backedge at j targets the head, which is inside.)
+        let mut exits: Vec<usize> = Vec::new();
+        for p in h..j {
+            if let Some(tgt) = any_branch_target(&v[p].2) {
+                let tp = labels[tgt];
+                if tp < h || tp > j {
+                    exits.push(p);
+                }
+            }
+        }
+        // Candidate stores.
+        for k in (h + 1)..j {
+            let (slot, _, ref text) = v[k];
+            if sunk_slot[slot] || lines[slot].contains('\n') {
+                continue; // already sunk, or not a standalone line
+            }
+            if !matches!(kinds[slot], LineKind::StoreSp { .. } | LineKind::MemOther) {
+                continue;
+            }
+            let Some((num, off)) = parse_sp_store_any(text) else {
+                continue;
+            };
+            let debug = std::env::var("CCC_SINK_DEBUG").is_ok();
+            let slot_ref = format!("[sp, #{}]", off);
+            let mut bad = false;
+            // (a) Nothing else in the region references this slot.
+            for p in h..=j {
+                if p == k {
+                    continue;
+                }
+                let t = &v[p].2;
+                if t.contains(&slot_ref) {
+                    bad = true;
+                    break;
+                }
+                // Pair ops cover a range: stp/ldp at base M spans M..M+16.
+                if t.starts_with("stp ") || t.starts_with("ldp ") {
+                    if let Some(base) = extract_sp_offset(t) {
+                        if base <= off && off < base + 16 {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if bad && debug {
+                eprintln!("sink bail: {} (slot re-referenced in region)", text);
+            }
+            // (b) No exiting branch anywhere (v1: fall-through exit only).
+            if !bad && !exits.is_empty() {
+                bad = true;
+                if debug {
+                    eprintln!("sink bail: {} ({} exit branches)", text, exits.len());
+                }
+            }
+            // (c) No labels between the store and the backedge (no way to
+            // reach the exit without passing the store), and none before the
+            // store either except the head (every path to the exit passes k).
+            if !bad {
+                for p in (h + 1)..j {
+                    if p == k {
+                        continue;
+                    }
+                    if v[p].2.ends_with(':') {
+                        bad = true;
+                        if debug {
+                            eprintln!("sink bail: {} (label {} in region)", text, v[p].2);
+                        }
+                        break;
+                    }
+                }
+            }
+            // (d) The stored register survives to the backedge.
+            if !bad {
+                for p in (k + 1)..=j {
+                    if instr_clobbers_reg(&v[p].2, num) {
+                        bad = true;
+                        if debug {
+                            eprintln!("sink bail: {} (clobbered by {})", text, v[p].2);
+                        }
+                        break;
+                    }
+                }
+            }
+            if bad {
+                continue;
+            }
+            sunk_slot[slot] = true;
+            edits.push((slot, format!("    {}", text), v[j].0, v[j].1));
+            if debug {
+                eprintln!("sink ok: {}", text);
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+    for (slot, _, _, _) in &edits {
+        kinds[*slot] = LineKind::Nop;
+    }
+    // Splice each sunk store into the backedge slot, right after the branch.
+    // Insertions land after the backedge sub-line, so it keeps its original
+    // sub-index no matter how many stores are spliced in.
+    for (_, text, bj, bsub) in &edits {
+        let mut subs: Vec<&str> = lines[*bj].split('\n').collect();
+        subs.insert(bsub + 1, text.as_str());
+        lines[*bj] = subs.join("\n");
+        kinds[*bj] = LineKind::Other;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -2186,13 +3666,662 @@ mod tests {
 
     #[test]
     fn test_dse_with_address_taken() {
-        // When sp address is taken, no stores should be eliminated
+        // Conservative GDSE: materializing ANY sp-derived address disables
+        // store elimination (we do not track whether it is used), so the
+        // store stays.
         let input = "\
     str w0, [sp, #16]\n\
     add x1, sp, #16\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // Store must be preserved because address of stack slot is taken
-        assert!(result.contains("str w0, [sp, #16]"));
+        assert!(
+            result.contains("str w0, [sp, #16]"),
+            "address-of-sp disables DSE conservatively:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dse_with_escaping_address() {
+        // The derived base is stored into memory here: the address escapes,
+        // so no store elimination may happen at all.
+        let input = "\
+    str w0, [sp, #16]\n\
+    add x1, sp, #16\n\
+    str x1, [x9]\n\
+    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("str w0, [sp, #16]"),
+            "escaping address must preserve stores:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dse_dead_fp_store_via_base() {
+        // Conservative GDSE: any address-of-sp (`add x23, sp, #112`)
+        // disables store elimination for the whole function — the store
+        // through the derived base must SURVIVE. (levkropp's escape-
+        // analysis rewrite that eliminated it caused 9 regressions on
+        // this tree — volatile_loop, unroll_const4_*, fp_cmp_inf et al. —
+        // and was rejected; see the REJECTED ADOPTION note at
+        // global_dead_store_elimination.)
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    fadd d0, d1, d1
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("str d28, [x23]"),
+            "store via derived base kept (conservative GDSE):\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dse_live_fp_store_via_base_kept() {
+        // Same conservative rule: with address-of-sp present, both the
+        // store and the (differently-addressed) load survive untouched.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    ldr d0, [sp, #112]
+    fadd d0, d0, d0
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("str d28"),
+            "store kept under conservative GDSE:\n{}",
+            result
+        );
+    }
+
+    // ── Address-alias soundness ────────────────────────────────────────
+
+    #[test]
+    fn test_address_alias_mov_survives_cross_block_use() {
+        // The mov's register is used as an address in a LATER block (after a
+        // call): deleting the initializer must not happen even though the
+        // in-window use is a pure address alias.
+        let input = "\
+f:
+    adrp x0, tbl
+    add x0, x0, :lo12:tbl
+    mov x23, x0
+    ldr x4, [x23, x28, lsl #3]
+    mov x19, x4
+    bl strcmp
+.LBB9:
+    ldr x19, [x23, x27, lsl #3]
+    str x22, [x23, x27, lsl #3]
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("mov x23, x0"),
+            "defining mov must survive:\n{}",
+            result
+        );
+        assert!(
+            result.contains("[x23, x27, lsl #3]"),
+            "cross-block use must not be rewritten:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_address_alias_folded_when_provably_dead() {
+        // The intended optimization: a short-lived address alias whose
+        // register is overwritten (without being read) after the uses.
+        let input = "\
+f:
+    mov x9, x26
+    ldr x4, [x9]
+    str x4, [x9, #8]
+    mov x9, x5
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("mov x9, x26"),
+            "dead alias mov removed:\n{}",
+            result
+        );
+        assert!(
+            result.contains("ldr x4, [x26]"),
+            "use rewritten:\n{}",
+            result
+        );
+        assert!(
+            result.contains("str x4, [x26, #8]"),
+            "use rewritten:\n{}",
+            result
+        );
+    }
+
+    // ── FP spill slot forwarding ─────────────────────────────────────────
+
+    #[test]
+    fn test_fp_slot_forward_basic() {
+        let input = "\
+f:
+    fsub d0, d12, d21
+    str d0, [sp, #224]
+    fmul d3, d0, d0
+    ldr d1, [sp, #224]
+    fadd d4, d1, d3
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("fmov d1, d0"),
+            "reload forwarded:\n{}",
+            result
+        );
+        assert!(!result.contains("ldr d1, [sp, #224]"));
+    }
+
+    #[test]
+    fn test_fp_slot_forward_same_reg_deletes() {
+        let input = "\
+f:
+    str d7, [sp, #64]
+    ldr d7, [sp, #64]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("ldr d7, [sp, #64]"),
+            "redundant reload deleted:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_source_clobber() {
+        // d0 is overwritten between the store and the load: no forwarding.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    fmul d0, d1, d2
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("ldr d1, [sp, #224]"),
+            "clobbered source must not forward:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_unknown_store() {
+        // A store through an untracked base may alias the slot: no forwarding.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    str d5, [x9]
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("ldr d1, [sp, #224]"),
+            "unknown-base store must block:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_slot_forward_via_materialized_base() {
+        // Stores through an sp-derived base register are tracked.
+        let input = "\
+f:
+    add x23, sp, #112
+    fmul d28, d27, d17
+    str d28, [x23]
+    fadd d4, d1, d1
+    ldr d6, [sp, #112]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("fmov d6, d28"),
+            "base-tracked forward:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_slot_forward_gp_store_overlap_blocks() {
+        // A GP word store into the upper half of the double slot must
+        // invalidate the double's forward entry.
+        let input = "\
+f:
+    str d0, [sp, #224]
+    str w1, [sp, #228]
+    ldr d1, [sp, #224]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("ldr d1, [sp, #224]"),
+            "overlapping GP store must block:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_slot_forward_blocked_by_intervening_reload_of_source() {
+        // The reload of d0 from a different slot clobbers the tracked source
+        // of slot #232's entry: forwarding the second load as `fmov d1, d0`
+        // would read the wrong value.
+        let input = "\
+f:
+    str d0, [sp, #232]
+    ldr d0, [sp, #224]
+    ldr d1, [sp, #232]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("fmov d1, d0"),
+            "reload of source must block forward:\n{}",
+            result
+        );
+    }
+
+    // ── FP field pair fusion (ldp/stp) ───────────────────────────────────
+
+    #[test]
+    fn test_fp_pair_loads_fused() {
+        let input = "\
+f:
+    ldr d22, [x7]
+    ldr d23, [x26]
+    fsub d27, d22, d23
+    ldr d28, [x7, #8]
+    fsub d30, d28, d29
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("ldp d22, d28, [x7]"),
+            "loads fused:\n{}",
+            result
+        );
+        assert!(!result.contains("ldr d28, [x7, #8]"));
+    }
+
+    #[test]
+    fn test_fp_pair_stores_fused() {
+        let input = "\
+f:
+    str d10, [x8]
+    str d22, [x8, #8]
+    ldr d1, [x8]
+    ldr d2, [x8, #8]
+    fadd d0, d1, d2
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("stp d10, d22, [x8]"),
+            "stores fused:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_pair_loads_blocked_by_store() {
+        // A store between the loads may alias the second load's address.
+        let input = "\
+f:
+    ldr d22, [x7]
+    str d0, [x9]
+    ldr d28, [x7, #8]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("ldr d28, [x7, #8]"),
+            "store must block fusion:\n{}",
+            result
+        );
+        assert!(!result.contains("ldp"));
+    }
+
+    #[test]
+    fn test_fp_pair_stores_blocked_by_load() {
+        // A load between the stores may read the second store's address.
+        let input = "\
+f:
+    str d10, [x7]
+    ldr d0, [x9]
+    str d22, [x7, #8]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("str d22, [x7, #8]"),
+            "load must block store fusion:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_pair_reversed_offsets() {
+        let input = "\
+f:
+    ldr d28, [x7, #8]
+    ldr d22, [x7]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("ldp d22, d28, [x7]"),
+            "reversed pair normalized:\n{}",
+            result
+        );
+    }
+
+    // ── Repeated slot load elimination ───────────────────────────────────
+
+    #[test]
+    fn test_repeated_slot_load_same_reg_deleted() {
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    ldr d28, [x9, #80]
+    fmul d29, d28, d8
+    ldr x9, [sp, #392]
+    ldr d30, [x9, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(
+            result.matches("ldr x9, [sp, #392]").count(),
+            1,
+            "second load deleted:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_repeated_slot_load_different_reg_mov() {
+        // The repeat load becomes a mov, and copy-propagation then folds the
+        // mov into the consumer — the second slot load disappears entirely.
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    ldr d28, [x9, #80]
+    ldr x10, [sp, #392]
+    ldr d30, [x10, #56]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("ldr x10, [sp, #392]"),
+            "repeat load gone:\n{}",
+            result
+        );
+        assert!(
+            result.contains("ldr d30, [x9, #56]"),
+            "consumer uses x9:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_repeated_slot_load_blocked_by_intervening_store() {
+        // A store through an unknown base may write the frame slot.
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    str d0, [x26]
+    ldr x9, [sp, #392]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(
+            result.matches("ldr x9, [sp, #392]").count(),
+            2,
+            "unknown-base store must block:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_repeated_slot_load_blocked_by_reg_clobber() {
+        let input = "\
+f:
+    ldr x9, [sp, #392]
+    add x9, x9, #8
+    ldr x9, [sp, #392]
+    ret
+";
+        // x9 was overwritten by the add: the second load must stay.
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(
+            result.matches("ldr x9, [sp, #392]").count(),
+            2,
+            "clobbered register must block:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_pair_latch_stores_no_overlap() {
+        // Consecutive latch spill stores fuse pairwise; an already-paired line
+        // must not be re-paired into an overlapping stp.
+        let input = "\
+f:
+    add x19, x26, #56
+    str d10, [sp, #344]
+    str d22, [sp, #352]
+    str d30, [sp, #360]
+    str d19, [sp, #368]
+    str d27, [sp, #376]
+    mov x26, x19
+    ldr d0, [sp, #344]
+    ldr d1, [sp, #352]
+    ldr d2, [sp, #360]
+    ldr d3, [sp, #368]
+    ldr d4, [sp, #376]
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("stp d10, d22, [sp, #344]"),
+            "first pair:\n{}",
+            result
+        );
+        assert!(
+            result.contains("stp d30, d19, [sp, #360]"),
+            "second pair:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("stp d22"),
+            "no overlapping re-fusion:\n{}",
+            result
+        );
+    }
+
+    // ── Zext move-chain folding ──────────────────────────────────────────
+
+    #[test]
+    fn test_zext_move_chain_folded() {
+        // x0 is overwritten write-only after the chain, proving the chain
+        // value dead in this block: fold is legal. (Without that overwrite
+        // the trailing `ret` reads x0 as the return value and MUST block
+        // the fold; see test_zext_move_chain_blocked_by_ret.)
+        let input = "\
+f:
+    mov x0, x24
+    mov w0, w0
+    mov x26, x0
+    mov x0, #7
+    mul w4, w26, w25
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w26, w24"), "chain folded:\n{}", result);
+        assert!(!result.contains("mov w0, w0"));
+    }
+
+    #[test]
+    fn test_zext_move_chain_blocked_by_ret() {
+        // The chain accumulator IS the return-value register: `ret` reads
+        // x0, so folding would change the returned value (aarch64_fuzz
+        // seeds 0/2/5 at -O1: d2hi return chain, 40/100 mismatches).
+        let input = "\
+f:
+    mov x0, x22
+    mov w0, w0
+    mov x23, x0
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("mov w0, w0"),
+            "zext chain into x0 before ret must not fold:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_zext_move_chain_blocked_when_accumulator_live() {
+        let input = "\
+f:
+    mov x0, x24
+    mov w0, w0
+    mov x26, x0
+    mul w4, w26, w25
+    add w5, w0, #1
+    ret
+";
+        // x0 is read after the chain: folding would lose the zext value.
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            result.contains("mov w0, w0"),
+            "live accumulator blocks fold:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sink_loop_carried_store() {
+        // Bottom-tested loop: the slot is never read inside, the value stays
+        // live in x20; the store can be sunk to the fall-through exit.
+        let input = "\
+f:
+    mov x20, #0
+    movz x21, #100
+    b .Lguard
+.Lbody:
+    sxtw x22, w20
+    add x0, x22, x20
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+    b .Lexit
+.Lguard:
+    cmp w20, w21
+    b.le .Lbody
+    b .Lexit
+.Lexit:
+    ldr x0, [sp, #24]
+    ret
+";
+        let result = {
+            let mut lines: Vec<String> = input.lines().map(String::from).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            let changed = sink_loop_carried_stores(&mut lines, &mut kinds, n);
+            let out = lines
+                .iter()
+                .zip(kinds.iter())
+                .filter(|(_, k)| **k != LineKind::Nop)
+                .map(|(l, _)| l.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(changed, "store should be sunk:\n{}", out);
+            out
+        };
+        // Exactly one store remains, on the exit path after the backedge.
+        assert_eq!(
+            result.matches("str x0, [sp, #24]").count(),
+            1,
+            "\n{}",
+            result
+        );
+        let be = result.find("b.le .Lbody").unwrap();
+        let st = result.find("str x0, [sp, #24]").unwrap();
+        assert!(st > be, "store after backedge:\n{}", result);
+    }
+
+    #[test]
+    fn test_sink_blocked_when_slot_read_in_loop() {
+        let input = "\
+f:
+    mov x20, #0
+.Lbody:
+    ldr x0, [sp, #24]
+    add x0, x0, x20
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+    ldr x0, [sp, #24]
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+    }
+
+    #[test]
+    fn test_sink_blocked_by_mid_loop_exit() {
+        let input = "\
+f:
+    mov x20, #0
+.Lbody:
+    cmp w20, w22
+    b.gt .Lexit
+    add x0, x20, #1
+    str x0, [sp, #24]
+    mov x20, x0
+    cmp w20, w21
+    b.le .Lbody
+.Lexit:
+    ldr x0, [sp, #24]
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
     }
 }

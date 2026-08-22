@@ -1,7 +1,7 @@
 //! X86Codegen: function call operations.
 
-use super::emit::{X86Codegen, X86_ARG_REGS};
-use crate::backend::call_abi::{compute_stack_push_bytes, CallAbiConfig, CallArgClass};
+use super::emit::{X86_ARG_REGS, X86Codegen};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
@@ -386,6 +386,18 @@ impl X86Codegen {
         if hazard_area > 0 {
             self.state
                 .emit_fmt(format_args!("    subq ${}, %rsp", hazard_area));
+            // The pre-spill area moves rsp: every rsp-relative slot read
+            // emitted during the staging loop below (emit_fp_operand_to_xmm,
+            // operand_to_rax, ... all go through slot_ref) must see the
+            // enlarged frame, or they read hazard_area bytes BELOW their
+            // slot. Under rsp addressing this returned stale/garbage args:
+            // printf("%f %f %f %f", s1, s2, t1, t2) printed t1's value as
+            // arg1 and stack garbage for args 2-3. rbp-addressed frames are
+            // unaffected (slot_ref ignores rsp there), which is why the
+            // session-25 hazard tests missed it.
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += hazard_area as i64;
+            }
             for (k, (arg_i, phys, is_fp)) in hazards.iter().enumerate() {
                 let off = (k * 8) as i64;
                 hazard_slot.insert(*arg_i, off);
@@ -735,6 +747,9 @@ impl X86Codegen {
         if hazard_area > 0 {
             self.state
                 .emit_fmt(format_args!("    addq ${}, %rsp", hazard_area));
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= hazard_area as i64;
+            }
         }
         // Restore the original RSP frame size.
         if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
