@@ -80,6 +80,16 @@ for function in "${!expected_condition[@]}"; do
     }
 done
 
+# The canonical two-parameter leaf must match GCC/Clang's irreducible
+# cmp+cinc+ret shape: no frame, copies, saves, or reloads.
+leaf=$(function_body inc_if_true_u32 "$tmp/enabled.s")
+leaf_instructions=$(grep -Ec '^[[:space:]]+(cmp|csinc|ret)([[:space:]]|$)' <<<"$leaf")
+if [[ $leaf_instructions -ne 3 ]] || grep -Eq '^[[:space:]]+(stp|ldp|str|ldr|mov)[[:space:]]' <<<"$leaf"; then
+    echo "FAIL: inc_if_true_u32 is not the optimal three-instruction leaf" >&2
+    printf '%s\n' "$leaf" >&2
+    exit 1
+fi
+
 for function in do_not_fold_delta_two do_not_fold_extra_use; do
     body=$(function_body "$function" "$tmp/enabled.s")
     if grep -qE '^[[:space:]]+csinc[[:space:]]' <<<"$body"; then

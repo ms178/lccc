@@ -142,7 +142,13 @@ impl ArmCodegen {
                     .copied()
                     .filter(|r| !is_arm_fp_phys(*r))
                 {
-                    let c = callee_saved_name(phys);
+                    let c = if self.conditional_increment_leaf
+                        && self.conditional_increment_leaf_condition_32
+                    {
+                        callee_saved_name_32(phys)
+                    } else {
+                        callee_saved_name(phys)
+                    };
                     self.state.emit_fmt(format_args!("    cmp {}, #0", c));
                 } else {
                     self.operand_to_x0(cond);
@@ -236,8 +242,15 @@ impl ArmCodegen {
                     .copied()
                     .filter(|reg| !is_arm_fp_phys(*reg))
                 {
+                    let condition_reg = if self.conditional_increment_leaf
+                        && self.conditional_increment_leaf_condition_32
+                    {
+                        callee_saved_name_32(phys)
+                    } else {
+                        callee_saved_name(phys)
+                    };
                     self.state
-                        .emit_fmt(format_args!("    cmp {}, #0", callee_saved_name(phys)));
+                        .emit_fmt(format_args!("    cmp {}, #0", condition_reg));
                 } else {
                     self.operand_to_x0(cond);
                     self.state.emit("    cmp x0, #0");

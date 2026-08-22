@@ -1,12 +1,165 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
 use super::emit::{
-    callee_saved_name, ArmCodegen, ARM_ARG_REGS, ARM_CALLEE_SAVED, ARM_CALLER_SAVED,
+    ARM_ARG_REGS, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ArmCodegen, callee_saved_name,
 };
-use crate::backend::call_abi::{classify_params, ParamClass};
+use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrFunction, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand, Terminator, Value};
+
+/// Exact fixed-register plan for the tiny conditional-increment leaf family.
+///
+/// Keeping incoming integer parameters in x0..x7 and the result in x0 gives
+/// AAPCS64's optimal `cmp; cinc; ret` shape. This is intentionally a strict
+/// machine-combine companion, not a general caller-register allocator: every
+/// non-ParamRef producer must be an Add/Cmp proven to be consumed by the one
+/// Select and therefore skipped by generic fused emission. Any extra IR makes
+/// the function use the ordinary scratch-aware allocator.
+fn conditional_increment_leaf_plan(
+    func: &IrFunction,
+) -> Option<(
+    crate::common::fx_hash::FxHashMap<u32, crate::backend::regalloc::PhysReg>,
+    bool,
+)> {
+    use crate::backend::regalloc::PhysReg;
+    use crate::common::fx_hash::FxHashMap;
+
+    if func.blocks.len() != 1
+        || func.is_variadic
+        || func.uses_sret
+        || func.params.len() > 8
+        || func.params.iter().any(|param| {
+            param.struct_size.is_some()
+                || param.ty.is_float()
+                || param.ty.is_long_double()
+                || param.ty.is_128bit()
+        })
+    {
+        return None;
+    }
+    let block = &func.blocks[0];
+    let Terminator::Return(Some(Operand::Value(returned))) = &block.terminator else {
+        return None;
+    };
+
+    let mut assignments = FxHashMap::default();
+    let mut param_values = FxHashMap::default();
+    let mut seen_param_indices = crate::common::fx_hash::FxHashSet::default();
+    let mut add = None;
+    let mut compare = None;
+    let mut select = None;
+    for (index, instruction) in block.instructions.iter().enumerate() {
+        match instruction {
+            Instruction::ParamRef {
+                dest,
+                param_idx,
+                ty,
+            } if *param_idx < 8 && ty.is_integer() && !ty.is_128bit() => {
+                if !seen_param_indices.insert(*param_idx) || param_values.contains_key(&dest.0) {
+                    return None;
+                }
+                assignments.insert(dest.0, PhysReg(*param_idx as u8));
+                param_values.insert(dest.0, *param_idx);
+            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+            } if matches!(ty.size(), 4 | 8) => {
+                if add.replace((index, *dest, lhs, rhs, *ty)).is_some() {
+                    return None;
+                }
+            }
+            Instruction::Cmp { dest, ty, .. } if ty.is_integer() && !ty.is_128bit() => {
+                if compare.replace((index, *dest)).is_some() {
+                    return None;
+                }
+            }
+            Instruction::Select {
+                dest,
+                cond,
+                true_val,
+                false_val,
+                ty,
+            } if ty.is_integer() && !ty.is_128bit() => {
+                if select
+                    .replace((index, *dest, cond, true_val, false_val, *ty))
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (add_index, add_dest, add_lhs, add_rhs, add_ty) = add?;
+    let (select_index, select_dest, condition, true_value, false_value, select_ty) = select?;
+    if select_dest != *returned || add_index >= select_index {
+        return None;
+    }
+    let is_one = |operand: &Operand| matches!(operand, Operand::Const(constant) if constant.to_i64() == Some(1));
+    let same = |a: &Operand, b: &Operand| match (a, b) {
+        (Operand::Value(a), Operand::Value(b)) => a == b,
+        (Operand::Const(a), Operand::Const(b)) => a.to_hash_key() == b.to_hash_key(),
+        _ => false,
+    };
+    let (increment, base) = if matches!(true_value, Operand::Value(value) if *value == add_dest) {
+        (true_value, false_value)
+    } else if matches!(false_value, Operand::Value(value) if *value == add_dest) {
+        (false_value, true_value)
+    } else {
+        return None;
+    };
+    let _ = increment;
+    if !((same(add_lhs, base) && is_one(add_rhs)) || (same(add_rhs, base) && is_one(add_lhs))) {
+        return None;
+    }
+    let width_ok = add_ty == select_ty
+        || (add_ty.is_integer() && select_ty.is_integer() && add_ty.size() == select_ty.size())
+        || (add_ty == IrType::U32 && select_ty.size() >= 4);
+    if !width_ok {
+        return None;
+    }
+    let Operand::Value(base_value) = base else {
+        return None;
+    };
+    if !param_values.contains_key(&base_value.0) {
+        return None;
+    }
+
+    let condition_is_32 = match condition {
+        Operand::Value(value) if param_values.contains_key(&value.0) => {
+            if compare.is_some() || add_index + 1 != select_index {
+                return None;
+            }
+            let param_index = *param_values.get(&value.0)?;
+            func.params[param_index].ty.size() <= 4
+        }
+        Operand::Value(value) => {
+            let (compare_index, compare_dest) = compare?;
+            if *value != compare_dest
+                || compare_index + 2 != select_index
+                || add_index != compare_index + 1
+            {
+                return None;
+            }
+            true
+        }
+        Operand::Const(_) => return None,
+    };
+
+    // The Add and optional Cmp are never materialized by the fused selector,
+    // but homes prevent stack-slot allocation before emission sees the fold.
+    assignments.insert(add_dest.0, PhysReg(8));
+    if let Some((_, compare_dest)) = compare {
+        assignments.insert(compare_dest.0, PhysReg(8));
+    }
+    assignments.insert(select_dest.0, PhysReg(0));
+    Some((assignments, condition_is_32))
+}
 
 impl ArmCodegen {
     // ---- calculate_stack_space ----
@@ -16,6 +169,8 @@ impl ArmCodegen {
         use crate::ir::reexports::Instruction;
 
         self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
+        self.conditional_increment_leaf = false;
+        self.conditional_increment_leaf_condition_32 = false;
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let base_regs: &[PhysReg] = if func.is_variadic {
@@ -120,7 +275,7 @@ impl ArmCodegen {
             crate::backend::regalloc::PhysReg(7),
             crate::backend::regalloc::PhysReg(8),
         ];
-        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
+        let (mut reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
             crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
                 func,
                 available_regs,
@@ -137,6 +292,16 @@ impl ArmCodegen {
                 // allocator must keep the index live to the consumer's end.
                 crate::backend::generation::collect_folded_index_links(func),
             );
+
+        if std::env::var_os("CCC_NO_CSINC_FOLD").is_none() {
+            if let Some((plan, condition_is_32)) = conditional_increment_leaf_plan(func) {
+                self.conditional_increment_leaf = true;
+                self.conditional_increment_leaf_condition_32 = condition_is_32;
+                self.reg_assignments = plan;
+                reg_assigned = self.reg_assignments.clone();
+                self.used_callee_saved.clear();
+            }
+        }
 
         // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by
         // the FP scan must be preserved by the prologue/epilogue.
@@ -236,6 +401,9 @@ impl ArmCodegen {
         self.current_return_type = func.return_type;
         self.current_frame_size = frame_size;
         self.frame_base_offset = None;
+        if self.conditional_increment_leaf {
+            return;
+        }
         self.emit_prologue_arm(frame_size);
 
         let used_regs = self.used_callee_saved.clone();
@@ -277,6 +445,9 @@ impl ArmCodegen {
     // ---- emit_epilogue ----
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
+        if self.conditional_increment_leaf {
+            return;
+        }
         self.emit_restore_callee_saved();
         self.emit_epilogue_arm(frame_size);
     }
@@ -354,6 +525,16 @@ impl ArmCodegen {
 
             if let Some(paramref_dest) = paramref_dests[i] {
                 if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
+                    if self.conditional_increment_leaf {
+                        if let ParamClass::IntReg { reg_idx } = class {
+                            if phys_reg.0 == reg_idx as u8 {
+                                // The fixed leaf plan deliberately keeps this
+                                // parameter in its incoming ABI register.
+                                self.state.param_pre_stored.insert(i);
+                                continue;
+                            }
+                        }
+                    }
                     // Only pre-store to callee-saved registers (x20-x28).
                     // Caller-saved registers (x13, x14) cannot be used because
                     // they may overlap with scratch registers.
@@ -470,8 +651,10 @@ impl ArmCodegen {
     // ---- emit_epilogue_and_ret ----
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
-        self.emit_restore_callee_saved();
-        self.emit_epilogue_arm(frame_size);
+        if !self.conditional_increment_leaf {
+            self.emit_restore_callee_saved();
+            self.emit_epilogue_arm(frame_size);
+        }
         self.state.emit("    ret");
     }
 
