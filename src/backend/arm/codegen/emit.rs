@@ -2314,6 +2314,9 @@ impl ArchCodegen for ArmCodegen {
     fn supports_fused_cmp_select(&self) -> bool {
         true
     }
+    fn supports_conditional_increment_select(&self) -> bool {
+        true
+    }
     fn emit_load_indexed(
         &mut self,
         dest: &Value,
@@ -2880,6 +2883,8 @@ impl ArchCodegen for ArmCodegen {
         fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_fused_cmp_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, true_val: &Operand, false_val: &Operand, dest: &Value, sel_ty: IrType) => emit_fused_cmp_select_impl;
+        fn emit_conditional_increment_select(&mut self, dest: &Value, cond: &Operand, base: &Operand, increment_on_true: bool, ty: IrType) => emit_conditional_increment_select_impl;
+        fn emit_fused_cmp_conditional_increment_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, base: &Operand, increment_on_true: bool, dest: &Value, sel_ty: IrType) => emit_fused_cmp_conditional_increment_select_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
         // calls
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;

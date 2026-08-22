@@ -1860,6 +1860,172 @@ fn detect_cmp_select_fusion(
     out
 }
 
+#[derive(Clone)]
+struct ConditionalIncrementFusion {
+    select_idx: usize,
+    add_idx: usize,
+    cmp_idx: Option<usize>,
+    base: Operand,
+    increment_ty: IrType,
+    increment_on_true: bool,
+}
+
+/// Recognize an integer compare/select arm of the form `base + 1` while the
+/// other arm is exactly `base`.  The producer has one use, so a backend with a
+/// conditional-increment instruction may omit the Add entirely.
+///
+/// This is deliberately an SSA-level combine rather than an assembly
+/// peephole. The other Select arm keeps `base` live through the Select in the
+/// allocator, and the one-use proof makes deleting the Add independent of
+/// physical-register assignment and CFG layout.
+fn detect_conditional_increment_selects(
+    block: &BasicBlock,
+    use_counts: &[u32],
+    base_stability: &BaseStability,
+) -> Vec<ConditionalIncrementFusion> {
+    let definitions: FxHashMap<u32, (usize, &Instruction)> = block
+        .instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            instruction
+                .dest()
+                .map(|dest| (dest.0, (index, instruction)))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (select_idx, instruction) in block.instructions.iter().enumerate() {
+        let Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ty,
+            ..
+        } = instruction
+        else {
+            continue;
+        };
+        if !ty.is_integer() || ty.is_128bit() {
+            continue;
+        }
+
+        for (increment, base, increment_on_true) in
+            [(true_val, false_val, true), (false_val, true_val, false)]
+        {
+            let Operand::Value(increment_value) = increment else {
+                continue;
+            };
+            if use_counts
+                .get(increment_value.0 as usize)
+                .copied()
+                .unwrap_or(u32::MAX)
+                != 1
+                || base_stability.def_count.get(&increment_value.0).copied() != Some(1)
+            {
+                continue;
+            }
+
+            let Some(&(add_idx, add)) = definitions.get(&increment_value.0) else {
+                continue;
+            };
+            if add_idx >= select_idx {
+                continue;
+            }
+            let Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: add_ty,
+                ..
+            } = add
+            else {
+                continue;
+            };
+            // Preserve the Add's arithmetic width. The frontend currently
+            // represents a U32 conditional expression as an I64 Select even
+            // though both arms are zero-extended U32 values. A 32-bit CSINC
+            // reproduces the required U32 wrap and zero-extension; widening
+            // signed or narrowing combinations require explicit casts and are
+            // deliberately left to ordinary lowering.
+            let width_compatible = add_ty == ty
+                || (add_ty.is_integer()
+                    && ty.is_integer()
+                    && !ty.is_128bit()
+                    && (add_ty.size() == ty.size() || (*add_ty == IrType::U32 && ty.size() >= 4)));
+            if !width_compatible || !matches!(add_ty.size(), 4 | 8) {
+                continue;
+            }
+            let is_one = |operand: &Operand| matches!(operand, Operand::Const(constant) if constant.to_i64() == Some(1));
+            let same_operand = |a: &Operand, b: &Operand| match (a, b) {
+                (Operand::Value(a), Operand::Value(b)) => a == b,
+                (Operand::Const(a), Operand::Const(b)) => a.to_hash_key() == b.to_hash_key(),
+                _ => false,
+            };
+            let matches_base = (same_operand(lhs, base) && is_one(rhs))
+                || (same_operand(rhs, base) && is_one(lhs));
+            if !matches_base {
+                continue;
+            }
+            // LCCC's post-phi IR permits repeated Copy definitions of one
+            // value id. The Add and Select still observe the same dynamic base
+            // only when no intervening instruction redefines that id.
+            if let Operand::Value(base_value) = base {
+                if block.instructions[add_idx + 1..select_idx]
+                    .iter()
+                    .any(|instruction| instruction.dest() == Some(*base_value))
+                {
+                    continue;
+                }
+            }
+
+            // If the condition is a single-use integer Cmp and the only IR
+            // instruction between it and the Select is the Add being removed,
+            // consume the comparison flags directly. This covers the common
+            // frontend order `Cmp; Add; Select` without the unsafe general
+            // reordering that the ordinary cmp-select fusion intentionally
+            // rejects.
+            let cmp_idx = match cond {
+                Operand::Value(condition)
+                    if use_counts
+                        .get(condition.0 as usize)
+                        .copied()
+                        .unwrap_or(u32::MAX)
+                        == 1
+                        && base_stability.def_count.get(&condition.0).copied() == Some(1) =>
+                {
+                    definitions.get(&condition.0).and_then(
+                        |&(index, instruction)| match instruction {
+                            Instruction::Cmp { ty, .. }
+                                if index < select_idx
+                                    && !ty.is_float()
+                                    && !ty.is_long_double()
+                                    && !ty.is_128bit()
+                                    && (index + 1 == select_idx
+                                        || (index + 2 == select_idx && add_idx == index + 1)) =>
+                            {
+                                Some(index)
+                            }
+                            _ => None,
+                        },
+                    )
+                }
+                _ => None,
+            };
+
+            out.push(ConditionalIncrementFusion {
+                select_idx,
+                add_idx,
+                cmp_idx,
+                base: base.clone(),
+                increment_ty: *add_ty,
+                increment_on_true,
+            });
+            break;
+        }
+    }
+    out
+}
+
 /// Mul whose single use is a nearby Add. Map: mul_idx → add_idx.
 fn detect_mul_add_fusions(
     block: &BasicBlock,
@@ -3069,6 +3235,20 @@ fn generate_function(
             } else {
                 Vec::new()
             };
+        let conditional_increment_fusions =
+            if cg.supports_conditional_increment_select() && !env_flag_set("CCC_NO_CSINC_FOLD") {
+                detect_conditional_increment_selects(block, &value_use_counts, &stab)
+            } else {
+                Vec::new()
+            };
+        let conditional_increment_adds: FxHashSet<usize> = conditional_increment_fusions
+            .iter()
+            .map(|fusion| fusion.add_idx)
+            .collect();
+        let conditional_increment_cmps: FxHashSet<usize> = conditional_increment_fusions
+            .iter()
+            .filter_map(|fusion| fusion.cmp_idx)
+            .collect();
         let shifted_logical_fusions = if cg.supports_shifted_logical() {
             detect_shifted_logical_fusions(block, &value_use_counts)
         } else {
@@ -3129,6 +3309,12 @@ fn generate_function(
             if cmp_select_fusions
                 .iter()
                 .any(|&(_, ci, copy_i)| ci == idx || copy_i == Some(idx))
+            {
+                cg.state().current_program_point += 1;
+                continue;
+            }
+            if conditional_increment_adds.contains(&idx)
+                || conditional_increment_cmps.contains(&idx)
             {
                 cg.state().current_program_point += 1;
                 continue;
@@ -3415,6 +3601,54 @@ fn generate_function(
                         cg.state().current_program_point += 1;
                         continue;
                     }
+                }
+            }
+
+            if let Some(fusion) = conditional_increment_fusions
+                .iter()
+                .find(|fusion| fusion.select_idx == idx)
+            {
+                if let Instruction::Select { dest, cond, .. } = inst {
+                    cg.flush_machinst();
+                    let cmp_idx = fusion.cmp_idx.or_else(|| {
+                        cmp_select_fusions
+                            .iter()
+                            .find(|&&(select_idx, _, _)| select_idx == idx)
+                            .map(|&(_, cmp_idx, _)| cmp_idx)
+                    });
+                    if let Some(cmp_idx) = cmp_idx {
+                        if let Instruction::Cmp {
+                            op,
+                            lhs,
+                            rhs,
+                            ty: cmp_ty,
+                            ..
+                        } = &block.instructions[cmp_idx]
+                        {
+                            cg.emit_fused_cmp_conditional_increment_select(
+                                *op,
+                                lhs,
+                                rhs,
+                                *cmp_ty,
+                                &fusion.base,
+                                fusion.increment_on_true,
+                                dest,
+                                fusion.increment_ty,
+                            );
+                        } else {
+                            unreachable!("cmp-select fusion did not reference a Cmp");
+                        }
+                    } else {
+                        cg.emit_conditional_increment_select(
+                            dest,
+                            cond,
+                            &fusion.base,
+                            fusion.increment_on_true,
+                            fusion.increment_ty,
+                        );
+                    }
+                    cg.state().current_program_point += 1;
+                    continue;
                 }
             }
 
@@ -4264,3 +4498,101 @@ pub use super::stack_layout::{
     collect_inline_asm_callee_saved_with_generic, filter_available_regs, find_param_alloca,
     run_regalloc_and_merge_clobbers, run_regalloc_and_merge_clobbers_ex,
 };
+
+#[cfg(test)]
+mod conditional_increment_tests {
+    use super::*;
+
+    fn function_with(instructions: Vec<Instruction>) -> IrFunction {
+        let mut function = IrFunction::new("csinc_test".to_string(), IrType::U32, vec![], false);
+        function.blocks.push(BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions,
+            terminator: Terminator::Unreachable,
+            source_spans: Vec::new(),
+        });
+        function.next_value_id = 8;
+        function
+    }
+
+    fn prefix() -> Vec<Instruction> {
+        vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::U32,
+            },
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 1,
+                ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            },
+        ]
+    }
+
+    fn select() -> Instruction {
+        Instruction::Select {
+            dest: Value(3),
+            cond: Operand::Value(Value(1)),
+            true_val: Operand::Value(Value(2)),
+            false_val: Operand::Value(Value(0)),
+            ty: IrType::I64,
+        }
+    }
+
+    fn detect(function: &IrFunction) -> Vec<ConditionalIncrementFusion> {
+        let uses = count_value_uses(function);
+        let stability = analyze_base_stability(function);
+        detect_conditional_increment_selects(&function.blocks[0], &uses, &stability)
+    }
+
+    #[test]
+    fn detects_u32_wrapping_increment_with_widened_select() {
+        let mut instructions = prefix();
+        instructions.push(select());
+        let fusions = detect(&function_with(instructions));
+        assert_eq!(fusions.len(), 1);
+        assert_eq!(fusions[0].add_idx, 2);
+        assert_eq!(fusions[0].increment_ty, IrType::U32);
+        assert!(fusions[0].increment_on_true);
+    }
+
+    #[test]
+    fn rejects_increment_with_another_use() {
+        let mut instructions = prefix();
+        instructions.push(Instruction::Copy {
+            dest: Value(4),
+            src: Operand::Value(Value(2)),
+        });
+        instructions.push(select());
+        assert!(detect(&function_with(instructions)).is_empty());
+    }
+
+    #[test]
+    fn rejects_base_redefinition_between_add_and_select() {
+        let mut instructions = prefix();
+        instructions.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(9)),
+        });
+        instructions.push(select());
+        assert!(detect(&function_with(instructions)).is_empty());
+    }
+
+    #[test]
+    fn rejects_non_unit_delta() {
+        let mut instructions = prefix();
+        if let Instruction::BinOp { rhs, .. } = &mut instructions[2] {
+            *rhs = Operand::Const(IrConst::I32(2));
+        }
+        instructions.push(select());
+        assert!(detect(&function_with(instructions)).is_empty());
+    }
+}

@@ -213,6 +213,91 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
+    /// Conditional increment from a materialized boolean condition.
+    pub(super) fn emit_conditional_increment_select_impl(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        base: &Operand,
+        increment_on_true: bool,
+        ty: IrType,
+    ) {
+        match cond {
+            Operand::Value(value) => {
+                if let Some(phys) = self
+                    .reg_assignments
+                    .get(&value.0)
+                    .copied()
+                    .filter(|reg| !is_arm_fp_phys(*reg))
+                {
+                    self.state
+                        .emit_fmt(format_args!("    cmp {}, #0", callee_saved_name(phys)));
+                } else {
+                    self.operand_to_x0(cond);
+                    self.state.emit("    cmp x0, #0");
+                }
+            }
+            Operand::Const(_) => {
+                self.operand_to_x0(cond);
+                self.state.emit("    cmp x0, #0");
+            }
+        }
+        // `ne` is the Select's true condition. CSINC increments when its own
+        // condition is false, so increment-on-true uses `eq`.
+        let csinc_cc = if increment_on_true { "eq" } else { "ne" };
+        self.emit_csinc_result(dest, base, ty, csinc_cc);
+    }
+
+    /// Fused compare plus conditional increment. Generic SSA analysis proved
+    /// that the omitted Add has one use and the opposite Select arm is the
+    /// same base.
+    pub(super) fn emit_fused_cmp_conditional_increment_select_impl(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        cmp_ty: IrType,
+        base: &Operand,
+        increment_on_true: bool,
+        dest: &Value,
+        sel_ty: IrType,
+    ) {
+        self.emit_int_cmp_insn(lhs, rhs, cmp_ty);
+        let cmp_cc = arm_int_cond_code(op);
+        let csinc_cc = if increment_on_true {
+            arm_invert_cond_code(cmp_cc)
+        } else {
+            cmp_cc
+        };
+        self.emit_csinc_result(dest, base, sel_ty, csinc_cc);
+    }
+
+    /// Emit CSINC after flags are ready. `condition` is the condition under
+    /// which the unincremented base is selected.
+    fn emit_csinc_result(&mut self, dest: &Value, base: &Operand, ty: IrType, condition: &str) {
+        let use_32bit = ty.size() <= 4;
+        let base_reg = self.select_arm_reg(base, "x1", use_32bit);
+        if let Some(phys) = self.dest_reg(dest).filter(|reg| !is_arm_fp_phys(*reg)) {
+            let dest_reg = if use_32bit {
+                callee_saved_name_32(phys)
+            } else {
+                callee_saved_name(phys)
+            };
+            self.state.emit_fmt(format_args!(
+                "    csinc {}, {}, {}, {}",
+                dest_reg, base_reg, base_reg, condition
+            ));
+        } else {
+            let accumulator = if use_32bit { "w0" } else { "x0" };
+            self.state.emit_fmt(format_args!(
+                "    csinc {}, {}, {}, {}",
+                accumulator, base_reg, base_reg, condition
+            ));
+            self.store_x0_to(dest);
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
     /// Resolve a Select arm to a register name: its assigned phys reg when
     /// available, otherwise loaded into the given scratch register.
     fn select_arm_reg(&mut self, op: &Operand, scratch_x: &str, use_32bit: bool) -> String {

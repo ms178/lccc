@@ -22,8 +22,9 @@ Survey a benchmark file and write review artifacts::
         --flags '-O3 -march=x86-64-v3' \
         --artifact-dir results/gzip-crc --json results/gzip-crc/manifest.json
 
-The defaults intentionally include GCC, Clang, ICC and ICX because ICX is a
-moving channel; every manifest records the resolved compiler id/name/version.
+The x86 defaults intentionally include GCC, Clang, ICC and ICX because ICX is
+a moving channel. AArch64 defaults to ARM64 GCC 16.1 plus trunk. Every manifest
+records the architecture and resolved compiler id/name/version.
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ import godbolt  # noqa: E402
 
 DEFAULT_FLAGS = "-O3 -march=x86-64-v3"
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
+DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk")
 
 _DIRECTIVE = re.compile(r"^\s*(?:\.|#|//|cfi_)")
 _LABEL = re.compile(r'^\s*"?([.\w$]+)"?:')
@@ -60,6 +62,7 @@ class Request:
     function: str | None
     flags: str
     local_flags: str | None
+    arch: str
 
 
 @dataclass
@@ -94,7 +97,7 @@ def _function_body(lines: list[str], wanted: str | None) -> list[str]:
     return out
 
 
-def _stats(lines: Iterable[str]) -> AsmStats:
+def _stats(lines: Iterable[str], arch: str) -> AsmStats:
     stats = AsmStats()
     for raw in lines:
         text = raw.strip()
@@ -105,22 +108,38 @@ def _stats(lines: Iterable[str]) -> AsmStats:
         parts = text.split(None, 1)
         if not parts:
             continue
-        mnem = parts[0].lower()
-        ops = parts[1] if len(parts) > 1 else ""
+        mnemonic = parts[0].lower()
+        operands = parts[1] if len(parts) > 1 else ""
         stats.instructions += 1
-        if _BRANCH.match(mnem):
-            stats.branches += 1
-        if mnem.startswith("v") and not re.search(r"(ss|sd|si)(q|l)?$", mnem):
-            stats.vectors += 1
-        if "(" in ops:
-            operands = ops.rsplit(",", 1)
-            src = operands[0]
-            dst = operands[1] if len(operands) > 1 else ""
-            if "(" in src:
+
+        if arch == "aarch64":
+            if (mnemonic in {"b", "bl", "blr", "br", "ret", "cbz", "cbnz", "tbz", "tbnz"}
+                    or mnemonic.startswith("b.")):
+                stats.branches += 1
+            if mnemonic.startswith(("ld", "prfm")) and "[" in operands:
                 stats.loads += 1
-            if "(" in dst:
+            if mnemonic.startswith("st") and "[" in operands:
                 stats.stores += 1
-            if _STACK_MEM.search(ops):
+            if "[sp" in operands or "[x29" in operands:
+                stats.spills += 1
+            if (re.search(r"\b[vsdq][0-9]+(?:\.|\b)", operands)
+                    or mnemonic in {"addv", "smaxv", "fmaxv", "sadalp"}):
+                stats.vectors += 1
+            continue
+
+        if _BRANCH.match(mnemonic):
+            stats.branches += 1
+        if mnemonic.startswith("v") and not re.search(r"(ss|sd|si)(q|l)?$", mnemonic):
+            stats.vectors += 1
+        if "(" in operands:
+            split_operands = operands.rsplit(",", 1)
+            source = split_operands[0]
+            destination = split_operands[1] if len(split_operands) > 1 else ""
+            if "(" in source:
+                stats.loads += 1
+            if "(" in destination:
+                stats.stores += 1
+            if _STACK_MEM.search(operands):
                 stats.spills += 1
     return stats
 
@@ -159,7 +178,7 @@ def _record_local(req: Request, executable: str) -> dict[str, Any]:
         "name": "local LCCC",
         "flags": req.local_flags or req.flags,
         "elapsed_s": elapsed,
-        **asdict(_stats(body)),
+        **asdict(_stats(body, req.arch)),
         "assembly": body,
     }
 
@@ -174,7 +193,7 @@ def _record_remote(name: str, source: str, req: Request, compilers: list[dict[st
         **godbolt.compiler_metadata(name, compilers=compilers),
         "flags": req.flags,
         "elapsed_s": elapsed,
-        **asdict(_stats(body)),
+        **asdict(_stats(body, req.arch)),
         "assembly": body,
     }
 
@@ -200,7 +219,13 @@ def _measure(req: Request, executable: str | None, oracles: list[str]) -> dict[s
         record["ratio_vs_best"] = (
             record["instructions"] / min(counts) if counts and record.get("instructions") else None
         )
-    return {"source": str(req.source), "function": req.function, "records": records, "errors": errors}
+    return {
+        "source": str(req.source),
+        "function": req.function,
+        "arch": req.arch,
+        "records": records,
+        "errors": errors,
+    }
 
 
 def _write_artifacts(result: dict[str, Any], artifact_dir: Path) -> None:
@@ -240,7 +265,7 @@ def _markdown(results: list[dict[str, Any]], path: Path) -> None:
         "",
         "Static code-size/structure statistics from local LCCC and Compiler Explorer.",
         "These are screening metrics, not PMU evidence; verify wins with controlled",
-        "runtime and hardware counters on Raptor Lake before making claims.",
+        "runtime and hardware counters on the intended target before making claims.",
         "",
         "| Source | Function | LCCC | Best | Best compiler | LCCC/best | Loads | Stores | Spills | Branches |",
         "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|",
@@ -275,7 +300,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-local", action="store_true")
     parser.add_argument("--flags", default=DEFAULT_FLAGS)
     parser.add_argument("--local-flags")
-    parser.add_argument("--oracles", default=",".join(DEFAULT_ORACLES))
+    parser.add_argument(
+        "--arch",
+        choices=("x86", "aarch64"),
+        default="x86",
+        help="assembly syntax used for structural statistics (default: x86)",
+    )
+    parser.add_argument(
+        "--oracles",
+        help="comma-separated CE compilers (defaults are architecture-specific)",
+    )
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument("--json", type=Path)
     parser.add_argument("--markdown", type=Path)
@@ -288,8 +322,10 @@ def main(argv: list[str] | None = None) -> int:
     functions: list[str | None] = list(args.function) if args.function else []
     if args.all_functions or not functions:
         functions.append(None)
-    oracles = [item.strip() for item in args.oracles.split(",") if item.strip()]
-    requests = [Request(source, function, args.flags, args.local_flags)
+    default_oracles = DEFAULT_AARCH64_ORACLES if args.arch == "aarch64" else DEFAULT_ORACLES
+    oracle_text = args.oracles or ",".join(default_oracles)
+    oracles = [item.strip() for item in oracle_text.split(",") if item.strip()]
+    requests = [Request(source, function, args.flags, args.local_flags, args.arch)
                 for source in args.sources for function in functions]
     executable = None if args.no_local else str(Path(args.local).expanduser().resolve())
     max_workers = max(1, min(args.jobs, len(requests)))
@@ -303,7 +339,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.artifact_dir:
                 _write_artifacts(result, args.artifact_dir)
     order = {req: idx for idx, req in enumerate(requests)}
-    results.sort(key=lambda item: order[Request(Path(item["source"]), item.get("function"), args.flags, args.local_flags)])
+    results.sort(key=lambda item: order[Request(
+        Path(item["source"]), item.get("function"), args.flags, args.local_flags, args.arch
+    )])
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         tmp = args.json.with_suffix(args.json.suffix + f".tmp.{os.getpid()}")

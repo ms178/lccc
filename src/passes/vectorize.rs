@@ -189,6 +189,11 @@ fn vectorize_with_analysis_mode(
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
             let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
+            // The AArch64 two-wide lowering emits both halves per iteration,
+            // consuming four doubles. Use the real machine-step width for the
+            // profitability/correctness gate rather than the nominal vector
+            // type width.
+            let machine_step_width = if neon { 4 } else { vec_width };
 
             // Profitability: with a KNOWN constant trip count, require the
             // vector body to run at least twice (trip >= 2*width). One vector
@@ -198,14 +203,14 @@ fn vectorize_with_analysis_mode(
             // remainder for zero win and ~3x code size). Unknown (dynamic)
             // trip counts still vectorize - the runtime guard handles n < width.
             let skip_small = match &pattern.limit {
-                Operand::Const(c) => c.to_i64().map_or(false, |n| n < 2 * vec_width),
+                Operand::Const(c) => c.to_i64().map_or(false, |n| n < 2 * machine_step_width),
                 _ => false,
             };
             if skip_small {
                 if debug {
                     eprintln!(
-                        "[VEC] Skip: constant trip count < 2x vector width ({})",
-                        vec_width
+                        "[VEC] Skip: constant trip count < 2x machine step width ({})",
+                        machine_step_width
                     );
                 }
             } else if use_sse2 {
@@ -592,6 +597,28 @@ fn analyze_loop_pattern(
     }
     let body_idx = body_idx?;
 
+    // This transform replaces one scalar read/modify/write stream. Additional
+    // stores in any loop block are not represented by the vector body and may
+    // overlap or overwrite its lanes (the i-j-k N=4 matmul reproducer did
+    // exactly that after unrolling). Reject rather than silently dropping or
+    // reordering observable memory effects.
+    let store_count = loop_info
+        .body
+        .iter()
+        .flat_map(|&block_index| &func.blocks[block_index].instructions)
+        .filter(|instruction| matches!(instruction, Instruction::Store { .. }))
+        .count();
+    if store_count != 1 {
+        if debug {
+            eprintln!(
+                "[VEC]   Loop has {} stores; matmul transform requires exactly one",
+                store_count
+            );
+        }
+        set_reject("matmul loop does not have exactly one store");
+        return None;
+    }
+
     // Find exit by looking at loop successors that are outside the loop.
     // Use label_to_idx to convert BlockId labels to block array indices for body.contains().
     let mut exit_label = None;
@@ -859,6 +886,49 @@ fn analyze_loop_pattern(
         if debug {
             eprintln!("[VEC]   B GEP not found in loop");
         }
+        return None;
+    }
+
+    // Both streams widened by this transform must advance by exactly one F64
+    // element per scalar iteration. Merely depending on the IV is insufficient
+    // (`iv * row_stride` is a column walk, not contiguous). Reuse the exact
+    // byte-stride recognizer used by map/reduction vectorization, then verify
+    // that its unscaled index is this loop's IV through Cast/Copy chains only.
+    let traces_to_loop_iv = |start: Value| {
+        let mut current = start;
+        let mut seen = FxHashSet::default();
+        loop {
+            if !seen.insert(current.0) {
+                break false;
+            }
+            if iv_derived.contains(&current) {
+                break true;
+            }
+            let Some((_, definition)) = find_inst_in_loop(func, &loop_info.body, current) else {
+                break false;
+            };
+            match definition {
+                Instruction::Cast {
+                    src: Operand::Value(source),
+                    ..
+                }
+                | Instruction::Copy {
+                    src: Operand::Value(source),
+                    ..
+                } => current = *source,
+                _ => break false,
+            }
+        }
+    };
+    let contiguous_f64_stream = |gep: Value| {
+        find_reduction_byte_iv(func, &loop_info.body, gep, 8)
+            .is_some_and(|(_, index)| traces_to_loop_iv(index))
+    };
+    if !contiguous_f64_stream(c_gep) || !contiguous_f64_stream(b_gep) {
+        if debug {
+            eprintln!("[VEC]   C/B stream is not a contiguous F64 IV walk");
+        }
+        set_reject("matmul C/B stream is not contiguous at F64 stride");
         return None;
     }
 

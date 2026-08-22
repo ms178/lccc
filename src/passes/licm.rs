@@ -1140,40 +1140,13 @@ fn hoist_loop_invariants(
         return 0;
     }
 
-    // Collect the set of instruction indices to remove from each block
+    // Record original locations before consuming the candidates into the
+    // topologically sorted insertion slice. No IR mutation occurs yet.
     let mut to_remove: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
     for &(block_idx, inst_idx, _) in &hoistable_insts {
         to_remove.entry(block_idx).or_default().insert(inst_idx);
     }
 
-    // Remove hoisted instructions from their original blocks
-    for (&block_idx, indices) in &to_remove {
-        if block_idx < func.blocks.len() {
-            let block = &mut func.blocks[block_idx];
-            let mut new_insts = Vec::with_capacity(block.instructions.len());
-            let old_spans = std::mem::take(&mut block.source_spans);
-            let has_spans = old_spans.len() == block.instructions.len() && !old_spans.is_empty();
-            let mut new_spans = if has_spans {
-                Vec::with_capacity(old_spans.len())
-            } else {
-                Vec::new()
-            };
-            for (i, inst) in block.instructions.drain(..).enumerate() {
-                if !indices.contains(&i) {
-                    new_insts.push(inst);
-                    if has_spans {
-                        new_spans.push(old_spans[i]);
-                    }
-                }
-            }
-            block.instructions = new_insts;
-            block.source_spans = new_spans;
-        }
-    }
-
-    // Insert hoisted instructions at the end of the preheader block
-    // (before its terminator, which is implicit - terminators are separate from instructions).
-    // We need to insert in the order they originally appeared to maintain SSA dominance.
     // Sort by (block_idx in RPO order, then inst_idx) to preserve def-before-use.
     hoistable_insts.sort_by_key(|&(block_idx, inst_idx, _)| (block_idx, inst_idx));
 
@@ -1197,17 +1170,87 @@ fn hoist_loop_invariants(
     // A must come before B in the preheader.
     let sorted = topological_sort_instructions(unique_insts);
 
-    // Insert at the end of the preheader (before terminator)
-    if preheader < func.blocks.len() {
-        let preheader_block = &mut func.blocks[preheader];
-        let num_sorted = sorted.len();
-        preheader_block.instructions.extend(sorted);
-        if !preheader_block.source_spans.is_empty() {
-            preheader_block.source_spans.extend(std::iter::repeat_n(
-                crate::common::source::Span::dummy(),
-                num_sorted,
-            ));
+    if preheader >= func.blocks.len() {
+        return 0;
+    }
+
+    // Compute a legal insertion interval before mutating the loop. Existing
+    // preheader definitions consumed by the hoisted slice form the lower
+    // bound; existing uses of hoisted destinations form the upper bound. If
+    // the bounds cross, preserving the preheader's existing order and SSA
+    // dependencies is impossible, so reject the transformation unchanged.
+    let hoisted_dests: FxHashSet<u32> = sorted
+        .iter()
+        .filter_map(|instruction| instruction.dest().map(|dest| dest.0))
+        .collect();
+    let mut needed_existing_values = FxHashSet::default();
+    for instruction in &sorted {
+        instruction.for_each_used_value(|value| {
+            if !hoisted_dests.contains(&value) {
+                needed_existing_values.insert(value);
+            }
+        });
+    }
+    let preheader_instructions = &func.blocks[preheader].instructions;
+    let earliest_existing_use = preheader_instructions.iter().position(|instruction| {
+        let mut uses_hoisted = false;
+        instruction.for_each_used_value(|value| {
+            uses_hoisted |= hoisted_dests.contains(&value);
+        });
+        uses_hoisted
+    });
+    let latest_needed_definition = preheader_instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            instruction
+                .dest()
+                .filter(|dest| needed_existing_values.contains(&dest.0))
+                .map(|_| index)
+        })
+        .max();
+    let lower_bound = latest_needed_definition.map_or(0, |index| index + 1);
+    let insert_pos = earliest_existing_use.unwrap_or(preheader_instructions.len());
+    if lower_bound > insert_pos {
+        return 0;
+    }
+
+    // Only now is it safe to remove the originals. Deferring mutation until
+    // after the legality proof makes failure atomic.
+    for (&block_idx, indices) in &to_remove {
+        if block_idx < func.blocks.len() {
+            let block = &mut func.blocks[block_idx];
+            let mut new_instructions = Vec::with_capacity(block.instructions.len());
+            let old_spans = std::mem::take(&mut block.source_spans);
+            let spans_in_lockstep =
+                !old_spans.is_empty() && old_spans.len() == block.instructions.len();
+            let mut new_spans = if spans_in_lockstep {
+                Vec::with_capacity(old_spans.len())
+            } else {
+                Vec::new()
+            };
+            for (index, instruction) in block.instructions.drain(..).enumerate() {
+                if !indices.contains(&index) {
+                    new_instructions.push(instruction);
+                    if spans_in_lockstep {
+                        new_spans.push(old_spans[index]);
+                    }
+                }
+            }
+            block.instructions = new_instructions;
+            block.source_spans = new_spans;
         }
+    }
+
+    let preheader_block = &mut func.blocks[preheader];
+    let tail = preheader_block.instructions.split_off(insert_pos);
+    preheader_block.instructions.extend(sorted);
+    preheader_block.instructions.extend(tail);
+    // Moving instructions across blocks destroys the one-to-one source-span
+    // mapping. An empty vector is the established representation for
+    // unavailable per-instruction locations and is safer than stale indices.
+    if !preheader_block.source_spans.is_empty() {
+        preheader_block.source_spans.clear();
     }
 
     num_hoisted
@@ -1417,6 +1460,78 @@ mod tests {
             } => {} // correct
             other => panic!("Expected BinOp::Mul, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_licm_inserts_hoisted_def_before_existing_preheader_use() {
+        let mut func = make_loop_func();
+        func.blocks[0].instructions.push(Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(4)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        func.next_value_id = 7;
+
+        let alloca_info = analyze_allocas(&func);
+        let labels = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &labels);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+        assert_eq!(
+            hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info),
+            1
+        );
+
+        let def = func.blocks[0]
+            .instructions
+            .iter()
+            .position(|instruction| instruction.dest() == Some(Value(4)))
+            .unwrap();
+        let use_site = func.blocks[0]
+            .instructions
+            .iter()
+            .position(|instruction| instruction.dest() == Some(Value(6)))
+            .unwrap();
+        assert!(
+            def < use_site,
+            "hoisted definition must dominate existing use"
+        );
+    }
+
+    #[test]
+    fn test_licm_rejects_crossed_preheader_dependency_bounds_atomically() {
+        let mut func = make_loop_func();
+        // Existing use of the candidate precedes the preheader definition that
+        // the candidate itself needs: no order-preserving insertion exists.
+        func.blocks[0].instructions.insert(
+            0,
+            Instruction::BinOp {
+                dest: Value(6),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(4)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+        );
+        func.next_value_id = 7;
+        let before = format!("{:?}", func.blocks);
+
+        let alloca_info = analyze_allocas(&func);
+        let labels = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &labels);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+        assert_eq!(
+            hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info),
+            0
+        );
+        assert_eq!(
+            format!("{:?}", func.blocks),
+            before,
+            "failed hoist mutated IR"
+        );
     }
 
     #[test]
