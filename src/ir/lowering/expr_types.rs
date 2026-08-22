@@ -342,7 +342,8 @@ impl Lowerer {
             "__builtin_nan" => Some(IrType::F64),
             "__builtin_nanf" => Some(IrType::F32),
             "__builtin_nanl" => Some(IrType::F128),
-            "__builtin_fabs"
+            "__builtin_fma"
+            | "__builtin_fabs"
             | "__builtin_sqrt"
             | "__builtin_sin"
             | "__builtin_cos"
@@ -357,7 +358,8 @@ impl Lowerer {
             | "__builtin_fmax"
             | "__builtin_copysign"
             | "__builtin_nextafter" => Some(IrType::F64),
-            "__builtin_fabsf"
+            "__builtin_fmaf"
+            | "__builtin_fabsf"
             | "__builtin_sqrtf"
             | "__builtin_sinf"
             | "__builtin_cosf"

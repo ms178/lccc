@@ -984,6 +984,16 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            IntrinsicOp::FmaScalarF64 => {
+                // dest = args[0]*args[1] + args[2], single rounding.
+                // vfmadd231 form: dest_reg preloaded with the addend, then
+                // dest = src2*src1 + dest — exactly emit_scalar_fma231's
+                // contract (shared with the mul+add fusion pass).
+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F64);
+            }
+            IntrinsicOp::FmaScalarF32 => {
+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F32);
+            }
             IntrinsicOp::SqrtF64 => {
                 // Prefer VEX scalar sqrt (ICX/GCC on x86-64-v3). Avoids the
                 // legacy SSE encoding and matches the vmul/vadd path.

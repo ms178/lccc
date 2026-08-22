@@ -686,8 +686,23 @@ impl Lowerer {
             for decl in &tu.decls {
                 if let ExternalDecl::Declaration(decl) = decl {
                     for declarator in &decl.declarators {
+                        // An `__attribute__((alias("target")))` declarator IS a
+                        // definition in this TU, even though it parses as an
+                        // extern declaration without an initializer. glibc's
+                        // libm_alias_finite hits exactly this:
+                        //   strong_alias (__j0f, __ieee754_j0f)      // alias def
+                        //   .symver __ieee754_j0f,__j0f_finite@GLIBC_2.15
+                        // GAS semantics for a symbol DEFINED in the object are
+                        // "create versioned alias for export"; references to
+                        // the plain name stay bound to the local definition.
+                        // Misclassifying the alias as undefined applied the
+                        // reference-versioning flavour instead and rewrote
+                        // `call __ieee754_j0f` into a dangling reference to
+                        // `__j0f_finite` (libm.so: undefined __j0f_finite).
                         if !declarator.name.is_empty()
-                            && (declarator.init.is_some() || !decl.is_extern())
+                            && (declarator.init.is_some()
+                                || !decl.is_extern()
+                                || declarator.attrs.alias_target.is_some())
                         {
                             defined.insert(declarator.name.clone());
                         }
@@ -700,15 +715,22 @@ impl Lowerer {
                         let t = line.trim();
                         if let Some(rest) = t.strip_prefix(".symver") {
                             let rest = rest.trim();
-                            if let Some(comma) = rest.find(',') {
-                                let real = rest[..comma].trim().to_string();
-                                let alias_ver = rest[comma + 1..].trim().to_string();
-                                if !real.is_empty()
-                                    && alias_ver.contains('@')
-                                    && !defined.contains(&real)
-                                {
-                                    self.symver_ref_map.insert(real, alias_ver);
-                                }
+                            // Optional third operand (GAS 2.35+):
+                            // `.symver real, name@VER, {local|hidden|remove}`.
+                            // The flag governs the DEFINED plain symbol and is
+                            // handled by the assembler; for the undefined-
+                            // reference case handled here it changes nothing
+                            // (verified against GAS: `.symver und, und@V,
+                            // remove` still just versionizes references), so
+                            // strip it rather than corrupt the version string.
+                            let mut fields = rest.split(',');
+                            let real = fields.next().unwrap_or("").trim().to_string();
+                            let alias_ver = fields.next().unwrap_or("").trim().to_string();
+                            if !real.is_empty()
+                                && alias_ver.contains('@')
+                                && !defined.contains(&real)
+                            {
+                                self.symver_ref_map.insert(real, alias_ver);
                             }
                         }
                     }

@@ -307,18 +307,24 @@ const NOP_PATTERNS: [&[u8]; 11] = [
 const MAX_NOP: usize = NOP_PATTERNS.len();
 
 /// Above this many maximum-size NOPs, jumping over the padding is cheaper
-/// than executing it. Matches GAS's `max_number_of_nops` for the long-NOP
-/// table: at 11 bytes per NOP the switch happens past ~77 bytes of padding,
-/// where a predicted-taken branch clearly beats decoding eight more NOPs.
-const MAX_NOP_RUN: usize = 7;
+/// than executing it. Matches GAS's `max_number_of_nops` empirically: with
+/// the 11-byte long-NOP table, GNU as 2.4x emits a jump only once the gap
+/// exceeds EIGHT max-size NOPs (count/11 > 8 — an 88-byte pad is still all
+/// NOPs, 99 bytes becomes `jmp` + NOPs), where a predicted-taken branch
+/// clearly beats decoding more NOP µops.
+const MAX_NOP_RUN: usize = 8;
 
 /// Build `count` bytes of executable padding.
 ///
-/// The layout mirrors GAS exactly: an optional remainder NOP sized
-/// `count % MAX_NOP` first, then a run of maximum-size NOPs. When the run
-/// would exceed `MAX_NOP_RUN` NOPs the whole gap is skipped with a single
-/// branch instead, so a large alignment gap costs one predicted-taken jump
-/// rather than dozens of decoded NOPs.
+/// The layout mirrors GAS byte-exactly (asmdiff.py oracle): a run of
+/// maximum-size NOPs FIRST, then one remainder NOP sized `count % MAX_NOP`
+/// LAST — GNU as's i386_output_nops fills from the largest pattern down and
+/// places the odd-size tail at the end. (The previous remainder-FIRST order
+/// produced identical total length but 270/746 byte-differential failures
+/// across the branch/padding corpora, masking real layout regressions.)
+/// When the run would exceed `MAX_NOP_RUN` NOPs the whole gap is skipped
+/// with a single branch instead, so a large alignment gap costs one
+/// predicted-taken jump rather than dozens of decoded NOPs.
 pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(count);
     if count == 0 {
@@ -351,14 +357,12 @@ pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
         }
     }
 
-    let remainder = count % MAX_NOP;
-    if remainder != 0 {
-        out.extend_from_slice(NOP_PATTERNS[remainder - 1]);
-        count -= remainder;
-    }
-    while count != 0 {
+    while count >= MAX_NOP {
         out.extend_from_slice(NOP_PATTERNS[MAX_NOP - 1]);
         count -= MAX_NOP;
+    }
+    if count != 0 {
+        out.extend_from_slice(NOP_PATTERNS[count - 1]);
     }
     out
 }
@@ -561,6 +565,13 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// GNU ld 2.47 does not bind unversioned refs to foo@VER under
     /// --whole-archive). Applied to relocations after all items are parsed.
     symver_refs: FxHashMap<String, String>,
+    /// Three-operand `.symver real, name@VER, {local|hidden|remove}` records
+    /// the visibility flag here (real -> (versioned name, flag)); applied to
+    /// the DEFINED plain symbol at emit time (GAS 2.35+ semantics, verified
+    /// against binutils: local demotes to STB_LOCAL, hidden sets STV_HIDDEN,
+    /// remove drops the plain symbol and rebinds intra-object references to
+    /// the versioned alias).
+    symver_flags: FxHashMap<String, (String, crate::backend::x86::assembler::parser::SymverFlag)>,
     section_stack: Vec<(Option<usize>, Option<usize>)>,
     /// Deferred `.skip` expressions: (section_index, offset, expression, fill_byte).
     deferred_skips: Vec<(usize, usize, String, u8)>,
@@ -604,6 +615,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             set_values: FxHashMap::default(),
             pending_set_exprs: Vec::new(),
             symver_refs: FxHashMap::default(),
+            symver_flags: FxHashMap::default(),
             section_stack: Vec::new(),
             deferred_skips: Vec::new(),
             deferred_byte_diffs: Vec::new(),
@@ -621,17 +633,46 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for item in &items {
             self.process_item(item)?;
         }
-        // GNU-as .symver references: if `real` was never defined as a label,
-        // rewrite relocations against it to the versioned name (foo@VER).
-        // `@@` in a reference selects the default version -> single @.
+        // GNU-as .symver references: if `real` was never DEFINED in this
+        // object, rewrite relocations against it to the versioned name
+        // (foo@VER). `@@` in a reference selects the default version ->
+        // single @.
+        //
+        // "Defined" must include `.set`/`.equiv` aliases and absolute .set
+        // symbols, not just labels: glibc's libm builds `.set
+        // __ieee754_j0f,__j0f` + `.symver __ieee754_j0f,__j0f_finite@...`,
+        // and treating the alias as undefined would wrongly versionize
+        // intra-object references that GAS binds to the local definition.
+        let symbol_is_defined = |writer: &Self, name: &String| {
+            writer.label_positions.contains_key(name)
+                || writer.aliases.contains_key(name)
+                || writer.set_values.contains_key(name)
+        };
         if !self.symver_refs.is_empty() {
-            let defined: crate::common::fx_hash::FxHashSet<&String> =
-                self.label_positions.keys().collect();
-            for sec in self.sections.iter_mut() {
-                for reloc in sec.relocations.iter_mut() {
-                    if let Some(ver) = self.symver_refs.get(&reloc.symbol) {
-                        if !defined.contains(&reloc.symbol) {
-                            reloc.symbol = ver.replace("@@", "@");
+            let mut rewrites: Vec<(String, String)> = Vec::new();
+            for (name, ver) in &self.symver_refs {
+                if !symbol_is_defined(&self, name) {
+                    rewrites.push((name.clone(), ver.replace("@@", "@")));
+                }
+            }
+            // Three-operand `remove` on a DEFINED symbol: GAS drops the
+            // plain name from the symbol table and rebinds intra-object
+            // references to the versioned symbol (verified against
+            // binutils GAS: `call foo` relocates against foo@VERS after
+            // `.symver foo, foo@VERS, remove`). The versioned name is
+            // used EXACTLY as written (no @@ folding: a defined default
+            // version keeps its two-@ symbol).
+            for (name, (ver, flag)) in &self.symver_flags {
+                if *flag == SymverFlag::Remove && symbol_is_defined(&self, name) {
+                    rewrites.push((name.clone(), ver.clone()));
+                }
+            }
+            if !rewrites.is_empty() {
+                let map: FxHashMap<String, String> = rewrites.into_iter().collect();
+                for sec in self.sections.iter_mut() {
+                    for reloc in sec.relocations.iter_mut() {
+                        if let Some(new_name) = map.get(&reloc.symbol) {
+                            reloc.symbol = new_name.clone();
                         }
                     }
                 }
@@ -711,7 +752,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::File(_, _)
             | AsmItem::Loc(_, _, _)
             | AsmItem::OptionDirective(_)
-            | AsmItem::Symver(_, _)
+            | AsmItem::Symver(_, _, _)
             | AsmItem::Empty
             | AsmItem::Align(_)
             | AsmItem::Org(_, _, _) => {}
@@ -954,7 +995,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     self.aliases.insert(alias.clone(), target.clone());
                 }
             }
-            AsmItem::Symver(name, ver_string) => {
+            AsmItem::Symver(name, ver_string, flag) => {
                 // GNU as semantics (verified against binutils 2.47):
                 //   .symver real, name@@V  -> symbols `real` AND `name@@V`
                 //   .symver real, name@V   -> symbols `real` AND `name@V`
@@ -971,6 +1012,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // `name` is never defined in this object (checked in
                         // build() after all items are parsed).
                         self.symver_refs.insert(name.clone(), ver_string.clone());
+                        if let Some(f) = flag {
+                            self.symver_flags.insert(name.clone(), (ver_string.clone(), *f));
+                        }
                     }
                 }
             }
@@ -2325,6 +2369,45 @@ impl<A: X86Arch> ElfWriterCore<A> {
             symbol_visibility.insert(name.clone(), STV_INTERNAL);
         }
 
+        // Three-operand `.symver` visibility flags on DEFINED plain symbols
+        // (GAS 2.35+ semantics, verified against binutils):
+        //   local  — plain name demoted to STB_LOCAL (references keep binding
+        //            to it inside the object),
+        //   hidden — plain name stays STB_GLOBAL but gets STV_HIDDEN,
+        //   remove — plain name is dropped from the symbol table entirely
+        //            (its relocations were already rebound to the versioned
+        //            alias in build()).
+        let mut symver_removed: crate::common::fx_hash::FxHashSet<String> =
+            crate::common::fx_hash::FxHashSet::default();
+        let mut global_symbols = global_symbols;
+        for (name, (ver, flag)) in &self.symver_flags {
+            let defined = self.label_positions.contains_key(name)
+                || self.aliases.contains_key(name)
+                || self.set_values.contains_key(name);
+            if !defined {
+                // Undefined plain name: GAS silently applies plain reference
+                // versioning (verified: `.symver und, und@V, remove` produces
+                // `U und@V` with no diagnostic); nothing to do here.
+                continue;
+            }
+            match flag {
+                SymverFlag::Local => {
+                    global_symbols.remove(name);
+                    // The demotion applies ONLY to the plain name: the
+                    // versioned alias stays STB_GLOBAL (GAS parity — that is
+                    // the whole point of `local`: keep the versioned export,
+                    // hide the unversioned name).
+                    global_symbols.insert(ver.clone(), true);
+                }
+                SymverFlag::Hidden => {
+                    symbol_visibility.insert(name.clone(), STV_HIDDEN);
+                }
+                SymverFlag::Remove => {
+                    symver_removed.insert(name.clone());
+                }
+            }
+        }
+
         let symtab_input = SymbolTableInput {
             labels: &labels,
             global_symbols: &global_symbols,
@@ -2338,6 +2421,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
         };
 
         let mut shared_symbols = elf_mod::build_elf_symbol_table(&symtab_input);
+        if !symver_removed.is_empty() {
+            shared_symbols.retain(|s| !symver_removed.contains(&s.name));
+        }
 
         // Add COMMON symbols
         for sym in &self.symbols {
