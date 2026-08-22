@@ -1059,8 +1059,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
     }
+    // A source defined *before* a caller-saved clobber in the same block
+    // cannot inherit the phi dest's register unless that register is
+    // callee-saved. Keep those sources eligible so Phase 1 can give them
+    // their own callee-saved home (or they spill). Removing them here was
+    // how `++i` before `strtol` inherited `%edi` and the latch read garbage
+    // (zlib-ng minideflate / loop_iv_across_call).
     for candidate in &phi_coalesce {
-        eligible.remove(&candidate.backedge_src);
+        if !phi_window_clobbers_caller_saved(func, candidate) {
+            eligible.remove(&candidate.backedge_src);
+        }
     }
 
     let coalesce_groups: FxHashMap<u32, Vec<u32>> = if !env_on("CCC_NO_COALESCE") {
@@ -2018,7 +2026,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    apply_phi_coalesce_assignments(func, &liveness, &iv_map, &phi_coalesce, &mut assignments);
+    apply_phi_coalesce_assignments(
+        func,
+        &liveness,
+        &iv_map,
+        &phi_coalesce,
+        &mut assignments,
+        &config.available_regs,
+    );
 
     let vector_values = if arm_fp_pool {
         collect_vector_values(func)
@@ -3970,6 +3985,40 @@ pub(crate) struct PhiCoalesceCandidate {
     pub(crate) copy_idx: usize,
 }
 
+/// True iff `inst` clobbers the caller-saved GPR set. Mirrors the
+/// conservative core of `liveness::instruction_is_call_point` without
+/// pulling in the i686-libcall / F128 special cases: a phi-destructive
+/// update across any of these is only legal in a callee-saved home.
+#[inline]
+fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaStart { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::VaArgStruct { .. }
+    )
+}
+
+/// The (def, copy) window of a phi-coalesce candidate contains a caller-saved
+/// clobber. Sharing the dest register then means the source is born in that
+/// register *before* the clobber and read after it — illegal for rdi/rsi/…
+fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandidate) -> bool {
+    let Some(block) = func.blocks.get(cand.block_idx) else {
+        return false;
+    };
+    if cand.source_def_idx >= cand.copy_idx || cand.copy_idx > block.instructions.len() {
+        return false;
+    }
+    block.instructions[cand.source_def_idx + 1..cand.copy_idx]
+        .iter()
+        .any(instruction_clobbers_caller_saved)
+}
+
 /// Revalidate the same-block destructive-update proof and propagate an
 /// assigned phi register to its backedge producer. Part 1 calls this after
 /// the GPR scan (`apply_phi_coalesce_assignments(..., &iv_map, ...)`).
@@ -3977,12 +4026,17 @@ pub(crate) struct PhiCoalesceCandidate {
 /// `iv_map` is the O(1) `[start, end]` index. Conflict checks still walk
 /// `liveness.intervals` so a multi-segment *other* value cannot hide an
 /// overlap behind iv_map's last-write-wins.
+///
+/// `callee_saved` is the Phase-1 pool. A source whose window contains a
+/// caller-saved clobber may inherit the dest home only when that home is
+/// in this pool (the call preserves it).
 fn apply_phi_coalesce_assignments(
     func: &IrFunction,
     liveness: &LivenessResult,
     iv_map: &FxHashMap<u32, (u32, u32)>,
     candidates: &[PhiCoalesceCandidate],
     assignments: &mut FxHashMap<u32, PhysReg>,
+    callee_saved: &[PhysReg],
 ) {
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
@@ -4012,6 +4066,18 @@ fn apply_phi_coalesce_assignments(
         let Some(&reg) = assignments.get(&phi_dest) else {
             continue;
         };
+
+        if phi_window_clobbers_caller_saved(func, candidate)
+            && !callee_saved.iter().any(|r| r.0 == reg.0)
+        {
+            if env_on("CCC_DEBUG_PHI_COALESCE") {
+                eprintln!(
+                    "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: call in window",
+                    phi_dest, backedge_src, reg.0
+                );
+            }
+            continue;
+        }
 
         if let Some(&src_iv) = iv_map.get(&backedge_src) {
             let has_conflict = liveness.intervals.iter().any(|iv| {
@@ -4506,5 +4572,107 @@ mod phi_coalesce_tests {
                 "later latch must sort first: {candidates:?}"
             );
         }
+    }
+
+    fn empty_call(dest: Option<Value>) -> Instruction {
+        Instruction::Call {
+            func: "strtol".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `++i` then a call then `i = i1` must not put i1 in the dest's
+    /// caller-saved home: the call clobbers it (loop_iv_across_call).
+    #[test]
+    fn refuses_caller_saved_home_across_call_in_window() {
+        let mut func = IrFunction::new("iv_across_call".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(1)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                    empty_call(None),
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(2)),
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 3;
+
+        let liveness = compute_live_intervals(&func);
+        let iv_map = interval_map(&liveness);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 1,
+            source_def_idx: 0,
+            copy_idx: 2,
+        };
+        assert!(
+            phi_window_clobbers_caller_saved(&func, &cand),
+            "strtol in the (def, copy) window must be a caller-saved clobber"
+        );
+
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(14)); // %edi — caller-saved
+        apply_phi_coalesce_assignments(
+            &func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)], // only rbx is callee-saved
+        );
+        assert_eq!(
+            assignments.get(&2),
+            None,
+            "call-spanning ++i must not inherit %edi: {assignments:?}"
+        );
+
+        // A callee-saved dest home is still legal: the call preserves it.
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        apply_phi_coalesce_assignments(
+            &func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(
+            assignments.get(&2).copied(),
+            Some(PhysReg(1)),
+            "callee-saved home may still be shared across the call: {assignments:?}"
+        );
     }
 }

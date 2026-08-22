@@ -1,4 +1,7 @@
-/* GAUNTLET REPRODUCER (known miscompile, pre-existing as of 2026-08-22).
+/* GAUNTLET REPRODUCER / REGRESSION PIN.
+ *
+ * Fixed by refusing phi-coalesce register inheritance across a caller-saved
+ * clobber (see detect/apply_phi_coalesce in regalloc.rs). Keep this file.
  *
  * Loop induction variable carried in a caller-saved register across a call.
  *

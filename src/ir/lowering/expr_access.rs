@@ -850,15 +850,13 @@ impl Lowerer {
         }
 
         if let Some(lv) = self.lower_lvalue(inner) {
-            let addr = self.lvalue_addr(&lv);
-            let result = self.fresh_value();
-            self.emit(Instruction::GetElementPtr {
-                dest: result,
-                base: addr,
-                offset: Operand::Const(IrConst::I64(0)),
-                ty: IrType::Ptr,
-            });
-            return Operand::Value(result);
+            // GEP +0 is a no-op. Emitting it used to make a local look
+            // address-taken through a derived pointer even after a helper
+            // that took `&x` was inlined (`*p = v` stores through the GEP
+            // dest, not the alloca). Returning the alloca/address directly
+            // lets mem2reg promote the scalar. Field/subscript lvalues
+            // already have a real GEP in `lvalue_addr`.
+            return Operand::Value(self.lvalue_addr(&lv));
         }
 
         if let Expr::Identifier(name, _) = inner {

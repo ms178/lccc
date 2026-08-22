@@ -196,10 +196,7 @@ impl SemanticAnalyzer {
         let params: Vec<(CType, Option<String>)> = func
             .params
             .iter()
-            .map(|p| {
-                let ty = self.type_spec_to_ctype(&p.type_spec);
-                (ty, p.name.clone())
-            })
+            .map(|p| (self.param_decl_ctype(p), p.name.clone()))
             .collect();
 
         // Preserve noreturn from a prior declaration (e.g., the prototype may have
@@ -237,10 +234,13 @@ impl SemanticAnalyzer {
         self.symbol_table.push_scope();
         self.result.type_context.push_scope();
 
-        // Declare parameters in function scope
+        // Declare parameters in function scope. Function-pointer parameters
+        // (`int (*cb)(void*)`) store the function type in `fptr_params`, not
+        // in `type_spec`; using only type_spec typed them as `int *` and
+        // rejected assigning them to matching fields (sqlite3 amalgamation).
         for param in &func.params {
             if let Some(name) = &param.name {
-                let ty = self.type_spec_to_ctype(&param.type_spec);
+                let ty = self.param_decl_ctype(param);
                 self.symbol_table.declare(Symbol {
                     name: name.clone(),
                     ty,
@@ -1973,6 +1973,46 @@ impl SemanticAnalyzer {
     }
 
     // === Type conversion utilities ===
+
+    /// CType of a function parameter, including C11 6.7.6.3 adjustments
+    /// (array→pointer, function→pointer-to-function) and the parser's
+    /// `fptr_params` encoding of `T (*name)(args)`.
+    ///
+    /// Mirrors `Lowerer::param_ctype`. Using only `type_spec` typed
+    /// `int (*xStress)(void*, PgHdr*)` as `int *` and rejected
+    /// `p->xStress = xStress` in the SQLite amalgamation.
+    fn param_decl_ctype(&self, param: &crate::frontend::parser::ast::ParamDecl) -> CType {
+        if let Some(ref fptr_params) = param.fptr_params {
+            let return_ctype = self.type_spec_to_ctype(&param.type_spec);
+            let actual_return = if let CType::Pointer(inner, _) = return_ctype {
+                *inner
+            } else {
+                return_ctype
+            };
+            let param_types: Vec<(CType, Option<String>)> = fptr_params
+                .iter()
+                .map(|p| (self.param_decl_ctype(p), p.name.clone()))
+                .collect();
+            let func_type = CType::Function(Box::new(FunctionType {
+                return_type: actual_return,
+                params: param_types,
+                variadic: false,
+            }));
+            let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
+            for _ in 1..param.fptr_inner_ptr_depth.max(1) {
+                result = CType::Pointer(Box::new(result), AddressSpace::Default);
+            }
+            return result;
+        }
+        let ctype = self.type_spec_to_ctype(&param.type_spec);
+        match ctype {
+            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+            CType::Function(ft) => {
+                CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default)
+            }
+            other => other,
+        }
+    }
 
     /// Convert an AST TypeSpecifier to a CType.
     /// Delegates to the shared `TypeConvertContext::resolve_type_spec_to_ctype` default
